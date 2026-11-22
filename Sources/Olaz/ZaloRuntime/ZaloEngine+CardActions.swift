@@ -22,7 +22,12 @@ extension ZaloEngine {
         return .unsupported(CardActionOutcome.defaultUnsupported)
     }
 
-    func resetCardState() {}
+    func resetCardState() {
+        reminderWatchCache.removeAll()
+        let allWaiters = reminderWatchWaiters.values.flatMap(\.values)
+        reminderWatchWaiters.removeAll()
+        for wake in allWaiters { wake() }
+    }
 
     func suggestedStickers(in conversationId: String, message messageId: String) async -> [SuggestedSticker] {
         let msg = messages[conversationId]?.first(where: { $0.id == messageId })
@@ -156,21 +161,383 @@ extension ZaloEngine {
         return await sendSticker(entry, in: conversationId, source: .category)
     }
 
+    private func resolveReminderId(in conversationId: String, messageId: String) -> String {
+        if let pinRef = pins[conversationId]?.items.first(where: {
+            $0.kind == .reminder && ($0.msgId == messageId || $0.cliMsgId == messageId)
+        })?.ref, !pinRef.isEmpty {
+            return pinRef
+        }
+        return messageId
+    }
+
+    private func reminderCardContext(in conversationId: String, messageId: String) -> ChatMessage.ECard? {
+        guard let msg = messages[conversationId]?.first(where: { $0.id == messageId }),
+              case .ecard(let card) = msg.kind else {
+            return nil
+        }
+        return card
+    }
+
+    private func wakeReminderWaiters(for key: String) {
+        guard let waiters = reminderWatchWaiters.removeValue(forKey: key) else { return }
+        for wake in waiters.values { wake() }
+    }
+
+    private func waitForReminderChange(key: String, timeoutSeconds: Double = 15) async -> Bool {
+        guard !Task.isCancelled else { return false }
+        let waiterId = UUID()
+        let result: Bool? = await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Bool?, Never>) in
+                let gate = OnceGate<Bool>(continuation)
+                let wake: @Sendable () -> Void = { gate.resume(true) }
+                reminderWatchWaiters[key, default: [:]][waiterId] = wake
+                Task {
+                    try? await Task.sleep(for: .seconds(timeoutSeconds))
+                    await MainActor.run {
+                        self.reminderWatchWaiters[key]?.removeValue(forKey: waiterId)
+                        if self.reminderWatchWaiters[key]?.isEmpty == true {
+                            self.reminderWatchWaiters.removeValue(forKey: key)
+                        }
+                    }
+                    gate.resume(nil)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in
+                if let wake = self.reminderWatchWaiters[key]?.removeValue(forKey: waiterId) {
+                    if self.reminderWatchWaiters[key]?.isEmpty == true {
+                        self.reminderWatchWaiters.removeValue(forKey: key)
+                    }
+                    wake()
+                }
+            }
+        }
+        return result ?? false
+    }
+
+    internal func normalizeReminderSnapshot(
+        from responseDict: [String: Any],
+        conversationId: String,
+        reminderId: String,
+        fallbackCard: ChatMessage.ECard? = nil
+    ) -> ReminderSnapshot? {
+        let data = (responseDict["data"] as? [String: Any]) ?? responseDict
+        if data.isEmpty, fallbackCard == nil { return nil }
+
+        let params: [String: Any] = {
+            if let p = data["params"] as? [String: Any] { return p }
+            if let pStr = data["params"] as? String,
+               let parsed = JSONLossless.parseObject(string: pStr) {
+                return parsed
+            }
+            return [:]
+        }()
+
+        func firstNonEmpty(_ values: String?...) -> String {
+            for v in values {
+                if let v, !v.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return v }
+            }
+            return ""
+        }
+
+        let rid = firstNonEmpty(
+            JSONLossless.string(data["rid"] ?? data["eventId"] ?? data["reminderId"] ?? data["id"] ?? data["topicId"]),
+            reminderId
+        )
+        let title = firstNonEmpty(
+            JSONLossless.string(data["title"] ?? data["topicTitle"]),
+            JSONLossless.string(params["title"] ?? params["topicTitle"]),
+            fallbackCard?.reminderTitle,
+            fallbackCard?.title
+        )
+        let rawStart = JSONLossless.int64(data["startTime"] ?? data["start"] ?? params["startTime"]) ?? 0
+        let startMs: Int64 = {
+            if rawStart > 0 {
+                return rawStart < 10_000_000_000 ? rawStart * 1000 : rawStart
+            }
+            if let d = fallbackCard?.reminderStart {
+                return Int64((d.timeIntervalSince1970 * 1000).rounded())
+            }
+            return 0
+        }()
+
+        let explicitRepeat = firstNonEmpty(
+            data["repeatLabel"] as? String,
+            data["repeat"] as? String,
+            params["repeatLabel"] as? String
+        )
+        let repeatLabel: String = {
+            if !explicitRepeat.isEmpty { return explicitRepeat }
+            if let mode = JSONLossless.int64(data["repeat"] ?? data["repeatMode"] ?? params["repeat"]) {
+                switch mode {
+                case 1: return "Hàng ngày"
+                case 2: return "Hàng tuần"
+                case 3: return "Hàng tháng"
+                default: break
+                }
+            }
+            return fallbackCard?.reminderRepeat ?? ""
+        }()
+
+        let creatorUid = ZaloWireParser.stripUserPrefix(JSONLossless.string(data["creatorId"] ?? data["creator"] ?? data["uid"]))
+        let creatorName = firstNonEmpty(
+            JSONLossless.string(data["creatorName"]),
+            !creatorUid.isEmpty ? lookupPersonInfo(creatorUid)?.name : nil
+        )
+        let isGroup = JSONLossless.bool(data["isGroup"]) ?? ZaloWireParser.isGroupId(conversationId)
+        let onlyMe = JSONLossless.bool(data["onlyMe"] ?? data["isOnlyMe"]) ?? false
+        let deleted = (JSONLossless.bool(data["deleted"] ?? data["isDeleted"]) == true)
+            || (JSONLossless.int64(data["delStatus"]) == 1)
+            || (JSONLossless.int64(data["status"]) == -1)
+
+        func extractUidSet(_ raw: Any?) -> [String] {
+            guard let arr = raw as? [Any] else { return [] }
+            return arr.compactMap { item in
+                let rawId: String
+                if let dict = item as? [String: Any] {
+                    rawId = JSONLossless.string(dict["uid"] ?? dict["userId"] ?? dict["id"])
+                } else {
+                    rawId = JSONLossless.string(item)
+                }
+                let clean = ZaloWireParser.stripUserPrefix(rawId)
+                return clean.isEmpty ? nil : clean
+            }
+        }
+
+        let acceptUids = extractUidSet(data["acceptUids"] ?? data["accept"])
+        let rejectUids = extractUidSet(data["rejectUids"] ?? data["reject"])
+        let acceptedCount = max(0, Int(JSONLossless.int64(
+            data["accepted"] ?? data["acceptedCount"] ?? data["acceptCount"] ?? data["numAccept"] ?? data["totalAccept"] ?? data["totalJoin"]
+        ) ?? Int64(acceptUids.count)))
+        let rejectedCount = max(0, Int(JSONLossless.int64(
+            data["rejected"] ?? data["rejectedCount"] ?? data["rejectCount"] ?? data["numReject"] ?? data["totalReject"] ?? data["totalDecline"]
+        ) ?? Int64(rejectUids.count)))
+
+        let myUid = ZaloWireParser.stripUserPrefix(profile?.userId ?? "")
+        let mineStr: String = {
+            if let explicit = data["mine"] as? String, explicit == "accept" || explicit == "reject" {
+                return explicit
+            }
+            if let res = JSONLossless.int64(data["myRes"] ?? data["myResponse"] ?? data["userResponse"] ?? data["responseType"]) {
+                if res == 1 { return "accept" }
+                if res == 2 { return "reject" }
+            }
+            if !myUid.isEmpty {
+                if acceptUids.contains(myUid) { return "accept" }
+                if rejectUids.contains(myUid) { return "reject" }
+            }
+            return ""
+        }()
+
+        let canRsvp = JSONLossless.bool(data["canRsvp"]) ?? (isGroup && !onlyMe && !deleted)
+        let canView = JSONLossless.bool(data["canView"]) ?? !deleted
+        let variantStr = firstNonEmpty(data["variant"] as? String, "invite")
+        let explicitSig = JSONLossless.string(data["sig"])
+        let sig = explicitSig.isEmpty
+            ? "\(rid)|\(title)|\(startMs)|\(repeatLabel)|\(mineStr)|\(acceptedCount)|\(rejectedCount)|\(deleted)|\(variantStr)"
+            : explicitSig
+
+        return ReminderSnapshot(json: [
+            "variant": variantStr,
+            "rid": rid,
+            "title": title,
+            "start": Double(startMs),
+            "repeat": repeatLabel,
+            "creatorName": creatorName,
+            "onlyMe": onlyMe,
+            "isGroup": isGroup,
+            "mine": mineStr,
+            "accepted": acceptedCount,
+            "rejected": rejectedCount,
+            "canRsvp": canRsvp,
+            "canView": canView,
+            "deleted": deleted,
+            "sig": sig
+        ])
+    }
+
     func reminderWatch(in conversationId: String, message messageId: String, signature: String) async -> ReminderSnapshot? {
-        nil
+        let eventId = resolveReminderId(in: conversationId, messageId: messageId)
+        guard !eventId.isEmpty else { return nil }
+        let key = "\(conversationId)|\(messageId)"
+        if !signature.isEmpty,
+           let cached = reminderWatchCache[key],
+           cached.sig == signature {
+            _ = await waitForReminderChange(key: key, timeoutSeconds: 15)
+            if Task.isCancelled { return nil }
+        }
+        guard let box = try? await sessionClient.fetchReminderDetail(convId: conversationId, reminderId: eventId) else {
+            return nil
+        }
+        let card = reminderCardContext(in: conversationId, messageId: messageId)
+        guard let snap = normalizeReminderSnapshot(
+            from: box.dict,
+            conversationId: conversationId,
+            reminderId: eventId,
+            fallbackCard: card
+        ) else {
+            return nil
+        }
+        reminderWatchCache[key] = (sig: snap.sig, snapshot: snap)
+        return snap
     }
 
     func respondToReminder(in conversationId: String, message messageId: String, accept: Bool) async -> (ok: Bool, text: String, snapshot: ReminderSnapshot?) {
+        let eventId = resolveReminderId(in: conversationId, messageId: messageId)
         do {
-            _ = try await sessionClient.respondReminderAPI(convId: conversationId, reminderId: messageId, accept: accept)
-            return (true, accept ? "Đã xác nhận tham gia." : "Đã từ chối.", nil)
+            _ = try await sessionClient.respondReminderAPI(convId: conversationId, reminderId: eventId, accept: accept)
+            let key = "\(conversationId)|\(messageId)"
+            var updated: ReminderSnapshot?
+            if let box = try? await sessionClient.fetchReminderDetail(convId: conversationId, reminderId: eventId) {
+                let card = reminderCardContext(in: conversationId, messageId: messageId)
+                updated = normalizeReminderSnapshot(
+                    from: box.dict,
+                    conversationId: conversationId,
+                    reminderId: eventId,
+                    fallbackCard: card
+                )
+            }
+            if let updated {
+                reminderWatchCache[key] = (sig: updated.sig, snapshot: updated)
+            } else {
+                reminderWatchCache.removeValue(forKey: key)
+            }
+            wakeReminderWaiters(for: key)
+            return (true, accept ? "Đã xác nhận tham gia." : "Đã từ chối.", updated)
         } catch {
             return (false, "Không thực hiện được thao tác.", nil)
         }
     }
 
+    private func extractResponderBuckets(from responseDict: [String: Any]) -> (
+        accept: [(uid: String, name: String, avatar: String)],
+        reject: [(uid: String, name: String, avatar: String)],
+        acceptTotal: Int,
+        rejectTotal: Int,
+        acceptMore: Int,
+        rejectMore: Int
+    )? {
+        let data: [String: Any]
+        if let d = responseDict["data"] as? [String: Any] {
+            data = d
+        } else if responseDict["data"] is [Any] {
+            data = responseDict
+        } else if !responseDict.isEmpty {
+            data = responseDict
+        } else {
+            return nil
+        }
+
+        func parseEntry(_ raw: Any) -> (uid: String, name: String, avatar: String, type: Int?)? {
+            if let dict = raw as? [String: Any] {
+                let uid = ZaloWireParser.stripUserPrefix(JSONLossless.string(
+                    dict["uid"] ?? dict["userId"] ?? dict["user_id"] ?? dict["id"]
+                ))
+                guard !uid.isEmpty, uid != "0" else { return nil }
+                let name = JSONLossless.string(dict["displayName"] ?? dict["dName"] ?? dict["zaloName"] ?? dict["name"])
+                let avatar = JSONLossless.string(dict["avatar"] ?? dict["avt"])
+                let rType = JSONLossless.int64(dict["type"] ?? dict["responseType"] ?? dict["status"]).map(Int.init)
+                return (uid, name, avatar, rType)
+            }
+            let uid = ZaloWireParser.stripUserPrefix(JSONLossless.string(raw))
+            guard !uid.isEmpty, uid != "0" else { return nil }
+            return (uid, "", "", nil)
+        }
+
+        var acceptRaw: [(uid: String, name: String, avatar: String)] = []
+        var rejectRaw: [(uid: String, name: String, avatar: String)] = []
+
+        if let arr = (data["accept"] as? [Any]) ?? (data["accepts"] as? [Any]) ?? (data["acceptUids"] as? [Any]) ?? (data["join"] as? [Any]) {
+            for item in arr {
+                if let e = parseEntry(item) { acceptRaw.append((e.uid, e.name, e.avatar)) }
+            }
+        }
+        if let arr = (data["reject"] as? [Any]) ?? (data["rejects"] as? [Any]) ?? (data["rejectUids"] as? [Any]) ?? (data["decline"] as? [Any]) {
+            for item in arr {
+                if let e = parseEntry(item) { rejectRaw.append((e.uid, e.name, e.avatar)) }
+            }
+        }
+        if acceptRaw.isEmpty && rejectRaw.isEmpty,
+           let combined = (data["responses"] as? [Any]) ?? (data["items"] as? [Any]) ?? (data["list"] as? [Any]) ?? (responseDict["data"] as? [Any]) {
+            for item in combined {
+                guard let e = parseEntry(item) else { continue }
+                if e.type == 2 {
+                    rejectRaw.append((e.uid, e.name, e.avatar))
+                } else {
+                    acceptRaw.append((e.uid, e.name, e.avatar))
+                }
+            }
+        }
+
+        let acceptTotal = max(acceptRaw.count, Int(JSONLossless.int64(data["acceptTotal"] ?? data["totalAccept"] ?? data["numAccept"]) ?? Int64(acceptRaw.count)))
+        let rejectTotal = max(rejectRaw.count, Int(JSONLossless.int64(data["rejectTotal"] ?? data["totalReject"] ?? data["numReject"]) ?? Int64(rejectRaw.count)))
+        let acceptMore = max(0, Int(JSONLossless.int64(data["acceptMore"]) ?? 0))
+        let rejectMore = max(0, Int(JSONLossless.int64(data["rejectMore"]) ?? 0))
+        return (acceptRaw, rejectRaw, acceptTotal, rejectTotal, acceptMore, rejectMore)
+    }
+
+    internal func buildReminderResponders(from responseDict: [String: Any]) -> ReminderResponders? {
+        guard let buckets = extractResponderBuckets(from: responseDict) else { return nil }
+        let myUid = ZaloWireParser.stripUserPrefix(profile?.userId ?? "")
+
+        func enrich(_ entries: [(uid: String, name: String, avatar: String)]) -> [[String: Any]] {
+            entries.map { entry in
+                let isMe = !myUid.isEmpty && entry.uid == myUid
+                let local = lookupPersonInfo(entry.uid)
+                let resolvedName: String = {
+                    if let n = local?.name, !n.isEmpty { return n }
+                    if !entry.name.isEmpty { return entry.name }
+                    return isMe ? "Bạn" : "Người dùng Zalo"
+                }()
+                let resolvedAvatar: String = {
+                    if let a = local?.avatar, !a.isEmpty { return a }
+                    return entry.avatar
+                }()
+                return [
+                    "uid": entry.uid,
+                    "name": resolvedName,
+                    "avatar": resolvedAvatar,
+                    "isMe": isMe
+                ]
+            }
+        }
+
+        return ReminderResponders(json: [
+            "ok": true,
+            "accept": enrich(buckets.accept),
+            "reject": enrich(buckets.reject),
+            "acceptTotal": buckets.acceptTotal,
+            "rejectTotal": buckets.rejectTotal,
+            "acceptMore": buckets.acceptMore,
+            "rejectMore": buckets.rejectMore
+        ])
+    }
+
     func reminderResponders(in conversationId: String, message messageId: String) async -> ReminderResponders? {
-        nil
+        let eventId = resolveReminderId(in: conversationId, messageId: messageId)
+        guard !eventId.isEmpty,
+              let box = try? await sessionClient.fetchReminderRespondersAPI(reminderId: eventId) else {
+            return nil
+        }
+        if let buckets = extractResponderBuckets(from: box.dict) {
+            let allEntries = buckets.accept + buckets.reject
+            let missingUids = Array(Set(allEntries.compactMap { entry -> String? in
+                guard lookupPersonInfo(entry.uid) == nil, entry.name.isEmpty else { return nil }
+                return entry.uid
+            })).prefix(50)
+            if !missingUids.isEmpty, await sessionClient.isAuthenticated,
+               let profBox = try? await sessionClient.fetchProfiles(uids: Array(missingUids)) {
+                for (uid, row) in ZaloWireParser.extractProfilesMap(profBox.dict) {
+                    let clean = ZaloWireParser.stripUserPrefix(uid)
+                    let name = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+                    let avatar = JSONLossless.string(row["avatar"] ?? row["avt"])
+                    if !clean.isEmpty, (!name.isEmpty || !avatar.isEmpty) {
+                        cachedProfiles[clean] = ZaloWebKitMigrator.CachedProfile(name: name, avatar: avatar)
+                    }
+                }
+            }
+        }
+        return buildReminderResponders(from: box.dict)
     }
 }
 

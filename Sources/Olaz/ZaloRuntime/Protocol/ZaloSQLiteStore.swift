@@ -46,6 +46,37 @@ struct StoredMessage: Equatable, Sendable {
     var rawJSONData: Data
 }
 
+struct StoredCloudConversationSummary: Equatable, Sendable {
+    var convId: String
+    var convName: String
+    var convAvatar: String
+    var isGroup: Bool
+    var photoBytes: Int64
+    var videoBytes: Int64
+    var fileBytes: Int64
+    var voiceBytes: Int64
+    var itemCount: Int
+    var lastActivityMs: Int64
+
+    var totalBytes: Int64 { photoBytes + videoBytes + fileBytes + voiceBytes }
+}
+
+struct StoredCloudMediaItem: Equatable, Sendable {
+    var id: String
+    var clientId: String
+    var convId: String
+    var convName: String
+    var kindTag: String
+    var text: String
+    var tsMs: Int64
+    var fileName: String
+    var sizeBytes: Int64
+    var durationSec: Int
+    var width: Int
+    var height: Int
+    var url: String
+}
+
 /// Pure Swift SQLite3 local store for Olaz conversations, message history, shared media index, and account preferences.
 /// All public inputs and outputs are strictly `Sendable` so Swift 6 actor isolation remains warning-free.
 actor ZaloSQLiteStore {
@@ -105,6 +136,7 @@ actor ZaloSQLiteStore {
         CREATE INDEX IF NOT EXISTS idx_messages_conv_ts ON messages(conv_id, ts_ms DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_conv_kind_ts ON messages(conv_id, kind_tag, ts_ms DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_conv_client ON messages(conv_id, client_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_kind_ts ON messages(kind_tag, ts_ms DESC);
         CREATE TABLE IF NOT EXISTS preferences (
             key TEXT PRIMARY KEY,
             value_json TEXT NOT NULL
@@ -874,6 +906,201 @@ actor ZaloSQLiteStore {
         let page = Array(collected.prefix(max(1, min(limit, 200))))
         let nextCursor = hasMore ? page.last.map { "\($0.ts)|\($0.id)" } : nil
         return (page.map(\.data), nextCursor, hasMore)
+    }
+
+    // MARK: - zCloud Media Aggregation & Queries
+
+    private static let cloudItemSizeSQL = """
+    CASE m.kind_tag
+        WHEN 'photo' THEN
+            CASE WHEN json_valid(m.raw_json) AND COALESCE(CAST(json_extract(m.raw_json, '$.kind.size') AS INTEGER), 0) > 0
+                 THEN CAST(json_extract(m.raw_json, '$.kind.size') AS INTEGER)
+                 ELSE 150000 END
+        WHEN 'video' THEN
+            CASE WHEN json_valid(m.raw_json) AND COALESCE(CAST(json_extract(m.raw_json, '$.kind.size') AS INTEGER), 0) > 0
+                 THEN CAST(json_extract(m.raw_json, '$.kind.size') AS INTEGER)
+                 ELSE 1500000 END
+        WHEN 'voice' THEN
+            CASE WHEN json_valid(m.raw_json) AND COALESCE(CAST(json_extract(m.raw_json, '$.kind.size') AS INTEGER), 0) > 0
+                 THEN CAST(json_extract(m.raw_json, '$.kind.size') AS INTEGER)
+                 ELSE 40000 END
+        WHEN 'file' THEN
+            CASE WHEN json_valid(m.raw_json) AND COALESCE(CAST(json_extract(m.raw_json, '$.kind.size') AS INTEGER), 0) > 0
+                 THEN CAST(json_extract(m.raw_json, '$.kind.size') AS INTEGER)
+                 ELSE 0 END
+        ELSE 0
+    END
+    """
+
+    /// Aggregates stored photo/video/file/voice media bytes and counts across all persisted conversations.
+    func cloudMediaAggregation() throws -> [StoredCloudConversationSummary] {
+        let sizeExpr = Self.cloudItemSizeSQL
+        let sql = """
+        SELECT
+            m.conv_id,
+            COALESCE(c.name, ''),
+            COALESCE(c.avatar, ''),
+            COALESCE(c.is_group, 0),
+            SUM(CASE WHEN m.kind_tag = 'photo' THEN (\(sizeExpr)) ELSE 0 END) AS photo_bytes,
+            SUM(CASE WHEN m.kind_tag = 'video' THEN (\(sizeExpr)) ELSE 0 END) AS video_bytes,
+            SUM(CASE WHEN m.kind_tag = 'file' THEN (\(sizeExpr)) ELSE 0 END) AS file_bytes,
+            SUM(CASE WHEN m.kind_tag = 'voice' THEN (\(sizeExpr)) ELSE 0 END) AS voice_bytes,
+            COUNT(*) AS item_count,
+            MAX(m.ts_ms) AS last_ts_ms
+        FROM messages m
+        LEFT JOIN conversations c ON c.id = m.conv_id
+        WHERE m.kind_tag IN ('photo', 'video', 'file', 'voice')
+          AND m.status != 'e2ee_locked'
+        GROUP BY m.conv_id
+        ORDER BY (photo_bytes + video_bytes + file_bytes + voice_bytes) DESC, last_ts_ms DESC;
+        """
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        var out: [StoredCloudConversationSummary] = []
+        while true {
+            let rc = sqlite3_step(stmt)
+            if rc == SQLITE_DONE { break }
+            guard rc == SQLITE_ROW else { throw ZaloSQLiteError.stepFailed(lastError) }
+            let convId = columnText(stmt, 0)
+            let isGroupCol = sqlite3_column_type(stmt, 3) != SQLITE_NULL ? (sqlite3_column_int(stmt, 3) != 0) : ZaloWireParser.isGroupId(convId)
+            out.append(StoredCloudConversationSummary(
+                convId: convId,
+                convName: columnText(stmt, 1),
+                convAvatar: columnText(stmt, 2),
+                isGroup: isGroupCol,
+                photoBytes: sqlite3_column_int64(stmt, 4),
+                videoBytes: sqlite3_column_int64(stmt, 5),
+                fileBytes: sqlite3_column_int64(stmt, 6),
+                voiceBytes: sqlite3_column_int64(stmt, 7),
+                itemCount: Int(sqlite3_column_int64(stmt, 8)),
+                lastActivityMs: sqlite3_column_int64(stmt, 9)
+            ))
+        }
+        return out
+    }
+
+    /// Queries stored media items across all (or a single) persisted conversations with SQL-level sorting and pagination.
+    func cloudMediaItems(
+        convId: String? = nil,
+        excludingConvId: String? = nil,
+        kindTags: [String] = ["photo", "video", "file", "voice"],
+        sortBySize: Bool = false,
+        ascending: Bool = false,
+        offset: Int = 0,
+        limit: Int = 60
+    ) throws -> (items: [StoredCloudMediaItem], hasMore: Bool) {
+        let validTags = kindTags.filter { ["photo", "video", "file", "voice"].contains($0) }
+        guard !validTags.isEmpty, limit > 0 else { return ([], false) }
+        let clampedLimit = max(1, min(limit, 500))
+        let safeOffset = max(0, offset)
+        let fetchLimit = clampedLimit + 1
+
+        var whereClauses = ["m.status != 'e2ee_locked'"]
+        let tagPlaceholders = Array(repeating: "?", count: validTags.count).joined(separator: ",")
+        whereClauses.append("m.kind_tag IN (\(tagPlaceholders))")
+        if let convId, !convId.isEmpty {
+            whereClauses.append("m.conv_id = ?")
+        } else if let excludingConvId, !excludingConvId.isEmpty {
+            whereClauses.append("m.conv_id != ?")
+        }
+
+        let dir = ascending ? "ASC" : "DESC"
+        let orderClause = sortBySize
+            ? "size_bytes \(dir), m.ts_ms DESC, m.id \(dir)"
+            : "m.ts_ms \(dir), m.id \(dir)"
+        let sizeExpr = Self.cloudItemSizeSQL
+
+        let sql = """
+        SELECT
+            m.id,
+            m.client_id,
+            m.conv_id,
+            COALESCE(c.name, ''),
+            m.kind_tag,
+            m.text,
+            m.ts_ms,
+            CASE WHEN json_valid(m.raw_json) THEN COALESCE(json_extract(m.raw_json, '$.kind.name'), '') ELSE '' END AS file_name,
+            (\(sizeExpr)) AS size_bytes,
+            CASE WHEN json_valid(m.raw_json) THEN COALESCE(CAST(json_extract(m.raw_json, '$.kind.duration') AS INTEGER), 0) ELSE 0 END AS dur_sec,
+            CASE WHEN json_valid(m.raw_json) THEN COALESCE(CAST(json_extract(m.raw_json, '$.kind.width') AS INTEGER), 0) ELSE 0 END AS width_px,
+            CASE WHEN json_valid(m.raw_json) THEN COALESCE(CAST(json_extract(m.raw_json, '$.kind.height') AS INTEGER), 0) ELSE 0 END AS height_px,
+            CASE WHEN json_valid(m.raw_json) THEN COALESCE(json_extract(m.raw_json, '$.kind.url'), '') ELSE '' END AS media_url
+        FROM messages m
+        LEFT JOIN conversations c ON c.id = m.conv_id
+        WHERE \(whereClauses.joined(separator: " AND "))
+        ORDER BY \(orderClause)
+        LIMIT ? OFFSET ?;
+        """
+
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        var idx: Int32 = 1
+        for tag in validTags {
+            bindText(stmt, idx, tag); idx += 1
+        }
+        if let convId, !convId.isEmpty {
+            bindText(stmt, idx, convId); idx += 1
+        } else if let excludingConvId, !excludingConvId.isEmpty {
+            bindText(stmt, idx, excludingConvId); idx += 1
+        }
+        sqlite3_bind_int(stmt, idx, Int32(fetchLimit)); idx += 1
+        sqlite3_bind_int(stmt, idx, Int32(safeOffset))
+
+        var collected: [StoredCloudMediaItem] = []
+        while true {
+            let rc = sqlite3_step(stmt)
+            if rc == SQLITE_DONE { break }
+            guard rc == SQLITE_ROW else { throw ZaloSQLiteError.stepFailed(lastError) }
+            collected.append(StoredCloudMediaItem(
+                id: columnText(stmt, 0),
+                clientId: columnText(stmt, 1),
+                convId: columnText(stmt, 2),
+                convName: columnText(stmt, 3),
+                kindTag: columnText(stmt, 4),
+                text: columnText(stmt, 5),
+                tsMs: sqlite3_column_int64(stmt, 6),
+                fileName: columnText(stmt, 7),
+                sizeBytes: sqlite3_column_int64(stmt, 8),
+                durationSec: max(0, Int(sqlite3_column_int64(stmt, 9))),
+                width: max(0, Int(sqlite3_column_int64(stmt, 10))),
+                height: max(0, Int(sqlite3_column_int64(stmt, 11))),
+                url: columnText(stmt, 12)
+            ))
+        }
+        let hasMore = collected.count > clampedLimit
+        return (Array(collected.prefix(clampedLimit)), hasMore)
+    }
+
+    /// Returns the subset of `ids` (matching either `id` or `client_id`) already persisted in `convId`.
+    func existingMessageIds(convId: String, ids: [String]) throws -> Set<String> {
+        let unique = Array(Set(ids.filter { !$0.isEmpty }))
+        guard !convId.isEmpty, !unique.isEmpty else { return [] }
+        var found = Set<String>()
+        for start in stride(from: 0, to: unique.count, by: 200) {
+            let chunk = Array(unique[start..<min(start + 200, unique.count)])
+            let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
+            let sql = """
+            SELECT id, client_id
+            FROM messages
+            WHERE conv_id = ? AND (id IN (\(placeholders)) OR client_id IN (\(placeholders)));
+            """
+            let stmt = try prepare(sql)
+            defer { sqlite3_finalize(stmt) }
+            var idx: Int32 = 1
+            bindText(stmt, idx, convId); idx += 1
+            for id in chunk { bindText(stmt, idx, id); idx += 1 }
+            for id in chunk { bindText(stmt, idx, id); idx += 1 }
+            while true {
+                let rc = sqlite3_step(stmt)
+                if rc == SQLITE_DONE { break }
+                guard rc == SQLITE_ROW else { throw ZaloSQLiteError.stepFailed(lastError) }
+                let rowId = columnText(stmt, 0)
+                let cliId = columnText(stmt, 1)
+                if !rowId.isEmpty { found.insert(rowId) }
+                if !cliId.isEmpty { found.insert(cliId) }
+            }
+        }
+        return found
     }
 
     // MARK: - Preferences

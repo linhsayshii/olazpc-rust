@@ -139,6 +139,10 @@ final class ZaloEngine {
     @ObservationIgnored internal var cachedGroups: [String: ZaloWebKitMigrator.CachedGroup] = [:]
     @ObservationIgnored internal var cachedActivityRanks: [String: Int64] = [:]
     @ObservationIgnored internal var cachedBoardRawTopics: [String: (version: Int64, topics: [String: [String: Any]])] = [:]
+    @ObservationIgnored internal var cachedHiddenPinHash: String?
+    @ObservationIgnored internal var cachedHiddenPinMD5: String?
+    @ObservationIgnored internal var reminderWatchCache: [String: (sig: String, snapshot: ReminderSnapshot)] = [:]
+    @ObservationIgnored internal var reminderWatchWaiters: [String: [UUID: @Sendable () -> Void]] = [:]
     @ObservationIgnored private var webkitMigrateTask: Task<Void, Never>?
 
     /// Kept for menu toggle binding compatibility; native engine has no hidden WebKit window.
@@ -147,9 +151,13 @@ final class ZaloEngine {
     var downloadedFilePaths: [String: URL] = [:]
 
     /// Strictly side-effect-free initializer so unit tests and previews instantiate safely.
-    init(dataDirectory: URL = ZaloPlatform.defaultUserData, useKeychain: Bool = true) {
+    init(
+        dataDirectory: URL = ZaloPlatform.defaultUserData,
+        useKeychain: Bool = true,
+        urlSession: URLSession? = nil
+    ) {
         self.dataDirectory = dataDirectory
-        self.sessionClient = ZaloSessionClient(dataDirectory: dataDirectory, useKeychain: useKeychain)
+        self.sessionClient = ZaloSessionClient(dataDirectory: dataDirectory, useKeychain: useKeychain, urlSession: urlSession)
     }
 
     // MARK: - Lifecycle
@@ -391,7 +399,7 @@ final class ZaloEngine {
         }
     }
 
-    private func applyAccountProfile(_ account: ZaloLoginAccount) {
+    internal func applyAccountProfile(_ account: ZaloLoginAccount) {
         profile = Profile(
             userId: account.userId,
             displayName: account.displayName.isEmpty ? "Người dùng Zalo" : account.displayName,
@@ -596,11 +604,14 @@ final class ZaloEngine {
 
         let hiddenIds = Set((try? await store.getPreferenceStrings(key: "hiddenIds")) ?? [])
         let hiddenHash = try? await store.getPreferenceString(key: "hiddenPinHash")
+        let hiddenMD5 = try? await store.getPreferenceString(key: "hiddenPinMD5")
+        cachedHiddenPinHash = (hiddenHash?.isEmpty == false) ? hiddenHash : nil
+        cachedHiddenPinMD5 = (hiddenMD5?.isEmpty == false) ? hiddenMD5 : nil
         var actions = conversationActions
         actions.hiddenKnown = true
         actions.loaded = true
         actions.hiddenEnabled = true
-        actions.hasHiddenPIN = (hiddenHash?.isEmpty == false)
+        actions.hasHiddenPIN = (cachedHiddenPinHash != nil) || (cachedHiddenPinMD5 != nil)
         actions.hiddenIds = hiddenIds
         actions.markUnreadEnabled = true
         conversationActions = actions
@@ -658,6 +669,7 @@ final class ZaloEngine {
         }
 
         await syncConversationLabelsFromServer()
+        await syncHiddenConversations()
         await performContactsSync()
         ensureKnownContactsInConversations()
         rebuildConversationFlags()

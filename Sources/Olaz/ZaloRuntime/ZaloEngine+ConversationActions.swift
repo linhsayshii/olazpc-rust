@@ -413,18 +413,79 @@ extension ZaloEngine {
         }
     }
 
-    // MARK: Hidden chats (local SHA-256 PIN + SQLite + best-effort server sync)
+    // MARK: Hidden chats (server MD5 PIN sync + local SHA-256 fallback + SQLite)
 
     private static func hashPIN(_ pin: String) -> String {
         let digest = SHA256.hash(data: Data("olaz-hidden-pin:\(pin)".utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    func checkHiddenChatPIN(_ pin: String) async -> Bool {
-        guard let storedHash = try? await sqliteStore?.getPreferenceString(key: "hiddenPinHash"), !storedHash.isEmpty else {
-            return false
+    private func storedHiddenPinDigests() async -> (md5: String?, sha256: String?) {
+        if let store = sqliteStore {
+            let md5 = try? await store.getPreferenceString(key: "hiddenPinMD5")
+            let sha = try? await store.getPreferenceString(key: "hiddenPinHash")
+            return (
+                md5?.isEmpty == false ? md5 : nil,
+                sha?.isEmpty == false ? sha : nil
+            )
         }
-        return Self.hashPIN(pin) == storedHash
+        return (
+            cachedHiddenPinMD5?.isEmpty == false ? cachedHiddenPinMD5 : nil,
+            cachedHiddenPinHash?.isEmpty == false ? cachedHiddenPinHash : nil
+        )
+    }
+
+    func syncHiddenConversations() async {
+        guard await sessionClient.isAuthenticated else { return }
+        guard let snap = try? await sessionClient.fetchHiddenConversationsAPI() else { return }
+        await applyServerHiddenConversations(snap)
+    }
+
+    internal func applyServerHiddenConversations(_ snap: HiddenConversationsSnapshot) async {
+        let serverPin = snap.pin.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let serverHiddenIds = Set(snap.threadIds.filter { !$0.isEmpty && $0 != selfConversationId })
+        let oldHiddenIds = conversationActions.hiddenIds
+
+        if !serverPin.isEmpty {
+            let prevMD5 = (try? await sqliteStore?.getPreferenceString(key: "hiddenPinMD5")) ?? cachedHiddenPinMD5
+            if prevMD5?.lowercased() != serverPin {
+                cachedHiddenPinHash = nil
+                try? await sqliteStore?.deletePreference(key: "hiddenPinHash")
+            }
+            cachedHiddenPinMD5 = serverPin
+            try? await sqliteStore?.setPreferenceString(key: "hiddenPinMD5", value: serverPin)
+        } else {
+            cachedHiddenPinMD5 = nil
+            cachedHiddenPinHash = nil
+            try? await sqliteStore?.deletePreference(key: "hiddenPinMD5")
+            try? await sqliteStore?.deletePreference(key: "hiddenPinHash")
+        }
+        try? await sqliteStore?.setPreferenceStrings(key: "hiddenIds", value: Array(serverHiddenIds))
+
+        var next = conversationActions
+        next.hiddenKnown = true
+        next.hiddenEnabled = true
+        next.hasHiddenPIN = !serverPin.isEmpty
+        next.hiddenIds = serverHiddenIds
+        conversationActions = next
+
+        let newlyHidden = serverHiddenIds.subtracting(oldHiddenIds)
+        if !newlyHidden.isEmpty {
+            conversationUI.remove(newlyHidden)
+        }
+        rebuildConversationFlags()
+        rebuildConversationExtras()
+    }
+
+    func checkHiddenChatPIN(_ pin: String) async -> Bool {
+        let digests = await storedHiddenPinDigests()
+        if let md5Stored = digests.md5 {
+            return ZaloSessionClient.hiddenPinMD5Hex(pin) == md5Stored.lowercased()
+        }
+        if let shaStored = digests.sha256 {
+            return Self.hashPIN(pin) == shaStored
+        }
+        return false
     }
 
     func hideConversation(_ id: String, pin: String) async -> ConversationActionResult {
@@ -440,14 +501,33 @@ extension ZaloEngine {
         return ConversationActionResult(ok: true, text: "Đã ẩn trò chuyện")
     }
 
+    private func syncAndPersistHiddenPin(_ pin: String) async -> Bool {
+        if await sessionClient.isAuthenticated {
+            do {
+                _ = try await sessionClient.updateHiddenPinAPI(pin: pin)
+            } catch {
+                return false
+            }
+            let md5 = ZaloSessionClient.hiddenPinMD5Hex(pin)
+            cachedHiddenPinMD5 = md5
+            try? await sqliteStore?.setPreferenceString(key: "hiddenPinMD5", value: md5)
+        }
+        let hash = Self.hashPIN(pin)
+        cachedHiddenPinHash = hash
+        try? await sqliteStore?.setPreferenceString(key: "hiddenPinHash", value: hash)
+        conversationActions.hasHiddenPIN = true
+        return true
+    }
+
     func hideConversation(_ id: String, settingNewPIN pin: String) async -> ConversationActionResult {
-        if let existing = try? await sqliteStore?.getPreferenceString(key: "hiddenPinHash"), !existing.isEmpty {
+        let existing = await storedHiddenPinDigests()
+        if conversationActions.hasHiddenPIN || existing.md5 != nil || existing.sha256 != nil {
             conversationActions.hasHiddenPIN = true
             return ConversationActionResult(ok: false, text: "Mã PIN đã được thiết lập trước đó.", pinExists: true)
         }
-        let hash = Self.hashPIN(pin)
-        try? await sqliteStore?.setPreferenceString(key: "hiddenPinHash", value: hash)
-        conversationActions.hasHiddenPIN = true
+        guard await syncAndPersistHiddenPin(pin) else {
+            return ConversationActionResult(ok: false, text: "Không thể cài mã PIN trò chuyện ẩn.")
+        }
         conversationActions.hiddenIds.insert(id)
         try? await sqliteStore?.setPreferenceStrings(key: "hiddenIds", value: Array(conversationActions.hiddenIds))
         await sessionClient.setHiddenConversationAPI(convId: id, hidden: true)
@@ -470,17 +550,29 @@ extension ZaloEngine {
     }
 
     func setHiddenChatPIN(_ pin: String, changed: Bool) async -> ConversationActionResult {
-        let hash = Self.hashPIN(pin)
-        try? await sqliteStore?.setPreferenceString(key: "hiddenPinHash", value: hash)
-        conversationActions.hasHiddenPIN = true
+        guard await syncAndPersistHiddenPin(pin) else {
+            return ConversationActionResult(ok: false, text: changed ? "Không thể đổi mã PIN." : "Không thể cài mã PIN.")
+        }
+        rebuildConversationFlags()
+        rebuildConversationExtras()
         return ConversationActionResult(ok: true, text: changed ? "Đã đổi mã PIN" : "Đã cài mã PIN")
     }
 
     func resetHiddenChatPIN() async -> ConversationActionResult {
+        if await sessionClient.isAuthenticated {
+            do {
+                _ = try await sessionClient.resetHiddenPinAPI()
+            } catch {
+                return ConversationActionResult(ok: false, text: "Không thể xóa mã PIN.")
+            }
+        }
         let formerlyHidden = conversationActions.hiddenIds
         conversationActions.hiddenIds.removeAll()
         conversationActions.hasHiddenPIN = false
+        cachedHiddenPinHash = nil
+        cachedHiddenPinMD5 = nil
         try? await sqliteStore?.deletePreference(key: "hiddenPinHash")
+        try? await sqliteStore?.deletePreference(key: "hiddenPinMD5")
         try? await sqliteStore?.setPreferenceStrings(key: "hiddenIds", value: [])
         conversationUI.remove(formerlyHidden)
         conversationUI.relock()
@@ -535,6 +627,8 @@ extension ZaloEngine {
     func resetConversationActions() {
         conversationActions = ConversationActionsState()
         conversationPrompt = nil
+        cachedHiddenPinHash = nil
+        cachedHiddenPinMD5 = nil
         conversationUI.reset()
     }
 

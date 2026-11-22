@@ -362,6 +362,13 @@ struct PollPinConfirm: Equatable, Sendable {
     var kind: String
     var title: String
 
+    init(ref: String, limit: Int, kind: String, title: String) {
+        self.ref = ref
+        self.limit = limit
+        self.kind = kind
+        self.title = title
+    }
+
     init?(json: Any?) {
         guard let o = json as? [String: Any], let ref = o["ref"] as? String, !ref.isEmpty else { return nil }
         self.ref = ref
@@ -445,7 +452,14 @@ extension ZaloEngine {
                 if polls.details[id] == nil { polls.failed.insert(id) }
                 return
             }
-            let normalized = normalizePollDetail(dataNode, id: id)
+            let gid = resolvePollGroupId(id: id, payload: dataNode, explicit: nil)
+            let cleanGrid = ZaloWireParser.cleanGroupId(gid)
+            if !gid.isEmpty, !cleanGrid.isEmpty,
+               cachedGroupDetails[cleanGrid] == nil,
+               await sessionClient.isAuthenticated {
+                await refreshGroupMetadata(gid)
+            }
+            let normalized = normalizePollDetail(dataNode, id: id, groupId: gid)
             if let detail = PollDetail(json: normalized) {
                 polls.failed.remove(id)
                 if polls.details[id] != detail { polls.details[id] = detail }
@@ -455,9 +469,72 @@ extension ZaloEngine {
         }
     }
 
-    private func normalizePollDetail(_ d: [String: Any], id: String) -> [String: Any] {
-        let myUid = profile?.userId ?? ""
+    internal func resolvePollGroupId(id: String, payload: [String: Any], explicit: String?) -> String {
+        let candidates: [String] = [
+            explicit ?? "",
+            JSONLossless.string(payload["group_id"] ?? payload["groupId"] ?? payload["grid"]),
+            PollClock.watched[id] ?? "",
+            polls.details[id]?.groupId ?? ""
+        ]
+        for raw in candidates {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, trimmed != "0", trimmed != "g0" else { continue }
+            let gid = ZaloWireParser.groupConvId(trimmed)
+            if !gid.isEmpty { return gid }
+        }
+        for (convId, list) in messages where ZaloWireParser.isGroupId(convId) {
+            if list.contains(where: {
+                if case .poll(let info) = $0.kind { return info.pollId == id }
+                return false
+            }) {
+                return ZaloWireParser.groupConvId(convId)
+            }
+        }
+        return ""
+    }
+
+    internal func isGroupAdminOrCreator(_ uid: String, inGroup groupId: String) -> Bool {
+        let cleanUid = ZaloWireParser.sanitizeProfileUid(uid) ?? ZaloWireParser.stripUserPrefix(uid)
+        guard !cleanUid.isEmpty, cleanUid != "0" else { return false }
+        let cleanGrid = ZaloWireParser.cleanGroupId(groupId)
+        let convId = ZaloWireParser.groupConvId(groupId)
+        let info = (!cleanGrid.isEmpty ? cachedGroupDetails[cleanGrid] : nil)
+            ?? (!convId.isEmpty ? cachedGroupDetails[convId] : nil)
+        guard let info else { return false }
+
+        var privileged = Set<String>()
+        func addCandidate(_ raw: Any?) {
+            let str = JSONLossless.string(raw)
+            let norm = ZaloWireParser.sanitizeProfileUid(str) ?? ZaloWireParser.stripUserPrefix(str)
+            if !norm.isEmpty, norm != "0" { privileged.insert(norm) }
+        }
+
+        for key in ["creatorId", "creator_id", "ownerId", "owner_id", "creator"] {
+            addCandidate(info[key])
+        }
+        for key in ["adminIds", "admin_ids", "admins", "deputies", "deputyIds"] {
+            if let arr = info[key] as? [Any] {
+                arr.forEach(addCandidate)
+            }
+        }
+        if let cur = info["currentMems"] as? [[String: Any]] {
+            for mem in cur {
+                let isAdmin = (JSONLossless.bool(mem["isAdmin"]) == true)
+                    || (JSONLossless.bool(mem["isCreator"]) == true)
+                if isAdmin {
+                    addCandidate(mem["id"] ?? mem["uid"])
+                }
+            }
+        }
+        return privileged.contains(cleanUid)
+    }
+
+    internal func normalizePollDetail(_ d: [String: Any], id: String, groupId explicitGroupId: String? = nil) -> [String: Any] {
+        let myUid = ZaloWireParser.stripUserPrefix(profile?.userId ?? "")
         let creatorId = ZaloWireParser.stripUserPrefix(JSONLossless.string(d["creator"]))
+        let resolvedGroupId = resolvePollGroupId(id: id, payload: d, explicit: explicitGroupId)
+        let isPollCreator = !myUid.isEmpty && creatorId == myUid
+        let isGroupPrivileged = !myUid.isEmpty && !resolvedGroupId.isEmpty && isGroupAdminOrCreator(myUid, inGroup: resolvedGroupId)
         let optionsRaw = (d["options"] as? [[String: Any]]) ?? []
         var totalVoters = Set<String>()
         var options: [[String: Any]] = []
@@ -475,6 +552,7 @@ extension ZaloEngine {
         }
         return [
             "id": id,
+            "groupId": resolvedGroupId,
             "question": JSONLossless.string(d["question"]),
             "creator": creatorId,
             "creatorName": lookupPersonInfo(creatorId)?.name ?? "Thành viên",
@@ -485,7 +563,7 @@ extension ZaloEngine {
             "closed": (JSONLossless.int64(d["status"]) == 0),
             "expired": (JSONLossless.int64(d["expired_time"]) ?? 0) * 1000,
             "voters": totalVoters.count,
-            "canClose": creatorId == myUid,
+            "canClose": isPollCreator || isGroupPrivileged,
             "joined": !myUid.isEmpty && totalVoters.contains(myUid),
             "options": options
         ]
@@ -515,15 +593,87 @@ extension ZaloEngine {
 
     @discardableResult
     func refreshPollPin(_ id: String, in conversationId: String) async -> PollPinState {
+        let isGroup = ZaloWireParser.isGroupId(conversationId)
+        if isGroup, pins[conversationId] == nil, await sessionClient.isAuthenticated {
+            await refreshBoardPins(for: conversationId)
+        }
         let board = pins[conversationId]?.items ?? []
         let isPinned = board.contains { $0.kind == .poll && $0.ref == id }
-        let state = PollPinState(json: ["ready": ZaloWireParser.isGroupId(conversationId), "canPin": ZaloWireParser.isGroupId(conversationId), "pinned": isPinned, "limit": 5])
+        let state = PollPinState(json: ["ready": isGroup, "canPin": isGroup, "pinned": isPinned, "limit": 5])
         if (state.ready || polls.pins[id] == nil), polls.pins[id] != state { polls.pins[id] = state }
         return polls.pins[id] ?? state
     }
 
+    internal static func mapPollPinError(_ error: Error, partial: Bool = false) -> PollActionResult {
+        if partial {
+            return PollActionResult(ok: false, error: "partial")
+        }
+        if let err = error as? ZaloSessionError {
+            let msg = err.message.lowercased()
+            if err.code == 1005 || err.code == 1010 || err.code == 201
+                || msg.contains("limit") || msg.contains("max") || msg.contains("full")
+                || msg.contains("giới hạn") || msg.contains("tối đa") {
+                return PollActionResult(ok: false, error: "limit")
+            }
+            if err.code == 112 || err.code == 114 || err.code == 200 || err.code == 403
+                || msg.contains("permission") || msg.contains("forbidden") || msg.contains("admin")
+                || msg.contains("quyền") || msg.contains("not allowed") {
+                return PollActionResult(ok: false, error: "forbidden")
+            }
+            return PollActionResult(ok: false, error: nil)
+        }
+        if error is ZaloTransportError || error is URLError {
+            return PollActionResult(ok: false, error: "network")
+        }
+        return PollActionResult(ok: false, error: nil)
+    }
+
     func pinPoll(_ id: String, in conversationId: String, confirming ref: String? = nil) async -> PollPinOutcome {
-        .failed(PollActionResult(ok: false, error: "limit"))
+        guard ZaloWireParser.isGroupId(conversationId), !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .failed(PollActionResult(ok: false, error: "forbidden"))
+        }
+        let didUnpinOld: Bool
+        if let ref, !ref.isEmpty {
+            let boardCache = cachedBoardRawTopics[conversationId]
+            do {
+                try await sessionClient.unpinBoardTopic(
+                    convId: conversationId,
+                    topicId: ref,
+                    rawTopic: boardCache?.topics[ref].map { ZaloJSONBox($0) },
+                    boardVersion: boardCache?.version ?? 0
+                )
+            } catch {
+                return .failed(Self.mapPollPinError(error))
+            }
+            didUnpinOld = true
+        } else {
+            didUnpinOld = false
+        }
+
+        do {
+            _ = try await sessionClient.pinBoardItemAPI(groupId: conversationId, topicId: id, topicType: 3)
+            await refreshBoardPins(for: conversationId)
+            await refreshPollPin(id, in: conversationId)
+            return .done
+        } catch {
+            if didUnpinOld {
+                return .failed(Self.mapPollPinError(error, partial: true))
+            }
+            let mapped = Self.mapPollPinError(error)
+            if mapped.error == "limit" {
+                await refreshBoardPins(for: conversationId)
+                let items = pins[conversationId]?.items ?? []
+                if let oldest = items.last, oldest.ref != id {
+                    return .needsConfirmation(PollPinConfirm(
+                        ref: oldest.ref,
+                        limit: max(items.count, 5),
+                        kind: oldest.kind.rawValue,
+                        title: oldest.title
+                    ))
+                }
+            }
+            return .failed(mapped)
+        }
     }
 
     func unpinPoll(_ id: String, in conversationId: String) async -> PollActionResult {
@@ -536,6 +686,7 @@ extension ZaloEngine {
                 boardVersion: boardCache?.version ?? 0
             )
             await refreshBoardPins(for: conversationId)
+            await refreshPollPin(id, in: conversationId)
             return PollActionResult(ok: true)
         } catch {
             return PollActionResult(ok: false, error: "network")
@@ -588,7 +739,7 @@ extension ZaloEngine {
     func createPoll(in conversationId: String, draft: PollCreateDraft, config: PollConfig, canPin: Bool) async -> PollActionResult {
         do {
             let expiredMs = draft.hasDeadline ? Int64(draft.deadline.timeIntervalSince1970 * 1000) : 0
-            _ = try await sessionClient.createPollAPI(
+            let box = try await sessionClient.createPollAPI(
                 convId: conversationId,
                 question: String(draft.trimmedQuestion.prefix(config.maxQuestion)),
                 options: draft.filledOptions.map { String($0.prefix(config.maxOption)) },
@@ -598,7 +749,28 @@ extension ZaloEngine {
                 hideVotePreview: draft.hidePreview && config.enableHidePreview,
                 isAnonymous: draft.anonymous && config.enableAnonymous
             )
+            if draft.pin && canPin {
+                let dataNode = (box.dict["data"] as? [String: Any]) ?? box.dict
+                let createdPollId = JSONLossless.string(
+                    dataNode["poll_id"] ?? dataNode["pollId"] ?? dataNode["id"]
+                ).trimmingCharacters(in: .whitespacesAndNewlines)
+                if createdPollId.isEmpty {
+                    return PollActionResult(ok: true, pinSkipped: true)
+                }
+                let pinOutcome = await pinPoll(createdPollId, in: conversationId)
+                if case .done = pinOutcome {
+                    return PollActionResult(ok: true)
+                }
+                return PollActionResult(ok: true, pinSkipped: true)
+            }
             return PollActionResult(ok: true)
+        } catch let err as ZaloSessionError {
+            let msg = err.message.lowercased()
+            if err.code == 112 || err.code == 114 || err.code == 403
+                || msg.contains("permission") || msg.contains("forbidden") || msg.contains("quyền") {
+                return PollActionResult(ok: false, error: "forbidden")
+            }
+            return PollActionResult(ok: false, error: "network")
         } catch {
             return PollActionResult(ok: false, error: "network")
         }
