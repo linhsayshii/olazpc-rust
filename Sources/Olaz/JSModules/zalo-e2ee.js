@@ -465,6 +465,171 @@
             return { ok: false, error: String(err && err.message ? err.message : err) };
           }
         },
+
+        async hasSession(uid, remoteUid, deviceId) {
+          const st = pcStates.get(uid);
+          if (!st) return false;
+          try {
+            const addr = zaloAddr(remoteUid, deviceId);
+            const cipher = new signal.SessionCipher(st.store, addr, { logger });
+            return Boolean(await cipher.hasOpenSession());
+          } catch (_) {
+            return false;
+          }
+        },
+
+        async listSessions(uid, remoteUid) {
+          const st = pcStates.get(uid);
+          if (!st) return [];
+          const out = [];
+          for (const devId of [0, 1, 2, 3]) {
+            try {
+              const addr = zaloAddr(remoteUid, devId);
+              const cipher = new signal.SessionCipher(st.store, addr, { logger });
+              if (await cipher.hasOpenSession()) {
+                const regId = await cipher.getRemoteRegistrationId();
+                out.push({ deviceId: devId, registrationId: Number(regId || 0) });
+              }
+            } catch (_) {}
+          }
+          return out;
+        },
+
+        async processPreKeyBundle(uid, remoteUid, deviceId, bundleObj) {
+          const st = pcStates.get(uid);
+          if (!st) return { ok: false, error: 'not_initialized' };
+          if (!bundleObj || typeof bundleObj !== 'object') return { ok: false, error: 'invalid_bundle' };
+          try {
+            const toBuf = (val) => (typeof val === 'string' ? b64ToBuf(val) : toBytes(val).slice().buffer);
+            const src = (bundleObj.key && bundleObj.key.preKey) ? bundleObj.key : bundleObj;
+            let preKeyBundle;
+            if (src.preKey && src.preKey.iKey && src.preKey.spKey) {
+              const pk = src.preKey;
+              const op = src.opKey || (Array.isArray(src.opKeys) && src.opKeys.length > 0 ? src.opKeys[0] : null);
+              preKeyBundle = {
+                registrationId: Number(pk.iKey.id),
+                identityKey: toBuf(pk.iKey.key),
+                signedPreKey: {
+                  keyId: Number(pk.spKey.id),
+                  publicKey: toBuf(pk.spKey.key),
+                  signature: toBuf(pk.signature),
+                },
+                preKey: (op && op.key) ? {
+                  keyId: Number(op.id),
+                  publicKey: toBuf(op.key),
+                } : undefined,
+              };
+            } else if (src.identityKey && src.signedPreKey) {
+              preKeyBundle = {
+                registrationId: Number(src.registrationId),
+                identityKey: toBuf(src.identityKey),
+                signedPreKey: {
+                  keyId: Number(src.signedPreKey.keyId),
+                  publicKey: toBuf(src.signedPreKey.publicKey),
+                  signature: toBuf(src.signedPreKey.signature),
+                },
+                preKey: (src.preKey && src.preKey.publicKey) ? {
+                  keyId: Number(src.preKey.keyId),
+                  publicKey: toBuf(src.preKey.publicKey),
+                } : undefined,
+              };
+            } else {
+              return { ok: false, error: 'unrecognized_bundle_format' };
+            }
+
+            const addr = zaloAddr(remoteUid, deviceId);
+            const builder = new signal.SessionBuilder(st.store, addr, { logger });
+            try {
+              await builder.processPreKey(preKeyBundle);
+            } catch (err) {
+              if (err && String(err.message || err).includes('Identity key changed')) {
+                st.store.remove('identityKey' + addr.getName());
+                await builder.processPreKey(preKeyBundle);
+              } else {
+                throw err;
+              }
+            }
+            return {
+              ok: true,
+              registrationId: preKeyBundle.registrationId,
+              storeJSON: serializeState(st),
+            };
+          } catch (err) {
+            return { ok: false, error: String(err && err.message ? err.message : err) };
+          }
+        },
+
+        async encryptCipher(uid, remoteUid, deviceId, value, format) {
+          const st = pcStates.get(uid);
+          if (!st) return { ok: false, error: 'not_initialized' };
+          try {
+            const addr = zaloAddr(remoteUid, deviceId);
+            const cipher = new signal.SessionCipher(st.store, addr, { logger });
+            let plainBytes;
+            if (format === 'uint32') {
+              const num = Number(value) >>> 0;
+              plainBytes = new Uint8Array([
+                num & 0xff,
+                (num >>> 8) & 0xff,
+                (num >>> 16) & 0xff,
+                (num >>> 24) & 0xff,
+              ]);
+            } else {
+              plainBytes = utf8.encode(String(value));
+            }
+            const plainBuf = plainBytes.buffer.slice(plainBytes.byteOffset, plainBytes.byteOffset + plainBytes.byteLength);
+            const message = await cipher.encrypt(plainBuf);
+            const bodyStr = message.body || '';
+            const outBytes = new Uint8Array(1 + bodyStr.length);
+            outBytes[0] = Number(message.type) & 0xff;
+            for (let i = 0; i < bodyStr.length; i++) {
+              outBytes[i + 1] = bodyStr.charCodeAt(i) & 0xff;
+            }
+            return {
+              ok: true,
+              cipher: bufToB64(outBytes),
+              type: message.type,
+              registrationId: message.registrationId,
+            };
+          } catch (err) {
+            return { ok: false, error: String(err && err.message ? err.message : err) };
+          }
+        },
+
+        async encryptBatch(uid, targets, values, formats) {
+          const st = pcStates.get(uid);
+          if (!st) return { ok: false, error: 'not_initialized' };
+          const results = [];
+          const valList = Array.isArray(values) ? values : [];
+          const fmtList = Array.isArray(formats) ? formats : [];
+          for (const t of (Array.isArray(targets) ? targets : [])) {
+            if (!t || !t.userId || t.deviceId === undefined || t.deviceId === null) continue;
+            try {
+              const ciphers = [];
+              let regId = 0;
+              for (let i = 0; i < valList.length; i++) {
+                const fmt = fmtList[i] || 'string';
+                const enc = await this.encryptCipher(uid, t.userId, t.deviceId, valList[i], fmt);
+                if (!enc || !enc.ok) {
+                  throw new Error((enc && enc.error) || 'encrypt_failed');
+                }
+                ciphers.push(enc.cipher);
+                regId = Number(enc.registrationId || regId);
+              }
+              results.push({
+                userId: String(t.userId),
+                deviceId: Number(t.deviceId),
+                registrationId: regId,
+                ciphers,
+              });
+            } catch (_) {}
+          }
+          return {
+            ok: true,
+            results,
+            storeJSON: serializeState(st),
+          };
+        },
       };
     })(),
   };

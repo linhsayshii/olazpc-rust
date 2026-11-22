@@ -242,6 +242,9 @@ extension ZaloEngine {
 
     func typingStickerSuggestions(in conversationId: String, text: String) async -> [StickerEntry] {
         guard StickerSuggestState.shared.setting?.enabled != false else { return [] }
+        if !ZaloWireParser.isGroupId(conversationId), await e2eeManager.isE2EEConversation(conversationId) {
+            return []
+        }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let box = try? await sessionClient.suggestStickersAPI(keyword: trimmed) else { return [] }
         let mapped = box.array.map { normalizeStickerRow($0, fallbackCateId: 0) }
@@ -250,7 +253,65 @@ extension ZaloEngine {
 
     func sendSticker(_ sticker: StickerEntry, in conversationId: String, source: StickerSource, typed: String? = nil, index: Int = -1) async -> CardActionOutcome {
         do {
-            let res = try await sessionClient.sendStickerAPI(convId: conversationId, cateId: sticker.cateId, stickerId: sticker.stickerId)
+            var isE2EE = false
+            if !ZaloWireParser.isGroupId(conversationId) {
+                isE2EE = await e2eeManager.isE2EEConversation(conversationId)
+            }
+            let res: SendMessageResult
+            if isE2EE {
+                let myUid = profile?.userId ?? ""
+                guard !myUid.isEmpty,
+                      await e2eeManager.ensureSessions(forPeer: conversationId, myUid: myUid, webSocket: webSocket, store: sqliteStore) else {
+                    EngineLog.shared.write("sendSticker e2ee failed: no open Signal session for peer=\(conversationId)")
+                    return .failed("Không gửi được sticker mã hóa đầu cuối.")
+                }
+                let encryptedDevices = await e2eeManager.encryptStickerMessage(
+                    peerUid: conversationId,
+                    myUid: myUid,
+                    stickerId: sticker.stickerId,
+                    cateId: sticker.cateId,
+                    stickerType: 7,
+                    store: sqliteStore
+                )
+                guard !encryptedDevices.isEmpty else {
+                    EngineLog.shared.write("sendSticker e2ee failed: encryption produced no peer payloads for peer=\(conversationId)")
+                    return .failed("Không gửi được sticker mã hóa đầu cuối.")
+                }
+                let senderIid = await e2eeManager.localRegistrationId()
+                let imei = await sessionClient.imei
+                let cliInt = await sessionClient.nextClientId()
+                let listParams: [[String: Any]] = encryptedDevices.compactMap { dev in
+                    guard dev.ciphers.count >= 3 else { return nil }
+                    let extra: [String: Any] = [
+                        "stickerId": dev.ciphers[0],
+                        "cateId": dev.ciphers[1],
+                        "type": dev.ciphers[2],
+                        "zsource": 101,
+                    ]
+                    return ZaloSessionClient.buildE2EEListParamEntry(
+                        toId: dev.toId,
+                        platform: dev.platform,
+                        clientId: cliInt,
+                        imei: imei,
+                        registrationId: dev.registrationId,
+                        senderIid: senderIid,
+                        extraFields: extra
+                    )
+                }
+                guard !listParams.isEmpty else {
+                    EngineLog.shared.write("sendSticker e2ee failed: empty listParams for peer=\(conversationId)")
+                    return .failed("Không gửi được sticker mã hóa đầu cuối.")
+                }
+                res = try await sessionClient.sendE2EEMessageAPI(
+                    endpoint: "sticker",
+                    threadId: conversationId,
+                    isGroup: false,
+                    clientId: cliInt,
+                    listParams: ZaloJSONArrayBox(listParams)
+                )
+            } else {
+                res = try await sessionClient.sendStickerAPI(convId: conversationId, cateId: sticker.cateId, stickerId: sticker.stickerId)
+            }
             let msg = ChatMessage(
                 id: res.msgId,
                 conversationId: conversationId,
@@ -264,7 +325,7 @@ extension ZaloEngine {
                 status: .sent,
                 quote: nil,
                 reactions: [],
-                isE2EE: false,
+                isE2EE: isE2EE,
                 mentions: [],
                 cardButtons: [],
                 suggestsStickers: false,
@@ -278,6 +339,7 @@ extension ZaloEngine {
             await saveRecentSticker(sticker)
             return .done
         } catch {
+            EngineLog.shared.write("sendSticker failed: \(error.localizedDescription)")
             return .failed("Không gửi được sticker. Hãy thử lại.")
         }
     }

@@ -912,6 +912,112 @@ extension ZaloSessionClient {
         )
     }
 
+    static func buildE2EEExtJSON(
+        registrationId: Int,
+        senderRegistrationId: Int,
+        version: Int = 1,
+        compatVersion: Int = 1
+    ) -> String {
+        let obj: [String: Any] = [
+            "version": version,
+            "compat_version": compatVersion,
+            "iid": registrationId,
+            "sender_iid": senderRegistrationId,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]),
+              let str = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return str
+    }
+
+    static func buildE2EEListParamEntry(
+        toId: String,
+        platform: Int,
+        clientId: Int64,
+        imei: String,
+        registrationId: Int,
+        senderIid: Int,
+        ttl: Int = 0,
+        useLegacyE2EEKey: Bool = false,
+        extraFields: [String: Any] = [:]
+    ) -> [String: Any] {
+        let extJSON = buildE2EEExtJSON(
+            registrationId: registrationId,
+            senderRegistrationId: senderIid
+        )
+        var entry: [String: Any] = [
+            "toId": ZaloWireParser.stripUserPrefix(toId),
+            "platform": platform,
+            "clientId": clientId,
+            "imei": imei,
+            "ttl": ttl,
+            useLegacyE2EEKey ? "e2ee" : "e2eeExt": extJSON,
+        ]
+        for (k, v) in extraFields {
+            entry[k] = v
+        }
+        return entry
+    }
+
+    static func buildE2EEMessageRequestPayload(
+        endpoint: String,
+        threadId: String,
+        isGroup: Bool,
+        clientId: Int64,
+        listParams: [[String: Any]],
+        destType: Int = 3
+    ) -> (service: String, path: String, payload: [String: Any]) {
+        let cleanId = isGroup ? ZaloWireParser.cleanGroupId(threadId) : ZaloWireParser.stripUserPrefix(threadId)
+        if isGroup {
+            var payload = listParams.first ?? [:]
+            payload["clientId"] = clientId
+            return ("group_e2e", "/api/e2ee/pc/group/\(endpoint)", payload)
+        }
+        let listStr = (try? JSONSerialization.data(withJSONObject: listParams, options: [.sortedKeys]))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        let payload: [String: Any] = [
+            "listParams": listStr,
+            "destType": destType,
+            "threadId": cleanId,
+            "clientId": clientId,
+        ]
+        return ("chat_e2e", "/api/e2ee/pc/message/\(endpoint)", payload)
+    }
+
+    func sendE2EEMessageAPI(
+        endpoint: String,
+        threadId: String,
+        isGroup: Bool,
+        clientId: Int64,
+        listParams: ZaloJSONArrayBox,
+        destType: Int = 3
+    ) async throws -> SendMessageResult {
+        let spec = Self.buildE2EEMessageRequestPayload(
+            endpoint: endpoint,
+            threadId: threadId,
+            isGroup: isGroup,
+            clientId: clientId,
+            listParams: listParams.array,
+            destType: destType
+        )
+        let resp = try await post(
+            service: spec.service,
+            path: spec.path,
+            encryptedPayload: spec.payload
+        )
+        let d = resp["data"] as? [String: Any] ?? [:]
+        let nested = d["data"] as? [String: Any]
+        let serverMsgId = JSONLossless.string(d["msgId"] ?? nested?["msgId"])
+        let cliStr = "\(clientId)"
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        return SendMessageResult(
+            msgId: serverMsgId.isEmpty ? cliStr : serverMsgId,
+            cliMsgId: cliStr,
+            tsMs: nowMs
+        )
+    }
+
     func sendTypingAPI(convId: String) async {
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)

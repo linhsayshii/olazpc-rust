@@ -471,6 +471,7 @@ final class ZaloEngine {
         if let repairedCount = try? await store.repairUndecryptedE2EEMessages(), repairedCount > 0 {
             EngineLog.shared.write("e2ee: repaired \(repairedCount) legacy ciphertext rows")
         }
+        await e2eeManager.loadPersistedThreads(store: store)
         if let myUid = profile?.userId, !myUid.isEmpty {
             let mgr = e2eeManager
             Task.detached(priority: .utility) {
@@ -895,10 +896,17 @@ final class ZaloEngine {
         var unreadDeltaByConv: [String: Int] = [:]
         var latestByConv: [String: ChatMessage] = [:]
         var incomingForNotice: [ChatMessage] = []
+        var markedE2EEInBatch: Set<String> = []
 
         for ev in events {
             switch ev {
             case .message(let msg, let stored):
+                if msg.isE2EE,
+                   !ZaloWireParser.isGroupId(msg.conversationId),
+                   msg.conversationId != selfConversationId,
+                   markedE2EEInBatch.insert(msg.conversationId).inserted {
+                    await e2eeManager.markE2EEConversation(msg.conversationId, enabled: true, store: sqliteStore)
+                }
                 let isLockedE2EE = (stored.status == "e2ee_locked")
                 if isLockedE2EE,
                    let memList = messages[msg.conversationId],
@@ -1072,20 +1080,31 @@ final class ZaloEngine {
         wsTask = Task { [weak self] in
             guard let self else { return }
             let stream = await self.webSocket.start(endpoints: endpoints, zpwSek: zpwSek)
-            Task { [weak self] in
+            let authWatchTask = Task { [weak self] in
                 guard let self else { return }
-                let deadline = Date().addingTimeInterval(12)
-                while !(await self.webSocket.isAuthed) && Date() < deadline && !Task.isCancelled {
-                    try? await Task.sleep(for: .milliseconds(250))
-                }
-                if await self.webSocket.isAuthed, let uid = self.profile?.userId, !uid.isEmpty {
-                    await self.e2eeManager.syncBundleWithServerIfNeeded(
-                        uid: uid,
-                        webSocket: self.webSocket,
-                        store: self.sqliteStore
-                    )
+                var wasAuthed = false
+                while !Task.isCancelled {
+                    let nowAuthed = await self.webSocket.isAuthed
+                    if wasAuthed && !nowAuthed {
+                        await self.e2eeManager.markDisconnected()
+                    }
+                    if !wasAuthed && nowAuthed, let uid = self.profile?.userId, !uid.isEmpty {
+                        await self.e2eeManager.syncBundleWithServerIfNeeded(
+                            uid: uid,
+                            webSocket: self.webSocket,
+                            store: self.sqliteStore
+                        )
+                        await self.e2eeManager.fetchE2EEPeerList(
+                            webSocket: self.webSocket,
+                            store: self.sqliteStore,
+                            myUid: uid
+                        )
+                    }
+                    wasAuthed = nowAuthed
+                    try? await Task.sleep(for: .milliseconds(nowAuthed ? 500 : 250))
                 }
             }
+            defer { authWatchTask.cancel() }
             for await event in stream {
                 if Task.isCancelled { break }
                 await self.handleWSEvent(event)
@@ -1099,6 +1118,10 @@ final class ZaloEngine {
         // Duplicate login / kicked check
         if let errorCode = JSONLossless.int64(payload["error_code"]), errorCode == 600 || errorCode == -102 {
             handleSessionExpiredNotice("Tài khoản đã đăng xuất hoặc đăng nhập trên thiết bị khác.")
+            return
+        }
+
+        if event.cmd == ZaloWebSocket.cmdAuthen {
             return
         }
 

@@ -208,6 +208,24 @@ actor ZaloWebSocket {
         }
     }
 
+    /// Encodes a `requestAsyncV2`-compatible binary frame (`{"data": innerData, "reqId": reqId}`).
+    static func encodeRequestFrame(
+        cmd: UInt16,
+        subCmd: UInt8 = 0,
+        version: UInt8 = 1,
+        reqId: String,
+        innerData: [String: Any]
+    ) -> Data? {
+        let bodyDict: [String: Any] = [
+            "data": innerData,
+            "reqId": reqId,
+        ]
+        guard let payloadJSON = try? JSONSerialization.data(withJSONObject: bodyDict, options: []) else {
+            return nil
+        }
+        return encodeFrame(cmd: cmd, subCmd: subCmd, version: version, payloadJSON: payloadJSON)
+    }
+
     /// Sends a `requestAsyncV2`-compatible request frame (`{"data": ..., "reqId": "req_..."}`) and awaits its response.
     func sendRequestFrame(
         cmd: UInt16,
@@ -219,14 +237,15 @@ actor ZaloWebSocket {
     ) async -> ZaloJSONBox? {
         guard authed, let task else { return nil }
         let reqId = explicitReqId ?? nextReqId()
-        let bodyDict: [String: Any] = [
-            "data": innerData.dict,
-            "reqId": reqId,
-        ]
-        guard let payloadJSON = try? JSONSerialization.data(withJSONObject: bodyDict, options: []) else {
+        guard let frame = Self.encodeRequestFrame(
+            cmd: cmd,
+            subCmd: subCmd,
+            version: version,
+            reqId: reqId,
+            innerData: innerData.dict
+        ) else {
             return nil
         }
-        let frame = Self.encodeFrame(cmd: cmd, subCmd: subCmd, version: version, payloadJSON: payloadJSON)
 
         return await withCheckedContinuation { continuation in
             requestWaiters[reqId] = continuation

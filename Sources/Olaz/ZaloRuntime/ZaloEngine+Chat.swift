@@ -241,10 +241,15 @@ extension ZaloEngine {
         guard !trimmed.isEmpty, !id.isEmpty else { return false }
 
         let quote = quoteId.flatMap { qid in messages[id]?.first(where: { $0.id == qid }) }
-        let cliId = "\(await sessionClient.nextClientId())"
+        let cliInt = await sessionClient.nextClientId()
+        let cliId = "\(cliInt)"
         let myUid = profile?.userId ?? ""
         let myName = profile?.displayName ?? "Bạn"
         let quoteBlock = quote.map { ChatMessage.Quote(senderName: $0.isMine ? "Bạn" : $0.senderName, text: $0.text.isEmpty ? "[Tin nhắn]" : $0.text) }
+        var isE2EE = false
+        if !ZaloWireParser.isGroupId(id) {
+            isE2EE = await e2eeManager.isE2EEConversation(id)
+        }
 
         var optimistic = ChatMessage(
             id: cliId,
@@ -259,7 +264,7 @@ extension ZaloEngine {
             status: .sending,
             quote: quoteBlock,
             reactions: [],
-            isE2EE: false,
+            isE2EE: isE2EE,
             mentions: mentions,
             cardButtons: [],
             suggestsStickers: false,
@@ -267,19 +272,100 @@ extension ZaloEngine {
         )
         mergeMessageIntoMemory(optimistic)
 
+        func removeOptimistic() {
+            if var list = messages[id] {
+                list.removeAll { $0.id == cliId }
+                messages[id] = list
+            }
+        }
+
         do {
             let quoteTsMs = quote.map { Int64(($0.date.timeIntervalSince1970 * 1000).rounded()) }
-            let res = try await sessionClient.sendTextAPI(
-                convId: id,
-                text: text,
-                cliMsgId: cliId,
-                quoteMsgId: quote?.id,
-                quoteCliMsgId: quote?.id,
-                quoteOwnerId: quote?.senderId,
-                quoteText: quote?.text,
-                quoteTsMs: quoteTsMs,
-                mentions: mentions
-            )
+            let res: SendMessageResult
+            if isE2EE {
+                guard !myUid.isEmpty else {
+                    EngineLog.shared.write("sendText e2ee failed: missing local uid")
+                    removeOptimistic()
+                    return false
+                }
+                let ready = await e2eeManager.ensureSessions(
+                    forPeer: id,
+                    myUid: myUid,
+                    webSocket: webSocket,
+                    store: sqliteStore
+                )
+                guard ready else {
+                    EngineLog.shared.write("sendText e2ee failed: no open Signal session for peer=\(id)")
+                    removeOptimistic()
+                    return false
+                }
+
+                let qMsgInt = quote.flatMap { Int64($0.id.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                let hasValidQuote = (quote != nil && qMsgInt != nil && qMsgInt != 0)
+                let quotePlain = hasValidQuote ? (quote!.text.isEmpty ? "[Tin nhắn]" : quote!.text) : nil
+                let encryptedDevices = await e2eeManager.encryptTextMessage(
+                    peerUid: id,
+                    myUid: myUid,
+                    text: text,
+                    quoteText: quotePlain,
+                    store: sqliteStore
+                )
+                guard !encryptedDevices.isEmpty else {
+                    EngineLog.shared.write("sendText e2ee failed: encryption produced no peer payloads for peer=\(id)")
+                    removeOptimistic()
+                    return false
+                }
+
+                let senderIid = await e2eeManager.localRegistrationId()
+                let imei = await sessionClient.imei
+                let listParams: [[String: Any]] = encryptedDevices.compactMap { dev in
+                    guard let msgCipher = dev.ciphers.first else { return nil }
+                    var extra: [String: Any] = ["message": msgCipher]
+                    if hasValidQuote, let qMsgInt, let quote {
+                        let rawOwner = quote.senderId.isEmpty ? myUid : quote.senderId
+                        extra["qmsgOwner"] = ZaloWireParser.stripUserPrefix(rawOwner)
+                        extra["qmsgId"] = qMsgInt
+                        extra["qmsgCliId"] = qMsgInt
+                        extra["qmsgType"] = 1
+                        extra["qmsg"] = dev.ciphers.count > 1 ? dev.ciphers[1] : ""
+                        extra["qmsgTs"] = quoteTsMs ?? Int64(Date().timeIntervalSince1970 * 1000)
+                        extra["zsource"] = 101
+                    }
+                    return ZaloSessionClient.buildE2EEListParamEntry(
+                        toId: dev.toId,
+                        platform: dev.platform,
+                        clientId: cliInt,
+                        imei: imei,
+                        registrationId: dev.registrationId,
+                        senderIid: senderIid,
+                        extraFields: extra
+                    )
+                }
+                guard !listParams.isEmpty else {
+                    EngineLog.shared.write("sendText e2ee failed: empty listParams for peer=\(id)")
+                    removeOptimistic()
+                    return false
+                }
+                res = try await sessionClient.sendE2EEMessageAPI(
+                    endpoint: hasValidQuote ? "quote" : "sms",
+                    threadId: id,
+                    isGroup: false,
+                    clientId: cliInt,
+                    listParams: ZaloJSONArrayBox(listParams)
+                )
+            } else {
+                res = try await sessionClient.sendTextAPI(
+                    convId: id,
+                    text: text,
+                    cliMsgId: cliId,
+                    quoteMsgId: quote?.id,
+                    quoteCliMsgId: quote?.id,
+                    quoteOwnerId: quote?.senderId,
+                    quoteText: quote?.text,
+                    quoteTsMs: quoteTsMs,
+                    mentions: mentions
+                )
+            }
             // Replace temporary client id with server msgId while avoiding duplicates.
             if var list = messages[id] {
                 list.removeAll { $0.id == cliId || $0.id == res.msgId }
@@ -296,10 +382,7 @@ extension ZaloEngine {
             return true
         } catch {
             EngineLog.shared.write("sendText failed: \(error.localizedDescription)")
-            if var list = messages[id] {
-                list.removeAll { $0.id == cliId }
-                messages[id] = list
-            }
+            removeOptimistic()
             return false
         }
     }

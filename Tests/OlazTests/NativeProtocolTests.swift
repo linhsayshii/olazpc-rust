@@ -1846,3 +1846,282 @@ private final class MockProfileURLProtocol: URLProtocol, @unchecked Sendable {
         engine.cancelTransfer()
     }
 }
+
+@Suite struct OutgoingE2EEProtocolTests {
+    @Test func e2eeInnerDataBuildersHaveNoNestedDataWrapperAndWSOuterEnvelope() throws {
+        let getKeyId = ZaloE2EEManager.buildGetKeyIdInnerData()
+        #expect(getKeyId["platformType"] as? Int == 2)
+        #expect(getKeyId["data"] == nil)
+
+        let submitBundle = ZaloE2EEManager.buildSubmitBundleInnerData(bundlePayload: [
+            "delSS": 0,
+            "key": ["deviceId": 2],
+        ])
+        #expect(submitBundle["delSS"] as? Int == 0)
+        #expect((submitBundle["key"] as? [String: Any])?["deviceId"] as? Int == 2)
+        #expect(submitBundle["data"] == nil)
+
+        let submitPreKeys = ZaloE2EEManager.buildSubmitPreKeysInnerData(
+            registrationId: 12345,
+            opKeys: [["id": 1, "key": "pub"]]
+        )
+        #expect(submitPreKeys["deviceId"] as? Int == 2)
+        #expect(submitPreKeys["id"] as? Int == 12345)
+        #expect((submitPreKeys["opKeys"] as? [[String: Any]])?.count == 1)
+        #expect(submitPreKeys["data"] == nil)
+
+        let ackInit = ZaloE2EEManager.buildAckInitSessionInnerData(uidTo: "222", deviceId: 0, ts: 1700000000000)
+        #expect(ackInit["type"] as? Int == 0)
+        #expect(ackInit["uidTo"] as? String == "222")
+        #expect((ackInit["data"] as? [[String: Any]])?.count == 1)
+
+        let doneProc = ZaloE2EEManager.buildDoneProcessSessionInnerData(info: [["gid": "10", "cmd": 543]])
+        #expect(doneProc["queueName"] as? String == "")
+        #expect((doneProc["info"] as? [[String: Any]])?.count == 1)
+        #expect(doneProc["data"] == nil)
+
+        let peerList = ZaloE2EEManager.buildGetListUserE2EEInnerData()
+        #expect(peerList["reqIid"] as? Int == 1)
+        #expect(peerList["data"] == nil)
+
+        let getBundleBoth = ZaloE2EEManager.buildGetBundleInnerData(peerUid: "222", myUid: "111")
+        let uidsBoth = try #require(getBundleBoth["uids"] as? [[String: Any]])
+        #expect(uidsBoth.count == 2)
+        #expect(uidsBoth[0]["uid"] as? String == "222" && uidsBoth[0]["deviceId"] as? Int == -1)
+        #expect(uidsBoth[1]["uid"] as? String == "111" && uidsBoth[1]["deviceId"] as? Int == -1)
+        #expect(getBundleBoth["isReInit"] as? Int == 0)
+        #expect(getBundleBoth["msgInfoNoti"] as? Int == 0)
+        #expect(getBundleBoth["isAutoUpgrade"] as? Int == 0)
+        #expect(getBundleBoth["data"] == nil)
+
+        let getBundleSingle = ZaloE2EEManager.buildGetBundleInnerData(peerUid: "222", myUid: nil)
+        let uidsSingle = try #require(getBundleSingle["uids"] as? [[String: Any]])
+        #expect(uidsSingle.count == 1)
+
+        // Verify `ZaloWebSocket.encodeRequestFrame` wraps `innerData` exactly once (`{"data": ..., "reqId": ...}`).
+        let frame = try #require(ZaloWebSocket.encodeRequestFrame(
+            cmd: ZaloE2EEManager.cmdSubmitBundle,
+            subCmd: 0,
+            version: 1,
+            reqId: "req_540",
+            innerData: submitBundle
+        ))
+        let decoded = try #require(ZaloWebSocket.decodeFrame(frame))
+        #expect(decoded.cmd == ZaloE2EEManager.cmdSubmitBundle)
+        #expect(decoded.envelope["reqId"] as? String == "req_540")
+        let outerData = try #require(decoded.envelope["data"] as? [String: Any])
+        #expect(outerData["delSS"] as? Int == 0)
+        #expect(outerData["data"] == nil)
+    }
+
+    @Test func e2eePeerListBundleParsingAndSQLitePersistence() async throws {
+        let peerListResp: [String: Any] = [
+            "error_code": 0,
+            "data": [
+                "data": [
+                    "threads": [
+                        ["uid": "111", "devices": [["di": 0, "iid": 9001]]],
+                        ["uid": "222", "devices": [["di": 0, "iid": 3001], ["di": 2, "iid": 3002]]],
+                    ],
+                    "hasMore": 0,
+                ]
+            ]
+        ]
+        let parsedList = ZaloE2EEManager.parseE2EEPeerListResponse(peerListResp, myUid: "111")
+        #expect(parsedList.threads == Set(["222"]))
+        #expect(parsedList.devices["111"] == nil)
+        #expect(parsedList.devices["222"]?.count == 2)
+        #expect(parsedList.devices["222"]?[0].deviceId == 0 && parsedList.devices["222"]?[0].sessionKey == 3001)
+        #expect(parsedList.devices["222"]?[1].deviceId == 2 && parsedList.devices["222"]?[1].sessionKey == 3002)
+        #expect(parsedList.nextReqIid == nil)
+
+        let bundleResp: [String: Any] = [
+            "data": [
+                "data": [
+                    "keys": [
+                        [
+                            "uid": "222",
+                            "keys": [
+                                ["deviceId": 0, "preKey": ["iKey": ["id": 3001, "key": "k0"], "signature": "sig", "spKey": ["id": 1, "key": "sp0"]]],
+                            ],
+                        ]
+                    ]
+                ]
+            ]
+        ]
+        let bundles = ZaloE2EEManager.parseGetBundleResponse(bundleResp)
+        #expect(bundles.count == 1)
+        #expect(bundles[0].uid == "222")
+        #expect(bundles[0].devices.count == 1)
+
+        // Verify `e2eeThreadsV1` persistence in SQLite across manager instances.
+        let store = try ZaloSQLiteStore(path: ":memory:")
+        let mgr1 = ZaloE2EEManager()
+        await mgr1.markE2EEConversation("222", enabled: true, store: store)
+        await mgr1.markE2EEConversation("g999", enabled: true, store: store)
+        #expect(await mgr1.isE2EEConversation("222"))
+        #expect(!(await mgr1.isE2EEConversation("g999")))
+
+        let persisted = try await store.getPreferenceStrings(key: ZaloE2EEManager.e2eeThreadsPrefKey)
+        #expect(persisted == ["222"])
+
+        let mgr2 = ZaloE2EEManager()
+        await mgr2.loadPersistedThreads(store: store)
+        #expect(await mgr2.isE2EEConversation("222"))
+        #expect(!(await mgr2.isE2EEConversation("g999")))
+    }
+
+    @Test func e2eeDomainsListParamEntryAndAPIServiceMockSend() async throws {
+        var domains = ZaloDomains()
+        #expect(domains.candidates(for: "chat_e2e") == domains.candidates(for: "chat"))
+        #expect(domains.candidates(for: "group_e2e") == domains.candidates(for: "group"))
+
+        domains.applyServerInfo([
+            "zpw_service_map_v3": [
+                "chat_e2e": ["https://custom-e2e.zaloapp.com"],
+                "group_e2e": ["https://custom-ge2e.zaloapp.com"],
+            ]
+        ])
+        #expect(domains.candidates(for: "chat_e2e").first == "https://custom-e2e.zaloapp.com")
+        #expect(domains.candidates(for: "group_e2e").first == "https://custom-ge2e.zaloapp.com")
+
+        let entry = ZaloSessionClient.buildE2EEListParamEntry(
+            toId: "222",
+            platform: 0,
+            clientId: 1_795_000_000_123,
+            imei: "IMEI_TEST",
+            registrationId: 3001,
+            senderIid: 9002,
+            extraFields: ["message": "AzM_CIPHER"]
+        )
+        #expect(entry["toId"] as? String == "222")
+        #expect(entry["platform"] as? Int == 0)
+        #expect(entry["clientId"] as? Int64 == 1_795_000_000_123)
+        #expect(entry["imei"] as? String == "IMEI_TEST")
+        #expect(entry["ttl"] as? Int == 0)
+        #expect(entry["message"] as? String == "AzM_CIPHER")
+
+        let extStr = try #require(entry["e2eeExt"] as? String)
+        let extObj = try #require(JSONLossless.parseObject(Data(extStr.utf8)))
+        #expect(JSONLossless.int64(extObj["version"]) == 1)
+        #expect(JSONLossless.int64(extObj["compat_version"]) == 1)
+        #expect(JSONLossless.int64(extObj["iid"]) == 3001)
+        #expect(JSONLossless.int64(extObj["sender_iid"]) == 9002)
+
+        let oneOneSpec = ZaloSessionClient.buildE2EEMessageRequestPayload(
+            endpoint: "sms",
+            threadId: "222",
+            isGroup: false,
+            clientId: 1_795_000_000_123,
+            listParams: [entry]
+        )
+        #expect(oneOneSpec.service == "chat_e2e")
+        #expect(oneOneSpec.path == "/api/e2ee/pc/message/sms")
+        #expect(oneOneSpec.payload["destType"] as? Int == 3)
+        #expect(oneOneSpec.payload["threadId"] as? String == "222")
+        #expect(oneOneSpec.payload["clientId"] as? Int64 == 1_795_000_000_123)
+        let listParamsStr = try #require(oneOneSpec.payload["listParams"] as? String)
+        let decodedList = try #require(JSONLossless.parseAny(Data(listParamsStr.utf8)) as? [[String: Any]])
+        #expect(decodedList.count == 1)
+        #expect(decodedList[0]["message"] as? String == "AzM_CIPHER")
+
+        let grpSpec = ZaloSessionClient.buildE2EEMessageRequestPayload(
+            endpoint: "sms",
+            threadId: "g777",
+            isGroup: true,
+            clientId: 1_795_000_000_123,
+            listParams: [entry]
+        )
+        #expect(grpSpec.service == "group_e2e")
+        #expect(grpSpec.path == "/api/e2ee/pc/group/sms")
+        #expect(grpSpec.payload["clientId"] as? Int64 == 1_795_000_000_123)
+
+        // End-to-end mock HTTP verification of `sendE2EEMessageAPI`
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-e2ee-http-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let host = "mock-e2ee-\(UUID().uuidString.lowercased()).invalid"
+        let key = Data("0123456789abcdef".utf8)
+        let captured = OSAllocatedUnfairLock<(path: String, payload: ZaloJSONBox)?>(initialState: nil)
+
+        MockProfileURLProtocol.handlers.withLock { handlers in
+            handlers[host] = { req, bodyData in
+                let path = req.url?.path ?? ""
+                let bodyStr = String(decoding: bodyData, as: UTF8.self)
+                var decodedObj: [String: Any] = [:]
+                if let paramsPart = bodyStr.split(separator: "&").first(where: { $0.hasPrefix("params=") }) {
+                    let encoded = String(paramsPart.dropFirst("params=".count))
+                    let decodedB64 = encoded.removingPercentEncoding ?? encoded
+                    if let plain = try? ZaloCrypto.decodeAES(key: key, base64: decodedB64),
+                       let obj = JSONLossless.parseObject(Data(plain.utf8)) {
+                        decodedObj = obj
+                    }
+                }
+                let box = ZaloJSONBox(decodedObj)
+                captured.withLock { $0 = (path: path, payload: box) }
+                return (200, ["error_code": 0, "data": ["msgId": "8800112233"]])
+            }
+        }
+        defer { _ = MockProfileURLProtocol.handlers.withLock { $0.removeValue(forKey: host) } }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockProfileURLProtocol.self]
+        let client = ZaloSessionClient(dataDirectory: root, useKeychain: false, urlSession: URLSession(configuration: config))
+        var mockDomains = ZaloDomains()
+        mockDomains.serviceCandidates["chat_e2e"] = ["https://\(host)"]
+        var account = ZaloLoginAccount()
+        account.userId = "100"
+        await client.updateCredentials(account: account, secretKey: key, zpwSek: "sek.1.2", domains: mockDomains)
+
+        let sendRes = try await client.sendE2EEMessageAPI(
+            endpoint: "sms",
+            threadId: "222",
+            isGroup: false,
+            clientId: 1_795_000_000_123,
+            listParams: ZaloJSONArrayBox([entry])
+        )
+        #expect(sendRes.msgId == "8800112233")
+        let reqInfo = try #require(captured.withLock { $0 })
+        #expect(reqInfo.path == "/api/e2ee/pc/message/sms")
+        #expect(JSONLossless.int64(reqInfo.payload.dict["destType"]) == 3)
+        #expect(JSONLossless.string(reqInfo.payload.dict["threadId"]) == "222")
+        #expect(JSONLossless.int64(reqInfo.payload.dict["clientId"]) == 1_795_000_000_123)
+        let sentListRaw = try #require((reqInfo.payload.dict["listParams"] as? String)?.data(using: .utf8))
+        let sentList = try #require(JSONLossless.parseAny(sentListRaw) as? [[String: Any]])
+        #expect(sentList.count == 1)
+        #expect(sentList[0]["e2eeExt"] as? String == extStr)
+    }
+
+    @MainActor
+    @Test func engineSendTextAndStickerE2EEFailsCleanlyWithoutSession() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-e2ee-fail-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let engine = ZaloEngine(dataDirectory: root, useKeychain: false)
+        let store = try ZaloSQLiteStore(path: root.appendingPathComponent("history.sqlite3").path)
+        engine.sqliteStore = store
+
+        await engine.e2eeManager.markE2EEConversation("999", enabled: true, store: store)
+        #expect(await engine.e2eeManager.isE2EEConversation("999"))
+
+        let sent = await engine.sendText("Tin nhắn mật", to: "999")
+        #expect(sent == false)
+        #expect((engine.messages["999"] ?? []).isEmpty)
+        #expect((try await store.messages(convId: "999", limit: 10)).isEmpty)
+
+        let stickerOutcome = await engine.sendSticker(
+            StickerEntry(cateId: 0, stickerId: 3, url: URL(string: "https://stc-chat.zdn.vn/images/stickers/default/thumb/3.png")!),
+            in: "999",
+            source: .category
+        )
+        if case .failed = stickerOutcome {} else {
+            Issue.record("Expected E2EE sticker send without session to fail cleanly")
+        }
+        #expect((try await store.messages(convId: "999", limit: 10)).isEmpty)
+
+        let suggestions = await engine.typingStickerSuggestions(in: "999", text: "haha")
+        #expect(suggestions.isEmpty)
+    }
+}
