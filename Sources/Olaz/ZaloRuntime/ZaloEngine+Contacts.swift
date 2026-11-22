@@ -208,6 +208,7 @@ extension ZaloEngine {
         ensureKnownContactsInConversations()
         rebuildConversationFlags()
         rebuildConversationExtras()
+        refreshReactionNames()
     }
 
     func acceptFriendRequest(_ id: String) {

@@ -138,7 +138,7 @@ struct ChatComposer: View {
                 }
             }.padding(24).frame(minWidth: 360)
         }
-        .fileImporter(isPresented: $importing, allowedContentTypes: importKind == .media ? [.image, .movie] : [.data],
+        .fileImporter(isPresented: $importing, allowedContentTypes: importKind == .media ? [.image, .movie] : [.item],
                       allowsMultipleSelection: true) { result in
             guard case .success(let urls) = result, !urls.isEmpty else { return }
             sendAttachments(urls, as: importKind)

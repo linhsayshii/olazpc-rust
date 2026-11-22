@@ -164,6 +164,46 @@ enum ZaloCrypto {
         return Data(trimmed.utf8)
     }
 
+    static func decodeCloudKey(_ base64Key: String) throws -> Data {
+        let trimmed = base64Key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let key = Data(base64Encoded: trimmed, options: .ignoreUnknownCharacters) else {
+            throw ZaloCryptoError.invalidBase64
+        }
+        guard key.count == 16 || key.count == 32 else {
+            throw ZaloCryptoError.invalidKeyLength(key.count)
+        }
+        return key
+    }
+
+    /// Encrypts zCloud payloads using AES-CBC (PKCS#7) with a random 16-byte IV prepended (`IV || ciphertext`).
+    static func encodeCloudAES(base64Key: String, plaintext: String) throws -> String {
+        let key = try decodeCloudKey(base64Key)
+        var ivBytes = [UInt8](repeating: 0, count: kCCBlockSizeAES128)
+        let status = SecRandomCopyBytes(kSecRandomDefault, ivBytes.count, &ivBytes)
+        guard status == errSecSuccess else {
+            throw ZaloCryptoError.cipherFailed(status)
+        }
+        let iv = Data(ivBytes)
+        let cipher = try aesCBCCrypt(Data(plaintext.utf8), key: key, iv: iv, encrypt: true)
+        return (iv + cipher).base64EncodedString()
+    }
+
+    /// Decrypts zCloud AES-CBC Base64 payloads where the first 16 bytes are the random IV.
+    static func decodeCloudAES(base64Key: String, base64Cipher: String) throws -> String {
+        let key = try decodeCloudKey(base64Key)
+        let trimmed = base64Cipher.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let raw = Data(base64Encoded: trimmed, options: .ignoreUnknownCharacters) else {
+            throw ZaloCryptoError.invalidBase64
+        }
+        guard raw.count > kCCBlockSizeAES128 else {
+            throw ZaloCryptoError.invalidPadding
+        }
+        let iv = Data(raw.prefix(kCCBlockSizeAES128))
+        let cipher = Data(raw.dropFirst(kCCBlockSizeAES128))
+        let plain = try aesCBCCrypt(cipher, key: key, iv: iv, encrypt: false)
+        return String(decoding: plain, as: UTF8.self)
+    }
+
     // MARK: Signkey & PasswordCipher
 
     /// `getSignKey(tag, params)` = `md5("zsecure" + tag + sortedKeys.map { params[k] }.joined())`.

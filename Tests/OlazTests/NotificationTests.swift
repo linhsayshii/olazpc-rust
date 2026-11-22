@@ -1,5 +1,9 @@
 import Testing
 import Foundation
+import ImageIO
+import Intents
+import UniformTypeIdentifiers
+import UserNotifications
 @testable import Olaz
 
 @Suite struct NotificationTests {
@@ -144,5 +148,89 @@ import Foundation
         #expect(!NotificationPolicy.isSoundURLAllowed(URL(string: "http://stc-chat.zdn.vn/sound/noti.mp3")!))
         #expect(!NotificationPolicy.isSoundURLAllowed(URL(string: "https://evil.example.com/sound/noti.mp3")!))
         #expect(!NotificationPolicy.isSoundURLAllowed(URL(string: "https://stc-chat.zdn.vn/other.mp3")!))
+    }
+
+    @Test func normalizedAvatarPNGDataConvertsJPEGAndNonSquareToSquarePNG() throws {
+        let colorSpace = try #require(CGColorSpace(name: CGColorSpace.sRGB))
+        let ctx = try #require(CGContext(
+            data: nil,
+            width: 40,
+            height: 20,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ))
+        ctx.setFillColor(red: 0.2, green: 0.5, blue: 0.9, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: 40, height: 20))
+        let cgImg = try #require(ctx.makeImage())
+
+        let jpegData = NSMutableData()
+        let dest = try #require(CGImageDestinationCreateWithData(jpegData, UTType.jpeg.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(dest, cgImg, nil)
+        #expect(CGImageDestinationFinalize(dest))
+
+        let png = try #require(NotificationPolicy.normalizedAvatarPNGData(from: jpegData as Data, maxPixelSize: 64))
+        #expect(NotificationPolicy.attachmentType(for: png)?.ext == "png")
+
+        let pngSource = try #require(CGImageSourceCreateWithData(png as CFData, nil))
+        let outImg = try #require(CGImageSourceCreateImageAtIndex(pngSource, 0, nil))
+        #expect(outImg.width == 20)
+        #expect(outImg.height == 20)
+        #expect(NotificationPolicy.normalizedAvatarPNGData(from: Data("not-an-image".utf8)) == nil)
+    }
+
+    @Test func monogramAvatarPNGDataProducesValidSquarePNG() throws {
+        let png = try #require(NotificationPolicy.monogramAvatarPNGData(for: "Minh Anh", size: 96))
+        #expect(NotificationPolicy.attachmentType(for: png)?.ext == "png")
+
+        let source = try #require(CGImageSourceCreateWithData(png as CFData, nil))
+        let image = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        #expect(image.width == 96)
+        #expect(image.height == 96)
+    }
+
+    @Test func buildCommunicationIntentSetsSenderAndGroupMetadata() throws {
+        let png = try #require(NotificationPolicy.monogramAvatarPNGData(for: "Lan", size: 64))
+        let dmReq = NativeNotificationRequest(
+            title: "Lan",
+            body: "Xin chào",
+            tag: "200",
+            silent: false,
+            icon: nil,
+            senderId: "200",
+            senderName: "Lan",
+            isGroup: false
+        )
+        let dmIntent = NotificationPolicy.buildCommunicationIntent(for: dmReq, body: "Xin chào", avatarPNGData: png)
+        #expect(dmIntent.sender?.displayName == "Lan")
+        #expect(dmIntent.sender?.customIdentifier == "200")
+        #expect(dmIntent.sender?.image != nil)
+        #expect(dmIntent.conversationIdentifier == "200")
+        #expect(dmIntent.speakableGroupName == nil)
+        #expect(dmIntent.__image(forParameterNamed: "sender") != nil)
+        #expect(dmIntent.keyImage() != nil)
+
+        let updatedDM = try UNMutableNotificationContent().updating(from: dmIntent)
+        #expect(updatedDM.title == "")
+
+        let groupReq = NativeNotificationRequest(
+            title: "Gia Đình",
+            body: "Ăn cơm chưa",
+            tag: "g999",
+            silent: false,
+            icon: nil,
+            senderId: "201",
+            senderName: "Mẹ",
+            isGroup: true
+        )
+        let groupIntent = NotificationPolicy.buildCommunicationIntent(for: groupReq, body: "Ăn cơm chưa", avatarPNGData: png)
+        #expect(groupIntent.speakableGroupName?.spokenPhrase == "Gia Đình")
+        #expect(groupIntent.sender?.displayName == "Mẹ")
+        #expect(groupIntent.conversationIdentifier == "g999")
+        #expect(groupIntent.recipients?.count == 1)
+        #expect(groupIntent.__image(forParameterNamed: "sender") != nil)
+        #expect(groupIntent.__image(forParameterNamed: "speakableGroupName") != nil)
+        #expect(groupIntent.keyImage() != nil)
     }
 }

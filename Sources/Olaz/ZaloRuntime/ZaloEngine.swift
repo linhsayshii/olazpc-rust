@@ -122,9 +122,22 @@ final class ZaloEngine {
     @ObservationIgnored internal let e2eeManager = ZaloE2EEManager()
     @ObservationIgnored internal var isTransferHidden = false
     @ObservationIgnored internal var phoneSyncStatusSignal: ZaloMobileSyncEvent?
-    @ObservationIgnored private var pollState = ZaloPollState()
+    @ObservationIgnored internal var pollState = ZaloPollState()
     @ObservationIgnored internal var typingResetTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored internal var pendingDeletedMessages: [String: ChatMessage] = [:]
+    internal struct PendingLocalReaction {
+        let id: UUID
+        let convId: String
+        let msgId: String
+        let cliMsgId: String
+        let rType: String
+        var reactClientId: String
+        let createdAt: Date
+    }
+    @ObservationIgnored internal var pendingLocalReactions: [PendingLocalReaction] = []
+    @ObservationIgnored internal var seenReactionEventIds: Set<String> = []
+    @ObservationIgnored internal var seenReactionEventOrder: [String] = []
+    @ObservationIgnored internal var reactionBusyKeys: Set<String> = []
     @ObservationIgnored internal var groupMemberCache: [String: [MentionCandidate]] = [:]
     @ObservationIgnored internal var cachedSentRequestsRaw: [[String: Any]] = []
     @ObservationIgnored internal var cachedReceivedRequestsRaw: [[String: Any]] = []
@@ -282,6 +295,10 @@ final class ZaloEngine {
         resetCardState()
         resetCloud()
         pendingDeletedMessages = [:]
+        pendingLocalReactions = []
+        seenReactionEventIds = []
+        seenReactionEventOrder = []
+        reactionBusyKeys = []
         groupMemberCache = [:]
         cachedSentRequestsRaw = []
         cachedReceivedRequestsRaw = []
@@ -474,10 +491,31 @@ final class ZaloEngine {
         }
     }
 
-    private func loadLocalAccountState(from store: ZaloSQLiteStore) async {
-        // Self-heal any legacy raw Signal ciphertexts / broken E2EE sticker URLs in SQLite before hydrating UI.
+    internal func loadLocalAccountState(from store: ZaloSQLiteStore) async {
+        // Self-heal any legacy raw Signal ciphertexts / broken E2EE sticker URLs / corrupted legacy reactions in SQLite before hydrating UI.
         if let repairedCount = try? await store.repairUndecryptedE2EEMessages(), repairedCount > 0 {
             EngineLog.shared.write("e2ee: repaired \(repairedCount) legacy ciphertext rows")
+        }
+        if let repairedReactCount = try? await store.repairLegacyReactions(myUid: profile?.userId ?? ""), repairedReactCount > 0 {
+            EngineLog.shared.write("reactions: repaired \(repairedReactCount) legacy rows")
+        }
+        if let savedSeen = try? await store.getPreferenceStrings(key: "seenReactionEventIds"), !savedSeen.isEmpty {
+            let capped = Array(savedSeen.suffix(1000))
+            seenReactionEventOrder = capped
+            seenReactionEventIds = Set(capped)
+        }
+        if let pollData = try? await store.getPreferenceData(key: "pollState"),
+           let savedPoll = try? JSONDecoder().decode(ZaloPollState.self, from: pollData) {
+            pollState = savedPoll
+        }
+        if let wsData = try? await store.getPreferenceData(key: "wsQueueCursors"),
+           let savedCursors = try? JSONDecoder().decode([String: ZaloWSQueueCursorSnapshot].self, from: wsData) {
+            await webSocket.seedQueueCursors(savedCursors)
+        }
+        await webSocket.setQueueCursorObserver { [weak self] updated in
+            Task { @MainActor [weak self] in
+                await self?.persistWSQueueCursors(updated)
+            }
         }
         await e2eeManager.loadPersistedThreads(store: store)
         if let myUid = profile?.userId, !myUid.isEmpty {
@@ -779,6 +817,7 @@ final class ZaloEngine {
         rebuildConversationFlags()
         rebuildConversationExtras()
         await persistConversationsToSQLite()
+        refreshCloud()
         EngineLog.shared.write("bootstrap: convs=\(conversations.count) friends=\(contacts.friends.count) groups=\(contacts.groups.count)")
     }
 
@@ -789,7 +828,10 @@ final class ZaloEngine {
             guard !Task.isCancelled else { break }
             do {
                 let (box, nextState, more) = try await sessionClient.fetchChatFromPolling(state: pollState)
-                pollState = nextState
+                if nextState != pollState {
+                    pollState = nextState
+                    await persistPollState()
+                }
                 let syncEvents = ZaloPhoneSync.extractMobileSyncEvents(box.dict)
                 if !syncEvents.isEmpty {
                     await processMobileSyncEvents(syncEvents)
@@ -910,9 +952,10 @@ final class ZaloEngine {
         var incomingForNotice: [ChatMessage] = []
         var markedE2EEInBatch: Set<String> = []
 
+        // Pass 1: ingest and persist messages first so reaction/undo/delete events in the same batch
+        // always find their target message and are never overwritten by the message upsert.
         for ev in events {
-            switch ev {
-            case .message(let msg, let stored):
+            if case .message(let msg, let stored) = ev {
                 if msg.isE2EE,
                    !ZaloWireParser.isGroupId(msg.conversationId),
                    msg.conversationId != selfConversationId,
@@ -941,10 +984,30 @@ final class ZaloEngine {
                     unreadDeltaByConv[msg.conversationId, default: 0] += 1
                     incomingForNotice.append(msg)
                 }
+            }
+        }
+        if !storedBatch.isEmpty {
+            try? await sqliteStore?.saveMessages(storedBatch, preserveExistingReactions: true)
+        }
 
-            case .reaction(let convId, let msgId, let cliMsgId, let senderId, let rType, let rIcon):
-                await applyRemoteReaction(convId: convId, msgId: msgId, cliMsgId: cliMsgId, senderId: senderId, rType: rType, rIcon: rIcon)
-
+        // Pass 2: apply reactions chronologically (per target message), then recalls, deletes, and typing events.
+        for ev in ZaloWireParser.sortReactionEventsChronologically(events) {
+            if case .reaction(let convId, let msgId, let cliMsgId, let senderId, let rType, let rIcon, let eventId, let reactClientId, _, _, let senderName) = ev {
+                await applyRemoteReaction(
+                    convId: convId,
+                    msgId: msgId,
+                    cliMsgId: cliMsgId,
+                    senderId: senderId,
+                    rType: rType,
+                    rIcon: rIcon,
+                    eventId: eventId,
+                    reactClientId: reactClientId,
+                    senderName: senderName
+                )
+            }
+        }
+        for ev in events {
+            switch ev {
             case .undo(let convId, let msgId, let cliMsgId):
                 await applyRemoteRecall(convId: convId, msgId: msgId, cliMsgId: cliMsgId)
 
@@ -956,7 +1019,7 @@ final class ZaloEngine {
                     showTyping(convId: convId, name: lookupPersonInfo(senderId)?.name ?? "Ai đó")
                 }
 
-            case .ignore:
+            case .message, .reaction, .ignore:
                 break
             }
         }
@@ -998,9 +1061,6 @@ final class ZaloEngine {
         if list != conversations {
             conversations = list
         }
-        if !storedBatch.isEmpty {
-            try? await sqliteStore?.saveMessages(storedBatch)
-        }
         if persistConversations {
             await persistConversationsToSQLite()
         }
@@ -1009,13 +1069,66 @@ final class ZaloEngine {
 
         if notifyIncoming {
             for msg in incomingForNotice where !isConversationMuted(msg.conversationId) && notificationSettings.enabled {
-                let title = conversations.first(where: { $0.id == msg.conversationId })?.displayName ?? msg.senderName
-                let body = notificationSettings.showsPreview ? msg.text : "Bạn có tin nhắn mới"
+                let convId = msg.conversationId
+                let isGroup = ZaloWireParser.isGroupId(convId)
+                let cleanSenderId = ZaloWireParser.stripUserPrefix(msg.senderId)
+                let convSummary = conversations.first(where: { $0.id == convId })
+                var person = (!cleanSenderId.isEmpty && cleanSenderId != "0") ? lookupPersonInfo(cleanSenderId) : nil
+
+                var resolvedAvatarURL: URL? = msg.senderAvatar
+                    ?? (person?.avatar.isEmpty == false ? URL(string: person!.avatar) : nil)
+                    ?? (!isGroup ? convSummary?.avatar : nil)
+
+                if resolvedAvatarURL == nil, !cleanSenderId.isEmpty, cleanSenderId != "0" {
+                    if let profBox = try? await sessionClient.fetchProfiles(uids: [cleanSenderId]) {
+                        let profilesMap = ZaloWireParser.extractProfilesMap(profBox.dict)
+                        if let row = profilesMap[cleanSenderId] {
+                            let fetchedName = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+                            let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
+                            if !fetchedName.isEmpty || !avt.isEmpty {
+                                cachedProfiles[cleanSenderId] = ZaloWebKitMigrator.CachedProfile(name: fetchedName, avatar: avt)
+                                if let data = try? JSONEncoder().encode(cachedProfiles) {
+                                    try? await sqliteStore?.setPreferenceData(key: "cachedProfiles", data: data)
+                                }
+                            }
+                            if !avt.isEmpty, let url = URL(string: avt) {
+                                resolvedAvatarURL = url
+                            }
+                            person = lookupPersonInfo(cleanSenderId)
+                        }
+                    }
+                }
+
+                let title: String = {
+                    if let convName = convSummary?.displayName, !convName.isEmpty, convName != convId {
+                        return convName
+                    }
+                    if let pName = person?.name, !pName.isEmpty, pName != cleanSenderId {
+                        return pName
+                    }
+                    return msg.senderName.isEmpty ? convId : msg.senderName
+                }()
+
+                let senderName: String = {
+                    if !isGroup {
+                        return title
+                    }
+                    if let pName = person?.name, !pName.isEmpty, pName != cleanSenderId, pName != "Người dùng Zalo" {
+                        return pName
+                    }
+                    return msg.senderName
+                }()
+
+                let rawBody = Self.messagePreviewLabel(msg)
+                let body = notificationSettings.showsPreview ? rawBody : NotificationPolicy.hiddenPreviewBody
                 NativeNotifier.shared.notifyIncomingMessage(
                     title: title,
                     body: body,
-                    conversationId: msg.conversationId,
-                    avatarURL: msg.senderAvatar,
+                    conversationId: convId,
+                    senderId: cleanSenderId,
+                    senderName: senderName,
+                    isGroup: isGroup,
+                    avatarURL: resolvedAvatarURL,
                     silent: !notificationSettings.sound
                 )
             }
@@ -1176,6 +1289,9 @@ final class ZaloEngine {
     }
 
     internal func processControlEnvelope(_ payload: [String: Any], cmd: UInt16 = 0) async {
+        for done in ZaloWebSocket.extractFileDoneEvents(payload) {
+            await webSocket.recordFileDone(fileId: done.fileId, url: done.url)
+        }
         let dataNode = payload["data"] as? [String: Any] ?? payload
         let myUid = profile?.userId ?? ""
 
@@ -1273,25 +1389,50 @@ final class ZaloEngine {
 
     internal func lookupPersonInfo(_ uid: String) -> (name: String, avatar: String)? {
         let clean = ZaloWireParser.stripUserPrefix(uid)
-        if clean == profile?.userId {
+        guard !clean.isEmpty, clean != "0", clean != "-1", clean != "__legacy__", clean != "unknown" else {
+            return nil
+        }
+        var candidates: [String] = [clean]
+        if let sanitized = ZaloWireParser.sanitizeProfileUid(clean), sanitized != clean {
+            candidates.append(sanitized)
+        }
+        if let mappedUid = cachedFriendGlobalIds.first(where: { candidates.contains($0.value) })?.key,
+           !candidates.contains(mappedUid) {
+            candidates.append(mappedUid)
+        }
+
+        let cleanMyUid = ZaloWireParser.stripUserPrefix(profile?.userId ?? "")
+        let sanitizedMyUid = ZaloWireParser.sanitizeProfileUid(cleanMyUid) ?? cleanMyUid
+        if !cleanMyUid.isEmpty, candidates.contains(where: { $0 == cleanMyUid || $0 == sanitizedMyUid }) {
             return ("Bạn", profile?.avatar?.absoluteString ?? "")
         }
-        let alias = cachedAliases[clean]
-        if let f = contacts.friends.first(where: { $0.id == clean }) {
-            let avt = f.avatar?.absoluteString ?? cachedProfiles[clean]?.avatar ?? ""
-            return (alias?.isEmpty == false ? alias! : f.name, avt)
-        }
-        if let p = cachedProfiles[clean] {
-            let best = (alias?.isEmpty == false) ? alias! : p.name
-            if !best.isEmpty || !p.avatar.isEmpty {
-                return (best, p.avatar)
+
+        for candidate in candidates {
+            let alias = cachedAliases[candidate]
+            if let f = contacts.friends.first(where: { $0.id == candidate }) {
+                let avt = f.avatar?.absoluteString ?? cachedProfiles[candidate]?.avatar ?? ""
+                return (alias?.isEmpty == false ? alias! : f.name, avt)
+            }
+            if let p = cachedProfiles[candidate] {
+                let best = (alias?.isEmpty == false) ? alias! : p.name
+                let validBest = (best == ReactionDetail.unknownName) ? "" : best
+                if !validBest.isEmpty || !p.avatar.isEmpty {
+                    return (validBest, p.avatar)
+                }
+            }
+            if let alias, !alias.isEmpty, alias != ReactionDetail.unknownName {
+                return (alias, "")
             }
         }
-        if let alias, !alias.isEmpty {
-            return (alias, "")
-        }
-        if let conv = conversations.first(where: { $0.id == clean }) {
-            return (conv.displayName, conv.avatar?.absoluteString ?? "")
+        for candidate in candidates {
+            if let conv = conversations.first(where: { $0.id == candidate }) {
+                let trimmedName = conv.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                let validName = (!trimmedName.isEmpty && trimmedName != conv.id && trimmedName != ReactionDetail.unknownName) ? trimmedName : ""
+                let avt = conv.avatar?.absoluteString ?? ""
+                if !validName.isEmpty || !avt.isEmpty {
+                    return (validName, avt)
+                }
+            }
         }
         return nil
     }
@@ -1346,10 +1487,43 @@ final class ZaloEngine {
             if case .placeholder = msg.kind, msg.isE2EE { return true }
             return false
         }()
+        let resolvedClientId = (clientId?.isEmpty == false) ? clientId : (msg.clientId.isEmpty ? nil : msg.clientId)
+        var preservedReactions: [ChatMessage.Reaction] = []
+        if let existingById = list.first(where: { $0.id == msg.id }) {
+            if !existingById.reactions.isEmpty {
+                preservedReactions = existingById.reactions
+            }
+            if msg.clientId.isEmpty && !existingById.clientId.isEmpty {
+                msg.clientId = existingById.clientId
+            }
+        } else if let cid = resolvedClientId,
+                  let existingByCli = list.first(where: { $0.id == cid || $0.clientId == cid }) {
+            if !existingByCli.reactions.isEmpty {
+                preservedReactions = existingByCli.reactions
+            }
+            if msg.clientId.isEmpty {
+                msg.clientId = existingByCli.clientId.isEmpty ? cid : existingByCli.clientId
+            }
+        }
+        if msg.reactions.isEmpty && !preservedReactions.isEmpty && msg.kind != .recalled {
+            msg.reactions = preservedReactions
+        }
         if let clientId, !clientId.isEmpty, clientId != msg.id {
             if incomingIsLockedPlaceholder {
-                if list.contains(where: { existing in
+                if let idx = list.firstIndex(where: { existing in
                     guard existing.id == clientId else { return false }
+                    if case .placeholder = existing.kind, existing.isE2EE { return false }
+                    return true
+                }) {
+                    list[idx].id = msg.id
+                    if list[idx].clientId.isEmpty {
+                        list[idx].clientId = clientId
+                    }
+                    messages[msg.conversationId] = list
+                    return
+                }
+                if list.contains(where: { existing in
+                    guard existing.clientId == clientId && existing.id != clientId else { return false }
                     if case .placeholder = existing.kind, existing.isE2EE { return false }
                     return true
                 }) {
@@ -1461,63 +1635,444 @@ final class ZaloEngine {
         }
     }
 
-    internal func applyRemoteReaction(convId: String, msgId: String, cliMsgId: String, senderId: String, rType: String, rIcon: String) async {
-        let targetId = !msgId.isEmpty ? msgId : cliMsgId
-        guard !targetId.isEmpty else { return }
-        let myUid = profile?.userId ?? ""
-        let isMe = senderId == myUid || senderId == "0"
-        let senderName = isMe ? "Bạn" : (lookupPersonInfo(senderId)?.name ?? ReactionDetail.unknownName)
+    internal func persistPollState() async {
+        guard let store = sqliteStore,
+              let data = try? JSONEncoder().encode(pollState) else { return }
+        try? await store.setPreferenceData(key: "pollState", data: data)
+    }
 
-        var list = messages[convId] ?? []
-        guard let idx = list.firstIndex(where: { $0.id == targetId || $0.id == cliMsgId }) else { return }
-        var msg = list[idx]
+    internal func persistWSQueueCursors(_ cursors: [String: ZaloWSQueueCursorSnapshot]) async {
+        guard let store = sqliteStore,
+              let data = try? JSONEncoder().encode(cursors) else { return }
+        try? await store.setPreferenceData(key: "wsQueueCursors", data: data)
+    }
 
-        if rType == "-1" {
-            msg.reactions = msg.reactions.compactMap { r in
-                var updated = r
-                if isMe && updated.includesMe {
-                    updated.includesMe = false
-                    updated.count = max(0, updated.count - 1)
-                    updated.people = max(0, updated.people - 1)
-                    updated.names.removeAll { $0 == "Bạn" }
-                }
-                return updated.count > 0 ? updated : nil
-            }
-        } else {
-            let icon = ZaloWireParser.reactionIcon(rType: rType, rIcon: rIcon)
-            if let rIdx = msg.reactions.firstIndex(where: { $0.icon.type == icon.type }) {
-                msg.reactions[rIdx].count += 1
-                if isMe { msg.reactions[rIdx].includesMe = true }
-                if !msg.reactions[rIdx].names.contains(senderName) {
-                    msg.reactions[rIdx].names.append(senderName)
-                    msg.reactions[rIdx].people = max(msg.reactions[rIdx].people, msg.reactions[rIdx].names.count)
-                }
-            } else {
-                msg.reactions.append(ChatMessage.Reaction(
-                    icon: icon,
-                    count: 1,
-                    includesMe: isMe,
-                    names: [senderName],
-                    people: 1
-                ))
+    internal func recordSeenReactionKeys(_ keys: [String]) async {
+        var insertedAny = false
+        for rawKey in keys {
+            let key = rawKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else { continue }
+            if seenReactionEventIds.insert(key).inserted {
+                seenReactionEventOrder.append(key)
+                insertedAny = true
             }
         }
-        list[idx] = msg
-        messages[convId] = list
-        if let stored = ZaloWireParser.encodeChatMessage(msg) {
-            try? await sqliteStore?.saveMessages([stored])
+        guard insertedAny else { return }
+        if seenReactionEventOrder.count > 1000 {
+            let overflow = seenReactionEventOrder.count - 1000
+            let evicted = seenReactionEventOrder.prefix(overflow)
+            seenReactionEventOrder.removeFirst(overflow)
+            for old in evicted {
+                seenReactionEventIds.remove(old)
+            }
+        }
+        try? await sqliteStore?.setPreferenceStrings(key: "seenReactionEventIds", value: seenReactionEventOrder)
+    }
+
+    internal func refreshReactionNames(in targetConvId: String? = nil) {
+        let myUid = ZaloWireParser.sanitizeProfileUid(profile?.userId ?? "") ?? ZaloWireParser.stripUserPrefix(profile?.userId ?? "")
+        let convKeys = targetConvId.map { [$0] } ?? Array(messages.keys)
+        var changedRows: [StoredMessage] = []
+
+        for convId in convKeys {
+            guard var list = messages[convId] else { continue }
+            var listChanged = false
+            for idx in list.indices where !list[idx].reactions.isEmpty {
+                var msg = list[idx]
+                var reactionsChanged = false
+                for rIdx in msg.reactions.indices {
+                    var r = msg.reactions[rIdx]
+                    var orderedUids = Array(r.userCounts.keys).filter {
+                        !$0.isEmpty && $0 != "__legacy__" && $0 != "unknown" && $0 != "-1" && (r.userCounts[$0] ?? 0) > 0
+                    }.sorted()
+                    if r.includesMe, !myUid.isEmpty {
+                        orderedUids.removeAll { $0 == myUid || $0 == "0" || $0 == "me" }
+                        orderedUids.insert(myUid, at: 0)
+                    }
+                    guard !orderedUids.isEmpty else { continue }
+                    var refreshed: [String] = []
+                    for uid in orderedUids where refreshed.count < 3 {
+                        if uid == myUid || uid == "0" || uid == "me" {
+                            refreshed.append("Bạn")
+                        } else if let name = lookupPersonInfo(uid)?.name.trimmingCharacters(in: .whitespacesAndNewlines),
+                                  !name.isEmpty, name != ReactionDetail.unknownName, name != uid {
+                            refreshed.append(name)
+                        }
+                    }
+                    if refreshed != r.names {
+                        r.names = refreshed
+                        msg.reactions[rIdx] = r
+                        reactionsChanged = true
+                    }
+                }
+                if reactionsChanged {
+                    list[idx] = msg
+                    listChanged = true
+                    if let stored = ZaloWireParser.encodeChatMessage(msg) {
+                        changedRows.append(stored)
+                    }
+                }
+            }
+            if listChanged {
+                messages[convId] = list
+            }
+        }
+
+        if !changedRows.isEmpty, let store = sqliteStore {
+            Task {
+                try? await store.saveMessages(changedRows, preserveExistingReactions: false)
+            }
+        }
+    }
+
+    internal static func mutateReactions(
+        _ reactions: inout [ChatMessage.Reaction],
+        actorUid: String,
+        myUid: String,
+        isMe: Bool,
+        rType: String,
+        rIcon: String,
+        allowDuplicateSameUser: Bool,
+        nameLookup: (String) -> String
+    ) {
+        let trimmedType = rType.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedIcon = rIcon.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedType.isEmpty || !trimmedIcon.isEmpty else { return }
+
+        let cleanMyUid = ZaloWireParser.sanitizeProfileUid(myUid) ?? ZaloWireParser.stripUserPrefix(myUid)
+        let myKey = cleanMyUid.isEmpty ? "me" : cleanMyUid
+        let cleanActor = ZaloWireParser.stripUserPrefix(actorUid)
+        let normalizedActor = isMe ? myKey : (ZaloWireParser.sanitizeProfileUid(cleanActor) ?? cleanActor)
+        let sentinelKeys: Set<String> = ["", "__legacy__", "unknown", "-1"]
+        if !isMe && sentinelKeys.contains(normalizedActor) {
+            return
+        }
+
+        func rebuildDerivedFields(_ reaction: inout ChatMessage.Reaction) {
+            reaction.userCounts = reaction.userCounts.filter { !sentinelKeys.contains($0.key) && $0.value > 0 }
+            let totalCount = reaction.userCounts.values.reduce(0, +)
+            reaction.count = totalCount
+            reaction.includesMe = (reaction.userCounts[myKey] ?? 0) > 0
+            reaction.people = reaction.userCounts.count
+
+            var orderedUids = Array(reaction.userCounts.keys).sorted()
+            if reaction.includesMe {
+                orderedUids.removeAll { $0 == myKey }
+                orderedUids.insert(myKey, at: 0)
+            }
+            var rebuiltNames: [String] = []
+            for uid in orderedUids where rebuiltNames.count < 3 {
+                if uid == myKey {
+                    rebuiltNames.append("Bạn")
+                } else {
+                    let resolved = nameLookup(uid).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !resolved.isEmpty && resolved != ReactionDetail.unknownName && resolved != uid {
+                        rebuiltNames.append(resolved)
+                    }
+                }
+            }
+            reaction.names = rebuiltNames
+        }
+
+        let isRemoval = trimmedType == "-1" || ((Int(trimmedType) ?? 0) < 0)
+        if isRemoval {
+            reactions = reactions.compactMap { existing in
+                var r = existing
+                if !r.userCounts.isEmpty {
+                    r.userCounts.removeValue(forKey: "__legacy__")
+                    r.userCounts.removeValue(forKey: "unknown")
+                    if isMe {
+                        r.userCounts.removeValue(forKey: myKey)
+                        r.userCounts.removeValue(forKey: "0")
+                        r.userCounts.removeValue(forKey: "me")
+                    } else {
+                        r.userCounts.removeValue(forKey: normalizedActor)
+                        if cleanActor != normalizedActor {
+                            r.userCounts.removeValue(forKey: cleanActor)
+                        }
+                    }
+                    rebuildDerivedFields(&r)
+                    return r.count > 0 ? r : nil
+                } else {
+                    let hadKnownPeople = existing.people > 0
+                    if isMe {
+                        guard r.includesMe else { return r }
+                        r.includesMe = false
+                        r.names.removeAll { $0 == "Bạn" }
+                        r.people = max(0, existing.people - 1)
+                        r.count = (hadKnownPeople && r.people == 0) ? 0 : max(0, existing.count - 1)
+                    } else {
+                        let actorName = nameLookup(normalizedActor).trimmingCharacters(in: .whitespacesAndNewlines)
+                        let matchedName = !actorName.isEmpty && r.names.contains(actorName)
+                        if matchedName || (!r.includesMe && r.people <= 1) {
+                            if matchedName {
+                                r.names.removeAll { $0 == actorName }
+                            }
+                            r.people = max(0, existing.people - 1)
+                            r.count = (hadKnownPeople && r.people == 0) ? 0 : max(0, existing.count - 1)
+                        }
+                    }
+                    return r.count > 0 ? r : nil
+                }
+            }
+            return
+        }
+
+        guard let icon = ZaloWireParser.reactionIcon(rType: trimmedType, rIcon: trimmedIcon) else {
+            return
+        }
+
+        if let rIdx = reactions.firstIndex(where: { $0.icon.type == icon.type }) {
+            var r = reactions[rIdx]
+            if r.userCounts.isEmpty && r.count > 0 && r.includesMe {
+                r.userCounts[myKey] = 1
+            }
+            if allowDuplicateSameUser || r.userCounts[normalizedActor] == nil {
+                r.userCounts[normalizedActor, default: 0] += 1
+            }
+            rebuildDerivedFields(&r)
+            reactions[rIdx] = r
+        } else {
+            var created = ChatMessage.Reaction(
+                icon: icon,
+                count: 1,
+                includesMe: isMe,
+                names: [],
+                people: 1,
+                userCounts: [normalizedActor: 1]
+            )
+            rebuildDerivedFields(&created)
+            reactions.append(created)
+        }
+    }
+
+    internal func applyRemoteReaction(
+        convId: String,
+        msgId: String,
+        cliMsgId: String,
+        senderId: String,
+        rType: String,
+        rIcon: String,
+        eventId: String = "",
+        reactClientId: String = "",
+        senderName: String = ""
+    ) async {
+        let trimmedConv = convId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedMsg = msgId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedCli = cliMsgId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedType = rType.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedIcon = rIcon.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedEventId = eventId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedReactCli = reactClientId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedWireSenderName = senderName.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmedConv.isEmpty,
+              (!trimmedMsg.isEmpty || !trimmedCli.isEmpty),
+              (!trimmedType.isEmpty || !trimmedIcon.isEmpty) else {
+            return
+        }
+
+        let sanitizedConv = ZaloWireParser.isGroupId(trimmedConv)
+            ? trimmedConv
+            : (ZaloWireParser.sanitizeProfileUid(trimmedConv) ?? trimmedConv)
+        let dedupConv = sanitizedConv
+        let targetKey = !trimmedMsg.isEmpty ? trimmedMsg : trimmedCli
+
+        var candidateDedupKeys: [String] = []
+        if !trimmedEventId.isEmpty {
+            candidateDedupKeys.append("\(dedupConv)|\(targetKey)|\(trimmedEventId)|\(trimmedType)")
+        }
+        if !trimmedReactCli.isEmpty {
+            if !trimmedMsg.isEmpty {
+                candidateDedupKeys.append("\(dedupConv)|\(trimmedMsg)|cli:\(trimmedReactCli)|\(trimmedType)")
+            }
+            if !trimmedCli.isEmpty && trimmedCli != trimmedMsg {
+                candidateDedupKeys.append("\(dedupConv)|\(trimmedCli)|cli:\(trimmedReactCli)|\(trimmedType)")
+            }
+        }
+        if candidateDedupKeys.contains(where: { seenReactionEventIds.contains($0) }) {
+            return
+        }
+        await recordSeenReactionKeys(candidateDedupKeys)
+
+        let myUid = profile?.userId ?? ""
+        let sanitizedMyUid = ZaloWireParser.sanitizeProfileUid(myUid) ?? ZaloWireParser.stripUserPrefix(myUid)
+        let cleanSender = ZaloWireParser.stripUserPrefix(senderId)
+        if cleanSender == "-1" { return }
+        let sanitizedSender = ZaloWireParser.sanitizeProfileUid(cleanSender)
+        let isMe = (!myUid.isEmpty && (cleanSender == myUid || sanitizedSender == sanitizedMyUid))
+            || cleanSender == "0"
+            || cleanSender.isEmpty
+
+        if !isMe {
+            let canonicalActor = sanitizedSender ?? cleanSender
+            if !canonicalActor.isEmpty,
+               !trimmedWireSenderName.isEmpty,
+               trimmedWireSenderName != ReactionDetail.unknownName,
+               trimmedWireSenderName != canonicalActor {
+                let existing = lookupPersonInfo(canonicalActor)
+                if existing == nil || existing?.name.isEmpty == true || existing?.name == canonicalActor {
+                    let existingAvatar = existing?.avatar ?? cachedProfiles[canonicalActor]?.avatar ?? ""
+                    cachedProfiles[canonicalActor] = ZaloWebKitMigrator.CachedProfile(name: trimmedWireSenderName, avatar: existingAvatar)
+                }
+            }
+        }
+
+        let now = Date()
+        pendingLocalReactions.removeAll { now.timeIntervalSince($0.createdAt) > 20 }
+        if isMe, let matchIdx = pendingLocalReactions.firstIndex(where: { pending in
+            guard pending.convId == trimmedConv || pending.convId == sanitizedConv else { return false }
+            let msgMatches = (!trimmedMsg.isEmpty && (pending.msgId == trimmedMsg || pending.cliMsgId == trimmedMsg))
+                || (!trimmedCli.isEmpty && (pending.msgId == trimmedCli || pending.cliMsgId == trimmedCli))
+            guard msgMatches else { return false }
+            if !trimmedReactCli.isEmpty && pending.reactClientId == trimmedReactCli {
+                return true
+            }
+            return pending.rType == trimmedType
+        }) {
+            pendingLocalReactions.remove(at: matchIdx)
+            return
+        }
+
+        func matchesMessage(_ m: ChatMessage) -> Bool {
+            if !trimmedMsg.isEmpty && (m.id == trimmedMsg || m.clientId == trimmedMsg) {
+                return true
+            }
+            if !trimmedCli.isEmpty && (m.id == trimmedCli || m.clientId == trimmedCli) {
+                return true
+            }
+            return false
+        }
+
+        let memoryConvKey: String? = {
+            if messages[trimmedConv]?.contains(where: matchesMessage) == true { return trimmedConv }
+            if sanitizedConv != trimmedConv, messages[sanitizedConv]?.contains(where: matchesMessage) == true { return sanitizedConv }
+            return nil
+        }()
+
+        if let convKey = memoryConvKey,
+           var list = messages[convKey],
+           let idx = list.firstIndex(where: matchesMessage) {
+            var msg = list[idx]
+            Self.mutateReactions(
+                &msg.reactions,
+                actorUid: cleanSender,
+                myUid: myUid,
+                isMe: isMe,
+                rType: trimmedType,
+                rIcon: trimmedIcon,
+                allowDuplicateSameUser: !trimmedEventId.isEmpty,
+                nameLookup: { [weak self] uid in
+                    self?.lookupPersonInfo(uid)?.name ?? ""
+                }
+            )
+            list[idx] = msg
+            messages[convKey] = list
+            if let stored = ZaloWireParser.encodeChatMessage(msg) {
+                try? await sqliteStore?.saveMessages([stored], preserveExistingReactions: false)
+            }
+            return
+        }
+
+        if let store = sqliteStore {
+            let convCandidates = (sanitizedConv == trimmedConv) ? [trimmedConv] : [trimmedConv, sanitizedConv]
+            var storedRow: StoredMessage?
+            for candidateConv in convCandidates where storedRow == nil {
+                if !trimmedMsg.isEmpty {
+                    storedRow = try? await store.message(convId: candidateConv, idOrClientId: trimmedMsg)
+                }
+                if storedRow == nil && !trimmedCli.isEmpty {
+                    storedRow = try? await store.message(convId: candidateConv, idOrClientId: trimmedCli)
+                }
+            }
+            if let storedRow, var decoded = ZaloWireParser.decodeStoredMessage(storedRow) {
+                Self.mutateReactions(
+                    &decoded.reactions,
+                    actorUid: cleanSender,
+                    myUid: myUid,
+                    isMe: isMe,
+                    rType: trimmedType,
+                    rIcon: trimmedIcon,
+                    allowDuplicateSameUser: !trimmedEventId.isEmpty,
+                    nameLookup: { [weak self] uid in
+                        self?.lookupPersonInfo(uid)?.name ?? ""
+                    }
+                )
+                if let updated = ZaloWireParser.encodeChatMessage(decoded) {
+                    try? await store.saveMessages([updated], preserveExistingReactions: false)
+                }
+            }
         }
     }
 
     internal func applyRemoteRecall(convId: String, msgId: String, cliMsgId: String) async {
         let targetId = !msgId.isEmpty ? msgId : cliMsgId
         guard !targetId.isEmpty else { return }
-        if var list = messages[convId], let idx = list.firstIndex(where: { $0.id == targetId || $0.id == cliMsgId }) {
+
+        var updatedPreview = false
+        if var list = messages[convId],
+           let idx = list.firstIndex(where: {
+               (!msgId.isEmpty && ($0.id == msgId || $0.clientId == msgId))
+                   || (!cliMsgId.isEmpty && ($0.clientId == cliMsgId || $0.id == cliMsgId))
+           }) {
+            let recalledId = list[idx].id
+            let wasLast = (idx == list.count - 1)
+            let msgDate = list[idx].date
+            let msgFromMe = list[idx].isMine
+
             list[idx].kind = .recalled
             list[idx].text = ""
+            list[idx].reactions = []
+            list[idx].quote = nil
+            list[idx].cardButtons = []
+            list[idx].menu.recall = false
+            list[idx].menu.forward = .hidden
+            list[idx].menu.pin = false
+            list[idx].menu.star = nil
+            list[idx].menu.starred = false
             messages[convId] = list
+
+            if cachedStarredIds.remove(recalledId) != nil {
+                try? await sqliteStore?.setPreferenceStrings(key: "starredIds", value: Array(cachedStarredIds))
+            }
+
+            if wasLast, let convIdx = conversations.firstIndex(where: { $0.id == convId }) {
+                var conv = conversations[convIdx]
+                if (conv.preview?.date ?? .distantPast) <= msgDate.addingTimeInterval(1) {
+                    conv.preview = ConversationSummary.Preview(
+                        text: "Tin nhắn đã được thu hồi",
+                        date: conv.preview?.date ?? msgDate,
+                        fromMe: conv.preview?.fromMe ?? msgFromMe
+                    )
+                    conversations[convIdx] = conv
+                    updatedPreview = true
+                }
+            }
         }
-        try? await sqliteStore?.markRecalled(convId: convId, id: targetId)
+
+        try? await sqliteStore?.markRecalled(convId: convId, id: targetId, cliMsgId: cliMsgId)
+
+        if !updatedPreview,
+           let convIdx = conversations.firstIndex(where: { $0.id == convId }),
+           let latest = try? await sqliteStore?.messages(convId: convId, limit: 1).first,
+           latest.kindTag == "recalled" {
+            let latestDate = Date(timeIntervalSince1970: Double(latest.tsMs) / 1000)
+            var conv = conversations[convIdx]
+            if conv.preview?.text != "Tin nhắn đã được thu hồi",
+               (conv.preview?.date ?? .distantPast) <= latestDate.addingTimeInterval(1) {
+                conv.preview = ConversationSummary.Preview(
+                    text: "Tin nhắn đã được thu hồi",
+                    date: conv.preview?.date ?? latestDate,
+                    fromMe: conv.preview?.fromMe ?? latest.isMine
+                )
+                conversations[convIdx] = conv
+                updatedPreview = true
+            }
+        }
+
+        if updatedPreview {
+            await persistConversationsToSQLite()
+        }
     }
 
     internal func applyRemoteDelete(convId: String, msgId: String, cliMsgId: String) async {

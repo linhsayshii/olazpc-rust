@@ -273,28 +273,154 @@ extension ZaloEngine {
         return sentAny ? .done : .failed(ComposerOutcome.genericFailure)
     }
 
+    nonisolated static func validateOutgoingFile(_ url: URL, maxBytes: Int64) -> String? {
+        var isDir: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+        if isDir.boolValue {
+            return "Chưa hỗ trợ gửi thư mục (\(url.lastPathComponent)). Hãy nén thành .zip trước."
+        }
+        guard exists,
+              let vals = try? url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey]) else {
+            return "Không đọc được tệp \(url.lastPathComponent)."
+        }
+        if vals.isDirectory == true {
+            return "Chưa hỗ trợ gửi thư mục (\(url.lastPathComponent)). Hãy nén thành .zip trước."
+        }
+        let size = Int64(vals.fileSize ?? 0)
+        if size <= 0 {
+            return "Tệp \(url.lastPathComponent) rỗng (0 byte) nên không thể gửi."
+        }
+        if maxBytes > 0 && size > maxBytes {
+            let limitMB = max(1, maxBytes / 1_048_576)
+            return "Tệp \(url.lastPathComponent) vượt quá giới hạn \(limitMB) MB."
+        }
+        return nil
+    }
+
     func sendFiles(_ urls: [URL], to id: String) async -> ComposerOutcome {
         guard !urls.isEmpty, !id.isEmpty else { return .cancelled }
+        let maxBytes = max(cloud.plan?.fileLimit ?? 0, 100 * 1_048_576)
+        let isGroup = ZaloWireParser.isGroupId(id)
+        let isE2EE = isGroup ? false : await e2eeManager.isE2EEConversation(id)
         var sentAny = false
+        var lastFailure: String?
+
         for url in urls {
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-            guard let data = try? Data(contentsOf: url) else { continue }
+
+            if let reason = Self.validateOutgoingFile(url, maxBytes: maxBytes) {
+                lastFailure = reason
+                continue
+            }
+
+            let data: Data
             do {
-                let res = try await sessionClient.uploadAndSendFile(
-                    convId: id, fileName: url.lastPathComponent, data: data, webSocket: webSocket
-                )
+                data = try Data(contentsOf: url)
+            } catch {
+                lastFailure = "Không đọc được tệp \(url.lastPathComponent)."
+                continue
+            }
+            guard !data.isEmpty else {
+                lastFailure = "Tệp \(url.lastPathComponent) rỗng (0 byte) nên không thể gửi."
+                continue
+            }
+
+            let cliInt = await sessionClient.nextClientId()
+            let cliId = "\(cliInt)"
+            let isSelf = (id == selfConversationId)
+            let optimistic = ChatMessage(
+                id: cliId,
+                conversationId: id,
+                senderId: profile?.userId ?? "",
+                senderName: profile?.displayName ?? "Bạn",
+                senderAvatar: profile?.avatar,
+                isMine: true,
+                kind: .file(name: url.lastPathComponent, size: Int64(data.count), url: nil),
+                text: url.lastPathComponent,
+                date: Date(),
+                status: .sending,
+                quote: nil,
+                reactions: [],
+                isE2EE: isE2EE,
+                mentions: [],
+                cardButtons: [],
+                suggestsStickers: false,
+                menu: MessageMenu(json: [
+                    "forward": "ok",
+                    "recall": !isSelf,
+                    "delete": isSelf ? "plain" : "forMe",
+                    "pin": isGroup && !isSelf,
+                    "star": "star",
+                ]),
+                clientId: cliId
+            )
+            mergeMessageIntoMemory(optimistic)
+
+            func removeOptimistic() {
+                if var list = messages[id] {
+                    list.removeAll { $0.id == cliId || $0.clientId == cliId }
+                    messages[id] = list
+                }
+            }
+
+            do {
+                let res: UploadedMediaResult
+                if isE2EE {
+                    res = try await sessionClient.uploadAndSendE2EEFile(
+                        convId: id,
+                        fileName: url.lastPathComponent,
+                        plaintextData: data,
+                        clientId: cliInt,
+                        e2eeManager: e2eeManager,
+                        store: sqliteStore,
+                        webSocket: webSocket
+                    )
+                } else {
+                    res = try await sessionClient.uploadAndSendFile(
+                        convId: id,
+                        fileName: url.lastPathComponent,
+                        data: data,
+                        clientId: cliInt,
+                        webSocket: webSocket
+                    )
+                }
                 await recordUploadedMessage(
-                    convId: id, msgId: res.msgId, cliId: res.cliMsgId,
+                    convId: id,
+                    msgId: res.msgId,
+                    cliId: res.cliMsgId,
                     kind: .file(name: url.lastPathComponent, size: Int64(data.count), url: URL(string: res.url)),
-                    text: url.lastPathComponent
+                    text: url.lastPathComponent,
+                    isE2EE: isE2EE
                 )
                 sentAny = true
+            } catch let sessionErr as ZaloSessionError {
+                removeOptimistic()
+                EngineLog.shared.write("sendFiles failed: code=\(sessionErr.code) msg=\(sessionErr.message)")
+                if !sessionErr.message.isEmpty {
+                    lastFailure = sessionErr.message
+                } else if sessionErr.code == -108 || sessionErr.code == -104 || sessionErr.code == 401 {
+                    lastFailure = "Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại."
+                } else {
+                    lastFailure = "Gửi tệp \(url.lastPathComponent) thất bại (mã \(sessionErr.code))."
+                }
+            } catch is URLError {
+                removeOptimistic()
+                EngineLog.shared.write("sendFiles failed: network error")
+                lastFailure = "Không có kết nối mạng. Vui lòng kiểm tra và thử lại."
             } catch {
+                removeOptimistic()
                 EngineLog.shared.write("sendFiles failed: \(error.localizedDescription)")
+                lastFailure = "Không thể gửi tệp \(url.lastPathComponent)."
             }
         }
-        return sentAny ? .done : .failed(ComposerOutcome.genericFailure)
+        if sentAny {
+            if let lastFailure {
+                CardActionCenter.shared.show(lastFailure, in: id)
+            }
+            return .done
+        }
+        return .failed(lastFailure ?? ComposerOutcome.genericFailure)
     }
 
     private func imageDimensions(_ data: Data) -> (width: Int, height: Int) {
@@ -307,7 +433,15 @@ extension ZaloEngine {
         return (w, h)
     }
 
-    internal func recordUploadedMessage(convId: String, msgId: String, cliId: String, kind: ChatMessage.Kind, text: String) async {
+    internal func recordUploadedMessage(
+        convId: String,
+        msgId: String,
+        cliId: String,
+        kind: ChatMessage.Kind,
+        text: String,
+        isE2EE: Bool = false
+    ) async {
+        let isSelf = (convId == selfConversationId)
         let msg = ChatMessage(
             id: msgId,
             conversationId: convId,
@@ -321,13 +455,20 @@ extension ZaloEngine {
             status: .sent,
             quote: nil,
             reactions: [],
-            isE2EE: false,
+            isE2EE: isE2EE,
             mentions: [],
             cardButtons: [],
             suggestsStickers: false,
-            menu: MessageMenu(json: ["forward": "ok", "recall": true, "delete": "forMe", "pin": ZaloWireParser.isGroupId(convId), "star": "star"])
+            menu: MessageMenu(json: [
+                "forward": "ok",
+                "recall": !isSelf,
+                "delete": isSelf ? "plain" : "forMe",
+                "pin": ZaloWireParser.isGroupId(convId) && !isSelf,
+                "star": "star"
+            ]),
+            clientId: cliId
         )
-        mergeMessageIntoMemory(msg)
+        mergeMessageIntoMemory(msg, replacingClientId: cliId)
         if let stored = ZaloWireParser.encodeChatMessage(msg, clientId: cliId) {
             try? await sqliteStore?.saveMessages([stored])
         }

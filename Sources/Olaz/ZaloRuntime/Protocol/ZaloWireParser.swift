@@ -14,7 +14,19 @@ struct ZaloJSONArrayBox: @unchecked Sendable {
 
 enum ParsedWireEvent: Sendable {
     case message(ChatMessage, StoredMessage)
-    case reaction(convId: String, msgId: String, cliMsgId: String, senderId: String, rType: String, rIcon: String)
+    case reaction(
+        convId: String,
+        msgId: String,
+        cliMsgId: String,
+        senderId: String,
+        rType: String,
+        rIcon: String,
+        eventId: String = "",
+        reactClientId: String = "",
+        tsMs: Int64 = 0,
+        seqId: Int64 = 0,
+        senderName: String = ""
+    )
     case undo(convId: String, msgId: String, cliMsgId: String)
     case delete(convId: String, msgId: String, cliMsgId: String)
     case typing(convId: String, senderId: String, isGroup: Bool)
@@ -89,20 +101,26 @@ enum ZaloWireParser {
     // MARK: - Reactions
 
     static func reactionSpec(forEmoji emoji: String) -> (rIcon: String, rType: Int) {
-        switch emoji {
+        let normalized = emoji
+            .replacingOccurrences(of: "\u{FE0F}", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        switch normalized {
         case "👍", "/-strong": return ("/-strong", 3)
-        case "❤️", "❤", "/-heart": return ("/-heart", 5)
+        case "❤", "/-heart": return ("/-heart", 5)
         case "😆", ":>": return (":>", 0)
         case "😮", ":o": return (":o", 32)
-        case "😢", ":-((" : return (":-((" , 2)
-        case "😠", ":-h": return (":-h", 20)
+        case "😢", ":-((" , ":-(": return (":-((" , 2)
+        case "😡", "😠", ":-h": return (":-h", 20)
         default: return ("/-strong", 3)
         }
     }
 
-    static func reactionIcon(rType: String, rIcon: String = "") -> ReactionIcon {
+    static func reactionIcon(rType: String, rIcon: String = "") -> ReactionIcon? {
         let t = rType.trimmingCharacters(in: .whitespacesAndNewlines)
         let k = rIcon.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let numericType = Int(t), numericType < 0 {
+            return nil
+        }
         switch (t, k) {
         case ("3", _), (_, "/-strong"):
             return ReactionIcon(type: "3", key: "/-strong", emoji: "👍")
@@ -115,11 +133,26 @@ enum ZaloWireParser {
         case ("2", _), (_, ":-(("), (_, ":-("):
             return ReactionIcon(type: "2", key: ":-((" , emoji: "😢")
         case ("20", _), (_, ":-h"):
-            return ReactionIcon(type: "20", key: ":-h", emoji: "😠")
+            return ReactionIcon(type: "20", key: ":-h", emoji: "😡")
         default:
+            guard !k.isEmpty else { return nil }
             let fallbackType = t.isEmpty ? k : t
-            let fallbackEmoji = k.isEmpty ? "👍" : k
-            return ReactionIcon(type: fallbackType, key: k.isEmpty ? fallbackType : k, emoji: fallbackEmoji)
+            return ReactionIcon(type: fallbackType, key: k, emoji: k)
+        }
+    }
+
+    static func reactionClientMsgType(for kind: ChatMessage.Kind) -> Int {
+        switch kind {
+        case .text: return 1
+        case .voice: return 31
+        case .photo: return 32
+        case .sticker: return 36
+        case .link, .contactCard: return 38
+        case .location: return 43
+        case .video: return 44
+        case .file: return 46
+        case .gif: return 49
+        default: return 1
         }
     }
 
@@ -315,25 +348,61 @@ enum ZaloWireParser {
             return .delete(convId: convId, msgId: delMsgId, cliMsgId: delCliId)
 
         case "chat.reaction":
-            let rMsgId = JSONLossless.string(contentDict?["rMsg"] ?? contentDict?["msgId"] ?? msgId)
+            let rMsgRaw: Any? = {
+                guard let rawRMsg = contentDict?["rMsg"] else { return nil }
+                if let str = rawRMsg as? String {
+                    let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if (trimmed.hasPrefix("[") || trimmed.hasPrefix("{")),
+                       let data = trimmed.data(using: .utf8),
+                       let parsed = JSONLossless.parseAny(data) {
+                        return parsed
+                    }
+                }
+                return rawRMsg
+            }()
             let targetMsgId: String
             let targetCliId: String
-            if let rMsgs = contentDict?["rMsg"] as? [[String: Any]], let first = rMsgs.first {
-                targetMsgId = JSONLossless.string(first["gMsgID"] ?? first["msgId"] ?? msgId)
-                targetCliId = JSONLossless.string(first["cMsgID"] ?? first["cliMsgId"] ?? cliMsgId)
+            if let rMsgs = (rMsgRaw as? [[String: Any]]) ?? (rMsgRaw as? [Any])?.compactMap({ $0 as? [String: Any] }),
+               let first = rMsgs.first {
+                targetMsgId = JSONLossless.string(first["gMsgID"] ?? first["msgId"] ?? first["globalMsgId"])
+                targetCliId = JSONLossless.string(first["cMsgID"] ?? first["cliMsgId"] ?? first["clientId"])
+            } else if let single = rMsgRaw as? [String: Any] {
+                targetMsgId = JSONLossless.string(single["gMsgID"] ?? single["msgId"] ?? single["globalMsgId"])
+                targetCliId = JSONLossless.string(single["cMsgID"] ?? single["cliMsgId"] ?? single["clientId"])
             } else {
-                targetMsgId = rMsgId
-                targetCliId = JSONLossless.string(contentDict?["cliMsgId"] ?? cliMsgId)
+                let scalarRMsg = (rMsgRaw is String) ? JSONLossless.string(rMsgRaw) : ""
+                targetMsgId = firstNonEmpty(
+                    JSONLossless.string(contentDict?["gMsgID"] ?? contentDict?["msgId"] ?? contentDict?["globalMsgId"]),
+                    scalarRMsg
+                )
+                targetCliId = JSONLossless.string(contentDict?["cMsgID"] ?? contentDict?["cliMsgId"] ?? contentDict?["clientId"])
             }
             let rIcon = JSONLossless.string(contentDict?["rIcon"])
             let rType = JSONLossless.string(contentDict?["rType"])
+            guard (!targetMsgId.isEmpty || !targetCliId.isEmpty),
+                  (!rType.isEmpty || !rIcon.isEmpty) else {
+                return .ignore
+            }
+            let eventId = firstNonEmpty(JSONLossless.string(raw["actionId"]), msgId, cliMsgId)
+            let reactionSender = firstNonEmpty(
+                uidFrom,
+                stripUserPrefix(JSONLossless.string(raw["fromUid"] ?? contentDict?["uidFrom"] ?? contentDict?["fromUid"]))
+            )
+            let reactionTsMs = optionalTimestampMs(raw["ts"] ?? raw["time"] ?? raw["sendTime"] ?? contentDict?["ts"])
+            let reactionSeqId = JSONLossless.int64(raw["actionId"] ?? raw["msgId"] ?? raw["cliMsgId"]) ?? 0
+            let reactionSenderName = JSONLossless.string(raw["dName"] ?? raw["senderName"] ?? contentDict?["dName"])
             return .reaction(
                 convId: convId,
                 msgId: targetMsgId,
                 cliMsgId: targetCliId,
-                senderId: uidFrom,
+                senderId: reactionSender,
                 rType: rType,
-                rIcon: rIcon
+                rIcon: rIcon,
+                eventId: eventId,
+                reactClientId: cliMsgId,
+                tsMs: reactionTsMs,
+                seqId: reactionSeqId,
+                senderName: reactionSenderName
             )
 
         default:
@@ -767,11 +836,14 @@ enum ZaloWireParser {
         }
 
         // Context menu defaults
+        let canRecall = isMine
+            && !isSelfCloudEnvelope
+            && !["call", "system", "notice", "recalled", "placeholder"].contains(kindTag)
         let menuDict: [String: Any] = [
             "forward": isUndecryptedE2EE ? "blocked" : "ok",
-            "recall": isMine,
-            "delete": "forMe",
-            "pin": inferredGroup && !isUndecryptedE2EE,
+            "recall": canRecall,
+            "delete": isSelfCloudEnvelope ? "plain" : "forMe",
+            "pin": inferredGroup && !isSelfCloudEnvelope && !isUndecryptedE2EE,
             "star": "star",
             "starred": false,
             "pinned": false,
@@ -887,19 +959,24 @@ enum ZaloWireParser {
     }
 
     static func decodeStoredMessage(_ stored: StoredMessage) -> ChatMessage? {
-        guard let dict = (try? JSONSerialization.jsonObject(with: stored.rawJSONData)) as? [String: Any] else {
+        guard let dict = (try? JSONSerialization.jsonObject(with: stored.rawJSONData)) as? [String: Any],
+              var msg = ChatMessage(json: dict, fallbackConversation: stored.convId) else {
             return nil
         }
-        return ChatMessage(json: dict, fallbackConversation: stored.convId)
+        if msg.clientId.isEmpty && !stored.clientId.isEmpty {
+            msg.clientId = stored.clientId
+        }
+        return msg
     }
 
     static func encodeChatMessage(_ msg: ChatMessage, clientId: String = "") -> StoredMessage? {
+        let effectiveClientId = clientId.isEmpty ? msg.clientId : clientId
         var (kindDict, kindTag) = serializeKind(msg.kind)
         if !msg.fallbackURLs.isEmpty {
             kindDict["fallbacks"] = msg.fallbackURLs.map(\.absoluteString)
         }
         let reactionsArr: [[String: Any]] = msg.reactions.map { r in
-            [
+            var dict: [String: Any] = [
                 "type": r.icon.type,
                 "key": r.icon.key,
                 "emoji": r.icon.emoji,
@@ -909,6 +986,10 @@ enum ZaloWireParser {
                 "names": r.names,
                 "people": r.people
             ]
+            if !r.userCounts.isEmpty {
+                dict["userCounts"] = r.userCounts
+            }
+            return dict
         }
         let mentionsArr: [[String: Any]] = msg.mentions.map { m in
             ["uid": m.uid, "pos": m.pos, "len": m.len, "isAll": m.isAll]
@@ -928,7 +1009,7 @@ enum ZaloWireParser {
         ]
         var canonical: [String: Any] = [
             "id": msg.id,
-            "clientId": clientId,
+            "clientId": effectiveClientId,
             "conversationId": msg.conversationId,
             "senderId": msg.senderId,
             "senderName": msg.senderName,
@@ -952,7 +1033,7 @@ enum ZaloWireParser {
         return StoredMessage(
             id: msg.id,
             convId: msg.conversationId,
-            clientId: clientId,
+            clientId: effectiveClientId,
             senderId: msg.senderId,
             senderName: msg.senderName,
             senderAvatar: msg.senderAvatar?.absoluteString ?? "",
@@ -1048,6 +1129,60 @@ enum ZaloWireParser {
         return raw
     }
 
+    static func optionalTimestampMs(_ value: Any?) -> Int64 {
+        guard let raw = JSONLossless.int64(value), raw > 0 else {
+            return 0
+        }
+        if raw < 10_000_000_000 { return raw * 1000 }
+        return raw
+    }
+
+    /// Returns `.reaction` events sorted ascending chronologically within each `(convId, targetMsg)` group
+    /// so newest-first batch deliveries apply reactions before unreactions.
+    static func sortReactionEventsChronologically(_ events: [ParsedWireEvent]) -> [ParsedWireEvent] {
+        struct IndexedReaction {
+            let index: Int
+            let groupKey: String
+            let tsMs: Int64
+            let seqId: Int64
+            let event: ParsedWireEvent
+        }
+        var grouped: [String: [IndexedReaction]] = [:]
+        var groupOrder: [String] = []
+        for (idx, ev) in events.enumerated() {
+            guard case .reaction(let convId, let msgId, let cliMsgId, _, _, _, _, _, let tsMs, let seqId, _) = ev else {
+                continue
+            }
+            let targetKey = !msgId.isEmpty ? msgId : cliMsgId
+            let key = "\(convId)|\(targetKey)"
+            if grouped[key] == nil {
+                groupOrder.append(key)
+            }
+            grouped[key, default: []].append(IndexedReaction(index: idx, groupKey: key, tsMs: tsMs, seqId: seqId, event: ev))
+        }
+        var out: [ParsedWireEvent] = []
+        for key in groupOrder {
+            guard let items = grouped[key] else { continue }
+            let sorted: [IndexedReaction]
+            if items.allSatisfy({ $0.tsMs > 0 }) {
+                sorted = items.sorted {
+                    if $0.tsMs != $1.tsMs { return $0.tsMs < $1.tsMs }
+                    if $0.seqId != $1.seqId { return $0.seqId < $1.seqId }
+                    return $0.index < $1.index
+                }
+            } else if items.allSatisfy({ $0.seqId > 0 }) {
+                sorted = items.sorted {
+                    if $0.seqId != $1.seqId { return $0.seqId < $1.seqId }
+                    return $0.index < $1.index
+                }
+            } else {
+                sorted = items
+            }
+            out.append(contentsOf: sorted.map(\.event))
+        }
+        return out
+    }
+
     private static func doubleValue(_ value: Any?) -> Double? {
         if let n = value as? NSNumber { return n.doubleValue }
         if let s = value as? String { return Double(s.trimmingCharacters(in: .whitespacesAndNewlines)) }
@@ -1134,31 +1269,79 @@ enum ZaloWireParser {
             for r in list {
                 let cRaw = unwrapValue(r["content"] as Any)
                 let cDict = cRaw as? [String: Any]
-                let sender = stripUserPrefix(JSONLossless.string(r["uidFrom"] ?? r["senderId"]))
-                let toRaw = JSONLossless.string(r["idTo"] ?? r["toId"] ?? r["grid"] ?? fallbackHint)
+                let sender = stripUserPrefix(JSONLossless.string(
+                    r["uidFrom"] ?? r["fromUid"] ?? r["senderId"] ?? cDict?["uidFrom"] ?? cDict?["fromUid"]
+                ))
+                let toRaw = JSONLossless.string(r["idTo"] ?? r["toId"] ?? r["grid"] ?? r["groupId"] ?? fallbackHint)
+                let cleanTo = stripUserPrefix(toRaw)
                 let convId: String = {
                     if isGroup {
                         let g = groupConvId(toRaw)
                         return g.isEmpty ? (fallbackHint ?? "") : g
                     }
                     if sender == myUid || sender == "0" || sender.isEmpty {
-                        return toRaw == "0" || toRaw.isEmpty ? firstNonEmpty(fallbackHint, selfConvId) : stripUserPrefix(toRaw)
+                        if toRaw == "0" || toRaw.isEmpty || (selfConvId != nil && (cleanTo == selfConvId || cleanTo == myUid)) {
+                            return firstNonEmpty(selfConvId, fallbackHint, (toRaw == "0" || toRaw.isEmpty) ? nil : cleanTo)
+                        }
+                        return cleanTo
                     }
                     return sender
                 }()
                 guard !convId.isEmpty else { continue }
-                let msgId = JSONLossless.string(cDict?["msgId"] ?? cDict?["gMsgID"] ?? r["msgId"] ?? r["globalMsgId"])
-                let cliMsgId = JSONLossless.string(cDict?["cliMsgId"] ?? cDict?["cMsgID"] ?? r["cliMsgId"])
+                let msgId = JSONLossless.string(cDict?["gMsgID"] ?? cDict?["msgId"] ?? cDict?["globalMsgId"])
+                let cliMsgId = JSONLossless.string(cDict?["cMsgID"] ?? cDict?["cliMsgId"] ?? cDict?["clientId"])
                 let rIcon = JSONLossless.string(cDict?["rIcon"] ?? r["rIcon"])
                 let rType = JSONLossless.string(cDict?["rType"] ?? r["rType"])
-                if let rMsgs = cDict?["rMsg"] as? [[String: Any]], !rMsgs.isEmpty {
+                guard !rType.isEmpty || !rIcon.isEmpty else { continue }
+
+                let baseEventId = firstNonEmpty(
+                    JSONLossless.string(r["actionId"]),
+                    JSONLossless.string(r["msgId"]),
+                    JSONLossless.string(r["cliMsgId"])
+                )
+                let reactClientId = JSONLossless.string(r["cliMsgId"] ?? r["clientId"])
+                let tsMs = optionalTimestampMs(r["ts"] ?? r["time"] ?? r["sendTime"] ?? cDict?["ts"])
+                let seqId = JSONLossless.int64(r["actionId"] ?? r["msgId"] ?? r["cliMsgId"]) ?? 0
+                let senderName = JSONLossless.string(r["dName"] ?? r["senderName"] ?? cDict?["dName"])
+
+                let rMsgRaw = cDict?["rMsg"].map { unwrapValue($0) }
+                let rMsgs: [[String: Any]] = (rMsgRaw as? [[String: Any]])
+                    ?? (rMsgRaw as? [Any])?.compactMap { $0 as? [String: Any] }
+                    ?? ((rMsgRaw as? [String: Any]).map { [$0] } ?? [])
+
+                if !rMsgs.isEmpty {
                     for rm in rMsgs {
-                        let gid = JSONLossless.string(rm["gMsgID"] ?? rm["msgId"] ?? msgId)
-                        let cid = JSONLossless.string(rm["cMsgID"] ?? rm["cliMsgId"] ?? cliMsgId)
-                        events.append(.reaction(convId: convId, msgId: gid, cliMsgId: cid, senderId: sender, rType: rType, rIcon: rIcon))
+                        let gid = JSONLossless.string(rm["gMsgID"] ?? rm["msgId"] ?? rm["globalMsgId"] ?? msgId)
+                        let cid = JSONLossless.string(rm["cMsgID"] ?? rm["cliMsgId"] ?? rm["clientId"] ?? cliMsgId)
+                        guard !gid.isEmpty || !cid.isEmpty else { continue }
+                        events.append(.reaction(
+                            convId: convId,
+                            msgId: gid,
+                            cliMsgId: cid,
+                            senderId: sender,
+                            rType: rType,
+                            rIcon: rIcon,
+                            eventId: baseEventId,
+                            reactClientId: reactClientId,
+                            tsMs: tsMs,
+                            seqId: seqId,
+                            senderName: senderName
+                        ))
                     }
                 } else if !msgId.isEmpty || !cliMsgId.isEmpty {
-                    events.append(.reaction(convId: convId, msgId: msgId, cliMsgId: cliMsgId, senderId: sender, rType: rType, rIcon: rIcon))
+                    events.append(.reaction(
+                        convId: convId,
+                        msgId: msgId,
+                        cliMsgId: cliMsgId,
+                        senderId: sender,
+                        rType: rType,
+                        rIcon: rIcon,
+                        eventId: baseEventId,
+                        reactClientId: reactClientId,
+                        tsMs: tsMs,
+                        seqId: seqId,
+                        senderName: senderName
+                    ))
                 }
             }
         }

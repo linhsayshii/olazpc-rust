@@ -297,21 +297,11 @@ extension ZaloEngine {
             }
 
         case "getAliasName":
-            let noisedId = JSONLossless.string(data["noisedId"])
+            let noisedId = JSONLossless.string(data["noisedId"]).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !noisedId.isEmpty else { return }
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                var resolvedUid = noisedId
-                let znoise = await self.sessionClient.resolveNoisedCallIds(fids: [noisedId], gids: [])
-                if let mapped = znoise.friends[noisedId], !mapped.isEmpty {
-                    resolvedUid = mapped
-                } else {
-                    let dec = await self.sessionClient.decryptGlobalIds([noisedId])
-                    if let mapped = dec[noisedId], !mapped.isEmpty {
-                        resolvedUid = mapped
-                    }
-                }
-                let alias = self.cachedAliases[resolvedUid] ?? self.lookupPersonInfo(resolvedUid)?.name ?? ""
+                let alias = await self.resolveCallAliasName(for: noisedId)
                 let resp: [String: Any] = [
                     "type": "response",
                     "command": "getAliasName",
@@ -376,7 +366,197 @@ extension ZaloEngine {
         }
     }
 
-    internal func handleVoipControlEvent(act: String, rawDataValue: Any?, parsedData: [String: Any]) async {
+    struct IncomingCallMetadata: Sendable, Equatable {
+        var isGroup: Bool
+        var callerCandidateIds: [String]
+        var groupCandidateIds: [String]
+        var inlineCallerName: String
+        var inlineGroupName: String
+        var inlineAvatar: String
+        var inlineGroupAvatar: String
+    }
+
+    private nonisolated static func parseNestedObject(_ raw: Any?) -> [String: Any]? {
+        if let dict = raw as? [String: Any] { return dict }
+        if let s = raw as? String {
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("{"),
+               let data = trimmed.data(using: .utf8),
+               let obj = JSONLossless.parseObject(data) {
+                return obj
+            }
+        }
+        return nil
+    }
+
+    private nonisolated static func normalizeCandidateUserId(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("u"), trimmed.count > 1, trimmed.dropFirst().allSatisfy({ $0.isASCII && $0.isNumber }) {
+            return String(trimmed.dropFirst())
+        }
+        return trimmed
+    }
+
+    nonisolated static func isMeaningfulPersonName(_ name: String, rawUid: String = "") -> Bool {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != "Người dùng Zalo" else { return false }
+        if !rawUid.isEmpty && trimmed == rawUid { return false }
+        return true
+    }
+
+    nonisolated static func extractIncomingCallMetadata(act: String, parsedData: [String: Any]) -> IncomingCallMetadata {
+        var objs: [[String: Any]] = [parsedData]
+        for nestedKey in ["data", "extendData", "groupInfo"] {
+            if let nested = parseNestedObject(parsedData[nestedKey]) {
+                objs.append(nested)
+            }
+        }
+
+        func firstString(_ keys: [String]) -> String {
+            for key in keys {
+                for obj in objs {
+                    let s = JSONLossless.string(obj[key]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !s.isEmpty { return s }
+                }
+            }
+            return ""
+        }
+
+        var rawGroupIds: [String] = []
+        var seenGroupIds = Set<String>()
+        func appendGroupId(_ raw: String) {
+            let clean = ZaloWireParser.cleanGroupId(raw)
+            guard !clean.isEmpty, clean != "0", seenGroupIds.insert(clean).inserted else { return }
+            rawGroupIds.append(clean)
+        }
+
+        for key in ["groupId", "grid", "gid", "groupID"] {
+            for obj in objs {
+                let s = JSONLossless.string(obj[key]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !s.isEmpty { appendGroupId(s) }
+            }
+        }
+        for obj in objs {
+            let uidN = JSONLossless.string(obj["uidN"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if ZaloWireParser.isGroupId(uidN) {
+                appendGroupId(uidN)
+            }
+        }
+
+        let isGroup = (act == "group_request") || !rawGroupIds.isEmpty
+
+        var callerCandidates: [String] = []
+        var seenCallerIds = Set<String>()
+        func appendCallerId(_ raw: String) {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, trimmed != "0", !ZaloWireParser.isGroupId(trimmed) else { return }
+            let normalized = normalizeCandidateUserId(trimmed)
+            if !normalized.isEmpty, normalized != "0", seenCallerIds.insert(normalized).inserted {
+                callerCandidates.append(normalized)
+            }
+            if trimmed != normalized, seenCallerIds.insert(trimmed).inserted {
+                callerCandidates.append(trimmed)
+            }
+        }
+
+        for key in ["uidN", "fromUid", "uid", "uidFrom", "callerId", "hostCall", "fromId", "partnerId"] {
+            for obj in objs {
+                let raw = JSONLossless.string(obj[key])
+                if !raw.isEmpty { appendCallerId(raw) }
+            }
+        }
+
+        var callerNameKeys = ["callerName", "dName", "displayName", "fromDName", "partnerName"]
+        if !isGroup {
+            callerNameKeys.append("name")
+        }
+        let inlineCallerName = firstString(callerNameKeys)
+        var groupNameKeys = ["groupName", "gName", "grName", "groupname"]
+        if isGroup {
+            groupNameKeys.append("name")
+        }
+        let inlineGroupName = firstString(groupNameKeys)
+        let inlineAvatar = firstString(["avatar", "callerAvatar", "avt"])
+        let inlineGroupAvatar = firstString(["groupAvatar", "gAvatar", "grAvatar"])
+
+        return IncomingCallMetadata(
+            isGroup: isGroup,
+            callerCandidateIds: callerCandidates,
+            groupCandidateIds: rawGroupIds,
+            inlineCallerName: inlineCallerName,
+            inlineGroupName: inlineGroupName,
+            inlineAvatar: inlineAvatar,
+            inlineGroupAvatar: inlineGroupAvatar
+        )
+    }
+
+    private func resolvePersonFromCandidates(_ candidates: [String]) -> (uid: String, name: String, avatar: String)? {
+        var bestAvatar = ""
+        for rawUid in candidates {
+            let uid = Self.normalizeCandidateUserId(rawUid)
+            guard !uid.isEmpty else { continue }
+            if let info = lookupPersonInfo(uid) {
+                if bestAvatar.isEmpty && !info.avatar.isEmpty {
+                    bestAvatar = info.avatar
+                }
+                if Self.isMeaningfulPersonName(info.name, rawUid: uid) {
+                    return (uid, info.name, info.avatar.isEmpty ? bestAvatar : info.avatar)
+                }
+            }
+            if let mappedUid = cachedFriendGlobalIds.first(where: { $0.value == rawUid || $0.value == uid })?.key,
+               let info = lookupPersonInfo(mappedUid),
+               Self.isMeaningfulPersonName(info.name, rawUid: mappedUid) {
+                return (mappedUid, info.name, info.avatar.isEmpty ? bestAvatar : info.avatar)
+            }
+        }
+        return nil
+    }
+
+    internal func resolveCallAliasName(for noisedId: String) async -> String {
+        let trimmed = noisedId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        if let alias = cachedAliases[trimmed], Self.isMeaningfulPersonName(alias, rawUid: trimmed) {
+            return alias
+        }
+        if let local = resolvePersonFromCandidates([trimmed]) {
+            return cachedAliases[local.uid] ?? local.name
+        }
+        var candidates: [String] = [trimmed]
+        let znoise = await sessionClient.resolveNoisedCallIds(fids: [trimmed], gids: [])
+        if let mapped = znoise.friends[trimmed], !mapped.isEmpty {
+            candidates.insert(mapped, at: 0)
+        }
+        let dec = await sessionClient.decryptGlobalIds([trimmed])
+        if let mapped = dec[trimmed], !mapped.isEmpty {
+            candidates.insert(mapped, at: 0)
+        }
+        if let resolved = resolvePersonFromCandidates(candidates) {
+            return cachedAliases[resolved.uid] ?? resolved.name
+        }
+        let profileUids = candidates.compactMap { ZaloWireParser.sanitizeProfileUid($0) }
+        if !profileUids.isEmpty,
+           let profBox = try? await sessionClient.fetchProfiles(uids: profileUids) {
+            for (uid, row) in ZaloWireParser.extractProfilesMap(profBox.dict) {
+                let c = ZaloWireParser.stripUserPrefix(uid)
+                let n = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+                let a = JSONLossless.string(row["avatar"] ?? row["avt"])
+                if !c.isEmpty, (!n.isEmpty || !a.isEmpty) {
+                    cachedProfiles[c] = ZaloWebKitMigrator.CachedProfile(name: n, avatar: a)
+                }
+            }
+            if let resolved = resolvePersonFromCandidates(candidates) {
+                return cachedAliases[resolved.uid] ?? resolved.name
+            }
+        }
+        return ""
+    }
+
+    internal func handleVoipControlEvent(
+        act: String,
+        rawDataValue: Any?,
+        parsedData: [String: Any],
+        launchHelperIfNeeded: Bool = true
+    ) async {
         let trimmedAct = act.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedAct.isEmpty else { return }
 
@@ -418,41 +598,118 @@ extension ZaloEngine {
             let wasBusy = call.busy
             voipCtrl["inCallStatus"] = wasBusy ? "zalo" : NSNull()
 
-            let isGroup = (trimmedAct == "group_request") || !JSONLossless.string(parsedData["groupId"]).isEmpty
-            let callerUid = ZaloWireParser.stripUserPrefix(
-                JSONLossless.string(parsedData["callerId"] ?? parsedData["uidFrom"] ?? parsedData["hostCall"] ?? parsedData["fromUid"])
-            )
-            let rawGroupId = ZaloWireParser.cleanGroupId(JSONLossless.string(parsedData["groupId"] ?? parsedData["grid"]))
+            let meta = Self.extractIncomingCallMetadata(act: trimmedAct, parsedData: parsedData)
+            let isGroup = meta.isGroup
+            var resolvedCaller = resolvePersonFromCandidates(meta.callerCandidateIds)
+            var resolvedGroupIds = meta.groupCandidateIds
 
-            if !callerUid.isEmpty, lookupPersonInfo(callerUid) == nil,
-               let profBox = try? await sessionClient.fetchProfiles(uids: [callerUid]) {
-                for (uid, row) in ZaloWireParser.extractProfilesMap(profBox.dict) {
-                    let c = ZaloWireParser.stripUserPrefix(uid)
-                    let n = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
-                    let a = JSONLossless.string(row["avatar"] ?? row["avt"])
-                    if !c.isEmpty, (!n.isEmpty || !a.isEmpty) {
-                        cachedProfiles[c] = ZaloWebKitMigrator.CachedProfile(name: n, avatar: a)
+            var allCandidates = meta.callerCandidateIds
+            if resolvedCaller == nil && !meta.callerCandidateIds.isEmpty {
+                let decrypted = await sessionClient.decryptGlobalIds(meta.callerCandidateIds)
+                var newlyMapped: [String] = []
+                for cand in meta.callerCandidateIds {
+                    if let mapped = decrypted[cand], !mapped.isEmpty, !allCandidates.contains(mapped) {
+                        newlyMapped.append(mapped)
+                    }
+                }
+                if !newlyMapped.isEmpty {
+                    allCandidates = newlyMapped + allCandidates
+                    resolvedCaller = resolvePersonFromCandidates(allCandidates)
+                }
+            }
+
+            if (resolvedCaller == nil && !allCandidates.isEmpty) || (isGroup && !meta.groupCandidateIds.isEmpty) {
+                let znoise = await sessionClient.resolveNoisedCallIds(
+                    fids: resolvedCaller == nil ? allCandidates : [],
+                    gids: meta.groupCandidateIds
+                )
+                var mappedCallers: [String] = []
+                for cand in allCandidates {
+                    if let mapped = znoise.friends[cand], !mapped.isEmpty, !allCandidates.contains(mapped) {
+                        mappedCallers.append(mapped)
+                    }
+                }
+                if !mappedCallers.isEmpty {
+                    allCandidates = mappedCallers + allCandidates
+                    if resolvedCaller == nil {
+                        resolvedCaller = resolvePersonFromCandidates(allCandidates)
+                    }
+                }
+                for (i, gid) in resolvedGroupIds.enumerated() {
+                    if let mapped = znoise.groups[gid], !mapped.isEmpty {
+                        resolvedGroupIds[i] = ZaloWireParser.cleanGroupId(mapped)
                     }
                 }
             }
 
-            let callerInfo = callerUid.isEmpty ? nil : lookupPersonInfo(callerUid)
-            let callerName = (callerInfo?.name.isEmpty == false)
-                ? callerInfo!.name
-                : JSONLossless.string(parsedData["callerName"] ?? parsedData["dName"])
+            if resolvedCaller == nil {
+                var seenFetch = Set<String>()
+                let profileFetchUids = allCandidates.compactMap { raw -> String? in
+                    guard let uid = ZaloWireParser.sanitizeProfileUid(raw), seenFetch.insert(uid).inserted else { return nil }
+                    return uid
+                }
+                if !profileFetchUids.isEmpty,
+                   let profBox = try? await sessionClient.fetchProfiles(uids: profileFetchUids) {
+                    for (uid, row) in ZaloWireParser.extractProfilesMap(profBox.dict) {
+                        let c = ZaloWireParser.stripUserPrefix(uid)
+                        let n = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+                        let a = JSONLossless.string(row["avatar"] ?? row["avt"])
+                        if !c.isEmpty, (!n.isEmpty || !a.isEmpty) {
+                            cachedProfiles[c] = ZaloWebKitMigrator.CachedProfile(name: n, avatar: a)
+                        }
+                    }
+                    resolvedCaller = resolvePersonFromCandidates(allCandidates)
+                }
+            }
+
+            let callerName: String = {
+                if let resolvedCaller, Self.isMeaningfulPersonName(resolvedCaller.name, rawUid: resolvedCaller.uid) {
+                    return resolvedCaller.name
+                }
+                if Self.isMeaningfulPersonName(meta.inlineCallerName) {
+                    return meta.inlineCallerName
+                }
+                return ""
+            }()
+            let callerAvatar: String = {
+                if let resolvedCaller, !resolvedCaller.avatar.isEmpty {
+                    return resolvedCaller.avatar
+                }
+                return meta.inlineAvatar
+            }()
 
             if !wasBusy, call.helperInstalled, call.helperProblem == nil {
                 let incoming: CallState.Incoming = {
                     if isGroup {
-                        let gConvId = ZaloWireParser.groupConvId(rawGroupId)
-                        let gIdent: (name: String, avatar: URL?, members: Int) = rawGroupId.isEmpty
-                            ? (name: "", avatar: nil, members: 0)
-                            : lookupConversationIdentity(gConvId)
-                        let gName = (!gIdent.name.isEmpty && gIdent.name != gConvId)
-                            ? gIdent.name
-                            : JSONLossless.string(parsedData["groupName"])
+                        var gName = ""
+                        var gAvatar: URL?
+                        for rawGroupId in resolvedGroupIds {
+                            let gConvId = ZaloWireParser.groupConvId(rawGroupId)
+                            guard !gConvId.isEmpty else { continue }
+                            let gIdent = lookupConversationIdentity(gConvId)
+                            if gName.isEmpty && Self.isMeaningfulPersonName(gIdent.name, rawUid: gConvId) {
+                                gName = gIdent.name
+                            }
+                            if gAvatar == nil {
+                                gAvatar = gIdent.avatar
+                            }
+                            if gName.isEmpty, let conv = conversations.first(where: { $0.id == gConvId }) {
+                                if Self.isMeaningfulPersonName(conv.name, rawUid: gConvId) {
+                                    gName = conv.name
+                                }
+                                if gAvatar == nil {
+                                    gAvatar = conv.avatar
+                                }
+                            }
+                            if !gName.isEmpty { break }
+                        }
+                        if gName.isEmpty && Self.isMeaningfulPersonName(meta.inlineGroupName) {
+                            gName = meta.inlineGroupName
+                        }
                         let title = !gName.isEmpty ? gName : (!callerName.isEmpty ? callerName : "Cuộc gọi nhóm")
-                        let avt = gIdent.avatar ?? (callerInfo?.avatar.isEmpty == false ? URL(string: callerInfo!.avatar) : nil)
+                        let avt = gAvatar
+                            ?? (meta.inlineGroupAvatar.isEmpty ? nil : URL(string: meta.inlineGroupAvatar))
+                            ?? (callerAvatar.isEmpty ? nil : URL(string: callerAvatar))
                         return CallState.Incoming(
                             name: title,
                             avatar: avt,
@@ -461,10 +718,9 @@ extension ZaloEngine {
                         )
                     } else {
                         let title = !callerName.isEmpty ? callerName : "Một người bạn"
-                        let avtStr = (callerInfo?.avatar.isEmpty == false) ? callerInfo!.avatar : JSONLossless.string(parsedData["avatar"])
                         return CallState.Incoming(
                             name: title,
-                            avatar: avtStr.isEmpty ? nil : URL(string: avtStr),
+                            avatar: callerAvatar.isEmpty ? nil : URL(string: callerAvatar),
                             group: false,
                             caller: nil
                         )
@@ -475,16 +731,19 @@ extension ZaloEngine {
                 scheduleIncomingExpiry(incoming.id)
             }
 
-            ensureCallBridgeStartedIfNeeded()
-            let ctrlJSON = ZaloVoiceCallProtocol.buildControlJSON(voipPayload: voipCtrl)
-            EngineLog.shared.write("call: recv incoming voip act=\(trimmedAct) group=\(isGroup) busy=\(wasBusy)")
-            callBridge?.sendToNative(json: ctrlJSON, optional: false)
+            let keyList = parsedData.keys.sorted().joined(separator: ",")
+            EngineLog.shared.write("call: recv incoming voip act=\(trimmedAct) group=\(isGroup) busy=\(wasBusy) resolved=\(!callerName.isEmpty) keys=\(keyList)")
+            if launchHelperIfNeeded {
+                ensureCallBridgeStartedIfNeeded()
+                let ctrlJSON = ZaloVoiceCallProtocol.buildControlJSON(voipPayload: voipCtrl)
+                callBridge?.sendToNative(json: ctrlJSON, optional: false)
+            }
         } else {
             let terminalActs: Set<String> = ["answer", "cancel", "endcall", "group_answer", "group_cancel", "group_endcall", "finish"]
             if terminalActs.contains(trimmedAct) {
                 call.incoming = nil
             }
-            if callBridge != nil {
+            if launchHelperIfNeeded, callBridge != nil {
                 let ctrlJSON = ZaloVoiceCallProtocol.buildControlJSON(voipPayload: voipCtrl)
                 EngineLog.shared.write("call: forward voip control act=\(trimmedAct)")
                 callBridge?.sendToNative(json: ctrlJSON, optional: true)

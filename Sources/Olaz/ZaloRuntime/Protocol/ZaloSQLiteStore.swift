@@ -298,9 +298,22 @@ actor ZaloSQLiteStore {
         return out
     }
 
-    func saveMessages(_ items: [StoredMessage], skipTwinChecks: Bool = false) throws {
+    func saveMessages(_ items: [StoredMessage], skipTwinChecks: Bool = false, preserveExistingReactions: Bool = false) throws {
         guard !items.isEmpty else { return }
         try inTransaction {
+            let rawJSONUpdateExpr: String = preserveExistingReactions
+                ? """
+                CASE
+                    WHEN excluded.kind_tag != 'recalled'
+                         AND json_valid(messages.raw_json)
+                         AND json_valid(excluded.raw_json)
+                         AND COALESCE(json_array_length(excluded.raw_json, '$.reactions'), 0) = 0
+                         AND COALESCE(json_array_length(messages.raw_json, '$.reactions'), 0) > 0
+                    THEN json_set(excluded.raw_json, '$.reactions', json_extract(messages.raw_json, '$.reactions'))
+                    ELSE excluded.raw_json
+                END
+                """
+                : "excluded.raw_json"
             let upsertSQL = """
             INSERT INTO messages(id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
@@ -314,14 +327,14 @@ actor ZaloSQLiteStore {
                 kind_tag = excluded.kind_tag,
                 ts_ms = CASE WHEN excluded.ts_ms > 0 THEN excluded.ts_ms ELSE messages.ts_ms END,
                 status = excluded.status,
-                raw_json = excluded.raw_json
+                raw_json = \(rawJSONUpdateExpr)
             WHERE excluded.status != 'e2ee_locked' OR messages.status = 'e2ee_locked';
             """
             let checkPlainTwinSQL = """
-            SELECT 1 FROM (
-                SELECT 1 FROM messages WHERE conv_id = ?1 AND id = ?2 AND status != 'e2ee_locked'
+            SELECT id FROM (
+                SELECT id FROM messages WHERE conv_id = ?1 AND id = ?2 AND status != 'e2ee_locked'
                 UNION ALL
-                SELECT 1 FROM messages WHERE conv_id = ?1 AND client_id = ?2 AND status != 'e2ee_locked'
+                SELECT id FROM messages WHERE conv_id = ?1 AND client_id = ?2 AND status != 'e2ee_locked'
             ) LIMIT 1;
             """
             let deleteStaleIdTwinSQL = """
@@ -350,6 +363,15 @@ actor ZaloSQLiteStore {
                         bindText(checkStmt, 1, m.convId)
                         bindText(checkStmt, 2, m.clientId)
                         if sqlite3_step(checkStmt) == SQLITE_ROW {
+                            let existingId = columnText(checkStmt, 0)
+                            if existingId == m.clientId, !m.id.isEmpty, m.id != m.clientId {
+                                _ = try? performUpgradeMessageIdInTransaction(
+                                    convId: m.convId,
+                                    oldId: m.clientId,
+                                    newId: m.id,
+                                    clientId: m.clientId
+                                )
+                            }
                             continue
                         }
                     } else if !isLocked, m.clientId != m.id, let delIdStmt, let delClientStmt {
@@ -387,6 +409,121 @@ actor ZaloSQLiteStore {
                 try stepDone(stmt)
             }
         }
+    }
+
+    /// One-time migration scrubbing pre-fix corrupted/ghost reactions (entries missing `userCounts`
+    /// or containing sentinel keys like `"__legacy__"` / `"unknown"` / placeholder `"Người dùng Zalo"`).
+    @discardableResult
+    func repairLegacyReactions(myUid: String) throws -> Int {
+        if (try? getPreferenceString(key: "reactionRepairVersion")) == "2" {
+            return 0
+        }
+
+        let cleanMyUid = ZaloWireParser.sanitizeProfileUid(myUid) ?? ZaloWireParser.stripUserPrefix(myUid)
+        let sentinelKeys: Set<String> = ["", "__legacy__", "unknown", "-1"]
+
+        let stmt = try prepare("""
+        SELECT id, conv_id, raw_json
+        FROM messages
+        WHERE json_valid(raw_json)
+          AND COALESCE(json_array_length(raw_json, '$.reactions'), 0) > 0;
+        """)
+        defer { sqlite3_finalize(stmt) }
+
+        var rows: [(id: String, convId: String, rawJSON: String)] = []
+        while true {
+            let rc = sqlite3_step(stmt)
+            if rc == SQLITE_DONE { break }
+            guard rc == SQLITE_ROW else { throw ZaloSQLiteError.stepFailed(lastError) }
+            rows.append((
+                id: columnText(stmt, 0),
+                convId: columnText(stmt, 1),
+                rawJSON: columnText(stmt, 2)
+            ))
+        }
+
+        var repaired = 0
+        try inTransaction {
+            let updStmt = try prepare("UPDATE messages SET raw_json = ?1 WHERE conv_id = ?2 AND id = ?3;")
+            defer { sqlite3_finalize(updStmt) }
+
+            for row in rows {
+                guard let rawData = row.rawJSON.data(using: .utf8),
+                      var obj = try? JSONSerialization.jsonObject(with: rawData) as? [String: Any],
+                      let rawReacts = obj["reactions"] as? [[String: Any]] else {
+                    continue
+                }
+
+                var cleanedReacts: [[String: Any]] = []
+                for var react in rawReacts {
+                    let typeStr = JSONLossless.string(react["type"]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let numericType = Int(typeStr), numericType < 0 {
+                        continue
+                    }
+                    guard let ucDict = react["userCounts"] as? [String: Any], !ucDict.isEmpty else {
+                        // Drop pre-fix legacy rows lacking `userCounts`.
+                        continue
+                    }
+
+                    var normalizedUC: [String: Int] = [:]
+                    for (rawKey, rawVal) in ucDict {
+                        let trimmedKey = rawKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !sentinelKeys.contains(trimmedKey) else { continue }
+                        let countVal = Int(JSONLossless.int64(rawVal) ?? 0)
+                        guard countVal > 0 else { continue }
+                        let canonicalKey: String = {
+                            if (trimmedKey == "0" || trimmedKey == "me"), !cleanMyUid.isEmpty {
+                                return cleanMyUid
+                            }
+                            return ZaloWireParser.sanitizeProfileUid(trimmedKey) ?? trimmedKey
+                        }()
+                        guard !sentinelKeys.contains(canonicalKey) else { continue }
+                        normalizedUC[canonicalKey, default: 0] += countVal
+                    }
+
+                    let totalCount = normalizedUC.values.reduce(0, +)
+                    guard totalCount > 0 else { continue }
+
+                    let includesMe = !cleanMyUid.isEmpty && (normalizedUC[cleanMyUid] ?? 0) > 0
+                    let existingNames = (react["names"] as? [String] ?? []).filter {
+                        let t = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                        return !t.isEmpty && t != "Người dùng Zalo"
+                    }
+                    react["userCounts"] = normalizedUC
+                    react["count"] = totalCount
+                    react["people"] = normalizedUC.count
+                    react["includesMe"] = includesMe
+                    react["names"] = existingNames
+                    cleanedReacts.append(react)
+                }
+
+                let changed: Bool = {
+                    if cleanedReacts.count != rawReacts.count { return true }
+                    guard let oldData = try? JSONSerialization.data(withJSONObject: rawReacts, options: [.sortedKeys]),
+                          let newData = try? JSONSerialization.data(withJSONObject: cleanedReacts, options: [.sortedKeys]) else {
+                        return true
+                    }
+                    return oldData != newData
+                }()
+                guard changed else { continue }
+
+                obj["reactions"] = cleanedReacts
+                guard let updatedData = try? JSONSerialization.data(withJSONObject: obj),
+                      let updatedStr = String(data: updatedData, encoding: .utf8) else {
+                    continue
+                }
+                sqlite3_reset(updStmt)
+                sqlite3_clear_bindings(updStmt)
+                bindText(updStmt, 1, updatedStr)
+                bindText(updStmt, 2, row.convId)
+                bindText(updStmt, 3, row.id)
+                try stepDone(updStmt)
+                repaired += 1
+            }
+        }
+
+        try setPreferenceString(key: "reactionRepairVersion", value: "2")
+        return repaired
     }
 
     /// Scans for any legacy undecrypted Signal ciphertext rows (`AzM...` / `AjM...` / `?eid=AzM...` / `?e2esession=AzM...`),
@@ -796,6 +933,82 @@ actor ZaloSQLiteStore {
         )
     }
 
+    @discardableResult
+    func upgradeMessageId(convId: String, oldId: String, newId: String, clientId: String) throws -> Bool {
+        var upgraded = false
+        try inTransaction {
+            upgraded = try performUpgradeMessageIdInTransaction(
+                convId: convId,
+                oldId: oldId,
+                newId: newId,
+                clientId: clientId
+            )
+        }
+        return upgraded
+    }
+
+    private func performUpgradeMessageIdInTransaction(
+        convId: String,
+        oldId: String,
+        newId: String,
+        clientId: String
+    ) throws -> Bool {
+        guard !convId.isEmpty, !oldId.isEmpty, !newId.isEmpty, oldId != newId else { return false }
+
+        let targetCheck = try prepare("SELECT 1 FROM messages WHERE conv_id = ?1 AND id = ?2 LIMIT 1;")
+        defer { sqlite3_finalize(targetCheck) }
+        bindText(targetCheck, 1, convId)
+        bindText(targetCheck, 2, newId)
+        if sqlite3_step(targetCheck) == SQLITE_ROW {
+            return false
+        }
+
+        let sourceFetch = try prepare("""
+        SELECT raw_json FROM messages
+        WHERE conv_id = ?1 AND id = ?2 AND status != 'e2ee_locked'
+        LIMIT 1;
+        """)
+        defer { sqlite3_finalize(sourceFetch) }
+        bindText(sourceFetch, 1, convId)
+        bindText(sourceFetch, 2, oldId)
+        guard sqlite3_step(sourceFetch) == SQLITE_ROW else {
+            return false
+        }
+
+        let oldRaw = columnText(sourceFetch, 0)
+        let updatedRawJSON: String = {
+            guard let data = oldRaw.data(using: .utf8),
+                  var obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                return oldRaw
+            }
+            obj["id"] = newId
+            if !clientId.isEmpty {
+                obj["clientId"] = clientId
+            }
+            guard let outData = try? JSONSerialization.data(withJSONObject: obj),
+                  let str = String(data: outData, encoding: .utf8) else {
+                return oldRaw
+            }
+            return str
+        }()
+
+        let upd = try prepare("""
+        UPDATE messages
+        SET id = ?1,
+            client_id = CASE WHEN ?2 != '' THEN ?2 ELSE client_id END,
+            raw_json = ?3
+        WHERE conv_id = ?4 AND id = ?5 AND status != 'e2ee_locked';
+        """)
+        defer { sqlite3_finalize(upd) }
+        bindText(upd, 1, newId)
+        bindText(upd, 2, clientId)
+        bindText(upd, 3, updatedRawJSON)
+        bindText(upd, 4, convId)
+        bindText(upd, 5, oldId)
+        try stepDone(upd)
+        return sqlite3_changes(db) > 0
+    }
+
     func deleteMessage(convId: String, id: String) throws {
         try inTransaction {
             let s1 = try prepare("DELETE FROM messages WHERE conv_id = ?1 AND id = ?2;")
@@ -812,14 +1025,27 @@ actor ZaloSQLiteStore {
         }
     }
 
-    func markRecalled(convId: String, id: String) throws {
-        guard let existing = try message(convId: convId, idOrClientId: id),
+    func markRecalled(convId: String, id: String, cliMsgId: String = "") throws {
+        let lookup = try message(convId: convId, idOrClientId: id)
+            ?? (!cliMsgId.isEmpty ? try message(convId: convId, idOrClientId: cliMsgId) : nil)
+        guard let existing = lookup,
               var dict = (try? JSONSerialization.jsonObject(with: existing.rawJSONData)) as? [String: Any] else {
             return
         }
         dict["type"] = "recalled"
         dict["kind"] = ["type": "recalled"]
         dict["text"] = ""
+        dict["reactions"] = []
+        dict["buttons"] = []
+        dict.removeValue(forKey: "quote")
+        if var menu = dict["menu"] as? [String: Any] {
+            menu["recall"] = false
+            menu["forward"] = ""
+            menu["pin"] = false
+            menu["star"] = ""
+            menu["starred"] = false
+            dict["menu"] = menu
+        }
         guard let updatedData = try? JSONSerialization.data(withJSONObject: dict) else { return }
         let updated = StoredMessage(
             id: existing.id, convId: existing.convId, clientId: existing.clientId,

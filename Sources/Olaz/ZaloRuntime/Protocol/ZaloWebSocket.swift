@@ -5,6 +5,11 @@ struct ZaloWSQueue: Hashable, Sendable {
     let subCmd: UInt8
 }
 
+struct ZaloWSQueueCursorSnapshot: Codable, Equatable, Sendable {
+    var lastId: String
+    var preIds: [String]
+}
+
 struct ZaloWSEvent: @unchecked Sendable {
     let cmd: UInt16
     let subCmd: UInt8
@@ -111,8 +116,33 @@ actor ZaloWebSocket {
     private var fileWaiters: [String: [CheckedContinuation<String?, Never>]] = [:]
     private var requestWaiters: [String: CheckedContinuation<ZaloJSONBox?, Never>] = [:]
     private var queueCursors: [String: QueueCursor] = [:]
+    private var onQueueCursorsChanged: (@Sendable ([String: ZaloWSQueueCursorSnapshot]) -> Void)?
 
     var isAuthed: Bool { authed }
+
+    func setQueueCursorObserver(_ observer: (@Sendable ([String: ZaloWSQueueCursorSnapshot]) -> Void)?) {
+        onQueueCursorsChanged = observer
+    }
+
+    func seedQueueCursors(_ snapshots: [String: ZaloWSQueueCursorSnapshot]) {
+        for (qkey, snap) in snapshots {
+            let trimmed = snap.lastId.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, trimmed != "0", trimmed != "1" else { continue }
+            let lastIdVal: Any = Int64(trimmed) ?? trimmed
+            queueCursors[qkey] = QueueCursor(lastId: lastIdVal, preIds: snap.preIds)
+        }
+    }
+
+    func currentQueueCursors() -> [String: ZaloWSQueueCursorSnapshot] {
+        var out: [String: ZaloWSQueueCursorSnapshot] = [:]
+        for (qkey, cursor) in queueCursors {
+            let lastStr = JSONLossless.string(cursor.lastId).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !lastStr.isEmpty, lastStr != "0", lastStr != "1" else { continue }
+            let pre = (cursor.preIds as? [Any])?.map(JSONLossless.string).filter { !$0.isEmpty } ?? []
+            out[qkey] = ZaloWSQueueCursorSnapshot(lastId: lastStr, preIds: pre)
+        }
+        return out
+    }
 
     func start(endpoints: [String], zpwSek: String) -> AsyncStream<ZaloWSEvent> {
         stop(resetCursors: false)
@@ -186,7 +216,7 @@ actor ZaloWebSocket {
         for cont in list { cont.resume(returning: nil) }
     }
 
-    private func recordFileDone(fileId: String, url: String) {
+    func recordFileDone(fileId: String, url: String) {
         guard !fileId.isEmpty, !url.isEmpty else { return }
         completedFileURLs[fileId] = url
         if completedFileURLs.count > 200 {
@@ -527,27 +557,42 @@ actor ZaloWebSocket {
         if let payloadData = payloadDataDict {
             let qkey = "\(cmd)_\(subCmd)"
             let qStatus = (payloadData["queueStatus"] as? [String: Any])?[qkey] as? [String: Any]
-            let candidateLastId: Any? = payloadData["lastActionId"]
-                ?? qStatus?["lastId"]
-                ?? Self.highestActionId(in: payloadData).map { $0 as Any }
-            let preIds: Any = qStatus?["ids"] ?? []
-            if let candidateLastId, !JSONLossless.string(candidateLastId).isEmpty, JSONLossless.string(candidateLastId) != "0" {
-                queueCursors[qkey] = QueueCursor(lastId: candidateLastId, preIds: preIds)
-            }
-            if JSONLossless.int64(payloadData["more"]) == 1 {
-                let lastId: Any = candidateLastId ?? queueCursors[qkey]?.lastId ?? 1
-                let nextPull = Self.pullNextFrame(cmd: cmd, subCmd: subCmd, reqId: nextReqId(), lastId: lastId, preIds: preIds)
-                try? await task.send(.data(nextPull))
+            let shouldReset = JSONLossless.bool(payloadData["resetLastActionId"]) == true
+                || JSONLossless.int64(payloadData["resetLastActionId"]) == 1
+            if shouldReset {
+                if queueCursors.removeValue(forKey: qkey) != nil {
+                    onQueueCursorsChanged?(currentQueueCursors())
+                }
+            } else {
+                let candidateLastId: Any? = payloadData["lastActionId"]
+                    ?? qStatus?["lastId"]
+                    ?? Self.highestActionId(in: payloadData).map { $0 as Any }
+                let preIds: Any = qStatus?["ids"] ?? []
+                if let candidateLastId,
+                   !JSONLossless.string(candidateLastId).isEmpty,
+                   JSONLossless.string(candidateLastId) != "0" {
+                    let prev = currentQueueCursors()
+                    queueCursors[qkey] = QueueCursor(lastId: candidateLastId, preIds: preIds)
+                    let updated = currentQueueCursors()
+                    if updated != prev {
+                        onQueueCursorsChanged?(updated)
+                    }
+                }
+                if JSONLossless.int64(payloadData["more"]) == 1 {
+                    let lastId: Any = candidateLastId ?? queueCursors[qkey]?.lastId ?? 1
+                    let nextPull = Self.pullNextFrame(cmd: cmd, subCmd: subCmd, reqId: nextReqId(), lastId: lastId, preIds: preIds)
+                    try? await task.send(.data(nextPull))
+                }
             }
         }
 
         continuation?.yield(ZaloWSEvent(cmd: cmd, subCmd: subCmd, version: version, payload: payload))
     }
 
-    private static func highestActionId(in payloadData: [String: Any]) -> String? {
+    static func highestActionId(in payloadData: [String: Any]) -> String? {
         var maxVal: Int64 = 0
         var maxStr: String?
-        for key in ["actions", "controls", "msgs", "groupMsgs"] {
+        for key in ["actions", "controls", "msgs", "groupMsgs", "reacts", "reactGroups"] {
             guard let rows = payloadData[key] as? [[String: Any]] else { continue }
             for row in rows {
                 let raw = row["actionId"] ?? row["actId"] ?? row["id"]
@@ -595,7 +640,7 @@ actor ZaloWebSocket {
                 return item
             }()
             let actType = JSONLossless.string(contentObj["act_type"] ?? contentObj["actType"])
-            guard actType == "file_done" else { continue }
+            guard actType == "file_done" || actType == "video_done" else { continue }
             let dObj: [String: Any] = {
                 if let d = contentObj["data"] as? [String: Any] { return d }
                 if let dStr = contentObj["data"] as? String,

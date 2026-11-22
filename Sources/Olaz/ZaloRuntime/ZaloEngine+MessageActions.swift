@@ -206,7 +206,14 @@ extension ZaloEngine {
                         isMine: true, kind: .contactCard(card), text: "[Danh thiếp] \(card.name)",
                         date: Date(), status: .sent, quote: nil, reactions: [], isE2EE: false,
                         mentions: [], cardButtons: [], suggestsStickers: false,
-                        menu: MessageMenu(json: ["forward": "ok", "recall": true, "delete": "forMe", "pin": ZaloWireParser.isGroupId(target), "star": "star"])
+                        menu: MessageMenu(json: [
+                            "forward": "ok",
+                            "recall": target != selfConversationId,
+                            "delete": target == selfConversationId ? "plain" : "forMe",
+                            "pin": ZaloWireParser.isGroupId(target) && target != selfConversationId,
+                            "star": "star"
+                        ]),
+                        clientId: res.cliMsgId
                     )
                     mergeMessageIntoMemory(msg, replacingClientId: res.cliMsgId)
                     if let stored = ZaloWireParser.encodeChatMessage(msg, clientId: res.cliMsgId) {
@@ -240,17 +247,179 @@ extension ZaloEngine {
     // MARK: Thu hồi
 
     func recall(_ message: ChatMessage) {
+        Task {
+            await performRecall(message)
+        }
+    }
+
+    nonisolated static func findServerMsgId(in payload: [String: Any], matchingClientId: String) -> String? {
+        let targetCli = matchingClientId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !targetCli.isEmpty else { return nil }
+
+        func search(_ node: Any, depth: Int) -> String? {
+            guard depth < 8 else { return nil }
+            if let s = node as? String {
+                let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                if (trimmed.hasPrefix("{") || trimmed.hasPrefix("[")),
+                   let data = trimmed.data(using: .utf8),
+                   let parsed = JSONLossless.parseAny(data) {
+                    return search(parsed, depth: depth + 1)
+                }
+                return nil
+            }
+            if let arr = node as? [Any] {
+                for item in arr {
+                    if let found = search(item, depth: depth + 1) { return found }
+                }
+                return nil
+            }
+            guard let dict = node as? [String: Any] else { return nil }
+            let cli = JSONLossless.string(dict["cliMsgId"] ?? dict["clientId"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if cli == targetCli {
+                let msgId = JSONLossless.string(dict["msgId"] ?? dict["globalMsgId"] ?? dict["minGlobalMsgId"])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !msgId.isEmpty && msgId != "0" && msgId != targetCli {
+                    return msgId
+                }
+            }
+            for key in ["data", "msgs", "groupMsgs", "messages", "list"] {
+                if let sub = dict[key], let found = search(sub, depth: depth + 1) {
+                    return found
+                }
+            }
+            for (k, v) in dict where !["data", "msgs", "groupMsgs", "messages", "list"].contains(k) {
+                if (v is [String: Any] || v is [Any] || v is String),
+                   let found = search(v, depth: depth + 1) {
+                    return found
+                }
+            }
+            return nil
+        }
+
+        return search(payload, depth: 0)
+    }
+
+    internal func resolveServerAndClientIds(for message: ChatMessage) async -> (msgId: String, cliMsgId: String) {
         let conv = message.conversationId
+        var resolvedCliId = message.clientId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if resolvedCliId.isEmpty, let store = sqliteStore,
+           let stored = try? await store.message(convId: conv, idOrClientId: message.id) {
+            let colCli = stored.clientId.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !colCli.isEmpty {
+                resolvedCliId = colCli
+            } else if let obj = (try? JSONSerialization.jsonObject(with: stored.rawJSONData)) as? [String: Any] {
+                let rawCli = JSONLossless.string(obj["clientId"] ?? obj["cliMsgId"]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !rawCli.isEmpty { resolvedCliId = rawCli }
+            }
+        }
+        if resolvedCliId.isEmpty {
+            resolvedCliId = message.id
+        }
+
+        var effectiveMsgId = message.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        if effectiveMsgId.isEmpty || effectiveMsgId == resolvedCliId {
+            if let store = sqliteStore,
+               let stored = try? await store.message(convId: conv, idOrClientId: resolvedCliId),
+               !stored.id.isEmpty,
+               stored.id != resolvedCliId {
+                effectiveMsgId = stored.id
+                if var list = messages[conv],
+                   let idx = list.firstIndex(where: { $0.id == message.id || $0.clientId == resolvedCliId }) {
+                    list[idx].id = stored.id
+                    if list[idx].clientId.isEmpty {
+                        list[idx].clientId = resolvedCliId
+                    }
+                    messages[conv] = list
+                }
+            } else if let histBox = try? await sessionClient.fetchHistory(convId: conv, lastMsgId: nil, count: 30),
+                      let resolved = Self.findServerMsgId(in: histBox.dict, matchingClientId: resolvedCliId) {
+                effectiveMsgId = resolved
+                if var list = messages[conv],
+                   let idx = list.firstIndex(where: { $0.id == message.id || $0.clientId == resolvedCliId }) {
+                    list[idx].id = resolved
+                    if list[idx].clientId.isEmpty {
+                        list[idx].clientId = resolvedCliId
+                    }
+                    messages[conv] = list
+                }
+                _ = try? await sqliteStore?.upgradeMessageId(
+                    convId: conv,
+                    oldId: message.id,
+                    newId: resolved,
+                    clientId: resolvedCliId
+                )
+            }
+        }
+        if effectiveMsgId.isEmpty {
+            effectiveMsgId = resolvedCliId
+        }
+        return (effectiveMsgId, resolvedCliId)
+    }
+
+    internal func performRecall(_ message: ChatMessage) async {
+        let conv = message.conversationId
+        guard !conv.isEmpty,
+              conv != selfConversationId,
+              message.isMine,
+              message.kind != .recalled,
+              message.status != .sending,
+              message.status != .failed else {
+            return
+        }
+        if Date().timeIntervalSince(message.date) >= 86_400 {
+            CardActionCenter.shared.show("Bạn chỉ có thể thu hồi tin nhắn đã gửi trong vòng 24 giờ.", in: conv)
+            return
+        }
         let key = "\(conv)|\(message.id)|recall"
         guard messageActionsBusy.insert(key).inserted else { return }
-        Task {
-            defer { messageActionsBusy.remove(key) }
+        defer { messageActionsBusy.remove(key) }
+
+        let (effectiveMsgId, resolvedCliId) = await resolveServerAndClientIds(for: message)
+
+        let primaryIsE2EE = message.isE2EE
+        let canTryAlternateRoute: Bool
+        if primaryIsE2EE {
+            canTryAlternateRoute = true
+        } else if ZaloWireParser.isGroupId(conv) {
+            canTryAlternateRoute = true
+        } else {
+            canTryAlternateRoute = await e2eeManager.isE2EEConversation(conv)
+        }
+        var retriedAlt = false
+
+        do {
             do {
-                try await sessionClient.recallMessageAPI(convId: conv, msgId: message.id, cliMsgId: message.id)
-                await applyRemoteRecall(convId: conv, msgId: message.id, cliMsgId: message.id)
-            } catch {
-                CardActionCenter.shared.show("Thu hồi tin nhắn không thành công", in: conv)
+                try await sessionClient.recallMessageAPI(
+                    convId: conv,
+                    msgId: effectiveMsgId,
+                    cliMsgId: resolvedCliId,
+                    isE2EE: primaryIsE2EE
+                )
+            } catch let err as ZaloSessionError where err.code == 112 && canTryAlternateRoute {
+                retriedAlt = true
+                try await sessionClient.recallMessageAPI(
+                    convId: conv,
+                    msgId: effectiveMsgId,
+                    cliMsgId: resolvedCliId,
+                    isE2EE: !primaryIsE2EE
+                )
             }
+            await applyRemoteRecall(convId: conv, msgId: effectiveMsgId, cliMsgId: resolvedCliId)
+        } catch let err as ZaloSessionError {
+            let msgNote = err.message.isEmpty ? "-" : err.message
+            EngineLog.shared.write(
+                "recall failed: code=\(err.code) msg=\(msgNote) primaryE2EE=\(primaryIsE2EE) retriedAlt=\(retriedAlt) sameId=\(effectiveMsgId == resolvedCliId) msgId=\(effectiveMsgId) cliId=\(resolvedCliId)"
+            )
+            let text = (err.code == 211)
+                ? "Tin nhắn đã quá thời hạn thu hồi."
+                : "Thu hồi tin nhắn không thành công (mã lỗi \(err.code))."
+            CardActionCenter.shared.show(text, in: conv)
+        } catch is URLError {
+            EngineLog.shared.write("recall failed: network error")
+            CardActionCenter.shared.show("Không có kết nối mạng. Vui lòng kiểm tra và thử lại.", in: conv)
+        } catch {
+            EngineLog.shared.write("recall failed: \(error.localizedDescription)")
+            CardActionCenter.shared.show("Thu hồi tin nhắn không thành công.", in: conv)
         }
     }
 
@@ -313,11 +482,12 @@ extension ZaloEngine {
 
     private func commitPendingDelete(id: String) {
         guard let msg = pendingDeletedMessages.removeValue(forKey: id) else { return }
+        let resolvedCliId = msg.clientId.isEmpty ? msg.id : msg.clientId
         Task {
             try? await sessionClient.deleteMessageForMeAPI(
                 convId: msg.conversationId,
                 msgId: msg.id,
-                cliMsgId: msg.id,
+                cliMsgId: resolvedCliId,
                 senderId: msg.senderId
             )
             try? await sqliteStore?.deleteMessage(convId: msg.conversationId, id: msg.id)

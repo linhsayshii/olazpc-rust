@@ -609,6 +609,29 @@ actor ZaloE2EEManager {
         )
     }
 
+    func encryptFileMessage(
+        peerUid: String,
+        myUid: String,
+        e2eSessionB64: String,
+        fileMsgParamsJSON: String,
+        fileName: String,
+        store: ZaloSQLiteStore?
+    ) async -> [(toId: String, platform: Int, registrationId: Int, ciphers: [String])] {
+        await encryptBatch(
+            peerUid: peerUid,
+            myUid: myUid,
+            values: [
+                .string(e2eSessionB64),
+                .string(""),
+                .string(fileMsgParamsJSON),
+                .string(fileName),
+                .string(""),
+            ],
+            formats: ["string", "string", "string", "string", "string"],
+            store: store
+        )
+    }
+
     private func encryptBatch(
         peerUid: String,
         myUid: String,

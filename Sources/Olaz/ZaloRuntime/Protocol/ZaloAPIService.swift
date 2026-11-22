@@ -940,11 +940,15 @@ extension ZaloSessionClient {
         senderIid: Int,
         ttl: Int = 0,
         useLegacyE2EEKey: Bool = false,
+        version: Int = 1,
+        compatVersion: Int = 1,
         extraFields: [String: Any] = [:]
     ) -> [String: Any] {
         let extJSON = buildE2EEExtJSON(
             registrationId: registrationId,
-            senderRegistrationId: senderIid
+            senderRegistrationId: senderIid,
+            version: version,
+            compatVersion: compatVersion
         )
         var entry: [String: Any] = [
             "toId": ZaloWireParser.stripUserPrefix(toId),
@@ -958,6 +962,98 @@ extension ZaloSessionClient {
             entry[k] = v
         }
         return entry
+    }
+
+    static func buildFileMsgParamsJSON(md5Hex: String, fileExt: String, fileSize: Int64) -> String {
+        let obj: [String: Any] = [
+            "checksum": md5Hex,
+            "checksumSha": "",
+            "fType": 1,
+            "fdata": "{}",
+            "fileExt": fileExt,
+            "fileSize": fileSize,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]),
+              let str = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return str
+    }
+
+    static func buildE2EEFileListParamEntry(
+        toId: String,
+        platform: Int,
+        clientId: Int64,
+        imei: String,
+        registrationId: Int,
+        senderIid: Int,
+        rawFileUrl: String,
+        fileId: String,
+        cipherSession: String,
+        cipherParams: String,
+        cipherFileName: String,
+        cipherThumb: String,
+        ttl: Int = 0
+    ) -> [String: Any] {
+        let sep = rawFileUrl.contains("?") ? "&e2esession=" : "?e2esession="
+        let fidVal: Any = Int64(fileId) ?? fileId
+        return buildE2EEListParamEntry(
+            toId: toId,
+            platform: platform,
+            clientId: clientId,
+            imei: imei,
+            registrationId: registrationId,
+            senderIid: senderIid,
+            ttl: ttl,
+            version: 0,
+            compatVersion: 0,
+            extraFields: [
+                "fileId": fidVal,
+                "fileUrl": "\(rawFileUrl)\(sep)\(cipherSession)",
+                "prmE2EE": cipherParams,
+                "fileName": cipherFileName,
+                "thumb": cipherThumb,
+            ]
+        )
+    }
+
+    static func buildAsyncFileMsgPayload(
+        cleanConvId: String,
+        isGroup: Bool,
+        fileId: String,
+        fileUrl: String,
+        fileName: String,
+        ext: String,
+        fileSize: Int,
+        checksum: String,
+        clientId: Int64,
+        imei: String
+    ) -> (path: String, payload: [String: Any]) {
+        let fidVal: Any = Int64(fileId) ?? fileId
+        var sendPayload: [String: Any] = [
+            "fileId": fidVal,
+            "checksum": checksum,
+            "checksumSha": "",
+            "extension": ext,
+            "totalSize": fileSize,
+            "fileName": fileName,
+            "clientId": clientId,
+            "fType": 1,
+            "fileCount": 0,
+            "fdata": "{}",
+            "ttl": 0,
+            "imei": imei,
+        ]
+        if !fileUrl.isEmpty {
+            sendPayload["fileUrl"] = fileUrl
+        }
+        if isGroup {
+            sendPayload["grid"] = cleanConvId
+            return ("/api/group/asyncfile/msg", sendPayload)
+        } else {
+            sendPayload["toid"] = cleanConvId
+            return ("/api/message/asyncfile/msg", sendPayload)
+        }
     }
 
     static func buildE2EEMessageRequestPayload(
@@ -985,6 +1081,38 @@ extension ZaloSessionClient {
         return ("chat_e2e", "/api/e2ee/pc/message/\(endpoint)", payload)
     }
 
+    static func extractE2EESendResponse(_ resp: [String: Any]) -> (msgId: String, tsMs: Int64?) {
+        let d = resp["data"] as? [String: Any]
+        let nested = d?["data"] as? [String: Any]
+        var dicts: [[String: Any]] = []
+        if let d { dicts.append(d) }
+        if let nested { dicts.append(nested) }
+        if let arr = d?["data"] as? [[String: Any]] {
+            dicts.append(contentsOf: arr)
+        }
+        dicts.append(resp)
+
+        var msgId = ""
+        for dict in dicts where msgId.isEmpty {
+            for key in ["minGlobalMsgId", "msgId", "globalMsgId"] {
+                let candidate = JSONLossless.string(dict[key]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !candidate.isEmpty && candidate != "0" {
+                    msgId = candidate
+                    break
+                }
+            }
+        }
+
+        var tsMs: Int64?
+        for dict in dicts {
+            if let rawTs = JSONLossless.int64(dict["ts"] ?? dict["sendDttm"]), rawTs > 0 {
+                tsMs = rawTs < 10_000_000_000 ? rawTs * 1000 : rawTs
+                break
+            }
+        }
+        return (msgId, tsMs)
+    }
+
     func sendE2EEMessageAPI(
         endpoint: String,
         threadId: String,
@@ -1006,15 +1134,13 @@ extension ZaloSessionClient {
             path: spec.path,
             encryptedPayload: spec.payload
         )
-        let d = resp["data"] as? [String: Any] ?? [:]
-        let nested = d["data"] as? [String: Any]
-        let serverMsgId = JSONLossless.string(d["msgId"] ?? nested?["msgId"])
+        let extracted = Self.extractE2EESendResponse(resp)
         let cliStr = "\(clientId)"
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         return SendMessageResult(
-            msgId: serverMsgId.isEmpty ? cliStr : serverMsgId,
+            msgId: extracted.msgId.isEmpty ? cliStr : extracted.msgId,
             cliMsgId: cliStr,
-            tsMs: nowMs
+            tsMs: extracted.tsMs ?? nowMs
         )
     }
 
@@ -1047,32 +1173,41 @@ extension ZaloSessionClient {
         _ = try? await post(service: service, path: path, encryptedPayload: payload)
     }
 
-    func sendReactionAPI(
+    struct ReactionRequestSpec: @unchecked Sendable {
+        let service: String
+        let path: String
+        let payload: [String: Any]
+        let clientId: Int64
+    }
+
+    static func buildReactionRequest(
         convId: String,
         msgId: String,
         cliMsgId: String,
         rIcon: String,
         rType: Int,
-        isSticker: Bool = false
-    ) async throws {
+        msgType: Int,
+        clientId: Int64,
+        imei: String
+    ) -> ReactionRequestSpec {
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
-        let nowInt = nextClientId()
         let gMsgVal: Any = Int64(msgId) ?? msgId
-        let cMsgInt = Int64(cliMsgId) ?? Int64(msgId) ?? nowInt
+        let cMsgInt = Int64(cliMsgId) ?? Int64(msgId) ?? clientId
         let innerDict: [String: Any] = [
-            "rMsg": [["gMsgID": gMsgVal, "cMsgID": cMsgInt, "msgType": isSticker ? 5 : 1]],
+            "rMsg": [["gMsgID": gMsgVal, "cMsgID": cMsgInt, "msgType": msgType]],
             "rIcon": rIcon,
             "rType": rType,
             "source": 6
         ]
-        let innerData = try JSONSerialization.data(withJSONObject: innerDict, options: [])
+        let innerData = (try? JSONSerialization.data(withJSONObject: innerDict, options: [.withoutEscapingSlashes]))
+            ?? Data("{}".utf8)
         let innerStr = String(decoding: innerData, as: UTF8.self)
         let path = isGroup ? "/api/group/reaction" : "/api/message/reaction"
         var payload: [String: Any] = [
             "react_list": [[
                 "message": innerStr,
-                "clientId": nowInt
+                "clientId": clientId
             ]]
         ]
         if isGroup {
@@ -1081,27 +1216,94 @@ extension ZaloSessionClient {
         } else {
             payload["toid"] = cleanId
         }
-        _ = try await post(service: "reaction", path: path, encryptedPayload: payload)
+        return ReactionRequestSpec(service: "reaction", path: path, payload: payload, clientId: clientId)
     }
 
-    func recallMessageAPI(convId: String, msgId: String, cliMsgId: String) async throws {
+    @discardableResult
+    func sendReactionAPI(
+        convId: String,
+        msgId: String,
+        cliMsgId: String,
+        rIcon: String,
+        rType: Int,
+        msgType: Int = 1,
+        clientId: Int64? = nil
+    ) async throws -> Int64 {
+        let nowInt = clientId ?? nextClientId()
+        let spec = Self.buildReactionRequest(
+            convId: convId,
+            msgId: msgId,
+            cliMsgId: cliMsgId,
+            rIcon: rIcon,
+            rType: rType,
+            msgType: msgType,
+            clientId: nowInt,
+            imei: imei
+        )
+        _ = try await post(service: spec.service, path: spec.path, encryptedPayload: spec.payload)
+        return spec.clientId
+    }
+
+    struct RecallRequestSpec: @unchecked Sendable {
+        let service: String
+        let path: String
+        let payload: [String: Any]
+    }
+
+    static func buildRecallMessageRequest(
+        convId: String,
+        msgId: String,
+        cliMsgId: String,
+        clientId: Int64,
+        isE2EE: Bool,
+        imei: String,
+        visibility: Int = 0,
+        destType: Int = 3
+    ) -> RecallRequestSpec {
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
-        let nowClientId = nextClientId()
+        let effectiveCliUndo = cliMsgId.isEmpty ? msgId : cliMsgId
         var payload: [String: Any] = [
             "msgId": msgId,
-            "clientId": nowClientId,
-            "cliMsgIdUndo": cliMsgId.isEmpty ? msgId : cliMsgId,
-            "imei": imei
+            "clientId": clientId,
+            "cliMsgIdUndo": effectiveCliUndo,
         ]
         if isGroup {
             payload["grid"] = cleanId
-            payload["visibility"] = 0
-            _ = try await post(service: "group", path: "/api/group/undomsg", encryptedPayload: payload)
-        } else {
-            payload["toid"] = cleanId
-            _ = try await post(service: "chat", path: "/api/message/undo", encryptedPayload: payload)
+            payload["visibility"] = visibility
+            payload["imei"] = imei
+            return RecallRequestSpec(
+                service: isE2EE ? "group_e2e" : "group",
+                path: isE2EE ? "/api/e2ee/pc/group/undoMsg" : "/api/group/undomsg",
+                payload: payload
+            )
         }
+        payload["toid"] = cleanId
+        if isE2EE {
+            payload["destType"] = destType
+            return RecallRequestSpec(
+                service: "chat_e2e",
+                path: "/api/e2ee/pc/message/undo",
+                payload: payload
+            )
+        }
+        return RecallRequestSpec(
+            service: "chat",
+            path: "/api/message/undo",
+            payload: payload
+        )
+    }
+
+    func recallMessageAPI(convId: String, msgId: String, cliMsgId: String, isE2EE: Bool = false) async throws {
+        let spec = Self.buildRecallMessageRequest(
+            convId: convId,
+            msgId: msgId,
+            cliMsgId: cliMsgId,
+            clientId: nextClientId(),
+            isE2EE: isE2EE,
+            imei: imei
+        )
+        _ = try await post(service: spec.service, path: spec.path, encryptedPayload: spec.payload)
     }
 
     func deleteMessageForMeAPI(convId: String, msgId: String, cliMsgId: String, senderId: String) async throws {
@@ -1178,6 +1380,21 @@ extension ZaloSessionClient {
         case "mov": return "video/quicktime"
         default: return "application/octet-stream"
         }
+    }
+
+    private static func extractUploadedMsgId(from resp: [String: Any]?) -> String {
+        guard let resp else { return "" }
+        let d = resp["data"] as? [String: Any]
+        let nested = d?["data"] as? [String: Any]
+        for dict in [d, nested, resp].compactMap({ $0 }) {
+            for key in ["msgId", "globalMsgId", "minGlobalMsgId"] {
+                let candidate = JSONLossless.string(dict[key]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !candidate.isEmpty && candidate != "0" {
+                    return candidate
+                }
+            }
+        }
+        return ""
     }
 
     func uploadAndSendPhoto(
@@ -1297,7 +1514,7 @@ extension ZaloSessionClient {
         }
 
         let d = sendResp?["data"] as? [String: Any] ?? [:]
-        let msgId = JSONLossless.string(d["msgId"])
+        let msgId = Self.extractUploadedMsgId(from: sendResp)
         let finalUrl = hdUrl.isEmpty ? JSONLossless.string(d["hdUrl"] ?? d["normalUrl"] ?? d["url"]) : hdUrl
         return UploadedMediaResult(
             url: finalUrl,
@@ -1308,35 +1525,35 @@ extension ZaloSessionClient {
         )
     }
 
-    func uploadAndSendFile(
+    private func uploadFileChunks(
         convId: String,
         fileName: String,
         data: Data,
-        webSocket: ZaloWebSocket? = nil
-    ) async throws -> UploadedMediaResult {
+        clientId: Int64,
+        isE2EE: Bool,
+        webSocket: ZaloWebSocket?
+    ) async throws -> (fileId: String, fileUrl: String) {
+        let payloadData = Data(data)
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
-        let cliInt = nextClientId()
-        let cliId = "\(cliInt)"
         let chunkSize = 1024 * 1024
-        let totalChunk = max(1, (data.count + chunkSize - 1) / chunkSize)
-        let ext = URL(fileURLWithPath: fileName).pathExtension.lowercased()
-        let isVideo = ["mp4", "mov", "mkv", "webm", "avi"].contains(ext)
+        let totalChunk = max(1, (payloadData.count + chunkSize - 1) / chunkSize)
         let mime = Self.mimeType(forFileName: fileName)
-        var uploadDataDict: [String: Any] = [:]
+        var fileId = ""
+        var fileUrl = ""
 
         for chunkIndex in 0..<totalChunk {
             let start = chunkIndex * chunkSize
-            let end = min(start + chunkSize, data.count)
-            let slice = data.subdata(in: start..<end)
+            let end = min(start + chunkSize, payloadData.count)
+            let slice = payloadData.subdata(in: start..<end)
             var encPayload: [String: Any] = [
                 "totalChunk": totalChunk,
                 "fileName": fileName,
-                "clientId": cliInt,
-                "totalSize": data.count,
+                "clientId": clientId,
+                "totalSize": payloadData.count,
                 "imei": imei,
-                "isE2EE": 0,
-                "chunkId": chunkIndex + 1
+                "isE2EE": isE2EE ? 1 : 0,
+                "chunkId": chunkIndex + 1,
             ]
             if isGroup {
                 encPayload["grid"] = cleanId
@@ -1344,7 +1561,7 @@ extension ZaloSessionClient {
                 encPayload["toid"] = cleanId
             }
             let uploadPath = isGroup ? "/api/group/asyncfile/upload" : "/api/message/asyncfile/upload"
-            let resp = try? await postMultipart(
+            let resp = try await postMultipart(
                 service: "file",
                 path: uploadPath,
                 queryParams: ["type": isGroup ? "11" : "2"],
@@ -1354,14 +1571,14 @@ extension ZaloSessionClient {
                 mimeType: mime,
                 chunkData: slice
             )
-            if let d = resp?["data"] as? [String: Any], !JSONLossless.string(d["fileId"]).isEmpty || !JSONLossless.string(d["fileUrl"]).isEmpty {
-                uploadDataDict = d
+            if let d = resp["data"] as? [String: Any] {
+                let fid = JSONLossless.string(d["fileId"])
+                let url = JSONLossless.string(d["fileUrl"] ?? d["url"])
+                if !fid.isEmpty { fileId = fid }
+                if !url.isEmpty { fileUrl = url }
             }
         }
 
-        let checksum = Insecure.MD5.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        let fileId = JSONLossless.string(uploadDataDict["fileId"])
-        var fileUrl = JSONLossless.string(uploadDataDict["fileUrl"])
         if fileUrl.isEmpty, !fileId.isEmpty, let webSocket {
             for _ in 0..<20 where !(await webSocket.isAuthed) {
                 try? await Task.sleep(for: .milliseconds(150))
@@ -1370,59 +1587,200 @@ extension ZaloSessionClient {
                 fileUrl = await webSocket.waitForFileDone(fileId: fileId, timeoutSeconds: 15) ?? ""
             }
         }
+        return (fileId, fileUrl)
+    }
+
+    func uploadAndSendFile(
+        convId: String,
+        fileName: String,
+        data: Data,
+        clientId: Int64? = nil,
+        webSocket: ZaloWebSocket? = nil
+    ) async throws -> UploadedMediaResult {
+        let isGroup = ZaloWireParser.isGroupId(convId)
+        let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
+        let cliInt = clientId ?? nextClientId()
+        let cliId = "\(cliInt)"
+        let ext = URL(fileURLWithPath: fileName).pathExtension.lowercased()
+        let mime = Self.mimeType(forFileName: fileName)
+        let checksum = Insecure.MD5.hash(data: data).map { String(format: "%02x", $0) }.joined()
+
+        var fileId = ""
+        var fileUrl = ""
+        var capturedError: Error?
+
+        do {
+            let uploaded = try await uploadFileChunks(
+                convId: convId,
+                fileName: fileName,
+                data: data,
+                clientId: cliInt,
+                isE2EE: false,
+                webSocket: webSocket
+            )
+            fileId = uploaded.fileId
+            fileUrl = uploaded.fileUrl
+        } catch let sessionErr as ZaloSessionError {
+            if sessionErr.code == -108 || sessionErr.code == -104 || sessionErr.code == 401 {
+                throw sessionErr
+            }
+            capturedError = sessionErr
+        } catch {
+            capturedError = error
+        }
 
         var sendResp: [String: Any]?
         if !fileId.isEmpty && !fileUrl.isEmpty {
-            let fidVal: Any = Int64(fileId) ?? fileId
-            var sendPayload: [String: Any] = [
-                "fileId": fidVal,
-                "checksum": checksum,
-                "checksumSha": "",
-                "extension": ext,
-                "totalSize": data.count,
-                "fileName": fileName,
-                "clientId": cliInt,
-                "fType": isVideo ? 2 : 1,
-                "fileCount": 0,
-                "fdata": "{}",
-                "ttl": 0,
-                "imei": imei
-            ]
-            if !fileUrl.isEmpty {
-                sendPayload["fileUrl"] = fileUrl
+            let msgSpec = Self.buildAsyncFileMsgPayload(
+                cleanConvId: cleanId,
+                isGroup: isGroup,
+                fileId: fileId,
+                fileUrl: fileUrl,
+                fileName: fileName,
+                ext: ext,
+                fileSize: data.count,
+                checksum: checksum,
+                clientId: cliInt,
+                imei: imei
+            )
+            do {
+                sendResp = try await post(service: "file", path: msgSpec.path, encryptedPayload: msgSpec.payload)
+            } catch let sessionErr as ZaloSessionError {
+                if sessionErr.code == -108 || sessionErr.code == -104 || sessionErr.code == 401 {
+                    throw sessionErr
+                }
+                capturedError = sessionErr
+            } catch {
+                capturedError = error
             }
-            if isGroup {
-                sendPayload["grid"] = cleanId
-            } else {
-                sendPayload["toid"] = cleanId
-            }
-            let sendPath = isGroup ? "/api/group/asyncfile/msg" : "/api/message/asyncfile/msg"
-            sendResp = try? await post(service: "file", path: sendPath, encryptedPayload: sendPayload)
         }
 
         if sendResp == nil {
-            var shareBody: [String: Any] = ["clientId": cliInt]
-            if isGroup { shareBody["grid"] = cleanId } else { shareBody["toid"] = cleanId }
-            let sharePath = isGroup ? "/api/group/sharefile_full" : "/api/message/sharefile_full"
-            sendResp = try await postMultipart(
-                service: "file",
-                path: sharePath,
-                queryParams: ["type": isGroup ? "11" : "2"],
-                encryptedPayload: shareBody,
-                fieldName: "fileContent",
-                fileName: fileName,
-                mimeType: mime,
-                chunkData: data
-            )
+            if data.count <= 10 * 1024 * 1024 {
+                var shareBody: [String: Any] = ["clientId": cliId]
+                if isGroup { shareBody["grid"] = cleanId } else { shareBody["toid"] = cleanId }
+                let sharePath = isGroup ? "/api/group/sharefile_full" : "/api/message/sharefile_full"
+                sendResp = try await postMultipart(
+                    service: "file",
+                    path: sharePath,
+                    queryParams: ["type": isGroup ? "11" : "2"],
+                    encryptedPayload: shareBody,
+                    fieldName: "fileContent",
+                    fileName: fileName,
+                    mimeType: mime,
+                    chunkData: data
+                )
+            } else if let capturedError {
+                throw capturedError
+            } else {
+                throw ZaloSessionError(code: -1, message: "Tải tệp lên thất bại.", url: "/api/message/asyncfile/upload")
+            }
         }
 
         let d = sendResp?["data"] as? [String: Any] ?? [:]
-        let msgId = JSONLossless.string(d["msgId"])
+        let msgId = Self.extractUploadedMsgId(from: sendResp)
         let finalUrl = fileUrl.isEmpty ? JSONLossless.string(d["fileUrl"] ?? d["url"] ?? d["href"]) : fileUrl
         return UploadedMediaResult(
             url: finalUrl,
             msgId: msgId.isEmpty ? cliId : msgId,
             cliMsgId: cliId,
+            width: 0,
+            height: 0
+        )
+    }
+
+    func uploadAndSendE2EEFile(
+        convId: String,
+        fileName: String,
+        plaintextData: Data,
+        clientId: Int64? = nil,
+        e2eeManager: ZaloE2EEManager,
+        store: ZaloSQLiteStore?,
+        webSocket: ZaloWebSocket
+    ) async throws -> UploadedMediaResult {
+        guard !ZaloWireParser.isGroupId(convId) else {
+            throw ZaloSessionError(code: -1, message: "Chưa hỗ trợ gửi file mã hóa trong nhóm.", url: "/api/e2ee/pc/message/file")
+        }
+        guard let myUid = account?.userId, !myUid.isEmpty else {
+            throw ZaloSessionError(code: -108, message: "Chưa đăng nhập.", url: "/api/e2ee/pc/message/file")
+        }
+        let ready = await e2eeManager.ensureSessions(
+            forPeer: convId,
+            myUid: myUid,
+            webSocket: webSocket,
+            store: store
+        )
+        guard ready else {
+            throw ZaloSessionError(code: -1, message: "Chưa có phiên mã hóa đầu cuối với người nhận.", url: "/api/e2ee/pc/message/file")
+        }
+
+        let encrypted = try SecureStream.encryptE2EEFile(plaintextData)
+        let cliInt = clientId ?? nextClientId()
+        let uploaded = try await uploadFileChunks(
+            convId: convId,
+            fileName: fileName,
+            data: encrypted.ciphertext,
+            clientId: cliInt,
+            isE2EE: true,
+            webSocket: webSocket
+        )
+        guard !uploaded.fileId.isEmpty, !uploaded.fileUrl.isEmpty else {
+            throw ZaloSessionError(code: -1, message: "Không nhận được liên kết tải tệp mã hóa.", url: "/api/message/asyncfile/upload")
+        }
+
+        let ext = URL(fileURLWithPath: fileName).pathExtension.lowercased()
+        let checksum = Insecure.MD5.hash(data: plaintextData).map { String(format: "%02x", $0) }.joined()
+        let fileMsgParams = Self.buildFileMsgParamsJSON(
+            md5Hex: checksum,
+            fileExt: ext,
+            fileSize: Int64(plaintextData.count)
+        )
+        let encryptedDevices = await e2eeManager.encryptFileMessage(
+            peerUid: convId,
+            myUid: myUid,
+            e2eSessionB64: encrypted.base64Session,
+            fileMsgParamsJSON: fileMsgParams,
+            fileName: fileName,
+            store: store
+        )
+        guard !encryptedDevices.isEmpty else {
+            throw ZaloSessionError(code: -1, message: "Không thể mã hóa thông tin tệp đầu cuối.", url: "/api/e2ee/pc/message/file")
+        }
+
+        let senderIid = await e2eeManager.localRegistrationId()
+        let listParams: [[String: Any]] = encryptedDevices.compactMap { dev in
+            guard dev.ciphers.count >= 5 else { return nil }
+            return Self.buildE2EEFileListParamEntry(
+                toId: dev.toId,
+                platform: dev.platform,
+                clientId: cliInt,
+                imei: imei,
+                registrationId: dev.registrationId,
+                senderIid: senderIid,
+                rawFileUrl: uploaded.fileUrl,
+                fileId: uploaded.fileId,
+                cipherSession: dev.ciphers[0],
+                cipherParams: dev.ciphers[2],
+                cipherFileName: dev.ciphers[3],
+                cipherThumb: dev.ciphers[4]
+            )
+        }
+        guard !listParams.isEmpty else {
+            throw ZaloSessionError(code: -1, message: "Không thể đóng gói tệp mã hóa đầu cuối.", url: "/api/e2ee/pc/message/file")
+        }
+
+        let sendResult = try await sendE2EEMessageAPI(
+            endpoint: "file",
+            threadId: convId,
+            isGroup: false,
+            clientId: cliInt,
+            listParams: ZaloJSONArrayBox(listParams)
+        )
+        let sep = uploaded.fileUrl.contains("?") ? "&e2esession=" : "?e2esession="
+        return UploadedMediaResult(
+            url: "\(uploaded.fileUrl)\(sep)\(encrypted.base64Session)",
+            msgId: sendResult.msgId,
+            cliMsgId: sendResult.cliMsgId,
             width: 0,
             height: 0
         )
@@ -1918,31 +2276,70 @@ extension ZaloSessionClient {
         return (ZaloJSONBox(resp), spec.activateApp)
     }
 
+    static func parseNoisedCallIdsResponse(
+        _ resp: [String: Any],
+        requestedFids: [String],
+        requestedGids: [String]
+    ) -> (friends: [String: String], groups: [String: String]) {
+        let d = (resp["data"] as? [String: Any]) ?? resp
+        func decodeMap(_ raw: Any?, requested: [String]) -> [String: String] {
+            var map: [String: String] = [:]
+            if let dict = raw as? [String: Any] {
+                for (k, v) in dict {
+                    let s = JSONLossless.string(v).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !k.isEmpty, !s.isEmpty, s != "0" {
+                        map[k] = s
+                    }
+                }
+            } else if let arr = raw as? [Any] {
+                for (idx, item) in arr.enumerated() where idx < requested.count {
+                    let reqKey = requested[idx]
+                    let s = JSONLossless.string(item).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !reqKey.isEmpty, !s.isEmpty, s != "0" {
+                        map[reqKey] = s
+                    }
+                }
+            }
+            return map
+        }
+        return (
+            decodeMap(d["fids"], requested: requestedFids),
+            decodeMap(d["gids"], requested: requestedGids)
+        )
+    }
+
     func resolveNoisedCallIds(fids: [String], gids: [String]) async -> (friends: [String: String], groups: [String: String]) {
-        guard !fids.isEmpty || !gids.isEmpty else { return ([:], [:]) }
-        guard let resp = try? await get(
+        let cleanFids = fids.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        let cleanGids = gids.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        guard !cleanFids.isEmpty || !cleanGids.isEmpty else { return ([:], [:]) }
+
+        let encodedFids: [Any] = cleanFids.map { Int64($0).map { $0 as Any } ?? ($0 as Any) }
+        let encodedGids: [Any] = cleanGids.map { Int64($0).map { $0 as Any } ?? ($0 as Any) }
+
+        var postPayload: [String: Any] = [:]
+        if !encodedFids.isEmpty { postPayload["fids"] = encodedFids }
+        if !encodedGids.isEmpty { postPayload["gids"] = encodedGids }
+
+        if let resp = try? await post(
+            service: "znoise",
+            path: "/api/znoise",
+            encryptedPayload: postPayload
+        ) {
+            let parsed = Self.parseNoisedCallIdsResponse(resp, requestedFids: cleanFids, requestedGids: cleanGids)
+            if !parsed.friends.isEmpty || !parsed.groups.isEmpty {
+                return parsed
+            }
+        }
+
+        let getPayload: [String: Any] = ["fids": cleanFids, "gids": cleanGids]
+        if let fallbackResp = try? await get(
             service: "profile",
             path: "/api/znoise",
-            encryptedPayload: ["fids": fids, "gids": gids]
-        ) else {
-            return ([:], [:])
+            encryptedPayload: getPayload
+        ) {
+            return Self.parseNoisedCallIdsResponse(fallbackResp, requestedFids: cleanFids, requestedGids: cleanGids)
         }
-        let d = (resp["data"] as? [String: Any]) ?? resp
-        var fMap: [String: String] = [:]
-        if let fObj = d["fids"] as? [String: Any] {
-            for (k, v) in fObj {
-                let s = JSONLossless.string(v)
-                if !s.isEmpty { fMap[k] = s }
-            }
-        }
-        var gMap: [String: String] = [:]
-        if let gObj = d["gids"] as? [String: Any] {
-            for (k, v) in gObj {
-                let s = JSONLossless.string(v)
-                if !s.isEmpty { gMap[k] = s }
-            }
-        }
-        return (fMap, gMap)
+        return ([:], [:])
     }
 }
 

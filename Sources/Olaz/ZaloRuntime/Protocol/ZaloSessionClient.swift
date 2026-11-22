@@ -98,6 +98,8 @@ actor ZaloSessionClient {
     var globalIdToUidCache: [String: String] = [:]
     var uidToGlobalIdCache: [String: String] = [:]
     var cloudIsOldByConv: [String: Bool] = [:]
+    var cloudViewerKey: String?
+    var cloudEnk: String?
 
     private var serverSelfG: Int = 0
     private var serverQrForm: Int = 0
@@ -230,6 +232,8 @@ actor ZaloSessionClient {
         self.zpwSek = zpwSek
         if let domains { self.domains = domains }
         self.expiredAt = nil
+        self.cloudViewerKey = nil
+        self.cloudEnk = nil
     }
 
     func seedGlobalIdMappings(_ map: [String: String]) {
@@ -355,6 +359,8 @@ actor ZaloSessionClient {
         zpwSek = nil
         secretKey = nil
         expiredAt = nil
+        cloudViewerKey = nil
+        cloudEnk = nil
         globalIdToUidCache.removeAll()
         uidToGlobalIdCache.removeAll()
         domains = ZaloDomains()
@@ -1104,7 +1110,7 @@ actor ZaloSessionClient {
         return out
     }
 
-    private func rawRequest(
+    func rawRequest(
         method: String,
         url: URL,
         body: Data? = nil,

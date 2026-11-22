@@ -329,7 +329,14 @@ extension ZaloEngine {
                 mentions: [],
                 cardButtons: [],
                 suggestsStickers: false,
-                menu: MessageMenu(json: ["forward": "ok", "recall": true, "delete": "forMe", "pin": false, "star": "star"])
+                menu: MessageMenu(json: [
+                    "forward": "ok",
+                    "recall": conversationId != selfConversationId,
+                    "delete": conversationId == selfConversationId ? "plain" : "forMe",
+                    "pin": false,
+                    "star": "star"
+                ]),
+                clientId: res.cliMsgId
             )
             mergeMessageIntoMemory(msg, replacingClientId: res.cliMsgId)
             if let stored = ZaloWireParser.encodeChatMessage(msg, clientId: res.cliMsgId) {

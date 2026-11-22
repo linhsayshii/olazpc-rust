@@ -224,7 +224,7 @@ import Testing
             "msgType": "chat.reaction", "uidFrom": "u9", "idTo": "g123",
             "content": ["rType": 5, "rIcon": "/-heart", "rMsg": [["gMsgID": "777", "cMsgID": "c777"]]]
         ], myUid: "me", cmd: ZaloWebSocket.cmdPushMsgGroup)
-        if case .reaction(let conv, let mid, _, _, let rType, _) = reaction {
+        if case .reaction(let conv, let mid, _, _, let rType, _, _, _, _, _, _) = reaction {
             #expect(conv == "g123" && mid == "777" && rType == "5")
         } else {
             Issue.record("Expected reaction")
@@ -375,7 +375,7 @@ import Testing
             ]
         ], myUid: "me123", selfConvId: "cloud999")
         #expect(reactEvents.count == 1)
-        if case .reaction(let c, let mid, _, let sender, let rType, _) = reactEvents.first! {
+        if case .reaction(let c, let mid, _, let sender, let rType, _, _, _, _, _, _) = reactEvents.first! {
             #expect(c == "g999" && mid == "300" && sender == "peer2" && rType == "5")
         }
 

@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Native chat pane for one conversation. All data comes from `ZaloEngine`.
 struct ChatView: View {
@@ -30,6 +31,7 @@ struct ChatView: View {
     @State private var jumpGeneration = 0
     @State private var activeJumpId: String?
     @State private var highlightedMessageId: String?
+    @State private var isDropTargeted = false
 
     private enum SendNotice { case restored, like }
 
@@ -177,6 +179,87 @@ struct ChatView: View {
         .onDisappear {
             searchTask?.cancel()
             jumpTask?.cancel()
+        }
+        .overlay {
+            if isDropTargeted && !id.isEmpty {
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(.clear)
+                    .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    .overlay {
+                        VStack(spacing: 10) {
+                            Image(systemName: "arrow.down.doc.fill")
+                                .font(.system(size: 32, weight: .semibold))
+                                .foregroundStyle(.tint)
+                            Text("Thả để gửi vào \(conversation.displayName)")
+                                .font(.system(size: 14, weight: .semibold))
+                            Text("Ảnh, video hoặc tài liệu")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(24)
+                    }
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .strokeBorder(.tint.opacity(0.45), style: StrokeStyle(lineWidth: 2, dash: [8, 6]))
+                    }
+                    .padding(16)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+            }
+        }
+        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted, perform: handleDrop)
+    }
+
+    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        let targetId = id
+        guard !targetId.isEmpty else { return false }
+        let fileProviders = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
+        guard !fileProviders.isEmpty else { return false }
+
+        Task {
+            var urls: [URL] = []
+            for provider in fileProviders {
+                if let url = await Self.loadDroppedFileURL(from: provider) {
+                    urls.append(url)
+                }
+            }
+            guard !urls.isEmpty else { return }
+            let mediaURLs = urls.filter { Self.isMediaURL($0) }
+            let fileURLs = urls.filter { !Self.isMediaURL($0) }
+            if !mediaURLs.isEmpty {
+                let outcome = await engine.sendMedia(mediaURLs, to: targetId)
+                engine.report(outcome, in: targetId)
+            }
+            if !fileURLs.isEmpty {
+                let outcome = await engine.sendFiles(fileURLs, to: targetId)
+                engine.report(outcome, in: targetId)
+            }
+        }
+        return true
+    }
+
+    private static func isMediaURL(_ url: URL) -> Bool {
+        if let ut = UTType(filenameExtension: url.pathExtension), ut.conforms(to: .image) {
+            return true
+        }
+        return ZaloEngine.isVideoURL(url)
+    }
+
+    private static func loadDroppedFileURL(from provider: NSItemProvider) async -> URL? {
+        await withCheckedContinuation { continuation in
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                if let data = item as? Data,
+                   let str = String(data: data, encoding: .utf8),
+                   let url = URL(string: str) {
+                    continuation.resume(returning: url)
+                } else if let url = item as? URL {
+                    continuation.resume(returning: url)
+                } else if let nsurl = item as? NSURL {
+                    continuation.resume(returning: nsurl as URL)
+                } else {
+                    continuation.resume(returning: nil)
+                }
+            }
         }
     }
 

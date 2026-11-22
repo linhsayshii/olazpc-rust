@@ -1,4 +1,7 @@
 import AppKit
+import CoreText
+import ImageIO
+@preconcurrency import Intents
 import Observation
 import UniformTypeIdentifiers
 @preconcurrency import UserNotifications
@@ -27,6 +30,9 @@ struct NativeNotificationRequest: Equatable {
     var tag: String
     var silent: Bool
     var icon: Icon?
+    var senderId: String = ""
+    var senderName: String = ""
+    var isGroup: Bool = false
 
     static func parse(_ args: [Any]) -> NativeNotificationRequest? {
         let title = args.string(0) ?? ""
@@ -99,6 +105,160 @@ enum NotificationPolicy {
         guard url.scheme == "https", let host = url.host() else { return false }
         return MediaLoader.isZaloCDN(host) && url.path().hasSuffix("/sound/noti.mp3")
     }
+
+    private static func encodePNG(_ cgImage: CGImage) -> Data? {
+        let mutableData = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(mutableData, UTType.png.identifier as CFString, 1, nil) else {
+            return nil
+        }
+        CGImageDestinationAddImage(dest, cgImage, nil)
+        guard CGImageDestinationFinalize(dest), mutableData.length > 0 else {
+            return nil
+        }
+        return mutableData as Data
+    }
+
+    /// Normalizes arbitrary image bytes (PNG, JPEG, GIF, WebP, HEIC) into a center-cropped square PNG
+    /// suitable for `INImage` / macOS Communication Notification avatars.
+    static func normalizedAvatarPNGData(from rawData: Data, maxPixelSize: Int = 256) -> Data? {
+        guard !rawData.isEmpty, maxPixelSize > 0,
+              let source = CGImageSourceCreateWithData(rawData as CFData, nil) else {
+            return nil
+        }
+        let thumbOpts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(maxPixelSize * 2, 512)
+        ]
+        guard let baseImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOpts as CFDictionary)
+            ?? CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            return nil
+        }
+        let w = baseImage.width
+        let h = baseImage.height
+        let side = min(w, h)
+        guard side > 0 else { return nil }
+
+        let cropRect = CGRect(x: (w - side) / 2, y: (h - side) / 2, width: side, height: side)
+        let squareImage = baseImage.cropping(to: cropRect) ?? baseImage
+        let targetSize = max(1, min(side, maxPixelSize))
+
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(
+                  data: nil,
+                  width: targetSize,
+                  height: targetSize,
+                  bitsPerComponent: 8,
+                  bytesPerRow: 0,
+                  space: colorSpace,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else {
+            return nil
+        }
+        ctx.interpolationQuality = .high
+        ctx.draw(squareImage, in: CGRect(x: 0, y: 0, width: targetSize, height: targetSize))
+        guard let outImage = ctx.makeImage() else { return nil }
+        return encodePNG(outImage)
+    }
+
+    /// Generates a deterministic-color square PNG monogram when a sender has no avatar URL or download fails.
+    static func monogramAvatarPNGData(for name: String, size: Int = 128) -> Data? {
+        let px = max(32, min(size, 512))
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawInitials = nameInitials(trimmed)
+        let initials = rawInitials.isEmpty ? "Z" : rawInitials
+
+        let palette: [(r: CGFloat, g: CGFloat, b: CGFloat)] = [
+            (0.16, 0.49, 0.96),
+            (0.14, 0.65, 0.56),
+            (0.91, 0.46, 0.16),
+            (0.58, 0.36, 0.87),
+            (0.84, 0.27, 0.45),
+            (0.22, 0.60, 0.84),
+        ]
+        var hash: UInt64 = 5381
+        for byte in (trimmed.isEmpty ? "Olaz" : trimmed).utf8 {
+            hash = ((hash &<< 5) &+ hash) &+ UInt64(byte)
+        }
+        let c = palette[Int(hash % UInt64(palette.count))]
+
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(
+                  data: nil,
+                  width: px,
+                  height: px,
+                  bitsPerComponent: 8,
+                  bytesPerRow: 0,
+                  space: colorSpace,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else {
+            return nil
+        }
+        ctx.setFillColor(red: c.r, green: c.g, blue: c.b, alpha: 1.0)
+        ctx.fill(CGRect(x: 0, y: 0, width: px, height: px))
+
+        let fontSize = CGFloat(px) * (initials.count > 1 ? 0.38 : 0.44)
+        let font = CTFontCreateWithName("HelveticaNeue-Bold" as CFString, fontSize, nil)
+        let white = CGColor(colorSpace: colorSpace, components: [1, 1, 1, 1])!
+        let attrs: [CFString: Any] = [
+            kCTFontAttributeName: font,
+            kCTForegroundColorAttributeName: white
+        ]
+        let attrStr = CFAttributedStringCreate(kCFAllocatorDefault, initials as CFString, attrs as CFDictionary)!
+        let line = CTLineCreateWithAttributedString(attrStr)
+        let bounds = CTLineGetBoundsWithOptions(line, .useOpticalBounds)
+        let x = (CGFloat(px) - bounds.width) / 2.0 - bounds.origin.x
+        let y = (CGFloat(px) - bounds.height) / 2.0 - bounds.origin.y
+        ctx.textPosition = CGPoint(x: x, y: y)
+        CTLineDraw(line, ctx)
+
+        guard let outImage = ctx.makeImage() else { return nil }
+        return encodePNG(outImage)
+    }
+
+    static func buildCommunicationIntent(
+        for request: NativeNotificationRequest,
+        body: String,
+        avatarPNGData: Data?
+    ) -> INSendMessageIntent {
+        let senderDisplayName = request.senderName.isEmpty ? request.title : request.senderName
+        let handleValue = request.senderId.isEmpty
+            ? (request.tag.isEmpty ? senderDisplayName : request.tag)
+            : request.senderId
+        let handle = INPersonHandle(value: handleValue, type: .unknown)
+        let avatarImage = avatarPNGData.map { INImage(imageData: $0) }
+        let sender = INPerson(
+            personHandle: handle,
+            nameComponents: nil,
+            displayName: senderDisplayName,
+            image: avatarImage,
+            contactIdentifier: nil,
+            customIdentifier: handleValue,
+            isMe: false,
+            suggestionType: .none
+        )
+        let groupName = (request.isGroup && !request.title.isEmpty)
+            ? INSpeakableString(spokenPhrase: request.title)
+            : nil
+        let conversationId = request.tag.isEmpty ? handleValue : request.tag
+        let intent = INSendMessageIntent(
+            recipients: request.isGroup ? [sender] : nil,
+            outgoingMessageType: .outgoingMessageText,
+            content: body,
+            speakableGroupName: groupName,
+            conversationIdentifier: conversationId,
+            serviceName: "Olaz",
+            sender: sender,
+            attachments: nil
+        )
+        if let avatarImage {
+            intent.__setImage(avatarImage, forParameterNamed: "sender")
+            if groupName != nil {
+                intent.__setImage(avatarImage, forParameterNamed: "speakableGroupName")
+            }
+        }
+        return intent
+    }
 }
 
 // MARK: - UNUserNotificationCenter bridge
@@ -132,14 +292,26 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     // MARK: Native delivery
 
-    func notifyIncomingMessage(title: String, body: String, conversationId: String, avatarURL: URL?, silent: Bool) {
+    func notifyIncomingMessage(
+        title: String,
+        body: String,
+        conversationId: String,
+        senderId: String = "",
+        senderName: String = "",
+        isGroup: Bool = false,
+        avatarURL: URL?,
+        silent: Bool
+    ) {
         guard isAvailable, !title.isEmpty || !body.isEmpty else { return }
         let request = NativeNotificationRequest(
             title: title,
             body: body,
             tag: conversationId,
             silent: silent,
-            icon: avatarURL.map { .remote($0) }
+            icon: avatarURL.map { .remote($0) },
+            senderId: senderId,
+            senderName: senderName,
+            isGroup: isGroup
         )
         let id = UUID().uuidString
         Task { await deliver(request, id: id) }
@@ -173,45 +345,98 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
         let showsPreview = UserDefaults.standard.object(forKey: NotificationSettingsState.previewDefaultsKey) as? Bool ?? true
         let content = UNMutableNotificationContent()
         content.title = request.title
+        if request.isGroup && !request.senderName.isEmpty && request.senderName != request.title {
+            content.subtitle = request.senderName
+        }
         content.body = NotificationPolicy.body(request.body, showsPreview: showsPreview)
         content.threadIdentifier = request.tag.isEmpty ? "zalo" : request.tag
         content.categoryIdentifier = Self.messageCategory
         content.userInfo = ["convId": request.tag, "id": id]
         if !request.silent { content.sound = .default }
-        if let attachment = await avatarAttachment(for: request.icon) { content.attachments = [attachment] }
+
+        let senderDisplayName = request.senderName.isEmpty ? request.title : request.senderName
+        let avatarPNG = await resolveAvatarPNGData(for: request.icon, fallbackName: senderDisplayName)
+        let intent = NotificationPolicy.buildCommunicationIntent(
+            for: request,
+            body: content.body,
+            avatarPNGData: avatarPNG
+        )
+        let interaction = INInteraction(intent: intent, response: nil)
+        interaction.direction = .incoming
+        await Self.donateIncomingInteraction(interaction, timeoutSeconds: 1)
+
+        let finalContent: UNNotificationContent
+        do {
+            finalContent = try content.updating(from: intent)
+        } catch {
+            notifierLog.error("updating notification from INSendMessageIntent failed: \(error.localizedDescription, privacy: .public)")
+            if let avatarPNG, let attachment = makeAttachment(pngData: avatarPNG) {
+                content.attachments = [attachment]
+            }
+            finalContent = content
+        }
 
         do {
-            try await center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
+            try await center.add(UNNotificationRequest(identifier: id, content: finalContent, trigger: nil))
         } catch {
             notifierLog.error("add notification failed: \(error.localizedDescription, privacy: .public)")
             return
         }
     }
 
-    private func avatarAttachment(for icon: NativeNotificationRequest.Icon?) async -> UNNotificationAttachment? {
-        guard let icon else { return nil }
-        let data: Data?
-        switch icon {
-        case .inline(let bytes): data = bytes
-        case .bundled: data = nil
-        case .remote(let url):
-            data = await Self.withTimeout(seconds: 3) {
-                guard let file = try? await MediaLoader.shared.localFile(for: url) else { return nil }
-                return try? Data(contentsOf: file)
-            } ?? nil
+    private func resolveAvatarPNGData(for icon: NativeNotificationRequest.Icon?, fallbackName: String) async -> Data? {
+        var rawData: Data?
+        if let icon {
+            switch icon {
+            case .inline(let bytes):
+                rawData = bytes
+            case .bundled:
+                rawData = nil
+            case .remote(let url):
+                rawData = await Self.withTimeout(seconds: 3) {
+                    try? await MediaLoader.shared.data(for: url, deadline: 3)
+                } ?? nil
+            }
         }
-        guard let data, let kind = NotificationPolicy.attachmentType(for: data) else { return nil }
+        if let rawData, let normalized = NotificationPolicy.normalizedAvatarPNGData(from: rawData) {
+            return normalized
+        }
+        return NotificationPolicy.monogramAvatarPNGData(for: fallbackName)
+    }
+
+    private func makeAttachment(pngData: Data) -> UNNotificationAttachment? {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("OlazNotifications", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let file = directory.appendingPathComponent(UUID().uuidString + "." + kind.ext)
+        let file = directory.appendingPathComponent(UUID().uuidString + ".png")
         do {
-            try data.write(to: file)
+            try pngData.write(to: file)
             // The center moves the file into its own store; remove stragglers if it did not.
-            return try UNNotificationAttachment(identifier: "avatar", url: file,
-                                                options: [UNNotificationAttachmentOptionsTypeHintKey: kind.type.identifier])
+            return try UNNotificationAttachment(
+                identifier: "avatar",
+                url: file,
+                options: [UNNotificationAttachmentOptionsTypeHintKey: UTType.png.identifier]
+            )
         } catch {
             try? FileManager.default.removeItem(at: file)
             return nil
+        }
+    }
+
+    private static func donateIncomingInteraction(_ interaction: INInteraction, timeoutSeconds: Double = 1) async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            var resumed = false
+            let finish: @MainActor () -> Void = {
+                guard !resumed else { return }
+                resumed = true
+                cont.resume()
+            }
+            interaction.donate { _ in
+                Task { @MainActor in finish() }
+            }
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(timeoutSeconds))
+                finish()
+            }
         }
     }
 
@@ -271,7 +496,7 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
         let reply = UNTextInputNotificationAction(
             identifier: Self.replyAction, title: "Trả lời", options: [],
             textInputButtonTitle: "Gửi", textInputPlaceholder: "Nhập tin nhắn…")
-        let category = UNNotificationCategory(identifier: Self.messageCategory, actions: [reply], intentIdentifiers: [],
+        let category = UNNotificationCategory(identifier: Self.messageCategory, actions: [reply], intentIdentifiers: ["INSendMessageIntent"],
                                               options: [.hiddenPreviewsShowTitle])
         center?.setNotificationCategories([category])
         center?.delegate = self

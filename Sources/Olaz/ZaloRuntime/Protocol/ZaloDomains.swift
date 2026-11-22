@@ -44,6 +44,7 @@ struct ZaloDomains: Codable, Sendable {
         "media_store": ["https://media-wpa.zaloapp.com"],
         "media_store_send2me": ["https://mediasend2me-wpa.zaloapp.com"],
         "voice_call": ["https://voicecall-wpa.zaloapp.com"],
+        "znoise": ["https://zwid.api.zalo.me"],
         "friend_lan": ["https://friend-lan-wpa.zaloapp.com"],
         "auto_reply": ["https://autoreply-wpa.api.zaloapp.com"],
         "quick_message": ["https://quickmsg-wpa.api.zaloapp.com"],
@@ -69,6 +70,7 @@ struct ZaloDomains: Codable, Sendable {
         "file": ["https://tt-files-wpa.chat.zalo.me"],
         "up_file": ["https://tt-files-wpa.zaloapp.com", "https://tt-files-wpa.chat.zalo.me"],
         "voice_call": ["https://voicecall-wpa.chat.zalo.me"],
+        "znoise": ["https://tt-profile-wpa.zaloapp.com"],
     ]
 
     var auth: String = "https://wpa.zaloapp.com"
@@ -156,6 +158,10 @@ struct ZaloDomains: Codable, Sendable {
         }
         if let mapped = serviceCandidates[key] {
             for host in mapped { appendUnique(host) }
+        }
+        if key == "auth" {
+            appendUnique(auth)
+            appendUnique(wpaChat)
         }
         if let defaults = Self.defaultServiceMapV3[key] {
             for host in defaults { appendUnique(host) }

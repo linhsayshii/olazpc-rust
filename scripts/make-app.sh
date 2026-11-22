@@ -54,6 +54,10 @@ cat > "$APP/Contents/Info.plist" << PLIST
     <key>LSApplicationCategoryType</key><string>public.app-category.social-networking</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+    <key>NSUserActivityTypes</key>
+    <array>
+        <string>INSendMessageIntent</string>
+    </array>
     <!-- Calls: the native call helper (ZaloCall, from the Zalo runtime Olaz installs) is started by Olaz, so macOS attributes
          its microphone / camera access to Olaz and shows these texts in the permission prompts. -->
     <key>NSMicrophoneUsageDescription</key>

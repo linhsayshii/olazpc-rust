@@ -430,6 +430,18 @@ struct SecureStream: Sendable {
         }
     }
 
+    /// Encrypts plaintext using linear AES-256-GCM and encodes the 60-byte `key(32) + iv(12) + tag(16)` session token as Base64.
+    static func encryptE2EEFile(_ plaintext: Data) throws -> (ciphertext: Data, base64Session: String) {
+        let key = SymmetricKey(size: .bits256)
+        let nonce = AES.GCM.Nonce()
+        let sealed = try AES.GCM.seal(plaintext, using: key, nonce: nonce)
+        var token = Data(capacity: 60)
+        key.withUnsafeBytes { token.append(contentsOf: $0) }
+        token.append(contentsOf: nonce)
+        token.append(sealed.tag)
+        return (Data(sealed.ciphertext), token.base64EncodedString())
+    }
+
     /// Streams `source` → `destination` (created here, removed on any failure) in constant memory.
     /// For GCM the tag is verified before returning, so a caller that only moves `destination` into place
     /// on success never publishes unauthenticated plaintext.

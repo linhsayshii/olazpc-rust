@@ -46,10 +46,11 @@ struct CloudUsageBar: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let quota = Double(max(plan.quota, 1))
+            let totalUsed = segments.reduce(Int64(0)) { $0 + max(0, $1.1) }
+            let denom = Double(max(plan.quota, totalUsed, 1))
             HStack(spacing: 1.5) {
                 ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
-                    let fraction = min(1, Double(max(0, segment.1)) / quota)
+                    let fraction = Double(max(0, segment.1)) / denom
                     if segment.1 > 0 {
                         Rectangle().fill(segment.0.gradient).frame(width: max(2, proxy.size.width * fraction))
                     }
@@ -98,8 +99,8 @@ struct CloudStorageCard: View {
                 CloudUsageBar(plan: plan)
                 // Wraps in the narrow content column.
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 96), spacing: 8, alignment: .leading)], alignment: .leading, spacing: 4) {
-                    legend(cloudMediaColor, "Media")
-                    legend(cloudBackupColor, "Sao lưu")
+                    if plan.isPaid || plan.cloudMedia > 0 { legend(cloudMediaColor, "Media") }
+                    if plan.isPaid || plan.messageBackup > 0 { legend(cloudBackupColor, "Sao lưu") }
                     legend(cloudMyCloudColor, "Cloud của tôi")
                     if plan.family > 0 { legend(cloudFamilyColor, "Gia đình") }
                 }
@@ -276,8 +277,12 @@ struct CloudPlanView: View {
             }
             CloudUsageBar(plan: plan, height: 12)
             VStack(spacing: 7) {
-                CloudLegendRow(color: cloudMediaColor, title: "Tin nhắn media", bytes: plan.cloudMedia)
-                CloudLegendRow(color: cloudBackupColor, title: "Sao lưu tin nhắn", bytes: plan.messageBackup)
+                if plan.isPaid || plan.cloudMedia > 0 {
+                    CloudLegendRow(color: cloudMediaColor, title: "Tin nhắn media", bytes: plan.cloudMedia)
+                }
+                if plan.isPaid || plan.messageBackup > 0 {
+                    CloudLegendRow(color: cloudBackupColor, title: "Sao lưu tin nhắn", bytes: plan.messageBackup)
+                }
                 CloudLegendRow(color: cloudMyCloudColor, title: "Cloud của tôi", bytes: plan.myCloud)
                 if plan.family > 0 { CloudLegendRow(color: cloudFamilyColor, title: "Gia đình", bytes: plan.family) }
             }

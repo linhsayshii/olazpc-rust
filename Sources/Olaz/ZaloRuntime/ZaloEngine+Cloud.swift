@@ -179,8 +179,11 @@ extension ZaloEngine {
     }
 
     func performRefreshCloud() async {
+        let serverSnapshot = (await sessionClient.account) != nil
+            ? await sessionClient.fetchCloudServerSnapshot()
+            : nil
         guard let store = sqliteStore else {
-            applyCloudSnapshot(sqlSummaries: [], existingIdsByConv: [:])
+            applyCloudSnapshot(sqlSummaries: [], existingIdsByConv: [:], serverSnapshot: serverSnapshot)
             return
         }
         let sqlSummaries = (try? await store.cloudMediaAggregation()) ?? []
@@ -196,7 +199,7 @@ extension ZaloEngine {
                 existingByConv[cid] = (try? await store.existingMessageIds(convId: cid, ids: mediaIds)) ?? []
             }
         }
-        applyCloudSnapshot(sqlSummaries: sqlSummaries, existingIdsByConv: existingByConv)
+        applyCloudSnapshot(sqlSummaries: sqlSummaries, existingIdsByConv: existingByConv, serverSnapshot: serverSnapshot)
     }
 
     private func resolveCloudConversationMeta(_ convId: String, fallbackName: String = "", fallbackAvatar: String = "", fallbackIsGroup: Bool? = nil) -> (name: String, avatar: URL?, isGroup: Bool) {
@@ -217,7 +220,8 @@ extension ZaloEngine {
 
     private func applyCloudSnapshot(
         sqlSummaries: [StoredCloudConversationSummary],
-        existingIdsByConv: [String: Set<String>]
+        existingIdsByConv: [String: Set<String>],
+        serverSnapshot: ZaloCloudServerSnapshot? = nil
     ) {
         struct Accumulator {
             var photo: Int64 = 0
@@ -326,20 +330,51 @@ extension ZaloEngine {
         next.media = mediaBreakdown
         next.myCloudTypes = myCloudBreakdown
         next.conversations = convEntries.sorted { $0.total > $1.total }
-        let totalUsed = myCloudBreakdown.total + mediaBreakdown.total
-        if var existingPlan = next.plan {
-            existingPlan.myCloud = myCloudBreakdown.total
-            existingPlan.cloudMedia = mediaBreakdown.total
-            existingPlan.usage = totalUsed + existingPlan.messageBackup
+
+        if let serverSnapshot {
+            let previousHasKey = next.plan?.hasKey ?? true
+            next.plan = CloudState.Plan(
+                kind: serverSnapshot.planKind,
+                name: serverSnapshot.planName,
+                quota: serverSnapshot.quota,
+                usage: serverSnapshot.usage,
+                family: serverSnapshot.family,
+                cloudMedia: serverSnapshot.cloudMedia,
+                messageBackup: serverSnapshot.messageBackup,
+                myCloud: serverSnapshot.myCloud,
+                expireAt: serverSnapshot.expireAt,
+                autoRenew: serverSnapshot.autoRenew,
+                months: serverSnapshot.months,
+                hasKey: previousHasKey,
+                backupMedia: serverSnapshot.backupMedia,
+                backupMyCloud: serverSnapshot.backupMyCloud,
+                backupMessages: serverSnapshot.backupMessages,
+                fileLimit: serverSnapshot.fileLimit
+            )
+        } else if var existingPlan = next.plan {
+            if existingPlan.isPaid {
+                existingPlan.myCloud = myCloudBreakdown.total
+                existingPlan.cloudMedia = mediaBreakdown.total
+                existingPlan.usage = myCloudBreakdown.total + mediaBreakdown.total + existingPlan.messageBackup
+            } else {
+                existingPlan.myCloud = myCloudBreakdown.total
+                existingPlan.cloudMedia = 0
+                existingPlan.messageBackup = 0
+                existingPlan.family = 0
+                existingPlan.usage = myCloudBreakdown.total
+                if existingPlan.quota <= 0 {
+                    existingPlan.quota = 1_073_741_824
+                }
+            }
             next.plan = existingPlan
         } else {
             next.plan = CloudState.Plan(
                 kind: .free,
                 name: "Cloud của tôi",
                 quota: 1_073_741_824,
-                usage: totalUsed,
+                usage: myCloudBreakdown.total,
                 family: 0,
-                cloudMedia: mediaBreakdown.total,
+                cloudMedia: 0,
                 messageBackup: 0,
                 myCloud: myCloudBreakdown.total,
                 expireAt: nil,

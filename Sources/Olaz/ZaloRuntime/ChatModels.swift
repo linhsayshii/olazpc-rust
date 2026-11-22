@@ -265,6 +265,8 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
         var names: [String] = []
         /// Distinct people who used this reaction.
         var people: Int = 0
+        /// Per-user reaction counts (`uid -> count`) for accurate unreact removal and reactor details.
+        var userCounts: [String: Int] = [:]
 
         var id: String { icon.id }
         var emoji: String { icon.emoji }
@@ -307,6 +309,8 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
     var menu = MessageMenu()
     /// Alternate CDN URLs in priority order (`normalUrl`, `oriUrl`, `thumbUrl`…) tried when the primary media URL 404s.
     var fallbackURLs: [URL] = []
+    /// Client-assigned ID (`cliMsgId` / `clientId`) required for recall (`undo`) and local correlation.
+    var clientId: String = ""
 }
 
 /// The items of the official message context menu (message-actions-adapter.js `describe`, the builder's own conditions) with the
@@ -365,8 +369,55 @@ extension ChatMessage {
         }
         let reactions = (json["reactions"] as? [[String: Any]] ?? []).compactMap { r -> Reaction? in
             guard let icon = ReactionIcon(json: r) else { return nil }
-            return Reaction(icon: icon, count: clampedInt(number(r["count"])), includesMe: r["includesMe"] as? Bool ?? false,
-                            names: r["names"] as? [String] ?? [], people: clampedInt(number(r["people"])))
+            if let numericType = Int(icon.type.trimmingCharacters(in: .whitespacesAndNewlines)), numericType < 0 {
+                return nil
+            }
+            let rawCount = clampedInt(number(r["count"]))
+            guard rawCount > 0 else { return nil }
+            let includesMe = r["includesMe"] as? Bool ?? false
+            let rawNames = r["names"] as? [String] ?? []
+            let sentinelKeys: Set<String> = ["", "__legacy__", "unknown", "-1"]
+            var rawUserCounts: [String: Int] = [:]
+            let hasExplicitUserCounts = r["userCounts"] != nil
+            if let ucDict = r["userCounts"] as? [String: Any] {
+                for (rawUid, val) in ucDict {
+                    let uid = rawUid.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !sentinelKeys.contains(uid) else { continue }
+                    let c = clampedInt(number(val))
+                    if c > 0 { rawUserCounts[uid] = c }
+                }
+            }
+            if hasExplicitUserCounts && rawUserCounts.isEmpty {
+                return nil
+            }
+            let parsedPeople = clampedInt(number(r["people"]))
+            let hasExplicitZeroPeople = (r["people"] as? NSNumber)?.intValue == 0
+            // Drop corrupted ghost reactions left in local SQLite without valid reactor info.
+            if rawUserCounts.isEmpty && !includesMe {
+                let hasOnlyPlaceholderNames = !rawNames.isEmpty && rawNames.allSatisfy {
+                    let t = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return t.isEmpty || t == ReactionDetail.unknownName
+                }
+                if hasExplicitZeroPeople || (rawNames.isEmpty && parsedPeople <= 0) || hasOnlyPlaceholderNames {
+                    return nil
+                }
+            }
+            let cleanedNames = rawNames.compactMap { name -> String? in
+                let t = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !t.isEmpty, t != ReactionDetail.unknownName else { return nil }
+                return t
+            }
+            let effectiveCount = rawUserCounts.isEmpty ? rawCount : rawUserCounts.values.reduce(0, +)
+            guard effectiveCount > 0 else { return nil }
+            let effectivePeople = rawUserCounts.isEmpty ? parsedPeople : rawUserCounts.count
+            return Reaction(
+                icon: icon,
+                count: effectiveCount,
+                includesMe: includesMe,
+                names: cleanedNames,
+                people: effectivePeople,
+                userCounts: rawUserCounts
+            )
         }
         let mentions = (json["mentions"] as? [[String: Any]] ?? []).compactMap { m -> Mention? in
             guard let uid = m["uid"] as? String, !uid.isEmpty else { return nil }
@@ -393,7 +444,8 @@ extension ChatMessage {
             cardButtons: CardButton.list(json: json["buttons"]),
             suggestsStickers: json["stickers"] as? Bool ?? false,
             menu: MessageMenu(json: json["menu"]),
-            fallbackURLs: fallbacks
+            fallbackURLs: fallbacks,
+            clientId: (json["clientId"] as? String) ?? (json["cliMsgId"] as? String) ?? ""
         )
     }
 }
