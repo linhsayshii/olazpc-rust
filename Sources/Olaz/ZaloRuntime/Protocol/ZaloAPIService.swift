@@ -1135,6 +1135,15 @@ extension ZaloSessionClient {
             encryptedPayload: spec.payload
         )
         let extracted = Self.extractE2EESendResponse(resp)
+        if extracted.msgId.isEmpty {
+            // Shapes only (key names), never values: the message keeps its clientId until the WS echo.
+            let dataKeys = (resp["data"] as? [String: Any]).map { $0.keys.sorted().joined(separator: ",") }
+                ?? String(describing: type(of: resp["data"] ?? NSNull()))
+            let path = spec.path
+            Task { @MainActor in
+                EngineLog.shared.write("e2ee send: no server msgId path=\(path) dataKeys=\(dataKeys)")
+            }
+        }
         let cliStr = "\(clientId)"
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         return SendMessageResult(

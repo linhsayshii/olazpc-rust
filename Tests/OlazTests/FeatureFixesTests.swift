@@ -403,6 +403,82 @@ import Testing
         #expect(memMsg.text == "Tin nhắn E2EE vừa gửi")
     }
 
+    /// Regression: own E2EE text sent from this Mac stays keyed by its clientId until the server echo
+    /// (which this device cannot decrypt) arrives. That echo used to be skipped outright while the chat
+    /// was open, so recall/react kept sending `msgId == cliMsgId` and the server answered error 112.
+    @Test @MainActor func lockedOwnE2EEEchoInBatchUpgradesOpenChatMessageIdInMemoryAndSQLite() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-e2ee-batch-upgrade-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let engine = ZaloEngine(dataDirectory: root, useKeychain: false)
+        let store = try ZaloSQLiteStore(path: root.appendingPathComponent("history.sqlite3").path)
+        engine.sqliteStore = store
+        var account = ZaloLoginAccount()
+        account.userId = "100"
+        account.displayName = "Minh"
+        engine.applyAccountProfile(account)
+
+        let cliId = "1795343225629"
+        let srvId = "8517564748888"
+        let sent = ChatMessage(
+            id: cliId,
+            conversationId: "3161",
+            senderId: "100",
+            senderName: "Minh",
+            senderAvatar: nil,
+            isMine: true,
+            kind: .text,
+            text: "Tin nhắn E2EE vừa gửi",
+            date: Date(timeIntervalSince1970: 1_795_343_225),
+            status: .sent,
+            quote: nil,
+            reactions: [],
+            isE2EE: true,
+            clientId: cliId
+        )
+        engine.messages["3161"] = [sent]
+        try await store.saveMessages([try #require(ZaloWireParser.encodeChatMessage(sent, clientId: cliId))])
+
+        // Signal whisper-shaped ciphertext (type 3, version 0x33, proto tag 0x0A) this device cannot decrypt.
+        var cipherBytes: [UInt8] = [3, 0x33, 0x0A]
+        cipherBytes.append(contentsOf: (0..<61).map { UInt8(truncatingIfNeeded: $0 &* 7 &+ 1) })
+        let cipher = Data(cipherBytes).base64EncodedString()
+        #expect(ZaloWireParser.isSignalCiphertext(cipher))
+
+        let echoBatch: [String: Any] = [
+            "data": [
+                "msgs": [[
+                    "msgId": srvId,
+                    "cliMsgId": cliId,
+                    "uidFrom": "0",
+                    "idTo": "3161",
+                    "msgType": "webchat",
+                    "ts": 1_795_343_225_631,
+                    "content": cipher,
+                ]]
+            ]
+        ]
+        _ = await engine.applyBatchResponse(echoBatch, persistConversations: false)
+
+        let mem = try #require(engine.messages["3161"])
+        #expect(mem.count == 1)
+        #expect(mem.first?.id == srvId)
+        #expect(mem.first?.clientId == cliId)
+        #expect(mem.first?.text == "Tin nhắn E2EE vừa gửi")
+
+        let rows = try await store.messages(convId: "3161", limit: 10)
+        #expect(rows.count == 1)
+        #expect(rows.first?.id == srvId)
+        #expect(rows.first?.clientId == cliId)
+        #expect(rows.first?.text == "Tin nhắn E2EE vừa gửi")
+        #expect(rows.first?.status == "sent")
+
+        let ids = await engine.resolveServerAndClientIds(for: try #require(mem.first))
+        #expect(ids.msgId == srvId)
+        #expect(ids.cliMsgId == cliId)
+    }
+
     @Test func findServerMsgIdExtractsServerIdMatchingClientId() {
         let payload: [String: Any] = [
             "data": [

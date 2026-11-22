@@ -965,13 +965,19 @@ final class ZaloEngine {
                 let isLockedE2EE = (stored.status == "e2ee_locked")
                 if isLockedE2EE,
                    let memList = messages[msg.conversationId],
-                   memList.contains(where: { existing in
+                   let readable = memList.first(where: { existing in
                        guard existing.id == msg.id || (!stored.clientId.isEmpty && existing.id == stored.clientId) else {
                            return false
                        }
                        if case .placeholder = existing.kind, existing.isE2EE { return false }
                        return true
                    }) {
+                    // Keep the readable copy, but adopt the server msgId from the undecryptable echo of our
+                    // own send: recall/react need the real global id (sending the clientId fails with 112).
+                    if readable.id != msg.id, !msg.id.isEmpty, readable.id == stored.clientId {
+                        mergeMessageIntoMemory(msg, replacingClientId: stored.clientId)
+                        storedBatch.append(stored)
+                    }
                     continue
                 }
                 let alreadyKnown = messages[msg.conversationId]?.contains(where: { $0.id == msg.id }) ?? false
