@@ -109,7 +109,12 @@ struct ChatComposer: View {
         .onChange(of: accentStored) { _, now in ComposerTextView.accent = NSColor(ChatPalette.accent(now)) }
         .task(id: query) { await loadCandidates() }
         .task(id: draft) { await loadStickerSuggestions() }
-        .onChange(of: draft) { _, _ in typingStickers.dismissed = false }
+        .onChange(of: draft) { _, newDraft in
+            typingStickers.dismissed = false
+            if newDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !conversationId.isEmpty {
+                engine.resetOutgoingTyping(in: conversationId)
+            }
+        }
         .sheet(isPresented: $showPollCreate) { PollCreateSheet(conversationId: conversationId) }
         .sheet(isPresented: $showMyCard) { MyCardSheet(conversationId: conversationId, conversationName: name) }
         .sheet(isPresented: Binding(get: { reminderInfo != nil }, set: { if !$0 { reminderInfo = nil } })) {
@@ -186,6 +191,14 @@ struct ChatComposer: View {
                 onPasteAttachment: { content in
                     guard !conversationId.isEmpty else { return }
                     pastedAttachment = PastedAttachment(content: content, conversationId: conversationId, conversationName: name)
+                },
+                onUserTextEdit: { newText in
+                    guard !conversationId.isEmpty else { return }
+                    if newText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        engine.resetOutgoingTyping(in: conversationId)
+                    } else {
+                        engine.notifyTyping(in: conversationId)
+                    }
                 },
                 onSend: send)
                 .frame(height: textHeight)
@@ -531,6 +544,7 @@ struct ComposerTextView: NSViewRepresentable {
     /// While the popover is open: ↑ ↓ Return/Tab Esc. Returns true when consumed.
     var onSuggestionKey: (MentionKey) -> Bool = { _ in false }
     var onPasteAttachment: (PastedContent) -> Void = { _ in }
+    var onUserTextEdit: (String) -> Void = { _ in }
     var onSend: () -> Void
 
     static let font = NSFont.systemFont(ofSize: 14)
@@ -655,12 +669,18 @@ struct ComposerTextView: NSViewRepresentable {
 
         func textDidChange(_ notification: Notification) {
             guard let tv = notification.object as? NSTextView else { return }
+            let hadPending = pending != nil
             if pending != nil {
                 if tv.hasMarkedText() { remeasure(tv); return }
                 applyPending(tv)
             }
             sanitizeTokens(tv)
-            if parent.text != tv.string { parent.text = tv.string }
+            if parent.text != tv.string {
+                parent.text = tv.string
+                if !hadPending {
+                    parent.onUserTextEdit(tv.string)
+                }
+            }
             syncMentions(tv)
             refreshQuery(tv)
             remeasure(tv)

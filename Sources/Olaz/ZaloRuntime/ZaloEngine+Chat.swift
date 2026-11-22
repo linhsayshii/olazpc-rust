@@ -239,6 +239,7 @@ extension ZaloEngine {
     func sendText(_ text: String, to id: String, quoting quoteId: String? = nil, mentions: [Mention] = []) async -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !id.isEmpty else { return false }
+        resetOutgoingTyping(in: id)
 
         let quote = quoteId.flatMap { qid in messages[id]?.first(where: { $0.id == qid }) }
         let cliInt = await sessionClient.nextClientId()
@@ -544,5 +545,77 @@ extension ZaloEngine {
            let name = info["name"] as? String {
             showTyping(convId: convId, name: name)
         }
+    }
+
+    @MainActor
+    func notifyTyping(in convId: String) {
+        let target = convId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty, phase == .ready else { return }
+        guard OutgoingTypingStore.throttle(for: self).shouldSend(in: target) else { return }
+        let client = sessionClient
+        Task {
+            guard await client.isAuthenticated else { return }
+            await client.sendTypingAPI(convId: target)
+        }
+    }
+
+    @MainActor
+    func resetOutgoingTyping(in convId: String) {
+        let target = convId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else { return }
+        OutgoingTypingStore.throttle(for: self).reset(in: target)
+    }
+}
+
+/// Per-conversation outgoing typing throttle (~3.5s) stored outside `ZaloEngine` so engine state stays decoupled.
+@MainActor
+final class OutgoingTypingThrottle {
+    static let defaultInterval: TimeInterval = 3.5
+
+    let interval: TimeInterval
+    private var lastSentByConv: [String: Date] = [:]
+
+    init(interval: TimeInterval = OutgoingTypingThrottle.defaultInterval) {
+        self.interval = interval
+    }
+
+    func shouldSend(in convId: String, now: Date = Date()) -> Bool {
+        let key = convId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return false }
+        if let last = lastSentByConv[key], now.timeIntervalSince(last) < interval {
+            return false
+        }
+        lastSentByConv[key] = now
+        return true
+    }
+
+    func reset(in convId: String) {
+        let key = convId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return }
+        lastSentByConv.removeValue(forKey: key)
+    }
+
+    func resetAll() {
+        lastSentByConv.removeAll()
+    }
+
+    func lastSentDate(for convId: String) -> Date? {
+        let key = convId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return nil }
+        return lastSentByConv[key]
+    }
+}
+
+@MainActor
+private enum OutgoingTypingStore {
+    private static let byEngine = NSMapTable<ZaloEngine, OutgoingTypingThrottle>.weakToStrongObjects()
+
+    static func throttle(for engine: ZaloEngine) -> OutgoingTypingThrottle {
+        if let existing = byEngine.object(forKey: engine) {
+            return existing
+        }
+        let created = OutgoingTypingThrottle()
+        byEngine.setObject(created, forKey: engine)
+        return created
     }
 }

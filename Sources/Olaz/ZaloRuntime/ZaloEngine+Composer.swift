@@ -1,3 +1,4 @@
+import AVFoundation
 import AppKit
 import ImageIO
 import UniformTypeIdentifiers
@@ -127,8 +128,91 @@ enum ReminderRepeat: Int, CaseIterable, Identifiable {
     }
 }
 
+struct VideoMetadata: Sendable, Equatable {
+    var durationMs: Int
+    var width: Int
+    var height: Int
+    var thumbnailData: Data
+}
+
 extension ZaloEngine {
     // MARK: Attachments
+
+    nonisolated static func isVideoUTType(_ utType: UTType?) -> Bool {
+        guard let utType else { return false }
+        return utType.conforms(to: .movie)
+            || utType.conforms(to: .video)
+            || utType.conforms(to: .mpeg4Movie)
+            || utType.conforms(to: .quickTimeMovie)
+    }
+
+    nonisolated static func isVideoURL(_ url: URL) -> Bool {
+        if isVideoUTType(UTType(filenameExtension: url.pathExtension)) {
+            return true
+        }
+        if url.pathExtension.isEmpty && url.isFileURL {
+            return VideoPoster.isVideo(url)
+        }
+        return false
+    }
+
+    nonisolated static func extractVideoMetadata(from url: URL) async -> VideoMetadata {
+        let asset: AVURLAsset = {
+            if url.isFileURL, url.pathExtension.isEmpty, let mime = VideoPoster.mimeType(of: url) {
+                return AVURLAsset(url: url, options: [AVURLAssetOverrideMIMETypeKey: mime])
+            }
+            return AVURLAsset(url: url)
+        }()
+
+        let durationSeconds = (try? await asset.load(.duration).seconds) ?? 0
+        let durationMs = (durationSeconds.isFinite && durationSeconds > 0)
+            ? Int((durationSeconds * 1000).rounded())
+            : 0
+
+        var width = 0
+        var height = 0
+        if let track = try? await asset.loadTracks(withMediaType: .video).first,
+           let (naturalSize, transform) = try? await track.load(.naturalSize, .preferredTransform) {
+            let rect = CGRect(origin: .zero, size: naturalSize).applying(transform)
+            width = max(0, Int(abs(rect.width).rounded()))
+            height = max(0, Int(abs(rect.height).rounded()))
+        }
+
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 960, height: 960)
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = CMTime(seconds: 1, preferredTimescale: 600)
+
+        let targetSeconds = durationMs > 0 ? min(0.1, Double(durationMs) / 2000.0) : 0
+        let targetTime = CMTime(seconds: targetSeconds, preferredTimescale: 600)
+
+        let cgImage: CGImage?
+        if let first = try? await generator.image(at: targetTime) {
+            cgImage = first.image
+        } else if targetSeconds > 0, let fallback = try? await generator.image(at: .zero) {
+            cgImage = fallback.image
+        } else {
+            cgImage = nil
+        }
+
+        var thumbnailData = Data()
+        if let cgImage {
+            if width == 0 || height == 0 {
+                width = cgImage.width
+                height = cgImage.height
+            }
+            let rep = NSBitmapImageRep(cgImage: cgImage)
+            thumbnailData = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.8]) ?? Data()
+        }
+
+        return VideoMetadata(
+            durationMs: durationMs,
+            width: width,
+            height: height,
+            thumbnailData: thumbnailData
+        )
+    }
 
     func sendMedia(_ urls: [URL], to id: String) async -> ComposerOutcome {
         guard !urls.isEmpty, !id.isEmpty else { return .cancelled }
@@ -139,6 +223,7 @@ extension ZaloEngine {
             guard let data = try? Data(contentsOf: url) else { continue }
             let utType = UTType(filenameExtension: url.pathExtension)
             let isImage = utType?.conforms(to: .image) ?? false
+            let isVideo = !isImage && Self.isVideoURL(url)
             do {
                 if isImage {
                     let dims = imageDimensions(data)
@@ -148,6 +233,26 @@ extension ZaloEngine {
                     await recordUploadedMessage(
                         convId: id, msgId: res.msgId, cliId: res.cliMsgId,
                         kind: .photo(url: URL(string: res.url), width: res.width, height: res.height),
+                        text: ""
+                    )
+                } else if isVideo {
+                    let meta = await Self.extractVideoMetadata(from: url)
+                    let res = try await sessionClient.uploadAndSendVideo(
+                        convId: id,
+                        fileName: url.lastPathComponent,
+                        data: data,
+                        thumbnailData: meta.thumbnailData,
+                        durationMs: meta.durationMs,
+                        width: meta.width,
+                        height: meta.height,
+                        webSocket: webSocket
+                    )
+                    let thumbURL = res.thumbUrl.isEmpty ? nil : URL(string: res.thumbUrl)
+                    let videoURL = res.url.isEmpty ? nil : URL(string: res.url)
+                    let durSec = res.durationMs > 0 ? max(1, Int((Double(res.durationMs) / 1000.0).rounded())) : 0
+                    await recordUploadedMessage(
+                        convId: id, msgId: res.msgId, cliId: res.cliMsgId,
+                        kind: .video(thumbnail: thumbURL, duration: durSec, url: videoURL),
                         text: ""
                     )
                 } else {
@@ -202,7 +307,7 @@ extension ZaloEngine {
         return (w, h)
     }
 
-    private func recordUploadedMessage(convId: String, msgId: String, cliId: String, kind: ChatMessage.Kind, text: String) async {
+    internal func recordUploadedMessage(convId: String, msgId: String, cliId: String, kind: ChatMessage.Kind, text: String) async {
         let msg = ChatMessage(
             id: msgId,
             conversationId: convId,
