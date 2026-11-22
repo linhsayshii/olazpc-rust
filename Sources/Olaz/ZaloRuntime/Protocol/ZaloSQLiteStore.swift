@@ -69,6 +69,7 @@ actor ZaloSQLiteStore {
             throw ZaloSQLiteError.openFailed(msg)
         }
         self.db = handle
+        Self.registerSearchFunctions(on: handle)
         try Self.exec(handle, """
         PRAGMA journal_mode=WAL;
         PRAGMA synchronous=NORMAL;
@@ -114,6 +115,7 @@ actor ZaloSQLiteStore {
             if sqlite3_open_v2(path, &rHandle, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
                let rHandle {
                 sqlite3_busy_timeout(rHandle, 5000)
+                Self.registerSearchFunctions(on: rHandle)
                 self.readDb = rHandle
             }
         }
@@ -558,23 +560,174 @@ actor ZaloSQLiteStore {
             let rc = sqlite3_step(stmt)
             if rc == SQLITE_DONE { break }
             guard rc == SQLITE_ROW else { throw ZaloSQLiteError.stepFailed(lastError) }
-            let raw = columnText(stmt, 11)
-            desc.append(StoredMessage(
-                id: columnText(stmt, 0),
-                convId: columnText(stmt, 1),
-                clientId: columnText(stmt, 2),
-                senderId: columnText(stmt, 3),
-                senderName: columnText(stmt, 4),
-                senderAvatar: columnText(stmt, 5),
-                isMine: sqlite3_column_int(stmt, 6) != 0,
-                text: columnText(stmt, 7),
-                kindTag: columnText(stmt, 8),
-                tsMs: sqlite3_column_int64(stmt, 9),
-                status: columnText(stmt, 10),
-                rawJSONData: Data(raw.utf8)
-            ))
+            desc.append(readStoredMessage(stmt))
         }
         return desc.reversed()
+    }
+
+    /// Escapes SQLite `LIKE` wildcards (`%`, `_`, and `\`) using `\` as the escape character.
+    static func escapeLikePattern(_ query: String) -> String {
+        var out = ""
+        out.reserveCapacity(query.count)
+        for ch in query {
+            if ch == "\\" || ch == "%" || ch == "_" {
+                out.append("\\")
+            }
+            out.append(ch)
+        }
+        return out
+    }
+
+    /// Searches stored messages in `conversationId` case-insensitively using `LIKE ? ESCAPE '\'`,
+    /// returning newest-first (`ts_ms DESC`).
+    func searchMessages(conversationId: String, query: String, limit: Int = 50) throws -> [StoredMessage] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !conversationId.isEmpty, !trimmed.isEmpty, limit > 0 else { return [] }
+        let clampedLimit = max(1, min(limit, 500))
+        let pattern = "%\(Self.escapeLikePattern(trimmed.lowercased()))%"
+        let sql = """
+        SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
+        FROM messages
+        WHERE conv_id = ?1
+          AND kind_tag != 'recalled'
+          AND status != 'e2ee_locked'
+          AND (
+              olaz_fold(text) LIKE ?2 ESCAPE '\\'
+              OR (
+                  json_valid(raw_json)
+                  AND (
+                      olaz_fold(COALESCE(json_extract(raw_json, '$.text'), '')) LIKE ?2 ESCAPE '\\'
+                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.caption'), '')) LIKE ?2 ESCAPE '\\'
+                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.body'), '')) LIKE ?2 ESCAPE '\\'
+                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.caption'), '')) LIKE ?2 ESCAPE '\\'
+                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.title'), '')) LIKE ?2 ESCAPE '\\'
+                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.description'), '')) LIKE ?2 ESCAPE '\\'
+                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.name'), '')) LIKE ?2 ESCAPE '\\'
+                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.address'), '')) LIKE ?2 ESCAPE '\\'
+                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.question'), '')) LIKE ?2 ESCAPE '\\'
+                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.header'), '')) LIKE ?2 ESCAPE '\\'
+                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.text'), '')) LIKE ?2 ESCAPE '\\'
+                      OR (
+                          kind_tag = 'oaMessage'
+                          AND json_type(raw_json, '$.kind.parts') = 'array'
+                          AND EXISTS (
+                              SELECT 1 FROM json_each(raw_json, '$.kind.parts')
+                              WHERE olaz_fold(COALESCE(json_extract(value, '$.title'), '')) LIKE ?2 ESCAPE '\\'
+                                 OR olaz_fold(COALESCE(json_extract(value, '$.description'), '')) LIKE ?2 ESCAPE '\\'
+                          )
+                      )
+                  )
+              )
+          )
+        ORDER BY ts_ms DESC, id DESC
+        LIMIT ?3;
+        """
+        let stmt = try prepare(sql)
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, conversationId)
+        bindText(stmt, 2, pattern)
+        sqlite3_bind_int(stmt, 3, Int32(clampedLimit))
+        var out: [StoredMessage] = []
+        while true {
+            let rc = sqlite3_step(stmt)
+            if rc == SQLITE_DONE { break }
+            guard rc == SQLITE_ROW else { throw ZaloSQLiteError.stepFailed(lastError) }
+            out.append(readStoredMessage(stmt))
+        }
+        return out
+    }
+
+    /// Loads messages from `targetTsMs` upward (optionally capped at `beforeOldestTsMs`) plus `contextBefore`
+    /// earlier messages so jumping to an older search match has surrounding context in chronological order.
+    func messagesAround(
+        convId: String,
+        targetTsMs: Int64,
+        beforeOldestTsMs: Int64?,
+        contextBefore: Int = 25,
+        maxWindow: Int = 3000
+    ) throws -> (messages: [StoredMessage], hasMoreOlder: Bool) {
+        let clampedBefore = max(0, min(contextBefore, 200))
+        let clampedWindow = max(1, min(maxWindow, 5000))
+
+        var olderDesc: [StoredMessage] = []
+        if clampedBefore > 0 {
+            let olderSQL = """
+            SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
+            FROM messages
+            WHERE conv_id = ?1 AND ts_ms < ?2
+            ORDER BY ts_ms DESC, id DESC
+            LIMIT ?3;
+            """
+            let stmt = try prepare(olderSQL)
+            defer { sqlite3_finalize(stmt) }
+            bindText(stmt, 1, convId)
+            sqlite3_bind_int64(stmt, 2, targetTsMs)
+            sqlite3_bind_int(stmt, 3, Int32(clampedBefore + 1))
+            while true {
+                let rc = sqlite3_step(stmt)
+                if rc == SQLITE_DONE { break }
+                guard rc == SQLITE_ROW else { throw ZaloSQLiteError.stepFailed(lastError) }
+                olderDesc.append(readStoredMessage(stmt))
+            }
+        }
+        let hasMoreOlder = olderDesc.count > clampedBefore
+        let contextAsc = Array(olderDesc.prefix(clampedBefore).reversed())
+
+        let newerSQL: String
+        if beforeOldestTsMs != nil {
+            newerSQL = """
+            SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
+            FROM messages
+            WHERE conv_id = ?1 AND ts_ms >= ?2 AND ts_ms <= ?3
+            ORDER BY ts_ms ASC, id ASC
+            LIMIT ?4;
+            """
+        } else {
+            newerSQL = """
+            SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
+            FROM messages
+            WHERE conv_id = ?1 AND ts_ms >= ?2
+            ORDER BY ts_ms ASC, id ASC
+            LIMIT ?3;
+            """
+        }
+        let newerStmt = try prepare(newerSQL)
+        defer { sqlite3_finalize(newerStmt) }
+        bindText(newerStmt, 1, convId)
+        sqlite3_bind_int64(newerStmt, 2, targetTsMs)
+        if let beforeOldestTsMs {
+            sqlite3_bind_int64(newerStmt, 3, beforeOldestTsMs)
+            sqlite3_bind_int(newerStmt, 4, Int32(clampedWindow))
+        } else {
+            sqlite3_bind_int(newerStmt, 3, Int32(clampedWindow))
+        }
+        var newerAsc: [StoredMessage] = []
+        while true {
+            let rc = sqlite3_step(newerStmt)
+            if rc == SQLITE_DONE { break }
+            guard rc == SQLITE_ROW else { throw ZaloSQLiteError.stepFailed(lastError) }
+            newerAsc.append(readStoredMessage(newerStmt))
+        }
+
+        return (contextAsc + newerAsc, hasMoreOlder)
+    }
+
+    private func readStoredMessage(_ stmt: OpaquePointer) -> StoredMessage {
+        let raw = columnText(stmt, 11)
+        return StoredMessage(
+            id: columnText(stmt, 0),
+            convId: columnText(stmt, 1),
+            clientId: columnText(stmt, 2),
+            senderId: columnText(stmt, 3),
+            senderName: columnText(stmt, 4),
+            senderAvatar: columnText(stmt, 5),
+            isMine: sqlite3_column_int(stmt, 6) != 0,
+            text: columnText(stmt, 7),
+            kindTag: columnText(stmt, 8),
+            tsMs: sqlite3_column_int64(stmt, 9),
+            status: columnText(stmt, 10),
+            rawJSONData: Data(raw.utf8)
+        )
     }
 
     func message(convId: String, idOrClientId: String) throws -> StoredMessage? {
@@ -828,6 +981,24 @@ actor ZaloSQLiteStore {
     }
 
     // MARK: - Low-level SQLite Helpers
+
+    private static func registerSearchFunctions(on db: OpaquePointer?) {
+        guard let db else { return }
+        let flags = SQLITE_UTF8 | SQLITE_DETERMINISTIC
+        sqlite3_create_function_v2(db, "olaz_fold", 1, flags, nil, { ctx, argc, argv in
+            guard argc == 1,
+                  let arg = argv?[0],
+                  sqlite3_value_type(arg) != SQLITE_NULL,
+                  let cStr = sqlite3_value_text(arg) else {
+                sqlite3_result_text(ctx, "", 0, nil)
+                return
+            }
+            let folded = String(cString: cStr).lowercased()
+            folded.withCString { ptr in
+                sqlite3_result_text(ctx, ptr, -1, SQLITE_TRANSIENT)
+            }
+        }, nil, nil, nil)
+    }
 
     private var lastError: String {
         db.map { String(cString: sqlite3_errmsg($0)) } ?? "closed"

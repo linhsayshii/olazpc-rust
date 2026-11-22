@@ -11,9 +11,15 @@ struct ChatInspector: View {
     @Environment(ShellModel.self) private var shell
     /// Group members from the official @mention suggestions; nil while loading.
     @State private var members: [MentionCandidate]?
+    @State private var showAllMembers = false
     @State private var showLabelManager = false
     @State private var pollSheet: PollEntry?
     @State private var showPollCreate = false
+    @State private var showRenameGroup = false
+    @State private var showAddMembers = false
+    @State private var memberToKick: MentionCandidate?
+    @State private var confirmLeaveGroup = false
+    @State private var leavingGroup = false
     /// Width of the overview's scroll view itself (not of its content, see `SharedMediaGrid`).
     @State private var outerWidth: CGFloat = 300
     /// Photos / files / links ever shared, read from the official media service (the overview shows the newest of each).
@@ -48,6 +54,50 @@ struct ChatInspector: View {
         }
         .sheet(isPresented: $showPollCreate) { PollCreateSheet(conversationId: id) }
         .sheet(isPresented: $showLabelManager) { LabelManagerView() }
+        .sheet(isPresented: $showRenameGroup) {
+            RenameGroupSheet(groupId: id, currentName: conversation.name)
+        }
+        .sheet(isPresented: $showAddMembers) {
+            AddGroupMembersSheet(
+                groupId: id,
+                groupName: conversation.displayName,
+                existingMemberIds: (members ?? []).map(\.id)
+            ) {
+                Task { await loadMembers() }
+            }
+        }
+        .alert(
+            "Xóa thành viên?",
+            isPresented: Binding(get: { memberToKick != nil }, set: { if !$0 { memberToKick = nil } }),
+            presenting: memberToKick
+        ) { member in
+            Button("Xóa khỏi nhóm", role: .destructive) {
+                memberToKick = nil
+                Task {
+                    if await engine.kickMember(member.id, from: id) {
+                        await loadMembers()
+                    }
+                }
+            }
+            Button("Hủy", role: .cancel) { memberToKick = nil }
+        } message: { member in
+            Text("Bạn có chắc muốn xóa \(member.name) khỏi nhóm này?")
+        }
+        .alert("Rời khỏi nhóm?", isPresented: $confirmLeaveGroup) {
+            Button("Rời nhóm", role: .destructive) {
+                Task {
+                    leavingGroup = true
+                    let ok = await engine.leaveGroup(id)
+                    leavingGroup = false
+                    if ok {
+                        shell.hideInspector(animated: false)
+                    }
+                }
+            }
+            Button("Hủy", role: .cancel) {}
+        } message: {
+            Text("Bạn sẽ không còn nhận được tin nhắn từ nhóm \"\(conversation.displayName)\" nữa.")
+        }
     }
 
     private var overview: some View {
@@ -58,11 +108,15 @@ struct ChatInspector: View {
                 actions
                 if conversation.isGroup {
                     groupBoard(LoadedPolls(messages: loaded).polls)
+                    groupManagementSection
                     membersSection
                 }
                 mediaSection(preview(.images, loaded))
                 filesSection(preview(.files, loaded))
                 linksSection(preview(.links, loaded))
+                if conversation.isGroup {
+                    leaveGroupSection
+                }
             }
             .padding(.horizontal, 16)
             .padding(.top, 8)
@@ -180,29 +234,109 @@ struct ChatInspector: View {
         }
     }
 
+    private var groupManagementSection: some View {
+        section("Quản lý nhóm") {
+            list {
+                row(symbol: "pencil", title: "Đổi tên nhóm") { showRenameGroup = true }
+                Divider().padding(.leading, 40)
+                row(symbol: "person.badge.plus", title: "Thêm thành viên") { showAddMembers = true }
+            }
+        }
+    }
+
+    private var leaveGroupSection: some View {
+        list {
+            Button(role: .destructive) {
+                confirmLeaveGroup = true
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "rectangle.portrait.and.arrow.right")
+                        .font(.system(size: 14))
+                        .frame(width: 18)
+                    if leavingGroup {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Text("Rời nhóm").font(.system(size: 13, weight: .medium))
+                    }
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(.red)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .frame(minHeight: 38)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(leavingGroup)
+        }
+    }
+
     @ViewBuilder
     private var membersSection: some View {
-        // The official suggestion list is the only member source; without it the section is left out.
+        let myUid = ZaloWireParser.stripUserPrefix(engine.profile?.userId ?? "")
         if let members, !members.isEmpty {
-            let shown = Array(members.prefix(memberLimit))
-            section("Thành viên", trailing: conversation.members > 0 ? "\(conversation.members)" : nil) {
+            let shown = showAllMembers ? members : Array(members.prefix(memberLimit))
+            let toggleAction: (() -> Void)? = members.count > memberLimit ? { showAllMembers.toggle() } : nil
+            section(
+                "Thành viên",
+                trailing: conversation.members > 0 ? "\(conversation.members)" : nil,
+                actionTitle: showAllMembers ? "Thu gọn" : "Xem tất cả",
+                seeAll: toggleAction
+            ) {
                 list {
                     ForEach(Array(shown.enumerated()), id: \.element.id) { index, member in
+                        let canKick = !member.isAll && member.id != "-1" && (myUid.isEmpty || member.id != myUid)
                         if index > 0 { Divider().padding(.leading, 46) }
-                        Button { engine.openContactConversation(member.id) } label: {
-                            HStack(spacing: 10) {
-                                RemoteAvatar(url: member.avatar, name: member.name, size: 26)
-                                Text(member.name).font(.system(size: 13)).lineLimit(1)
-                                Spacer(minLength: 0)
+                        HStack(spacing: 8) {
+                            Button { engine.openContactConversation(member.id) } label: {
+                                HStack(spacing: 10) {
+                                    RemoteAvatar(url: member.avatar, name: member.name, size: 26)
+                                    Text(member.name).font(.system(size: 13)).lineLimit(1)
+                                    Spacer(minLength: 0)
+                                }
+                                .contentShape(Rectangle())
                             }
-                            .padding(.horizontal, 12)
-                            .frame(minHeight: 38)
-                            .contentShape(Rectangle())
+                            .buttonStyle(.plain)
+                            .help("Nhắn tin với \(member.name)")
+
+                            if canKick {
+                                Menu {
+                                    Button("Nhắn tin", systemImage: "bubble.left") {
+                                        engine.openContactConversation(member.id)
+                                    }
+                                    Divider()
+                                    Button("Xóa khỏi nhóm", systemImage: "person.badge.minus", role: .destructive) {
+                                        memberToKick = member
+                                    }
+                                } label: {
+                                    Image(systemName: "ellipsis")
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 24, height: 24)
+                                        .contentShape(Rectangle())
+                                }
+                                .menuStyle(.borderlessButton)
+                                .menuIndicator(.hidden)
+                                .fixedSize()
+                                .help("Quản lý thành viên")
+                                .accessibilityLabel("Tùy chọn cho \(member.name)")
+                            }
                         }
-                        .buttonStyle(.plain)
-                        .help("Nhắn tin với \(member.name)")
+                        .padding(.horizontal, 12)
+                        .frame(minHeight: 38)
+                        .contextMenu {
+                            Button("Nhắn tin", systemImage: "bubble.left") {
+                                engine.openContactConversation(member.id)
+                            }
+                            if canKick {
+                                Divider()
+                                Button("Xóa khỏi nhóm", systemImage: "person.badge.minus", role: .destructive) {
+                                    memberToKick = member
+                                }
+                            }
+                        }
                     }
-                    if conversation.members > shown.count {
+                    if !showAllMembers && conversation.members > shown.count {
                         Divider()
                         emptyLine("và \(conversation.members - shown.count) thành viên khác")
                     }
@@ -218,9 +352,9 @@ struct ChatInspector: View {
     private func loadMembers() async {
         members = nil
         guard conversation.isGroup else { members = []; return }
-        let found = await engine.mentionCandidates(in: id, query: "", excluding: [])
+        let found = await engine.loadGroupMembers(in: id)
         guard !Task.isCancelled else { return }
-        members = found.filter { !$0.isAll }
+        members = found.filter { !$0.isAll && $0.id != "-1" }
     }
 
     // MARK: Shared content
@@ -331,7 +465,13 @@ struct ChatInspector: View {
     // MARK: Building blocks
 
     /// `trailing`: a quiet value (the member count); `seeAll`: the "Xem tất cả" button of a list that continues on the storage page.
-    private func section<Content: View>(_ title: String, trailing: String? = nil, seeAll: (() -> Void)? = nil, @ViewBuilder _ content: () -> Content) -> some View {
+    private func section<Content: View>(
+        _ title: String,
+        trailing: String? = nil,
+        actionTitle: String = "Xem tất cả",
+        seeAll: (() -> Void)? = nil,
+        @ViewBuilder _ content: () -> Content
+    ) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text(title).font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
@@ -339,7 +479,7 @@ struct ChatInspector: View {
                 Spacer()
                 if let trailing { Text(trailing).font(.system(size: 12)).foregroundStyle(.tertiary) }
                 if let seeAll {
-                    Button("Xem tất cả", action: seeAll)
+                    Button(actionTitle, action: seeAll)
                         .buttonStyle(.plain)
                         .font(.system(size: 12))
                         .foregroundStyle(.tint)
@@ -415,6 +555,286 @@ private struct LoadedPolls {
         for message in messages.reversed() {
             if case .poll(let info) = message.kind, !info.pollId.isEmpty, seenPolls.insert(info.pollId).inserted {
                 polls.append(Poll(id: info.pollId, question: info.question))
+            }
+        }
+    }
+}
+
+// MARK: - Group Management Sheets
+
+private struct RenameGroupSheet: View {
+    let groupId: String
+    let currentName: String
+
+    @Environment(ZaloEngine.self) private var engine
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var name = ""
+    @State private var saving = false
+    @State private var error: String?
+    @FocusState private var focused: Bool
+
+    private let limits = GroupCreateLimits()
+
+    private var trimmedName: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var canSave: Bool {
+        !trimmedName.isEmpty && trimmedName != currentName.trimmingCharacters(in: .whitespacesAndNewlines) && !saving
+    }
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Text("Đổi tên nhóm")
+                .font(.system(size: 16, weight: .semibold))
+            TextField("Nhập tên nhóm...", text: $name)
+                .textFieldStyle(.plain)
+                .font(.system(size: 14))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .glassEffect(.regular, in: Capsule())
+                .focused($focused)
+                .disabled(saving)
+                .onChange(of: name) { _, typed in
+                    let clamped = limits.clampedName(typed)
+                    if clamped != typed { name = clamped }
+                }
+                .onSubmit { save() }
+            if let error {
+                Text(error)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.orange)
+                    .multilineTextAlignment(.center)
+            }
+            HStack(spacing: 10) {
+                Button("Hủy") { dismiss() }
+                    .buttonStyle(.glass)
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(saving)
+                Button {
+                    save()
+                } label: {
+                    if saving {
+                        ProgressView().controlSize(.small).frame(width: 56)
+                    } else {
+                        Text("Lưu")
+                    }
+                }
+                .buttonStyle(.glassProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(!canSave)
+            }
+        }
+        .padding(24)
+        .frame(width: 360)
+        .onAppear {
+            name = limits.clampedName(currentName)
+            focused = true
+            DispatchQueue.main.async { focused = true }
+        }
+    }
+
+    private func save() {
+        guard canSave else { return }
+        saving = true
+        error = nil
+        let target = trimmedName
+        Task {
+            let ok = await engine.renameGroup(groupId, to: target)
+            saving = false
+            if ok {
+                dismiss()
+            } else {
+                error = "Không thể đổi tên nhóm. Vui lòng thử lại."
+            }
+        }
+    }
+}
+
+private struct AddGroupMembersSheet: View {
+    let groupId: String
+    let groupName: String
+    let existingMemberIds: [String]
+    var onAdded: () -> Void
+
+    @Environment(ZaloEngine.self) private var engine
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var query = ""
+    @State private var selected: [String] = []
+    @State private var saving = false
+    @State private var error: String?
+    @FocusState private var searchFocused: Bool
+
+    private var excludedIds: Set<String> {
+        var ids = Set(existingMemberIds)
+        ids.formUnion(engine.groupMemberIds(in: groupId))
+        if let myUid = engine.profile?.userId {
+            ids.insert(ZaloWireParser.stripUserPrefix(myUid))
+        }
+        return ids
+    }
+
+    private var availablePeople: [GroupComposeRoster.Person] {
+        let excluded = excludedIds
+        let roster = GroupComposeRoster(
+            friends: engine.visibleFriends,
+            conversations: engine.visibleConversations,
+            selfId: engine.selfConversationId
+        )
+        let source = query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? roster.friends
+            : roster.matching(query)
+        return source.filter { !excluded.contains($0.id) }
+    }
+
+    var body: some View {
+        let people = availablePeople
+        VStack(spacing: 0) {
+            VStack(spacing: 4) {
+                Text("Thêm thành viên")
+                    .font(.system(size: 16, weight: .semibold))
+                Text(groupName)
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .padding(.top, 18)
+            .padding(.bottom, 12)
+
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("Tìm bạn bè...", text: $query)
+                    .textFieldStyle(.plain)
+                    .focused($searchFocused)
+                if !query.isEmpty {
+                    Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .glassEffect(.regular, in: Capsule())
+            .padding(.horizontal, 16)
+            .padding(.bottom, 10)
+
+            Divider()
+
+            if !engine.contacts.friendsLoaded {
+                ProgressView("Đang tải danh sách bạn bè…")
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if people.isEmpty {
+                ContentUnavailableView(
+                    query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? "Không còn bạn bè để thêm"
+                        : "Không tìm thấy",
+                    systemImage: query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? "person.2"
+                        : "magnifyingglass"
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 2) {
+                        ForEach(people) { person in
+                            memberRow(person)
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                }
+            }
+
+            Divider()
+
+            VStack(spacing: 8) {
+                if let error {
+                    Text(error)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.orange)
+                }
+                HStack(spacing: 8) {
+                    Text(selected.isEmpty ? "Chọn thành viên muốn thêm" : "Đã chọn \(selected.count)")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                    Spacer()
+                    Button("Hủy") { dismiss() }
+                        .buttonStyle(.glass)
+                        .keyboardShortcut(.cancelAction)
+                        .disabled(saving)
+                    Button {
+                        invite()
+                    } label: {
+                        if saving {
+                            ProgressView().controlSize(.small).frame(width: 56)
+                        } else {
+                            Text("Thêm")
+                        }
+                    }
+                    .buttonStyle(.glassProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(selected.isEmpty || saving)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+        }
+        .frame(width: 420, height: 560)
+        .task {
+            if !engine.contacts.friendsLoaded {
+                await engine.performContactsSync()
+            }
+        }
+        .onAppear {
+            searchFocused = true
+            DispatchQueue.main.async { searchFocused = true }
+        }
+    }
+
+    private func memberRow(_ person: GroupComposeRoster.Person) -> some View {
+        let checked = selected.contains(person.id)
+        return Button {
+            if let idx = selected.firstIndex(of: person.id) {
+                selected.remove(at: idx)
+            } else {
+                selected.append(person.id)
+            }
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: checked ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 18))
+                    .foregroundStyle(checked ? AnyShapeStyle(.tint) : AnyShapeStyle(Color.secondary.opacity(0.6)))
+                RemoteAvatar(url: person.avatar, name: person.name, size: 34)
+                Text(person.name)
+                    .font(.system(size: 14))
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(checked ? .isSelected : [])
+    }
+
+    private func invite() {
+        guard !selected.isEmpty, !saving else { return }
+        saving = true
+        error = nil
+        let targetIds = selected
+        Task {
+            let ok = await engine.inviteMembers(targetIds, to: groupId)
+            saving = false
+            if ok {
+                onAdded()
+                dismiss()
+            } else {
+                error = "Không thể thêm thành viên. Vui lòng thử lại."
             }
         }
     }

@@ -17,8 +17,19 @@ struct ChatView: View {
     @State private var lastMarkedId: String?
     /// Width of the chat column; the header's room in the toolbar is what the buttons leave of it.
     @State private var columnWidth: CGFloat = 400
-    /// A loaded message to bring on screen (a pin of the pinned bar).
+    /// A loaded message to bring on screen (a pin of the pinned bar or a search match).
     @State private var jumpTarget: String?
+    @State private var searchOpen = false
+    @State private var searchQuery = ""
+    @State private var searchMatches: [ChatMessage] = []
+    @State private var searchMatchIndex = 0
+    @State private var searchSearching = false
+    @State private var searchFocusTick = 0
+    @State private var searchTask: Task<Void, Never>?
+    @State private var jumpTask: Task<Void, Never>?
+    @State private var jumpGeneration = 0
+    @State private var activeJumpId: String?
+    @State private var highlightedMessageId: String?
 
     private enum SendNotice { case restored, like }
 
@@ -43,7 +54,14 @@ struct ChatView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .tourAnchor(.message, arrowEdge: .trailing)
                 } else {
-                    MessageList(conversation: conversation, scrollToBottomTick: sendTick, jumpTarget: $jumpTarget, onReply: reply)
+                    MessageList(
+                        conversation: conversation,
+                        scrollToBottomTick: sendTick,
+                        jumpTarget: $jumpTarget,
+                        highlightedMessageId: highlightedMessageId,
+                        suppressRestore: activeJumpId != nil,
+                        onReply: reply
+                    )
                 }
             } else {
                 VStack(spacing: 10) {
@@ -54,9 +72,32 @@ struct ChatView: View {
                 .tourAnchor(.message, arrowEdge: .trailing)
             }
         }
-        .background { ChatWallpaperBackground() }
+        .background {
+            ChatWallpaperBackground()
+            Button("") { openSearch() }
+                .keyboardShortcut("f", modifiers: .command)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+                .accessibilityHidden(true)
+        }
         .safeAreaBar(edge: .top, spacing: 0) {
-            PinnedBar(conversationId: id, open: openPin)
+            VStack(spacing: 0) {
+                if searchOpen {
+                    MessageSearchBar(
+                        query: $searchQuery,
+                        matchIndex: searchMatchIndex,
+                        matchCount: searchMatches.count,
+                        isSearching: searchSearching,
+                        focusTick: searchFocusTick,
+                        onPrevious: { stepMatch(+1) },
+                        onNext: { stepMatch(-1) },
+                        onSubmit: { submitSearch() },
+                        onClose: closeSearch
+                    )
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+                PinnedBar(conversationId: id, open: openPin)
+            }
         }
         .safeAreaBar(edge: .bottom, spacing: 0) {
             ChatComposer(
@@ -96,6 +137,13 @@ struct ChatView: View {
             ToolbarSpacer(.fixed, placement: .primaryAction)
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
+                    toggleSearch()
+                } label: {
+                    Label("Tìm kiếm tin nhắn", systemImage: "magnifyingglass")
+                }
+                .help("Tìm tin nhắn (⌘F)")
+                .accessibilityLabel("Tìm tin nhắn")
+                Button {
                     shell.toggleInspector()
                 } label: {
                     Label("Thông tin", systemImage: "sidebar.right")
@@ -123,10 +171,17 @@ struct ChatView: View {
         .onChange(of: shell.replyTick) { _, _ in
             if let newest = engine.messages[id]?.last(where: { !$0.isMine && !$0.kind.isStandalone && $0.kind != .recalled }) { reply(newest) }
         }
+        .onChange(of: searchQuery) { _, newValue in
+            scheduleSearch(for: newValue)
+        }
+        .onDisappear {
+            searchTask?.cancel()
+            jumpTask?.cancel()
+        }
     }
 
-    /// Toolbar room kept free of the header: the call buttons, the info button and the "⋯" menu with their spacing.
-    private static let toolbarButtonsRoom: CGFloat = 230
+    /// Toolbar room kept free of the header: the call buttons, search button, the info button and the "⋯" menu with their spacing.
+    private static let toolbarButtonsRoom: CGFloat = 270
 
     /// Avatar, name and subtitle: the first toolbar item of the chat column.
     private func header(subtitle: String) -> some View {
@@ -222,6 +277,235 @@ struct ChatView: View {
         replyTo = merged.replyTo
         if showsNotice { notice = .restored }
     }
+
+    // MARK: In-conversation search
+
+    private func openSearch() {
+        if !searchOpen {
+            withAnimation(.snappy(duration: 0.2)) { searchOpen = true }
+        }
+        searchFocusTick += 1
+    }
+
+    private func toggleSearch() {
+        if searchOpen { closeSearch() } else { openSearch() }
+    }
+
+    private func closeSearch() {
+        searchTask?.cancel()
+        searchTask = nil
+        jumpTask?.cancel()
+        jumpTask = nil
+        activeJumpId = nil
+        searchMatches = []
+        searchMatchIndex = 0
+        searchQuery = ""
+        searchSearching = false
+        highlightedMessageId = nil
+        withAnimation(.snappy(duration: 0.2)) { searchOpen = false }
+        focusTick += 1
+    }
+
+    private func scheduleSearch(for rawQuery: String) {
+        searchTask?.cancel()
+        let trimmed = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            searchSearching = false
+            searchMatches = []
+            searchMatchIndex = 0
+            highlightedMessageId = nil
+            return
+        }
+        searchSearching = true
+        searchTask = Task {
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled else { return }
+            await executeSearch(trimmed)
+        }
+    }
+
+    private func submitSearch() {
+        let trimmed = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if !searchMatches.isEmpty && !searchSearching {
+            stepMatch(+1)
+            return
+        }
+        searchTask?.cancel()
+        searchSearching = true
+        searchTask = Task {
+            await executeSearch(trimmed)
+        }
+    }
+
+    private func executeSearch(_ trimmed: String) async {
+        let found = await engine.searchMessages(in: id, query: trimmed, limit: 100)
+        guard !Task.isCancelled else { return }
+        searchSearching = false
+        searchMatches = found
+        searchMatchIndex = 0
+        if let first = found.first {
+            jumpToSearchMatch(first)
+        } else {
+            highlightedMessageId = nil
+        }
+    }
+
+    private func stepMatch(_ delta: Int) {
+        guard !searchMatches.isEmpty else { return }
+        let count = searchMatches.count
+        searchMatchIndex = (searchMatchIndex + delta + count) % count
+        jumpToSearchMatch(searchMatches[searchMatchIndex])
+    }
+
+    private func jumpToSearchMatch(_ message: ChatMessage) {
+        jumpGeneration += 1
+        let gen = jumpGeneration
+        jumpTask?.cancel()
+        activeJumpId = message.id
+        highlightedMessageId = message.id
+        jumpTask = Task {
+            let ready = await engine.ensureMessageLoaded(message, in: id)
+            guard !Task.isCancelled, gen == jumpGeneration else { return }
+            if ready {
+                // Allow SwiftUI one layout pass to materialize newly prepended rows before scrolling.
+                try? await Task.sleep(for: .milliseconds(20))
+                guard !Task.isCancelled, gen == jumpGeneration else { return }
+                jumpTarget = message.id
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+            if !Task.isCancelled, gen == jumpGeneration {
+                activeJumpId = nil
+            }
+        }
+    }
+}
+
+// MARK: - Inline search bar
+
+private struct MessageSearchBar: View {
+    @Binding var query: String
+    let matchIndex: Int
+    let matchCount: Int
+    let isSearching: Bool
+    let focusTick: Int
+    let onPrevious: () -> Void
+    let onNext: () -> Void
+    let onSubmit: () -> Void
+    let onClose: () -> Void
+
+    @FocusState private var focused: Bool
+
+    private var hasQuery: Bool {
+        !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(.secondary)
+            TextField("Tìm tin nhắn trong cuộc trò chuyện", text: $query)
+                .textFieldStyle(.plain)
+                .font(.system(size: 13))
+                .focused($focused)
+                .onSubmit(onSubmit)
+                .onExitCommand(perform: onClose)
+                .onKeyPress(.upArrow) {
+                    guard matchCount > 0 else { return .ignored }
+                    onPrevious()
+                    return .handled
+                }
+                .onKeyPress(.downArrow) {
+                    guard matchCount > 0 else { return .ignored }
+                    onNext()
+                    return .handled
+                }
+
+            if !query.isEmpty {
+                Button {
+                    query = ""
+                    focused = true
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Xoá nội dung tìm kiếm")
+                .accessibilityLabel("Xoá nội dung tìm kiếm")
+            }
+
+            if hasQuery {
+                Group {
+                    if isSearching {
+                        ProgressView().controlSize(.mini)
+                    } else if matchCount == 0 {
+                        Text("Không tìm thấy")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("\(matchIndex + 1) / \(matchCount)")
+                            .font(.system(size: 11.5, weight: .medium).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .fixedSize()
+            }
+
+            Divider().frame(height: 14)
+
+            Button(action: onPrevious) {
+                Image(systemName: "chevron.up")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(matchCount > 0 ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiary))
+            .disabled(matchCount == 0)
+            .help("Tin nhắn cũ hơn (↑)")
+            .accessibilityLabel("Kết quả cũ hơn")
+
+            Button(action: onNext) {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(matchCount > 0 ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiary))
+            .disabled(matchCount == 0)
+            .help("Tin nhắn mới hơn (↓)")
+            .accessibilityLabel("Kết quả mới hơn")
+
+            Button(action: onClose) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Đóng tìm kiếm (Esc)")
+            .accessibilityLabel("Đóng tìm kiếm")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(.horizontal, 16)
+        .padding(.top, 6)
+        .padding(.bottom, 2)
+        .onExitCommand(perform: onClose)
+        .onAppear {
+            focused = true
+            DispatchQueue.main.async { focused = true }
+        }
+        .onChange(of: focusTick) { _, _ in
+            focused = true
+            DispatchQueue.main.async { focused = true }
+        }
+    }
 }
 
 // MARK: - Row model (memoized)
@@ -294,6 +578,8 @@ private struct MessageList: View {
     let conversation: ZaloEngine.ConversationSummary
     let scrollToBottomTick: Int
     @Binding var jumpTarget: String?
+    var highlightedMessageId: String?
+    var suppressRestore: Bool = false
     var onReply: (ChatMessage) -> Void
 
     @Environment(ZaloEngine.self) private var engine
@@ -336,11 +622,25 @@ private struct MessageList: View {
                         case .day(let date):
                             DaySeparator(date: date)
                         case .message(let m, let first, let last, let status):
+                            let isHighlighted = (m.id == highlightedMessageId)
                             MessageRow(message: m, isGroup: conversation.isGroup,
                                        firstInGroup: first, lastInGroup: last, showStatus: status,
                                        isNewest: m.id == newestId,
                                        onReply: onReply,
                                        onReact: { emoji, msg in engine.react(emoji, to: msg.id, in: id) })
+                                .background {
+                                    if isHighlighted {
+                                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                            .fill(Color.accentColor.opacity(0.14))
+                                            .overlay {
+                                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                                    .strokeBorder(Color.accentColor.opacity(0.35), lineWidth: 1)
+                                            }
+                                            .padding(.horizontal, -4)
+                                            .padding(.vertical, 1)
+                                    }
+                                }
+                                .animation(.easeOut(duration: 0.2), value: isHighlighted)
                         }
                     }
                     Color.clear.frame(height: 8).id("bottom")
@@ -380,6 +680,7 @@ private struct MessageList: View {
             .onChange(of: msgs.first?.id) { old, _ in
                 // Older history was prepended: put the row that was at the top back there, and wait for the reader to
                 // scroll up again before the next page.
+                guard !suppressRestore, jumpTarget == nil else { return }
                 guard let old, let idx = msgs.firstIndex(where: { $0.id == old }), idx > 0 else { return }
                 olderArmed = false
                 // A pull saved its row; a prepend nobody asked for keeps the row on screen now (the binding still holds it).
@@ -412,7 +713,12 @@ private struct MessageList: View {
             // The tour's message step points at the newest row: make sure it exists in the lazy stack.
             .onChange(of: shell.tour) { _, step in if step == .message { scrollToBottom(proxy) } }
             .onAppear {
-                DispatchQueue.main.async { proxy.scrollTo("bottom", anchor: .bottom) }
+                if let pending = jumpTarget {
+                    jumpTarget = nil
+                    DispatchQueue.main.async { proxy.scrollTo(pending, anchor: .center) }
+                } else if highlightedMessageId == nil {
+                    DispatchQueue.main.async { proxy.scrollTo("bottom", anchor: .bottom) }
+                }
             }
             .onDisappear { olderTask?.cancel() }
             .overlay(alignment: .bottomTrailing) {
