@@ -246,15 +246,72 @@ extension ZaloSessionClient {
     }
 
     func fetchProfiles(uids: [String]) async throws -> ZaloJSONBox {
-        let clean = Array(Set(uids.map(ZaloWireParser.stripUserPrefix))).filter { !$0.isEmpty }
+        var seen = Set<String>()
+        var clean: [String] = []
+        clean.reserveCapacity(uids.count)
+        for raw in uids {
+            if let uid = ZaloWireParser.sanitizeProfileUid(raw), seen.insert(uid).inserted {
+                clean.append(uid)
+            }
+        }
         guard !clean.isEmpty else { return ZaloJSONBox([:]) }
-        let pver = clean.map { "\($0)_0" }
-        let resp = try await post(
-            service: "profile",
-            path: "/api/social/group/members",
-            encryptedPayload: ["friend_pversion_map": pver]
-        )
-        return ZaloJSONBox(resp)
+
+        var mergedProfiles: [String: [String: Any]] = [:]
+        for offset in stride(from: 0, to: clean.count, by: 50) {
+            let chunk = Array(clean[offset..<min(offset + 50, clean.count)])
+            let chunkMap = try await fetchProfileChunk(chunk)
+            for (uid, row) in chunkMap {
+                mergedProfiles[uid] = row
+            }
+        }
+        return ZaloJSONBox(["data": ["profiles": mergedProfiles]])
+    }
+
+    private func fetchProfileChunk(_ chunk: [String]) async throws -> [String: [String: Any]] {
+        guard !chunk.isEmpty else { return [:] }
+        let pver = chunk.map { "\($0)_0" }
+        do {
+            let resp = try await post(
+                service: "profile",
+                path: "/api/social/group/members",
+                encryptedPayload: ["friend_pversion_map": pver]
+            )
+            return ZaloWireParser.extractProfilesMap(resp)
+        } catch let primaryErr as ZaloSessionError {
+            if primaryErr.isAuthError { throw primaryErr }
+            do {
+                let fallbackResp = try await post(
+                    service: "profile",
+                    path: "/api/social/friend/getprofiles/v2",
+                    encryptedPayload: [
+                        "phonebook_version": 0,
+                        "friend_pversion_map": pver,
+                        "avatar_size": 160,
+                        "language": "vi",
+                        "show_online_status": 0,
+                        "imei": imei
+                    ]
+                )
+                return ZaloWireParser.extractProfilesMap(fallbackResp)
+            } catch let fallbackErr as ZaloSessionError {
+                if fallbackErr.isAuthError { throw fallbackErr }
+                if fallbackErr.code == 114 || primaryErr.code == 114 {
+                    if chunk.count > 1 {
+                        let mid = chunk.count / 2
+                        let left = try await fetchProfileChunk(Array(chunk[..<mid]))
+                        let right = try await fetchProfileChunk(Array(chunk[mid...]))
+                        var merged = left
+                        for (uid, row) in right {
+                            merged[uid] = row
+                        }
+                        return merged
+                    }
+                    // Single invalid/deleted UID should not poison the rest of a batch.
+                    return [:]
+                }
+                throw fallbackErr
+            }
+        }
     }
 
     func fetchAliases() async throws -> [String: String] {

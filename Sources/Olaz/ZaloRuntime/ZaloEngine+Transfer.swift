@@ -1,11 +1,11 @@
 import Foundation
 
-private actor SyncBatchDownloadLimiter {
+private actor SyncConcurrencyLimiter {
     private let maxConcurrent: Int
     private var running = 0
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
-    init(maxConcurrent: Int = 6) {
+    init(maxConcurrent: Int) {
         self.maxConcurrent = maxConcurrent
     }
 
@@ -15,7 +15,7 @@ private actor SyncBatchDownloadLimiter {
         return try await operation()
     }
 
-    private func acquire() async {
+    func acquire() async {
         if running < maxConcurrent {
             running += 1
             return
@@ -25,7 +25,7 @@ private actor SyncBatchDownloadLimiter {
         }
     }
 
-    private func release() {
+    func release() {
         if !waiters.isEmpty {
             let next = waiters.removeFirst()
             next.resume()
@@ -35,7 +35,19 @@ private actor SyncBatchDownloadLimiter {
     }
 }
 
-private let syncBatchDownloadLimiter = SyncBatchDownloadLimiter(maxConcurrent: 6)
+private let syncBatchDownloadLimiter = SyncConcurrencyLimiter(maxConcurrent: 6)
+private let syncBatchIngestLimiter = SyncConcurrencyLimiter(maxConcurrent: 2)
+
+struct SyncStage2ProgressState: Sendable, Equatable {
+    var activeSyncId: String = ""
+    var totalPartitions: Int = 0
+    var completedPartitionsBeforeChunk: Int = 0
+    var currentChunkPartitionCount: Int = 0
+    var chunkIndex: Int = 0
+    var totalChunks: Int = 1
+    var cumulativeMessagesBeforeChunk: Int = 0
+    var cumulativeConvIdsBeforeChunk: Set<String> = []
+}
 
 // Phone → PC message transfer (`SyncFull` v2 `cmd 590`/`591` + in-process `JSRuntime` `libzproto` + server catch-up).
 extension ZaloEngine {
@@ -165,6 +177,9 @@ extension ZaloEngine {
         activeSyncBatchTasks.values.forEach { $0.cancel() }
         activeSyncBatchTasks = [:]
         phoneSyncConvTimestamps = [:]
+        syncAttemptedProfileUids = []
+        syncStage2Progress = SyncStage2ProgressState()
+        syncInitialEmptyDB = false
         lastSyncConvFlushAt = .distantPast
         isTransferHidden = false
         phoneSyncStatusSignal = nil
@@ -198,6 +213,8 @@ extension ZaloEngine {
 
             await self.phoneSync.resetAll()
             await self.loadAndPersistSyncIdentityKey()
+            let hadMessagesBeforeSync = (try? await self.sqliteStore?.hasAnyMessages()) ?? true
+            self.syncInitialEmptyDB = !hadMessagesBeforeSync
 
             // Guard against an invalid/kicked session before prompting the phone.
             do {
@@ -240,9 +257,21 @@ extension ZaloEngine {
                     }
                 }
 
+                let diag = ZaloPhoneSync.diagnostics()
                 let wasmReady = await self.phoneSync.prepareWasm()
                 let wsAuthed = await self.webSocket.isAuthed
-                EngineLog.shared.write("sync-v2: init wasm=\(wasmReady) ws=\(wsAuthed)")
+                EngineLog.shared.write("sync-v2: init wasm=\(wasmReady) wasm_bytes=\(diag.wasmBytes) zstd=\(diag.zstdAvailable)(\(diag.zstdBackend ?? "none")) ws=\(wsAuthed)")
+
+                if !wasmReady {
+                    self.transferStartBlockedReason = "WASM_UNAVAILABLE"
+                    await self.failTransfer(
+                        name: "WASM_UNAVAILABLE",
+                        synced: 0,
+                        total: nil,
+                        received: 0
+                    )
+                    return
+                }
 
                 if wasmReady && wsAuthed {
                     let snap = await self.sessionClient.currentSnapshot()
@@ -280,12 +309,12 @@ extension ZaloEngine {
                         EngineLog.shared.write("sync-v2: conv request sync=\(String(convReg.syncId.prefix(8))) ack_code=\(ackCode)")
 
                         if ackBox != nil && ackCode == 0 {
-                            let convOutcome = await self.waitSyncSessionCompletion(
+                            let convWait = await self.waitSyncSessionCompletion(
                                 syncId: convReg.syncId,
-                                waitLimit: 120.0,
+                                unansweredLimit: 120.0,
                                 phoneAlreadyAnswered: false
                             )
-                            switch convOutcome {
+                            switch convWait.outcome {
                             case .rejected:
                                 await self.failTransfer(name: "USER_REJECT_BACKUP", synced: 0, total: nil, received: 0)
                                 return
@@ -299,6 +328,8 @@ extension ZaloEngine {
                                 phoneAnswered = true
                             }
                             await self.awaitAllActiveSyncBatchTasks()
+                            let convSnap = await self.phoneSync.requestSnapshot(syncId: convReg.syncId)
+                            EngineLog.shared.write("sync-v2: chunk done ussidx=0 msgs=\(convSnap?.importedCount ?? 0) convs=\(self.phoneSyncConvTimestamps.count) reason=\(convWait.reason)")
                             await self.ackDeleteSyncSession(syncId: convReg.syncId, reason: 0)
                             await self.phoneSync.removeRequest(syncId: convReg.syncId)
                         } else {
@@ -362,6 +393,7 @@ extension ZaloEngine {
                     if !plan.partitions.isEmpty {
                         var effectiveBatchSize = ZaloPhoneSync.partitionsPerRequest
                         var offset = 0
+                        var chunkIndex = 0
                         var cumulativeMessages = 0
                         var cumulativeConvs = Set<String>()
 
@@ -371,8 +403,9 @@ extension ZaloEngine {
 
                             let end = min(offset + effectiveBatchSize, plan.partitions.count)
                             let chunk = Array(plan.partitions[offset..<end])
-                            let totalChunks = max(1, (plan.partitions.count + effectiveBatchSize - 1) / effectiveBatchSize)
-                            let chunkIndex = offset / effectiveBatchSize
+                            let remainingChunks = max(1, (plan.partitions.count - offset + effectiveBatchSize - 1) / effectiveBatchSize)
+                            let totalChunks = chunkIndex + remainingChunks
+                            let chunkUssidx = ussidx
 
                             let reg: (syncId: String, innerData: ZaloJSONBox)
                             do {
@@ -388,6 +421,17 @@ extension ZaloEngine {
                                 break
                             }
 
+                            self.syncStage2Progress = SyncStage2ProgressState(
+                                activeSyncId: reg.syncId,
+                                totalPartitions: plan.partitions.count,
+                                completedPartitionsBeforeChunk: offset,
+                                currentChunkPartitionCount: chunk.count,
+                                chunkIndex: chunkIndex,
+                                totalChunks: totalChunks,
+                                cumulativeMessagesBeforeChunk: cumulativeMessages,
+                                cumulativeConvIdsBeforeChunk: cumulativeConvs
+                            )
+
                             let ackBox = await self.webSocket.sendRequestFrame(
                                 cmd: ZaloWebSocket.cmdSyncRequest,
                                 subCmd: 0,
@@ -397,7 +441,7 @@ extension ZaloEngine {
                             )
                             let ackCode = JSONLossless.int64(ackBox?.dict["error_code"]) ?? -1
                             let ackMsg = JSONLossless.string(ackBox?.dict["error_message"])
-                            EngineLog.shared.write("sync-v2: msg request sync=\(String(reg.syncId.prefix(8))) ussidx=\(ussidx - 1) parts=\(chunk.count) ack_code=\(ackCode) msg=\(ackMsg)")
+                            EngineLog.shared.write("sync-v2: msg request sync=\(String(reg.syncId.prefix(8))) ussidx=\(chunkUssidx) parts=\(chunk.count) ack_code=\(ackCode) msg=\(ackMsg)")
                             guard ackBox != nil, ackCode == 0 else {
                                 await self.phoneSync.removeRequest(syncId: reg.syncId)
                                 if effectiveBatchSize > 10 && ackCode != 211 {
@@ -411,38 +455,48 @@ extension ZaloEngine {
                             msgAckFailureCode = nil
                             offset = end
 
-                            let frac = Double(chunkIndex) / Double(max(1, totalChunks))
+                            let initialProg = Self.computeStage2BatchProgress(
+                                completedPartitionsBeforeChunk: self.syncStage2Progress.completedPartitionsBeforeChunk,
+                                currentChunkPartitions: chunk.count,
+                                totalPartitions: plan.partitions.count,
+                                batchesCompletedInChunk: 0,
+                                expectedBatchesInChunk: nil,
+                                previousProgress: self.transfer?.progress
+                            )
                             if phoneAnswered {
                                 self.updateTransferUI(MessageTransferState(
                                     phase: .transferring,
-                                    progress: 0.14 + frac * 0.58,
+                                    progress: initialProg.progress,
                                     syncedConversations: cumulativeConvs.count,
                                     totalConversations: plan.partitions.count,
                                     message: "Đang nhận tin nhắn từ điện thoại (\(chunkIndex + 1)/\(totalChunks))…",
                                     stage: "messages",
                                     stageIndex: 2,
                                     stageCount: 3,
-                                    stageProgress: frac,
+                                    stageProgress: initialProg.stageProgress,
                                     receivedMessages: cumulativeMessages
                                 ))
                             }
 
-                            let outcome = await self.waitSyncSessionCompletion(
+                            let waitResult = await self.waitSyncSessionCompletion(
                                 syncId: reg.syncId,
-                                waitLimit: phoneAnswered ? 35.0 : 120.0,
+                                unansweredLimit: 120.0,
                                 phoneAlreadyAnswered: phoneAnswered
                             )
                             await self.awaitAllActiveSyncBatchTasks()
-                            if let snapDone = await self.phoneSync.requestSnapshot(syncId: reg.syncId) {
+                            let snapDone = await self.phoneSync.requestSnapshot(syncId: reg.syncId)
+                            if let snapDone {
                                 cumulativeMessages += snapDone.importedCount
                                 phoneImportedTotal = cumulativeMessages
                                 cumulativeConvs.formUnion(snapDone.syncedConvIds)
                             }
                             phoneSyncedConvCount = max(phoneSyncedConvCount, cumulativeConvs.count)
+                            EngineLog.shared.write("sync-v2: chunk done ussidx=\(chunkUssidx) msgs=\(snapDone?.importedCount ?? 0) convs=\(snapDone?.syncedConversationsCount ?? 0) reason=\(waitResult.reason)")
                             await self.ackDeleteSyncSession(syncId: reg.syncId, reason: 0)
                             await self.phoneSync.removeRequest(syncId: reg.syncId)
+                            chunkIndex += 1
 
-                            switch outcome {
+                            switch waitResult.outcome {
                             case .rejected:
                                 await self.failTransfer(name: "USER_REJECT_BACKUP", synced: phoneSyncedConvCount, total: plan.partitions.count, received: phoneImportedTotal)
                                 return
@@ -456,6 +510,7 @@ extension ZaloEngine {
                                 phoneAnswered = true
                             }
                         }
+                        self.syncStage2Progress = SyncStage2ProgressState()
                         self.flushSyncedConversationsNow()
                         await self.persistConversationsToSQLite()
                     }
@@ -552,55 +607,143 @@ extension ZaloEngine {
         }
     }
 
-    private enum SyncWaitOutcome {
+    internal enum SyncWaitOutcome: Sendable, Equatable {
         case completed
         case rejected
         case busy
         case timedOutUnconfirmed
     }
 
-    private func waitSyncSessionCompletion(
-        syncId: String,
-        waitLimit: TimeInterval,
-        phoneAlreadyAnswered: Bool
-    ) async -> SyncWaitOutcome {
-        let start = Date()
-        var answered = phoneAlreadyAnswered
-        while !Task.isCancelled {
-            try? await Task.sleep(for: .milliseconds(80))
-            if Task.isCancelled { return .completed }
+    internal enum SyncWaitStepDecision: Sendable, Equatable {
+        case keepWaiting(answeredAt: Date?)
+        case finished(outcome: SyncWaitOutcome, reason: String)
+    }
 
-            if case .userRejected? = phoneSyncStatusSignal {
-                return .rejected
-            }
-            if case .mobileBusy? = phoneSyncStatusSignal {
-                return .busy
-            }
+    nonisolated static func evaluateWaitStep(
+        signal: ZaloMobileSyncEvent?,
+        snapshot: SyncRequestSnapshot?,
+        now: Date,
+        start: Date,
+        answeredAt: Date?,
+        unansweredLimit: TimeInterval = 120.0,
+        chunkCeiling: TimeInterval = 180.0,
+        idleThreshold: TimeInterval = 4.0,
+        emptyChunkTimeout: TimeInterval = 8.0,
+        maxIdleAfterActivity: TimeInterval = 15.0
+    ) -> SyncWaitStepDecision {
+        if case .userRejected? = signal {
+            return .finished(outcome: .rejected, reason: "user_rejected")
+        }
+        if case .mobileBusy? = signal {
+            return .finished(outcome: .busy, reason: "mobile_busy")
+        }
 
-            let reqSnap = await phoneSync.requestSnapshot(syncId: syncId)
-            if phoneSyncStatusSignal == .userConfirmed || (reqSnap?.batchesCount ?? 0) > 0 || (reqSnap?.inFlightCount ?? 0) > 0 {
-                answered = true
+        let becameAnswered = (signal == .userConfirmed)
+            || ((snapshot?.batchesCount ?? 0) > 0)
+            || ((snapshot?.inFlightCount ?? 0) > 0)
+        let effectiveAnsweredAt = answeredAt ?? (becameAnswered ? now : nil)
+
+        guard let ansAt = effectiveAnsweredAt else {
+            if now.timeIntervalSince(start) > unansweredLimit {
+                return .finished(outcome: .timedOutUnconfirmed, reason: "unconfirmed_timeout")
             }
-            if let reqSnap {
-                if reqSnap.isFulfilled {
-                    return .completed
-                }
-                if reqSnap.inFlightCount == 0 {
-                    if reqSnap.batchesCount > 0 {
-                        let idle = reqSnap.lastActivity.map { Date().timeIntervalSince($0) } ?? 0
-                        if reqSnap.lastSeen || idle > 3.5 {
-                            return .completed
+            return .keepWaiting(answeredAt: nil)
+        }
+
+        let answeredElapsed = now.timeIntervalSince(ansAt)
+        if let reqSnap = snapshot {
+            if reqSnap.isFulfilled {
+                return .finished(outcome: .completed, reason: "fulfilled")
+            }
+            if reqSnap.inFlightCount == 0 {
+                let idle = reqSnap.lastActivity.map { now.timeIntervalSince($0) }
+                if reqSnap.batchesCount > 0 {
+                    if reqSnap.lastSeen {
+                        return .finished(outcome: .completed, reason: "last_seen")
+                    }
+                    if let idle {
+                        if idle > idleThreshold {
+                            return .finished(outcome: .completed, reason: "idle_after_batches")
                         }
-                    } else if answered && Date().timeIntervalSince(start) > 4.5 {
-                        return .completed
+                    } else if answeredElapsed > idleThreshold {
+                        return .finished(outcome: .completed, reason: "idle_after_batches")
+                    }
+                } else if answeredElapsed > emptyChunkTimeout {
+                    if idle == nil || (idle ?? 0) > idleThreshold {
+                        return .finished(outcome: .completed, reason: "empty_chunk_timeout")
                     }
                 }
+            } else {
+                // `inFlightCount > 0`: keep waiting while active or within recent activity window, up to ceiling.
+                let idle = reqSnap.lastActivity.map { now.timeIntervalSince($0) } ?? answeredElapsed
+                if answeredElapsed > chunkCeiling && idle > maxIdleAfterActivity {
+                    return .finished(outcome: .completed, reason: "ceiling_timeout")
+                }
             }
-            if Date().timeIntervalSince(start) > waitLimit {
-                return answered ? .completed : .timedOutUnconfirmed
+        } else if answeredElapsed > emptyChunkTimeout {
+            return .finished(outcome: .completed, reason: "missing_snapshot")
+        }
+
+        if answeredElapsed > chunkCeiling {
+            return .finished(outcome: .completed, reason: "ceiling_timeout")
+        }
+        return .keepWaiting(answeredAt: ansAt)
+    }
+
+    nonisolated static func computeStage2BatchProgress(
+        completedPartitionsBeforeChunk: Int,
+        currentChunkPartitions: Int,
+        totalPartitions: Int,
+        batchesCompletedInChunk: Int,
+        expectedBatchesInChunk: Int?,
+        previousProgress: Double?
+    ) -> (progress: Double, stageProgress: Double) {
+        let safeTotal = max(1, totalPartitions)
+        let baseFrac = min(1.0, max(0.0, Double(completedPartitionsBeforeChunk) / Double(safeTotal)))
+        let chunkWeight = min(1.0 - baseFrac, max(0.0, Double(currentChunkPartitions) / Double(safeTotal)))
+        let intraFrac: Double = {
+            if let expected = expectedBatchesInChunk, expected > 0 {
+                return min(1.0, max(0.0, Double(batchesCompletedInChunk) / Double(expected)))
+            }
+            let b = Double(max(0, batchesCompletedInChunk))
+            if b <= 0 { return 0.0 }
+            return min(0.95, b / (b + 12.0))
+        }()
+        let stageFrac = min(1.0, max(0.0, baseFrac + chunkWeight * intraFrac))
+        let rawProgress = 0.14 + stageFrac * 0.58
+        let prevClamped = min(0.72, max(0.14, previousProgress ?? 0.14))
+        let progress = min(0.72, max(prevClamped, rawProgress))
+        return (progress: progress, stageProgress: stageFrac)
+    }
+
+    private func waitSyncSessionCompletion(
+        syncId: String,
+        unansweredLimit: TimeInterval = 120.0,
+        phoneAlreadyAnswered: Bool
+    ) async -> (outcome: SyncWaitOutcome, reason: String) {
+        let start = Date()
+        var answeredAt: Date? = phoneAlreadyAnswered ? start : nil
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .milliseconds(80))
+            if Task.isCancelled { return (.completed, "cancelled") }
+
+            let reqSnap = await phoneSync.requestSnapshot(syncId: syncId)
+            let decision = Self.evaluateWaitStep(
+                signal: phoneSyncStatusSignal,
+                snapshot: reqSnap,
+                now: Date(),
+                start: start,
+                answeredAt: answeredAt,
+                unansweredLimit: unansweredLimit
+            )
+            switch decision {
+            case .keepWaiting(let nextAnsweredAt):
+                answeredAt = nextAnsweredAt
+            case .finished(let outcome, let reason):
+                return (outcome, reason)
             }
         }
-        return .completed
+        return (.completed, "cancelled")
     }
 
     private func failTransfer(name: String, synced: Int, total: Int?, received: Int) async {
@@ -765,17 +908,43 @@ extension ZaloEngine {
             } else {
                 await ingestParsedPhoneMessages(result.parsedMessages)
                 if let snap = await phoneSync.requestSnapshot(syncId: syncId), transferTask != nil {
+                    let s2 = syncStage2Progress
+                    let useS2 = (s2.activeSyncId == syncId && s2.totalPartitions > 0)
+                    let prog: (progress: Double, stageProgress: Double) = {
+                        if useS2 {
+                            let completedCount = (snap.expectedDataBatches != nil) ? snap.completedDataBatchesCount : snap.batchesCount
+                            return Self.computeStage2BatchProgress(
+                                completedPartitionsBeforeChunk: s2.completedPartitionsBeforeChunk,
+                                currentChunkPartitions: s2.currentChunkPartitionCount,
+                                totalPartitions: s2.totalPartitions,
+                                batchesCompletedInChunk: completedCount,
+                                expectedBatchesInChunk: snap.expectedDataBatches,
+                                previousProgress: transfer?.progress
+                            )
+                        }
+                        return (max(transfer?.progress ?? 0.15, 0.16), transfer?.stageProgress ?? 0.1)
+                    }()
+                    let syncedCount = useS2
+                        ? s2.cumulativeConvIdsBeforeChunk.union(snap.syncedConvIds).count
+                        : max(transfer?.syncedConversations ?? 0, snap.syncedConversationsCount)
+                    let totalConvs = useS2 ? s2.totalPartitions : transfer?.totalConversations
+                    let receivedMsgs = useS2
+                        ? (s2.cumulativeMessagesBeforeChunk + snap.importedCount)
+                        : ((transfer?.receivedMessages ?? 0) + result.parsedMessages.count)
+                    let msgLabel = (useS2 && s2.totalChunks > 1)
+                        ? "Đang nhận tin nhắn từ điện thoại (\(s2.chunkIndex + 1)/\(s2.totalChunks))…"
+                        : "Đang nhận dữ liệu tin nhắn từ điện thoại…"
                     updateTransferUI(MessageTransferState(
                         phase: .transferring,
-                        progress: max(transfer?.progress ?? 0.15, 0.16),
-                        syncedConversations: max(transfer?.syncedConversations ?? 0, snap.syncedConversationsCount),
-                        totalConversations: transfer?.totalConversations,
-                        message: "Đang nhận dữ liệu tin nhắn từ điện thoại…",
+                        progress: prog.progress,
+                        syncedConversations: syncedCount,
+                        totalConversations: totalConvs,
+                        message: msgLabel,
                         stage: "messages",
                         stageIndex: 2,
                         stageCount: 3,
-                        stageProgress: transfer?.stageProgress,
-                        receivedMessages: (transfer?.receivedMessages ?? 0) + result.parsedMessages.count
+                        stageProgress: prog.stageProgress,
+                        receivedMessages: receivedMsgs
                     ))
                 }
             }
@@ -904,7 +1073,12 @@ extension ZaloEngine {
 
     internal func ingestParsedPhoneMessages(_ parsed: [ParsedPhoneMessage]) async {
         guard !parsed.isEmpty else { return }
+        await syncBatchIngestLimiter.acquire()
+        await performIngestParsedPhoneMessages(parsed)
+        await syncBatchIngestLimiter.release()
+    }
 
+    private func performIngestParsedPhoneMessages(_ parsed: [ParsedPhoneMessage]) async {
         // Resolve any group sender / mention / quote global IDs that aren't in cache yet.
         var globalIdsToDecrypt = Set<String>()
         for item in parsed {
@@ -923,12 +1097,22 @@ extension ZaloEngine {
         let gidMap = globalIdsToDecrypt.isEmpty ? [:] : await sessionClient.decryptGlobalIds(Array(globalIdsToDecrypt))
 
         // Fetch profiles for any newly discovered group member UIDs and persist to cachedProfiles so we never re-fetch them!
-        let unknownSenderUids = Array(Set(gidMap.values.filter { lookupPersonInfo($0) == nil && $0 != profile?.userId }))
+        let unknownSenderUids = Array(Set(gidMap.values.compactMap { rawUid -> String? in
+            guard let clean = ZaloWireParser.sanitizeProfileUid(rawUid),
+                  clean != profile?.userId,
+                  !syncAttemptedProfileUids.contains(clean),
+                  lookupPersonInfo(clean) == nil else {
+                return nil
+            }
+            return clean
+        }))
+        let uidsToFetch = Array(unknownSenderUids.prefix(150))
         var extraProfiles: [String: (name: String, avatar: String)] = [:]
-        if !unknownSenderUids.isEmpty {
+        if !uidsToFetch.isEmpty {
+            syncAttemptedProfileUids.formUnion(uidsToFetch)
             var profileCacheDirty = false
-            for offset in stride(from: 0, to: min(unknownSenderUids.count, 150), by: 50) {
-                let slice = Array(unknownSenderUids[offset..<min(offset + 50, unknownSenderUids.count)])
+            for offset in stride(from: 0, to: uidsToFetch.count, by: 50) {
+                let slice = Array(uidsToFetch[offset..<min(offset + 50, uidsToFetch.count)])
                 if let profBox = try? await sessionClient.fetchProfiles(uids: slice) {
                     for (uid, row) in ZaloWireParser.extractProfilesMap(profBox.dict) {
                         let clean = ZaloWireParser.stripUserPrefix(uid)
@@ -998,7 +1182,8 @@ extension ZaloEngine {
 
         // 1. Persist all messages transactionally to SQLite on its dedicated actor.
         if !built.storedBatch.isEmpty {
-            try? await sqliteStore?.saveMessages(built.storedBatch)
+            let fastBulk = syncInitialEmptyDB && built.storedBatch.count >= 50
+            try? await sqliteStore?.saveMessages(built.storedBatch, skipTwinChecks: fastBulk)
         }
 
         // 2. Only update in-memory `messages` for open / already-loaded conversations (or when running without SQLite in tests).
@@ -1079,6 +1264,7 @@ extension ZaloEngine {
         case "MOBILE_NOT_SUPPORT": "Zalo trên điện thoại chưa hỗ trợ đồng bộ này. Hãy cập nhật Zalo trên điện thoại."
         case "DISABLED", "SYNC_SRC_DISABLED": "Tài khoản này chưa được Zalo bật đồng bộ tin nhắn từ điện thoại."
         case "NO_PERMISSION": "Thiết bị này chưa được phép đồng bộ tin nhắn."
+        case "WASM_UNAVAILABLE": "Thiếu mô-đun giải mã đồng bộ Zalo (libzproto_wasm_bg.wasm). Hãy cài đặt lại ứng dụng Zalo trên Mac rồi thử lại."
         default: "Chưa thể đồng bộ lúc này, hãy thử lại sau."
         }
     }
@@ -1167,6 +1353,8 @@ extension ZaloEngine {
             return "Quá trình đồng bộ bị gián đoạn do quá thời gian chờ."
         case "CLIENT_NOT_SUPPORT":
             return "Phiên bản Zalo trên điện thoại chưa hỗ trợ đồng bộ này."
+        case "WASM_UNAVAILABLE":
+            return "Thiếu mô-đun giải mã đồng bộ Zalo (libzproto_wasm_bg.wasm). Hãy cài đặt lại ứng dụng Zalo trên Mac rồi thử lại."
         default:
             if let code { return "Đồng bộ không thành công (mã lỗi \(code))." }
             return "Đồng bộ không thành công."

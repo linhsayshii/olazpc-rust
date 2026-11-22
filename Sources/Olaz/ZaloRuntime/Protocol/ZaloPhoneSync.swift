@@ -154,6 +154,17 @@ enum ZstdDecompressor {
 
     private static let loadedAPI = OSAllocatedUnfairLock<API?>(initialState: nil)
     private static let attemptedLoad = OSAllocatedUnfairLock<Bool>(initialState: false)
+    private static let loggedFailure = OSAllocatedUnfairLock<Bool>(initialState: false)
+
+    static var isAvailable: Bool {
+        availableBackend() != nil
+    }
+
+    static func availableBackend() -> String? {
+        if resolveAPI() != nil { return "libzstd" }
+        if cliExecutablePath() != nil { return "zstd-cli" }
+        return nil
+    }
 
     static func hasZstdMagic(_ data: Data) -> Bool {
         data.count >= 4 && data.prefix(4).elementsEqual(zstdMagic)
@@ -161,7 +172,21 @@ enum ZstdDecompressor {
 
     static func decompressIfNeeded(_ data: Data) -> Data {
         guard hasZstdMagic(data) else { return data }
-        return decompressZstd(data) ?? data
+        if let out = decompressZstd(data) {
+            return out
+        }
+        let firstFailure = loggedFailure.withLock { flag -> Bool in
+            let prev = flag
+            flag = true
+            return !prev
+        }
+        if firstFailure {
+            let available = isAvailable
+            Task { @MainActor in
+                EngineLog.shared.write("sync-v2: zstd decompression failed bytes=\(data.count) zstd_available=\(available)")
+            }
+        }
+        return data
     }
 
     static func decompressZstd(_ data: Data) -> Data? {
@@ -185,7 +210,9 @@ enum ZstdDecompressor {
 
         let candidates = [
             "/opt/homebrew/lib/libzstd.dylib",
+            "/opt/homebrew/opt/zstd/lib/libzstd.dylib",
             "/usr/local/lib/libzstd.dylib",
+            "/usr/local/opt/zstd/lib/libzstd.dylib",
             "libzstd.dylib",
             "libzstd.1.dylib",
         ]
@@ -225,6 +252,7 @@ enum ZstdDecompressor {
             guard let base = rawBuf.baseAddress else { return false }
             var inBuf = ZstdInBuffer(src: base, size: rawBuf.count, pos: 0)
             while inBuf.pos < inBuf.size {
+                let prevPos = inBuf.pos
                 var produced = 0
                 let ret = chunk.withUnsafeMutableBytes { outRaw -> Int in
                     var outBuf = ZstdOutBuffer(dst: outRaw.baseAddress, size: outRaw.count, pos: 0)
@@ -244,6 +272,8 @@ enum ZstdDecompressor {
                     output.append(contentsOf: chunk.prefix(produced))
                 } else if inBuf.pos == inBuf.size {
                     break
+                } else if inBuf.pos == prevPos {
+                    return false
                 }
             }
             return true
@@ -251,9 +281,13 @@ enum ZstdDecompressor {
         return ok ? output : nil
     }
 
-    private static func decompressWithCLI(_ data: Data) -> Data? {
+    private static func cliExecutablePath() -> String? {
         let candidates = ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "/usr/bin/zstd"]
-        guard let tool = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    private static func decompressWithCLI(_ data: Data) -> Data? {
+        guard let tool = cliExecutablePath() else {
             return nil
         }
         let proc = Process()
@@ -954,9 +988,29 @@ struct SyncRequestSnapshot: Sendable {
     var lastSeen: Bool
     var inFlightCount: Int
     var isFulfilled: Bool
+    var expectedDataBatches: Int? = nil
+    var completedDataBatchesCount: Int = 0
 }
 
 enum ZaloPhoneSync {
+    struct Diagnostics: Sendable, Equatable {
+        let wasmAvailable: Bool
+        let wasmBytes: Int
+        let zstdAvailable: Bool
+        let zstdBackend: String?
+    }
+
+    static func diagnostics() -> Diagnostics {
+        let wasm = AsarWasmReader.loadZprotoWasm()
+        let zstdBackend = ZstdDecompressor.availableBackend()
+        return Diagnostics(
+            wasmAvailable: wasm != nil,
+            wasmBytes: wasm?.count ?? 0,
+            zstdAvailable: zstdBackend != nil,
+            zstdBackend: zstdBackend
+        )
+    }
+
     static let noLimit: Int64 = 2_147_483_647
     static let maxTimestamp: Int64 = 9_007_199_254_740_991
     static let transferBatchSize: Int = 2000
@@ -1526,18 +1580,26 @@ actor ZaloPhoneSyncCoordinator {
         var parsedMessages: [ParsedPhoneMessage] = []
         var touchedConvs = Set<String>()
         var unknownPartitions = 0
+        var zstdFailedCount = 0
+
+        func decompressRecord(_ plainData: Data) -> Data? {
+            guard ZstdDecompressor.hasZstdMagic(plainData) else { return plainData }
+            if let out = ZstdDecompressor.decompressZstd(plainData) { return out }
+            zstdFailedCount += 1
+            return nil
+        }
 
         if req.databaseType == "conversation" {
             for entry in recordsArr {
-                guard let plainData = entry["plain"]?.dataValue else { continue }
-                let decompressed = ZstdDecompressor.decompressIfNeeded(plainData)
+                guard let plainData = entry["plain"]?.dataValue,
+                      let decompressed = decompressRecord(plainData) else { continue }
                 let convs = ZaloSyncProtobufParser.parseConversationSyncChunk(decompressed)
                 parsedConversations.append(contentsOf: convs)
             }
         } else {
             for entry in recordsArr {
-                guard let plainData = entry["plain"]?.dataValue else { continue }
-                let decompressed = ZstdDecompressor.decompressIfNeeded(plainData)
+                guard let plainData = entry["plain"]?.dataValue,
+                      let decompressed = decompressRecord(plainData) else { continue }
                 let partitions = ZaloSyncProtobufParser.parseSyncChunk(decompressed)
                 for part in partitions {
                     guard let target = req.partitionsById[part.id] else {
@@ -1608,15 +1670,17 @@ actor ZaloPhoneSyncCoordinator {
 
         let shortId = String(syncId.prefix(8))
         let dbLabel = req.databaseType
+        let zstdFailed = zstdFailedCount
+        let totalFailed = failedCount + zstdFailed
         Task { @MainActor in
-            EngineLog.shared.write("sync-v2: batch db=\(dbLabel) sync=\(shortId) bytes=\(rawBytes.count) meta=\(metaCount) msg=\(msgCount) failed=\(failedCount) parsed=\(recordItemCount) unknown_part=\(unknownPartitions)")
+            EngineLog.shared.write("sync-v2: batch db=\(dbLabel) sync=\(shortId) bytes=\(rawBytes.count) meta=\(metaCount) msg=\(msgCount) failed=\(totalFailed) zstd_fail=\(zstdFailed) parsed=\(recordItemCount) unknown_part=\(unknownPartitions)")
         }
 
         return DecryptedSyncBatchResult(
             databaseType: req.databaseType,
             metaRecords: metaCount,
             messageRecords: msgCount,
-            failedRecords: failedCount,
+            failedRecords: totalFailed,
             deferred: false,
             parsedConversations: parsedConversations,
             parsedMessages: parsedMessages,
@@ -1642,7 +1706,9 @@ actor ZaloPhoneSyncCoordinator {
             lastActivity: req.lastActivity,
             lastSeen: req.lastSeen,
             inFlightCount: req.inFlightCount,
-            isFulfilled: fulfilled
+            isFulfilled: fulfilled,
+            expectedDataBatches: req.expectedDataBatches,
+            completedDataBatchesCount: req.completedDataBatches.count
         )
     }
 }

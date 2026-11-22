@@ -1,6 +1,7 @@
 import Compression
 import CryptoKit
 import Foundation
+import os
 import Testing
 @testable import Olaz
 
@@ -1462,5 +1463,386 @@ import Testing
         } else {
             Issue.record("Expected decrypted E2EE sticker URL with eid=34840")
         }
+    }
+}
+
+private final class MockProfileURLProtocol: URLProtocol, @unchecked Sendable {
+    typealias Handler = @Sendable (URLRequest, Data) -> (Int, [String: Any])
+    static let handlers = OSAllocatedUnfairLock<[String: Handler]>(initialState: [:])
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        guard let host = request.url?.host else { return false }
+        return handlers.withLock { $0[host] != nil }
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        guard let url = request.url,
+              let host = url.host,
+              let handler = Self.handlers.withLock({ $0[host] }) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        var bodyData = request.httpBody ?? Data()
+        if bodyData.isEmpty, let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var buf = [UInt8](repeating: 0, count: 4096)
+            while stream.hasBytesAvailable {
+                let n = stream.read(&buf, maxLength: buf.count)
+                if n > 0 { bodyData.append(contentsOf: buf.prefix(n)) }
+                else { break }
+            }
+        }
+        let (status, jsonObj) = handler(request, bodyData)
+        let respData = (try? JSONSerialization.data(withJSONObject: jsonObj)) ?? Data("{}".utf8)
+        let http = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+        client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: respData)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+@Suite struct SyncProfilesAndSQLiteIndexTests {
+    @Test func sanitizeProfileUidAndExtractProfilesMapVariants() {
+        // Rejects invalid / group / zero / stranger / global IDs / overlong
+        #expect(ZaloWireParser.sanitizeProfileUid("") == nil)
+        #expect(ZaloWireParser.sanitizeProfileUid("   ") == nil)
+        #expect(ZaloWireParser.sanitizeProfileUid("0") == nil)
+        #expect(ZaloWireParser.sanitizeProfileUid("000") == nil)
+        #expect(ZaloWireParser.sanitizeProfileUid("-1") == nil)
+        #expect(ZaloWireParser.sanitizeProfileUid("g123") == nil)
+        #expect(ZaloWireParser.sanitizeProfileUid("G123456") == nil)
+        #expect(ZaloWireParser.sanitizeProfileUid("stranger_box") == nil)
+        #expect(ZaloWireParser.sanitizeProfileUid("u") == nil)
+        #expect(ZaloWireParser.sanitizeProfileUid("u0") == nil)
+        #expect(ZaloWireParser.sanitizeProfileUid("123_abc") == nil)
+        #expect(ZaloWireParser.sanitizeProfileUid("123_") == nil)
+        #expect(ZaloWireParser.sanitizeProfileUid("2000.globalEncryptedId==") == nil)
+        #expect(ZaloWireParser.sanitizeProfileUid(String(repeating: "9", count: 25)) == nil)
+
+        // Accepts numeric UIDs, u-prefixed UIDs, and _<version> suffixed UIDs
+        #expect(ZaloWireParser.sanitizeProfileUid("123456") == "123456")
+        #expect(ZaloWireParser.sanitizeProfileUid("  123456  ") == "123456")
+        #expect(ZaloWireParser.sanitizeProfileUid("u123456") == "123456")
+        #expect(ZaloWireParser.sanitizeProfileUid("123456_0") == "123456")
+        #expect(ZaloWireParser.sanitizeProfileUid("u123456_12") == "123456")
+        #expect(ZaloWireParser.sanitizeProfileUid(String(repeating: "7", count: 24)) == String(repeating: "7", count: 24))
+
+        // Parses `profiles`, `changed_profiles`, `unchanged_profiles`, and `list`
+        let v2Combined = ZaloWireParser.extractProfilesMap([
+            "data": [
+                "changed_profiles": [
+                    "111_0": ["userId": "111", "displayName": "Changed Alice", "avatar": "https://a.vn/1.jpg"]
+                ],
+                "unchanged_profiles": [
+                    "222_0": ["uid": "222", "zaloName": "Unchanged Bob", "avt": "https://a.vn/2.jpg"]
+                ]
+            ]
+        ])
+        #expect(v2Combined["111"]?["displayName"] as? String == "Changed Alice")
+        #expect(v2Combined["222"]?["zaloName"] as? String == "Unchanged Bob")
+
+        let fromList = ZaloWireParser.extractProfilesMap([
+            "data": [
+                "list": [
+                    ["id": "333", "dName": "Charlie"]
+                ]
+            ]
+        ])
+        #expect(fromList["333"]?["dName"] as? String == "Charlie")
+    }
+
+    @Test func fetchProfilesSanitizesFallsBackToGetProfilesV2AndSplitsOn114() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-prof-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let host = "mock-prof-\(UUID().uuidString.lowercased()).invalid"
+        let key = Data("0123456789abcdef".utf8)
+        let callLog = OSAllocatedUnfairLock<[(path: String, uids: [String])]>(initialState: [])
+
+        MockProfileURLProtocol.handlers.withLock { handlers in
+            handlers[host] = { req, bodyData in
+                let path = req.url?.path ?? ""
+                let bodyStr = String(decoding: bodyData, as: UTF8.self)
+                var requestedUids: [String] = []
+                if let paramsPart = bodyStr.split(separator: "&").first(where: { $0.hasPrefix("params=") }) {
+                    let encoded = String(paramsPart.dropFirst("params=".count))
+                    let decodedB64 = encoded.removingPercentEncoding ?? encoded
+                    if let plain = try? ZaloCrypto.decodeAES(key: key, base64: decodedB64),
+                       let obj = JSONLossless.parseObject(Data(plain.utf8)),
+                       let arr = obj["friend_pversion_map"] as? [String] {
+                        requestedUids = arr
+                    }
+                }
+                let uids = requestedUids
+                callLog.withLock { $0.append((path: path, uids: uids)) }
+
+                // Poison UID "999" triggers 114 on both endpoints so recursive split isolates it
+                if requestedUids.contains("999_0") {
+                    return (200, ["error_code": 114, "error_message": "Invalid parameter"])
+                }
+                // Primary endpoint rejects with 114 even for valid batch -> triggers fallback to getprofiles/v2
+                if path == "/api/social/group/members" {
+                    return (200, ["error_code": 114, "error_message": "Group members fallback"])
+                }
+                if path == "/api/social/friend/getprofiles/v2" {
+                    var changed: [String: [String: Any]] = [:]
+                    for pver in requestedUids {
+                        let uid = String(pver.split(separator: "_").first ?? "")
+                        changed[uid] = ["userId": uid, "displayName": "User \(uid)", "avatar": "https://ava.example/\(uid).jpg"]
+                    }
+                    return (200, ["error_code": 0, "data": ["changed_profiles": changed, "unchanged_profiles": [:]]])
+                }
+                return (404, ["error_code": -1])
+            }
+        }
+        defer { _ = MockProfileURLProtocol.handlers.withLock { $0.removeValue(forKey: host) } }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockProfileURLProtocol.self]
+        let session = URLSession(configuration: config)
+
+        let client = ZaloSessionClient(dataDirectory: root, useKeychain: false, urlSession: session)
+        var domains = ZaloDomains()
+        domains.serviceCandidates["profile"] = ["https://\(host)"]
+        var account = ZaloLoginAccount()
+        account.userId = "100"
+        await client.updateCredentials(account: account, secretKey: key, zpwSek: "sek.1.2", domains: domains)
+
+        // 1. All-invalid UIDs short-circuit without network calls
+        let emptyBox = try await client.fetchProfiles(uids: ["0", "-1", "g123", "stranger_box", "2000.noise=="])
+        #expect(emptyBox.dict.isEmpty)
+        #expect(callLog.withLock { $0.isEmpty })
+
+        // 2. Valid UIDs + one poison UID "999": fallback + binary split returns all valid profiles and drops only "999"
+        let resBox = try await client.fetchProfiles(uids: ["u111", "222_0", "999", "333", "0", "g888", "222"])
+        let profiles = ZaloWireParser.extractProfilesMap(resBox.dict)
+        #expect(Set(profiles.keys) == Set(["111", "222", "333"]))
+        #expect(profiles["111"]?["displayName"] as? String == "User 111")
+        #expect(profiles["222"]?["displayName"] as? String == "User 222")
+        #expect(profiles["333"]?["displayName"] as? String == "User 333")
+        #expect(callLog.withLock { $0.contains(where: { $0.path == "/api/social/friend/getprofiles/v2" }) })
+
+        // 3. >50 UIDs are chunked into batches of at most 50 and merged seamlessly
+        callLog.withLock { $0.removeAll() }
+        let sixtyUids = (1...60).map { "\(10_000 + $0)" }
+        let chunkedBox = try await client.fetchProfiles(uids: sixtyUids)
+        let chunkedProfiles = ZaloWireParser.extractProfilesMap(chunkedBox.dict)
+        #expect(chunkedProfiles.count == 60)
+        let chunkCounts = callLog.withLock { $0.filter { $0.path == "/api/social/friend/getprofiles/v2" }.map(\.uids.count) }
+        #expect(chunkCounts == [50, 10])
+    }
+
+    @Test func sqliteClientIdIndexExistsBulkSaveIsFastAndE2EETwinProtectionIntact() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-sql-idx-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = try ZaloSQLiteStore(path: root.appendingPathComponent("history.sqlite3").path)
+        let indexes = try await store.messageIndexNames()
+        #expect(indexes.contains("idx_messages_conv_client"))
+
+        func makeMsg(id: String, clientId: String, ts: Int64, text: String = "Hello", status: String = "sent") -> StoredMessage {
+            StoredMessage(
+                id: id,
+                convId: "conv_bulk",
+                clientId: clientId,
+                senderId: "111",
+                senderName: "Alice",
+                senderAvatar: "",
+                isMine: false,
+                text: text,
+                kindTag: "text",
+                tsMs: ts,
+                status: status,
+                rawJSONData: Data("{\"id\":\"\(id)\",\"text\":\"\(text)\"}".utf8)
+            )
+        }
+
+        // Seed 2,000 existing rows in the same conversation so an unindexed twin scan would be O(N^2)
+        let seedBatch = (1...2_000).map { i in
+            makeMsg(id: "seed_\(i)", clientId: "cli_seed_\(i)", ts: Int64(1_700_000_000_000 + i))
+        }
+        try await store.saveMessages(seedBatch)
+
+        // Bulk save another 2,500 rows with `skipTwinChecks: false` (default) -> indexed O(log N) completes well under 0.5s!
+        let nextBatch = (2_001...4_500).map { i in
+            makeMsg(id: "msg_\(i)", clientId: "cli_\(i)", ts: Int64(1_700_000_000_000 + i))
+        }
+        let t0 = Date()
+        try await store.saveMessages(nextBatch)
+        let indexedElapsed = Date().timeIntervalSince(t0)
+        #expect(indexedElapsed < 0.5)
+
+        // Also test fast-path `skipTwinChecks: true` on 2,500 rows
+        let fastBatch = (4_501...7_000).map { i in
+            makeMsg(id: "msg_\(i)", clientId: "cli_\(i)", ts: Int64(1_700_000_000_000 + i))
+        }
+        let t1 = Date()
+        try await store.saveMessages(fastBatch, skipTwinChecks: true)
+        let fastElapsed = Date().timeIntervalSince(t1)
+        #expect(fastElapsed < 0.5)
+
+        // Verify E2EE twin protection remains 100% intact:
+        // 1) Locked twin arriving after plaintext twin with matching clientId is ignored
+        try await store.saveMessages([makeMsg(id: "e2ee_dup_1", clientId: "cli_2001", ts: 1_700_000_002_001, text: "Locked", status: "e2ee_locked")])
+        #expect(try await store.message(convId: "conv_bulk", idOrClientId: "e2ee_dup_1") == nil)
+
+        // 2) Locked placeholder stored first is deleted when plaintext twin arrives with different id and matching clientId
+        try await store.saveMessages([makeMsg(id: "locked_temp_99", clientId: "cli_twin_99", ts: 1_700_000_999_000, text: "Locked", status: "e2ee_locked")])
+        #expect(try await store.message(convId: "conv_bulk", idOrClientId: "locked_temp_99") != nil)
+        try await store.saveMessages([makeMsg(id: "plain_real_99", clientId: "cli_twin_99", ts: 1_700_000_999_000, text: "Decrypted!", status: "sent")])
+        #expect(try await store.message(convId: "conv_bulk", idOrClientId: "locked_temp_99") == nil)
+        let real99 = try await store.message(convId: "conv_bulk", idOrClientId: "plain_real_99")
+        #expect(real99?.text == "Decrypted!")
+    }
+
+    @Test func phoneSyncIdleWaitAndMultiChunkProgressLogic() {
+        let start = Date(timeIntervalSince1970: 1_000)
+
+        // 1. Unanswered waits up to 120s, then times out unconfirmed
+        let waitUnanswered = ZaloEngine.evaluateWaitStep(
+            signal: nil,
+            snapshot: SyncRequestSnapshot(batchesCount: 0, importedCount: 0, syncedConversationsCount: 0, lastActivity: nil, lastSeen: false, inFlightCount: 0, isFulfilled: false),
+            now: start.addingTimeInterval(60),
+            start: start,
+            answeredAt: nil
+        )
+        #expect(waitUnanswered == .keepWaiting(answeredAt: nil))
+
+        let timedOutUnanswered = ZaloEngine.evaluateWaitStep(
+            signal: nil,
+            snapshot: SyncRequestSnapshot(batchesCount: 0, importedCount: 0, syncedConversationsCount: 0, lastActivity: nil, lastSeen: false, inFlightCount: 0, isFulfilled: false),
+            now: start.addingTimeInterval(121),
+            start: start,
+            answeredAt: nil
+        )
+        #expect(timedOutUnanswered == .finished(outcome: .timedOutUnconfirmed, reason: "unconfirmed_timeout"))
+
+        // 2. User confirmation arriving at t=25s does NOT prematurely trigger 8s empty timeout at t=26s
+        let t25 = start.addingTimeInterval(25)
+        let justConfirmed = ZaloEngine.evaluateWaitStep(
+            signal: .userConfirmed,
+            snapshot: SyncRequestSnapshot(batchesCount: 0, importedCount: 0, syncedConversationsCount: 0, lastActivity: nil, lastSeen: false, inFlightCount: 0, isFulfilled: false),
+            now: t25,
+            start: start,
+            answeredAt: nil
+        )
+        #expect(justConfirmed == .keepWaiting(answeredAt: t25))
+
+        let oneSecAfterConfirm = ZaloEngine.evaluateWaitStep(
+            signal: .userConfirmed,
+            snapshot: SyncRequestSnapshot(batchesCount: 0, importedCount: 0, syncedConversationsCount: 0, lastActivity: nil, lastSeen: false, inFlightCount: 0, isFulfilled: false),
+            now: t25.addingTimeInterval(1),
+            start: start,
+            answeredAt: t25
+        )
+        #expect(oneSecAfterConfirm == .keepWaiting(answeredAt: t25))
+
+        // 3. Large chunk with active batches in flight keeps waiting well past 35s (e.g. 50s, 120s), up to 180s ceiling
+        let activeAt50s = ZaloEngine.evaluateWaitStep(
+            signal: .userConfirmed,
+            snapshot: SyncRequestSnapshot(batchesCount: 30, importedCount: 1500, syncedConversationsCount: 10, lastActivity: start.addingTimeInterval(49), lastSeen: false, inFlightCount: 4, isFulfilled: false),
+            now: start.addingTimeInterval(50),
+            start: start,
+            answeredAt: start
+        )
+        #expect(activeAt50s == .keepWaiting(answeredAt: start))
+
+        let ceilingAt181s = ZaloEngine.evaluateWaitStep(
+            signal: .userConfirmed,
+            snapshot: SyncRequestSnapshot(batchesCount: 30, importedCount: 1500, syncedConversationsCount: 10, lastActivity: start.addingTimeInterval(180), lastSeen: false, inFlightCount: 1, isFulfilled: false),
+            now: start.addingTimeInterval(181),
+            start: start,
+            answeredAt: start
+        )
+        #expect(ceilingAt181s == .finished(outcome: .completed, reason: "ceiling_timeout"))
+
+        // 4. Fulfilled or lastSeen with inFlight==0 completes immediately; idle<=4 waits, idle>4 completes
+        let fulfilled = ZaloEngine.evaluateWaitStep(
+            signal: .userConfirmed,
+            snapshot: SyncRequestSnapshot(batchesCount: 65, importedCount: 5000, syncedConversationsCount: 30, lastActivity: start.addingTimeInterval(55), lastSeen: true, inFlightCount: 0, isFulfilled: true),
+            now: start.addingTimeInterval(55),
+            start: start,
+            answeredAt: start
+        )
+        #expect(fulfilled == .finished(outcome: .completed, reason: "fulfilled"))
+
+        let idleShort = ZaloEngine.evaluateWaitStep(
+            signal: .userConfirmed,
+            snapshot: SyncRequestSnapshot(batchesCount: 10, importedCount: 500, syncedConversationsCount: 5, lastActivity: start.addingTimeInterval(40), lastSeen: false, inFlightCount: 0, isFulfilled: false),
+            now: start.addingTimeInterval(42),
+            start: start,
+            answeredAt: start
+        )
+        #expect(idleShort == .keepWaiting(answeredAt: start))
+
+        let idleDone = ZaloEngine.evaluateWaitStep(
+            signal: .userConfirmed,
+            snapshot: SyncRequestSnapshot(batchesCount: 10, importedCount: 500, syncedConversationsCount: 5, lastActivity: start.addingTimeInterval(40), lastSeen: false, inFlightCount: 0, isFulfilled: false),
+            now: start.addingTimeInterval(44.5),
+            start: start,
+            answeredAt: start
+        )
+        #expect(idleDone == .finished(outcome: .completed, reason: "idle_after_batches"))
+
+        let emptyTimeout = ZaloEngine.evaluateWaitStep(
+            signal: .userConfirmed,
+            snapshot: SyncRequestSnapshot(batchesCount: 0, importedCount: 0, syncedConversationsCount: 0, lastActivity: nil, lastSeen: false, inFlightCount: 0, isFulfilled: false),
+            now: start.addingTimeInterval(8.5),
+            start: start,
+            answeredAt: start
+        )
+        #expect(emptyTimeout == .finished(outcome: .completed, reason: "empty_chunk_timeout"))
+
+        // 5. Rejected and Busy signals terminate immediately
+        #expect(ZaloEngine.evaluateWaitStep(signal: .userRejected, snapshot: nil, now: start, start: start, answeredAt: nil) == .finished(outcome: .rejected, reason: "user_rejected"))
+        #expect(ZaloEngine.evaluateWaitStep(signal: .mobileBusy, snapshot: nil, now: start, start: start, answeredAt: nil) == .finished(outcome: .busy, reason: "mobile_busy"))
+
+        // 6. Multi-chunk progress smoothly advances inside [0.14, 0.72] across chunks and batches
+        let p0 = ZaloEngine.computeStage2BatchProgress(completedPartitionsBeforeChunk: 0, currentChunkPartitions: 30, totalPartitions: 90, batchesCompletedInChunk: 1, expectedBatchesInChunk: nil, previousProgress: 0.14)
+        let p1 = ZaloEngine.computeStage2BatchProgress(completedPartitionsBeforeChunk: 0, currentChunkPartitions: 30, totalPartitions: 90, batchesCompletedInChunk: 10, expectedBatchesInChunk: nil, previousProgress: p0.progress)
+        let p2 = ZaloEngine.computeStage2BatchProgress(completedPartitionsBeforeChunk: 0, currentChunkPartitions: 30, totalPartitions: 90, batchesCompletedInChunk: 65, expectedBatchesInChunk: 65, previousProgress: p1.progress)
+        let p3 = ZaloEngine.computeStage2BatchProgress(completedPartitionsBeforeChunk: 30, currentChunkPartitions: 30, totalPartitions: 90, batchesCompletedInChunk: 10, expectedBatchesInChunk: 20, previousProgress: p2.progress)
+        let p4 = ZaloEngine.computeStage2BatchProgress(completedPartitionsBeforeChunk: 60, currentChunkPartitions: 30, totalPartitions: 90, batchesCompletedInChunk: 10, expectedBatchesInChunk: 10, previousProgress: p3.progress)
+
+        #expect(p0.progress > 0.14 && p0.progress < p1.progress)
+        #expect(p1.progress > 0.16 && p1.progress < p2.progress)
+        #expect(p2.progress < p3.progress && p3.progress < p4.progress)
+        #expect(abs(p4.progress - 0.72) < 0.0001)
+    }
+
+    @MainActor
+    @Test func phoneSyncDiagnosticsAndWasmUnavailableMessaging() {
+        let diag = ZaloPhoneSync.diagnostics()
+        #expect((diag.wasmAvailable && diag.wasmBytes > 8) || (!diag.wasmAvailable && diag.wasmBytes == 0))
+        #expect((diag.zstdAvailable && diag.zstdBackend != nil) || (!diag.zstdAvailable && diag.zstdBackend == nil))
+
+        let blockedText = ZaloEngine.transferBlockedText("WASM_UNAVAILABLE")
+        let errorText = ZaloEngine.transferErrorText(code: nil, name: "WASM_UNAVAILABLE")
+        #expect(blockedText.contains("libzproto_wasm_bg.wasm"))
+        #expect(errorText == blockedText)
+    }
+
+    @MainActor
+    @Test func startTransferResetsAttemptedProfileUidsAndStage2Progress() {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-reset-uids-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let engine = ZaloEngine(dataDirectory: root, useKeychain: false)
+        engine.syncAttemptedProfileUids = ["111", "222"]
+        engine.syncStage2Progress = SyncStage2ProgressState(activeSyncId: "old", totalPartitions: 30, completedPartitionsBeforeChunk: 10, currentChunkPartitionCount: 20, chunkIndex: 1, totalChunks: 2, cumulativeMessagesBeforeChunk: 500, cumulativeConvIdsBeforeChunk: ["111"])
+
+        engine.startTransfer(requestPhoneSync: false)
+        #expect(engine.syncAttemptedProfileUids.isEmpty)
+        #expect(engine.syncStage2Progress == SyncStage2ProgressState())
+        engine.cancelTransfer()
     }
 }

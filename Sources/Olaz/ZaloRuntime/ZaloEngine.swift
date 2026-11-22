@@ -115,6 +115,9 @@ final class ZaloEngine {
     @ObservationIgnored internal var activeSyncBatchTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var lastSyncConvFlushAt: Date = .distantPast
     @ObservationIgnored internal var phoneSyncConvTimestamps: [String: UInt64] = [:]
+    @ObservationIgnored internal var syncAttemptedProfileUids: Set<String> = []
+    @ObservationIgnored internal var syncStage2Progress = SyncStage2ProgressState()
+    @ObservationIgnored internal var syncInitialEmptyDB = false
     @ObservationIgnored internal let phoneSync = ZaloPhoneSyncCoordinator()
     @ObservationIgnored internal let e2eeManager = ZaloE2EEManager()
     @ObservationIgnored internal var isTransferHidden = false
@@ -250,6 +253,9 @@ final class ZaloEngine {
         transfer = nil
         canStartTransfer = false
         transferStartBlockedReason = nil
+        syncAttemptedProfileUids = []
+        syncStage2Progress = SyncStage2ProgressState()
+        syncInitialEmptyDB = false
         selfConversationId = nil
         navigationRequest = nil
         conversationExtras = ConversationExtras()

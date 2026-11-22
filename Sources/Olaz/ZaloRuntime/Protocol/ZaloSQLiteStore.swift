@@ -103,6 +103,7 @@ actor ZaloSQLiteStore {
         );
         CREATE INDEX IF NOT EXISTS idx_messages_conv_ts ON messages(conv_id, ts_ms DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_conv_kind_ts ON messages(conv_id, kind_tag, ts_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_conv_client ON messages(conv_id, client_id);
         CREATE TABLE IF NOT EXISTS preferences (
             key TEXT PRIMARY KEY,
             value_json TEXT NOT NULL
@@ -243,7 +244,27 @@ actor ZaloSQLiteStore {
 
     // MARK: - Messages
 
-    func saveMessages(_ items: [StoredMessage]) throws {
+    func hasAnyMessages() throws -> Bool {
+        let stmt = try prepare("SELECT 1 FROM messages LIMIT 1;")
+        defer { sqlite3_finalize(stmt) }
+        return sqlite3_step(stmt) == SQLITE_ROW
+    }
+
+    func messageIndexNames() throws -> [String] {
+        let stmt = try prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'messages';")
+        defer { sqlite3_finalize(stmt) }
+        var out: [String] = []
+        while true {
+            let rc = sqlite3_step(stmt)
+            if rc == SQLITE_DONE { break }
+            guard rc == SQLITE_ROW else { throw ZaloSQLiteError.stepFailed(lastError) }
+            let name = columnText(stmt, 0)
+            if !name.isEmpty { out.append(name) }
+        }
+        return out
+    }
+
+    func saveMessages(_ items: [StoredMessage], skipTwinChecks: Bool = false) throws {
         guard !items.isEmpty else { return }
         try inTransaction {
             let upsertSQL = """
@@ -263,25 +284,33 @@ actor ZaloSQLiteStore {
             WHERE excluded.status != 'e2ee_locked' OR messages.status = 'e2ee_locked';
             """
             let checkPlainTwinSQL = """
-            SELECT 1 FROM messages
-            WHERE conv_id = ?1 AND (id = ?2 OR client_id = ?2) AND status != 'e2ee_locked'
-            LIMIT 1;
+            SELECT 1 FROM (
+                SELECT 1 FROM messages WHERE conv_id = ?1 AND id = ?2 AND status != 'e2ee_locked'
+                UNION ALL
+                SELECT 1 FROM messages WHERE conv_id = ?1 AND client_id = ?2 AND status != 'e2ee_locked'
+            ) LIMIT 1;
             """
-            let deleteStaleTwinSQL = """
+            let deleteStaleIdTwinSQL = """
             DELETE FROM messages
-            WHERE conv_id = ?1 AND id != ?2 AND (id = ?3 OR (client_id = ?3 AND status = 'e2ee_locked'));
+            WHERE conv_id = ?1 AND id = ?3 AND id != ?2;
+            """
+            let deleteStaleClientTwinSQL = """
+            DELETE FROM messages
+            WHERE conv_id = ?1 AND client_id = ?3 AND id != ?2 AND status = 'e2ee_locked';
             """
             let stmt = try prepare(upsertSQL)
             defer { sqlite3_finalize(stmt) }
-            let checkStmt = try prepare(checkPlainTwinSQL)
-            defer { sqlite3_finalize(checkStmt) }
-            let delStmt = try prepare(deleteStaleTwinSQL)
-            defer { sqlite3_finalize(delStmt) }
+            let checkStmt = skipTwinChecks ? nil : try prepare(checkPlainTwinSQL)
+            defer { if let checkStmt { sqlite3_finalize(checkStmt) } }
+            let delIdStmt = skipTwinChecks ? nil : try prepare(deleteStaleIdTwinSQL)
+            defer { if let delIdStmt { sqlite3_finalize(delIdStmt) } }
+            let delClientStmt = skipTwinChecks ? nil : try prepare(deleteStaleClientTwinSQL)
+            defer { if let delClientStmt { sqlite3_finalize(delClientStmt) } }
 
             for m in items {
                 let isLocked = (m.status == "e2ee_locked")
-                if !m.clientId.isEmpty {
-                    if isLocked {
+                if !skipTwinChecks, !m.clientId.isEmpty {
+                    if isLocked, let checkStmt {
                         sqlite3_reset(checkStmt)
                         sqlite3_clear_bindings(checkStmt)
                         bindText(checkStmt, 1, m.convId)
@@ -289,13 +318,20 @@ actor ZaloSQLiteStore {
                         if sqlite3_step(checkStmt) == SQLITE_ROW {
                             continue
                         }
-                    } else if m.clientId != m.id {
-                        sqlite3_reset(delStmt)
-                        sqlite3_clear_bindings(delStmt)
-                        bindText(delStmt, 1, m.convId)
-                        bindText(delStmt, 2, m.id)
-                        bindText(delStmt, 3, m.clientId)
-                        try stepDone(delStmt)
+                    } else if !isLocked, m.clientId != m.id, let delIdStmt, let delClientStmt {
+                        sqlite3_reset(delIdStmt)
+                        sqlite3_clear_bindings(delIdStmt)
+                        bindText(delIdStmt, 1, m.convId)
+                        bindText(delIdStmt, 2, m.id)
+                        bindText(delIdStmt, 3, m.clientId)
+                        try stepDone(delIdStmt)
+
+                        sqlite3_reset(delClientStmt)
+                        sqlite3_clear_bindings(delClientStmt)
+                        bindText(delClientStmt, 1, m.convId)
+                        bindText(delClientStmt, 2, m.id)
+                        bindText(delClientStmt, 3, m.clientId)
+                        try stepDone(delClientStmt)
                     }
                 }
 
@@ -363,7 +399,10 @@ actor ZaloSQLiteStore {
         try inTransaction {
             let twinCheck = try prepare("""
                 SELECT text, raw_json FROM messages
-                WHERE conv_id = ?1 AND id != ?2 AND (id = ?3 OR client_id = ?3) AND status != 'e2ee_locked'
+                WHERE conv_id = ?1 AND id = ?3 AND id != ?2 AND status != 'e2ee_locked'
+                UNION ALL
+                SELECT text, raw_json FROM messages
+                WHERE conv_id = ?1 AND client_id = ?3 AND id != ?2 AND status != 'e2ee_locked'
                 LIMIT 5;
             """)
             defer { sqlite3_finalize(twinCheck) }
@@ -542,7 +581,11 @@ actor ZaloSQLiteStore {
         let sql = """
         SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
         FROM messages
-        WHERE conv_id = ?1 AND (id = ?2 OR client_id = ?2)
+        WHERE conv_id = ?1 AND id = ?2
+        UNION ALL
+        SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
+        FROM messages
+        WHERE conv_id = ?1 AND client_id = ?2 AND id != ?2
         LIMIT 1;
         """
         let stmt = try prepare(sql)
@@ -569,11 +612,19 @@ actor ZaloSQLiteStore {
     }
 
     func deleteMessage(convId: String, id: String) throws {
-        let stmt = try prepare("DELETE FROM messages WHERE conv_id = ?1 AND (id = ?2 OR client_id = ?2);")
-        defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, convId)
-        bindText(stmt, 2, id)
-        try stepDone(stmt)
+        try inTransaction {
+            let s1 = try prepare("DELETE FROM messages WHERE conv_id = ?1 AND id = ?2;")
+            defer { sqlite3_finalize(s1) }
+            bindText(s1, 1, convId)
+            bindText(s1, 2, id)
+            try stepDone(s1)
+
+            let s2 = try prepare("DELETE FROM messages WHERE conv_id = ?1 AND client_id = ?2;")
+            defer { sqlite3_finalize(s2) }
+            bindText(s2, 1, convId)
+            bindText(s2, 2, id)
+            try stepDone(s2)
+        }
     }
 
     func markRecalled(convId: String, id: String) throws {

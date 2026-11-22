@@ -51,6 +51,30 @@ enum ZaloWireParser {
         id.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    static func sanitizeProfileUid(_ raw: String) -> String? {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return nil }
+        if let underscoreIdx = s.firstIndex(of: "_") {
+            let suffix = s[s.index(after: underscoreIdx)...]
+            guard !suffix.isEmpty, suffix.allSatisfy({ $0.isASCII && $0.isNumber }) else {
+                return nil
+            }
+            s = String(s[..<underscoreIdx])
+        }
+        if s.hasPrefix("u") {
+            let rest = s.dropFirst()
+            if !rest.isEmpty && rest.allSatisfy({ $0.isASCII && $0.isNumber }) {
+                s = String(rest)
+            }
+        }
+        guard !s.isEmpty, s != "0", !s.allSatisfy({ $0 == "0" }),
+              (1...24).contains(s.count),
+              s.allSatisfy({ $0.isASCII && $0.isNumber }) else {
+            return nil
+        }
+        return s
+    }
+
     /// Strips Zalo's `"u"` prefix used specifically by pin/archive list APIs (`["u12345", "g678"]`).
     static func normalizeThreadIdFromList(_ id: String) -> String {
         if id.hasPrefix("u"), id.count > 1, id.dropFirst().allSatisfy({ $0.isASCII && $0.isNumber }) {
@@ -1043,29 +1067,38 @@ enum ZaloWireParser {
         let dataNode = resp["data"]
         var result: [String: [String: Any]] = [:]
 
+        func normalizeUid(_ candidate: String) -> String {
+            let trimmed = stripUserPrefix(candidate)
+            return sanitizeProfileUid(trimmed) ?? trimmed
+        }
+
         func ingestDictMap(_ map: [String: Any]) {
             for (k, v) in map {
                 if let row = v as? [String: Any] {
-                    let uid = stripUserPrefix(firstNonEmpty(JSONLossless.string(row["userId"] ?? row["uid"] ?? row["id"]), k))
+                    let uid = normalizeUid(firstNonEmpty(JSONLossless.string(row["userId"] ?? row["uid"] ?? row["id"]), k))
                     if !uid.isEmpty { result[uid] = row }
                 }
             }
         }
         func ingestArray(_ rows: [[String: Any]]) {
             for row in rows {
-                let uid = stripUserPrefix(JSONLossless.string(row["userId"] ?? row["uid"] ?? row["id"]))
+                let uid = normalizeUid(JSONLossless.string(row["userId"] ?? row["uid"] ?? row["id"]))
                 if !uid.isEmpty { result[uid] = row }
             }
         }
 
         if let dataDict = dataNode as? [String: Any] {
-            if let profilesDict = dataDict["profiles"] as? [String: Any] {
-                ingestDictMap(profilesDict)
-            } else if let profilesArr = dataDict["profiles"] as? [[String: Any]] {
-                ingestArray(profilesArr)
-            } else if let listArr = dataDict["list"] as? [[String: Any]] {
-                ingestArray(listArr)
-            } else {
+            var matchedContainer = false
+            for key in ["profiles", "unchanged_profiles", "changed_profiles", "list"] {
+                if let profilesDict = dataDict[key] as? [String: Any] {
+                    ingestDictMap(profilesDict)
+                    matchedContainer = true
+                } else if let profilesArr = dataDict[key] as? [[String: Any]] {
+                    ingestArray(profilesArr)
+                    matchedContainer = true
+                }
+            }
+            if !matchedContainer {
                 ingestDictMap(dataDict)
             }
         } else if let dataArr = dataNode as? [[String: Any]] {
