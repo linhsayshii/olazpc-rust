@@ -309,14 +309,394 @@ extension ZaloEngine {
                 return .failed(title: nil, message: GroupCreateOutcome.defaultFailure)
             }
             let failed = (d["rejectedMembers"] as? [Any] ?? []).map(JSONLossless.string).filter { !$0.isEmpty }
+            let failedSet = Set(ZaloSessionClient.cleanGroupMemberIds(failed))
+            let myUid = ZaloWireParser.stripUserPrefix(profile?.userId ?? "")
+            var initialIds = ZaloSessionClient.cleanGroupMemberIds(members).filter { !failedSet.contains($0) }
+            if !myUid.isEmpty && !initialIds.contains(myUid) {
+                initialIds.insert(myUid, at: 0)
+            }
+            let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let initialName = trimmedName.isEmpty ? "Nhóm" : trimmedName
+            applyGroupMetadataUpdate(
+                gid: gid,
+                name: initialName,
+                avatar: nil,
+                memberCount: max(1, initialIds.count),
+                memberIds: initialIds
+            )
+
+            var avatarUploadFailed = false
+            if let avatar {
+                do {
+                    let upBox = try await sessionClient.uploadGroupAvatarAPI(groupId: gid, jpegData: avatar.jpeg, side: avatar.side)
+                    let upData = upBox.dict["data"] as? [String: Any] ?? [:]
+                    let avtStr = JSONLossless.string(upData["avatar"] ?? upData["avt"] ?? upData["fullAvt"] ?? upData["url"])
+                    if !avtStr.isEmpty, let avtURL = URL(string: avtStr) {
+                        applyGroupMetadataUpdate(gid: gid, name: nil, avatar: avtURL, memberCount: nil, memberIds: nil)
+                    }
+                } catch {
+                    avatarUploadFailed = true
+                    EngineLog.shared.write("group avatar upload failed: \(error.localizedDescription)")
+                }
+            }
+
+            await refreshGroupMetadata(gid)
             refreshContacts()
             await openCreatedGroup(gid)
-            if !failed.isEmpty { conversationUI.show(.neutral, Self.notAddedText(failed.map(contactName(_:)))) }
+            if !failed.isEmpty && avatarUploadFailed {
+                conversationUI.show(.neutral, Self.notAddedText(failed.map(contactName(_:))) + " Chưa tải lên được ảnh đại diện.")
+            } else if !failed.isEmpty {
+                conversationUI.show(.neutral, Self.notAddedText(failed.map(contactName(_:))))
+            } else if avatarUploadFailed {
+                conversationUI.show(.neutral, "Đã tạo nhóm nhưng chưa tải lên được ảnh đại diện.")
+            }
             return .created(id: gid, failed: failed)
         } catch {
             EngineLog.shared.write("group create failed: \(error.localizedDescription)")
             return .failed(title: nil, message: GroupCreateOutcome.defaultFailure)
         }
+    }
+
+    func renameGroup(_ groupId: String, to name: String) async -> Bool {
+        let gid = ZaloWireParser.groupConvId(groupId)
+        let cleanGrid = ZaloWireParser.cleanGroupId(groupId)
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !gid.isEmpty, !cleanGrid.isEmpty, cleanGrid != "0", !trimmed.isEmpty else { return false }
+
+        do {
+            _ = try await sessionClient.renameGroupAPI(groupId: gid, name: trimmed)
+            applyGroupMetadataUpdate(gid: gid, name: trimmed, avatar: nil, memberCount: nil, memberIds: nil)
+            await persistSingleGroupConversation(gid)
+            conversationUI.show(.success, "Đã đổi tên nhóm")
+            return true
+        } catch {
+            EngineLog.shared.write("rename group failed: \(error.localizedDescription)")
+            conversationUI.show(.failure, "Không thể đổi tên nhóm.")
+            return false
+        }
+    }
+
+    func inviteMembers(_ memberIds: [String], to groupId: String) async -> Bool {
+        let gid = ZaloWireParser.groupConvId(groupId)
+        let cleanGrid = ZaloWireParser.cleanGroupId(groupId)
+        let myUid = ZaloWireParser.stripUserPrefix(profile?.userId ?? "")
+        let cleanIds = ZaloSessionClient.cleanGroupMemberIds(memberIds).filter { $0 != myUid }
+        guard !gid.isEmpty, !cleanGrid.isEmpty, cleanGrid != "0", !cleanIds.isEmpty else { return false }
+
+        do {
+            let box = try await sessionClient.inviteGroupMembersAPI(groupId: gid, memberIds: cleanIds)
+            let d = box.dict["data"] as? [String: Any] ?? [:]
+            let rawRejected = (d["errorMem"] as? [Any])
+                ?? (d["errorMembers"] as? [Any])
+                ?? (d["rejectedMembers"] as? [Any])
+                ?? []
+            let rejectedSet = Set(ZaloSessionClient.cleanGroupMemberIds(rawRejected.map(JSONLossless.string)))
+            let added = cleanIds.filter { !rejectedSet.contains($0) }
+            guard !added.isEmpty else {
+                conversationUI.show(.failure, "Không thể thêm thành viên vào nhóm.")
+                return false
+            }
+
+            let existingIds = groupMemberIds(in: gid)
+            var mergedIds = existingIds
+            var newlyAddedCount = 0
+            for uid in added where !mergedIds.contains(uid) {
+                mergedIds.append(uid)
+                newlyAddedCount += 1
+            }
+            let currentCount = conversations.first(where: { $0.id == gid })?.members
+                ?? contacts.groups.first(where: { $0.id == gid })?.members
+                ?? existingIds.count
+            let nextCount = max(mergedIds.count, currentCount + newlyAddedCount)
+
+            groupMemberCache.removeValue(forKey: gid)
+            applyGroupMetadataUpdate(gid: gid, name: nil, avatar: nil, memberCount: nextCount, memberIds: mergedIds)
+            await persistSingleGroupConversation(gid)
+            await refreshGroupMetadata(gid)
+
+            if !rejectedSet.isEmpty {
+                conversationUI.show(.neutral, Self.notAddedText(Array(rejectedSet).map(contactName(_:))))
+            } else {
+                conversationUI.show(.success, "Đã thêm thành viên vào nhóm")
+            }
+            return true
+        } catch {
+            EngineLog.shared.write("invite group members failed: \(error.localizedDescription)")
+            conversationUI.show(.failure, "Không thể thêm thành viên vào nhóm.")
+            return false
+        }
+    }
+
+    func kickMember(_ memberId: String, from groupId: String) async -> Bool {
+        let gid = ZaloWireParser.groupConvId(groupId)
+        let cleanGrid = ZaloWireParser.cleanGroupId(groupId)
+        guard let cleanMember = ZaloSessionClient.cleanGroupMemberIds([memberId]).first,
+              !gid.isEmpty, !cleanGrid.isEmpty, cleanGrid != "0" else {
+            return false
+        }
+        if let myUid = profile?.userId, !myUid.isEmpty, cleanMember == ZaloWireParser.stripUserPrefix(myUid) {
+            return false
+        }
+
+        do {
+            _ = try await sessionClient.kickGroupMembersAPI(groupId: gid, memberIds: [cleanMember])
+            if var cached = groupMemberCache[gid] {
+                cached.removeAll { $0.id == cleanMember }
+                groupMemberCache[gid] = cached
+            }
+            let currentIds = groupMemberIds(in: gid)
+            let updatedIds = currentIds.filter { $0 != cleanMember }
+            let hadMember = currentIds.contains(cleanMember)
+            let currentCount = conversations.first(where: { $0.id == gid })?.members
+                ?? contacts.groups.first(where: { $0.id == gid })?.members
+                ?? currentIds.count
+            let nextCount = (hadMember || currentIds.isEmpty) ? max(1, currentCount - 1) : max(1, updatedIds.count)
+
+            applyGroupMetadataUpdate(
+                gid: gid,
+                name: nil,
+                avatar: nil,
+                memberCount: nextCount,
+                memberIds: currentIds.isEmpty ? nil : updatedIds
+            )
+            await persistSingleGroupConversation(gid)
+            await refreshGroupMetadata(gid)
+            conversationUI.show(.success, "Đã xóa thành viên khỏi nhóm")
+            return true
+        } catch {
+            EngineLog.shared.write("kick group member failed: \(error.localizedDescription)")
+            conversationUI.show(.failure, "Không thể xóa thành viên.")
+            return false
+        }
+    }
+
+    func leaveGroup(_ groupId: String, silent: Bool = false) async -> Bool {
+        let gid = ZaloWireParser.groupConvId(groupId)
+        let cleanGrid = ZaloWireParser.cleanGroupId(groupId)
+        guard !gid.isEmpty, !cleanGrid.isEmpty, cleanGrid != "0" else { return false }
+
+        do {
+            _ = try await sessionClient.leaveGroupAPI(groupId: gid, silent: silent)
+            conversations.removeAll { $0.id == gid }
+            contacts.groups.removeAll { $0.id == gid }
+            cachedGroupDetails.removeValue(forKey: cleanGrid)
+            groupMemberCache.removeValue(forKey: gid)
+            cachedGroups.removeValue(forKey: gid)
+            messages.removeValue(forKey: gid)
+            hasMoreHistory.removeValue(forKey: gid)
+            historyTicks.removeValue(forKey: gid)
+            typing.removeValue(forKey: gid)
+            pins.removeValue(forKey: gid)
+            cachedPinnedIds.remove(gid)
+            cachedArchivedIds.remove(gid)
+            cachedUnreadMarks.remove(gid)
+            if openConversationId == gid {
+                openConversationId = nil
+                dropMessagePrompts()
+            }
+            conversationUI.remove([gid])
+            rebuildConversationFlags()
+            rebuildConversationExtras()
+
+            try? await sqliteStore?.deleteConversation(id: gid)
+            await persistCachedGroupsPreference()
+            try? await sqliteStore?.setPreferenceStrings(key: "pinnedIds", value: Array(cachedPinnedIds))
+            try? await sqliteStore?.setPreferenceStrings(key: "archivedIds", value: Array(cachedArchivedIds))
+            try? await sqliteStore?.setPreferenceStrings(key: "unreadMarks", value: Array(cachedUnreadMarks))
+            conversationUI.show(.success, "Đã rời nhóm")
+            return true
+        } catch {
+            EngineLog.shared.write("leave group failed: \(error.localizedDescription)")
+            conversationUI.show(.failure, "Không thể rời nhóm.")
+            return false
+        }
+    }
+
+    /// Extracts all known user IDs for a group from cached detail / member cache.
+    func groupMemberIds(in groupId: String) -> [String] {
+        let gid = ZaloWireParser.groupConvId(groupId)
+        let cleanGrid = ZaloWireParser.cleanGroupId(groupId)
+        var raw: [String] = []
+        if let groupInfo = cachedGroupDetails[cleanGrid] {
+            if let verList = groupInfo["memVerList"] as? [String] {
+                raw.append(contentsOf: verList.compactMap { $0.split(separator: "_").first.map(String.init) })
+            }
+            if let mems = groupInfo["memIds"] as? [Any] {
+                raw.append(contentsOf: mems.map(JSONLossless.string))
+            }
+            if let cur = groupInfo["currentMems"] as? [[String: Any]] {
+                raw.append(contentsOf: cur.map { JSONLossless.string($0["id"] ?? $0["uid"]) })
+            }
+        }
+        if let cached = groupMemberCache[gid] {
+            raw.append(contentsOf: cached.filter { !$0.isAll && $0.id != "-1" }.map(\.id))
+        }
+        return ZaloSessionClient.cleanGroupMemberIds(raw)
+    }
+
+    /// Loads group members for the inspector (excluding self and `@All`), fetching group detail if missing.
+    func loadGroupMembers(in groupId: String) async -> [MentionCandidate] {
+        let gid = ZaloWireParser.groupConvId(groupId)
+        let cleanGrid = ZaloWireParser.cleanGroupId(groupId)
+        guard !gid.isEmpty else { return [] }
+
+        if cachedGroupDetails[cleanGrid] == nil {
+            await refreshGroupMetadata(gid)
+        }
+        let viaMention = await mentionCandidates(in: gid, query: "", excluding: []).filter { !$0.isAll && $0.id != "-1" }
+        if !viaMention.isEmpty {
+            return viaMention
+        }
+
+        let myUid = ZaloWireParser.stripUserPrefix(profile?.userId ?? "")
+        let knownIds = groupMemberIds(in: gid).filter { $0 != myUid }
+        guard !knownIds.isEmpty else { return [] }
+        let fallback = knownIds.map { uid -> MentionCandidate in
+            let info = lookupPersonInfo(uid)
+            let name = (info?.name.isEmpty == false) ? info!.name : "Người dùng Zalo"
+            let avatar = info.flatMap { $0.avatar.isEmpty ? nil : URL(string: $0.avatar) }
+            return MentionCandidate(id: uid, name: name, avatar: avatar, isAll: false)
+        }
+        groupMemberCache[gid] = [MentionCandidate(id: "-1", name: "All", avatar: nil, isAll: true)] + fallback
+        return fallback
+    }
+
+    internal func refreshGroupMetadata(_ groupId: String) async {
+        let gid = ZaloWireParser.groupConvId(groupId)
+        let cleanGrid = ZaloWireParser.cleanGroupId(groupId)
+        guard !gid.isEmpty, !cleanGrid.isEmpty,
+              let box = try? await sessionClient.fetchGroupDetailAPI(groupId: gid),
+              !box.dict.isEmpty else {
+            return
+        }
+        let info = box.dict
+        cachedGroupDetails[cleanGrid] = info
+        let serverName = JSONLossless.string(info["name"])
+        let avtStr = JSONLossless.string(info["avt"] ?? info["fullAvt"])
+        let avtURL = avtStr.isEmpty ? nil : URL(string: avtStr)
+        var rawMemberIds: [String] = []
+        if let verList = info["memVerList"] as? [String] {
+            rawMemberIds.append(contentsOf: verList.compactMap { $0.split(separator: "_").first.map(String.init) })
+        }
+        if rawMemberIds.isEmpty, let mems = info["memIds"] as? [Any] {
+            rawMemberIds.append(contentsOf: mems.map(JSONLossless.string))
+        }
+        if rawMemberIds.isEmpty, let cur = info["currentMems"] as? [[String: Any]] {
+            rawMemberIds.append(contentsOf: cur.map { JSONLossless.string($0["id"] ?? $0["uid"]) })
+        }
+        let cleanMemberIds = ZaloSessionClient.cleanGroupMemberIds(rawMemberIds)
+        let memberCount = Int(JSONLossless.int64(info["totalMember"] ?? info["total"]) ?? Int64(cleanMemberIds.count))
+        groupMemberCache.removeValue(forKey: gid)
+        applyGroupMetadataUpdate(
+            gid: gid,
+            name: serverName.isEmpty ? nil : serverName,
+            avatar: avtURL,
+            memberCount: memberCount > 0 ? memberCount : nil,
+            memberIds: cleanMemberIds.isEmpty ? nil : cleanMemberIds
+        )
+        await persistSingleGroupConversation(gid)
+    }
+
+    private func applyGroupMetadataUpdate(
+        gid: String,
+        name: String?,
+        avatar: URL?,
+        memberCount: Int?,
+        memberIds: [String]?
+    ) {
+        let cleanGrid = ZaloWireParser.cleanGroupId(gid)
+        var detail = cachedGroupDetails[cleanGrid] ?? [:]
+        if let name, !name.isEmpty { detail["name"] = name }
+        if let avatar { detail["avt"] = avatar.absoluteString }
+        if let memberCount, memberCount > 0 { detail["totalMember"] = memberCount }
+        if let memberIds {
+            detail["memIds"] = memberIds
+            detail["memVerList"] = memberIds.map { "\($0)_0" }
+            if detail["currentMems"] != nil {
+                detail["currentMems"] = memberIds.map { ["id": $0] }
+            }
+        }
+        cachedGroupDetails[cleanGrid] = detail
+
+        if let idx = contacts.groups.firstIndex(where: { $0.id == gid }) {
+            let old = contacts.groups[idx]
+            let nextName = (name?.isEmpty == false) ? name! : old.name
+            let nextAvatar = avatar ?? old.avatar
+            let nextMembers = memberCount ?? old.members
+            contacts.groups[idx] = ContactsState.Group(
+                id: gid,
+                name: nextName,
+                avatar: nextAvatar,
+                members: nextMembers,
+                sortKey: Self.contactFold(nextName)
+            )
+        } else {
+            let nextName = (name?.isEmpty == false) ? name! : "Nhóm"
+            contacts.groups.append(ContactsState.Group(
+                id: gid,
+                name: nextName,
+                avatar: avatar,
+                members: memberCount ?? 1,
+                sortKey: Self.contactFold(nextName)
+            ))
+        }
+        contacts.groups.sort { $0.sortKey.localizedStandardCompare($1.sortKey) == .orderedAscending }
+
+        var convList = conversations
+        if let idx = convList.firstIndex(where: { $0.id == gid }) {
+            if let name, !name.isEmpty { convList[idx].name = name }
+            if let avatar { convList[idx].avatar = avatar }
+            if let memberCount, memberCount > 0 { convList[idx].members = memberCount }
+        } else {
+            convList.append(ConversationSummary(
+                id: gid,
+                isGroup: true,
+                name: (name?.isEmpty == false) ? name! : "Nhóm",
+                avatar: avatar,
+                pinned: cachedPinnedIds.contains(gid),
+                members: memberCount ?? 1,
+                unread: 0,
+                preview: nil
+            ))
+        }
+        sortConversations(&convList)
+        conversations = convList
+
+        let existingCached = cachedGroups[gid]
+        cachedGroups[gid] = ZaloWebKitMigrator.CachedGroup(
+            name: (name?.isEmpty == false) ? name! : (existingCached?.name ?? ""),
+            avatar: avatar?.absoluteString ?? existingCached?.avatar ?? "",
+            members: memberCount ?? existingCached?.members ?? 0
+        )
+
+        rebuildConversationFlags()
+        rebuildConversationExtras()
+    }
+
+    private func persistSingleGroupConversation(_ gid: String) async {
+        await persistCachedGroupsPreference()
+        guard let store = sqliteStore,
+              let summary = conversations.first(where: { $0.id == gid }) else { return }
+        let stored = StoredConversation(
+            id: summary.id,
+            isGroup: summary.isGroup,
+            name: summary.name,
+            avatar: summary.avatar?.absoluteString ?? "",
+            pinned: summary.pinned,
+            members: summary.members,
+            unread: summary.unread,
+            previewText: summary.preview?.text ?? "",
+            previewTsMs: Int64(((summary.preview?.date?.timeIntervalSince1970 ?? 0) * 1000).rounded()),
+            previewFromMe: summary.preview?.fromMe ?? false,
+            updatedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+        )
+        try? await store.upsertConversation(stored)
+    }
+
+    private func persistCachedGroupsPreference() async {
+        guard let store = sqliteStore,
+              let data = try? JSONEncoder().encode(cachedGroups) else { return }
+        try? await store.setPreferenceData(key: "cachedGroups", data: data)
     }
 
     /// "Chưa thêm được A, B và 3 người khác vào nhóm."

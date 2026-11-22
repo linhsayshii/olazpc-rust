@@ -1,0 +1,145 @@
+import Foundation
+
+extension ZaloEngine {
+    /// Returns `true` when `message` matches `query` case-insensitively across its text/caption/card content.
+    nonisolated static func messageMatchesSearchQuery(_ message: ChatMessage, query: String) -> Bool {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if case .recalled = message.kind { return false }
+        if case .placeholder = message.kind, message.isE2EE { return false }
+
+        let needle = trimmed.lowercased()
+        if message.text.lowercased().contains(needle) { return true }
+
+        switch message.kind {
+        case .file(let name, _, _):
+            return name.lowercased().contains(needle)
+        case .link(let title, _, _, let description, _):
+            return title.lowercased().contains(needle) || description.lowercased().contains(needle)
+        case .contactCard(let card):
+            return card.name.lowercased().contains(needle)
+        case .location(let info):
+            return info.title.lowercased().contains(needle) || info.address.lowercased().contains(needle)
+        case .call(_, _, _, let title, let detail):
+            return title.lowercased().contains(needle) || detail.lowercased().contains(needle)
+        case .ecard(let card):
+            return card.title.lowercased().contains(needle)
+                || card.description.lowercased().contains(needle)
+                || card.reminderTitle.lowercased().contains(needle)
+        case .oaMessage(let parts):
+            return parts.contains {
+                $0.title.lowercased().contains(needle) || $0.description.lowercased().contains(needle)
+            }
+        case .poll(let poll):
+            return poll.question.lowercased().contains(needle) || poll.header.lowercased().contains(needle)
+        case .stickerSet(let title, _):
+            return title.lowercased().contains(needle)
+        case .zinstant(let title, let text, _):
+            return title.lowercased().contains(needle) || text.lowercased().contains(needle)
+        case .notice(_, let text):
+            return text.lowercased().contains(needle)
+        case .text, .photo, .sticker, .gif, .video, .voice, .placeholder, .system, .recalled, .unsupported:
+            return false
+        }
+    }
+
+    /// Searches in-memory messages and SQLite history for `convId`, deduplicated by message/client ID and ordered newest-first.
+    func searchMessages(in convId: String, query: String, limit: Int = 50) async -> [ChatMessage] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !convId.isEmpty, !trimmed.isEmpty, limit > 0 else { return [] }
+        let clampedLimit = max(1, min(limit, 500))
+
+        let pendingDeletedIds = Set(
+            pendingDeletedMessages.values
+                .filter { $0.conversationId == convId }
+                .map(\.id)
+        )
+        let inMemory = messages[convId] ?? []
+        var memoryById: [String: ChatMessage] = [:]
+        memoryById.reserveCapacity(inMemory.count)
+        for msg in inMemory {
+            memoryById[msg.id] = msg
+        }
+
+        var results: [ChatMessage] = []
+        var seenIds = Set<String>()
+
+        for msg in inMemory {
+            guard !pendingDeletedIds.contains(msg.id) else { continue }
+            guard Self.messageMatchesSearchQuery(msg, query: trimmed) else { continue }
+            if seenIds.insert(msg.id).inserted {
+                results.append(msg)
+            }
+        }
+
+        let storedMatches = (try? await sqliteStore?.searchMessages(conversationId: convId, query: trimmed, limit: clampedLimit)) ?? []
+        for stored in storedMatches {
+            if pendingDeletedIds.contains(stored.id) || (!stored.clientId.isEmpty && pendingDeletedIds.contains(stored.clientId)) {
+                continue
+            }
+            if seenIds.contains(stored.id) || (!stored.clientId.isEmpty && seenIds.contains(stored.clientId)) {
+                continue
+            }
+            // If the live in-memory list already holds this message (e.g., recalled in memory), trust memory state.
+            if memoryById[stored.id] != nil || (!stored.clientId.isEmpty && memoryById[stored.clientId] != nil) {
+                seenIds.insert(stored.id)
+                if !stored.clientId.isEmpty { seenIds.insert(stored.clientId) }
+                continue
+            }
+            guard let decoded = ZaloWireParser.decodeStoredMessage(stored) else { continue }
+            if case .recalled = decoded.kind { continue }
+            if case .placeholder = decoded.kind, decoded.isE2EE { continue }
+
+            seenIds.insert(stored.id)
+            seenIds.insert(decoded.id)
+            if !stored.clientId.isEmpty { seenIds.insert(stored.clientId) }
+            results.append(decoded)
+        }
+
+        results.sort { a, b in
+            if a.date != b.date { return a.date > b.date }
+            return a.id > b.id
+        }
+        return Array(results.prefix(clampedLimit))
+    }
+
+    /// Ensures an older search match is loaded into `messages[convId]` so `MessageList` can scroll to it.
+    @discardableResult
+    func ensureMessageLoaded(_ message: ChatMessage, in convId: String) async -> Bool {
+        guard !convId.isEmpty else { return false }
+        if messages[convId]?.contains(where: { $0.id == message.id }) == true {
+            return true
+        }
+
+        let targetTsMs = Int64((message.date.timeIntervalSince1970 * 1000).rounded())
+        let oldestTsMs = messages[convId]?.first.map { Int64(($0.date.timeIntervalSince1970 * 1000).rounded()) }
+
+        if let store = sqliteStore,
+           let window = try? await store.messagesAround(
+               convId: convId,
+               targetTsMs: targetTsMs,
+               beforeOldestTsMs: oldestTsMs
+           ) {
+            let pendingDeletedIds = Set(
+                pendingDeletedMessages.values
+                    .filter { $0.conversationId == convId }
+                    .map(\.id)
+            )
+            for stored in window.messages {
+                if pendingDeletedIds.contains(stored.id) { continue }
+                if let decoded = ZaloWireParser.decodeStoredMessage(stored) {
+                    mergeMessageIntoMemory(decoded, replacingClientId: stored.clientId)
+                }
+            }
+            if window.hasMoreOlder {
+                hasMoreHistory[convId] = true
+            }
+        }
+
+        if messages[convId]?.contains(where: { $0.id == message.id }) != true,
+           (message.conversationId == convId || message.conversationId.isEmpty) {
+            mergeMessageIntoMemory(message)
+        }
+        return messages[convId]?.contains(where: { $0.id == message.id }) == true
+    }
+}
