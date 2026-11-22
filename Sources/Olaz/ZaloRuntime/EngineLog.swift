@@ -10,6 +10,7 @@ final class EngineLog {
     static let shared = EngineLog()
 
     let url: URL
+    var onAppend: ((String) -> Void)?
     private var handle: FileHandle?
     private let formatter: DateFormatter = {
         let f = DateFormatter()
@@ -46,6 +47,7 @@ final class EngineLog {
     func write(_ line: String) {
         let text = "\(formatter.string(from: .now)) \(line.prefix(1500))\n"
         handle?.write(Data(text.utf8))
+        onAppend?(String(text.dropLast()))
     }
 
     /// Argument summary without values: `(string, object{3}, bytes[512])`.

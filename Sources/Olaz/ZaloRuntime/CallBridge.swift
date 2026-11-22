@@ -42,12 +42,12 @@ final class CallBridge {
 
     typealias Spawn = @MainActor (_ recvPath: String, _ sendPath: String, _ onExit: @escaping @MainActor (Int32) -> Void) throws -> any CallProcess
 
-    /// Where Zalo.app keeps the helper (`dirname(exe)/../ZaloHelper.app/Contents/MacOS/ZaloCall`), in Olaz's copy of it.
-    nonisolated static func helperExecutable(appURL: URL = OfficialZaloInstall.defaultAppURL) -> URL {
+    /// Where Zalo.app keeps the helper (`dirname(exe)/../ZaloHelper.app/Contents/MacOS/ZaloCall`), in Olaz's copy or /Applications/Zalo.app.
+    nonisolated static func helperExecutable(appURL: URL = ZaloRuntime.defaultCallAppURL) -> URL {
         appURL.appendingPathComponent("Contents/ZaloHelper.app/Contents/MacOS/ZaloCall")
     }
 
-    nonisolated static func isHelperInstalled(appURL: URL = OfficialZaloInstall.defaultAppURL) -> Bool {
+    nonisolated static func isHelperInstalled(appURL: URL = ZaloRuntime.defaultCallAppURL) -> Bool {
         FileManager.default.isExecutableFile(atPath: helperExecutable(appURL: appURL).path)
     }
 

@@ -134,6 +134,7 @@ struct MessageRow: View {
     @AppStorage(OlazPrefs.wallpaper) private var wallpaperStored = ChatWallpaper.none.rawValue
     @State private var hovering = false
     @State private var showsReactionPicker = false
+    @State private var showsFilePreview = false
     private static let reactionEmojis = ["❤️", "👍", "😆", "😮", "😢", "😡"]
 
     private var mine: Bool { message.isMine }
@@ -337,6 +338,46 @@ struct MessageRow: View {
     private var menu: some View {
         let actions = message.menu
         if message.kind != .recalled {
+            if !actions.isProtected, case .file(let fileName, _, let fileURL) = message.kind {
+                Button("Xem trước", systemImage: "eye") { showsFilePreview = true }
+                    .disabled(fileURL == nil)
+                Button("Tải về", systemImage: "arrow.down.circle") {
+                    Task {
+                        let key = engine.fileDownloadKey(conversationId: message.conversationId, messageId: message.id, url: fileURL, name: fileName)
+                        if case .ready(let staged) = await engine.resolveFile(conversationId: message.conversationId, messageId: message.id, name: fileName, url: fileURL),
+                           let saved = try? ChatFileResolver.saveToDownloads(staged: staged, displayName: fileName) {
+                            engine.downloadedFilePaths[key] = saved
+                            CardActionCenter.shared.show("Đã tải tệp về thư mục Downloads", in: message.conversationId)
+                        } else {
+                            CardActionCenter.shared.show("Không tải được tệp đính kèm", in: message.conversationId)
+                        }
+                    }
+                }
+                .disabled(fileURL == nil)
+                Button("Lưu về máy…", systemImage: "folder") {
+                    Task {
+                        let key = engine.fileDownloadKey(conversationId: message.conversationId, messageId: message.id, url: fileURL, name: fileName)
+                        if case .ready(let staged) = await engine.resolveFile(conversationId: message.conversationId, messageId: message.id, name: fileName, url: fileURL),
+                           case .success(let chosen?) = await ChatFileSavePanel.saveAs(staged: staged, displayName: fileName) {
+                            engine.downloadedFilePaths[key] = chosen
+                        }
+                    }
+                }
+                .disabled(fileURL == nil)
+                Button("Mở bằng ứng dụng mặc định", systemImage: "arrow.up.forward.app") {
+                    Task {
+                        if case .ready(let staged) = await engine.resolveFile(conversationId: message.conversationId, messageId: message.id, name: fileName, url: fileURL) {
+                            if FileCard.mayExecute(staged, displayName: fileName) {
+                                NSWorkspace.shared.activateFileViewerSelecting([staged])
+                            } else {
+                                NSWorkspace.shared.open(staged)
+                            }
+                        }
+                    }
+                }
+                .disabled(fileURL == nil)
+                Divider()
+            }
             Button("Trả lời", systemImage: "arrowshape.turn.up.left") { onReply(message) }
             if actions.forward != .hidden {
                 Button("Chia sẻ", systemImage: "arrowshape.turn.up.right") { engine.requestForward(message) }
@@ -400,7 +441,7 @@ struct MessageRow: View {
             VStack(alignment: mine ? .trailing : .leading, spacing: 4) {
                 PhotoView(url: url, width: w, height: h, conversationId: message.conversationId, messageId: message.id,
                           senderName: mine ? "Bạn" : message.senderName, date: message.date,
-                          encrypted: message.isE2EE || url?.query?.contains("e2esession") == true)
+                          encrypted: message.isE2EE || url?.absoluteString.contains("e2esession") == true)
                 caption
             }
         case .gif(let url):
@@ -418,7 +459,7 @@ struct MessageRow: View {
         case .video(let thumbnail, let duration, let url):
             VideoThumb(thumbnail: thumbnail, duration: duration, url: url, conversationId: message.conversationId, messageId: message.id,
                        senderName: mine ? "Bạn" : message.senderName, date: message.date,
-                       encrypted: message.isE2EE || url?.query?.contains("e2esession") == true)
+                       encrypted: message.isE2EE || url?.absoluteString.contains("e2esession") == true || thumbnail?.absoluteString.contains("e2esession") == true)
         case .recalled:
             bubble(muted: true) {
                 Text("Tin nhắn đã được thu hồi").font(.system(size: scaled(13.5))).italic()
@@ -435,7 +476,15 @@ struct MessageRow: View {
             // Files are cards, not bubbles: neutral for both sides, no tail.
             VStack(alignment: .leading, spacing: 6) {
                 if let quote = message.quote { QuoteBlock(quote: quote, mine: false) }
-                FileCard(name: name, size: size, url: url, mine: false)
+                FileCard(
+                    name: name,
+                    size: size,
+                    url: url,
+                    mine: false,
+                    conversationId: message.conversationId,
+                    messageId: message.id,
+                    externalPreviewTrigger: $showsFilePreview
+                )
             }
             .padding(10)
             .cardChrome(radius: 16)
@@ -1000,8 +1049,39 @@ struct FileCard: View {
     let size: Int64
     let url: URL?
     let mine: Bool
+    var conversationId: String = ""
+    var messageId: String = ""
+    var externalPreviewTrigger: Binding<Bool>? = nil
+
+    @Environment(ZaloEngine.self) private var engine: ZaloEngine?
     @State private var downloading = false
+    @State private var progress: Double = 0
+    @State private var localSavedURL: URL?
     @State private var note: String?
+    @State private var isErrorNote = false
+    @State private var internalShowPreview = false
+
+    private var previewBinding: Binding<Bool> {
+        Binding(
+            get: { internalShowPreview || (externalPreviewTrigger?.wrappedValue ?? false) },
+            set: { newVal in
+                internalShowPreview = newVal
+                externalPreviewTrigger?.wrappedValue = newVal
+            }
+        )
+    }
+
+    private var downloadKey: String {
+        engine?.fileDownloadKey(conversationId: conversationId, messageId: messageId, url: url, name: name)
+            ?? (url?.absoluteString ?? name)
+    }
+
+    private var existingDownloadedURL: URL? {
+        if let localSavedURL, FileManager.default.fileExists(atPath: localSavedURL.path) {
+            return localSavedURL
+        }
+        return engine?.rememberedDownloadedFile(for: downloadKey)
+    }
 
     /// Files whose type could run code when opened (extension comes from the sender, so it is untrusted).
     static func mayExecute(_ file: URL, displayName: String) -> Bool {
@@ -1021,56 +1101,169 @@ struct FileCard: View {
         return false
     }
 
-    private func open() {
-        guard let url, !downloading else { return }
-        downloading = true
+    static func iconName(for fileName: String) -> String {
+        switch (fileName as NSString).pathExtension.lowercased() {
+        case "pdf": "doc.richtext.fill"
+        case "doc", "docx", "rtf", "pages": "doc.text.fill"
+        case "xls", "xlsx", "csv", "numbers": "tablecells.fill"
+        case "ppt", "pptx", "key": "play.rectangle.on.rectangle.fill"
+        case "zip", "rar", "7z", "gz", "tar": "doc.zipper"
+        case "mp3", "m4a", "wav", "aac", "flac": "music.note"
+        case "mp4", "mov", "mkv", "avi": "film.fill"
+        case "jpg", "jpeg", "png", "gif", "heic", "webp", "jxl": "photo.fill"
+        case "txt", "md", "json", "xml", "log": "doc.plaintext.fill"
+        default: "doc.fill"
+        }
+    }
+
+    private func preview() {
+        guard url != nil || !messageId.isEmpty else { return }
         note = nil
+        isErrorNote = false
+        internalShowPreview = true
+    }
+
+    private func downloadOrReveal() {
+        if let saved = existingDownloadedURL {
+            NSWorkspace.shared.activateFileViewerSelecting([saved])
+            return
+        }
+        guard (url != nil || !messageId.isEmpty), !downloading else { return }
+        downloading = true
+        progress = 0
+        note = nil
+        isErrorNote = false
         Task {
             defer { downloading = false }
-            guard let local = try? await MediaLoader.shared.localFile(for: url) else { return }
-            if Self.mayExecute(local, displayName: name) {
-                NSWorkspace.shared.activateFileViewerSelecting([local])
-                note = "Đã mở trong Finder vì tệp có thể chạy mã"
+            let onProgress: @Sendable (Double) -> Void = { frac in
+                Task { @MainActor in self.progress = frac }
+            }
+            let res: FileResolution
+            if let engine {
+                res = await engine.resolveFile(
+                    conversationId: conversationId,
+                    messageId: messageId,
+                    name: name,
+                    url: url,
+                    force: false,
+                    progress: onProgress
+                )
             } else {
-                NSWorkspace.shared.open(local)
+                res = await ChatFileResolver.resolve(name: name, url: url, force: false, progress: onProgress)
+            }
+            switch res {
+            case .ready(let staged):
+                do {
+                    let saved = try ChatFileResolver.saveToDownloads(staged: staged, displayName: name)
+                    localSavedURL = saved
+                    engine?.downloadedFilePaths[downloadKey] = saved
+                    note = "Đã tải về thư mục Downloads"
+                    isErrorNote = false
+                } catch {
+                    note = "Không lưu được vào Downloads"
+                    isErrorNote = true
+                }
+            case .expired:
+                note = "Tệp đã quá hạn trên máy chủ"
+                isErrorNote = true
+            case .failed(let message):
+                note = message
+                isErrorNote = true
             }
         }
+    }
+
+    private var subtitleText: String? {
+        if downloading {
+            if progress > 0 && progress < 1 {
+                return "Đang tải… \(Int((progress * 100).rounded()))%"
+            }
+            return "Đang tải…"
+        }
+        if let note {
+            return note
+        }
+        var parts: [String] = []
+        if size > 0 { parts.append(ChatFormat.bytes(size)) }
+        if existingDownloadedURL != nil { parts.append("Đã tải về") }
+        return parts.isEmpty ? nil : parts.joined(separator: " • ")
     }
 
     var body: some View {
-        Button(action: open) {
-            HStack(spacing: 10) {
-                Image(systemName: symbol)
-                    .font(.system(size: 20))
-                    .foregroundStyle(brandStyle(onMine: !mine))
-                    .frame(width: 38, height: 38)
-                    .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(brandStyle(onMine: mine)))
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(name).font(.system(size: 13, weight: .semibold)).lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                    if let note { Text(note).font(.system(size: 11)).opacity(0.85).fixedSize(horizontal: false, vertical: true) }
-                    else if size > 0 { Text(ChatFormat.bytes(size)).font(.system(size: 11.5)).opacity(0.75) }
+        HStack(spacing: 10) {
+            Button(action: preview) {
+                HStack(spacing: 10) {
+                    Image(systemName: Self.iconName(for: name))
+                        .font(.system(size: 20))
+                        .foregroundStyle(brandStyle(onMine: !mine))
+                        .frame(width: 38, height: 38)
+                        .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(brandStyle(onMine: mine)))
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(name.isEmpty ? "Tệp đính kèm" : name)
+                            .font(.system(size: 13, weight: .semibold))
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                        if let sub = subtitleText {
+                            Text(sub)
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(isErrorNote ? AnyShapeStyle(Color.orange) : AnyShapeStyle(Color.primary.opacity(0.72)))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .frame(maxWidth: 210, alignment: .leading)
                 }
-                .frame(maxWidth: 200, alignment: .leading)
-                if downloading {
-                    ProgressView().controlSize(.small)
-                } else if url != nil {
-                    Image(systemName: "arrow.down.circle").font(.system(size: 16)).opacity(0.8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(url == nil && messageId.isEmpty)
+            .help("Xem trước tệp")
+
+            if url != nil || !messageId.isEmpty {
+                HStack(spacing: 4) {
+                    Button(action: preview) {
+                        Image(systemName: "eye")
+                            .font(.system(size: 13.5))
+                            .opacity(0.75)
+                            .frame(width: 26, height: 26)
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Xem trước")
+
+                    if downloading {
+                        ProgressView()
+                            .controlSize(.small)
+                            .frame(width: 26, height: 26)
+                    } else {
+                        Button(action: downloadOrReveal) {
+                            if existingDownloadedURL != nil {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.system(size: 16))
+                                    .foregroundStyle(.green)
+                                    .frame(width: 26, height: 26)
+                                    .contentShape(Circle())
+                            } else {
+                                Image(systemName: "arrow.down.circle")
+                                    .font(.system(size: 16))
+                                    .opacity(0.82)
+                                    .frame(width: 26, height: 26)
+                                    .contentShape(Circle())
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .help(existingDownloadedURL != nil ? "Hiện trong Finder (Downloads)" : "Tải về thư mục Downloads")
+                    }
                 }
             }
         }
-        .buttonStyle(.plain)
-        .disabled(url == nil)
-    }
-
-    private var symbol: String {
-        switch (name as NSString).pathExtension.lowercased() {
-        case "pdf": "doc.richtext.fill"
-        case "zip", "rar", "7z", "gz": "doc.zipper"
-        case "xls", "xlsx", "csv": "tablecells.fill"
-        case "mp3", "m4a", "wav": "music.note"
-        case "mp4", "mov", "mkv": "film.fill"
-        default: "doc.fill"
+        .sheet(isPresented: previewBinding) {
+            FilePreviewSheet(
+                name: name,
+                size: size,
+                url: url,
+                conversationId: conversationId,
+                messageId: messageId
+            )
         }
     }
 }

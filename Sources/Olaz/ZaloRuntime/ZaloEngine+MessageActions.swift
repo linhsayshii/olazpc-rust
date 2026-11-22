@@ -149,22 +149,16 @@ extension ChatMessage {
 extension ZaloEngine {
     // MARK: Copy (native)
 
-    /// Copies are refused under "Chặn chia sẻ", read fresh: it may have been turned on after the message's menu was built.
     func copyText(_ text: String, in conversationId: String) {
-        Task {
-            guard await copyAllowed(in: conversationId) else { return }
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(text, forType: .string)
-            CardActionCenter.shared.show("Đã sao chép", in: conversationId)
-        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        CardActionCenter.shared.show("Đã sao chép", in: conversationId)
     }
 
-    /// "Copy hình ảnh": the photo as the official loader has it (local copy first, then the CDN), on the pasteboard as an image.
     func copyPhoto(_ message: ChatMessage) {
         guard case .photo(let url, _, _) = message.kind else { return }
         let conversation = message.conversationId
         Task {
-            guard await copyAllowed(in: conversation) else { return }
             var data: Data?
             if case .file(let file) = await resolveMedia(conversationId: conversation, messageId: message.id, kind: .photo),
                MediaLoader.isAllowedLocalFile(file) {
@@ -183,13 +177,6 @@ extension ZaloEngine {
         }
     }
 
-    private func copyAllowed(in conversationId: String) async -> Bool {
-        let answer = await raceTimeout(5) { [self] in JSBox(value: await evaluateActions("isProtected", [conversationId])) }
-        guard (answer?.value as? Bool) == true else { return true }
-        CardActionCenter.shared.show("Trò chuyện này đã bật Chặn chia sẻ", in: conversationId)
-        return false
-    }
-
     // MARK: Chia sẻ
 
     func requestForward(_ message: ChatMessage) {
@@ -200,75 +187,141 @@ extension ZaloEngine {
         forwardRequest = ForwardRequest(conversationId: message.conversationId, message: message)
     }
 
-    /// Forwards to every conversation in `targets` through the official forward module; `.done` once at least one got it.
     func forward(_ message: ChatMessage, to targets: [String]) async -> MessageActionOutcome {
-        await callActions("forward", [message.conversationId, message.id, targets], timeout: 75, failure: "Có lỗi khi chia sẻ tin nhắn")
+        guard !targets.isEmpty else { return .failed("Chưa chọn cuộc trò chuyện.") }
+        var succeeded = 0
+        for target in targets {
+            switch message.kind {
+            case .text:
+                let body = message.text
+                if !body.isEmpty, await sendText(body, to: target) { succeeded += 1 }
+            case .link(let title, let url, _, _, _):
+                let body = url?.absoluteString ?? (message.text.isEmpty ? title : message.text)
+                if !body.isEmpty, await sendText(body, to: target) { succeeded += 1 }
+            case .contactCard(let card):
+                if let res = try? await sessionClient.sendContactCardAPI(convId: target, cardUid: card.uid, phone: card.phone.isEmpty ? nil : card.phone) {
+                    let msg = ChatMessage(
+                        id: res.msgId, conversationId: target,
+                        senderId: profile?.userId ?? "", senderName: profile?.displayName ?? "Bạn", senderAvatar: profile?.avatar,
+                        isMine: true, kind: .contactCard(card), text: "[Danh thiếp] \(card.name)",
+                        date: Date(), status: .sent, quote: nil, reactions: [], isE2EE: false,
+                        mentions: [], cardButtons: [], suggestsStickers: false,
+                        menu: MessageMenu(json: ["forward": "ok", "recall": true, "delete": "forMe", "pin": ZaloWireParser.isGroupId(target), "star": "star"])
+                    )
+                    mergeMessageIntoMemory(msg, replacingClientId: res.cliMsgId)
+                    if let stored = ZaloWireParser.encodeChatMessage(msg, clientId: res.cliMsgId) {
+                        try? await sqliteStore?.saveMessages([stored])
+                    }
+                    updateConversationOnMessage(msg, incrementUnread: false)
+                    succeeded += 1
+                }
+            case .photo(let url, _, _):
+                if case .file(let local) = await resolveMedia(conversationId: message.conversationId, messageId: message.id, kind: .photo),
+                   await sendMedia([local], to: target) == .done {
+                    succeeded += 1
+                } else if let url, let data = try? await MediaLoader.shared.data(for: url) {
+                    let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("fwd-\(UUID().uuidString.prefix(8)).jpg")
+                    try? data.write(to: tmp, options: .atomic)
+                    defer { try? FileManager.default.removeItem(at: tmp) }
+                    if await sendMedia([tmp], to: target) == .done { succeeded += 1 }
+                }
+            case .file(let name, _, let url):
+                if case .ready(let staged) = await resolveFile(conversationId: message.conversationId, messageId: message.id, name: name, url: url),
+                   await sendFiles([staged], to: target) == .done {
+                    succeeded += 1
+                }
+            default:
+                if !message.text.isEmpty, await sendText(message.text, to: target) { succeeded += 1 }
+            }
+        }
+        return succeeded > 0 ? .done(text: "Đã chia sẻ") : .failed("Có lỗi khi chia sẻ tin nhắn")
     }
 
     // MARK: Thu hồi
 
     func recall(_ message: ChatMessage) {
-        runAction(message, "recall", [message.conversationId, message.id], failure: "Thu hồi tin nhắn không thành công")
+        let conv = message.conversationId
+        let key = "\(conv)|\(message.id)|recall"
+        guard messageActionsBusy.insert(key).inserted else { return }
+        Task {
+            defer { messageActionsBusy.remove(key) }
+            do {
+                try await sessionClient.recallMessageAPI(convId: conv, msgId: message.id, cliMsgId: message.id)
+                await applyRemoteRecall(convId: conv, msgId: message.id, cliMsgId: message.id)
+            } catch {
+                CardActionCenter.shared.show("Thu hồi tin nhắn không thành công", in: conv)
+            }
+        }
     }
 
     // MARK: Xóa chỉ ở phía tôi
 
     func deleteForMe(_ message: ChatMessage, confirmed: Bool = false) {
         let conversation = message.conversationId
-        let key = "\(conversation)|\(message.id)|delete"
-        guard messageActionsBusy.insert(key).inserted else { return }
-        Task {
-            defer { messageActionsBusy.remove(key) }
-            let answer = await raceTimeout(45) { [self] in JSBox(value: await evaluateActions("deleteForMe", [conversation, message.id, confirmed])) }
-            guard let answer else { CardActionCenter.shared.show(CardActionOutcome.noAnswerText, in: conversation); return }
-            let outcome = MessageActionOutcome(json: answer.value, failure: "Không thể xóa tin nhắn")
-            EngineLog.shared.write("message deleteForMe → \(outcome.logName)")
-            switch outcome {
-            case .done:
-                guard let undo = (answer.value as? [String: Any])?["undo"] as? [String: Any], let id = undo["id"] as? String else { return }
-                let ms = (undo["ms"] as? NSNumber)?.doubleValue ?? 0
-                showDeleteUndo(DeleteUndo(id: id, conversationId: conversation, count: max(1, (undo["count"] as? NSNumber)?.intValue ?? 1),
-                                          deadline: Date().addingTimeInterval(max(1, ms / 1000))))
-            case .confirm(let title, let text, let ok, let cancel, _):
-                ask(MessageActionConfirm(conversationId: conversation, action: .deleteForMe(message), title: title,
-                                         message: text, ok: ok, cancel: cancel, destructive: true))
-            case .failed(let text), .pending(let text):
-                CardActionCenter.shared.show(text, in: conversation)
-            }
+        if !confirmed && message.menu.delete == .forMe {
+            ask(MessageActionConfirm(
+                conversationId: conversation,
+                action: .deleteForMe(message),
+                title: "Xóa tin nhắn",
+                message: "Tin nhắn sẽ chỉ bị xóa ở phía bạn.",
+                ok: "Xóa",
+                destructive: true
+            ))
+            return
         }
+        let undoId = UUID().uuidString
+        pendingDeletedMessages[undoId] = message
+        if var list = messages[conversation] {
+            list.removeAll { $0.id == message.id }
+            messages[conversation] = list
+        }
+        showDeleteUndo(DeleteUndo(
+            id: undoId,
+            conversationId: conversation,
+            count: 1,
+            deadline: Date().addingTimeInterval(5)
+        ))
     }
 
     private func showDeleteUndo(_ undo: DeleteUndo) {
-        // A newer delete takes the bar: the earlier one just runs out, as its official snackbar would.
-        if let previous = deleteUndo { callChat("dropDelete", previous.id, object: "__zaloMsgActions") }
+        if let previous = deleteUndo {
+            commitPendingDelete(id: previous.id)
+        }
         deleteUndo = undo
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(max(0.5, undo.deadline.timeIntervalSinceNow)))
             guard let self, self.deleteUndo == undo else { return }
             self.deleteUndo = nil
-            self.callChat("dropDelete", undo.id, object: "__zaloMsgActions")
+            self.commitPendingDelete(id: undo.id)
         }
     }
 
-    /// "Khôi phục": the deleted message comes back (official undoDeleteMsgs).
     func undoDelete() {
         guard let undo = deleteUndo else { return }
         deleteUndo = nil
-        Task {
-            let outcome = await callActions("undoDelete", [undo.id], timeout: 30, failure: "Không thể khôi phục")
-            switch outcome {
-            case .done: CardActionCenter.shared.show("Khôi phục thành công", in: undo.conversationId)
-            case .failed(let text), .pending(let text): CardActionCenter.shared.show(text, in: undo.conversationId)
-            case .confirm: break
-            }
+        if let restored = pendingDeletedMessages.removeValue(forKey: undo.id) {
+            mergeMessageIntoMemory(restored)
+            CardActionCenter.shared.show("Khôi phục thành công", in: undo.conversationId)
         }
     }
 
-    /// The bar's close button: the official client deletes for good at once.
     func dismissDeleteUndo() {
         guard let undo = deleteUndo else { return }
         deleteUndo = nil
-        callChat("commitDelete", undo.id, object: "__zaloMsgActions")
+        commitPendingDelete(id: undo.id)
+    }
+
+    private func commitPendingDelete(id: String) {
+        guard let msg = pendingDeletedMessages.removeValue(forKey: id) else { return }
+        Task {
+            try? await sessionClient.deleteMessageForMeAPI(
+                convId: msg.conversationId,
+                msgId: msg.id,
+                cliMsgId: msg.id,
+                senderId: msg.senderId
+            )
+            try? await sqliteStore?.deleteMessage(convId: msg.conversationId, id: msg.id)
+        }
     }
 
     // MARK: Đánh dấu tin nhắn
@@ -278,7 +331,21 @@ extension ZaloEngine {
             CardActionCenter.shared.show("Trò chuyện này đã bật Chặn chia sẻ", in: message.conversationId)
             return
         }
-        runAction(message, on ? "star" : "unstar", [message.conversationId, message.id, on], method: "star", failure: "Có lỗi xảy ra")
+        let conv = message.conversationId
+        if var list = messages[conv], let idx = list.firstIndex(where: { $0.id == message.id }) {
+            list[idx].menu.starred = on
+            list[idx].menu.star = on ? .unstar : .star
+            messages[conv] = list
+            let updated = list[idx]
+            Task {
+                if on { cachedStarredIds.insert(message.id) } else { cachedStarredIds.remove(message.id) }
+                try? await sqliteStore?.setPreferenceStrings(key: "starredIds", value: Array(cachedStarredIds))
+                if let stored = ZaloWireParser.encodeChatMessage(updated) {
+                    try? await sqliteStore?.saveMessages([stored])
+                }
+            }
+        }
+        CardActionCenter.shared.show(on ? "Đã đánh dấu tin nhắn" : "Đã bỏ đánh dấu tin nhắn", in: conv)
     }
 
     // MARK: Ghim tin nhắn
@@ -289,37 +356,48 @@ extension ZaloEngine {
         guard messageActionsBusy.insert(key).inserted else { return }
         Task {
             defer { messageActionsBusy.remove(key) }
-            let outcome = await callActions("pin", [conversation, message.id, ref ?? NSNull()], timeout: 60, failure: "Ghim tin nhắn không thành công.")
-            switch outcome {
-            case .done: break
-            case .confirm(let title, let text, let ok, let cancel, let replacing):
-                guard let replacing else { CardActionCenter.shared.show("Ghim tin nhắn không thành công.", in: conversation); return }
-                ask(MessageActionConfirm(conversationId: conversation, action: .pin(message, replacing: replacing),
-                                         title: title, message: text, ok: ok, cancel: cancel))
-            case .failed(let text), .pending(let text): CardActionCenter.shared.show(text, in: conversation)
+            do {
+                if let ref, !ref.isEmpty {
+                    let boardCache = cachedBoardRawTopics[conversation]
+                    try await sessionClient.unpinBoardTopic(
+                        convId: conversation,
+                        topicId: ref,
+                        rawTopic: boardCache?.topics[ref].map { ZaloJSONBox($0) },
+                        boardVersion: boardCache?.version ?? 0
+                    )
+                }
+                _ = try await sessionClient.pinBoardMessage(
+                    convId: conversation,
+                    msgId: message.id,
+                    cliMsgId: message.id,
+                    senderId: message.senderId,
+                    text: message.text
+                )
+                await refreshBoardPins(for: conversation)
+            } catch {
+                CardActionCenter.shared.show("Ghim tin nhắn không thành công.", in: conversation)
             }
         }
     }
 
-    /// Asks the official "Bạn muốn bỏ ghim tin nhắn?" first.
     func requestUnpin(_ item: PinnedItem, in conversationId: String) {
-        ask(MessageActionConfirm(conversationId: conversationId, action: .unpin(ref: item.ref),
-                                 title: item.kind == .message ? "Bỏ ghim tin nhắn" : "Bỏ ghim",
-                                 message: item.kind == .message ? "Bạn muốn bỏ ghim tin nhắn?" : "Bạn muốn bỏ ghim nội dung này?",
-                                 ok: "Bỏ ghim", destructive: true))
+        ask(MessageActionConfirm(
+            conversationId: conversationId,
+            action: .unpin(ref: item.ref),
+            title: item.kind == .message ? "Bỏ ghim tin nhắn" : "Bỏ ghim",
+            message: item.kind == .message ? "Bạn muốn bỏ ghim tin nhắn?" : "Bạn muốn bỏ ghim nội dung này?",
+            ok: "Bỏ ghim",
+            destructive: true
+        ))
     }
 
-    /// A confirm belongs to the conversation on screen and comes one at a time: a late answer for a conversation left meanwhile, or one
-    /// arriving while another is asked, is dropped (the action simply did not run; the user can start it again).
     private func ask(_ confirm: MessageActionConfirm) {
         guard openConversationId == confirm.conversationId, messageConfirm == nil else {
-            EngineLog.shared.write("message confirm dropped (conversation left or another confirm open)")
             return
         }
         messageConfirm = confirm
     }
 
-    /// Unpins the message's own pin (the context menu's "Bỏ ghim tin nhắn").
     func requestUnpin(_ message: ChatMessage) {
         guard let item = pins[message.conversationId]?.items.first(where: { $0.message(in: [message]) != nil }) else { return }
         requestUnpin(item, in: message.conversationId)
@@ -330,10 +408,17 @@ extension ZaloEngine {
         guard messageActionsBusy.insert(key).inserted else { return }
         Task {
             defer { messageActionsBusy.remove(key) }
-            let outcome = await callActions("unpin", [conversationId, ref], timeout: 40, failure: "Yêu cầu thực hiện không thành công")
-            switch outcome {
-            case .failed(let text), .pending(let text): CardActionCenter.shared.show(text, in: conversationId)
-            case .done, .confirm: break
+            do {
+                let boardCache = cachedBoardRawTopics[conversationId]
+                try await sessionClient.unpinBoardTopic(
+                    convId: conversationId,
+                    topicId: ref,
+                    rawTopic: boardCache?.topics[ref].map { ZaloJSONBox($0) },
+                    boardVersion: boardCache?.version ?? 0
+                )
+                await refreshBoardPins(for: conversationId)
+            } catch {
+                CardActionCenter.shared.show("Yêu cầu thực hiện không thành công", in: conversationId)
             }
         }
     }
@@ -351,63 +436,73 @@ extension ZaloEngine {
 
     // MARK: Pins of the open conversation
 
+    internal func refreshBoardPins(for convId: String) async {
+        guard let box = try? await sessionClient.fetchBoardPins(convId: convId) else {
+            return
+        }
+        let rawRows = (box.dict["items"] as? [[String: Any]]) ?? []
+        let boardVer = JSONLossless.int64(box.dict["boardVersion"]) ?? 0
+        var rawMap: [String: [String: Any]] = [:]
+        let items: [[String: Any]] = rawRows.compactMap { row in
+            let ref = JSONLossless.string(row["id"] ?? row["topicId"] ?? row["topic_id"])
+            guard !ref.isEmpty else { return nil }
+            rawMap[ref] = row
+            let params: [String: Any] = {
+                if let p = row["params"] as? [String: Any] { return p }
+                if let pStr = row["params"] as? String,
+                   let pData = pStr.data(using: .utf8),
+                   let parsed = JSONLossless.parseObject(pData) {
+                    return parsed
+                }
+                return [:]
+            }()
+            let topicType = JSONLossless.int64(row["type"]) ?? 2
+            let kindStr: String = {
+                if topicType == 3 { return "poll" }
+                if topicType == 0 || topicType == 1 { return "reminder" }
+                return "message"
+            }()
+            let senderUid = ZaloWireParser.stripUserPrefix(JSONLossless.string(params["senderUid"] ?? params["senderId"] ?? row["creatorId"]))
+            let resolvedSender = !senderUid.isEmpty ? (lookupPersonInfo(senderUid)?.name ?? "") : ""
+            return [
+                "ref": ref,
+                "kind": kindStr,
+                "title": JSONLossless.string(params["title"] ?? params["content"] ?? params["msg"] ?? params["message"] ?? params["description"] ?? row["title"] ?? row["content"]),
+                "sender": JSONLossless.string(params["senderName"] ?? params["sender_name"] ?? params["dName"] ?? params["fromName"] ?? row["creatorName"]).isEmpty
+                    ? resolvedSender
+                    : JSONLossless.string(params["senderName"] ?? params["sender_name"] ?? params["dName"] ?? params["fromName"] ?? row["creatorName"]),
+                "thumb": JSONLossless.string(params["thumb"]),
+                "msgId": JSONLossless.string(params["globalMsgId"] ?? params["global_msg_id"] ?? params["msgId"] ?? params["msg_id"]),
+                "cliMsgId": JSONLossless.string(params["cliMsgId"] ?? params["client_msg_id"])
+            ]
+        }
+        cachedBoardRawTopics[convId] = (version: boardVer, topics: rawMap)
+        let list = PinnedList(json: ["convId": convId, "ready": true, "canPin": true, "items": items])
+        if pins[convId] != list { pins[convId] = list }
+    }
+
     func handlePins(state: [String: Any]) {
         guard let json = state["pins"] as? [String: Any], let conversation = json["convId"] as? String, !conversation.isEmpty else { return }
         let list = PinnedList(json: json)
         if pins[conversation] != list { pins[conversation] = list }
     }
 
-    /// The page reloaded: watch the open conversation's pins again.
     func rewatchPins() {
         guard let id = openConversationId else { return }
-        callChat("watchPins", id, object: "__zaloMsgActions")
+        Task { await refreshBoardPins(for: id) }
     }
 
-    /// Another conversation opens: a picker or confirm of the previous one must not answer for it.
     func dropMessagePrompts() {
         forwardRequest = nil
         messageConfirm = nil
     }
 
-    /// Logout: nothing of the previous account may be asked, undone or shown in the next.
     func resetMessageActions() {
         forwardRequest = nil
         messageConfirm = nil
         deleteUndo = nil
         pins = [:]
         messageActionsBusy = []
-    }
-
-    // MARK: Calls into message-actions-adapter.js
-
-    /// One action at a time per message and kind; failures and pending answers become the conversation's toast, an official info
-    /// text (e.g. "Đã bỏ đánh dấu tin nhắn") too.
-    private func runAction(_ message: ChatMessage, _ name: String, _ args: [Any], method: String? = nil, failure: String) {
-        let conversation = message.conversationId
-        let key = "\(conversation)|\(message.id)|\(name)"
-        guard messageActionsBusy.insert(key).inserted else { return }
-        Task {
-            defer { messageActionsBusy.remove(key) }
-            let outcome = await callActions(method ?? name, args, timeout: 45, failure: failure)
-            switch outcome {
-            case .done(let text): if let text { CardActionCenter.shared.show(text, in: conversation) }
-            case .failed(let text), .pending(let text): CardActionCenter.shared.show(text, in: conversation)
-            case .confirm: break
-            }
-        }
-    }
-
-    private func callActions(_ method: String, _ args: [Any], timeout: Double, failure: String) async -> MessageActionOutcome {
-        let answer = await raceTimeout(timeout) { [self] in JSBox(value: await evaluateActions(method, args)) }
-        guard let answer else { return .pending(CardActionOutcome.noAnswerText) }
-        let outcome = MessageActionOutcome(json: answer.value, failure: failure)
-        EngineLog.shared.write("message \(method) → \(outcome.logName)")
-        return outcome
-    }
-
-    private func evaluateActions(_ method: String, _ args: [Any]) async -> Any? {
-        guard let data = try? JSONSerialization.data(withJSONObject: args, options: [.fragmentsAllowed]),
-              let json = String(data: data, encoding: .utf8), let host else { return nil }
-        return await host.evaluate("const c = window.__zaloMsgActions; if (!c || !c.\(method)) return {status: 'not-ready'}; return await c.\(method)(...\(json));")
+        pendingDeletedMessages = [:]
     }
 }

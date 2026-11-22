@@ -173,10 +173,16 @@ final class ShellModel {
         }
     }
 
-    func hideInspector() {
+    func hideInspector(animated: Bool = true) {
         holdsInspectorRoom = false
         endReveal()
-        withAnimation(.easeInOut(duration: InspectorRoom.revealDuration)) { showInspector = false }
+        if animated {
+            withAnimation(.easeInOut(duration: InspectorRoom.revealDuration)) { showInspector = false }
+        } else {
+            var tx = Transaction()
+            tx.disablesAnimations = true
+            withTransaction(tx) { showInspector = false }
+        }
     }
 
     /// The detail column's width, reported by `DetailColumn` whenever it changes. During a reveal the room the column gained
@@ -240,11 +246,8 @@ enum InspectorRoom {
         guard let window, !window.styleMask.contains(.fullScreen), let screen = window.screen ?? NSScreen.main else { completion(); return }
         let target = frame(for: window.frame, in: screen.visibleFrame)
         guard target != window.frame else { completion(); return }
-        // `setFrame(_:display:animate:)` is of no use here: on macOS 27 it moves a 300 pt change in one step.
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = revealDuration
-            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            window.animator().setFrame(target, display: true)
-        }, completionHandler: { MainActor.assumeIsolated { completion() } })
+        // Apply frame synchronously before sliding the inspector column so AppKit never leaves `NSTableView` stuck in `inLiveResize`.
+        window.setFrame(target, display: true, animate: false)
+        completion()
     }
 }

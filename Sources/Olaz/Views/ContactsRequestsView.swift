@@ -43,16 +43,6 @@ struct RequestsList: View {
                 .scrollEdgeEffectStyle(.soft, for: .top)
             }
         }
-        .columnTitle("Lời mời kết bạn", subtitle: "\(engine.contacts.pendingRequestCount) lời mời đang chờ")
-        .toolbar {
-            ToolbarItem {
-                if engine.contacts.loadingRequests {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Button("Tải lại", systemImage: "arrow.clockwise") { engine.refreshContacts() }
-                }
-            }
-        }
     }
 }
 
@@ -212,7 +202,6 @@ struct AddFriendForm: View {
             }
             .padding(14)
         }
-        .columnTitle("Thêm bạn")
         .onAppear { phoneFocused = true }
         .onDisappear { engine.resetFriendSearch() }
     }

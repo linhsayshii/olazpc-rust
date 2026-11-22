@@ -1,8 +1,6 @@
 # Zalo for macOS — Reverse Engineering Notes
 
-Source: `ZaloSetup-universal-26.10.20.dmg` (337.9 MB) — analyzed 2026-10-25.
-
-## 1. Packaging identity
+## 1. Official Zalo PC (`ZaloSetup-universal-26.10.20.dmg`)
 
 | Fact | Value |
 |---|---|
@@ -10,72 +8,37 @@ Source: `ZaloSetup-universal-26.10.20.dmg` (337.9 MB) — analyzed 2026-10-25.
 | Version | 26.10.20 (build 26.10.20.3253) |
 | Runtime | **Electron 22.3.9** (Chromium 108), universal (arm64 + x64) |
 | App size | 762 MB installed; `app.asar` 180 MB |
-| Updater | electron-updater / Squirrel (`app-update.yml`) |
-| URL scheme | `zalo://` |
-| Entry | `bootstrap.js` → `main-dist/main.js` (single-instance lock) |
-| Permissions | Camera, microphone, Bluetooth (calls); ATS allows arbitrary loads |
+| Native Helpers | `ZaloHelper.app/Contents/MacOS/ZaloCall` (Qt/VoIP), `ZaloCap` (screenshot) |
 
-Other processes: `compact-app` (mini overlay chat), `znotification` (notification window),
-utility processes for SQLite and media, `mainless-worker`.
+## 2. Architecture Study: `lebad280324/zalolite`
 
-## 2. Code layout (extracted ASAR → `reanalysis/app_extracted/`)
+Static analysis of `/Applications/Zalolite.app/Contents/Helpers/ctdozlite-core` (SHA-256 `69a0ff55473c16c9650bd9514fa964587f2f97c4b0112d0a66d5ca2d40e15242`, Universal arm64/x86_64):
+- Links only **15 macOS system frameworks/dylibs** (AppKit, CoreGraphics, OpenGL, CoreAudio, AudioUnit, CoreVideo, Carbon, etc.) with **zero WebKit, Chromium, Node.js, or Electron helpers**.
+- Uses a pure native protocol core talking directly to Zalo's Web/PC APIs (`zpw_ver=694`, `zpw_type=30` / `23`) over HTTPS + binary `zpw_ws` WebSockets + local SQLite storage.
 
-- `main-dist/` — Electron main process, **obfuscated** with `@zsecure/zpc` (`zsymb(...)` calls).
-- `pc-dist/` — the renderer. **This is the Zalo Web app** (`index.html` title "Đăng nhập Zalo Web",
-  `body class="web"`). React + Redux Toolkit, webpack-bundled:
-  - `lazy/default-login-main-startup-…js` (17 MB) — entire UI: **0 references to `require("electron")`**.
-    Desktop integration goes through a preload bridge (`preload-render.js`), not direct Electron APIs.
-  - `lazy/lang-vi.js` — 6,469 Vietnamese UI strings (full feature map, parsed to `reanalysis/lang_vi.json` — VNG content, gitignored; regenerate locally).
-  - `libs/libsignal-protocol.static.js` — Signal-protocol E2E encryption (pure JS).
-  - Workers: `sync-v2`, `dal`, `zd`, `search`, `cpu-heavy`, `opfs`, `pdf`, `trust`.
-- `native/nativelibs/` — `.node` binaries: `zcall` (VoIP/video via `vcmac`), `sqlite3`,
-  `db-cross-v4`, `mp4thumb`, `os-sys-info`, `file-utils`, `v8-profiles`. These are the only
-  parts that cannot run under plain JavaScriptCore.
+## 3. Zalo Wire Protocol Implemented in Olaz (`Sources/Olaz/ZaloRuntime/Protocol/`)
 
-## 3. UI structure (from lang pack + CSS class census)
+### 3.1 Handshake & Request Signing (`ZaloCrypto.swift`, `ZaloSessionClient.swift`)
+- **IMEI:** `<lowercase-uuid>-<md5(userAgent)>` (69 chars).
+- **`signkey`:** `MD5("zsecure" + tag + sortedParamValuesJoined)`.
+- **ParamCipher v2:** Derives 16/32-byte key + encrypts JSON payload via AES-CBC PKCS#7 Base64, URL-safe transport via `zcid`, `zcid_ext`, `enc_ver=v2`.
+- **64-bit IDs:** Server `msgId`/`cliMsgId`/`globalMsgId`/`uidFrom`/`idTo` exceed `Double` integer precision (`2^53`); `JSONLossless` quotes `>= 15`-digit integers prior to `JSONSerialization`.
 
-- **Login** (`login.html`): QR-code login ("Quét mã QR để đăng nhập"), phone-number login,
-  email login, company-account (Zalo Business) login.
-- **Main window** (`index.html`): left icon **tab-bar nav rail** + conversation list + chat pane.
-  - Rail tabs (strings found): **Tin nhắn** (Messages), **Danh bạ** (Contacts/You),
-    **Ưu tiên** (Focus tab), phân loại **Labels/Khách hàng** (customer labels for Business mode),
-    **Công việc** (Todo), ZCloud (drive), Calls, Settings, profile.
-  - Conversation list: `conv-item`, pinned ("Ưu tiên ghim"), group/community badges, unread counts,
-    labels ("Phân loại hội thoại"), broadcast.
-  - Chat: `message-view` / `chat-message` (810 rules) with pictures, voice messages
-    ("Tin nhắn thoại"), quotes/replies ("Trả lời"), reactions, comments ("Bình luận"),
-    recall ("Thu hồi"), E2EE notices, date separators (`chat-date`), typing status.
-  - Composer: `chat-box-input` ("Nhập tin nhắn"), attachments, stickers/emoji, AI translate
-    (`ai-translation-language-model.js` — TF.js on-device model), screenshot capture.
-- **Communities** (348 strings — biggest feature): groups of groups, membership approval,
-  management menus.
+### 3.2 QR Authentication Flow
+1. `GET https://wpa.chat.zalo.me/api/login/reqqr` (`signkey` tag `"reqqr"`) -> `token_id`, `qr_cnt`, `chk_wait_scan`, `chk_wait_cfirm`.
+2. Long-poll `chk_wait_scan` (HTTP `408` = retry) -> user profile preview.
+3. Long-poll `chk_wait_cfirm` (HTTP `408` / `error_code=18012` = waiting confirmation) -> `zpw_sek` cookie.
+4. `GET /api/login/getLoginInfo` (`signkey` tag `"getlogininfo"`, `zpw_ver=694`, `zpw_type=30`) -> decrypt AES response for `zpw_enk`, `dkey`, `send2me_id`, `zpw_service_map_v3`, and `zpw_ws`.
 
-## 4. Brand / theme tokens
+### 3.3 Realtime WebSocket (`ZaloWebSocket.swift`)
+- URL must include `/` before query string (`wss://ws*-msg.chat.zalo.me/?zpw_ver=694&zpw_type=30&t=<ms>`).
+- Binary frame header: `u8 version | u16 LE cmd | u8 subCmd | UTF-8 JSON envelope`.
+- Key commands: `1` (`AUTHEN` -> returns `cipherKey`, `ctrl_qCmds`, `qCmds`), `2`/`4` (ping keep-alive every 15s), `501` / `521` (1-1 / group push), `510` / `511` / `513..518` (pull queues, paginated via `more == 1`), `533` -> `570` (`GET_MSG`), `601..604` (control/typing/seen/VoIP).
+- Payload encryption (`encrypt`): `0` = plain JSON, `1` = AES-GCM-16 (`iv(16)|aad(16)|ct||tag(16)`), `2`/`3` = AES-GCM-16 + gzip/zlib inflate (after URL percent-decode + Base64 decode).
 
-- Primary blue: `#0068FF` (CTA links, buttons; pressed `#005AE0`, tonal bg `#E5F1FF`).
-- Text primary (light): `#081B3A`. Dark-mode window bg: `#22262B`.
-- Fonts: system + embedded fonts in `pc-dist/fonts/`.
-- Tagline: "Zalo - Nhắn gửi yêu thương" ("Send love").
+### 3.4 Multi-Host Failover (`ZaloDomains.swift`)
+- Routes per logical service (`chat`, `group`, `friend`, `profile`, `file`, `sticker`, `reaction`, `conversation`, `group_board`, `group_poll`, `group_cloud_message`, `alias`) across `SERVICE_MAP_V3` candidates; promotes winning host and fails over only on HTTP `404`/`5xx` or network errors (never on `ZaloSessionError`).
 
-## 5. Network surface (from CSP + bundle strings)
-
-- Static/resources: `res-zalo.zadn.vn`, `stc-chat.zdn.vn`, `res.zalo.zdn.vn` (avatars: `s120-ava-talk.zadn.vn`).
-- Messaging API: `zimsg.chat.zalo.me`, `wss://…chat.zalo.me`, `wss://*.zavi.me` (realtime).
-- Identity/auth: `zwid.api.zalo.me`. Cloud drive: `f12/f14-zpcloud.zdn.vn`. Web: `zalo.me`.
-- Avatars modelled as `https://s120-ava-talk.zadn.vn/…` URLs; CDN for files `*.z-cdn.me`.
-
-## 6. Feasibility verdict for the native rewrite
-
-- **UI layer**: 100 % portable to SwiftUI — the renderer is plain React with no Electron coupling.
-- **Engine layer**: pure-JS protocol/crypto (Signal + sync + DAL workers) is embeddable in
-  **JavaScriptCore** with Swift shims (WebSocket, storage, fetch). Native `.node` modules
-  (calls, sqlite) would need a Node sidecar — out of scope for v1.
-- **Real login/messaging against VNG servers** requires re-implementing their proprietary
-  handshake/obfuscation (`@zsecure/zpc` on the wire too) — v1 ships a demo engine behind a
-  `ZaloService` protocol so a future JS engine can be dropped in.
-
-## 7. Asset provenance
-
-`Assets/zalo-wordmark.svg`, `zalo-logo.png`, `avatar-default.png` extracted from `pc-dist/assets/`;
-`zalo.icns` from `Resources/`. Used for visual fidelity of the early recreation. These are VNG's assets: they are
-gitignored and **not part of the public repo** (Olaz ships its own artwork); extract them locally if needed.
+### 3.5 On-Demand Native Call Helper (`CallBridge.swift`, `ZaloEngine+CallHook.swift`)
+- VNG's signed `ZaloCall` (`ZaloHelper.app`) communicates over encrypted UNIX domain sockets (`AES-128-CBC` `$`-framed chunks).
+- Olaz launches `ZaloCall` **only** when placing or receiving a call and calls `reset()` to terminate it as soon as `callState` returns to `"free"`.

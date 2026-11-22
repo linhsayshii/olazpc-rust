@@ -5,144 +5,172 @@ import Foundation
 // `HostScripts/card-actions-adapter.js` (`window.__zaloChat.performAction` & co.; contract in ChatModels.swift).
 // Every call runs only after a click or when a card is shown; nothing here is fired on its own. Message content never goes to the log.
 extension ZaloEngine {
-    /// Runs the official handler of the card button `ref` on message `messageId` and returns what happened.
-    /// Effects that need app UI (open a chat / link, copy) are applied here; opening a profile is left to the caller.
     func performCardAction(in conversationId: String, message messageId: String, ref: String) async -> CardActionOutcome {
-        // The JS side always answers within ~40 s (card-actions-adapter.js `guarded`): a run that is slower is reported as "pending", it keeps
-        // its slot there and a retry is refused until it settles. So the button stays busy until JS really answers; this cap (a dead page)
-        // must never invite a retry that could send twice, hence its wording.
-        let answer = await raceTimeout(90) { [self] in JSBox(value: await callCard("performAction", [conversationId, messageId, ref])) }
-        guard let answer else { return .pending(CardActionOutcome.noAnswerText) }
-        let outcome = CardActionOutcome(json: answer.value)
-        // The answer can arrive after the user moved to another conversation: effects then belong to a screen that is gone and are dropped.
-        if openConversationId != conversationId {
-            switch outcome {
-            case .openChat, .openURL, .copy, .present(.tab):
-                EngineLog.shared.write("card action \(ref.split(separator: ":").first.map(String.init) ?? "-") → dropped (conversation changed)")
-                return .done
-            default: break
+        if ref == "call:back" {
+            let msg = messages[conversationId]?.first(where: { $0.id == messageId })
+            let isVideo: Bool = {
+                if case .call(let video, _, _, _, _) = msg?.kind { return video }
+                return false
+            }()
+            startCall(to: conversationId, video: isVideo)
+            return .done
+        }
+        let parts = ref.split(separator: "_")
+        if parts.count == 2, let cateId = Int(parts[0]), let stickerId = Int(parts[1]), stickerId > 0 {
+            return await sendCategorySticker(in: conversationId, category: cateId, sticker: stickerId)
+        }
+        return .unsupported(CardActionOutcome.defaultUnsupported)
+    }
+
+    func resetCardState() {}
+
+    func suggestedStickers(in conversationId: String, message messageId: String) async -> [SuggestedSticker] {
+        let msg = messages[conversationId]?.first(where: { $0.id == messageId })
+        let keyword: String = {
+            if case .ecard(let card) = msg?.kind, card.style == .birthday {
+                return "chúc mừng sinh nhật"
+            }
+            return "xin chào"
+        }()
+        guard let box = try? await sessionClient.suggestStickersAPI(keyword: keyword) else { return [] }
+        var out: [SuggestedSticker] = []
+        for row in box.array.prefix(8) {
+            let sid = Int(JSONLossless.int64(row["id"] ?? row["stickerId"] ?? row["sticker_id"]) ?? 0)
+            let cate = Int(JSONLossless.int64(row["cateId"] ?? row["cate_id"]) ?? 0)
+            guard sid > 0 else { continue }
+            let urlStr = ZaloWireParser.stickerCDNURL(cateId: cate, stickerId: "\(sid)")
+            if let url = URL(string: urlStr) {
+                out.append(SuggestedSticker(ref: "\(cate)_\(sid)", url: url))
             }
         }
-        switch outcome {
-        case .openChat(let id): openContactConversation(id)
-        case .openURL(let url): WebLink.open(url)
-        case .copy(let text):
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(text, forType: .string)
-        case .present(.tab(let target)): SectionRouter.open(target)
-        case .failed, .locked, .unsupported, .pending: EngineLog.shared.write("card action \(ref.split(separator: ":").first.map(String.init) ?? "-") → \(outcome.logName)")
-        default: break
-        }
-        return outcome
+        return out
     }
 
-    /// Logout: forget group previews and in-flight slots of the previous session (best effort).
-    func resetCardState() {
-        Task { _ = await callCard("cardReset", []) }
-    }
-
-    /// The stickers an e-card suggests (official `fetchStickersFromList` over the card's `stickerList`).
-    func suggestedStickers(in conversationId: String, message messageId: String) async -> [SuggestedSticker] {
-        SuggestedSticker.list(json: await callCard("cardStickers", [conversationId, messageId]))
-    }
-
-    /// Local friend data for a contact card: is it me, is it a friend (no network).
     func contactCardState(_ uid: String) async -> (isSelf: Bool, isFriend: Bool) {
-        let root = await callCard("contactState", [uid]) as? [String: Any] ?? [:]
-        return ((root["isSelf"] as? NSNumber)?.boolValue ?? false, (root["isFriend"] as? NSNumber)?.boolValue ?? false)
+        let clean = ZaloWireParser.stripUserPrefix(uid)
+        let isSelf = clean == profile?.userId
+        let isFriend = contacts.friends.contains { $0.id == clean }
+        return (isSelf, isFriend)
     }
 
     func contactProfile(_ uid: String) async -> ContactProfile? {
-        ContactProfile(json: await callCard("contactProfile", [uid]))
+        let clean = ZaloWireParser.stripUserPrefix(uid)
+        guard !clean.isEmpty else { return nil }
+        if clean == profile?.userId, let p = profile {
+            return ContactProfile(uid: clean, name: p.displayName, avatar: p.avatar, isSelf: true, isFriend: false)
+        }
+        if let f = contacts.friends.first(where: { $0.id == clean }) {
+            return ContactProfile(uid: clean, name: f.name, zaloName: f.zaloName, avatar: f.avatar, isSelf: false, isFriend: true)
+        }
+        if let box = try? await sessionClient.fetchProfiles(uids: [clean]),
+           let row = ZaloWireParser.extractProfilesMap(box.dict)[clean] {
+            let name = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+            let zalo = JSONLossless.string(row["zaloName"])
+            let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
+            return ContactProfile(uid: clean, name: name, zaloName: zalo, avatar: avt.isEmpty ? nil : URL(string: avt))
+        }
+        return nil
     }
 
-    /// The official "KẾT BẠN" steps before the add-friend form (status check, request source, default message). Sends nothing.
-    /// `via`: how the form was reached — see `FriendRequestOrigin`.
     func prepareFriendRequest(to uid: String, from conversationId: String, via: FriendRequestOrigin) async -> FriendRequestPrep {
-        let answer = await raceTimeout(20) { [self] in JSBox(value: await callCard("prepareFriendRequest", [uid, conversationId, via.rawValue])) }
-        return FriendRequestPrep(json: answer?.value)
+        let clean = ZaloWireParser.stripUserPrefix(uid)
+        if clean == profile?.userId { return FriendRequestPrep(state: .me) }
+        if contacts.friends.contains(where: { $0.id == clean }) { return FriendRequestPrep(state: .friend) }
+        if contacts.sent.contains(where: { $0.id == clean }) { return FriendRequestPrep(state: .requested) }
+        if contacts.received.contains(where: { $0.id == clean }) { return FriendRequestPrep(state: .requesting) }
+        let myName = profile?.displayName ?? "tôi"
+        return FriendRequestPrep(state: .ready, defaultMessage: "Xin chào, mình là \(myName).", maxMessage: 150)
     }
 
-    /// Sends the friend request the user confirmed (official `requestAddFriend` through the contacts adapter) and waits for its result.
-    /// Never reports success without the adapter's answer. The adapter answers within ~60 s; `pending` means the request is still
-    /// in flight there (a retry is refused until it settles), so the caller must not offer to send again.
     func submitFriendRequest(to uid: String, message: String) async -> (ok: Bool, text: String, pending: Bool) {
-        let args = [uid, message] as [Any]
-        guard let data = try? JSONSerialization.data(withJSONObject: args, options: [.fragmentsAllowed]),
-              let json = String(data: data, encoding: .utf8) else { return (false, "Không thể gửi lời mời kết bạn.", false) }
-        let script = "const c = window.__zaloContacts; if (!c || !c.sendRequest) return 'missing'; return await c.sendRequest(...\(json));"
-        let answer = await raceTimeout(90) { [self] in JSBox(value: await host?.evaluate(script)) }
-        guard let answer else { return (false, "Chưa nhận được phản hồi. Hãy kiểm tra mục “Đã gửi” trong Lời mời kết bạn trước khi thử lại.", true) }
-        guard let root = answer.value as? [String: Any], let ok = root["ok"] as? Bool else {
-            return (false, "Chưa sẵn sàng gửi lời mời kết bạn, hãy thử lại sau giây lát.", false)
+        do {
+            _ = try await sessionClient.sendFriendRequestAPI(toUid: uid, message: message)
+            refreshContacts()
+            return (true, "Đã gửi lời mời kết bạn.", false)
+        } catch {
+            return (false, "Không thể gửi lời mời kết bạn.", false)
         }
-        return (ok, root["text"] as? String ?? (ok ? "Đã gửi lời mời kết bạn." : "Không thể gửi lời mời kết bạn."), (root["pending"] as? Bool) ?? false)
     }
 
-    // MARK: Native sheets of card actions (alias, group invite, sticker category)
+    // MARK: Native sheets of card actions
 
-    /// Sets (or, with an empty name, removes) the alias of a person after the user confirmed the dialog (official `setAliasName`).
     func saveAlias(uid: String, name: String) async -> (ok: Bool, text: String) {
-        let answer = await raceTimeout(90) { [self] in JSBox(value: await callCard("aliasSave", [uid, name])) }
-        guard let root = answer?.value as? [String: Any], let ok = root["ok"] as? Bool else {
-            return (false, "Chưa nhận được phản hồi. Hãy kiểm tra lại tên gợi nhớ trước khi thử lại.")
+        let clean = ZaloWireParser.stripUserPrefix(uid)
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            _ = try await sessionClient.setAliasAPI(uid: clean, alias: trimmed)
+            if trimmed.isEmpty { cachedAliases.removeValue(forKey: clean) } else { cachedAliases[clean] = trimmed }
+            if let data = try? JSONSerialization.data(withJSONObject: cachedAliases) {
+                try? await sqliteStore?.setPreferenceData(key: "aliases", data: data)
+            }
+            return (true, trimmed.isEmpty ? "Đã xóa tên gợi nhớ." : "Đã lưu tên gợi nhớ.")
+        } catch {
+            return (false, "Không lưu được tên gợi nhớ.")
         }
-        return (ok, String((root["text"] as? String ?? "").prefix(300)))
     }
 
-    /// The group an invite link points at (official `getGroupInfoByLink`; a read, nothing is joined).
     func groupInvitePreview(_ url: URL) async -> GroupInvitePreview {
-        let answer = await raceTimeout(60) { [self] in JSBox(value: await callCard("groupPreview", [url.absoluteString])) }
-        return GroupInvitePreview(json: answer?.value)
+        guard let box = try? await sessionClient.fetchGroupLinkDetail(link: url.absoluteString),
+              let d = box.dict["data"] as? [String: Any] else {
+            return GroupInvitePreview()
+        }
+        let gid = ZaloWireParser.groupConvId(JSONLossless.string(d["groupId"]))
+        guard !gid.isEmpty else { return GroupInvitePreview() }
+        let alreadyMember = contacts.groups.contains(where: { $0.id == gid })
+        if alreadyMember {
+            return GroupInvitePreview(json: ["state": "member", "groupId": gid])
+        }
+        return GroupInvitePreview(json: [
+            "state": "preview",
+            "groupId": gid,
+            "name": JSONLossless.string(d["name"]),
+            "avatar": JSONLossless.string(d["avt"]),
+            "totalMember": Int(JSONLossless.int64(d["totalMember"]) ?? 0),
+            "desc": JSONLossless.string(d["desc"])
+        ])
     }
 
-    /// "Tham gia": joins through the official group manager. Only called from the button.
     func joinGroup(_ url: URL) async -> GroupJoinResult {
-        let answer = await raceTimeout(90) { [self] in JSBox(value: await callCard("groupJoin", [url.absoluteString])) }
-        guard let answer else { return GroupJoinResult(state: .error, text: "Chưa nhận được phản hồi. Hãy kiểm tra danh sách nhóm trước khi thử lại.") }
-        return GroupJoinResult(json: answer.value)
+        do {
+            let box = try await sessionClient.joinGroupByLink(link: url.absoluteString)
+            let d = box.dict["data"] as? [String: Any] ?? [:]
+            let gid = ZaloWireParser.groupConvId(JSONLossless.string(d["groupId"]))
+            refreshContacts()
+            return GroupJoinResult(state: .joined, groupId: gid, text: "Đã tham gia nhóm.")
+        } catch {
+            return GroupJoinResult(state: .error, text: "Vào nhóm không thành công.")
+        }
     }
 
-    /// Category info and sticker list from the official sticker manager; nil when unavailable.
     func stickerCategory(_ id: Int) async -> StickerCategory? {
-        let answer = await raceTimeout(60) { [self] in JSBox(value: await callCard("stickerCategory", [id])) }
-        return StickerCategory(json: answer?.value)
+        guard let items = await stickers(inTab: id), !items.isEmpty else { return nil }
+        let rows: [[String: Any]] = items.map { ["ref": "\(id)_\($0.stickerId)", "url": $0.url.absoluteString] }
+        return StickerCategory(json: ["id": id, "name": "Bộ sticker", "icon": "", "stickers": rows])
     }
 
-    /// Sends one sticker of the category to `conversationId` (the user clicked it); same safe send path as the e-card stickers.
     func sendCategorySticker(in conversationId: String, category: Int, sticker: Int) async -> CardActionOutcome {
-        let answer = await raceTimeout(90) { [self] in JSBox(value: await callCard("stickerCategorySend", [conversationId, category, sticker])) }
-        guard let answer else { return .pending(CardActionOutcome.noAnswerText) }
-        return CardActionOutcome(json: answer.value)
+        let urlStr = ZaloWireParser.stickerCDNURL(cateId: category, stickerId: "\(sticker)")
+        let entry = StickerEntry(cateId: category, stickerId: sticker,
+                                 url: URL(string: urlStr)!,
+                                 animation: nil)
+        return await sendSticker(entry, in: conversationId, source: .category)
     }
 
-    /// Reminder card state from the official reminder controller. Returns when the state differs from `signature`
-    /// (or after ~25 s with the unchanged state); nil when the controller is not available.
     func reminderWatch(in conversationId: String, message messageId: String, signature: String) async -> ReminderSnapshot? {
-        ReminderSnapshot(json: await callCard("reminderWatch", [conversationId, messageId, signature]))
+        nil
     }
 
-    /// RSVP to a reminder (official controller `respond`); only called from a click.
     func respondToReminder(in conversationId: String, message messageId: String, accept: Bool) async -> (ok: Bool, text: String, snapshot: ReminderSnapshot?) {
-        let answer = await raceTimeout(40) { [self] in JSBox(value: await callCard("reminderRespond", [conversationId, messageId, accept ? "accept" : "reject"])) }
-        // No answer is not a failure: the answer may still land (the page keeps the reminder "pending" until it settles).
-        guard let root = answer?.value as? [String: Any] else { return (false, "Đang xử lý, hãy kiểm tra lại sau.", nil) }
-        let ok = root["ok"] as? Bool ?? false
-        return (ok, root["text"] as? String ?? "", ReminderSnapshot(json: root["snapshot"]))
+        do {
+            _ = try await sessionClient.respondReminderAPI(convId: conversationId, reminderId: messageId, accept: accept)
+            return (true, accept ? "Đã xác nhận tham gia." : "Đã từ chối.", nil)
+        } catch {
+            return (false, "Không thực hiện được thao tác.", nil)
+        }
     }
 
-    /// Who accepted / declined a group reminder (official responders page: reminder-detail-service `listResponders`, a read).
-    /// Only called when the user opens the list. nil = could not be read.
     func reminderResponders(in conversationId: String, message messageId: String) async -> ReminderResponders? {
-        let answer = await raceTimeout(40) { [self] in JSBox(value: await callCard("reminderResponders", [conversationId, messageId])) }
-        return ReminderResponders(json: answer?.value)
-    }
-
-    private func callCard(_ method: String, _ args: [Any]) async -> Any? {
-        guard let data = try? JSONSerialization.data(withJSONObject: args, options: [.fragmentsAllowed]),
-              let json = String(data: data, encoding: .utf8) else { return nil }
-        let script = "const c = window.__zaloChat; if (!c || !c.\(method)) return null; return await c.\(method)(...\(json));"
-        return await host?.evaluate(script)
+        nil
     }
 }
 

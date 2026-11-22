@@ -95,10 +95,6 @@ private struct ConversationCommandItems: View {
         Button("Trả lời tin nhắn cuối") { shell.replyToLatest() }
             .keyboardShortcut("r", modifiers: .command)
             .disabled(id == nil)
-        // Zalo PC's screenshot shortcut (⌘⌥S), here while the app is active.
-        Button("Chụp màn hình") { if let id { engine.startScreenCapture(in: id, withOlaz: true) } }
-            .keyboardShortcut("s", modifiers: [.option, .command])
-            .disabled(id == nil)
         Divider()
         pinItem(plan?.pin, id: id)
         readItem(plan?.read, id: id)

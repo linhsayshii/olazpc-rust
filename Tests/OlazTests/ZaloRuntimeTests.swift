@@ -95,9 +95,7 @@ import Foundation
 
         #expect(version == ZaloRuntime.pinned.version)
         #expect(ZaloRuntime.isComplete(destination))
-        #expect(try OfficialZaloInstall.locate(appURL: destination).asar.contains("pc-dist/index.html"))
         try CallHelperSignature.verify(executable: ZaloRuntime.helper("ZaloCall", in: destination))
-        #expect(FileManager.default.isExecutableFile(atPath: ZaloRuntime.helper("ZaloCap", in: destination).path))
         #expect(steps.all.contains(.verifying) && steps.all.contains(.installing))
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("work").path)
         #expect(leftovers.isEmpty)

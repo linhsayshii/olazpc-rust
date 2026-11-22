@@ -19,6 +19,8 @@ struct GroupCallPicker: Equatable, Identifiable {
 
     /// Request token (single use).
     let id: String
+    /// Group conversation ID (`g<grid>` or `<grid>`).
+    var groupId: String
     /// The helper asked to add people to a running call (instead of starting one).
     var adding: Bool
     /// nil: unknown (add-participant: the renderer does not know whether the running call has video).
@@ -37,9 +39,10 @@ struct GroupCallPicker: Equatable, Identifiable {
     var confirmTitle: String { adding ? "Thêm" : "Gọi" }
     var searchPlaceholder: String { "Tìm kiếm thành viên" }
 
-    init(id: String, adding: Bool, video: Bool?, groupName: String, groupAvatar: URL? = nil, maxSelectable: Int,
+    init(id: String, groupId: String = "", adding: Bool, video: Bool?, groupName: String, groupAvatar: URL? = nil, maxSelectable: Int,
          existing: Set<String> = [], note: String? = nil, members: [Member]) {
         self.id = id
+        self.groupId = groupId
         self.adding = adding
         self.video = video
         self.groupName = groupName
@@ -61,7 +64,9 @@ struct GroupCallPicker: Equatable, Identifiable {
                           avatar: (row["avatar"] as? String).flatMap { $0.isEmpty ? nil : URL(string: $0) })
         }
         let name = (group["name"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawGroupId = (group["id"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         self.init(id: token,
+                  groupId: rawGroupId,
                   adding: json["add"] as? Bool ?? false,
                   video: json["video"] as? Bool,
                   groupName: name.isEmpty ? "Nhóm" : name,
@@ -103,41 +108,136 @@ struct GroupCallPicker: Equatable, Identifiable {
 }
 
 extension ZaloEngine {
-    /// The user confirmed: runs the modal's `onConfirm` in the renderer (starts the call / answers the helper).
+    internal func loadGroupCallMembers(groupConvId: String) async -> [GroupCallPicker.Member] {
+        let convId = ZaloWireParser.groupConvId(groupConvId)
+        let cleanGrid = ZaloWireParser.cleanGroupId(convId)
+        let myUid = profile?.userId ?? ""
+
+        if cachedGroupDetails[cleanGrid] == nil,
+           let gBox = try? await sessionClient.fetchGroupsList(),
+           let infoMap = gBox.dict["gridInfoMap"] as? [String: Any] {
+            for (rawId, rawInfo) in infoMap {
+                guard let info = rawInfo as? [String: Any] else { continue }
+                let cid = ZaloWireParser.cleanGroupId(rawId)
+                if !cid.isEmpty { cachedGroupDetails[cid] = info }
+            }
+        }
+
+        var memberIds: [String] = []
+        if let groupInfo = cachedGroupDetails[cleanGrid] {
+            if let verList = groupInfo["memVerList"] as? [String] {
+                memberIds.append(contentsOf: verList.compactMap { $0.split(separator: "_").first.map(String.init) })
+            }
+            if memberIds.isEmpty, let mems = groupInfo["memIds"] as? [Any] {
+                memberIds.append(contentsOf: mems.map(JSONLossless.string))
+            }
+            if memberIds.isEmpty, let cur = groupInfo["currentMems"] as? [[String: Any]] {
+                memberIds.append(contentsOf: cur.map { JSONLossless.string($0["id"] ?? $0["uid"]) })
+            }
+        }
+        let cleanIds = Array(Set(memberIds.map(ZaloWireParser.stripUserPrefix))).filter { !$0.isEmpty && $0 != "0" && $0 != myUid }
+        guard !cleanIds.isEmpty else {
+            return (groupMemberCache[convId] ?? [])
+                .filter { !$0.isAll && $0.id != "-1" && $0.id != myUid }
+                .map { GroupCallPicker.Member(id: $0.id, name: $0.name, avatar: $0.avatar) }
+        }
+
+        let missing = cleanIds.filter { lookupPersonInfo($0) == nil }
+        if !missing.isEmpty {
+            for offset in stride(from: 0, to: min(missing.count, 100), by: 50) {
+                let slice = Array(missing[offset..<min(offset + 50, missing.count)])
+                if let profBox = try? await sessionClient.fetchProfiles(uids: slice) {
+                    for (uid, row) in ZaloWireParser.extractProfilesMap(profBox.dict) {
+                        let c = ZaloWireParser.stripUserPrefix(uid)
+                        let n = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+                        let a = JSONLossless.string(row["avatar"] ?? row["avt"])
+                        if !c.isEmpty, (!n.isEmpty || !a.isEmpty) {
+                            cachedProfiles[c] = ZaloWebKitMigrator.CachedProfile(name: n, avatar: a)
+                        }
+                    }
+                }
+            }
+        }
+
+        return cleanIds.map { uid in
+            let info = lookupPersonInfo(uid)
+            let name = (info?.name.isEmpty == false) ? info!.name : "Người dùng Zalo"
+            let avatar = info.flatMap { $0.avatar.isEmpty ? nil : URL(string: $0.avatar) }
+            return GroupCallPicker.Member(id: uid, name: name, avatar: avatar)
+        }.sorted {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+    }
+
     func confirmGroupPicker(_ picker: GroupCallPicker, selected: [String]) {
         guard call.picker?.id == picker.id else { return }
         call.picker = nil
         let ids = selected.filter { id in picker.members.contains { $0.id == id } && !picker.existing.contains(id) }
-        guard !ids.isEmpty, ids.count <= picker.maxSelectable else {
-            Task { _ = await self.pickerCall("pickerCancel", picker.id) }
-            return
-        }
-        Task { [weak self] in
-            guard let self else { return }
-            guard let result = await self.pickerCall("pickerConfirm", picker.id, ids) as? String,
-                  !["started", "sent", "cancelled", "missing"].contains(result) else { return }
-            if result == "stale" {
-                self.call.notice = CallState.Notice(title: "Chưa gọi được",
-                                                    message: "Yêu cầu đã hết hạn (cuộc gọi đã kết thúc hoặc có yêu cầu mới). Hãy thử lại.")
-            } else if let message = Self.callFailureMessage(result, group: true) {
-                self.call.notice = CallState.Notice(title: "Chưa gọi được", message: message)
+        guard !ids.isEmpty, ids.count <= picker.maxSelectable else { return }
+
+        ensureCallBridgeStartedIfNeeded()
+        let memberById = Dictionary(uniqueKeysWithValues: picker.members.map { ($0.id, $0) })
+        let cleanGroupId = ZaloWireParser.cleanGroupId(picker.groupId)
+
+        if picker.adding {
+            let callees: [[String: Any]] = ids.map { uid in
+                [
+                    "userId": ZaloWireParser.stripUserPrefix(uid),
+                    "avatar": memberById[uid]?.avatar?.absoluteString ?? lookupPersonInfo(uid)?.avatar ?? "",
+                ]
             }
+            let resp: [String: Any] = [
+                "type": "response",
+                "command": "addUser",
+                "data": [
+                    "groupId": cleanGroupId,
+                    "calleeIds": callees,
+                ],
+            ]
+            if let data = try? JSONSerialization.data(withJSONObject: resp),
+               let json = String(data: data, encoding: .utf8) {
+                callBridge?.sendToNative(json: json, optional: false)
+            }
+        } else {
+            let partners: [(id: String, name: String, avatar: String)] = ids.map { uid in
+                let m = memberById[uid]
+                let info = lookupPersonInfo(uid)
+                return (
+                    id: ZaloWireParser.stripUserPrefix(uid),
+                    name: m?.name ?? info?.name ?? "Người dùng Zalo",
+                    avatar: m?.avatar?.absoluteString ?? info?.avatar ?? ""
+                )
+            }
+            let makeCallJSON = ZaloVoiceCallProtocol.buildMakeCallJSON(
+                partners: partners,
+                video: picker.video ?? true,
+                groupInfo: (
+                    id: cleanGroupId,
+                    name: picker.groupName,
+                    avatar: picker.groupAvatar?.absoluteString ?? "",
+                    maxUsers: picker.maxSelectable + 1
+                )
+            )
+            callBridge?.sendToNative(json: makeCallJSON, optional: false)
         }
     }
 
-    /// Cancel / dismiss: `onCancel` — an add-participant request is answered with nobody.
     func cancelGroupPicker(_ picker: GroupCallPicker) {
         guard call.picker?.id == picker.id else { return }
         call.picker = nil
-        Task { _ = await self.pickerCall("pickerCancel", picker.id) }
-    }
-
-    private func pickerCall(_ method: String, _ args: Any...) async -> Any? {
-        guard let data = try? JSONSerialization.data(withJSONObject: args, options: [.fragmentsAllowed]),
-              let json = String(data: data, encoding: .utf8) else { return nil }
-        let script = "const c = window.__zaloCall; if (!c || !c.\(method)) return 'missing'; return await c.\(method)(...\(json));"
-        let result = await host?.evaluate(script)
-        if let text = result as? String, text == "missing" { EngineLog.shared.write("call \(method) → missing") }
-        return result
+        if picker.adding {
+            let resp: [String: Any] = [
+                "type": "response",
+                "command": "addUser",
+                "data": [
+                    "groupId": ZaloWireParser.cleanGroupId(picker.groupId),
+                    "calleeIds": [] as [[String: Any]],
+                ],
+            ]
+            if let data = try? JSONSerialization.data(withJSONObject: resp),
+               let json = String(data: data, encoding: .utf8) {
+                callBridge?.sendToNative(json: json, optional: true)
+            }
+        }
     }
 }

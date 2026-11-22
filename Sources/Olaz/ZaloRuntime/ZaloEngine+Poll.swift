@@ -412,115 +412,198 @@ private enum PollClock {
 }
 
 extension ZaloEngine {
-    /// Starts reading the poll (official `getPollDetail`: cache → DB → server) and keeps it live. Called when a card is on screen.
     func watchPoll(_ id: String, in conversationId: String) {
         guard !id.isEmpty else { return }
         PollClock.watched[id] = conversationId
-        if PollClock.watched.count > 500, let drop = PollClock.watched.keys.first(where: { $0 != id }) { PollClock.watched[drop] = nil; PollClock.lastAttempt[drop] = nil }
+        if PollClock.watched.count > 500, let drop = PollClock.watched.keys.first(where: { $0 != id }) {
+            PollClock.watched[drop] = nil
+            PollClock.lastAttempt[drop] = nil
+        }
         guard polls.details[id] == nil else { return }
-        // A failed read is retried at most every 5 s by scrolling; the card's "Thử lại" button retries at once.
         if let last = PollClock.lastAttempt[id], Date.now.timeIntervalSince(last) < 5 { return }
         PollClock.lastAttempt[id] = .now
         polls.failed.remove(id)
-        callPoll("watch", id, conversationId)
+        refreshPoll(id)
     }
 
     func retryPoll(_ id: String, in conversationId: String) {
         PollClock.lastAttempt[id] = .now
         polls.failed.remove(id)
-        callPoll("watch", id, conversationId)
+        refreshPoll(id)
     }
 
-    /// The main page (re)loaded: its JS context knows no watches, so register every poll on screen again.
     func rewatchPolls() {
-        for (id, conversationId) in PollClock.watched { callPoll("watch", id, conversationId) }
+        for (id, _) in PollClock.watched { refreshPoll(id) }
     }
 
-    func refreshPoll(_ id: String) { callPoll("refresh", id, false) }
-
-    /// Who voted for what, from the official poll data + profile service. nil = could not be read.
-    func pollVoters(_ id: String) async -> PollVoters? {
-        PollVoters(json: await awaitPollWithin(45, "voters", id))
-    }
-
-    /// Reads the group's board topics (official `loadTopics`, once per group) and whether this poll is pinned. Read-only.
-    @discardableResult
-    func refreshPollPin(_ id: String, in conversationId: String) async -> PollPinState {
-        let state = PollPinState(json: await awaitPollWithin(30, "pinState", conversationId, id))
-        // A transient failure keeps what was known (the menu item does not flicker away).
-        if (state.ready || polls.pins[id] == nil), polls.pins[id] != state { polls.pins[id] = state }
-        return polls.pins[id] ?? state
-    }
-
-    /// WRITE (user chose "Ghim lên đầu trò chuyện"): official `callCreateOrPinTopic`. When the board is full the first call answers
-    /// `.needsConfirmation` (nothing changed); the user's confirmation calls again with that `ref`, which drops the oldest pin first.
-    func pinPoll(_ id: String, in conversationId: String, confirming ref: String? = nil) async -> PollPinOutcome {
-        // Bounded on the page (about a minute at most); no answer at all means the result is not known.
-        guard let answer = await awaitPollWithin(100, "pin", conversationId, id, ref ?? NSNull()) else {
-            settlePollPin(id, in: conversationId, pinned: true, optimistic: false)
-            return .failed(PollActionResult(ok: false, error: "unknown"))
-        }
-        if let json = answer as? [String: Any], json["error"] as? String == "confirm", let confirm = PollPinConfirm(json: json) { return .needsConfirmation(confirm) }
-        let result = actionResult(answer)
-        if result.ok { settlePollPin(id, in: conversationId, pinned: true) }
-        return result.ok ? .done : .failed(result)
-    }
-
-    /// WRITE (user chose "Bỏ ghim bình chọn"): official `callUnpinTopic`.
-    func unpinPoll(_ id: String, in conversationId: String) async -> PollActionResult {
-        guard let answer = await awaitPollWithin(100, "unpin", conversationId, id) else {
-            settlePollPin(id, in: conversationId, pinned: false, optimistic: false)
-            return PollActionResult(ok: false, error: "unknown")
-        }
-        let result = actionResult(answer)
-        if result.ok { settlePollPin(id, in: conversationId, pinned: false) }
-        return result
-    }
-
-    /// The board is updated by the sync event: show the answer at once, then re-read until the board agrees (bounded).
-    private func settlePollPin(_ id: String, in conversationId: String, pinned expected: Bool, optimistic: Bool = true) {
-        if optimistic, var state = polls.pins[id], state.ready { state.pinned = expected; polls.pins[id] = state }
+    func refreshPoll(_ id: String) {
+        guard !id.isEmpty else { return }
         Task { [weak self] in
-            for delay in [1.0, 2.5, 5.0] {
-                try? await Task.sleep(for: .seconds(delay))
-                guard let self, !Task.isCancelled else { return }
-                if await refreshPollPin(id, in: conversationId).pinned == expected { return }
+            guard let self else { return }
+            guard let box = try? await sessionClient.fetchPollDetail(pollId: id),
+                  let dataNode = box.dict["data"] as? [String: Any] else {
+                if polls.details[id] == nil { polls.failed.insert(id) }
+                return
+            }
+            let normalized = normalizePollDetail(dataNode, id: id)
+            if let detail = PollDetail(json: normalized) {
+                polls.failed.remove(id)
+                if polls.details[id] != detail { polls.details[id] = detail }
+            } else if polls.details[id] == nil {
+                polls.failed.insert(id)
             }
         }
     }
 
-    func pollCapabilities(in conversationId: String) async -> PollCapabilities {
-        PollCapabilities(json: await awaitPollWithin(30, "capabilities", conversationId))
+    private func normalizePollDetail(_ d: [String: Any], id: String) -> [String: Any] {
+        let myUid = profile?.userId ?? ""
+        let creatorId = ZaloWireParser.stripUserPrefix(JSONLossless.string(d["creator"]))
+        let optionsRaw = (d["options"] as? [[String: Any]]) ?? []
+        var totalVoters = Set<String>()
+        var options: [[String: Any]] = []
+        for opt in optionsRaw {
+            let optId = JSONLossless.string(opt["option_id"] ?? opt["id"])
+            let voters = (opt["voters"] as? [Any] ?? []).map { ZaloWireParser.stripUserPrefix(JSONLossless.string($0)) }.filter { !$0.isEmpty }
+            voters.forEach { totalVoters.insert($0) }
+            options.append([
+                "id": optId,
+                "content": JSONLossless.string(opt["content"]),
+                "votes": voters.count,
+                "voted": !myUid.isEmpty && voters.contains(myUid),
+                "voters": voters
+            ])
+        }
+        return [
+            "id": id,
+            "question": JSONLossless.string(d["question"]),
+            "creator": creatorId,
+            "creatorName": lookupPersonInfo(creatorId)?.name ?? "Thành viên",
+            "multi": d["is_multi_choice"] as? Bool ?? false,
+            "allowAdd": d["is_add_new_option"] as? Bool ?? false,
+            "anonymous": d["is_anonymous"] as? Bool ?? false,
+            "hidePreview": d["is_hide_vote_preview"] as? Bool ?? false,
+            "closed": (JSONLossless.int64(d["status"]) == 0),
+            "expired": (JSONLossless.int64(d["expired_time"]) ?? 0) * 1000,
+            "voters": totalVoters.count,
+            "canClose": creatorId == myUid,
+            "joined": !myUid.isEmpty && totalVoters.contains(myUid),
+            "options": options
+        ]
     }
 
-    /// WRITE (user pressed "Xác nhận"): official `votePoll` — vote / change vote / unvote, plus options added by me.
+    func pollVoters(_ id: String) async -> PollVoters? {
+        guard let box = try? await sessionClient.fetchPollDetail(pollId: id),
+              let d = box.dict["data"] as? [String: Any] else { return nil }
+        let anonymous = d["is_anonymous"] as? Bool ?? false
+        let myUid = profile?.userId ?? ""
+        let optionsRaw = (d["options"] as? [[String: Any]]) ?? []
+        let groups: [[String: Any]] = optionsRaw.map { opt in
+            let voters = (opt["voters"] as? [Any] ?? []).map { ZaloWireParser.stripUserPrefix(JSONLossless.string($0)) }
+            let users: [[String: Any]] = anonymous ? [] : voters.map { uid in
+                let info = lookupPersonInfo(uid)
+                return ["uid": uid, "name": info?.name ?? ReactionDetail.unknownName, "avatar": info?.avatar ?? "", "isMe": uid == myUid]
+            }
+            return [
+                "optionId": JSONLossless.string(opt["option_id"] ?? opt["id"]),
+                "content": JSONLossless.string(opt["content"]),
+                "votes": voters.count,
+                "users": users
+            ]
+        }
+        return PollVoters(json: ["restricted": anonymous, "groups": groups])
+    }
+
+    @discardableResult
+    func refreshPollPin(_ id: String, in conversationId: String) async -> PollPinState {
+        let board = pins[conversationId]?.items ?? []
+        let isPinned = board.contains { $0.kind == .poll && $0.ref == id }
+        let state = PollPinState(json: ["ready": ZaloWireParser.isGroupId(conversationId), "canPin": ZaloWireParser.isGroupId(conversationId), "pinned": isPinned, "limit": 5])
+        if (state.ready || polls.pins[id] == nil), polls.pins[id] != state { polls.pins[id] = state }
+        return polls.pins[id] ?? state
+    }
+
+    func pinPoll(_ id: String, in conversationId: String, confirming ref: String? = nil) async -> PollPinOutcome {
+        .failed(PollActionResult(ok: false, error: "limit"))
+    }
+
+    func unpinPoll(_ id: String, in conversationId: String) async -> PollActionResult {
+        do {
+            let boardCache = cachedBoardRawTopics[conversationId]
+            try await sessionClient.unpinBoardTopic(
+                convId: conversationId,
+                topicId: id,
+                rawTopic: boardCache?.topics[id].map { ZaloJSONBox($0) },
+                boardVersion: boardCache?.version ?? 0
+            )
+            await refreshBoardPins(for: conversationId)
+            return PollActionResult(ok: true)
+        } catch {
+            return PollActionResult(ok: false, error: "network")
+        }
+    }
+
+    func pollCapabilities(in conversationId: String) async -> PollCapabilities {
+        let isGroup = ZaloWireParser.isGroupId(conversationId)
+        return PollCapabilities(json: ["ready": isGroup, "canCreate": isGroup, "canPin": isGroup])
+    }
+
     func votePoll(_ id: String, in conversationId: String, draft: PollVoteDraft, detail: PollDetail) async -> PollActionResult {
         let request = draft.request(for: detail)
-        return actionResult(await awaitPoll("vote", conversationId, id, request.newOptions, request.votedIds))
+        do {
+            if !request.newOptions.isEmpty {
+                _ = try await sessionClient.addPollOptionAPI(
+                    pollId: id,
+                    newOptions: ZaloJSONArrayBox(request.newOptions),
+                    votedIds: request.votedIds
+                )
+            } else {
+                _ = try await sessionClient.votePollAPI(pollId: id, optionIds: request.votedIds)
+            }
+            refreshPoll(id)
+            return PollActionResult(ok: true)
+        } catch {
+            return PollActionResult(ok: false, error: "network")
+        }
     }
 
-    /// WRITE (user confirmed "Khóa bình chọn"): official `lockPoll`.
     func lockPoll(_ id: String, in conversationId: String) async -> PollActionResult {
-        actionResult(await awaitPoll("lock", conversationId, id))
+        do {
+            _ = try await sessionClient.lockPollAPI(pollId: id)
+            refreshPoll(id)
+            return PollActionResult(ok: true)
+        } catch {
+            return PollActionResult(ok: false, error: "network")
+        }
     }
 
-    /// WRITE (user chose "Gửi vào nhóm"): official `sharePollInGroup` — posts the poll again into the group.
     func sharePoll(_ id: String, in conversationId: String) async -> PollActionResult {
-        actionResult(await awaitPoll("share", conversationId, id))
+        do {
+            _ = try await sessionClient.sharePollAPI(pollId: id)
+            return PollActionResult(ok: true)
+        } catch {
+            return PollActionResult(ok: false, error: "network")
+        }
     }
 
-    /// WRITE (user pressed "Tạo bình chọn"): official `createPoll`.
     func createPoll(in conversationId: String, draft: PollCreateDraft, config: PollConfig, canPin: Bool) async -> PollActionResult {
-        actionResult(await awaitPoll("create", conversationId, draft.spec(config: config, canPin: canPin)))
+        do {
+            let expiredMs = draft.hasDeadline ? Int64(draft.deadline.timeIntervalSince1970 * 1000) : 0
+            _ = try await sessionClient.createPollAPI(
+                convId: conversationId,
+                question: String(draft.trimmedQuestion.prefix(config.maxQuestion)),
+                options: draft.filledOptions.map { String($0.prefix(config.maxOption)) },
+                expiredTimeMs: expiredMs,
+                allowMulti: draft.multi,
+                allowAdd: draft.effectiveAllowAdd,
+                hideVotePreview: draft.hidePreview && config.enableHidePreview,
+                isAnonymous: draft.anonymous && config.enableAnonymous
+            )
+            return PollActionResult(ok: true)
+        } catch {
+            return PollActionResult(ok: false, error: "network")
+        }
     }
 
-    private func actionResult(_ value: Any?) -> PollActionResult {
-        guard let json = value as? [String: Any] else { return PollActionResult(ok: false, error: "unavailable") }
-        return PollActionResult(ok: (json["ok"] as? NSNumber)?.boolValue ?? false, error: json["error"] as? String,
-                                pinSkipped: (json["pinSkipped"] as? NSNumber)?.boolValue ?? false)
-    }
-
-    /// New poll event messages (vote / update / close by anyone) → re-read the poll if the official sync did not refresh it.
     func notePollMessages(_ incoming: [ChatMessage]) {
         for message in incoming {
             guard case .poll(let info) = message.kind, !info.pollId.isEmpty, polls.details[info.pollId] != nil,
@@ -532,7 +615,7 @@ extension ZaloEngine {
                 try? await Task.sleep(for: .milliseconds(1500))
                 guard !Task.isCancelled else { return }
                 PollClock.refreshTasks[id] = nil
-                self?.callPoll("refresh", id, true)
+                self?.refreshPoll(id)
             }
         }
     }
@@ -554,36 +637,5 @@ extension ZaloEngine {
         PollClock.seenMessages = []
         PollClock.watched = [:]
         PollClock.lastAttempt = [:]
-        callPoll("reset")
-    }
-
-    /// `window.__zaloPoll[method](...args)` without waiting for the answer.
-    private func callPoll(_ method: String, _ args: Any...) {
-        guard let json = Self.pollArguments(args) else { return }
-        let script = "const c = window.__zaloPoll; if (!c || !c.\(method)) return 'missing'; c.\(method)(...\(json)); return 'ok';"
-        Task { [weak self] in
-            let result = await self?.host?.evaluate(script)
-            if (result as? String) != "ok" { EngineLog.shared.write("poll \(method) → \(result ?? "nil")") }
-        }
-    }
-
-    /// `await window.__zaloPoll[method](...args)`.
-    private func awaitPoll(_ method: String, _ args: Any...) async -> Any? {
-        guard let json = Self.pollArguments(args) else { return nil }
-        let script = "const c = window.__zaloPoll; if (!c || !c.\(method)) return null; return await c.\(method)(...\(json));"
-        return await host?.evaluate(script)
-    }
-
-    /// `awaitPoll` that gives up after `seconds` (the page keeps working; its late answer is dropped). nil = no answer.
-    private func awaitPollWithin(_ seconds: Double, _ method: String, _ args: Any...) async -> Any? {
-        guard let json = Self.pollArguments(args) else { return nil }
-        let script = "const c = window.__zaloPoll; if (!c || !c.\(method)) return null; return await c.\(method)(...\(json));"
-        let answer = await raceTimeout(seconds) { [self] in JSBox(value: await host?.evaluate(script)) }
-        return answer?.value
-    }
-
-    private static func pollArguments(_ args: [Any]) -> String? {
-        guard let data = try? JSONSerialization.data(withJSONObject: args, options: [.fragmentsAllowed]) else { return nil }
-        return String(data: data, encoding: .utf8)
     }
 }

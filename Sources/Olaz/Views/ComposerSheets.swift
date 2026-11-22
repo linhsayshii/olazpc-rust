@@ -1,7 +1,6 @@
 import SwiftUI
 
-// Sheets of the composer's "+" menu: my contact card, a new reminder, and the conversation picker of the screenshot tool's
-// "Chia sẻ". They gather what the official modals gather; sending goes through `ZaloEngine+Composer.swift`.
+// Sheets of the composer’s "+" menu: my contact card and a new reminder.
 
 // MARK: - Danh thiếp
 
@@ -199,99 +198,6 @@ struct ReminderComposeSheet: View {
     }
 }
 
-// MARK: - Chia sẻ (screenshot tool)
-
-/// The conversations a screenshot (or its recognised text) is shared to — the official SHARE_MSG_COMPOSE picker, native.
-struct ScreenshotShareSheet: View {
-    let share: ScreenshotShare
-
-    static let maxTargets = 10
-
-    @Environment(ZaloEngine.self) private var engine
-    @Environment(\.dismiss) private var dismiss
-    @State private var search = ""
-    @State private var selected: [String] = []
-    @State private var busy = false
-    @State private var message: String?
-
-    private var rows: [ZaloEngine.ConversationSummary] {
-        let all = engine.visibleConversations.sorted { ($0.preview?.date ?? .distantPast) > ($1.preview?.date ?? .distantPast) }
-        let needle = search.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !needle.isEmpty else { return all }
-        return all.filter { title(of: $0).range(of: needle, options: [.caseInsensitive, .diacriticInsensitive]) != nil }
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            SheetHeader(title: share.text == nil ? "Chia sẻ ảnh chụp màn hình" : "Chia sẻ văn bản") { dismiss() }
-            Divider()
-            VStack(alignment: .leading, spacing: 10) {
-                preview
-                TextField("Tìm cuộc trò chuyện", text: $search).textFieldStyle(.roundedBorder)
-            }
-            .padding(16)
-            List(rows) { conversation in
-                row(conversation)
-            }
-            .listStyle(.plain)
-            Divider()
-            SheetFooter(message: message, hint: "Đã chọn \(selected.count)/\(Self.maxTargets)", action: "Chia sẻ", busy: busy,
-                        disabled: selected.isEmpty, cancel: { dismiss() }) {
-                Task { await send() }
-            }
-        }
-        .frame(width: 440, height: 560)
-    }
-
-    @ViewBuilder private var preview: some View {
-        if let image = share.image, let picture = NSImage(contentsOf: image) {
-            Image(nsImage: picture).resizable().scaledToFit()
-                .frame(maxWidth: .infinity, maxHeight: 120)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        } else if let text = share.text {
-            Text(text).font(.system(size: 12.5)).lineLimit(4)
-                .padding(10).frame(maxWidth: .infinity, alignment: .leading)
-                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.05)))
-        }
-    }
-
-    private func row(_ conversation: ZaloEngine.ConversationSummary) -> some View {
-        let isOn = selected.contains(conversation.id)
-        return Button {
-            if isOn { selected.removeAll { $0 == conversation.id } }
-            else if selected.count < Self.maxTargets { selected.append(conversation.id) }
-        } label: {
-            HStack(spacing: 10) {
-                Image(systemName: isOn ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 16)).foregroundStyle(isOn ? AnyShapeStyle(.tint) : AnyShapeStyle(.tertiary))
-                RemoteAvatar(url: conversation.avatar, name: conversation.displayName, size: 30)
-                Text(title(of: conversation)).font(.system(size: 13)).lineLimit(1)
-                Spacer(minLength: 0)
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(!isOn && selected.count >= Self.maxTargets)
-        .accessibilityAddTraits(isOn ? .isSelected : [])
-    }
-
-    private func title(of conversation: ZaloEngine.ConversationSummary) -> String {
-        conversation.id == engine.selfConversationId ? "Cloud của tôi" : conversation.displayName
-    }
-
-    private func send() async {
-        guard !selected.isEmpty, !busy else { return }
-        busy = true; message = nil
-        let outcome = await engine.shareScreenshot(share, to: selected)
-        busy = false
-        switch outcome {
-        case .done, .cancelled: dismiss()
-        case .pending(let text): CardActionCenter.shared.show(text, in: share.conversationId); dismiss()
-        case .failed(let text): message = text
-        }
-    }
-}
-
 // MARK: - Shared chrome
 
 struct SheetHeader: View {
@@ -342,13 +248,11 @@ struct SheetFooter: View {
 
 // MARK: - Engine-wide prompts of composer actions
 
-/// What a composer action may ask while it runs, whichever chat is on screen: the official confirms (e.g. "Gửi dưới dạng file"),
-/// the screenshot tool's "Chia sẻ" picker and the screen-recording permission notice.
+/// Official confirms a composer action may ask while it runs, whichever chat is on screen.
 private struct ComposerPrompts: ViewModifier {
     @Environment(ZaloEngine.self) private var engine
 
     func body(content: Content) -> some View {
-        @Bindable var engine = engine
         content
             // Answered only by its buttons (the dismissal binding must not answer first and turn an OK into a cancel).
             .alert(engine.composerConfirm?.title ?? "", isPresented: Binding(get: { engine.composerConfirm != nil }, set: { _ in }),
@@ -357,18 +261,6 @@ private struct ComposerPrompts: ViewModifier {
                 Button(confirm.cancel, role: .cancel) { engine.answerComposerConfirm(confirm, ok: false) }
             } message: { confirm in
                 Text(confirm.message)
-            }
-            .sheet(item: $engine.screenshotShare) { share in
-                ScreenshotShareSheet(share: share)
-            }
-            .alert("Cho phép ghi màn hình", isPresented: $engine.screenCaptureNeedsPermission) {
-                Button("Mở Cài đặt") {
-                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") { NSWorkspace.shared.open(url) }
-                }
-                Button("Để sau", role: .cancel) {}
-            } message: {
-                // STR_DES_NO_PERMISSION_MAC_1, then where to find it.
-                Text("Để sử dụng tính năng chụp màn hình, cần được kích hoạt trong cài đặt của hệ điều hành. Hãy bật \(AppBrand.name) trong Quyền riêng tư & Bảo mật ▸ Ghi màn hình, rồi thử lại.")
             }
     }
 }

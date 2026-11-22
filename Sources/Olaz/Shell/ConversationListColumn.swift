@@ -106,13 +106,12 @@ struct ConversationListColumn: View {
 
     var body: some View {
         let listing = self.listing
-        content(listing)
-            .safeAreaBar(edge: .top) { header }
-            .columnTitle(title, subtitle: subtitle(listing))
-            // A column whose toolbar holds nothing but the title lets the title grow into the next section on macOS 27, which pushed
-            // the chat header to the right beside its buttons; the spacer takes this section's slack instead.
-            .toolbar { ToolbarSpacer(.flexible) }
-            .sheet(isPresented: $showLabelManager) { LabelManagerView() }
+        VStack(spacing: 0) {
+            header
+                .padding(.top, 6)
+            content(listing)
+        }
+        .sheet(isPresented: $showLabelManager) { LabelManagerView() }
             .background { pinShortcuts(listing.pins) }
             .task(id: shell.search) {
                 pinMatches = query.count == 4 ? (await engine.hiddenConversations(matching: query) ?? []) : []

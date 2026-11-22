@@ -147,18 +147,18 @@ struct NotificationSettingsState: Equatable {
 extension ZaloEngine {
     // MARK: Actions — settings
 
-    /// Official toggle: notifications on/off (also switches the sound like the official page does).
     func setNotificationsEnabled(_ enabled: Bool) {
         notificationSettings.enabled = enabled
         notificationSettings.sound = enabled
-        callChat("setEnabled", enabled, object: "__zaloNotification")
+        notificationSettings.hasSoundSetting = true
         if enabled { Task { await requestNotificationAuthorization() } }
+        Task { await saveNotificationPreferences() }
     }
 
     func setNotificationSound(_ enabled: Bool) {
         notificationSettings.sound = enabled
         notificationSettings.hasSoundSetting = true
-        callChat("setSound", enabled, object: "__zaloNotification")
+        Task { await saveNotificationPreferences() }
     }
 
     func setMessagePreview(_ shown: Bool) {
@@ -166,31 +166,64 @@ extension ZaloEngine {
         UserDefaults.standard.set(shown, forKey: NotificationSettingsState.previewDefaultsKey)
     }
 
-    /// Call when the settings UI appears: applies the official settings page's first-visit defaults.
     func notificationSettingsDidAppear() {
-        callChat("reconcileDefaults", object: "__zaloNotification")
-        callChat("refresh", object: "__zaloNotification")
         Task { await refreshNotificationAuthorization() }
     }
 
-    // MARK: Actions — per-conversation mute (hook into list rows / chat header: `ConversationMuteMenu`)
+    // MARK: Actions — per-conversation mute
 
     func isConversationMuted(_ id: String) -> Bool { notificationSettings.isMuted(id) }
 
-    /// Official "Tắt thông báo" submenu → `MuteDataManager.onMute(convId, mode)`; syncs to the server.
     func muteConversation(_ id: String, _ duration: MuteDuration) {
         let now = Date.now
-        // Optimistic: the official service confirms through the next settings snapshot.
         let until = duration.expiry(from: now)
-        notificationSettings.mutes[id] = MuteInfo(startTime: now.timeIntervalSince1970,
-                                                  duration: until.map { $0.timeIntervalSince(now) } ?? -1)
-        callChat("mute", id, duration.rawValue, object: "__zaloNotification")
+        let sec = until.map { Int($0.timeIntervalSince(now)) } ?? -1
+        notificationSettings.mutes[id] = MuteInfo(startTime: now.timeIntervalSince1970, duration: sec < 0 ? -1 : Double(sec))
+        let isGroup = ZaloWireParser.isGroupId(id)
+        Task {
+            try? await sessionClient.setMuteAPI(convId: id, isGroup: isGroup, durationSeconds: sec, unmute: false)
+            await saveNotificationPreferences()
+        }
     }
 
-    /// Official "Bật thông báo" → `MuteDataManager.onUnMute(convId)`.
     func unmuteConversation(_ id: String) {
         notificationSettings.mutes[id] = nil
-        callChat("unmute", id, object: "__zaloNotification")
+        let isGroup = ZaloWireParser.isGroupId(id)
+        Task {
+            try? await sessionClient.setMuteAPI(convId: id, isGroup: isGroup, durationSeconds: 0, unmute: true)
+            await saveNotificationPreferences()
+        }
+    }
+
+    // MARK: SQLite persistence
+
+    internal func loadNotificationPreferences(from store: ZaloSQLiteStore) async {
+        var next = notificationSettings
+        next.isLoaded = true
+        next.enabled = (try? await store.getPreferenceBool(key: "notifEnabled", default: true)) ?? true
+        next.sound = (try? await store.getPreferenceBool(key: "notifSound", default: true)) ?? true
+        next.hasSoundSetting = true
+        if let data = try? await store.getPreferenceData(key: "mutedThreads"),
+           let rows = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
+            var mutes: [String: MuteInfo] = [:]
+            for row in rows {
+                if let parsed = MuteInfo.parse(row) { mutes[parsed.id] = parsed.info }
+            }
+            next.mutes = mutes
+        }
+        notificationSettings = next
+    }
+
+    internal func saveNotificationPreferences() async {
+        guard let store = sqliteStore else { return }
+        try? await store.setPreferenceBool(key: "notifEnabled", value: notificationSettings.enabled)
+        try? await store.setPreferenceBool(key: "notifSound", value: notificationSettings.sound)
+        let serialized: [[String: Any]] = notificationSettings.mutes.map { id, info in
+            ["id": id, "startTime": info.startTime, "duration": info.duration]
+        }
+        if let data = try? JSONSerialization.data(withJSONObject: serialized) {
+            try? await store.setPreferenceData(key: "mutedThreads", data: data)
+        }
     }
 
     // MARK: macOS authorization
@@ -220,44 +253,16 @@ extension ZaloEngine {
         case .authorized: .authorized
         }
         if notificationSettings.authorization != mapped { notificationSettings.authorization = mapped }
-        // The shim's `Notification.permission` is what the official code gates on.
-        let permission = mapped == .authorized ? "granted" : mapped == .denied ? "denied" : "default"
-        callChat("setPermission", permission, object: "__zaloNotification")
     }
 
-    // MARK: Adapter events
+    // MARK: Legacy state adapter no-op
 
     func handleNotification(state: [String: Any]) {
         guard let payload = state["notification"] as? [String: Any] else { return }
-        switch payload["kind"] as? String {
-        case "ready":
-            // Renderer booted: bind the notifier, ask macOS for permission once, tell the shim.
-            NativeNotifier.shared.attach(engine: self)
-            Task {
-                var status = await NativeNotifier.shared.authorizationStatus()
-                if status == .notDetermined { status = await NativeNotifier.shared.requestAuthorization() }
-                applyAuthorization(status)
-                callChat("refresh", object: "__zaloNotification")
-                // The page-load handler announces "focus" once the page finishes; restore the real state after it.
-                try? await Task.sleep(for: .seconds(4))
-                NativeNotifier.shared.syncFocusState()
-            }
-        case "requestPermission":
-            // The official code asked (`Notification.requestPermission`): answer with the macOS decision.
-            Task {
-                let status = await NativeNotifier.shared.requestAuthorization()
-                applyAuthorization(status)
-                let permission = status == .authorized ? "granted" : status == .denied ? "denied" : "default"
-                callChat("permissionResult", permission, object: "__zaloNotification")
-            }
-        case "settings":
+        if payload["kind"] as? String == "settings" {
             var next = notificationSettings
             next.apply(settings: payload)
             if next != notificationSettings { notificationSettings = next }
-        case "sound":
-            if let url = payload["url"] as? String { NativeNotifier.shared.playNotificationSound(url) }
-        default:
-            break
         }
     }
 }

@@ -305,6 +305,8 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
     var suggestsStickers: Bool = false
     /// What the official right-click menu offers for this message (forward, recall, delete, pin, star).
     var menu = MessageMenu()
+    /// Alternate CDN URLs in priority order (`normalUrl`, `oriUrl`, `thumbUrl`…) tried when the primary media URL 404s.
+    var fallbackURLs: [URL] = []
 }
 
 /// The items of the official message context menu (message-actions-adapter.js `describe`, the builder's own conditions) with the
@@ -370,6 +372,9 @@ extension ChatMessage {
             guard let uid = m["uid"] as? String, !uid.isEmpty else { return nil }
             return Mention(uid: uid, pos: clampedInt(number(m["pos"])), len: clampedInt(number(m["len"])), isAll: m["isAll"] as? Bool ?? false)
         }
+        let kindDict = json["kind"] as? [String: Any] ?? [:]
+        let rawFallbacks = (kindDict["fallbacks"] as? [String]) ?? (json["fallbacks"] as? [String]) ?? []
+        let fallbacks = rawFallbacks.compactMap(url)
         self.init(
             id: id,
             conversationId: json["conversationId"] as? String ?? fallbackConversation,
@@ -377,7 +382,7 @@ extension ChatMessage {
             senderName: json["senderName"] as? String ?? "",
             senderAvatar: url(json["senderAvatar"]),
             isMine: json["isMine"] as? Bool ?? false,
-            kind: Kind(json: json["kind"] as? [String: Any] ?? [:]),
+            kind: Kind(json: kindDict),
             text: json["text"] as? String ?? "",
             date: Date(timeIntervalSince1970: number(json["date"]) / 1000),
             status: Status(rawValue: json["status"] as? String ?? "") ?? .sent,
@@ -387,7 +392,8 @@ extension ChatMessage {
             mentions: mentions,
             cardButtons: CardButton.list(json: json["buttons"]),
             suggestsStickers: json["stickers"] as? Bool ?? false,
-            menu: MessageMenu(json: json["menu"])
+            menu: MessageMenu(json: json["menu"]),
+            fallbackURLs: fallbacks
         )
     }
 }

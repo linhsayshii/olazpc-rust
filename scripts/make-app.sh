@@ -3,6 +3,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+if [[ -z "${DEVELOPER_DIR:-}" && "$(xcode-select -p 2>/dev/null || true)" == "/Library/Developer/CommandLineTools" ]]; then
+    for candidate in /Applications/Xcode.app/Contents/Developer /Applications/Xcode-beta.app/Contents/Developer; do
+        if [[ -f "$candidate/Platforms/MacOSX.platform/Developer/usr/lib/swift/host/plugins/libSwiftUIMacros.dylib" ]]; then
+            export DEVELOPER_DIR="$candidate"
+            break
+        fi
+    done
+fi
+
 CONFIG="${1:-release}"
 # Bundle id. Cookies, WebKit storage (the synced message DB), preferences and privacy permissions are keyed by it;
 # LegacyMigration.swift brings the session over from the SwiftZalo builds' `dev.swiftzalo.app`.

@@ -206,46 +206,47 @@ struct FriendsList: View {
     var body: some View {
         @Bindable var shell = shell
         let sections = sections
-        Group {
-            if !engine.contacts.friendsLoaded || !engine.conversationActions.hiddenKnown {
-                ContactsLoading(text: "Đang tải danh sách bạn bè…")
-            } else if engine.visibleFriends.isEmpty {
-                ContentUnavailableView {
-                    Label("Chưa có bạn bè", systemImage: "person.2")
-                } description: {
-                    Text("Tìm bạn bằng số điện thoại để gửi lời mời kết bạn.")
-                } actions: {
-                    Button("Thêm bạn") { shell.destination = .addFriend }.buttonStyle(.glass)
-                }
-                // Fills the column so the search bar stays at the top instead of hugging a centered empty state.
-                .fillColumn()
-            } else if sections.isEmpty {
-                ContentUnavailableView.search(text: query).fillColumn()
-            } else {
-                List(selection: $shell.contactSelection) {
-                    ForEach(sections, id: \.letter) { section in
-                        Section(section.letter) {
-                            ForEach(section.friends) { friend in
-                                FriendRow(friend: friend).tag(friend.id)
+        VStack(spacing: 0) {
+            ContactsSearchField(text: $query, prompt: "Tìm bạn")
+                .padding(.horizontal, 12)
+                .padding(.top, 6)
+                .padding(.bottom, 6)
+            Group {
+                if !engine.contacts.friendsLoaded || !engine.conversationActions.hiddenKnown {
+                    ContactsLoading(text: "Đang tải danh sách bạn bè…")
+                } else if engine.visibleFriends.isEmpty {
+                    ContentUnavailableView {
+                        Label("Chưa có bạn bè", systemImage: "person.2")
+                    } description: {
+                        Text("Tìm bạn bằng số điện thoại để gửi lời mời kết bạn.")
+                    } actions: {
+                        Button("Thêm bạn") { shell.destination = .addFriend }.buttonStyle(.glass)
+                    }
+                    // Fills the column so the search bar stays at the top instead of hugging a centered empty state.
+                    .fillColumn()
+                } else if sections.isEmpty {
+                    ContentUnavailableView.search(text: query).fillColumn()
+                } else {
+                    List(selection: $shell.contactSelection) {
+                        ForEach(sections, id: \.letter) { section in
+                            Section(section.letter) {
+                                ForEach(section.friends) { friend in
+                                    FriendRow(friend: friend).tag(friend.id)
+                                }
                             }
                         }
                     }
-                }
-                .contextMenu(forSelectionType: String.self) { ids in
-                    if let id = ids.first, let friend = engine.visibleFriends.first(where: { $0.id == id }) {
-                        FriendMenu(friend: friend)
+                    .contextMenu(forSelectionType: String.self) { ids in
+                        if let id = ids.first, let friend = engine.visibleFriends.first(where: { $0.id == id }) {
+                            FriendMenu(friend: friend)
+                        }
+                    } primaryAction: { ids in
+                        if let id = ids.first { engine.openContactConversation(id) }
                     }
-                } primaryAction: { ids in
-                    if let id = ids.first { engine.openContactConversation(id) }
+                    .scrollEdgeEffectStyle(.soft, for: .top)
                 }
-                .scrollEdgeEffectStyle(.soft, for: .top)
             }
         }
-        .safeAreaBar(edge: .top) {
-            ContactsSearchField(text: $query, prompt: "Tìm bạn")
-                .padding(.horizontal, 12).padding(.bottom, 6)
-        }
-        .columnTitle("Bạn bè", subtitle: "\(engine.visibleFriends.count) bạn bè")
     }
 }
 
@@ -355,40 +356,41 @@ struct GroupsList: View {
     var body: some View {
         @Bindable var shell = shell
         let groups = groups
-        Group {
-            if !engine.contacts.groupsLoaded || !engine.conversationActions.hiddenKnown {
-                ContactsLoading(text: "Đang tải danh sách nhóm…")
-            } else if engine.visibleGroups.isEmpty {
-                // Official empty group list: STR_TEXT_CREATE_GROUPS_LIST + "Tạo nhóm".
-                ContentUnavailableView {
-                    Label("Chưa tham gia nhóm nào", systemImage: "person.2")
-                } description: {
-                    Text("Tạo nhóm để cùng nhau trò chuyện và trao đổi với bạn bè đồng nghiệp")
-                } actions: {
-                    Button("Tạo nhóm") { shell.composeGroup() }.buttonStyle(.glass)
-                }
-                .fillColumn()
-            } else if groups.isEmpty {
-                ContentUnavailableView.search(text: query).fillColumn()
-            } else {
-                List(groups, selection: $shell.contactSelection) { group in
-                    GroupRow(group: group).tag(group.id)
-                }
-                .contextMenu(forSelectionType: String.self) { ids in
-                    if let id = ids.first {
-                        Button("Mở trò chuyện", systemImage: "bubble.left") { engine.openContactConversation(id) }
+        VStack(spacing: 0) {
+            ContactsSearchField(text: $query, prompt: "Tìm nhóm")
+                .padding(.horizontal, 12)
+                .padding(.top, 6)
+                .padding(.bottom, 6)
+            Group {
+                if !engine.contacts.groupsLoaded || !engine.conversationActions.hiddenKnown {
+                    ContactsLoading(text: "Đang tải danh sách nhóm…")
+                } else if engine.visibleGroups.isEmpty {
+                    // Official empty group list: STR_TEXT_CREATE_GROUPS_LIST + "Tạo nhóm".
+                    ContentUnavailableView {
+                        Label("Chưa tham gia nhóm nào", systemImage: "person.2")
+                    } description: {
+                        Text("Tạo nhóm để cùng nhau trò chuyện và trao đổi với bạn bè đồng nghiệp")
+                    } actions: {
+                        Button("Tạo nhóm") { shell.composeGroup() }.buttonStyle(.glass)
                     }
-                } primaryAction: { ids in
-                    if let id = ids.first { engine.openContactConversation(id) }
+                    .fillColumn()
+                } else if groups.isEmpty {
+                    ContentUnavailableView.search(text: query).fillColumn()
+                } else {
+                    List(groups, selection: $shell.contactSelection) { group in
+                        GroupRow(group: group).tag(group.id)
+                    }
+                    .contextMenu(forSelectionType: String.self) { ids in
+                        if let id = ids.first {
+                            Button("Mở trò chuyện", systemImage: "bubble.left") { engine.openContactConversation(id) }
+                        }
+                    } primaryAction: { ids in
+                        if let id = ids.first { engine.openContactConversation(id) }
+                    }
+                    .scrollEdgeEffectStyle(.soft, for: .top)
                 }
-                .scrollEdgeEffectStyle(.soft, for: .top)
             }
         }
-        .safeAreaBar(edge: .top) {
-            ContactsSearchField(text: $query, prompt: "Tìm nhóm")
-                .padding(.horizontal, 12).padding(.bottom, 6)
-        }
-        .columnTitle("Nhóm và cộng đồng", subtitle: "\(engine.visibleGroups.count) nhóm")
     }
 }
 

@@ -8,26 +8,21 @@ struct ContactsListColumn: View {
     let destination: SidebarDestination
 
     var body: some View {
-        Group {
-            switch destination {
-            case .groups: GroupsList()
-            case .requests: RequestsList()
-            case .addFriend: AddFriendForm()
-            default: FriendsList()
-            }
-        }
-        .toolbar {
-            if destination == .groups {
-                ToolbarItem {
-                    Button("Tạo nhóm", systemImage: "person.2.badge.plus") { shell.composeGroup() }
-                        .help("Tạo nhóm trò chuyện (⇧⌘N)")
-                }
-            }
-            if destination != .addFriend {
-                ToolbarItem {
-                    Button("Thêm bạn", systemImage: "person.badge.plus") { shell.destination = .addFriend }
-                        .help("Thêm bạn bằng số điện thoại")
-                }
+        ZStack {
+            FriendsList()
+                .opacity(destination == .friends ? 1 : 0)
+                .allowsHitTesting(destination == .friends)
+                .accessibilityHidden(destination != .friends)
+            GroupsList()
+                .opacity(destination == .groups ? 1 : 0)
+                .allowsHitTesting(destination == .groups)
+                .accessibilityHidden(destination != .groups)
+            RequestsList()
+                .opacity(destination == .requests ? 1 : 0)
+                .allowsHitTesting(destination == .requests)
+                .accessibilityHidden(destination != .requests)
+            if destination == .addFriend {
+                AddFriendForm()
             }
         }
         .task { engine.refreshContacts() }

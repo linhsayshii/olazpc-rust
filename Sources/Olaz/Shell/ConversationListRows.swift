@@ -105,7 +105,8 @@ struct ConversationListRow: View {
         if let p = conversation.preview, !p.text.isEmpty { return (p.fromMe ? "Bạn: " : "") + p.text }
         if conversation.isGroup, conversation.members > 0 { return "\(conversation.members) thành viên" }
         if isSelf { return "Lưu trữ và truy cập nhanh những nội dung quan trọng" }
-        return conversation.isGroup ? "Nhóm" : (isStranger ? "Chưa là bạn" : "Bạn bè")
+        let stranger = isStranger || engine.conversationExtras.strangerIds.contains(conversation.id)
+        return conversation.isGroup ? "Nhóm" : (stranger ? "Chưa là bạn" : "Bạn bè")
     }
 }
 

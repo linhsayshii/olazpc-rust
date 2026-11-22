@@ -1,176 +1,465 @@
-import Foundation
 import AppKit
+import Foundation
 
-// Chat + phone→PC transfer, bridged to `HostScripts/chat-adapter.js` (`window.__zaloChat`).
-// Contract: ChatModels.swift. All actions run through the official client's own services.
 extension ZaloEngine {
+    // MARK: - Open / Close / History
+
     func openConversation(_ id: String) {
-        if openConversationId != id { dropMessagePrompts() }
+        guard !id.isEmpty else { return }
+        let changed = openConversationId != id
         openConversationId = id
-        callChat("open", id)
-        callChat("watchPins", id, object: "__zaloMsgActions")
+        if changed { dropMessagePrompts() }
+        typing[id] = nil
+        if messages[id] == nil {
+            messages[id] = []
+        }
+        // Synchronous WAL snapshot read (< 0.5ms) so synced local history appears on the very first frame.
+        if let syncCached = sqliteStore?.readMessagesNow(convId: id, limit: 50) {
+            let decoded = syncCached.compactMap { ZaloWireParser.decodeStoredMessage($0) }
+            for msg in decoded { mergeMessageIntoMemory(msg) }
+            if decoded.count >= 45 {
+                hasMoreHistory[id] = true
+            }
+        }
+
+        let isGrp = ZaloWireParser.isGroupId(id)
+        updateCallGateForConversation(id)
+
+        Task { [weak self] in
+            guard let self else { return }
+            // 1. Fallback async read for in-memory test DBs without a separate WAL handle.
+            if (self.messages[id]?.isEmpty ?? true),
+               let cached = try? await self.sqliteStore?.messages(convId: id, limit: 50) {
+                let decoded = cached.compactMap { ZaloWireParser.decodeStoredMessage($0) }
+                for msg in decoded { self.mergeMessageIntoMemory(msg) }
+                if decoded.count >= 45 {
+                    self.hasMoreHistory[id] = true
+                }
+            }
+
+            // 2. Refresh recent history (and board pins) from server if authenticated.
+            let fetched = await self.fetchAndMergeHistory(convId: id, beforeMsgId: nil, isOld: false, count: 50)
+            await self.resolveMissingSenderProfiles(in: id)
+            if (fetched > 0 || self.conversations.first(where: { $0.id == id })?.preview == nil),
+               let latest = self.messages[id]?.last {
+                self.updateConversationOnMessage(latest, incrementUnread: false)
+            }
+            if isGrp || self.contacts.friends.contains(where: { $0.id == id }) {
+                await self.refreshBoardPins(for: id)
+            }
+
+            // 3. Mark read locally & remotely.
+            self.markRead(id)
+        }
+    }
+
+    internal func resolveMissingSenderProfiles(in convId: String) async {
+        guard let list = messages[convId], !list.isEmpty else { return }
+        let myUid = profile?.userId ?? ""
+        var unknownUids: [String] = []
+        var seen: Set<String> = []
+        for msg in list where !msg.isMine && !msg.senderId.isEmpty && msg.senderId != "0" && msg.senderId != myUid {
+            let clean = ZaloWireParser.stripUserPrefix(msg.senderId)
+            guard !clean.isEmpty, seen.insert(clean).inserted else { continue }
+            let needsName = msg.senderName.isEmpty || msg.senderName == clean || msg.senderName == "Người dùng Zalo"
+            let needsAvatar = msg.senderAvatar == nil && (cachedProfiles[clean]?.avatar.isEmpty ?? true)
+            if needsName || needsAvatar {
+                unknownUids.append(clean)
+            }
+        }
+        guard !unknownUids.isEmpty else { return }
+
+        var cacheUpdated = false
+        for offset in stride(from: 0, to: unknownUids.count, by: 50) {
+            let chunk = Array(unknownUids[offset..<min(offset + 50, unknownUids.count)])
+            guard let box = try? await sessionClient.fetchProfiles(uids: chunk) else { continue }
+            let profilesMap = ZaloWireParser.extractProfilesMap(box.dict)
+            for (uid, row) in profilesMap {
+                let clean = ZaloWireParser.stripUserPrefix(uid)
+                let fetchedName = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+                let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
+                if !clean.isEmpty, (!fetchedName.isEmpty || !avt.isEmpty) {
+                    cachedProfiles[clean] = ZaloWebKitMigrator.CachedProfile(name: fetchedName, avatar: avt)
+                    cacheUpdated = true
+                }
+            }
+        }
+        guard cacheUpdated else { return }
+        if let data = try? JSONEncoder().encode(cachedProfiles) {
+            try? await sqliteStore?.setPreferenceData(key: "cachedProfiles", data: data)
+        }
+
+        guard var updatedList = messages[convId] else { return }
+        var toPersist: [StoredMessage] = []
+        var modified = false
+        for i in updatedList.indices where !updatedList[i].isMine {
+            let clean = ZaloWireParser.stripUserPrefix(updatedList[i].senderId)
+            guard let info = lookupPersonInfo(clean) else { continue }
+            var rowChanged = false
+            if !info.name.isEmpty, info.name != clean, updatedList[i].senderName != info.name {
+                updatedList[i].senderName = info.name
+                rowChanged = true
+            }
+            if updatedList[i].senderAvatar == nil, !info.avatar.isEmpty, let url = URL(string: info.avatar) {
+                updatedList[i].senderAvatar = url
+                rowChanged = true
+            }
+            if rowChanged {
+                modified = true
+                if let stored = ZaloWireParser.encodeChatMessage(updatedList[i]) {
+                    toPersist.append(stored)
+                }
+            }
+        }
+        if modified {
+            messages[convId] = updatedList
+            if !toPersist.isEmpty {
+                try? await sqliteStore?.saveMessages(toPersist)
+            }
+        }
     }
 
     func closeConversation() {
-        guard let id = openConversationId else { return }
         openConversationId = nil
         dropMessagePrompts()
-        callChat("close", id)
-        callChat("watchPins", nil, object: "__zaloMsgActions")
     }
 
-    func loadOlderMessages(_ id: String) { callChat("loadMore", id) }
+    func loadOlderMessages(_ id: String) {
+        guard !id.isEmpty else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            let existing = self.messages[id] ?? []
+            let oldest = existing.first
+            let beforeTsMs = oldest.map { Int64(($0.date.timeIntervalSince1970 * 1000).rounded()) }
 
-    /// `mentions` are offsets (UTF-16) into `text` as typed; they are re-based when the text is trimmed
-    /// and dropped when they no longer point at their "@Name".
-    /// Returns false when the official client could not take the message (nothing was sent).
+            var addedCount = 0
+            if let beforeTsMs {
+                let cachedOlder: [StoredMessage]?
+                if let syncOlder = self.sqliteStore?.readMessagesNow(convId: id, beforeTsMs: beforeTsMs, limit: 50) {
+                    cachedOlder = syncOlder
+                } else {
+                    cachedOlder = try? await self.sqliteStore?.messages(convId: id, beforeTsMs: beforeTsMs, limit: 50)
+                }
+                if let cachedOlder, !cachedOlder.isEmpty {
+                    let decoded = cachedOlder.compactMap { ZaloWireParser.decodeStoredMessage($0) }
+                    for msg in decoded {
+                        if !(self.messages[id]?.contains(where: { $0.id == msg.id }) ?? false) {
+                            addedCount += 1
+                        }
+                        self.mergeMessageIntoMemory(msg)
+                    }
+                    if cachedOlder.count < 45 && !ZaloWireParser.isGroupId(id) && id != self.selfConversationId {
+                        self.hasMoreHistory[id] = false
+                    }
+                }
+            }
+
+            if addedCount == 0 {
+                let cursor: String? = oldest.flatMap { msg in
+                    Int64(msg.id).map(String.init)
+                }
+                let fetched = await self.fetchAndMergeHistory(convId: id, beforeMsgId: cursor, isOld: nil, count: 50)
+                if fetched == 0 {
+                    self.hasMoreHistory[id] = false
+                }
+            }
+            await self.resolveMissingSenderProfiles(in: id)
+            self.historyTicks[id, default: 0] += 1
+        }
+    }
+
     @discardableResult
-    func sendText(_ text: String, to id: String, quoting messageId: String? = nil, mentions: [Mention] = []) async -> Bool {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return true }
-        let leading = text.utf16.prefix { unit in
-            guard let scalar = Unicode.Scalar(unit) else { return false }
-            return CharacterSet.whitespacesAndNewlines.contains(scalar)
-        }.count
-        let body = trimmed as NSString
-        let wire: [[String: Any]] = mentions.compactMap { mention in
-            let pos = mention.pos - leading
-            guard pos >= 0, mention.len > 1, pos + mention.len <= body.length,
-                  body.character(at: pos) == 0x40 else { return nil }
-            return ["pos": pos, "len": mention.len, "uid": mention.uid, "type": mention.isAll ? 1 : 0]
-        }.sorted { ($0["pos"] as? Int ?? 0) < ($1["pos"] as? Int ?? 0) }
-        let args = [id, trimmed, messageId ?? NSNull(), wire] as [Any]
-        guard let data = try? JSONSerialization.data(withJSONObject: args, options: [.fragmentsAllowed]),
-              let json = String(data: data, encoding: .utf8) else { return false }
-        let script = "const c = window.__zaloChat; if (!c || !c.sendText) return 'missing'; return await c.sendText(...\(json));"
-        let result = await host?.evaluate(script) as? String
-        if result != "sent" { EngineLog.shared.write("chat sendText → \(result ?? "nil")") }
-        return result == "sent"
-    }
-
-    /// Group members matching `query` (what follows the "@"), from the official suggestion engine:
-    /// same filtering/ordering as Zalo PC, "Tất cả" first when the official rules allow mention-all.
-    func mentionCandidates(in id: String, query: String, excluding mentioned: [String]) async -> [MentionCandidate] {
-        let args = [id, query, mentioned] as [Any]
-        guard let data = try? JSONSerialization.data(withJSONObject: args, options: [.fragmentsAllowed]),
-              let json = String(data: data, encoding: .utf8) else { return [] }
-        let script = "const c = window.__zaloChat; if (!c || !c.mentionCandidates) return []; return await c.mentionCandidates(...\(json));"
-        guard let rows = await host?.evaluate(script) as? [[String: Any]] else { return [] }
-        return rows.compactMap { row in
-            guard let uid = row["id"] as? String, !uid.isEmpty else { return nil }
-            let isAll = row["isAll"] as? Bool ?? false
-            let name = (row["name"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            guard isAll || !name.isEmpty else { return nil }
-            return MentionCandidate(id: uid, name: isAll ? "All" : name,
-                                    avatar: (row["avatar"] as? String).flatMap { $0.isEmpty ? nil : URL(string: $0) },
-                                    isAll: isAll)
+    internal func fetchAndMergeHistory(convId: String, beforeMsgId: String?, isOld: Bool? = nil, count: Int = 50) async -> Int {
+        guard let box = try? await sessionClient.fetchHistory(convId: convId, lastMsgId: beforeMsgId, count: count, isOld: isOld) else {
+            if beforeMsgId == nil {
+                if messages[convId] == nil { messages[convId] = [] }
+                if messages[convId]?.isEmpty ?? true { hasMoreHistory[convId] = false }
+            }
+            return 0
         }
-    }
 
-    /// Who reacted to a message, from the official reaction cache + profile service (read-only).
-    /// nil when the client could not answer (not ready, error); an empty detail when nobody reacted.
-    func reactors(for messageId: String, in conversationId: String) async -> ReactionDetail? {
-        let args = [conversationId, messageId] as [Any]
-        guard let data = try? JSONSerialization.data(withJSONObject: args, options: [.fragmentsAllowed]),
-              let json = String(data: data, encoding: .utf8) else { return nil }
-        let script = "const c = window.__zaloChat; if (!c || !c.reactors) return null; return await c.reactors(...\(json));"
-        return ReactionDetail(json: await host?.evaluate(script))
-    }
+        let myUid = profile?.userId ?? ""
+        let isGrp = ZaloWireParser.isGroupId(convId)
+        let isSelf = (convId == selfConversationId)
+        let events = ZaloWireParser.extractBatchEvents(
+            box.dict,
+            myUid: myUid,
+            selfConvId: selfConversationId,
+            fallbackConvId: (isGrp || isSelf) ? convId : nil,
+            isGroupHint: isGrp ? true : (isSelf ? false : nil),
+            nameLookup: { [weak self] uid in self?.lookupPersonInfo(uid) }
+        )
 
-    /// The PNG of an official reaction icon (`pc-dist/emoji/…`, read from the install's asar), cached by path.
-    func reactionImage(_ path: String) -> NSImage? {
-        guard !path.isEmpty else { return nil }
-        if let cached = Self.reactionImages.object(forKey: path as NSString) { return cached }
-        guard let data = host?.install.asar.read("pc-dist/" + path), let image = NSImage(data: data) else { return nil }
-        Self.reactionImages.setObject(image, forKey: path as NSString)
-        return image
-    }
-    private static let reactionImages = NSCache<NSString, NSImage>()
+        var storedBatch: [StoredMessage] = []
+        var newVisibleCount = 0
+        var totalParsedMessages = 0
 
-    func markRead(_ id: String) { callChat("markRead", id) }
-
-    func react(_ emoji: String, to messageId: String, in id: String) { callChat("react", id, messageId, emoji) }
-
-    func handleChat(state: [String: Any]) {
-        if let chat = state["chat"] as? [String: Any], let convId = chat["convId"] as? String {
-            mergeChat(chat, convId: convId)
-        }
-        if let typingState = state["typing"] as? [String: Any], let convId = typingState["convId"] as? String {
-            showTyping(typingState["name"] as? String ?? "", in: convId)
-        }
-    }
-
-    /// `reset` replaces the list; otherwise changed messages merge by id (a pending message
-    /// keeps its id when it is confirmed) and `removed` ids drop out. Kept oldest first.
-    private func mergeChat(_ chat: [String: Any], convId: String) {
-        let incoming = (chat["messages"] as? [[String: Any]] ?? []).compactMap { Self.chatMessage($0, fallbackConversation: convId) }
-        let removed = Set(chat["removed"] as? [String] ?? [])
-        let reset = chat["reset"] as? Bool ?? false
-        var list = reset ? [] : (messages[convId] ?? [])
-        if !removed.isEmpty { list.removeAll { removed.contains($0.id) } }
-        var index = list.enumerated().reduce(into: [String: Int]()) { $0[$1.element.id] = $1.offset }
-        var needsSort = reset
-        for message in incoming {
-            if let at = index[message.id] {
-                if list[at].date != message.date { needsSort = true }
-                list[at] = message
-            } else {
-                if let last = list.last, message.date < last.date { needsSort = true }
-                index[message.id] = list.count
-                list.append(message)
+        for ev in events {
+            switch ev {
+            case .message(let msg, let stored):
+                if msg.conversationId == convId {
+                    totalParsedMessages += 1
+                    if !(messages[msg.conversationId]?.contains(where: { $0.id == msg.id }) ?? false) {
+                        newVisibleCount += 1
+                    }
+                }
+                storedBatch.append(stored)
+                mergeMessageIntoMemory(msg, replacingClientId: stored.clientId)
+            case .reaction(let cId, let mid, let cid, let senderId, let rType, let rIcon):
+                await applyRemoteReaction(convId: cId, msgId: mid, cliMsgId: cid, senderId: senderId, rType: rType, rIcon: rIcon)
+            case .undo(let cId, let mid, let cid):
+                await applyRemoteRecall(convId: cId, msgId: mid, cliMsgId: cid)
+            case .delete(let cId, let mid, let cid):
+                await applyRemoteDelete(convId: cId, msgId: mid, cliMsgId: cid)
+            case .typing, .ignore:
+                break
             }
         }
-        if needsSort {
-            // Stable: equal timestamps keep the order the official client gave them.
-            list = list.enumerated().sorted { ($0.element.date, $0.offset) < ($1.element.date, $1.offset) }.map(\.element)
+        if messages[convId] == nil {
+            messages[convId] = []
         }
-        EngineLog.shared.write("chat merge conv=\(convId.prefix(4))… reset=\(reset) in=\(incoming.count) removed=\(removed.count) total=\(list.count) hasMore=\(chat["hasMore"] ?? "-")")
-        if messages[convId] != list { messages[convId] = list }
-        notePollMessages(incoming)
-        if let hasMore = chat["hasMore"] as? Bool, hasMoreHistory[convId] != hasMore { hasMoreHistory[convId] = hasMore }
-        if chat["grew"] as? Bool == true { historyTicks[convId, default: 0] += 1 }
-        if typing[convId] != nil, let newest = incoming.last, !newest.isMine, newest.date > Date().addingTimeInterval(-5) {
-            clearTyping(convId)
+        if !storedBatch.isEmpty {
+            try? await sqliteStore?.saveMessages(storedBatch)
+        }
+        let isSelfCloud = convId == selfConversationId
+        if isGrp || isSelfCloud {
+            if totalParsedMessages >= max(10, count / 2) {
+                hasMoreHistory[convId] = true
+            } else if (messages[convId]?.count ?? 0) < 45 {
+                hasMoreHistory[convId] = false
+            }
+        } else if (messages[convId]?.count ?? 0) < 45 {
+            hasMoreHistory[convId] = false
+        }
+        return newVisibleCount
+    }
+
+    // MARK: - Send Text / Mentions
+
+    func sendText(_ text: String, to id: String, quoting quoteId: String? = nil, mentions: [Mention] = []) async -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !id.isEmpty else { return false }
+
+        let quote = quoteId.flatMap { qid in messages[id]?.first(where: { $0.id == qid }) }
+        let cliId = "\(await sessionClient.nextClientId())"
+        let myUid = profile?.userId ?? ""
+        let myName = profile?.displayName ?? "Bạn"
+        let quoteBlock = quote.map { ChatMessage.Quote(senderName: $0.isMine ? "Bạn" : $0.senderName, text: $0.text.isEmpty ? "[Tin nhắn]" : $0.text) }
+
+        var optimistic = ChatMessage(
+            id: cliId,
+            conversationId: id,
+            senderId: myUid,
+            senderName: myName,
+            senderAvatar: profile?.avatar,
+            isMine: true,
+            kind: .text,
+            text: text,
+            date: Date(),
+            status: .sending,
+            quote: quoteBlock,
+            reactions: [],
+            isE2EE: false,
+            mentions: mentions,
+            cardButtons: [],
+            suggestsStickers: false,
+            menu: MessageMenu(json: ["forward": "ok", "recall": true, "delete": "forMe", "pin": ZaloWireParser.isGroupId(id), "star": "star"])
+        )
+        mergeMessageIntoMemory(optimistic)
+
+        do {
+            let quoteTsMs = quote.map { Int64(($0.date.timeIntervalSince1970 * 1000).rounded()) }
+            let res = try await sessionClient.sendTextAPI(
+                convId: id,
+                text: text,
+                cliMsgId: cliId,
+                quoteMsgId: quote?.id,
+                quoteCliMsgId: quote?.id,
+                quoteOwnerId: quote?.senderId,
+                quoteText: quote?.text,
+                quoteTsMs: quoteTsMs,
+                mentions: mentions
+            )
+            // Replace temporary client id with server msgId while avoiding duplicates.
+            if var list = messages[id] {
+                list.removeAll { $0.id == cliId || $0.id == res.msgId }
+                optimistic.id = res.msgId
+                optimistic.status = .sent
+                list.append(optimistic)
+                list.sort { a, b in a.date == b.date ? a.id < b.id : a.date < b.date }
+                messages[id] = list
+            }
+            if let stored = ZaloWireParser.encodeChatMessage(optimistic, clientId: cliId) {
+                try? await sqliteStore?.saveMessages([stored])
+            }
+            updateConversationOnMessage(optimistic, incrementUnread: false)
+            return true
+        } catch {
+            EngineLog.shared.write("sendText failed: \(error.localizedDescription)")
+            if var list = messages[id] {
+                list.removeAll { $0.id == cliId }
+                messages[id] = list
+            }
+            return false
         }
     }
 
-    private func showTyping(_ name: String, in convId: String) {
-        let trimmed = name.trimmingCharacters(in: .whitespaces)
-        if trimmed.isEmpty { clearTyping(convId); return }
-        typing[convId] = trimmed
-        ChatTypingClock.tasks[convId]?.cancel()
-        ChatTypingClock.tasks[convId] = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(5))
-            guard !Task.isCancelled else { return }
-            self?.clearTyping(convId)
+    func mentionCandidates(in id: String, query: String, excluding: [String] = []) async -> [MentionCandidate] {
+        guard ZaloWireParser.isGroupId(id) else { return [] }
+        let cleanGroup = ZaloWireParser.cleanGroupId(id)
+        let excludedSet = Set(excluding)
+
+        if groupMemberCache[id] == nil {
+            var candidates: [MentionCandidate] = [
+                MentionCandidate(id: "-1", name: "All", avatar: nil, isAll: true)
+            ]
+            if let groupInfo = cachedGroupDetails[cleanGroup] {
+                var memberIds: [String] = []
+                if let verList = groupInfo["memVerList"] as? [String] {
+                    memberIds.append(contentsOf: verList.compactMap { $0.split(separator: "_").first.map(String.init) })
+                }
+                if memberIds.isEmpty, let mems = groupInfo["memIds"] as? [Any] {
+                    memberIds.append(contentsOf: mems.map(JSONLossless.string))
+                }
+                if memberIds.isEmpty, let cur = groupInfo["currentMems"] as? [[String: Any]] {
+                    memberIds.append(contentsOf: cur.map { JSONLossless.string($0["id"] ?? $0["uid"]) })
+                }
+                let myUid = profile?.userId ?? ""
+                let cleanIds = Array(Set(memberIds.map(ZaloWireParser.stripUserPrefix))).filter { !$0.isEmpty && $0 != myUid }
+                if let profBox = try? await sessionClient.fetchProfiles(uids: Array(cleanIds.prefix(50))) {
+                    let profilesMap = ZaloWireParser.extractProfilesMap(profBox.dict)
+                    for uid in cleanIds {
+                        guard let row = profilesMap[uid] else { continue }
+                        let name = JSONLossless.string(row["dName"] ?? row["displayName"] ?? row["zaloName"] ?? row["name"])
+                        let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
+                        if !name.isEmpty {
+                            candidates.append(MentionCandidate(id: uid, name: name, avatar: avt.isEmpty ? nil : URL(string: avt), isAll: false))
+                        }
+                    }
+                }
+            }
+            groupMemberCache[id] = candidates
+        }
+
+        let needle = Self.contactFold(query).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (groupMemberCache[id] ?? []).filter { candidate in
+            guard !excludedSet.contains(candidate.id) else { return false }
+            if needle.isEmpty { return true }
+            return Self.contactFold(candidate.name).contains(needle)
         }
     }
 
-    private func clearTyping(_ convId: String) {
-        ChatTypingClock.tasks[convId]?.cancel()
-        ChatTypingClock.tasks[convId] = nil
-        typing[convId] = nil
+    // MARK: - Reactions & Read Receipts
+
+    func reactors(for messageId: String, in conversationId: String) async -> ReactionDetail? {
+        guard let msg = messages[conversationId]?.first(where: { $0.id == messageId }), !msg.reactions.isEmpty else {
+            return nil
+        }
+        let tabsJSON: [[String: Any]] = msg.reactions
+            .sorted { $0.count > $1.count }
+            .map { r in
+                ["type": r.icon.type, "key": r.icon.key, "emoji": r.icon.emoji, "image": r.icon.image, "total": r.count]
+            }
+
+        var usersJSON: [[String: Any]] = []
+        let myUid = profile?.userId ?? "me"
+        if msg.reactions.contains(where: \.includesMe) {
+            let myIcons: [[String: Any]] = msg.reactions.filter(\.includesMe).map { r in
+                ["type": r.icon.type, "key": r.icon.key, "emoji": r.icon.emoji, "image": r.icon.image, "count": 1]
+            }
+            usersJSON.append([
+                "uid": myUid,
+                "name": "Bạn",
+                "avatar": profile?.avatar?.absoluteString ?? "",
+                "isMe": true,
+                "total": myIcons.count,
+                "icons": myIcons
+            ])
+        }
+        if let first = msg.reactions.first, !first.includesMe {
+            for (idx, name) in first.names.enumerated() where name != "Bạn" {
+                usersJSON.append([
+                    "uid": "u_\(idx)",
+                    "name": name,
+                    "avatar": "",
+                    "isMe": false,
+                    "total": 1,
+                    "icons": [["type": first.icon.type, "key": first.icon.key, "emoji": first.icon.emoji, "image": first.icon.image, "count": 1]]
+                ])
+            }
+        }
+        return ReactionDetail(json: ["tabs": tabsJSON, "users": usersJSON])
     }
 
-    private static func chatMessage(_ json: [String: Any], fallbackConversation: String) -> ChatMessage? {
-        ChatMessage(json: json, fallbackConversation: fallbackConversation)
+    func reactionImage(_ path: String) -> NSImage? {
+        nil
     }
 
-    /// `window.__zaloChat[method](...args)`; arguments are JSON-encoded.
-    func callChat(_ method: String, _ args: Any?..., object: String = "__zaloChat") {
-        let values = args.map { $0 ?? NSNull() }
-        guard let data = try? JSONSerialization.data(withJSONObject: values, options: [.fragmentsAllowed]),
-              let json = String(data: data, encoding: .utf8) else { return }
-        let script = "return (() => { const c = window.\(object); if (!c || !c.\(method)) return 'missing'; c.\(method)(...\(json)); return 'ok'; })()"
-        Task { [weak self] in
-            let result = await self?.host?.evaluate(script)
-            if (result as? String) != "ok" { EngineLog.shared.write("chat \(method) → \(result ?? "nil")") }
+    func markRead(_ id: String) {
+        guard !id.isEmpty else { return }
+        var extrasChanged = false
+        if let idx = conversations.firstIndex(where: { $0.id == id }), conversations[idx].unread > 0 {
+            conversations[idx].unread = 0
+            extrasChanged = true
+        }
+        let hadUnreadMark = cachedUnreadMarks.remove(id) != nil
+        if hadUnreadMark {
+            rebuildConversationFlags()
+            extrasChanged = true
+            Task {
+                try? await sqliteStore?.setPreferenceStrings(key: "unreadMarks", value: Array(cachedUnreadMarks))
+                try? await sessionClient.setUnreadMarkAPI(convId: id, unread: false)
+            }
+        }
+        if extrasChanged {
+            rebuildConversationExtras()
+        }
+        Task {
+            try? await sqliteStore?.setConversationUnread(id: id, unread: 0)
+            if let last = messages[id]?.last, !last.isMine {
+                await sessionClient.sendSeenAPI(convId: id, msgId: last.id, cliMsgId: last.id, senderId: last.senderId)
+            }
         }
     }
-}
 
-/// Auto-clear timers for "is typing" banners (extensions cannot hold stored properties).
-@MainActor
-private enum ChatTypingClock {
-    static var tasks: [String: Task<Void, Never>] = [:]
+    func react(_ emoji: String, to messageId: String, in conversationId: String) {
+        let spec = ZaloWireParser.reactionSpec(forEmoji: emoji)
+        let msg = messages[conversationId]?.first(where: { $0.id == messageId })
+        let isSticker = { if case .sticker = msg?.kind { return true }; return false }()
+        let alreadyMine = msg?.reactions.contains(where: { $0.includesMe && $0.icon.type == "\(spec.rType)" }) ?? false
+        let effectiveType = alreadyMine ? -1 : spec.rType
+        let effectiveIcon = alreadyMine ? "" : spec.rIcon
+        let cliId = messageId
+
+        Task {
+            do {
+                try await sessionClient.sendReactionAPI(
+                    convId: conversationId,
+                    msgId: messageId,
+                    cliMsgId: cliId,
+                    rIcon: effectiveIcon,
+                    rType: effectiveType,
+                    isSticker: isSticker
+                )
+                await applyRemoteReaction(
+                    convId: conversationId,
+                    msgId: messageId,
+                    cliMsgId: cliId,
+                    senderId: profile?.userId ?? "0",
+                    rType: "\(effectiveType)",
+                    rIcon: effectiveIcon
+                )
+            } catch {
+                EngineLog.shared.write("react failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func handleTyping(state: [String: Any]) {
+        if let info = state["typing"] as? [String: Any],
+           let convId = info["convId"] as? String,
+           let name = info["name"] as? String {
+            showTyping(convId: convId, name: name)
+        }
+    }
 }

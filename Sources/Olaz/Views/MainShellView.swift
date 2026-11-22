@@ -37,8 +37,8 @@ struct MainShellView: View {
         .onChange(of: shell.destination) { _, destination in
             EngineLog.shared.write("shell destination \(destination.logName)")
             applyOfficialFilter(destination)
-            // Leaving the conversation lists hides the inspector (the chat itself stays open in the official client).
-            if !destination.isConversationList { shell.hideInspector() }
+            // Leaving the conversation lists hides the inspector without triggering a simultaneous live-resize teardown on `NSOutlineView`.
+            if !destination.isConversationList { shell.hideInspector(animated: false) }
         }
         .onChange(of: engine.conversationExtras.loaded) { _, _ in applyOfficialFilter(shell.destination) }
         // A label deleted here or on another device takes its list with it.
@@ -146,19 +146,105 @@ struct MainShellView: View {
 // MARK: - Columns
 
 /// Middle column: the list for the sidebar destination.
+/// Keeps `List`-backed subviews (`ConversationListColumn`, `CloudListColumn`, `ContactsListColumn`) persistently mounted
+/// so AppKit never tears down an `NSOutlineView` mid-resize on macOS 26/27.
 private struct ContentColumn: View {
+    @Environment(ZaloEngine.self) private var engine
     @Environment(ShellModel.self) private var shell
 
     var body: some View {
         let destination = shell.destination
-        Group {
-            if destination.isConversationList {
-                ConversationListColumn()
-            } else if destination == .zcloud {
-                CloudListColumn()
+        let isConv = destination.isConversationList
+        let isCloud = destination == .zcloud
+        let isContacts = destination.isContacts
+
+        ZStack {
+            ConversationListColumn()
+                .opacity(isConv ? 1 : 0)
+                .allowsHitTesting(isConv)
+                .accessibilityHidden(!isConv)
+            CloudListColumn()
+                .opacity(isCloud ? 1 : 0)
+                .allowsHitTesting(isCloud)
+                .accessibilityHidden(!isCloud)
+            ContactsListColumn(destination: destination)
+                .opacity(isContacts ? 1 : 0)
+                .allowsHitTesting(isContacts)
+                .accessibilityHidden(!isContacts)
+        }
+        .columnTitle(columnHeader.title, subtitle: columnHeader.subtitle)
+        .toolbar {
+            if isContacts {
+                if destination == .requests {
+                    ToolbarItem {
+                        if engine.contacts.loadingRequests {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Button("Tải lại", systemImage: "arrow.clockwise") { engine.refreshContacts() }
+                        }
+                    }
+                }
+                if destination == .groups {
+                    ToolbarItem {
+                        Button("Tạo nhóm", systemImage: "person.2.badge.plus") { shell.composeGroup() }
+                            .help("Tạo nhóm trò chuyện (⇧⌘N)")
+                    }
+                }
+                if destination != .addFriend {
+                    ToolbarItem {
+                        Button("Thêm bạn", systemImage: "person.badge.plus") { shell.destination = .addFriend }
+                            .help("Thêm bạn bằng số điện thoại")
+                    }
+                }
             } else {
-                ContactsListColumn(destination: destination)
+                ToolbarSpacer(.flexible)
             }
+        }
+    }
+
+    private var columnHeader: (title: String, subtitle: String) {
+        let destination = shell.destination
+        switch destination {
+        case .inbox, .myCloud, .label, .other, .unread, .strangers, .hidden:
+            let title: String = switch destination {
+            case .inbox, .myCloud, .label: ConversationExtras.inboxTitle
+            case .other: ConversationTypeFilter.other.title
+            case .unread: ConversationTypeFilter.unread.title
+            case .strangers: "Người lạ"
+            case .hidden: "Trò chuyện ẩn"
+            default: ConversationExtras.inboxTitle
+            }
+            let counts = UnreadCounts(engine: engine)
+            let unread: Int = switch destination {
+            case .other: counts.other
+            case .strangers: counts.strangers
+            case .unread: engine.visibleConversations.filter { $0.unread > 0 }.count
+            case .label(let lid): engine.conversationExtras.labels.first(where: { $0.id == lid }).map { counts.unread(in: $0) } ?? 0
+            default: counts.inbox
+            }
+            let isLocked = destination == .hidden && engine.conversationActions.hasHiddenPIN && shell.unlockedHiddenIds == nil && shell.search.trimmingCharacters(in: .whitespaces).isEmpty
+            let activeLabel = shell.search.trimmingCharacters(in: .whitespaces).isEmpty ? engine.conversationExtras.label(filteredBy: destination) : nil
+            guard !isLocked, !engine.conversations.isEmpty, engine.conversationActions.hiddenKnown else {
+                return (title, activeLabel?.name ?? "")
+            }
+            let status = unread > 0 ? "\(unread) cuộc trò chuyện chưa đọc" : "Đã đọc hết"
+            return (title, activeLabel.map { "\($0.name) · \(status)" } ?? status)
+
+        case .zcloud:
+            let sub = engine.cloud.plan.map { "\(CloudFormat.size($0.usage + $0.family)) / \(CloudFormat.size($0.quota))" } ?? ""
+            return ("zCloud", sub)
+
+        case .friends:
+            return ("Bạn bè", "\(engine.visibleFriends.count) bạn bè")
+
+        case .groups:
+            return ("Nhóm và cộng đồng", "\(engine.visibleGroups.count) nhóm")
+
+        case .requests:
+            return ("Lời mời kết bạn", "\(engine.contacts.pendingRequestCount) lời mời đang chờ")
+
+        case .addFriend:
+            return ("Thêm bạn", "")
         }
     }
 }

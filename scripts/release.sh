@@ -10,6 +10,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+if [[ -z "${DEVELOPER_DIR:-}" && "$(xcode-select -p 2>/dev/null || true)" == "/Library/Developer/CommandLineTools" ]]; then
+    for candidate in /Applications/Xcode.app/Contents/Developer /Applications/Xcode-beta.app/Contents/Developer; do
+        if [[ -f "$candidate/Platforms/MacOSX.platform/Developer/usr/lib/swift/host/plugins/libSwiftUIMacros.dylib" ]]; then
+            export DEVELOPER_DIR="$candidate"
+            break
+        fi
+    done
+fi
+
 VERSION="${OLAZ_VERSION:-1.0}"
 IDENTITY="${OLAZ_SIGN_IDENTITY:-Developer ID Application}"   # codesign matches the identity by substring
 PROFILE="${OLAZ_NOTARY_PROFILE:-olaz-notary}"

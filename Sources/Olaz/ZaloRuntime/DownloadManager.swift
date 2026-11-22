@@ -142,63 +142,11 @@ final class DownloadManager {
         }
     }
 
-    func install(on bridge: ZaloBridge) {
-        bridge.handle(Self.channel) { [weak self, weak bridge] args in
-            guard let self, let bridge, let request = args.first as? [String: Any],
-                  let channel = request["channel"] as? String else { return nil }
-            self.handle(channel: channel, data: request["data"] as? [String: Any] ?? [:], bridge: bridge)
-            return nil
-        }
-    }
-
-    func handle(channel: String, data: [String: Any], bridge: ZaloBridge) {
-        switch channel {
-        case Request.download:
-            start(data, bridge: bridge)
-        case Request.abort:
-            guard let key = data["key"].map({ "\($0)" }) else { return }
-            let from = data["downloadFrom"] as? String ?? ""
-            for task in tasks["\(from)|\(key)"]?.values ?? [:].values { task.cancel() }
-        default:
-            break       // concurrency / quota / resp-cache config, ping, scan, priority: nothing to schedule here
-        }
-    }
-
     /// Logout / account switch: nothing may keep writing, and a new account must not inherit verdicts.
     func reset() {
         for entries in tasks.values { for task in entries.values { task.cancel() } }
         tasks.removeAll()
         notFound.removeAll()
-    }
-
-    /// Like the official `add`, a repeated key is not cancelled: each request runs (writes go through temp
-    /// files and an atomic rename, so concurrent duplicates cannot corrupt the destination) and answers
-    /// on its own; only the request's own entry is cleared when it finishes.
-    private func start(_ request: [String: Any], bridge: ZaloBridge) {
-        guard let key = request["key"].map({ "\($0)" }) else { return }
-        let from = request["downloadFrom"] as? String ?? ""
-        let type = request["type"] as? String ?? ""
-        let id = "\(from)|\(key)"
-        let token = UUID()
-        let task = Task { [weak self, weak bridge] in
-            guard let self else { return }
-            let outcome = await self.perform(request)
-            self.tasks[id]?[token] = nil
-            if self.tasks[id]?.isEmpty == true { self.tasks[id] = nil }
-            guard let bridge else { return }
-            bridge.send(Self.channel, [[
-                "channel": Self.responseChannel,
-                "data": [
-                    "downloadError": outcome.failure?.json ?? NSNull(),
-                    "savePath": outcome.savePath ?? NSNull(),
-                    "downloadFrom": from,
-                    "key": request["key"] ?? key,
-                    "type": type,
-                    "isCached": outcome.cached,
-                ] as [String: Any],
-            ]])
-        }
-        tasks[id, default: [:]][token] = task
     }
 
     // MARK: Download
@@ -414,9 +362,51 @@ struct SecureStream: Sendable {
 
     private static func bytes(_ value: Any?) -> Data? {
         if let data = value as? Data { return data }
-        if let text = value as? String { return Data(base64Encoded: text) }
+        if let text = value as? String { return decodeBase64Flexible(text) }
         if let array = value as? [NSNumber] { return Data(array.map { UInt8(truncatingIfNeeded: $0.intValue) }) }
         return nil
+    }
+
+    static func decodeBase64Flexible(_ raw: String) -> Data? {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.contains("%"), let decoded = s.removingPercentEncoding {
+            s = decoded
+        }
+        s = s.replacingOccurrences(of: "-", with: "+")
+             .replacingOccurrences(of: "_", with: "/")
+        let rem = s.count % 4
+        if rem > 0 { s += String(repeating: "=", count: 4 - rem) }
+        return Data(base64Encoded: s, options: .ignoreUnknownCharacters)
+    }
+
+    /// Parses Zalo's client-side `e2esession` base64 key (`_getAesKeyFromBase64` in `pc-dist`):
+    /// - 60 bytes (`version != "2"`): AES-256-GCM linear (`key = [0..<32]`, `iv = [32..<44]`, `tag = [44..<60]`)
+    /// - 48 bytes (`version == "2"` or video 48-byte session): AES-256-CTR 4096-byte block (`key = [0..<32]`, `iv = [32..<48]`)
+    static func parseE2EESession(_ base64: String, version: String? = nil) -> Parsed {
+        guard !base64.isEmpty else { return .none }
+        guard let raw = decodeBase64Flexible(base64) else { return .invalid }
+        if version == "2" || raw.count == 48 {
+            guard raw.count == 48 else { return .invalid }
+            return .stream(SecureStream(
+                algorithm: .ctr,
+                key: Data(raw[0..<32]),
+                iv: Data(raw[32..<48]),
+                tag: nil,
+                block: true,
+                blockSize: 4096
+            ))
+        }
+        guard version == nil || version == "" || version == "1", raw.count == 60 else {
+            return .invalid
+        }
+        return .stream(SecureStream(
+            algorithm: .gcm,
+            key: Data(raw[0..<32]),
+            iv: Data(raw[32..<44]),
+            tag: Data(raw[44..<60]),
+            block: false,
+            blockSize: 4096
+        ))
     }
 
     /// Whole-buffer decryption (photos; bounded by `DownloadManager.photoByteCap`).
@@ -639,5 +629,91 @@ struct GHASH {
 
     func digest() -> [UInt8] {
         (0..<8).map { UInt8(truncatingIfNeeded: yh >> UInt64(56 - 8 * $0)) } + (0..<8).map { UInt8(truncatingIfNeeded: yl >> UInt64(56 - 8 * $0)) }
+    }
+}
+
+/// Parses Zalo CDN URLs carrying client-side `?e2esession=...` / `&version=...` / `?jxlstatus=1` metadata
+/// (`parseE2eeProtocol`, `removeJxlSignature`, and `transcode` in `pc-dist`).
+struct ZaloMediaURL: Sendable {
+    let originalURL: URL
+    /// Clean HTTPS URL sent over the wire (`jxlstatus` and `e2esession`/`version`/`cloudkeyversion` stripped).
+    let networkURL: URL
+    /// Stream cipher parsed from `e2esession` (`.none` when unencrypted, `.invalid` when malformed).
+    let encryption: SecureStream.Parsed
+    /// When `originalURL` is a non-encrypted `/jxl/.../*.jxl` URL, the `/jpg/.../*.jpg` fallback URL.
+    let jxlTranscodedURL: URL?
+
+    static func parse(_ url: URL) -> ZaloMediaURL? {
+        let rawString = url.absoluteString
+        guard !rawString.isEmpty else { return nil }
+
+        // Extract query parameters across both `&` and accidental secondary `?` separators (`...jxl?jxlstatus=1?e2esession=...`).
+        var params: [String: String] = [:]
+        if let firstQ = rawString.firstIndex(of: "?") {
+            let afterQ = rawString[rawString.index(after: firstQ)...]
+            let tail = afterQ.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false).first ?? afterQ
+            for token in tail.split(whereSeparator: { $0 == "&" || $0 == "?" }) {
+                let parts = token.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+                guard let name = parts.first, !name.isEmpty else { continue }
+                let value = parts.count > 1 ? String(parts[1]) : ""
+                params[String(name)] = value
+            }
+        }
+
+        let encryption: SecureStream.Parsed
+        if let sessionVal = params["e2esession"] {
+            if sessionVal.isEmpty {
+                encryption = .invalid
+            } else {
+                encryption = SecureStream.parseE2EESession(sessionVal, version: params["version"])
+            }
+        } else {
+            encryption = .none
+        }
+
+        // Strip `?e2esession...` tail if appended directly, and filter client-only query params.
+        var baseString = rawString
+        if let e2eRange = baseString.range(of: "?e2esession") {
+            baseString = String(baseString[..<e2eRange.lowerBound])
+        }
+        guard var components = URLComponents(string: baseString),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              components.host?.isEmpty == false else {
+            return nil
+        }
+        if scheme == "http" { components.scheme = "https" }
+
+        let strippedKeys: Set<String> = ["jxlstatus", "e2esession", "version", "cloudkeyversion"]
+        if let existingItems = components.percentEncodedQueryItems {
+            let kept = existingItems.filter { !strippedKeys.contains($0.name.lowercased()) }
+            components.percentEncodedQueryItems = kept.isEmpty ? nil : kept
+        }
+        guard let networkURL = components.url else { return nil }
+
+        let jxlTranscodedURL: URL?
+        if case .none = encryption,
+           networkURL.path.lowercased().hasSuffix(".jxl") || params["jxlstatus"] == "1" {
+            var jpgComp = components
+            var p = jpgComp.path
+            if p.contains("/jxl/") {
+                p = p.replacingOccurrences(of: "/jxl/", with: "/jpg/")
+            }
+            if p.lowercased().hasSuffix(".jxl") {
+                p = String(p.dropLast(4)) + ".jpg"
+            }
+            jpgComp.path = p
+            let candidate = jpgComp.url
+            jxlTranscodedURL = (candidate != networkURL) ? candidate : nil
+        } else {
+            jxlTranscodedURL = nil
+        }
+
+        return ZaloMediaURL(
+            originalURL: url,
+            networkURL: networkURL,
+            encryption: encryption,
+            jxlTranscodedURL: jxlTranscodedURL
+        )
     }
 }

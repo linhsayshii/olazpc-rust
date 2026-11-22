@@ -38,7 +38,7 @@ struct RootView: View {
             case .main:
                 MainShellView()
                     .tourCoordinator()
-                    // Composer actions may still ask (official confirm, screenshot "Chia sẻ") after their chat is left.
+                    // Composer actions may still ask (official confirm) after their chat is left.
                     .composerPrompts()
                     .transition(.opacity)
             }

@@ -291,42 +291,32 @@ enum GroupCreateOutcome: Equatable {
 }
 
 extension ZaloEngine {
-    /// The compose's limits, nil while the official services are not ready.
     func groupCreateLimits() async -> GroupCreateLimits? {
-        GroupCreateLimits(json: await evaluateGroupCreate("info", []))
+        GroupCreateLimits()
     }
 
-    /// `groupCreateLimits()`, asked again until the official services answer (the blocked list must not stay unknown).
     func groupCreateLimitsWhenReady(attempts: Int = 20) async -> GroupCreateLimits? {
-        for attempt in 0..<attempts {
-            if let limits = await groupCreateLimits() { return limits }
-            if attempt + 1 < attempts { try? await Task.sleep(for: .seconds(1)) }
-            if Task.isCancelled { return nil }
-        }
-        return nil
+        GroupCreateLimits()
     }
 
-    /// Creates the group in the official client. On success the new (or existing) group is opened in the shell once the conversation
-    /// list knows it; members the server did not add are named in a toast (the official summary message in the chat has the detail).
     func createGroup(name: String, members: [String], avatar: GroupAvatarImage?) async -> GroupCreateOutcome {
-        var input: [String: Any] = ["name": name, "members": members]
-        if let avatar { input["avatar"] = ["data": avatar.base64, "width": avatar.side, "height": avatar.side] }
-        let answer = await raceTimeout(45) { [self] in JSBox(value: await evaluateGroupCreate("create", [input])) }
-        let outcome = answer.map { GroupCreateOutcome(json: $0.value) } ?? .pending(GroupCreateOutcome.noAnswerText)
-        EngineLog.shared.write("group create → \(outcome.logName)")
-        switch outcome {
-        case .created(let id, let failed):
-            await openCreatedGroup(id)
+        do {
+            let box = try await sessionClient.createGroupAPI(name: name, members: members)
+            let d = box.dict["data"] as? [String: Any] ?? [:]
+            let rawGid = JSONLossless.string(d["groupId"])
+            let gid = ZaloWireParser.groupConvId(rawGid)
+            guard !gid.isEmpty else {
+                return .failed(title: nil, message: GroupCreateOutcome.defaultFailure)
+            }
+            let failed = (d["rejectedMembers"] as? [Any] ?? []).map(JSONLossless.string).filter { !$0.isEmpty }
+            refreshContacts()
+            await openCreatedGroup(gid)
             if !failed.isEmpty { conversationUI.show(.neutral, Self.notAddedText(failed.map(contactName(_:)))) }
-        case .exists(let id, let text):
-            await openCreatedGroup(id)
-            conversationUI.show(.neutral, text)
-        case .pending(let text):
-            conversationUI.show(.neutral, text)
-        case .invalid, .failed:
-            break
+            return .created(id: gid, failed: failed)
+        } catch {
+            EngineLog.shared.write("group create failed: \(error.localizedDescription)")
+            return .failed(title: nil, message: GroupCreateOutcome.defaultFailure)
         }
-        return outcome
     }
 
     /// "Chưa thêm được A, B và 3 người khác vào nhóm."
@@ -340,17 +330,10 @@ extension ZaloEngine {
         contacts.friends.first { $0.id == id }?.name ?? "Người dùng Zalo"
     }
 
-    /// Waits (briefly) for the new conversation to reach the list, then shows it.
     private func openCreatedGroup(_ id: String) async {
-        for _ in 0..<50 where !conversations.contains(where: { $0.id == id }) && !contacts.groups.contains(where: { $0.id == id }) {
+        for _ in 0..<30 where !conversations.contains(where: { $0.id == id }) && !contacts.groups.contains(where: { $0.id == id }) {
             try? await Task.sleep(for: .milliseconds(100))
         }
         navigationRequest = id
-    }
-
-    private func evaluateGroupCreate(_ method: String, _ args: [Any]) async -> Any? {
-        guard let data = try? JSONSerialization.data(withJSONObject: args, options: [.fragmentsAllowed]),
-              let json = String(data: data, encoding: .utf8), let host else { return nil }
-        return await host.evaluate("const c = window.__zaloGroupCreate; if (!c || !c.\(method)) return {status: 'not-ready'}; return await c.\(method)(...\(json));")
     }
 }

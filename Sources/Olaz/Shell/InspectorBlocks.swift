@@ -98,11 +98,11 @@ struct SharedMediaTile: View {
         case .photo(let url, let width, let height):
             PhotoView(url: url, width: width, height: height, conversationId: conversationId, messageId: message.id,
                       senderName: message.isMine ? "Bạn" : message.senderName, date: message.date,
-                      encrypted: message.isE2EE || url?.query?.contains("e2esession") == true, tile: side)
+                      encrypted: message.isE2EE || url?.absoluteString.contains("e2esession") == true, tile: side)
         case .video(let thumbnail, let duration, let url):
             VideoThumb(thumbnail: thumbnail, duration: duration, url: url, conversationId: conversationId, messageId: message.id,
                        senderName: message.isMine ? "Bạn" : message.senderName, date: message.date,
-                       encrypted: message.isE2EE || url?.query?.contains("e2esession") == true, tile: side)
+                       encrypted: message.isE2EE || url?.absoluteString.contains("e2esession") == true || thumbnail?.absoluteString.contains("e2esession") == true, tile: side)
         default:
             EmptyView()
         }
@@ -112,12 +112,60 @@ struct SharedMediaTile: View {
 /// A file as a row of an inspector list (the chat's file card).
 struct SharedFileRow: View {
     let message: ChatMessage
+    @Environment(ZaloEngine.self) private var engine: ZaloEngine?
+    @State private var showPreview = false
 
     var body: some View {
         if case .file(let name, let size, let url) = message.kind {
-            FileCard(name: name, size: size, url: url, mine: false)
-                .padding(.horizontal, 10).padding(.vertical, 8)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            FileCard(
+                name: name,
+                size: size,
+                url: url,
+                mine: false,
+                conversationId: message.conversationId,
+                messageId: message.id,
+                externalPreviewTrigger: $showPreview
+            )
+            .padding(.horizontal, 10).padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contextMenu {
+                Button("Xem trước", systemImage: "eye") { showPreview = true }
+                    .disabled(url == nil && message.id.isEmpty)
+                Button("Tải về", systemImage: "arrow.down.circle") {
+                    Task {
+                        let res: FileResolution
+                        if let engine {
+                            res = await engine.resolveFile(conversationId: message.conversationId, messageId: message.id, name: name, url: url)
+                        } else {
+                            res = await ChatFileResolver.resolve(name: name, url: url)
+                        }
+                        if case .ready(let staged) = res,
+                           let saved = try? ChatFileResolver.saveToDownloads(staged: staged, displayName: name),
+                           let engine {
+                            let key = engine.fileDownloadKey(conversationId: message.conversationId, messageId: message.id, url: url, name: name)
+                            engine.downloadedFilePaths[key] = saved
+                        }
+                    }
+                }
+                .disabled(url == nil && message.id.isEmpty)
+                Button("Lưu về máy…", systemImage: "folder") {
+                    Task {
+                        let res: FileResolution
+                        if let engine {
+                            res = await engine.resolveFile(conversationId: message.conversationId, messageId: message.id, name: name, url: url)
+                        } else {
+                            res = await ChatFileResolver.resolve(name: name, url: url)
+                        }
+                        if case .ready(let staged) = res,
+                           case .success(let chosen?) = await ChatFileSavePanel.saveAs(staged: staged, displayName: name),
+                           let engine {
+                            let key = engine.fileDownloadKey(conversationId: message.conversationId, messageId: message.id, url: url, name: name)
+                            engine.downloadedFilePaths[key] = chosen
+                        }
+                    }
+                }
+                .disabled(url == nil && message.id.isEmpty)
+            }
         }
     }
 }

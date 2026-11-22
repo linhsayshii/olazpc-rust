@@ -28,7 +28,6 @@ struct CloudListColumn: View {
                 row("Cài đặt zCloud", "gearshape.fill", .settings)
             }
         }
-        .columnTitle("zCloud", subtitle: cloud.plan.map { "\(CloudFormat.size($0.usage + $0.family)) / \(CloudFormat.size($0.quota))" } ?? "")
         .task { engine.refreshCloud() }
         // Free accounts only have "Cloud của tôi": leave the hidden media screens.
         .onChange(of: cloud.hasMediaScreens, initial: true) { _, hasMedia in

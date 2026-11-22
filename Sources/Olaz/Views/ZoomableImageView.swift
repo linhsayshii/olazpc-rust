@@ -229,6 +229,15 @@ final class ZoomScrollView: NSScrollView {
         let clamped = min(max(target, minMagnification), maxMagnification)
         let center = documentPoint ?? NSPoint(x: contentView.bounds.midX, y: contentView.bounds.midY)
         followsFit = false
+        guard window != nil else {
+            setMagnification(clamped, centeredAt: center)
+            if refit {
+                followsFit = true
+                applyFit()
+            }
+            scheduleSync()
+            return
+        }
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.22
             context.allowsImplicitAnimation = true

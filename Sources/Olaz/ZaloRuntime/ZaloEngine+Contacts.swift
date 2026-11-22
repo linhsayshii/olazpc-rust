@@ -84,32 +84,238 @@ struct ContactsState: Equatable {
 extension ZaloEngine {
     // MARK: Actions
 
-    /// Re-reads friend requests from the server (as opening the official invitation page does).
-    func refreshContacts() { callChat("refresh", object: "__zaloContacts") }
+    func refreshContacts() {
+        Task { [weak self] in
+            await self?.performContactsSync()
+        }
+    }
 
-    func acceptFriendRequest(_ id: String) { callChat("accept", id, object: "__zaloContacts") }
-    func declineFriendRequest(_ id: String) { callChat("decline", id, object: "__zaloContacts") }
-    func cancelFriendRequest(_ id: String) { callChat("cancel", id, object: "__zaloContacts") }
+    func performContactsSync() async {
+        contacts.loadingRequests = true
+        defer { self.contacts.loadingRequests = false }
 
-    /// Looks a user up by phone number through the official find-user API.
+        async let friendsResp = try? sessionClient.fetchFriends(page: 1, count: 20000)
+        async let groupsResp = try? sessionClient.fetchGroupsList()
+        async let sentResp = try? sessionClient.fetchSentFriendRequests()
+        async let receivedResp = try? sessionClient.fetchReceivedFriendRequests()
+
+        let (fBox, gBox, sBox, rBox) = await (friendsResp, groupsResp, sentResp, receivedResp)
+        var next = contacts
+
+        if let fBox {
+            var mappedFriends: [ContactsState.Friend] = []
+            var friendGlobalMap: [String: String] = [:]
+            for row in fBox.array {
+                let uid = ZaloWireParser.stripUserPrefix(JSONLossless.string(row["userId"] ?? row["uid"] ?? row["id"]))
+                guard !uid.isEmpty else { continue }
+                let globalId = JSONLossless.string(row["globalId"])
+                if !globalId.isEmpty {
+                    friendGlobalMap[uid] = globalId
+                }
+                let display = JSONLossless.string(row["displayName"] ?? row["name"] ?? row["zaloName"])
+                let zaloName = JSONLossless.string(row["zaloName"])
+                let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
+                let lastAct = (JSONLossless.int64(row["lastActionTime"]).map(Double.init)) ?? 0
+                let norm: [String: Any] = [
+                    "id": uid,
+                    "name": display.isEmpty ? zaloName : display,
+                    "zaloName": zaloName,
+                    "avatar": avt,
+                    "lastActive": lastAct,
+                    "online": (JSONLossless.int64(row["isActivePC"]) == 1) || (row["online"] as? Bool == true)
+                ]
+                if let friend = Self.contactFriend(norm) {
+                    mappedFriends.append(friend)
+                }
+            }
+            if !friendGlobalMap.isEmpty {
+                cachedFriendGlobalIds.merge(friendGlobalMap) { _, new in new }
+            }
+            next.friends = mappedFriends.sorted {
+                if $0.section != $1.section {
+                    if $0.section == "#" { return false }
+                    if $1.section == "#" { return true }
+                    return $0.section < $1.section
+                }
+                return $0.sortKey.localizedStandardCompare($1.sortKey) == .orderedAscending
+            }
+            next.friendsLoaded = true
+        }
+
+        if let gBox {
+            let infoMap = (gBox.dict["gridInfoMap"] as? [String: Any]) ?? [:]
+            var mappedGroups: [ContactsState.Group] = []
+            var groupDetailCache: [String: [String: Any]] = [:]
+            for (rawId, rawInfo) in infoMap {
+                guard let info = rawInfo as? [String: Any] else { continue }
+                let cleanId = ZaloWireParser.cleanGroupId(rawId)
+                guard !cleanId.isEmpty else { continue }
+                groupDetailCache[cleanId] = info
+                let convId = ZaloWireParser.groupConvId(cleanId)
+                let name = JSONLossless.string(info["name"])
+                let avt = JSONLossless.string(info["avt"] ?? info["fullAvt"])
+                let members = Int(JSONLossless.int64(info["totalMember"] ?? info["total"])
+                    ?? Int64((info["memVerList"] as? [Any])?.count ?? (info["memIds"] as? [Any])?.count ?? 0))
+                if let grp = Self.contactGroup([
+                    "id": convId,
+                    "name": name,
+                    "avatar": avt,
+                    "members": members
+                ]) {
+                    mappedGroups.append(grp)
+                }
+            }
+            cachedGroupDetails = groupDetailCache
+            next.groups = mappedGroups.sorted { $0.sortKey.localizedStandardCompare($1.sortKey) == .orderedAscending }
+            next.groupsLoaded = true
+        }
+
+        if let rBox {
+            cachedReceivedRequestsRaw = rBox.array
+            next.received = rBox.array.compactMap { row -> ContactsState.FriendRequest? in
+                let uid = ZaloWireParser.stripUserPrefix(JSONLossless.string(row["userId"] ?? row["uid"] ?? row["fromUid"]))
+                guard !uid.isEmpty else { return nil }
+                return Self.contactRequest([
+                    "id": uid,
+                    "name": JSONLossless.string(row["displayName"] ?? row["zaloName"]),
+                    "avatar": JSONLossless.string(row["avatar"] ?? row["avt"]),
+                    "message": JSONLossless.string(row["message"] ?? row["msg"]),
+                    "time": JSONLossless.int64(row["time"] ?? row["ts"]) ?? 0
+                ])
+            }
+            next.pendingRequestCount = next.received.count
+        }
+
+        if let sBox {
+            cachedSentRequestsRaw = sBox.array
+            next.sent = sBox.array.compactMap { row -> ContactsState.FriendRequest? in
+                let uid = ZaloWireParser.stripUserPrefix(JSONLossless.string(row["userId"] ?? row["uid"] ?? row["toUid"]))
+                guard !uid.isEmpty else { return nil }
+                return Self.contactRequest([
+                    "id": uid,
+                    "name": JSONLossless.string(row["displayName"] ?? row["zaloName"]),
+                    "avatar": JSONLossless.string(row["avatar"] ?? row["avt"]),
+                    "message": JSONLossless.string(row["message"] ?? row["msg"]),
+                    "time": JSONLossless.int64(row["time"] ?? row["ts"]) ?? 0
+                ])
+            }
+        }
+
+        if next != contacts { contacts = next }
+        if let openId = openConversationId {
+            updateCallGateForConversation(openId)
+        }
+        ensureKnownContactsInConversations()
+        rebuildConversationFlags()
+        rebuildConversationExtras()
+    }
+
+    func acceptFriendRequest(_ id: String) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await sessionClient.acceptFriendRequestAPI(uid: id)
+                bumpContactsNotice(ok: true, text: "Đã chấp nhận lời mời kết bạn.")
+                refreshContacts()
+            } catch {
+                bumpContactsNotice(ok: false, text: "Không thể chấp nhận lời mời.")
+            }
+        }
+    }
+
+    func declineFriendRequest(_ id: String) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await sessionClient.rejectFriendRequestAPI(uid: id)
+                contacts.received.removeAll { $0.id == id }
+                contacts.pendingRequestCount = contacts.received.count
+                bumpContactsNotice(ok: true, text: "Đã từ chối lời mời kết bạn.")
+            } catch {
+                bumpContactsNotice(ok: false, text: "Không thể từ chối lời mời.")
+            }
+        }
+    }
+
+    func cancelFriendRequest(_ id: String) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await sessionClient.cancelFriendRequestAPI(uid: id)
+                contacts.sent.removeAll { $0.id == id }
+                bumpContactsNotice(ok: true, text: "Đã thu hồi lời mời kết bạn.")
+            } catch {
+                bumpContactsNotice(ok: false, text: "Không thể thu hồi lời mời.")
+            }
+        }
+    }
+
     func findFriend(byPhone phone: String) {
         let trimmed = phone.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         contacts.search = ContactsState.Search(status: .searching)
-        callChat("search", trimmed, object: "__zaloContacts")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let resp = try await sessionClient.searchFriendByPhone(trimmed)
+                let d = (resp.dict["data"] as? [String: Any]) ?? resp.dict
+                let uid = ZaloWireParser.stripUserPrefix(JSONLossless.string(d["uid"] ?? d["userId"]))
+                guard !uid.isEmpty else {
+                    contacts.search = ContactsState.Search(status: .error, error: "Không tìm thấy người dùng với số điện thoại này.")
+                    return
+                }
+                let isSelf = uid == profile?.userId
+                let isFriend = contacts.friends.contains(where: { $0.id == uid })
+                let requested = contacts.sent.contains(where: { $0.id == uid })
+                let requesting = contacts.received.contains(where: { $0.id == uid })
+                let myName = profile?.displayName ?? "tôi"
+                let found = Self.contactSearch([
+                    "status": "found",
+                    "user": [
+                        "id": uid,
+                        "name": JSONLossless.string(d["display_name"] ?? d["displayName"] ?? d["zalo_name"]),
+                        "zaloName": JSONLossless.string(d["zalo_name"] ?? d["zaloName"]),
+                        "avatar": JSONLossless.string(d["avatar"]),
+                        "bio": JSONLossless.string(d["status"]),
+                        "isFriend": isFriend,
+                        "isSelf": isSelf,
+                        "requested": requested,
+                        "requesting": requesting,
+                        "defaultMessage": "Xin chào, mình là \(myName).",
+                        "maxMessage": 150
+                    ]
+                ])
+                contacts.search = found
+            } catch {
+                contacts.search = ContactsState.Search(status: .error, error: error.localizedDescription)
+            }
+        }
     }
 
     func resetFriendSearch() {
         if contacts.search != ContactsState.Search() { contacts.search = ContactsState.Search() }
-        callChat("resetSearch", object: "__zaloContacts")
     }
 
     func sendFriendRequest(to id: String, message: String) {
-        callChat("sendRequest", id, message, object: "__zaloContacts")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await sessionClient.sendFriendRequestAPI(toUid: id, message: message)
+                bumpContactsNotice(ok: true, text: "Đã gửi lời mời kết bạn.")
+                refreshContacts()
+            } catch {
+                bumpContactsNotice(ok: false, text: "Không thể gửi lời mời kết bạn.")
+            }
+        }
     }
 
     /// Opens the 1-1 or group conversation with `id` (the shell observes `navigationRequest`).
     func openContactConversation(_ id: String) { navigationRequest = id }
+
+    private func bumpContactsNotice(ok: Bool, text: String) {
+        let nextSeq = (contacts.notice?.seq ?? 0) + 1
+        contacts.notice = ContactsState.Notice(seq: nextSeq, ok: ok, text: text)
+    }
 
     // MARK: State
 

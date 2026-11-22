@@ -44,7 +44,7 @@ actor MediaLoader {
 
     /// Hosts for which the DoH fallback is allowed (so arbitrary hosts embedded in message content
     /// cannot bypass the user's own DNS / hosts-file blocking).
-    static let dohHostSuffixes = ["zadn.vn", "zdn.vn", "zalo.me", "zaloapp.com", "zingcdn.me", "zalo.vn", "zing.vn"]
+    static let dohHostSuffixes = ["zadn.vn", "zdn.vn", "dlfl.vn", "zalo.me", "zaloapp.com", "zingcdn.me", "zalo.vn", "zing.vn"]
 
     nonisolated static func isZaloCDN(_ host: String) -> Bool {
         let host = host.lowercased()
@@ -243,9 +243,16 @@ actor MediaLoader {
             return try await join(key: (cache ? "i:" : "i!:") + key) { [self] in
                 do {
                     let data = try await self.data(for: url)
-                    guard let decoded = await Task.detached(priority: .userInitiated, operation: {
+                    var decoded = await Task.detached(priority: .userInitiated, operation: {
                         Self.decode(data, maxPixelSize: pixels)
-                    }).value else { throw LoadError.undecodable }
+                    }).value
+                    if decoded == nil, let jpgURL = ZaloMediaURL.parse(url)?.jxlTranscodedURL,
+                       let fallbackData = try? await self.data(for: jpgURL) {
+                        decoded = await Task.detached(priority: .userInitiated, operation: {
+                            Self.decode(fallbackData, maxPixelSize: pixels)
+                        }).value
+                    }
+                    guard let decoded else { throw LoadError.undecodable }
                     if cache {
                         let cost = Int(decoded.size.width * decoded.size.height) * 4
                         Self.memory.setObject(CachedImage(decoded), forKey: key as NSString, cost: cost)
@@ -349,16 +356,49 @@ actor MediaLoader {
                 try Data(contentsOf: url, options: .mappedIfSafe)
             }.value
         }
-        guard let url = Self.normalized(url) else { throw LoadError.badURL }
-        if let cached = urlCache.cachedResponse(for: URLRequest(url: url)) { return cached.data }
-        return try await join(key: "d:" + url.absoluteString) { [self] in
-            try await self.withSlot {
-                try await Self.withDeadline(deadline) {
-                    let fetched = try await self.download(url, redirectsLeft: 3)
-                    if fetched.framed, fetched.finalURL != url {
-                        await self.store(fetched.data, for: url, contentType: nil)     // also under the original URL
+        guard let media = ZaloMediaURL.parse(url) else { throw LoadError.badURL }
+        switch media.encryption {
+        case .invalid:
+            throw LoadError.undecodable
+        case .stream(let cipher):
+            let sep = media.networkURL.query == nil ? "?" : "&"
+            let cacheURL = URL(string: media.networkURL.absoluteString + sep + "_olaz_dec=" + Self.stableHash(media.originalURL.absoluteString)) ?? media.networkURL
+            if let cached = urlCache.cachedResponse(for: URLRequest(url: cacheURL)) { return cached.data }
+            return try await join(key: "d:dec:" + media.originalURL.absoluteString) { [self] in
+                try await self.withSlot {
+                    try await Self.withDeadline(deadline) {
+                        let fetched = try await self.download(media.networkURL, redirectsLeft: 3, storeInCache: false)
+                        guard let plain = try? cipher.decrypt(fetched.data) else {
+                            throw LoadError.undecodable
+                        }
+                        if fetched.framed {
+                            await self.store(plain, for: cacheURL, contentType: nil)
+                        }
+                        return plain
                     }
-                    return fetched.data
+                }
+            }
+        case .none:
+            let cleanURL = media.networkURL
+            if let cached = urlCache.cachedResponse(for: URLRequest(url: cleanURL)) { return cached.data }
+            return try await join(key: "d:" + cleanURL.absoluteString) { [self] in
+                try await self.withSlot {
+                    try await Self.withDeadline(deadline) {
+                        let fetched: Fetched
+                        do {
+                            fetched = try await self.download(cleanURL, redirectsLeft: 3, storeInCache: true)
+                        } catch {
+                            if let jpgURL = media.jxlTranscodedURL {
+                                fetched = try await self.download(jpgURL, redirectsLeft: 3, storeInCache: true)
+                            } else {
+                                throw error
+                            }
+                        }
+                        if fetched.framed, fetched.finalURL != cleanURL {
+                            await self.store(fetched.data, for: cleanURL, contentType: nil)
+                        }
+                        return fetched.data
+                    }
                 }
             }
         }
@@ -534,16 +574,18 @@ actor MediaLoader {
         return parts.url
     }
 
-    private func download(_ url: URL, redirectsLeft: Int) async throws -> Fetched {
+    private func download(_ url: URL, redirectsLeft: Int, storeInCache: Bool = true) async throws -> Fetched {
         guard let host = url.host?.lowercased() else { throw LoadError.badURL }
         try failIfDead(host)
         return try await withDNSFallback(host: host, doh: {
-            try await self.fetchViaDoHFetched(url, redirectsLeft: redirectsLeft)
+            try await self.fetchViaDoHFetched(url, redirectsLeft: redirectsLeft, storeInCache: storeInCache)
         }, system: {
             let (data, response) = try await self.session.data(for: URLRequest(url: url))
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard (200..<300).contains(status) else { throw LoadError.http(status) }
-            self.store(data, for: url, contentType: response.mimeType)
+            if storeInCache {
+                self.store(data, for: url, contentType: response.mimeType)
+            }
             return Fetched(data: data, framed: true, finalURL: url)
         })
     }
@@ -670,7 +712,7 @@ actor MediaLoader {
         try await fetchViaDoHFetched(url, redirectsLeft: redirectsLeft).data
     }
 
-    private func fetchViaDoHFetched(_ url: URL, redirectsLeft: Int) async throws -> Fetched {
+    private func fetchViaDoHFetched(_ url: URL, redirectsLeft: Int, storeInCache: Bool = true) async throws -> Fetched {
         guard let host = url.host?.lowercased(), url.scheme == "https", Self.isZaloCDN(host) else { throw LoadError.badURL }
         let addresses = try await resolver.resolve(host)
         let response: PinnedHTTPSClient.Response
@@ -684,10 +726,10 @@ actor MediaLoader {
            let location = response.headers["location"],
            let next = URL(string: location, relativeTo: url)?.absoluteURL, redirectsLeft > 0,
            let normalized = Self.normalized(next) {
-            return try await download(normalized, redirectsLeft: redirectsLeft - 1)
+            return try await download(normalized, redirectsLeft: redirectsLeft - 1, storeInCache: storeInCache)
         }
         guard (200..<300).contains(response.status) else { throw LoadError.http(response.status) }
-        if response.framed { store(response.body, for: url, contentType: response.headers["content-type"]) }
+        if storeInCache, response.framed { store(response.body, for: url, contentType: response.headers["content-type"]) }
         return Fetched(data: response.body, framed: response.framed, finalURL: url)
     }
 
@@ -739,19 +781,44 @@ actor MediaLoader {
         directory.appendingPathComponent(".\(UUID().uuidString).part")
     }
 
+    private nonisolated static func cachedFileLocation(for media: ZaloMediaURL, in directory: URL) -> URL {
+        let ext = media.networkURL.pathExtension.filter { $0.isLetter || $0.isNumber }.prefix(8)
+        let seed: String
+        if case .stream = media.encryption {
+            seed = "dec1:" + media.originalURL.absoluteString
+        } else {
+            seed = media.networkURL.absoluteString
+        }
+        let name = Self.stableHash(seed) + (ext.isEmpty ? "" : "." + ext)
+        return directory.appendingPathComponent(name)
+    }
+
+    func evictCachedFile(for url: URL) {
+        guard !url.isFileURL, let media = ZaloMediaURL.parse(url) else { return }
+        let file = Self.cachedFileLocation(for: media, in: filesDirectory)
+        try? FileManager.default.removeItem(at: file)
+        forgetFailures(for: url)
+    }
+
     /// Downloads `url` through the same DoH-capable path and stores it under
     /// Caches/Olaz/files/<hash>.<ext> (reused when present). Returns the file URL.
     ///
     /// The body is streamed to a temporary file (no in-memory buffering, no 50 MB cap; the limit is
-    /// `maxFileBytes`) and only renamed to its final name once complete, so a truncated or cancelled
-    /// download never leaves a partial file behind. There is no total deadline, only a 30 s stall timeout.
-    /// `progress` (called on arbitrary threads, 0...1) is optional.
+    /// `maxFileBytes`), decrypted on disk when `url` carries `?e2esession=...`, and only renamed to its
+    /// final name once complete, so a truncated or cancelled download never leaves a partial file behind.
+    /// There is no total deadline, only a 30 s stall timeout. `progress` (called on arbitrary threads, 0...1) is optional.
     func localFile(for url: URL, progress: (@Sendable (Double) -> Void)? = nil) async throws -> URL {
-        guard let normalized = Self.normalized(url) else { throw LoadError.badURL }
+        if url.isFileURL {
+            guard Self.isAllowedLocalFile(url), FileManager.default.fileExists(atPath: url.path) else {
+                throw LoadError.badURL
+            }
+            progress?(1)
+            return url
+        }
+        guard let media = ZaloMediaURL.parse(url) else { throw LoadError.badURL }
+        if case .invalid = media.encryption { throw LoadError.undecodable }
         let directory = filesDirectory
-        let ext = normalized.pathExtension.filter { $0.isLetter || $0.isNumber }.prefix(8)
-        let name = Self.stableHash(normalized.absoluteString) + (ext.isEmpty ? "" : "." + ext)
-        let file = directory.appendingPathComponent(name)
+        let file = Self.cachedFileLocation(for: media, in: directory)
         startMaintenanceIfNeeded()
         if FileManager.default.fileExists(atPath: file.path) {
             try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)   // LRU use
@@ -762,11 +829,35 @@ actor MediaLoader {
             let result = try await join(key: "f:" + file.path, observer: progress) { [self] hub -> URL in
                 do {
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                    let temp = try await self.fetchFileToTemp(normalized, directory: directory, redirectsLeft: 3, progress: hub)
-                    defer { try? FileManager.default.removeItem(at: temp) }     // no-op once moved
+                    let rawTemp: URL
+                    do {
+                        rawTemp = try await self.fetchFileToTemp(media.networkURL, directory: directory, redirectsLeft: 3, progress: hub)
+                    } catch {
+                        if let jpgURL = media.jxlTranscodedURL {
+                            rawTemp = try await self.fetchFileToTemp(jpgURL, directory: directory, redirectsLeft: 3, progress: hub)
+                        } else {
+                            throw error
+                        }
+                    }
+                    var temp = rawTemp
+                    defer {
+                        try? FileManager.default.removeItem(at: rawTemp)
+                        if temp != rawTemp { try? FileManager.default.removeItem(at: temp) }
+                    }
+                    if case .stream(let cipher) = media.encryption {
+                        let decryptedTemp = Self.partFile(in: directory)
+                        do {
+                            try cipher.decryptFile(at: rawTemp, to: decryptedTemp)
+                        } catch {
+                            try? FileManager.default.removeItem(at: decryptedTemp)
+                            throw LoadError.undecodable
+                        }
+                        try? FileManager.default.removeItem(at: rawTemp)
+                        temp = decryptedTemp
+                    }
                     if FileManager.default.fileExists(atPath: file.path) { return file }   // lost a race: other copy is complete
                     // Quarantine before the final name appears, so the file is never visible without it.
-                    Self.applyQuarantine(to: temp, origin: normalized)
+                    Self.applyQuarantine(to: temp, origin: media.networkURL)
                     Self.syncToDisk(temp)
                     do {
                         try FileManager.default.moveItem(at: temp, to: file)    // same directory: atomic rename

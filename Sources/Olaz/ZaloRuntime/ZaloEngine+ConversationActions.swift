@@ -1,10 +1,8 @@
+import CryptoKit
 import Foundation
 
-// Conversation context-menu actions: pin / unpin, "Khác" / "Ưu tiên", mark read / unread, hide / unhide, delete.
-// Bridged to `HostScripts/conversation-actions-adapter.js` (`window.__zaloConvActions`; posts {page:'main', convActions:{…}}).
-// The official menu is class `ae` (lazy bundle ~16274997–16296500); every action runs the service that menu item calls,
-// see the adapter header for the entry points. Nothing here fires on its own: each call follows a click.
-// Conversation ids, names and PINs never go to the log.
+// Native conversation context-menu actions: pin / unpin, "Khác" / "Ưu tiên", mark read / unread, hide / unhide, delete.
+// Backed by Zalo Web APIs + SQLite3 local state. Conversation ids, names and PINs never go to the log.
 
 /// Per-conversation facts of the official menu (`render()`); the bit values are the adapter's `F` table.
 struct ConversationActionFlags: OptionSet, Sendable {
@@ -278,114 +276,233 @@ enum ConversationActionText {
 extension ZaloEngine {
     // MARK: Pin
 
-    /// "Ghim hội thoại". A full tab opens the board instead (`POP_PINNED_CONVERSATION`).
     func pinConversation(_ id: String) {
-        Task {
-            let result = await callConversationAction("pin", [id])
-            if result.full { conversationPrompt = .pinBoard(id: id) } else { report(result) }
+        Task { [weak self] in
+            guard let self else { return }
+            let pinnedCount = cachedPinnedIds.count
+            if !cachedPinnedIds.contains(id), pinnedCount >= 10 {
+                conversationPrompt = .pinBoard(id: id)
+                return
+            }
+            do {
+                try await sessionClient.updatePinnedConversation(convId: id, pinned: true)
+                cachedPinnedIds.insert(id)
+                applyPinStatus(id: id, pinned: true)
+                try? await sqliteStore?.setPreferenceStrings(key: "pinnedIds", value: Array(cachedPinnedIds))
+                try? await sqliteStore?.setConversationPinned(id: id, pinned: true)
+                report(ConversationActionResult(ok: true, text: "Đã ghim hội thoại"))
+            } catch {
+                report(ConversationActionResult(ok: false, text: "Ghim hội thoại không thành công."))
+            }
         }
     }
 
     func unpinConversation(_ id: String) {
-        Task { report(await callConversationAction("unpin", [id])) }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await sessionClient.updatePinnedConversation(convId: id, pinned: false)
+                cachedPinnedIds.remove(id)
+                applyPinStatus(id: id, pinned: false)
+                try? await sqliteStore?.setPreferenceStrings(key: "pinnedIds", value: Array(cachedPinnedIds))
+                try? await sqliteStore?.setConversationPinned(id: id, pinned: false)
+                report(ConversationActionResult(ok: true, text: "Đã bỏ ghim hội thoại"))
+            } catch {
+                report(ConversationActionResult(ok: false, text: "Bỏ ghim không thành công."))
+            }
+        }
+    }
+
+    private func applyPinStatus(id: String, pinned: Bool) {
+        var list = conversations
+        if let idx = list.firstIndex(where: { $0.id == id }) {
+            list[idx].pinned = pinned
+        }
+        sortConversations(&list)
+        conversations = list
+        rebuildConversationFlags()
+        rebuildConversationExtras()
     }
 
     func pinBoard(for id: String) async -> PinBoard? {
-        PinBoard(json: await callConversationActionRaw("pinBoard", [id]))
+        let items = conversations.filter { cachedPinnedIds.contains($0.id) || $0.pinned }.map(\.id)
+        let limit = 10
+        let need = max(1, items.count - limit + 1)
+        return PinBoard(tab: 0, limit: limit, total: items.count, need: need, items: items)
     }
 
-    /// Board confirm: unpin the chosen ones, then pin `id`.
     func pinReplacing(_ unpinIds: [String], pinning id: String) async -> ConversationActionResult {
-        let result = await callConversationAction("pinReplacing", [unpinIds, id])
-        report(result)
-        return result
+        do {
+            for old in unpinIds {
+                try await sessionClient.updatePinnedConversation(convId: old, pinned: false)
+                cachedPinnedIds.remove(old)
+                applyPinStatus(id: old, pinned: false)
+                try? await sqliteStore?.setConversationPinned(id: old, pinned: false)
+            }
+            try await sessionClient.updatePinnedConversation(convId: id, pinned: true)
+            cachedPinnedIds.insert(id)
+            applyPinStatus(id: id, pinned: true)
+            try? await sqliteStore?.setPreferenceStrings(key: "pinnedIds", value: Array(cachedPinnedIds))
+            try? await sqliteStore?.setConversationPinned(id: id, pinned: true)
+            let res = ConversationActionResult(ok: true, text: "Đã ghim hội thoại")
+            report(res)
+            return res
+        } catch {
+            let res = ConversationActionResult(ok: false, text: "Ghim hội thoại không thành công.")
+            report(res)
+            return res
+        }
     }
 
     // MARK: Archive
 
     func moveConversation(_ id: String, toOther: Bool) {
-        Task { report(await callConversationAction(toOther ? "archive" : "unarchive", [id], timeout: 45)) }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await sessionClient.updateArchivedChat(convId: id, archived: toOther)
+                if toOther { cachedArchivedIds.insert(id) } else { cachedArchivedIds.remove(id) }
+                try? await sqliteStore?.setPreferenceStrings(key: "archivedIds", value: Array(cachedArchivedIds))
+                rebuildConversationFlags()
+                rebuildConversationExtras()
+                let text = toOther ? "Đã chuyển sang mục Khác" : "Đã chuyển về Hộp thư đến"
+                report(ConversationActionResult(ok: true, text: text, neutral: toOther))
+            } catch {
+                report(ConversationActionResult(ok: false, text: "Không thể chuyển cuộc trò chuyện."))
+            }
+        }
     }
 
     // MARK: Delete
 
-    /// "Xóa hội thoại": asks for the confirmation (official `STR_CONV_DEL_CONFIRM_*`), `confirmDelete` runs it.
     func requestDeleteConversation(_ id: String) {
         conversationPrompt = .delete(id: id)
     }
 
     func confirmDeleteConversation(_ id: String) {
-        Task {
-            let result = await callConversationAction("deleteConversation", [id], timeout: 60)
-            if result.ok { conversationUI.remove([id]) }
-            report(result)
+        let lastCliId = messages[id]?.last?.id ?? ""
+        Task { [weak self] in
+            guard let self else { return }
+            await sessionClient.deleteConversationAPI(convId: id, lastCliMsgId: lastCliId)
+            try? await sqliteStore?.deleteConversation(id: id)
+            conversations.removeAll { $0.id == id }
+            messages[id] = nil
+            cachedPinnedIds.remove(id)
+            cachedArchivedIds.remove(id)
+            cachedUnreadMarks.remove(id)
+            conversationUI.remove([id])
+            rebuildConversationFlags()
+            rebuildConversationExtras()
+            report(ConversationActionResult(ok: true, text: "Đã xóa hội thoại"))
         }
     }
 
     // MARK: Read / unread
 
     func markConversationRead(_ id: String) {
-        Task { report(await callConversationAction("markRead", [id])) }
+        markRead(id)
     }
 
     func markConversationUnread(_ id: String) {
-        Task { report(await callConversationAction("markUnread", [id])) }
+        cachedUnreadMarks.insert(id)
+        rebuildConversationFlags()
+        rebuildConversationExtras()
+        Task {
+            try? await sqliteStore?.setPreferenceStrings(key: "unreadMarks", value: Array(cachedUnreadMarks))
+            try? await sessionClient.setUnreadMarkAPI(convId: id, unread: true)
+        }
     }
 
-    // MARK: Hidden chats (PIN goes straight into the official calls)
+    // MARK: Hidden chats (local SHA-256 PIN + SQLite + best-effort server sync)
+
+    private static func hashPIN(_ pin: String) -> String {
+        let digest = SHA256.hash(data: Data("olaz-hidden-pin:\(pin)".utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
 
     func checkHiddenChatPIN(_ pin: String) async -> Bool {
-        ConversationActionResult(json: await callConversationActionRaw("checkPin", [pin])).ok
+        guard let storedHash = try? await sqliteStore?.getPreferenceString(key: "hiddenPinHash"), !storedHash.isEmpty else {
+            return false
+        }
+        return Self.hashPIN(pin) == storedHash
     }
 
     func hideConversation(_ id: String, pin: String) async -> ConversationActionResult {
-        let result = await callConversationAction("hide", [id, pin])
-        if result.ok { conversationUI.remove([id]) }
-        return result
+        guard await checkHiddenChatPIN(pin) else {
+            return ConversationActionResult(ok: false, text: "Mã PIN không đúng.", badPIN: true)
+        }
+        conversationActions.hiddenIds.insert(id)
+        try? await sqliteStore?.setPreferenceStrings(key: "hiddenIds", value: Array(conversationActions.hiddenIds))
+        await sessionClient.setHiddenConversationAPI(convId: id, hidden: true)
+        conversationUI.remove([id])
+        rebuildConversationFlags()
+        rebuildConversationExtras()
+        return ConversationActionResult(ok: true, text: "Đã ẩn trò chuyện")
     }
 
     func hideConversation(_ id: String, settingNewPIN pin: String) async -> ConversationActionResult {
-        let result = await callConversationAction("hideWithNewPin", [id, pin])
-        if result.ok { conversationUI.remove([id]) }
-        return result
+        if let existing = try? await sqliteStore?.getPreferenceString(key: "hiddenPinHash"), !existing.isEmpty {
+            conversationActions.hasHiddenPIN = true
+            return ConversationActionResult(ok: false, text: "Mã PIN đã được thiết lập trước đó.", pinExists: true)
+        }
+        let hash = Self.hashPIN(pin)
+        try? await sqliteStore?.setPreferenceString(key: "hiddenPinHash", value: hash)
+        conversationActions.hasHiddenPIN = true
+        conversationActions.hiddenIds.insert(id)
+        try? await sqliteStore?.setPreferenceStrings(key: "hiddenIds", value: Array(conversationActions.hiddenIds))
+        await sessionClient.setHiddenConversationAPI(convId: id, hidden: true)
+        conversationUI.remove([id])
+        rebuildConversationFlags()
+        rebuildConversationExtras()
+        return ConversationActionResult(ok: true, text: "Đã ẩn trò chuyện")
     }
 
-    /// `pin` nil = the conversation was opened with the PIN already (official `UNHIDE_CONV`, no PIN field).
     func unhideConversation(_ id: String, pin: String?) async -> ConversationActionResult {
-        await callConversationAction("unhide", [id, pin])
+        if let pin, !(await checkHiddenChatPIN(pin)) {
+            return ConversationActionResult(ok: false, text: "Mã PIN không đúng.", badPIN: true)
+        }
+        conversationActions.hiddenIds.remove(id)
+        try? await sqliteStore?.setPreferenceStrings(key: "hiddenIds", value: Array(conversationActions.hiddenIds))
+        await sessionClient.setHiddenConversationAPI(convId: id, hidden: false)
+        rebuildConversationFlags()
+        rebuildConversationExtras()
+        return ConversationActionResult(ok: true, text: "Đã bỏ ẩn trò chuyện")
     }
 
     func setHiddenChatPIN(_ pin: String, changed: Bool) async -> ConversationActionResult {
-        await callConversationAction("setPin", [pin, changed])
+        let hash = Self.hashPIN(pin)
+        try? await sqliteStore?.setPreferenceString(key: "hiddenPinHash", value: hash)
+        conversationActions.hasHiddenPIN = true
+        return ConversationActionResult(ok: true, text: changed ? "Đã đổi mã PIN" : "Đã cài mã PIN")
     }
 
-    /// Removes the PIN and every hidden chat: they all leave the view and nothing stays unlocked.
     func resetHiddenChatPIN() async -> ConversationActionResult {
         let formerlyHidden = conversationActions.hiddenIds
-        let result = await callConversationAction("resetPin", [], timeout: 60)
-        if result.ok {
-            conversationUI.remove(formerlyHidden)
-            conversationUI.relock()
-        }
-        return result
+        conversationActions.hiddenIds.removeAll()
+        conversationActions.hasHiddenPIN = false
+        try? await sqliteStore?.deletePreference(key: "hiddenPinHash")
+        try? await sqliteStore?.setPreferenceStrings(key: "hiddenIds", value: [])
+        conversationUI.remove(formerlyHidden)
+        conversationUI.relock()
+        rebuildConversationFlags()
+        rebuildConversationExtras()
+        return ConversationActionResult(ok: true, text: "Đã xóa mã PIN")
     }
 
-    /// Sidebar search: when `query` is the PIN, the hidden conversations; nil otherwise. Nothing is unlocked by a search: opening one of
-    /// the results unlocks only that conversation.
     func hiddenConversations(matching query: String) async -> [String]? {
-        guard conversationActions.hiddenEnabled, query.count == 4 else { conversationUI.setPinSearch([]); return nil }
-        guard let root = await callConversationActionRaw("hiddenSearch", [query]) as? [String: Any],
-              let ids = root["ids"] as? [String] else { conversationUI.setPinSearch([]); return nil }
+        guard conversationActions.hiddenEnabled, query.count == 4, await checkHiddenChatPIN(query) else {
+            conversationUI.setPinSearch([])
+            return nil
+        }
+        let ids = Array(conversationActions.hiddenIds)
         conversationUI.setPinSearch(ids)
         return ids
     }
 
-    /// A hidden conversation is closed unless it was opened with the PIN (and only that one).
     func isConversationLocked(_ id: String) -> Bool {
         conversationActions.isHidden(id) && !conversationUI.isUnlocked(id)
     }
 
-    /// Opened from the PIN search results: unlocks that one conversation.
     func unlockFromPINSearch(_ id: String) -> Bool {
         guard conversationUI.pinSearchIds.contains(id) else { return false }
         conversationUI.unlock(id)
@@ -396,7 +513,6 @@ extension ZaloEngine {
 
     // MARK: Hidden chats elsewhere in the app
 
-    /// Contacts without the hidden chats (official friend list ~10721188 skips them); empty until the hidden state is known.
     var visibleFriends: [ContactsState.Friend] {
         conversationActions.hiddenKnown ? contacts.friends.filter { !conversationActions.isHidden($0.id) } : []
     }
@@ -405,42 +521,55 @@ extension ZaloEngine {
         conversationActions.hiddenKnown ? contacts.groups.filter { !conversationActions.isHidden($0.id) } : []
     }
 
-    /// Conversations that may be counted / listed: none while the hidden state is unknown.
     var visibleConversations: [ConversationSummary] {
         conversationActions.hiddenKnown ? conversations.filter { !conversationActions.isHidden($0.id) } : []
     }
 
     // MARK: Feedback
 
-    /// Shows the official toast text (empty text: nothing to say, e.g. a silent success).
     func report(_ result: ConversationActionResult) {
         guard !result.text.isEmpty, !result.full, !result.pinExists else { return }
         conversationUI.show(result.ok ? (result.neutral ? .neutral : .success) : .failure, result.text)
     }
 
-    /// Logout (this device or the server's): nothing of the previous account's menus, prompts or unlocks survives.
     func resetConversationActions() {
         conversationActions = ConversationActionsState()
         conversationPrompt = nil
         conversationUI.reset()
-        republishConversationActions()
     }
 
-    /// Asks the page to post its current state again (it only posts on change, so a reset on the same page would otherwise stay empty).
     func republishConversationActions() {
-        Task { _ = await callConversationActionRaw("republish", []) }
+        rebuildConversationFlags()
     }
 
-    /// A call is running: the open conversation must not be closed under it.
-    var isInCall: Bool { call.busy || call.nativeRunning }
+    internal func rebuildConversationFlags() {
+        var next = conversationActions
+        next.hiddenKnown = true
+        next.loaded = true
+        next.hiddenEnabled = true
+        next.markUnreadEnabled = true
+        var nextFlags: [String: ConversationActionFlags] = [:]
+        for c in conversations {
+            var f: ConversationActionFlags = []
+            if cachedPinnedIds.contains(c.id) || c.pinned { f.insert(.pinned) }
+            if cachedArchivedIds.contains(c.id) { f.insert(.archived) }
+            if next.hiddenIds.contains(c.id) { f.insert(.hidden) }
+            if cachedUnreadMarks.contains(c.id) { f.insert(.unreadMark) }
+            if c.id == selfConversationId {
+                f.formUnion([.cannotDelete, .cannotHide, .cannotArchive])
+            }
+            if !f.isEmpty { nextFlags[c.id] = f }
+        }
+        next.flags = nextFlags
+        if next != conversationActions { conversationActions = next }
+    }
 
-    // MARK: Page events
+    var isInCall: Bool { call.busy || call.nativeRunning }
 
     func handleConversationActions(state: [String: Any]) {
         guard let json = state["convActions"] as? [String: Any] else { return }
         var next = conversationActions
         next.apply(json: json)
-        // The outcome of an archive / delete that had answered "pending": report it now. A new page epoch restarts the sequence.
         let epoch = (json["epoch"] as? NSNumber)?.int64Value ?? next.lateEpoch
         if epoch != next.lateEpoch { next.lateEpoch = epoch; next.lateSeq = 0 }
         if let late = json["late"] as? [String: Any], let seq = (late["seq"] as? NSNumber)?.intValue, seq > next.lateSeq {
@@ -451,26 +580,5 @@ extension ZaloEngine {
             if let removed = late["removedId"] as? String, !removed.isEmpty { conversationUI.remove([removed]) }
         }
         if next != conversationActions { conversationActions = next }
-    }
-
-    // MARK: Bridge
-
-    private func callConversationAction(_ method: String, _ args: [Any?], timeout: Double = 40) async -> ConversationActionResult {
-        let answer = await raceTimeout(timeout) { [self] in JSBox(value: await callConversationActionRaw(method, args)) }
-        guard let answer else {
-            return ConversationActionResult(ok: false, text: "Thao tác vẫn đang được xử lý. Hãy kiểm tra lại danh sách hội thoại trước khi thử lại.")
-        }
-        let result = ConversationActionResult(json: answer.value)
-        if !result.ok { EngineLog.shared.write("conversation action \(method) → failed") }
-        return result
-    }
-
-    /// Evaluates `window.__zaloConvActions.<method>(...args)`. Arguments (ids, PINs) are never logged.
-    private func callConversationActionRaw(_ method: String, _ args: [Any?]) async -> Any? {
-        let values = args.map { $0 ?? NSNull() }
-        guard let data = try? JSONSerialization.data(withJSONObject: values, options: [.fragmentsAllowed]),
-              let json = String(data: data, encoding: .utf8) else { return nil }
-        let script = "const c = window.__zaloConvActions; if (!c || !c.\(method)) return null; return await c.\(method)(...\(json));"
-        return await host?.evaluate(script)
     }
 }

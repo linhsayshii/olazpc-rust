@@ -8,7 +8,7 @@ let package = Package(
         .executableTarget(
             name: "Olaz",
             path: "Sources/Olaz",
-            resources: [.copy("JSModules"), .copy("Resources"), .copy("HostScripts")]
+            resources: [.copy("JSModules"), .copy("Resources")]
         ),
         .testTarget(
             name: "OlazTests",

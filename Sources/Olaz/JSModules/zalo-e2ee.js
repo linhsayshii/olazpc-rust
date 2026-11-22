@@ -222,5 +222,250 @@
       const digits = await generator.createFor(a, pa.identity.pubKey, b, pb.identity.pubKey);
       return digits.match(/.{1,5}/g).join(' ');
     },
+
+    // MARK: Persistent Zalo PC Device (deviceId = 2) Runtime
+    pc: (() => {
+      const PC_DEVICE_ID = 2;
+      const PC_PREKEY_BATCH = 25;
+      const pcStates = new Map();
+
+      const bufToB64 = (buf) => {
+        const bytes = toBytes(buf);
+        let bin = '';
+        for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+        return btoa(bin);
+      };
+      const b64ToBytes = (b64) => new Uint8Array(base64ToBuffer(b64));
+      const b64ToBuf = (b64) => base64ToBuffer(b64);
+
+      const zaloAddr = (remoteUid, devId) => {
+        const d = Number(devId);
+        return new signal.SignalProtocolAddress(String(remoteUid) + '_' + d, d);
+      };
+
+      const serializeState = (st) => {
+        const rawStore = st.store.store;
+        const preKeysObj = {};
+        const signedPreKeysObj = {};
+        const sessionsObj = {};
+        const trustedObj = {};
+        for (const k of Object.keys(rawStore)) {
+          const v = rawStore[k];
+          if (k.startsWith('25519KeypreKey')) {
+            const id = k.slice('25519KeypreKey'.length);
+            preKeysObj[id] = { pubKey: bufToB64(v.pubKey), privKey: bufToB64(v.privKey) };
+          } else if (k.startsWith('25519KeysignedKey')) {
+            const id = k.slice('25519KeysignedKey'.length);
+            signedPreKeysObj[id] = {
+              pubKey: bufToB64(v.pubKey),
+              privKey: bufToB64(v.privKey),
+              signature: st.signatures[id] || '',
+            };
+          } else if (k.startsWith('session')) {
+            const id = k.slice('session'.length);
+            sessionsObj[id] = typeof v === 'string' ? v : JSON.stringify(v);
+          } else if (k.startsWith('identityKey') && k !== 'identityKey') {
+            const id = k.slice('identityKey'.length);
+            trustedObj[id] = bufToB64(v);
+          }
+        }
+        return JSON.stringify({
+          version: 1,
+          registrationId: st.registrationId,
+          nextPreKeyId: st.nextPreKeyId,
+          signedPreKeyId: st.signedPreKeyId,
+          identity: {
+            pubKey: bufToB64(st.identity.pubKey),
+            privKey: bufToB64(st.identity.privKey),
+          },
+          preKeys: preKeysObj,
+          signedPreKeys: signedPreKeysObj,
+          sessions: sessionsObj,
+          trusted: trustedObj,
+        });
+      };
+
+      const buildSubmitBundlePayload = (st) => {
+        const spk = st.store.get('25519KeysignedKey' + st.signedPreKeyId);
+        const sigB64 = st.signatures[String(st.signedPreKeyId)] || '';
+        const opKeys = [];
+        for (const k of Object.keys(st.store.store)) {
+          if (k.startsWith('25519KeypreKey')) {
+            const kid = Number(k.slice('25519KeypreKey'.length));
+            const kp = st.store.store[k];
+            if (!isNaN(kid) && kp && kp.pubKey) {
+              opKeys.push({ id: kid, key: bufToB64(kp.pubKey) });
+            }
+          }
+        }
+        opKeys.sort((a, b) => a.id - b.id);
+        return {
+          delSS: 0,
+          key: {
+            deviceId: PC_DEVICE_ID,
+            preKey: {
+              iKey: {
+                id: st.registrationId,
+                key: bufToB64(st.identity.pubKey),
+              },
+              signature: sigB64,
+              spKey: {
+                id: st.signedPreKeyId,
+                key: bufToB64(spk.pubKey),
+              },
+            },
+            opKeys: opKeys.slice(0, PC_PREKEY_BATCH),
+          },
+        };
+      };
+
+      return {
+        async initOrRestore(uid, savedJSON) {
+          if (savedJSON && typeof savedJSON === 'string' && savedJSON.length > 2) {
+            try {
+              const parsed = JSON.parse(savedJSON);
+              if (parsed && parsed.identity && parsed.registrationId) {
+                const store = new MemoryStore();
+                const identity = {
+                  pubKey: b64ToBuf(parsed.identity.pubKey),
+                  privKey: b64ToBuf(parsed.identity.privKey),
+                };
+                store.put('identityKey', identity);
+                store.put('registrationId', Number(parsed.registrationId));
+                const signatures = {};
+                const spks = parsed.signedPreKeys || {};
+                for (const id of Object.keys(spks)) {
+                  store.put('25519KeysignedKey' + id, {
+                    pubKey: b64ToBuf(spks[id].pubKey),
+                    privKey: b64ToBuf(spks[id].privKey),
+                  });
+                  if (spks[id].signature) signatures[id] = spks[id].signature;
+                }
+                const pks = parsed.preKeys || {};
+                for (const id of Object.keys(pks)) {
+                  store.put('25519KeypreKey' + id, {
+                    pubKey: b64ToBuf(pks[id].pubKey),
+                    privKey: b64ToBuf(pks[id].privKey),
+                  });
+                }
+                const sess = parsed.sessions || {};
+                for (const id of Object.keys(sess)) {
+                  store.put('session' + id, sess[id]);
+                }
+                const trusted = parsed.trusted || {};
+                for (const id of Object.keys(trusted)) {
+                  store.put('identityKey' + id, b64ToBuf(trusted[id]));
+                }
+                const st = {
+                  uid,
+                  store,
+                  identity,
+                  registrationId: Number(parsed.registrationId),
+                  signedPreKeyId: Number(parsed.signedPreKeyId || 1),
+                  nextPreKeyId: Number(parsed.nextPreKeyId || 100),
+                  signatures,
+                };
+                pcStates.set(uid, st);
+                return {
+                  restored: true,
+                  registrationId: st.registrationId,
+                  bundlePayload: buildSubmitBundlePayload(st),
+                  storeJSON: serializeState(st),
+                };
+              }
+            } catch (_) {}
+          }
+
+          const store = new MemoryStore();
+          const registrationId = signal.KeyHelper.generateRegistrationId();
+          const identity = await signal.KeyHelper.generateIdentityKeyPair();
+          store.put('identityKey', identity);
+          store.put('registrationId', registrationId);
+
+          const signedPreKeyId = 1;
+          const signedPreKey = await signal.KeyHelper.generateSignedPreKey(identity, signedPreKeyId);
+          await store.storeSignedPreKey(signedPreKey.keyId, signedPreKey.keyPair);
+          const signatures = { [String(signedPreKeyId)]: bufToB64(signedPreKey.signature) };
+
+          let nextPreKeyId = 1;
+          for (let i = 0; i < PC_PREKEY_BATCH; i++) {
+            const pk = await signal.KeyHelper.generatePreKey(nextPreKeyId++);
+            await store.storePreKey(pk.keyId, pk.keyPair);
+          }
+
+          const st = {
+            uid,
+            store,
+            identity,
+            registrationId,
+            signedPreKeyId,
+            nextPreKeyId,
+            signatures,
+          };
+          pcStates.set(uid, st);
+          return {
+            restored: false,
+            registrationId,
+            bundlePayload: buildSubmitBundlePayload(st),
+            storeJSON: serializeState(st),
+          };
+        },
+
+        exportStore(uid) {
+          const st = pcStates.get(uid);
+          return st ? serializeState(st) : '';
+        },
+
+        async refillPreKeys(uid, count) {
+          const st = pcStates.get(uid);
+          if (!st) throw new Error('PC E2EE not initialized for ' + uid);
+          const n = Math.max(1, Number(count || 30));
+          const opKeys = [];
+          for (let i = 0; i < n; i++) {
+            const pk = await signal.KeyHelper.generatePreKey(st.nextPreKeyId++);
+            await st.store.storePreKey(pk.keyId, pk.keyPair);
+            opKeys.push({ id: pk.keyId, key: bufToB64(pk.keyPair.pubKey) });
+          }
+          return {
+            registrationId: st.registrationId,
+            opKeys,
+            storeJSON: serializeState(st),
+          };
+        },
+
+        async decryptCipher(uid, senderUid, deviceId, cipherB64, format) {
+          const st = pcStates.get(uid);
+          if (!st) return { ok: false, error: 'not_initialized' };
+          try {
+            const allBytes = b64ToBytes(cipherB64);
+            if (allBytes.length < 16) return { ok: false, error: 'too_short' };
+            const msgType = allBytes[0];
+            const bodyBuf = allBytes.slice(1).buffer;
+            const addr = zaloAddr(senderUid, deviceId);
+            const cipher = new signal.SessionCipher(st.store, addr, { logger });
+            let plainBuf;
+            if (msgType === 3) {
+              plainBuf = await cipher.decryptPreKeyWhisperMessage(bodyBuf, 'binary');
+            } else {
+              plainBuf = await cipher.decryptWhisperMessage(bodyBuf, 'binary');
+            }
+            const outBytes = toBytes(plainBuf);
+            if (format === 'uint32') {
+              if (outBytes.length < 4) return { ok: false, error: 'short_uint32' };
+              const val = (
+                (outBytes[0]) |
+                (outBytes[1] << 8) |
+                (outBytes[2] << 16) |
+                (outBytes[3] << 24)
+              ) >>> 0;
+              return { ok: true, number: val };
+            }
+            return { ok: true, text: utf8d.decode(outBytes) };
+          } catch (err) {
+            return { ok: false, error: String(err && err.message ? err.message : err) };
+          }
+        },
+      };
+    })(),
   };
 })(globalThis);

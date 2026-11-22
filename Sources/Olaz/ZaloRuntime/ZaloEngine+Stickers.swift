@@ -192,71 +192,161 @@ struct TypingStickerState: Equatable {
 }
 
 extension ZaloEngine {
-    /// The user's downloaded sticker sets in the official order, "Gần đây" first when there are recent stickers. nil = unavailable.
     func stickerTabs() async -> [StickerTab]? {
-        let answer = await raceTimeout(60) { [self] in JSBox(value: await callSticker("categories", [])) }
-        return StickerTab.list(json: answer?.value)
+        guard let box = try? await sessionClient.fetchStickerCategories() else { return nil }
+        var tabs: [[String: Any]] = []
+        if let recents = try? await recentStickersFromSQLite(), !recents.isEmpty {
+            tabs.append(["id": StickerTab.recentId, "name": "Gần đây", "icon": "", "count": recents.count])
+        }
+        for row in box.array {
+            let id = Int(JSONLossless.int64(row["id"] ?? row["cateId"]) ?? -1)
+            guard id >= 0 else { continue }
+            tabs.append([
+                "id": id,
+                "name": JSONLossless.string(row["name"]),
+                "icon": JSONLossless.string(row["iconUrl"] ?? row["icon"]),
+                "count": Int(JSONLossless.int64(row["total"] ?? row["count"]) ?? 0)
+            ])
+        }
+        return StickerTab.list(json: tabs)
     }
 
-    /// The stickers of one tab (`StickerTab.recentId` = recent stickers). nil = unavailable.
     func stickers(inTab id: Int) async -> [StickerEntry]? {
-        let answer = await raceTimeout(60) { [self] in JSBox(value: await callSticker("category", [id])) }
-        guard let root = answer?.value as? [String: Any], (root["id"] as? NSNumber)?.intValue == id else { return nil }
-        return StickerEntry.list(json: root["stickers"])
+        if id == StickerTab.recentId {
+            let recents = (try? await recentStickersFromSQLite()) ?? []
+            return StickerEntry.list(json: recents)
+        }
+        guard let box = try? await sessionClient.fetchStickerCategoryDetail(cateId: id) else { return nil }
+        let rows: [[String: Any]] = {
+            if let direct = box.dict["data"] as? [[String: Any]] {
+                return direct
+            }
+            if let dataNode = box.dict["data"] as? [String: Any] {
+                return (dataNode["stickers"] as? [[String: Any]])
+                    ?? ((dataNode["\(id)"] as? [String: Any])?["stickers"] as? [[String: Any]])
+                    ?? []
+            }
+            return []
+        }()
+        let mapped = rows.map { normalizeStickerRow($0, fallbackCateId: id) }
+        return StickerEntry.list(json: mapped)
     }
 
-    /// Official dock search (`searchSticker(keyword, 40)`). nil = could not be asked; [] = nothing matches.
     func searchStickers(_ text: String) async -> [StickerEntry]? {
-        let answer = await raceTimeout(40) { [self] in JSBox(value: await callSticker("search", [text])) }
-        guard let rows = answer?.value as? [Any] else { return nil }
-        return StickerEntry.list(json: rows, limit: 40)
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        guard let box = try? await sessionClient.searchStickersAPI(keyword: trimmed, limit: 40) else { return nil }
+        let mapped = box.array.map { normalizeStickerRow($0, fallbackCateId: 0) }
+        return StickerEntry.list(json: mapped, limit: 40)
     }
 
-    /// Stickers the official suggestion logic offers for the text being typed; [] when the setting is off, the chat is end-to-end
-    /// encrypted or nothing matches.
     func typingStickerSuggestions(in conversationId: String, text: String) async -> [StickerEntry] {
-        let answer = await raceTimeout(25) { [self] in JSBox(value: await callSticker("suggest", [conversationId, text])) }
-        return StickerEntry.list(json: answer?.value, limit: 30)
+        guard StickerSuggestState.shared.setting?.enabled != false else { return [] }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let box = try? await sessionClient.suggestStickersAPI(keyword: trimmed) else { return [] }
+        let mapped = box.array.map { normalizeStickerRow($0, fallbackCateId: 0) }
+        return StickerEntry.list(json: mapped, limit: 30)
     }
 
-    /// Sends one sticker to `conversationId` through the official chat-box path (the user clicked it). The answer is the usual card-action
-    /// outcome: `.done`, `.locked` (only admins may post), or `.failed` with the reason. For a suggestion, `typed` is the text it was
-    /// suggested for and `index` its position in the strip (official suggestion stats / action logs).
     func sendSticker(_ sticker: StickerEntry, in conversationId: String, source: StickerSource, typed: String? = nil, index: Int = -1) async -> CardActionOutcome {
-        let target: [String: Any] = ["cateId": sticker.cateId, "id": sticker.stickerId]
-        let context: [String: Any] = source == .suggestion ? ["text": typed ?? "", "index": index] : [:]
-        // The JS side answers within ~40 s and keeps the slot taken until the send settles (a retry is refused meanwhile).
-        let answer = await raceTimeout(90) { [self] in JSBox(value: await callSticker("send", [conversationId, target, source.rawValue, context])) }
-        guard let answer else { return .pending(CardActionOutcome.noAnswerText) }
-        let outcome = CardActionOutcome(json: answer.value)
-        if case .done = outcome {} else { EngineLog.shared.write("sticker send \(source.rawValue) → \(outcome.logName)") }
-        return outcome
+        do {
+            let res = try await sessionClient.sendStickerAPI(convId: conversationId, cateId: sticker.cateId, stickerId: sticker.stickerId)
+            let msg = ChatMessage(
+                id: res.msgId,
+                conversationId: conversationId,
+                senderId: profile?.userId ?? "",
+                senderName: profile?.displayName ?? "Bạn",
+                senderAvatar: profile?.avatar,
+                isMine: true,
+                kind: .sticker(url: sticker.url),
+                text: "[Sticker]",
+                date: Date(),
+                status: .sent,
+                quote: nil,
+                reactions: [],
+                isE2EE: false,
+                mentions: [],
+                cardButtons: [],
+                suggestsStickers: false,
+                menu: MessageMenu(json: ["forward": "ok", "recall": true, "delete": "forMe", "pin": false, "star": "star"])
+            )
+            mergeMessageIntoMemory(msg, replacingClientId: res.cliMsgId)
+            if let stored = ZaloWireParser.encodeChatMessage(msg, clientId: res.cliMsgId) {
+                try? await sqliteStore?.saveMessages([stored])
+            }
+            updateConversationOnMessage(msg, incrementUnread: false)
+            await saveRecentSticker(sticker)
+            return .done
+        } catch {
+            return .failed("Không gửi được sticker. Hãy thử lại.")
+        }
     }
 
     func stickerSuggestSetting() async -> StickerSuggestSetting? {
-        let answer = await raceTimeout(15) { [self] in JSBox(value: await callSticker("suggestSetting", [])) }
-        return StickerSuggestSetting(json: answer?.value)
+        let enabled = (try? await sqliteStore?.getPreferenceBool(key: "stickerSuggest", default: true)) ?? true
+        return StickerSuggestSetting(json: ["ok": true, "enabled": enabled, "debounce": 180])
     }
 
-    /// Turns "Gợi ý Sticker" on or off (the official `setFlagForCurrentUser`) and returns the value now in force; nil = could not be changed.
     func setStickerSuggest(enabled: Bool) async -> StickerSuggestSetting? {
-        let answer = await raceTimeout(15) { [self] in JSBox(value: await callSticker("setSuggestSetting", [enabled])) }
-        guard let root = answer?.value as? [String: Any], (root["ok"] as? Bool) == true else { return nil }
+        try? await sqliteStore?.setPreferenceBool(key: "stickerSuggest", value: enabled)
         let now = await stickerSuggestSetting()
         StickerSuggestState.shared.apply(now)
         return now
     }
 
-    /// Logout: forget the suggestions and the setting of the previous session.
     func resetStickers() {
         StickerSuggestState.shared.reset()
-        Task { _ = await callSticker("reset", []) }
     }
 
-    private func callSticker(_ method: String, _ args: [Any]) async -> Any? {
-        guard let data = try? JSONSerialization.data(withJSONObject: args, options: [.fragmentsAllowed]),
-              let json = String(data: data, encoding: .utf8) else { return nil }
-        let script = "const c = window.__zaloSticker; if (!c || !c.\(method)) return null; return await c.\(method)(...\(json));"
-        return await host?.evaluate(script)
+    private func normalizeStickerRow(_ row: [String: Any], fallbackCateId: Int) -> [String: Any] {
+        let id = Int(JSONLossless.int64(row["id"] ?? row["stickerId"] ?? row["sticker_id"]) ?? 0)
+        let cate = Int(JSONLossless.int64(row["cateId"] ?? row["cate_id"]) ?? Int64(fallbackCateId))
+        let explicitUrl = JSONLossless.string(row["stickerUrl"] ?? row["url"])
+        let urlStr = explicitUrl.isEmpty
+            ? ZaloWireParser.stickerCDNURL(cateId: cate, stickerId: "\(id)")
+            : explicitUrl
+        var out: [String: Any] = [
+            "id": id,
+            "cateId": cate,
+            "type": Int(JSONLossless.int64(row["type"]) ?? 7),
+            "url": urlStr
+        ]
+        let sprite = JSONLossless.string(row["stickerSpriteUrl"]).replacingOccurrences(of: "http://", with: "https://")
+        let frames = Int(JSONLossless.int64(row["totalFrames"]) ?? 0)
+        if sprite.hasPrefix("https://"), (2...200).contains(frames) {
+            let dur = Int(JSONLossless.int64(row["duration"]) ?? 120)
+            out["anim"] = [
+                "kind": "sprite",
+                "url": sprite,
+                "frames": frames,
+                "ms": max(30, min(1000, dur > 0 ? dur : 120))
+            ]
+        }
+        return out
+    }
+
+    private func recentStickersFromSQLite() async throws -> [[String: Any]] {
+        guard let store = sqliteStore,
+              let data = try await store.getPreferenceData(key: "recentStickers"),
+              let rows = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
+            return []
+        }
+        return rows
+    }
+
+    private func saveRecentSticker(_ sticker: StickerEntry) async {
+        guard let store = sqliteStore else { return }
+        var rows = (try? await recentStickersFromSQLite()) ?? []
+        rows.removeAll { (JSONLossless.int64($0["id"]) == Int64(sticker.stickerId)) }
+        rows.insert([
+            "id": sticker.stickerId,
+            "cateId": sticker.cateId,
+            "type": 7,
+            "url": sticker.url.absoluteString
+        ], at: 0)
+        if rows.count > 30 { rows = Array(rows.prefix(30)) }
+        if let data = try? JSONSerialization.data(withJSONObject: rows) {
+            try? await store.setPreferenceData(key: "recentStickers", data: data)
+        }
     }
 }

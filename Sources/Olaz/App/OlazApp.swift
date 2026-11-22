@@ -1,22 +1,70 @@
 import AppKit
 import SwiftUI
 
+@MainActor
+final class OlazAppDelegate: NSObject, NSApplicationDelegate {
+    var openMainWindow: (() -> Void)?
+    var onLaunch: (() -> Void)?
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSWindow.allowsAutomaticWindowTabbing = false
+        NSApp.setActivationPolicy(.regular)
+        onLaunch?()
+        DispatchQueue.main.async { [weak self] in
+            if NSApp.windows.filter({ $0.canBecomeMain && $0.isVisible }).isEmpty {
+                self?.openMainWindow?()
+            }
+            NSApp.activate()
+        }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            openMainWindow?()
+        }
+        NSApp.activate()
+        return true
+    }
+}
+
 struct OlazApp: App {
+    @NSApplicationDelegateAdaptor(OlazAppDelegate.self) private var appDelegate
+    @Environment(\.openWindow) private var openWindow
     @State private var engine = ZaloEngine()
     @State private var shell = ShellModel()
 
     var body: some Scene {
-        WindowGroup {
+        let _ = {
+            let open = openWindow
+            let eng = engine
+            appDelegate.openMainWindow = { open(id: "main") }
+            appDelegate.onLaunch = { eng.start() }
+        }()
+        Window(AppBrand.name, id: "main") {
             RootView()
                 .olazAppearance(engine: engine, shell: shell)
                 // While the inspector shows, the window may not get narrower than what keeps the chat usable beside it.
                 .frame(minWidth: shell.holdsInspectorRoom ? InspectorRoom.windowMinWidthWithInspector : InspectorRoom.windowMinWidth, minHeight: 620)
-                .task { engine.start() }
+                .task {
+                    engine.start()
+                    await EngineProbe.runUISmokeIfRequested(engine: engine, shell: shell)
+                }
         }
+        .defaultLaunchBehavior(.presented)
+        .restorationBehavior(.disabled)
         .windowToolbarStyle(.unified)
         .windowResizability(.contentMinSize)
         .commands {
             OlazCommands(engine: engine, shell: shell)
+            CommandGroup(before: .windowList) {
+                Button("Cửa sổ chính") { openWindow(id: "main") }
+                    .keyboardShortcut("0", modifiers: .command)
+                Divider()
+            }
             CommandMenu("Tài khoản") {
                 Button("Lấy mã QR mới") { engine.refreshQR() }
                     .keyboardShortcut("R", modifiers: [.command, .shift])

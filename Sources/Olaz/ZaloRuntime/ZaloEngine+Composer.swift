@@ -1,11 +1,11 @@
 import AppKit
+import ImageIO
+import UniformTypeIdentifiers
 
-// Composer "+" actions — Ảnh hoặc Video, Tệp, Chụp màn hình, Danh thiếp, Nhắc hẹn — bridged to `HostScripts/composer-adapter.js`
-// (`window.__zaloCompose`). Picked files reach the page as browser `File`s: the adapter clicks a hidden file input and
-// `OfficialClientHost` answers its open panel with the URLs picked here. Screenshots come from the official ZaloCap tool
-// (ScreenCapture.swift).
+// Native composer "+" actions — Ảnh hoặc Video, Tệp, Danh thiếp, Nhắc hẹn.
+// Screenshots are handled natively via macOS clipboard paste (⌘V).
 
-/// Result of a composer action (composer-adapter.js `{status, text}`).
+/// Result of a composer action.
 enum ComposerOutcome: Equatable, Sendable {
     case done
     /// Nothing was picked, or the official client already said why (its toast reached the screen).
@@ -130,94 +130,179 @@ enum ReminderRepeat: Int, CaseIterable, Identifiable {
 extension ZaloEngine {
     // MARK: Attachments
 
-    /// "Ảnh hoặc Video": photos through the official photo button's path, videos and other files as files.
     func sendMedia(_ urls: [URL], to id: String) async -> ComposerOutcome {
-        await composeWithFiles("sendMedia", [id], files: urls)
-    }
-
-    /// "Tệp": the official file button's path.
-    func sendFiles(_ urls: [URL], to id: String) async -> ComposerOutcome {
-        await composeWithFiles("sendFiles", [id], files: urls)
-    }
-
-    // MARK: Screenshot
-
-    /// Starts the official screenshot tool for the conversation `id`; the result arrives through `handleCapture`.
-    func startScreenCapture(in id: String, withOlaz: Bool) {
-        screenCapture().start(in: id, withOlaz: withOlaz)
-    }
-
-    func shareScreenshot(_ share: ScreenshotShare, to ids: [String]) async -> ComposerOutcome {
-        if let text = share.text {
-            var sent = 0
-            for id in ids where await sendText(text, to: id) { sent += 1 }
-            return sent > 0 ? .done : .failed(ComposerOutcome.genericFailure)
-        }
-        guard let image = share.image else { return .cancelled }
-        return await composeWithFiles("shareShot", [ids], files: [image])
-    }
-
-    private func screenCapture() -> ScreenCapture {
-        if let screenCaptureTool { return screenCaptureTool }
-        let tool = ScreenCapture()
-        tool.log = { EngineLog.shared.write($0) }
-        tool.onOutcome = { [weak self] outcome in self?.handleCapture(outcome) }
-        screenCaptureTool = tool
-        return tool
-    }
-
-    private func handleCapture(_ outcome: ScreenCapture.Outcome) {
-        switch outcome {
-        case .send(let url, let id), .sendToMe(let url, let id):
-            var toMe = false
-            if case .sendToMe = outcome { toMe = true }
-            Task {
-                let result = await composeWithFiles("sendShot", [id, toMe], files: [url])
-                report(result, in: id)
+        guard !urls.isEmpty, !id.isEmpty else { return .cancelled }
+        var sentAny = false
+        for url in urls {
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            guard let data = try? Data(contentsOf: url) else { continue }
+            let utType = UTType(filenameExtension: url.pathExtension)
+            let isImage = utType?.conforms(to: .image) ?? false
+            do {
+                if isImage {
+                    let dims = imageDimensions(data)
+                    let res = try await sessionClient.uploadAndSendPhoto(
+                        convId: id, fileName: url.lastPathComponent, data: data, width: dims.width, height: dims.height
+                    )
+                    await recordUploadedMessage(
+                        convId: id, msgId: res.msgId, cliId: res.cliMsgId,
+                        kind: .photo(url: URL(string: res.url), width: res.width, height: res.height),
+                        text: ""
+                    )
+                } else {
+                    let res = try await sessionClient.uploadAndSendFile(
+                        convId: id, fileName: url.lastPathComponent, data: data, webSocket: webSocket
+                    )
+                    await recordUploadedMessage(
+                        convId: id, msgId: res.msgId, cliId: res.cliMsgId,
+                        kind: .file(name: url.lastPathComponent, size: Int64(data.count), url: URL(string: res.url)),
+                        text: url.lastPathComponent
+                    )
+                }
+                sentAny = true
+            } catch {
+                EngineLog.shared.write("sendMedia failed: \(error.localizedDescription)")
             }
-        case .share(let url, let id):
-            screenshotShare = ScreenshotShare(image: url, text: nil, conversationId: id)
-        case .shareText(let text, let id):
-            screenshotShare = ScreenshotShare(image: nil, text: text, conversationId: id)
-        case .noPermission:
-            screenCaptureNeedsPermission = true
-        case .failed(let text, let id):
-            CardActionCenter.shared.show(text, in: id.isEmpty ? nil : id)
         }
+        return sentAny ? .done : .failed(ComposerOutcome.genericFailure)
+    }
+
+    func sendFiles(_ urls: [URL], to id: String) async -> ComposerOutcome {
+        guard !urls.isEmpty, !id.isEmpty else { return .cancelled }
+        var sentAny = false
+        for url in urls {
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            guard let data = try? Data(contentsOf: url) else { continue }
+            do {
+                let res = try await sessionClient.uploadAndSendFile(
+                    convId: id, fileName: url.lastPathComponent, data: data, webSocket: webSocket
+                )
+                await recordUploadedMessage(
+                    convId: id, msgId: res.msgId, cliId: res.cliMsgId,
+                    kind: .file(name: url.lastPathComponent, size: Int64(data.count), url: URL(string: res.url)),
+                    text: url.lastPathComponent
+                )
+                sentAny = true
+            } catch {
+                EngineLog.shared.write("sendFiles failed: \(error.localizedDescription)")
+            }
+        }
+        return sentAny ? .done : .failed(ComposerOutcome.genericFailure)
+    }
+
+    private func imageDimensions(_ data: Data) -> (width: Int, height: Int) {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let w = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let h = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue else {
+            return (800, 600)
+        }
+        return (w, h)
+    }
+
+    private func recordUploadedMessage(convId: String, msgId: String, cliId: String, kind: ChatMessage.Kind, text: String) async {
+        let msg = ChatMessage(
+            id: msgId,
+            conversationId: convId,
+            senderId: profile?.userId ?? "",
+            senderName: profile?.displayName ?? "Bạn",
+            senderAvatar: profile?.avatar,
+            isMine: true,
+            kind: kind,
+            text: text,
+            date: Date(),
+            status: .sent,
+            quote: nil,
+            reactions: [],
+            isE2EE: false,
+            mentions: [],
+            cardButtons: [],
+            suggestsStickers: false,
+            menu: MessageMenu(json: ["forward": "ok", "recall": true, "delete": "forMe", "pin": ZaloWireParser.isGroupId(convId), "star": "star"])
+        )
+        mergeMessageIntoMemory(msg)
+        if let stored = ZaloWireParser.encodeChatMessage(msg, clientId: cliId) {
+            try? await sqliteStore?.saveMessages([stored])
+        }
+        updateConversationOnMessage(msg, incrementUnread: false)
     }
 
     // MARK: Danh thiếp
 
     func myCard() async -> MyCardInfo? {
-        let answer = await raceTimeout(15) { [self] in JSBox(value: await callCompose("myCard", [])) }
-        return MyCardInfo(json: answer?.value)
+        guard let profile else { return nil }
+        return MyCardInfo(json: [
+            "uid": profile.userId,
+            "name": profile.displayName,
+            "avatar": profile.avatar?.absoluteString ?? "",
+            "phone": profile.phone ?? "",
+            "withPhone": !(profile.phone?.isEmpty ?? true)
+        ])
     }
 
     func sendMyCard(to id: String, withPhone: Bool) async -> ComposerOutcome {
-        await compose("sendMyCard", [id, withPhone], timeout: 45)
+        guard let profile else { return .failed("Chưa đăng nhập.") }
+        do {
+            let res = try await sessionClient.sendContactCardAPI(
+                convId: id,
+                cardUid: profile.userId,
+                phone: withPhone ? profile.phone : nil
+            )
+            let card = ChatMessage.ContactCard(
+                name: profile.displayName,
+                uid: profile.userId,
+                avatar: profile.avatar,
+                phone: withPhone ? (profile.phone ?? "") : ""
+            )
+            await recordUploadedMessage(
+                convId: id, msgId: res.msgId, cliId: res.cliMsgId,
+                kind: .contactCard(card), text: "[Danh thiếp] \(profile.displayName)"
+            )
+            return .done
+        } catch {
+            return .failed(ComposerOutcome.genericFailure)
+        }
     }
 
     // MARK: Nhắc hẹn
 
     func reminderComposeInfo(for id: String) async -> ReminderComposeInfo? {
-        let answer = await raceTimeout(15) { [self] in JSBox(value: await callCompose("reminderInfo", [id])) }
-        return ReminderComposeInfo(json: answer?.value)
+        let isGroup = ZaloWireParser.isGroupId(id)
+        return ReminderComposeInfo(json: [
+            "allowed": id != selfConversationId,
+            "hidden": false,
+            "text": "",
+            "isGroup": isGroup,
+            "canPin": isGroup,
+            "pinToggle": isGroup,
+            "titleMaxChars": 3000,
+            "titleMaxBytes": 3700
+        ])
     }
 
     func createReminder(in id: String, title: String, start: Date, repeat rule: ReminderRepeat, pin: Bool) async -> ComposerOutcome {
-        let options: [String: Any] = ["title": title, "startTime": (start.timeIntervalSince1970 * 1000).rounded(),
-                                      "repeat": rule.rawValue, "needPin": pin]
-        return await compose("createReminder", [id, options], timeout: 40)
+        do {
+            _ = try await sessionClient.createReminderAPI(
+                convId: id,
+                title: title,
+                startTimeMs: Int64((start.timeIntervalSince1970 * 1000).rounded()),
+                repeatMode: rule.rawValue,
+                pin: pin
+            )
+            return .done
+        } catch {
+            return .failed("Không tạo được nhắc hẹn. Hãy thử lại.")
+        }
     }
 
-    // MARK: Official confirms / toasts
+    // MARK: Confirms / Toasts
 
     func answerComposerConfirm(_ confirm: ComposerConfirm, ok: Bool) {
         guard composerConfirm?.id == confirm.id else { return }
         composerConfirm = nil
-        Task { _ = await callCompose("answer", [confirm.id, ok]) }
         guard !queuedComposerConfirms.isEmpty else { return }
-        // The next one after a beat, so the alert closes and opens again with its own text.
         Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(300))
             guard let self, self.composerConfirm == nil, !self.queuedComposerConfirms.isEmpty else { return }
@@ -225,7 +310,6 @@ extension ZaloEngine {
         }
     }
 
-    /// A page reload: its unanswered confirms are gone with it.
     func dropComposerConfirms() {
         composerConfirm = nil
         queuedComposerConfirms = []
@@ -234,79 +318,19 @@ extension ZaloEngine {
     func handleCompose(state: [String: Any]) {
         guard let event = state["compose"] as? [String: Any] else { return }
         let conversation = (event["convId"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        switch event["kind"] as? String {
-        case "toast":
-            if let text = event["text"] as? String, !text.isEmpty { CardActionCenter.shared.show(text, in: conversation) }
-        case "confirm":
-            guard let token = event["token"] as? String else { return }
-            let confirm = ComposerConfirm(id: token, conversationId: conversation ?? "",
-                                          title: event["title"] as? String ?? "", message: event["message"] as? String ?? "",
-                                          ok: event["ok"] as? String ?? "OK", cancel: event["cancel"] as? String ?? "Hủy")
-            // One at a time, in the order asked.
-            if composerConfirm == nil { composerConfirm = confirm } else { queuedComposerConfirms.append(confirm) }
-        default:
-            break
+        if event["kind"] as? String == "toast", let text = event["text"] as? String, !text.isEmpty {
+            CardActionCenter.shared.show(text, in: conversation)
         }
     }
 
-    /// Logout: nothing of the previous account may be asked or shared in the next.
     func resetComposer() {
         dropComposerConfirms()
-        screenshotShare = nil
-        screenCaptureNeedsPermission = false
     }
 
-    /// Shows a failure or pending text for a composer action as the conversation's toast.
     func report(_ outcome: ComposerOutcome, in id: String) {
         switch outcome {
         case .failed(let text), .pending(let text): CardActionCenter.shared.show(text, in: id.isEmpty ? nil : id)
         case .done, .cancelled: break
         }
-    }
-
-    #if DEBUG
-    /// Dev evaluation channel only (`compose.json`): a composer action with `files` as the user's pick.
-    func devCompose(_ method: String, _ args: [Any], files: [URL]) async -> String {
-        if method == "screenshot", let id = args.first as? String {
-            startScreenCapture(in: id, withOlaz: (args.dropFirst().first as? Bool) ?? true)
-            return "started"
-        }
-        let outcome = files.isEmpty ? await compose(method, args, timeout: 60) : await composeWithFiles(method, args, files: files)
-        return "\(outcome)"
-    }
-    #endif
-
-    // MARK: Calls into composer-adapter.js
-
-    private func composeWithFiles(_ method: String, _ args: [Any], files: [URL]) async -> ComposerOutcome {
-        guard !files.isEmpty else { return .cancelled }
-        // Photos are processed (resized, JXL) before the call returns; the uploads themselves continue in the page.
-        let answer = await raceTimeout(180) { [self] in JSBox(value: await callCompose(method, args, files: files)) }
-        guard let answer else { return .pending(CardActionOutcome.noAnswerText) }
-        var outcome = ComposerOutcome(json: answer.value)
-        // Files were picked but the page's file input received none: say so instead of nothing.
-        if outcome == .cancelled, (answer.value as? [String: Any])?["status"] as? String == "cancelled" {
-            outcome = .failed("Không đọc được tệp đã chọn. Hãy thử lại.")
-        }
-        EngineLog.shared.write("compose \(method) files=\(files.count) → \(outcome.logName)")
-        return outcome
-    }
-
-    private func compose(_ method: String, _ args: [Any], timeout: Double) async -> ComposerOutcome {
-        let answer = await raceTimeout(timeout) { [self] in JSBox(value: await callCompose(method, args)) }
-        guard let answer else { return .pending(CardActionOutcome.noAnswerText) }
-        let outcome = ComposerOutcome(json: answer.value)
-        EngineLog.shared.write("compose \(method) → \(outcome.logName)")
-        return outcome
-    }
-
-    private func callCompose(_ method: String, _ args: [Any], files: [URL]? = nil) async -> Any? {
-        guard let data = try? JSONSerialization.data(withJSONObject: args, options: [.fragmentsAllowed]),
-              let json = String(data: data, encoding: .utf8) else { return nil }
-        // The adapter clicks its file input synchronously in this call: nothing may be awaited before it.
-        let script = "const c = window.__zaloCompose; if (!c || !c.\(method)) return null; return await c.\(method)(...\(json));"
-        guard let host else { return nil }
-        if let files { return await host.evaluate(script, providingFiles: files) }
-        return await host.evaluate(script)
     }
 }

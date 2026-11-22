@@ -52,13 +52,28 @@ protocol SharedMediaSource: AnyObject {
 }
 
 extension ZaloEngine: SharedMediaSource {
-    /// A page of the photos / videos, files or links ever shared in `conversationId`, older than `cursor` (nil = the newest).
-    /// nil when the official media service could not answer (not ready yet, error, timeout) — not the same as "nothing shared".
+    /// A page of the photos / videos, files or links ever shared in `conversationId`, older than `cursor` (nil = the newest),
+    /// backed by Olaz's local SQLite message index.
     func sharedMedia(in conversationId: String, kind: SharedMediaKind, after cursor: String?, limit: Int) async -> SharedMediaPage? {
-        let args = [conversationId, kind.rawValue, cursor ?? NSNull(), limit] as [Any]
-        guard let data = try? JSONSerialization.data(withJSONObject: args, options: [.fragmentsAllowed]),
-              let json = String(data: data, encoding: .utf8) else { return nil }
-        let script = "const s = window.__zaloMediaStore; if (!s || !s.page) return null; return await s.page(...\(json));"
-        return SharedMediaPage(json: await host?.evaluate(script), conversationId: conversationId)
+        guard let store = sqliteStore else {
+            // Fall back to in-memory loaded messages if store is not open.
+            let mem = (messages[conversationId] ?? [])
+                .filter { kind.accepts($0.kind) }
+                .sorted { $0.date > $1.date }
+            return SharedMediaPage(items: Array(mem.prefix(limit)), cursor: nil, more: false)
+        }
+        let tags: [String] = switch kind {
+        case .images: ["photo", "video"]
+        case .files: ["file"]
+        case .links: ["link"]
+        }
+        guard let page = try? await store.sharedMediaRaw(convId: conversationId, kindTags: tags, afterCursor: cursor, limit: limit) else {
+            return nil
+        }
+        let items = page.rows.compactMap { data -> ChatMessage? in
+            guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+            return ChatMessage(json: json, fallbackConversation: conversationId)
+        }
+        return SharedMediaPage(items: items, cursor: page.cursor, more: page.more)
     }
 }

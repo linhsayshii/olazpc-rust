@@ -120,14 +120,7 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     weak var engine: ZaloEngine?
 
-    private struct Live {
-        weak var bridge: ZaloBridge?
-        var tag: String
-    }
-    private var live: [String: Live] = [:]
     private var focusObservers: [NSObjectProtocol] = []
-    private var activityMonitor: Any?
-    private var lastActivityPush = Date.distantPast
     private var sounds: [NSSound] = []
     private var attached = false
     private var orphanDrafts = FailedDraftStore()
@@ -137,33 +130,19 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
     var isAvailable: Bool { Bundle.main.bundleURL.pathExtension == "app" && Bundle.main.bundleIdentifier != nil }
     private var center: UNUserNotificationCenter? { isAvailable ? UNUserNotificationCenter.current() : nil }
 
-    // MARK: IPC (Electron `Notification` → `_noti_*`)
+    // MARK: Native delivery
 
-    static func installIPC(on bridge: ZaloBridge) {
-        bridge.handle("_noti_is-supported") { _ in NativeNotifier.shared.isAvailable }
-        bridge.handle("_noti_create") { [weak bridge] args in NativeNotifier.shared.create(args, bridge: bridge) }
-        bridge.handle("_noti_close") { args in
-            NativeNotifier.shared.close(id: args.string(0))
-            return nil
-        }
-    }
-
-    private func create(_ args: [Any], bridge: ZaloBridge?) -> String? {
-        guard isAvailable, let request = NativeNotificationRequest.parse(args) else { return nil }
+    func notifyIncomingMessage(title: String, body: String, conversationId: String, avatarURL: URL?, silent: Bool) {
+        guard isAvailable, !title.isEmpty || !body.isEmpty else { return }
+        let request = NativeNotificationRequest(
+            title: title,
+            body: body,
+            tag: conversationId,
+            silent: silent,
+            icon: avatarURL.map { .remote($0) }
+        )
         let id = UUID().uuidString
-        live[id] = Live(bridge: bridge, tag: request.tag)
         Task { await deliver(request, id: id) }
-        return id
-    }
-
-    /// The official code closes its notification after ~10 s (Windows pop-up lifetime), when a newer one for the
-    /// same conversation replaces it, and on click. A macOS banner leaves the screen by itself and its history
-    /// belongs in Notification Center, so this only acknowledges the close to the renderer; delivered notifications
-    /// are removed when the conversation is opened (`clearDelivered(conversation:)`).
-    private func close(id: String?) {
-        guard let id, let entry = live[id] else { return }
-        push("_noti_on-close", id: id, entry: entry)
-        live[id] = nil
     }
 
     /// Drops the banners of a conversation the user has now opened.
@@ -175,11 +154,6 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    private func push(_ channel: String, id: String, entry: Live?) {
-        let bridge = entry?.bridge ?? engine?.host?.bridge
-        bridge?.send(channel, [["id": id, "tag": entry?.tag ?? ""]])
-    }
-
     // MARK: Delivery
 
     private func deliver(_ request: NativeNotificationRequest, id: String) async {
@@ -187,11 +161,10 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
         let status = await center.notificationSettings().authorizationStatus
         guard status == .authorized || status == .provisional else {
             notifierLog.info("notification dropped: authorization \(status.rawValue)")
-            live[id] = nil
             return
         }
         if NotificationPolicy.shouldSuppress(
-            appIsActive: NSApp.isActive, mainWindowVisible: mainWindow()?.isVisible == true && mainWindow()?.isMiniaturized == false,
+            appIsActive: NSApp?.isActive ?? false, mainWindowVisible: mainWindow()?.isVisible == true && mainWindow()?.isMiniaturized == false,
             openConversation: engine?.openConversationId, tag: request.tag, userIdleSeconds: Self.userIdleSeconds()) {
             notifierLog.info("notification suppressed: conversation is open and the app is in use")
             return
@@ -211,13 +184,7 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
             try await center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
         } catch {
             notifierLog.error("add notification failed: \(error.localizedDescription, privacy: .public)")
-            live[id] = nil
             return
-        }
-        if let entry = live[id] {
-            // The renderer registers the id when `createNotification` resolves; let that happen first.
-            try? await Task.sleep(for: .milliseconds(60))
-            push("_noti_on-show", id: id, entry: entry)
         }
     }
 
@@ -226,7 +193,7 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
         let data: Data?
         switch icon {
         case .inline(let bytes): data = bytes
-        case .bundled(let path): data = engine?.host?.install.asar.read("pc-dist/" + path)
+        case .bundled: data = nil
         case .remote(let url):
             data = await Self.withTimeout(seconds: 3) {
                 guard let file = try? await MediaLoader.shared.localFile(for: url) else { return nil }
@@ -342,37 +309,18 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    /// Re-sends the current focus state (the page-load handler in `ZaloMainProcess` announces "focus" unconditionally).
-    func syncFocusState() { sendFocus(NSApp.isActive) }
-
-    // MARK: Focus bridge — the official FocusDetector decides "app is in use" from these events
+    func syncFocusState() {
+        if NSApp?.isActive == true { Task { await engine?.refreshNotificationAuthorization() } }
+    }
 
     private func startFocusBridge() {
-        let names: [(Notification.Name, Bool)] = [(NSApplication.didBecomeActiveNotification, true),
-                                                  (NSApplication.didResignActiveNotification, false)]
-        focusObservers = names.map { name, active in
-            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.sendFocus(active) }
+        focusObservers = [
+            NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+                _ = MainActor.assumeIsolated {
+                    Task { await self?.engine?.refreshNotificationAuthorization() }
+                }
             }
-        }
-        activityMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown, .scrollWheel]) { [weak self] event in
-            MainActor.assumeIsolated { self?.noteUserActivity() }
-            return event
-        }
-        sendFocus(NSApp.isActive)
-    }
-
-    /// `webContents.send('visibility-change', 'focus'|'blur', windowId)` as Electron's main does for the main window.
-    private func sendFocus(_ active: Bool) {
-        engine?.host?.bridge.send("visibility-change", active ? ["focus", "1"] : ["blur", "1"])
-        if active { Task { await engine?.refreshNotificationAuthorization() } }
-    }
-
-    private func noteUserActivity() {
-        let now = Date()
-        guard now.timeIntervalSince(lastActivityPush) >= 2 else { return }
-        lastActivityPush = now
-        engine?.callChat("activity", object: "__zaloNotification")
+        ]
     }
 
     // MARK: Sound (official `noti.mp3`, requested by the renderer's own sound rules)
@@ -393,11 +341,11 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
     /// The app's chat window: not the debug renderer, a panel, or the media viewer (which can be key and main too, but
     /// is not where messages are read, and must not be what "bring Olaz to the front" raises).
     private func mainWindow() -> NSWindow? {
-        NSApp.windows.first { $0.canBecomeMain && !($0 is NSPanel) && !($0 is MediaViewerWindow) && $0.title != Self.debugWindowTitle }
+        (NSApp?.windows ?? []).first { $0.canBecomeMain && !($0 is NSPanel) && !($0 is MediaViewerWindow) && $0.title != Self.debugWindowTitle }
     }
 
     func bringAppToFront() {
-        NSApp.activate()
+        NSApp?.activate()
         if let window = mainWindow() {
             if window.isMiniaturized { window.deminiaturize(nil) }
             window.makeKeyAndOrderFront(nil)
@@ -425,33 +373,25 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
     }
 
     private func handleResponse(id: String, convId: String, action: String, text: String?) {
-        let entry = live[id]
         switch action {
         case Self.replyAction:
-            // Inline reply goes through the official send path; the app stays in the background.
             if let text, !convId.isEmpty {
                 Task {
                     // A locked hidden chat (or an unknown hidden state) is never written to from a banner: the text takes the failure path.
                     let refused = engine.map { NotificationPolicy.refusesReply(hiddenStateKnown: $0.conversationActions.hiddenKnown,
                                                                                conversationLocked: $0.isConversationLocked(convId)) } ?? true
                     if !refused, let engine, await engine.sendText(text, to: convId) { return }
-                    // Not sent: keep the text for that conversation's composer (held here until an engine is attached).
                     let draft = ComposerDraft(text: text)
                     if let engine { engine.failedDrafts.stash(draft, for: convId) } else { orphanDrafts.stash(draft, for: convId) }
-                    // Say so (no content in the banner) unless the conversation is on screen, where its composer shows it.
-                    if !(NSApp.isActive && engine?.openConversationId == convId) { await postSendFailure(convId: convId) }
+                    if !(NSApp?.isActive == true && engine?.openConversationId == convId) { await postSendFailure(convId: convId) }
                 }
             }
         case UNNotificationDefaultActionIdentifier:
             bringAppToFront()
             if !convId.isEmpty { engine?.navigationRequest = convId }
-            // The official click handler (`_onNotiClicked`) opens the conversation in the client state.
-            if entry != nil || !id.hasPrefix("sendfail-") { push("_noti_on-click", id: id, entry: entry) }
+            clearDelivered(conversation: convId)
         default:
             break
         }
-        if entry != nil { push("_noti_on-close", id: id, entry: entry) }
-        if action == UNNotificationDefaultActionIdentifier { clearDelivered(conversation: convId) }
-        live[id] = nil
     }
 }

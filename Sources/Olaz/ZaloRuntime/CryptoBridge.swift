@@ -179,9 +179,6 @@ enum CryptoBridge {
     }
 
     static var debugResponses = ProcessInfo.processInfo.environment["OLAZ_DEBUG_RESPONSES"] != nil
-    private static var sessions: [Int: CipherSession] = [:]
-    private static var hashes: [Int: (String, Data)] = [:]
-    private static var nextHandle = 1
 
     static func oneShot(encrypting: Bool, _ args: [Any]) throws -> Any {
         // (data, algorithm, key, iv = zeros(16), encodings?, options?)
@@ -211,72 +208,6 @@ enum CryptoBridge {
         case "sha384": return Data(SHA384.hash(data: data))
         case "sha512": return Data(SHA512.hash(data: data))
         default: throw CryptoError(message: "Digest method not supported: \(algorithm)")
-        }
-    }
-
-    static func install(on bridge: ZaloBridge) {
-        bridge.sync("$znode.crypto.encrypt") { args in try oneShot(encrypting: true, args) }
-        bridge.sync("$znode.crypto.decrypt") { args in try oneShot(encrypting: false, args) }
-        // hash(data, algorithm, inputEncoding?, outputEncoding?, options?)
-        bridge.sync("$znode.crypto.hash") { args in
-            let data = try bytes(args.first, encoding: args.string(2))
-            return encode(try digest(args.string(1) ?? "sha256", data), encoding: args.string(3))
-        }
-        bridge.sync("$znode.crypto.randomBytes") { args in
-            var data = Data(count: max(0, args.int(0) ?? 0))
-            _ = data.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, $0.count, $0.baseAddress!) }
-            return ArrayBufferValue(data: data)
-        }
-
-        // Stateful cipher/hash objects — the JS side (local-modules.js) holds a handle.
-        bridge.sync("$znode.crypto.__cipherCreate") { args in
-            let encrypting = args.string(0) == "cipher"
-            let algorithm = args.string(1) ?? ""
-            let key = try bytes(args.count > 2 ? args[2] : nil, encoding: "utf8")
-            let iv = try bytes(args.count > 3 ? args[3] : nil, encoding: "utf8")
-            let session = try CipherSession(encrypting: encrypting, algorithm: algorithm, key: key, iv: iv)
-            let handle = nextHandle
-            nextHandle += 1
-            sessions[handle] = session
-            return handle
-        }
-        bridge.sync("$znode.crypto.__cipherUpdate") { args in
-            guard let session = sessions[args.int(0) ?? 0] else { throw CryptoError(message: "cipher released") }
-            let out = try session.update(try bytes(args.count > 1 ? args[1] : nil, encoding: args.string(2)))
-            return encode(out, encoding: args.string(3))
-        }
-        bridge.sync("$znode.crypto.__cipherFinal") { args in
-            guard let session = sessions[args.int(0) ?? 0] else { throw CryptoError(message: "cipher released") }
-            defer { if !session.isGCM || !session.encrypting { sessions[args.int(0) ?? 0] = nil } }
-            return encode(try session.final(), encoding: args.string(1))
-        }
-        bridge.sync("$znode.crypto.__cipherOption") { args in
-            guard let session = sessions[args.int(0) ?? 0] else { return nil }
-            switch args.string(1) {
-            case "autoPadding": try session.setAutoPadding(args.bool(2) ?? true)
-            case "authTag": session.authTag = try bytes(args.count > 2 ? args[2] : nil, encoding: nil)
-            case "aad": session.aad = try bytes(args.count > 2 ? args[2] : nil, encoding: nil)
-            case "getAuthTag":
-                defer { sessions[args.int(0) ?? 0] = nil }
-                return session.authTag.map { ArrayBufferValue(data: $0) }
-            default: break
-            }
-            return nil
-        }
-        bridge.sync("$znode.crypto.__hashCreate") { args in
-            let handle = nextHandle
-            nextHandle += 1
-            hashes[handle] = (args.string(0) ?? "sha256", Data())
-            return handle
-        }
-        bridge.sync("$znode.crypto.__hashUpdate") { args in
-            guard let entry = hashes[args.int(0) ?? 0] else { throw CryptoError(message: "Digest already called") }
-            hashes[args.int(0) ?? 0] = (entry.0, entry.1 + (try bytes(args.count > 1 ? args[1] : nil, encoding: args.string(2))))
-            return nil
-        }
-        bridge.sync("$znode.crypto.__hashDigest") { args in
-            guard let entry = hashes.removeValue(forKey: args.int(0) ?? 0) else { throw CryptoError(message: "Digest already called") }
-            return encode(try digest(entry.0, entry.1), encoding: args.string(1))
         }
     }
 }

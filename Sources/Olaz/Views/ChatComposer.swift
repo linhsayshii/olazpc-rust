@@ -31,6 +31,7 @@ struct ChatComposer: View {
     @State private var importKind = AttachmentKind.files
     @State private var showMyCard = false
     @State private var reminderInfo: ReminderComposeInfo?
+    @State private var pastedAttachment: PastedAttachment?
 
     private enum AttachmentKind { case media, files }
     /// Stickers suggested for the draft (official suggestion logic); they show only while the draft still is the text they were found for.
@@ -114,6 +115,24 @@ struct ChatComposer: View {
         .sheet(isPresented: Binding(get: { reminderInfo != nil }, set: { if !$0 { reminderInfo = nil } })) {
             if let reminderInfo { ReminderComposeSheet(conversationId: conversationId, info: reminderInfo) }
         }
+        .sheet(item: $pastedAttachment) { attachment in
+            VStack(spacing: 14) {
+                Text("Gửi vào \(attachment.conversationName)?").font(.headline)
+                if let image = attachment.preview {
+                    Image(nsImage: image).resizable().scaledToFit().frame(maxWidth: 320, maxHeight: 220)
+                } else {
+                    Image(systemName: "doc").font(.system(size: 48))
+                    Text(attachment.fileSummary).lineLimit(2)
+                }
+                HStack {
+                    Button("Hủy") { pastedAttachment = nil }.keyboardShortcut(.cancelAction)
+                    Button("Gửi") {
+                        pastedAttachment = nil
+                        sendPastedAttachment(attachment)
+                    }.keyboardShortcut(.defaultAction).buttonStyle(.glassProminent)
+                }
+            }.padding(24).frame(minWidth: 360)
+        }
         .fileImporter(isPresented: $importing, allowedContentTypes: importKind == .media ? [.image, .movie] : [.data],
                       allowsMultipleSelection: true) { result in
             guard case .success(let urls) = result, !urls.isEmpty else { return }
@@ -123,17 +142,13 @@ struct ChatComposer: View {
 
     // MARK: Parts
 
-    /// The official toolbar's attachments (photo / video, file, screenshot, my contact card) and its "…" menu (reminder, poll),
+    /// The official toolbar's attachments (photo / video, file, my contact card) and its "…" menu (reminder, poll),
     /// then sticker and the system emoji palette.
     private var plusMenu: some View {
         Menu {
             if !conversationId.isEmpty {
                 Button("Ảnh hoặc Video", systemImage: "photo.on.rectangle") { importKind = .media; importing = true }
                 Button("Tệp", systemImage: "paperclip") { importKind = .files; importing = true }
-                Menu("Chụp màn hình", systemImage: "camera.viewfinder") {
-                    Button("Chụp kèm cửa sổ \(AppBrand.name)") { engine.startScreenCapture(in: conversationId, withOlaz: true) }
-                    Button("Chụp không kèm cửa sổ \(AppBrand.name)") { engine.startScreenCapture(in: conversationId, withOlaz: false) }
-                }
                 Button("Danh thiếp của tôi", systemImage: "person.crop.rectangle") { showMyCard = true }
                 Divider()
                 Button("Nhắc hẹn", systemImage: "alarm") { openReminder() }
@@ -168,6 +183,10 @@ struct ChatComposer: View {
                 handle: handle, mentionsEnabled: isGroup,
                 onMentionQuery: { query = $0 },
                 onSuggestionKey: suggestionKey,
+                onPasteAttachment: { content in
+                    guard !conversationId.isEmpty else { return }
+                    pastedAttachment = PastedAttachment(content: content, conversationId: conversationId, conversationName: name)
+                },
                 onSend: send)
                 .frame(height: textHeight)
                 .overlay(alignment: .topLeading) {
@@ -230,6 +249,36 @@ struct ChatComposer: View {
     }
 
     // MARK: Attachments, reminder
+
+    private func sendPastedAttachment(_ attachment: PastedAttachment) {
+        let target = attachment.conversationId
+        Task {
+            var temporary: URL?
+            let urls: [URL]
+            switch attachment.content {
+            case .image(let png):
+                do {
+                    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-screenshots", isDirectory: true)
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                    let url = directory.appendingPathComponent("\(UUID().uuidString).png")
+                    try png.write(to: url, options: .atomic)
+                    temporary = url
+                    urls = [url]
+                } catch {
+                    CardActionCenter.shared.show("Không đọc được ảnh đã sao chép. Hãy thử lại.", in: target)
+                    return
+                }
+            case .files(let files): urls = files
+            }
+            let outcome = attachment.isMedia ? await engine.sendMedia(urls, to: target) : await engine.sendFiles(urls, to: target)
+            if case .pending = outcome {
+                // Keep temp file until upload finishes.
+            } else if let temporary {
+                try? FileManager.default.removeItem(at: temporary)
+            }
+            engine.report(outcome, in: target)
+        }
+    }
 
     /// The picked files go to the conversation they were picked in, even if another one is open by the time they are sent.
     private func sendAttachments(_ urls: [URL], as kind: AttachmentKind) {
@@ -481,6 +530,7 @@ struct ComposerTextView: NSViewRepresentable {
     var onMentionQuery: (MentionQuery?) -> Void = { _ in }
     /// While the popover is open: ↑ ↓ Return/Tab Esc. Returns true when consumed.
     var onSuggestionKey: (MentionKey) -> Bool = { _ in false }
+    var onPasteAttachment: (PastedContent) -> Void = { _ in }
     var onSend: () -> Void
 
     static let font = NSFont.systemFont(ofSize: 14)
@@ -513,6 +563,7 @@ struct ComposerTextView: NSViewRepresentable {
     func makeNSView(context: Context) -> NSScrollView {
         let tv = FieldTextView()
         tv.delegate = context.coordinator
+        tv.onPasteAttachment = { [weak coordinator = context.coordinator] content in coordinator?.parent.onPasteAttachment(content) }
         tv.font = Self.font
         tv.textColor = .labelColor
         tv.drawsBackground = false
@@ -748,10 +799,58 @@ struct ComposerTextView: NSViewRepresentable {
 
     final class FieldTextView: NSTextView {
         var onWidthChange: (() -> Void)?
+        var onPasteAttachment: ((PastedContent) -> Void)?
+        override func paste(_ sender: Any?) {
+            if let content = PastedContent.read(from: .general) {
+                onPasteAttachment?(content)
+            } else {
+                super.paste(sender)
+            }
+        }
         override func setFrameSize(_ newSize: NSSize) {
             let changed = abs(newSize.width - frame.width) > 0.5
             super.setFrameSize(newSize)
             if changed { DispatchQueue.main.async { [weak self] in self?.onWidthChange?() } }
         }
+    }
+}
+
+/// Clipboard attachments deliberately defer sending until the user confirms.
+enum PastedContent {
+    case image(Data)
+    case files([URL])
+
+    static func read(from pasteboard: NSPasteboard) -> PastedContent? {
+        let urls = (pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+        if !urls.isEmpty { return .files(urls) }
+        if let text = pasteboard.string(forType: .string), !text.isEmpty { return nil }
+        if let png = pasteboard.data(forType: .png), NSImage(data: png) != nil { return .image(png) }
+        guard let image = NSImage(pasteboard: pasteboard), let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff), let png = bitmap.representation(using: .png, properties: [:]) else { return nil }
+        return .image(png)
+    }
+}
+
+private struct PastedAttachment: Identifiable {
+    let id = UUID()
+    let content: PastedContent
+    let conversationId: String
+    let conversationName: String
+
+    var isMedia: Bool {
+        switch content {
+        case .image: true
+        case .files(let urls): urls.contains { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .image) == true }
+        }
+    }
+    var preview: NSImage? {
+        switch content {
+        case .image(let png): NSImage(data: png)
+        case .files(let urls): urls.first(where: { UTType(filenameExtension: $0.pathExtension)?.conforms(to: .image) == true }).flatMap { NSImage(contentsOf: $0) }
+        }
+    }
+    var fileSummary: String {
+        if case .files(let urls) = content { return urls.map(\.lastPathComponent).joined(separator: ", ") }
+        return ""
     }
 }

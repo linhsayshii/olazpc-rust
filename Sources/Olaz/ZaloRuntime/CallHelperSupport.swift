@@ -67,16 +67,18 @@ enum CallOrphans {
         var reaped: [pid_t] = []
         for pid in allPIDs() where pid != getpid() {
             var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
-            guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0,
-                  URL(fileURLWithPath: String(cString: buffer)).resolvingSymlinksInPath().path == helperPath,
+            guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { continue }
+            let path = String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            guard URL(fileURLWithPath: path).resolvingSymlinksInPath().path == helperPath,
                   owner(of: pid) == getuid(),
                   let argv = arguments(of: pid), staleOwner(argv: argv) != nil else { continue }
             kill(pid, SIGTERM)
             reaped.append(pid)
         }
         if !reaped.isEmpty {
+            let pidsToKill = reaped
             DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-                for pid in reaped where kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+                for pid in pidsToKill where kill(pid, 0) == 0 { kill(pid, SIGKILL) }
             }
         }
         return reaped

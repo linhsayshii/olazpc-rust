@@ -230,9 +230,7 @@ struct PinBoardSheet: View {
         VStack(spacing: 0) {
             Text("Ghim hội thoại").font(.system(size: 15, weight: .semibold)).padding(.top, 18).padding(.bottom, 10)
             if let board {
-                (Text("Bạn chỉ được ghim tối đa \(board.limit) trò chuyện.\nĐể ghim trò chuyện ") +
-                 Text(name(of: conversationId)).fontWeight(.semibold) +
-                 Text(", vui lòng bỏ ghim ít nhất \(board.need) trò chuyện bên dưới."))
+                Text("Bạn chỉ được ghim tối đa \(board.limit) trò chuyện.\nĐể ghim trò chuyện \(Text(name(of: conversationId)).fontWeight(.semibold)), vui lòng bỏ ghim ít nhất \(board.need) trò chuyện bên dưới.")
                     .font(.system(size: 13))
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 20).padding(.bottom, 10)

@@ -34,8 +34,19 @@ enum ZaloRuntime {
     /// The download button of zalo.me/pc: redirects a Mac browser to the current DMG. Used when the pinned one is gone.
     static let latestLink = URL(string: "https://zalo.me/download/zalo-pc")!
 
-    /// What is copied out of Zalo.app.
-    static let parts = ["Contents/Info.plist", "Contents/Resources/app.asar", "Contents/ZaloHelper.app"]
+    /// What is copied out of Zalo.app for on-demand calls (zero app.asar / Electron).
+    static let parts = ["Contents/Info.plist", "Contents/ZaloHelper.app"]
+
+    static var defaultCallAppURL: URL {
+        if FileManager.default.isExecutableFile(atPath: helper("ZaloCall", in: current).path) {
+            return current
+        }
+        let installed = URL(fileURLWithPath: "/Applications/Zalo.app")
+        if FileManager.default.isExecutableFile(atPath: helper("ZaloCall", in: installed).path) {
+            return installed
+        }
+        return current
+    }
 
     static var root: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -55,7 +66,6 @@ enum ZaloRuntime {
     static func isComplete(_ runtime: URL) -> Bool {
         let fm = FileManager.default
         return fm.fileExists(atPath: runtime.appendingPathComponent("Contents/Info.plist").path)
-            && fm.fileExists(atPath: runtime.appendingPathComponent("Contents/Resources/app.asar").path)
             && fm.isExecutableFile(atPath: helper("ZaloCall", in: runtime).path)
     }
 
@@ -256,6 +266,7 @@ struct ZaloRuntimeInstaller: Sendable {
         try? fm.removeItem(at: destination)
         try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         try fm.moveItem(at: staging, to: destination)
+        _ = AsarWasmReader.cacheWasmIfPresent(inZaloApp: app)
         // ~270 MB that can always be fetched again: not worth a place in Time Machine.
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
