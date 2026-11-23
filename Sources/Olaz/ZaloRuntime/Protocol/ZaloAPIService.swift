@@ -392,14 +392,31 @@ extension ZaloSessionClient {
         return ZaloJSONArrayBox(rows)
     }
 
+    /// Received friend requests. The official client has no `received/list` endpoint (it 404s on every host): it reads
+    /// `recommendsv2/list` (cmd 11437, params `{imei}`) and keeps the `recommItems` whose `dataInfo.recommType == 2`.
     func fetchReceivedFriendRequests() async throws -> ZaloJSONArrayBox {
         let resp = try await get(
             service: "friend",
-            path: "/api/friend/received/list",
-            encryptedPayload: ["page": 1, "count": 100, "avatar_size": 120]
+            path: "/api/friend/recommendsv2/list",
+            encryptedPayload: ["imei": imei]
         )
-        let rows = (resp["data"] as? [[String: Any]]) ?? ((resp["data"] as? [String: Any])?["list"] as? [[String: Any]]) ?? []
-        return ZaloJSONArrayBox(rows)
+        return ZaloJSONArrayBox(Self.receivedFriendRequestRows(resp["data"]))
+    }
+
+    /// Flattens `recommendsv2/list` items with `recommType == 2` into the row shape the contacts sync reads
+    /// (`userId`, `displayName`, `zaloName`, `avatar`, `message`, `time`), newest first like the official list.
+    static func receivedFriendRequestRows(_ data: Any?) -> [[String: Any]] {
+        let items = ((data as? [String: Any])?["recommItems"] as? [[String: Any]]) ?? []
+        var rows: [[String: Any]] = []
+        for item in items {
+            guard let info = item["dataInfo"] as? [String: Any], JSONLossless.int64(info["recommType"]) == 2 else { continue }
+            var row = info
+            let recomm = info["recommInfo"] as? [String: Any]
+            row["message"] = JSONLossless.string(recomm?["message"] ?? info["message"])
+            row["time"] = JSONLossless.int64(info["recommTime"] ?? info["friendRequestFetchTime"]) ?? 0
+            rows.append(row)
+        }
+        return rows.sorted { (JSONLossless.int64($0["time"]) ?? 0) > (JSONLossless.int64($1["time"]) ?? 0) }
     }
 
     static func normalizePhoneForLookup(_ raw: String) -> String {
