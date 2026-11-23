@@ -189,8 +189,10 @@ machine's load and by where the pointer was. They are superseded by the tables a
 - **Top scroll edge effect.** The bottom soft edge effect under the composer still applies; SwiftUI's `safeAreaBar`
   applies it to the AppKit scroll view. The top `.hard` edge effect under the toolbar was a SwiftUI `ScrollView`
   modifier, so the top now shows AppKit's default titlebar treatment. Check it in the real window.
-- **Not in this change:**
-  - The conversation sidebar `List` still diffs all rows on every `engine.conversations` change.
-  - The `NSTableView reentrant` warning comes from that `List`, not the message list.
+- **Conversation list (done after this change).** The sidebar `List` re-diffed all ~700 rows on every
+  `engine.conversations` change: ~134 ms of main thread and 1.5 G instructions per arriving message, 48% of frames
+  dropped while messages arrived. `ConversationTableView` (an `NSTableView` hosting the same SwiftUI rows, diffing ids
+  and re-rooting only visible changed rows) brings that to ~19 ms and 51 M instructions per message, 3.4% dropped
+  (`OLAZ_BENCH_MODE=convlist Olaz --scroll-bench`, 700 chats, 120 Hz).
 - **Rows held by the conversation.** `MessageRow` still observes the engine (`profile`, `canCall`). That is fine with
   per-row hosts, because only rows that read a changed value update.

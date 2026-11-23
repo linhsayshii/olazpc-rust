@@ -182,37 +182,3 @@ struct ConversationListPinGrid: View {
     }
 }
 
-// MARK: - Swipe actions
-
-/// Leading "Ghim" / "Bỏ ghim" and trailing "Đã đọc" / "Chưa đọc", offered exactly when the context menu offers them.
-struct ConversationListSwipeActions: ViewModifier {
-    @Environment(ZaloEngine.self) private var engine
-    /// Swipe buttons take a plain color, not the root `.tint` style.
-    @AppStorage(OlazPrefs.accent) private var accent = OlazAccent.blue
-    let conversation: ZaloEngine.ConversationSummary
-
-    func body(content: Content) -> some View {
-        let state = engine.conversationActions
-        let plan = ConversationMenuPlan.make(id: conversation.id, preset: .thread, state: state, unread: conversation.unread,
-                                             muted: engine.isConversationMuted(conversation.id))
-        content
-            .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                if state.loaded {
-                    switch plan.pin {
-                    case .pin: Button("Ghim", systemImage: "pin.fill") { engine.pinConversation(conversation.id) }.tint(.orange)
-                    case .unpin: Button("Bỏ ghim", systemImage: "pin.slash.fill") { engine.unpinConversation(conversation.id) }.tint(.orange)
-                    case nil: EmptyView()
-                    }
-                }
-            }
-            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                if state.loaded {
-                    switch plan.read {
-                    case .markRead: Button("Đã đọc", systemImage: "envelope.open.fill") { engine.markConversationRead(conversation.id) }.tint(accent.color)
-                    case .markUnread: Button("Chưa đọc", systemImage: "envelope.badge.fill") { engine.markConversationUnread(conversation.id) }.tint(accent.color)
-                    case nil: EmptyView()
-                    }
-                }
-            }
-    }
-}

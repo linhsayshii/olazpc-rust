@@ -35,6 +35,8 @@ struct ConversationListColumn: View {
     @Environment(ZaloEngine.self) private var engine
     @Environment(ShellModel.self) private var shell
     @State private var showLabelManager = false
+    /// Swipe buttons take a plain color, not the root `.tint` style.
+    @AppStorage(OlazPrefs.accent) private var accent = OlazAccent.blue
     /// Hidden conversations listed because the search text is the PIN.
     @State private var pinMatches: [String] = []
     /// The search text the PIN search last ran for (nil on the first run of this view: re-appearing is not a search change).
@@ -175,54 +177,97 @@ struct ConversationListColumn: View {
     }
 
     private func list(_ listing: Listing) -> some View {
-        List(selection: Binding(get: { shell.selection }, set: { shell.selection = $0 })) {
-            if !isSearching, hasBanner {
-                banner
-                    .listRowInsets(EdgeInsets(top: 4, leading: 10, bottom: 8, trailing: 10))
-                    .listRowSeparator(.hidden)
-                    .selectionDisabled()
-            }
-            if !listing.pins.isEmpty {
-                ConversationListPinGrid(pins: listing.pins, showLabelManager: $showLabelManager)
-                    .listRowInsets(EdgeInsets(top: 2, leading: 10, bottom: 6, trailing: 10))
-                    .listRowSeparator(.hidden)
-                    .selectionDisabled()
-            }
-            if isSearching {
-                Section("Cuộc trò chuyện") { rows(listing.rows) }
-            } else {
-                rows(listing.rows)
-            }
-        }
-        .listStyle(.inset)
-        .scrollEdgeEffectStyle(.soft, for: .top)
+        ConversationTableView(
+            entries: entries(listing),
+            selection: shell.selection,
+            onSelect: { shell.selection = $0 },
+            onActivate: { _ in },
+            swipeActions: swipeActions,
+            rowContent: rowContent)
     }
 
-    private func rows(_ items: [ListItem]) -> some View {
-        ForEach(items) { item in
+    /// The lines of the table: banner, pinned tiles, then the rows (under a section title while searching).
+    private func entries(_ listing: Listing) -> [ConversationTableEntry] {
+        var out: [ConversationTableEntry] = []
+        out.reserveCapacity(listing.rows.count + 3)
+        if !isSearching, hasBanner { out.append(.banner) }
+        if !listing.pins.isEmpty { out.append(.pins(listing.pins)) }
+        if isSearching { out.append(.section("Cuộc trò chuyện")) }
+        let actions = engine.conversationActions
+        let selfId = engine.selfConversationId
+        let pinGlyph = !(destination == .inbox && !isSearching)
+        for item in listing.rows {
             switch item {
-            case .conversation(let conversation):
-                ConversationListRow(conversation: conversation,
-                                    label: extras.label(of: conversation.id),
-                                    showsPin: !(destination == .inbox && !isSearching) && engine.conversationActions.isPinned(conversation.id),
-                                    unreadMark: engine.conversationActions.hasUnreadMark(conversation.id),
-                                    isStranger: destination != .strangers && extras.strangerIds.contains(conversation.id),
-                                    isSelf: conversation.id == engine.selfConversationId)
-                    .equatable()
-                    .tag(conversation.id)
-                    .listRowInsets(EdgeInsets(top: 5, leading: 10, bottom: 5, trailing: 10))
-                    .alignmentGuide(.listRowSeparatorLeading) { _ in 64 }
-                    .modifier(ConversationListSwipeActions(conversation: conversation))
-                    .contextMenu { ConversationActionsMenu(conversationId: conversation.id, preset: .thread, showLabelManager: $showLabelManager) }
+            case .conversation(let c):
+                out.append(.conversation(ConversationRowModel(
+                    conversation: c,
+                    label: extras.label(of: c.id),
+                    showsPin: pinGlyph && actions.isPinned(c.id),
+                    unreadMark: actions.hasUnreadMark(c.id),
+                    isStranger: destination != .strangers && extras.strangerIds.contains(c.id),
+                    isSelf: c.id == selfId)))
             case .strangerBox:
-                StrangerBoxRow(box: extras.strangerBox,
-                               newest: extras.strangerBox.newestId.flatMap { id in engine.conversations.first { $0.id == id && !engine.conversationActions.isHidden(id) } }) {
-                    shell.search = ""
-                    shell.destination = .strangers
-                }
-                .listRowInsets(EdgeInsets(top: 5, leading: 10, bottom: 5, trailing: 10))
-                .alignmentGuide(.listRowSeparatorLeading) { _ in 64 }
+                out.append(.strangerBox)
             }
+        }
+        return out
+    }
+
+    private func rowContent(_ entry: ConversationTableEntry) -> AnyView {
+        switch entry {
+        case .banner:
+            return AnyView(banner.padding(.top, 4).padding(.bottom, 8))
+        case .pins(let pins):
+            return AnyView(ConversationListPinGrid(pins: pins, showLabelManager: $showLabelManager).padding(.top, 2).padding(.bottom, 6))
+        case .section(let title):
+            return AnyView(Text(title).font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                .padding(.top, 6).padding(.bottom, 2))
+        case .conversation(let m):
+            return AnyView(
+                ConversationListRow(conversation: m.conversation, label: m.label, showsPin: m.showsPin, unreadMark: m.unreadMark,
+                                    isStranger: m.isStranger, isSelf: m.isSelf)
+                    .equatable()
+                    .contextMenu {
+                        ConversationActionsMenu(conversationId: m.conversation.id, preset: .thread, showLabelManager: $showLabelManager)
+                    })
+        case .strangerBox:
+            return AnyView(StrangerBoxRow(box: extras.strangerBox,
+                                          newest: extras.strangerBox.newestId.flatMap { id in engine.conversations.first { $0.id == id && !engine.conversationActions.isHidden(id) } }) {
+                shell.search = ""
+                shell.destination = .strangers
+            }.padding(.vertical, 5))
+        }
+    }
+
+    /// Leading "Ghim" / "Bỏ ghim" and trailing "Đã đọc" / "Chưa đọc", offered exactly when the context menu offers them.
+    private func swipeActions(_ id: String, _ edge: NSTableView.RowActionEdge) -> [NSTableViewRowAction] {
+        let state = engine.conversationActions
+        guard state.loaded, let conversation = engine.conversations.first(where: { $0.id == id }) else { return [] }
+        let plan = ConversationMenuPlan.make(id: id, preset: .thread, state: state, unread: conversation.unread,
+                                             muted: engine.isConversationMuted(id))
+        func action(_ title: String, _ symbol: String, _ color: NSColor, _ run: @escaping () -> Void) -> NSTableViewRowAction {
+            let a = NSTableViewRowAction(style: .regular, title: title) { _, _ in run() }
+            a.backgroundColor = color
+            a.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+            return a
+        }
+        let engine = engine
+        switch edge {
+        case .leading:
+            switch plan.pin {
+            case .pin: return [action("Ghim", "pin.fill", .systemOrange) { engine.pinConversation(id) }]
+            case .unpin: return [action("Bỏ ghim", "pin.slash.fill", .systemOrange) { engine.unpinConversation(id) }]
+            case nil: return []
+            }
+        case .trailing:
+            let accent = NSColor(self.accent.color)
+            switch plan.read {
+            case .markRead: return [action("Đã đọc", "envelope.open.fill", accent) { engine.markConversationRead(id) }]
+            case .markUnread: return [action("Chưa đọc", "envelope.badge.fill", accent) { engine.markConversationUnread(id) }]
+            case nil: return []
+            }
+        @unknown default:
+            return []
         }
     }
 

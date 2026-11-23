@@ -42,7 +42,11 @@ enum ScrollBench {
         init(out: URL, label: String) { self.out = out; self.label = label }
         func applicationDidFinishLaunching(_ notification: Notification) {
             Task { @MainActor in
-                await ScrollBench.run(out: out, label: label)
+                if ProcessInfo.processInfo.environment["OLAZ_BENCH_MODE"] == "convlist" {
+                    await ScrollBench.runConversationList(out: out, label: label)
+                } else {
+                    await ScrollBench.run(out: out, label: label)
+                }
                 NSApp.terminate(nil)
             }
         }
@@ -522,5 +526,138 @@ enum ScrollBench {
                 isE2EE: false, mentions: mentions))
         }
         return out
+    }
+}
+
+// MARK: - Conversation list (OLAZ_BENCH_MODE=convlist)
+
+extension ScrollBench {
+    /// The conversation column with `OLAZ_BENCH_CONVS` (default 700) synthetic chats. Passes: messages arriving while idle
+    /// (one every 250 ms moves a chat from lower down to the top, as `applyParsedEvents` does), a drag down and up, and both at
+    /// once. Same metrics as the chat bench; `upd` is per arriving message.
+    static func runConversationList(out: URL, label: String) async {
+        let activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical], reason: "list bench")
+        defer { ProcessInfo.processInfo.endActivity(activity) }
+        var report: [String] = []
+        func log(_ s: String) { print("bench: " + s); report.append(s) }
+        let env = ProcessInfo.processInfo.environment
+        let count = Int(env["OLAZ_BENCH_CONVS"] ?? "") ?? 700
+        let speed = Double(env["OLAZ_BENCH_SPEED"] ?? "") ?? 2400
+
+        let images = makeImages(in: out.appendingPathComponent("img", isDirectory: true))
+        let engine = ZaloEngine(dataDirectory: out.appendingPathComponent("data", isDirectory: true), useKeychain: false)
+        let shell = ShellModel()
+        var rng = RNG(state: 11)
+        let start = Date()
+        var list: [ZaloEngine.ConversationSummary] = (0..<count).map { i in
+            let group = rng.chance(0.3)
+            return ZaloEngine.ConversationSummary(
+                id: group ? "g\(100_000 + i)" : "\(200_000 + i)", isGroup: group, name: (group ? "Nhóm " : "Bạn ") + "\(i)",
+                avatar: images.avatars.isEmpty ? nil : images.avatars[i % images.avatars.count], pinned: false,
+                members: group ? 3 + rng.int(200) : 0, unread: rng.chance(0.2) ? 1 + rng.int(9) : 0,
+                preview: .init(text: "Tin nhắn \(i) " + String(repeating: "chữ ", count: rng.int(12)),
+                               date: start.addingTimeInterval(-Double(i) * 600), fromMe: rng.chance(0.3)))
+        }
+        func publish() {
+            engine.conversations = list
+            engine.rebuildConversationFlags()
+            engine.rebuildConversationExtras()
+        }
+        publish()
+        shell.destination = .inbox
+
+        let screen = pickScreen(env["OLAZ_BENCH_SCREEN"])
+        let size = NSSize(width: 380, height: min(860, screen.visibleFrame.height - 80))
+        let frame = NSRect(origin: NSPoint(x: screen.visibleFrame.maxX - size.width - 20, y: screen.visibleFrame.minY + 40), size: size)
+        let window = NSWindow(contentRect: frame, styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+                              backing: .buffered, defer: false, screen: screen)
+        window.title = "Olaz list bench"
+        window.isReleasedWhenClosed = false
+        let host = NSHostingView(rootView: ConversationListColumn().olazAppearance(engine: engine, shell: shell))
+        window.contentView = host
+        window.setFrame(frame, display: true)
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        let clock = FrameClock()
+        let link = host.displayLink(target: clock, selector: #selector(FrameClock.tick(_:)))
+        link.add(to: .main, forMode: .common)
+        defer { link.invalidate() }
+        let busy = BusyMeter()
+        busy.install()
+        defer { busy.remove() }
+        try? await Task.sleep(for: .seconds(2.5))
+        let refresh = clock.refresh
+        log(String(format: "label=%@ mode=convlist convs=%d speed=%.0fpt/s refresh=%.2fms", label, count, speed, refresh * 1000))
+        guard let scroll = largestScrollView(in: host) else { log("no scroll view"); return }
+        if env["OLAZ_BENCH_SHOT"] != nil {
+            shell.selection = list[3].id
+            try? await Task.sleep(for: .seconds(1.5))
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            p.arguments = ["-x", "-o", "-l", "\(window.windowNumber)", out.appendingPathComponent("\(label)-list.png").path]
+            try? p.run(); p.waitUntilExit()
+        }
+
+        var tick = 0
+        func arrive() {
+            tick += 1
+            let idx = 5 + rng.int(max(1, list.count - 5))
+            var c = list.remove(at: idx)
+            c.preview = .init(text: "Tin mới \(tick)", date: Date(), fromMe: false)
+            c.unread += 1
+            list.insert(c, at: 0)
+            publish()
+        }
+        func arrivals() -> Task<Void, Never> {
+            Task { @MainActor in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(250))
+                    if !Task.isCancelled { arrive() }
+                }
+            }
+        }
+
+        // 1. Messages arriving while the list sits still.
+        clock.stamps.removeAll(); busy.reset()
+        let cpu0 = mainThreadCPU(), instr0 = instructionsM(), tick0 = tick
+        let idle = arrivals()
+        try? await Task.sleep(for: .seconds(10))
+        idle.cancel()
+        let updates = max(1, tick - tick0)
+        let stamps = clock.stamps
+        let intervals = zip(stamps.dropFirst(), stamps).map { ($0 - $1) * 1000 }
+        let cpu = mainThreadCPU() - cpu0, instr = instructionsM() - instr0
+        log(stats("NEWMSG-IDLE", intervals: intervals, busy: busy.take(), seconds: (stamps.last ?? 0) - (stamps.first ?? 0),
+                  refresh: refresh, distance: 0, cpu: cpu, instructions: instr)
+            + String(format: " upd=%d cpu=%.2fms/upd instr=%.1fM/upd", updates, cpu / Double(updates), instr / Double(updates)))
+        try? await Task.sleep(for: .milliseconds(600))
+
+        // 2–3. Drag down through the list and back up.
+        for (name, direction) in [("SCROLL-DOWN", 1.0), ("SCROLL-UP", -1.0)] {
+            let r = await scrollPass(scroll, clock: clock, busy: busy, direction: direction, speed: speed, maxSeconds: 10)
+            log(stats(name, intervals: r.intervals, busy: r.busy, seconds: r.seconds, refresh: refresh, distance: r.distance,
+                      cpu: r.cpu, instructions: r.instructions))
+            try? await Task.sleep(for: .milliseconds(600))
+        }
+
+        // 4. Dragging while messages arrive.
+        let tick1 = tick
+        let live = arrivals()
+        let r = await scrollPass(scroll, clock: clock, busy: busy, direction: 1, speed: speed, maxSeconds: 8)
+        live.cancel()
+        let liveUpdates = max(1, tick - tick1)
+        log(stats("SCROLL-NEWMSG", intervals: r.intervals, busy: r.busy, seconds: r.seconds, refresh: refresh, distance: r.distance,
+                  cpu: r.cpu, instructions: r.instructions)
+            + String(format: " upd=%d instr=%.1fM/upd", liveUpdates, r.instructions / Double(liveUpdates)))
+        log(String(format: "memory rss=%.0fMB", residentMB()))
+
+        let text = report.joined(separator: "\n") + "\n\n"
+        let file = out.appendingPathComponent("bench.txt")
+        if let h = try? FileHandle(forWritingTo: file) {
+            h.seekToEndOfFile(); h.write(Data(text.utf8)); try? h.close()
+        } else {
+            try? text.write(to: file, atomically: true, encoding: .utf8)
+        }
     }
 }
