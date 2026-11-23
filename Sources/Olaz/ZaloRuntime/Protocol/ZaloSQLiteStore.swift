@@ -1537,6 +1537,21 @@ actor ZaloSQLiteStore {
         return Self.decoded(try await messages(convId: convId, beforeTsMs: beforeTsMs, limit: limit))
     }
 
+    /// `message(convId:idOrClientId:)` decoded to a `ChatMessage` (nil when missing or undecodable). Rust path: decoded in
+    /// the core, no JSON re-parse in Swift. The row's `id` / `clientId` columns come back with it.
+    func decodedMessage(convId: String, idOrClientId: String) async throws -> DecodedMessageRow? {
+        if let core {
+            do {
+                return try await core.messageChat(convId: convId, idOrClientId: idOrClientId).map {
+                    DecodedMessageRow(message: ChatMessage(record: $0.message), rowId: $0.rowId, rowClientId: $0.rowClientId)
+                }
+            } catch { throw RustCore.mapError(error) }
+        }
+        guard let stored = try await message(convId: convId, idOrClientId: idOrClientId),
+              let decoded = ZaloWireParser.decodeStoredMessage(stored) else { return nil }
+        return DecodedMessageRow(message: decoded, rowId: stored.id, rowClientId: stored.clientId)
+    }
+
     /// `searchMessages(...)` decoded to `ChatMessage`s.
     func decodedSearch(conversationId: String, query: String, limit: Int = 50) async throws -> [DecodedMessageRow] {
         if let core {

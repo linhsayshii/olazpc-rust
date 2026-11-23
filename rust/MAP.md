@@ -1,6 +1,6 @@
 # Olaz Rust port map
 
-Goal: move Olaz's protocol engine to a Rust core called from the existing SwiftUI app (macOS only), for speed and a smoother main thread. Decisions: [DECISIONS.md](DECISIONS.md) (ADR-001..008). Terms: [GLOSSARY.md](GLOSSARY.md).
+Goal: move Olaz's protocol engine to a Rust core called from the existing SwiftUI app (macOS only), for speed and a smoother main thread. Decisions: [DECISIONS.md](DECISIONS.md) (ADR-001..013). Terms: [GLOSSARY.md](GLOSSARY.md).
 
 Workflow per unit: claim here, port into its own crate, port Swift fixtures as Rust tests, `cargo fmt --check && cargo clippy -p <crate> -- -D warnings && cargo test -p <crate>` green, mark done with test counts.
 
@@ -28,6 +28,7 @@ Workflow per unit: claim here, port into its own crate, port Swift fixtures as R
 | 4b | Chat state (conversation list merge/sort/unread, per-conversation message window) in Rust; Swift gets diffs | deferred (small remaining gain) |
 | 4c | Flip `OLAZ_RUST_CORE` default on (ADR-012) | done 2026-11-23 (swift 443 both modes) |
 | 4d | Delete Swift chat path | open (after commit + daily use) |
+| 5a | typed history/lookup/envelopes | done 2026-11-23 (rust 258, swift 449 both modes; non-plain ws envelopes stay raw, ADR-013) |
 | 5b | generic signed HTTP seam (all feature endpoints) + timeout fix | done 2026-11-23 (rust 271 = +8 golden/seam, +2 timeout, +5 ffi; swift 452 both modes). `CoreHttp` (`request`, `post_multipart`, `post_multipart_file`) over `olaz_net::GenericCall`; Swift `ZaloSessionClient.get/post/postMultipart` delegate to it when `useRustCore`. Still Swift: `rawGetJSON`/`rawRequest` callers (QR/login already Rust), `zCloudGet` (cloud-viewer-key header, no ParamCipher), `rawDownloadData`, `downloadSyncBatch` |
 
 ## Later waves (out of milestone 1)
@@ -47,7 +48,7 @@ SwiftUI views (`App/`, `Shell/`, `Views/`), `ShellModel`, Keychain glue, QR PNG 
 
 - Perf (2,000 msgs, debug Swift vs release Rust): parse 56 ms Swift vs 97 ms Rust incl. ChatMessage rebuild; save 13-17 vs 18-24 ms. The Rust path wins only by running off the MainActor. Real gains need typed records end to end (no JSON re-parse in Swift) and engine state moving into Rust.
 - Timing flakes under full parallel `swift test`: `fastPhoneSyncPlanFiltersAndSortsNewestFirstAndBulkIngestsFast` (elapsed < 2.5 s; 0.1 s alone) and `MediaRecoveryTests/queueIsLIFOAndDropsCancelledWork`. Machine contention, not Rust.
-- Off hot path still JSON: non-plain/E2EE ws envelopes, history HTTP results (Swift dict re-serialised), `message(...)` lookup and `findMessageForMedia`.
+- Off hot path still JSON (ADR-013): non-plain ws envelopes (E2EE 535/551/552, control/typing/mute/voip, mobile sync, auth), HTTP polling results, raw `message(...)` lookup used by `resolveServerAndClientIds`, and the `raw_json()` of a history page for dictionary-reading callers. History pages, single-message decode and `findMessageForMedia` are typed.
 
 - Lossless JSON accessors are duplicated in `olaz-crypto`, `olaz-wire`, `olaz-ws` (`json.rs`), `olaz-store` (`helpers.rs`). Unify into `olaz-crypto::json` (or a tiny `olaz-json`) at the start of wave 2.
 - Sorted JSON keys: server accepts them (live send ok 2026-11-22).

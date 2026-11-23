@@ -202,7 +202,7 @@ extension ZaloEngine {
 
     @discardableResult
     internal func fetchAndMergeHistory(convId: String, beforeMsgId: String?, isOld: Bool? = nil, count: Int = 50) async -> Int {
-        guard let box = try? await sessionClient.fetchHistory(convId: convId, lastMsgId: beforeMsgId, count: count, isOld: isOld) else {
+        guard let page = try? await sessionClient.fetchHistoryPage(convId: convId, lastMsgId: beforeMsgId, count: count, isOld: isOld) else {
             if beforeMsgId == nil {
                 if messages[convId] == nil { messages[convId] = [] }
                 if messages[convId]?.isEmpty ?? true { hasMoreHistory[convId] = false }
@@ -213,8 +213,8 @@ extension ZaloEngine {
         let myUid = profile?.userId ?? ""
         let isGrp = ZaloWireParser.isGroupId(convId)
         let isSelf = (convId == selfConversationId)
-        let events = await ZaloWireParser.extractBatchEventsAsync(
-            box.dict,
+        let events = await ZaloWireParser.historyEventsAsync(
+            page,
             myUid: myUid,
             selfConvId: selfConversationId,
             fallbackConvId: (isGrp || isSelf) ? convId : nil,

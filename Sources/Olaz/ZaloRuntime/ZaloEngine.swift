@@ -2046,16 +2046,16 @@ final class ZaloEngine {
 
         if let store = sqliteStore {
             let convCandidates = (sanitizedConv == trimmedConv) ? [trimmedConv] : [trimmedConv, sanitizedConv]
-            var storedRow: StoredMessage?
+            var storedRow: DecodedMessageRow?
             for candidateConv in convCandidates where storedRow == nil {
                 if !trimmedMsg.isEmpty {
-                    storedRow = try? await store.message(convId: candidateConv, idOrClientId: trimmedMsg)
+                    storedRow = try? await store.decodedMessage(convId: candidateConv, idOrClientId: trimmedMsg)
                 }
                 if storedRow == nil && !trimmedCli.isEmpty {
-                    storedRow = try? await store.message(convId: candidateConv, idOrClientId: trimmedCli)
+                    storedRow = try? await store.decodedMessage(convId: candidateConv, idOrClientId: trimmedCli)
                 }
             }
-            if let storedRow, var decoded = ZaloWireParser.decodeStoredMessage(storedRow) {
+            if var decoded = storedRow?.message {
                 Self.mutateReactions(
                     &decoded.reactions,
                     actorUid: cleanSender,

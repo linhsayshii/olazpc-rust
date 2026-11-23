@@ -270,9 +270,8 @@ extension ZaloEngine {
         }
         if !conversationId.isEmpty,
            let store = self.sqliteStore,
-           let stored = try? await store.message(convId: conversationId, idOrClientId: messageId),
-           let decoded = ZaloWireParser.decodeStoredMessage(stored) {
-            return decoded
+           let row = try? await store.decodedMessage(convId: conversationId, idOrClientId: messageId) {
+            return row.message
         }
         for list in self.messages.values {
             if let hit = list.first(where: { $0.id == messageId }) {

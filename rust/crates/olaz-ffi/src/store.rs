@@ -442,6 +442,18 @@ impl CoreStore {
         Ok(m.map(Into::into))
     }
 
+    /// [`CoreStore::message`] decoded to a typed message in Rust (no JSON reaches Swift). `None` when the row is
+    /// missing or its JSON cannot be decoded (Swift's `decodeStoredMessage` returns nil for those).
+    pub async fn message_chat(
+        &self,
+        conv_id: String,
+        id_or_client_id: String,
+    ) -> Result<Option<StoredChat>, CoreError> {
+        let db = Arc::clone(&self.inner);
+        let m = blocking(move || lock(&db).message(&conv_id, &id_or_client_id)).await??;
+        Ok(m.and_then(|row| decode_rows(vec![row]).pop()))
+    }
+
     pub async fn delete_message(&self, conv_id: String, id: String) -> Result<(), CoreError> {
         let db = Arc::clone(&self.inner);
         blocking(move || lock(&db).delete_message(&conv_id, &id)).await??;

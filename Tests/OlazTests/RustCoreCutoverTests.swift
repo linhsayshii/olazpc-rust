@@ -420,4 +420,76 @@ import Testing
             #expect(rx?.isEqual(ry) == true, "row \(x.id) differs: \(String(decoding: x.rawJSONData, as: UTF8.self)) vs \(String(decoding: y.rawJSONData, as: UTF8.self))")
         }
     }
+
+    // MARK: typed history page (wave 5a)
+
+    private static var historyBody: [String: Any] { [
+        "error_code": 0,
+        "data": [
+            "hasMore": 1, "isOld": 0, "lastMsgId": "7412345678901234500",
+            "groupMsgs": [
+                ["msgId": "7412345678901234567", "cliMsgId": "c1", "uidFrom": "u1", "idTo": "g1", "msgType": "webchat", "content": "Chào nhóm", "ts": 1_795_000_000_000,
+                 "quote": ["ownerId": "u1", "msg": "Tin cũ", "fromD": "x"]],
+                ["msgId": "7412345678901234568", "cliMsgId": "c2", "uidFrom": "me", "idTo": "g1", "msgType": "chat.photo", "content": ["hd": "https://cdn.example/p.jpg", "title": "Anh"], "ts": 1_795_000_001_000],
+                ["msgType": "chat.undo", "uidFrom": "u1", "idTo": "g1", "content": ["globalMsgId": "7412345678901234567", "cliMsgId": "c1"]]
+            ]
+        ]
+    ] }
+
+    @MainActor
+    @Test func historyPageMatchesSwiftWalkAndHead() async throws {
+        let json = String(decoding: try JSONSerialization.data(withJSONObject: Self.historyBody), as: UTF8.self)
+        let rustPage = ZaloHistoryPage(record: try historyRecordFromJson(json: json))
+        let swiftPage = ZaloHistoryPage(box: ZaloJSONBox(JSONLossless.parseObject(string: json) ?? [:]))
+        // The paging head reads the same on both paths, 64-bit ids exact.
+        #expect(rustPage.hasMore && swiftPage.hasMore)
+        #expect(!rustPage.isOld && !swiftPage.isOld)
+        #expect(rustPage.lastMsgId == "7412345678901234500" && swiftPage.lastMsgId == rustPage.lastMsgId)
+        #expect(rustPage.uids == ["me", "u1"])
+        #expect(rustPage.rustBatch != nil && swiftPage.rustBatch == nil)
+        for fallback in [("g1", true), ("g:g1", true)] {
+            let rust = await ZaloWireParser.historyEventsAsync(
+                rustPage, myUid: "me", selfConvId: "cloud999", fallbackConvId: fallback.0, isGroupHint: fallback.1, nameLookup: Self.lookup)
+            let swift = await ZaloWireParser.historyEventsAsync(
+                swiftPage, myUid: "me", selfConvId: "cloud999", fallbackConvId: fallback.0, isGroupHint: fallback.1, nameLookup: Self.lookup)
+            let walk = ZaloWireParser.extractBatchEvents(
+                swiftPage.box.dict, myUid: "me", selfConvId: "cloud999", fallbackConvId: fallback.0, isGroupHint: fallback.1,
+                nameLookup: Self.lookup, useRustCore: false)
+            #expect(rust.count >= 3)
+            #expect(Self.equalEvents(swift, walk))
+            #expect(Self.equalEvents(rust, walk), "typed history events differ from the Swift walk")
+        }
+        // The raw fallback still yields the whole answer (ids intact).
+        let raw = rustPage.box.dict["data"] as? [String: Any]
+        #expect(JSONLossless.string(raw?["lastMsgId"]) == "7412345678901234500")
+        #expect((raw?["groupMsgs"] as? [[String: Any]])?.count == 3)
+    }
+
+    @Test func decodedSingleMessageLookupMatchesAcrossPaths() async throws {
+        let dirSwift = Self.tempDir(), dirRust = Self.tempDir()
+        defer { try? FileManager.default.removeItem(at: dirSwift); try? FileManager.default.removeItem(at: dirRust) }
+        let swiftStore = try ZaloSQLiteStore(path: dirSwift.appendingPathComponent("t.db").path, useRustCore: false)
+        let rustStore = try ZaloSQLiteStore(path: dirRust.appendingPathComponent("t.db").path, useRustCore: true)
+        let rows = Self.storedFixtureRows()
+        for store in [swiftStore, rustStore] { try await store.saveMessages(rows) }
+        // Every fixture row by server id and by client id, plus a corrupt row (2025) and a miss: identical on both paths.
+        var keys = rows.map(\.id) + rows.map(\.clientId) + ["missing"]
+        keys.append("colcli")
+        var found = 0
+        for key in keys {
+            let a = try await swiftStore.decodedMessage(convId: "u1", idOrClientId: key)
+            let b = try await rustStore.decodedMessage(convId: "u1", idOrClientId: key)
+            #expect((a == nil) == (b == nil), "presence differs for \(key)")
+            if let a, let b {
+                found += 1
+                #expect(a.message == b.message && a.rowId == b.rowId && a.rowClientId == b.rowClientId, "row \(key) differs")
+            }
+        }
+        #expect(found > 20)
+        let corrupt = try await rustStore.decodedMessage(convId: "u1", idOrClientId: "2025")   // corrupt JSON drops
+        let otherConv = try await rustStore.decodedMessage(convId: "other", idOrClientId: "2001")
+        #expect(corrupt == nil && otherConv == nil)
+        let fallback = try await rustStore.decodedMessage(convId: "u1", idOrClientId: "colcli")
+        #expect(fallback?.rowId == "2026" && fallback?.rowClientId == "colcli")
+    }
 }
