@@ -102,7 +102,7 @@ struct ConversationListRow: View {
     }
 
     private var subtitle: String {
-        if let p = conversation.preview, !p.text.isEmpty { return (p.fromMe ? "Bạn: " : "") + p.text }
+        if let p = conversation.preview, !p.text.isEmpty { return (p.fromMe ? "Bạn: " : "") + Emoticon.replacing(in: p.text) }
         if conversation.isGroup, conversation.members > 0 { return "\(conversation.members) thành viên" }
         if isSelf { return "Lưu trữ và truy cập nhanh những nội dung quan trọng" }
         let stranger = isStranger || engine.conversationExtras.strangerIds.contains(conversation.id)
