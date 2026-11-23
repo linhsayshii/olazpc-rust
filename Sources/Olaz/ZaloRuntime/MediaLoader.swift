@@ -3,6 +3,7 @@ import AppKit
 import ImageIO
 import Network
 import CoreServices
+import OlazCore
 
 /// `NSImage` is not `Sendable`; images handed out by the loader are immutable after creation.
 struct SendableImage: @unchecked Sendable {
@@ -64,6 +65,10 @@ actor MediaLoader {
     nonisolated let filesDirectory: URL
     private let filesCacheLimit: Int
     private var didStartMaintenance = false
+    /// Rust media engine (network + files cache); nil when `OLAZ_RUST_CORE=0` (Swift path below).
+    nonisolated let rustMedia: CoreMedia?
+    /// Tests only: local servers speak plain http (production always upgrades to https).
+    nonisolated let allowPlainHTTP: Bool
     private let urlCache: URLCache
     private let resolver: DoHResolver
     private var dohHosts: [String: Date] = [:]          // host -> when to retry system DNS
@@ -93,8 +98,9 @@ actor MediaLoader {
     static let stalePartAge: TimeInterval = 600
 
     init(cacheDirectory: URL? = nil, resolver: DoHResolver = DoHResolver(), maxConcurrentDownloads: Int = 6,
-         filesCacheLimit: Int = MediaLoader.defaultFilesCacheLimit) {
+         filesCacheLimit: Int = MediaLoader.defaultFilesCacheLimit, allowPlainHTTP: Bool = false) {
         self.filesCacheLimit = filesCacheLimit
+        self.allowPlainHTTP = allowPlainHTTP
         if let cacheDirectory {
             filesDirectory = cacheDirectory.appendingPathComponent("files", isDirectory: true)
         } else {
@@ -122,7 +128,17 @@ actor MediaLoader {
         fileSession = URLSession(configuration: fileConfig)
         self.resolver = resolver
         self.maxConcurrentDownloads = maxConcurrentDownloads
+        if RustCore.isEnabled {
+            rustMedia = CoreMedia(options: MediaCoreOptions(
+                filesDir: filesDirectory.path, filesCacheLimit: UInt64(filesCacheLimit),
+                maxConcurrent: UInt32(maxConcurrentDownloads), allowPlainHttp: allowPlainHTTP,
+                dohEndpoints: nil, fileIdleSecs: Self.fileIdleTimeout, imageIdleSecs: 10),
+                hook: QuarantineHook())
+        } else {
+            rustMedia = nil
+        }
     }
+
 
     // MARK: Decoded-image memory cache (synchronous access for views)
 
@@ -356,7 +372,7 @@ actor MediaLoader {
                 try Data(contentsOf: url, options: .mappedIfSafe)
             }.value
         }
-        guard let media = ZaloMediaURL.parse(url) else { throw LoadError.badURL }
+        guard let media = ZaloMediaURL.parse(url, allowPlainHTTP: allowPlainHTTP) else { throw LoadError.badURL }
         switch media.encryption {
         case .invalid:
             throw LoadError.undecodable
@@ -364,6 +380,13 @@ actor MediaLoader {
             let sep = media.networkURL.query == nil ? "?" : "&"
             let cacheURL = URL(string: media.networkURL.absoluteString + sep + "_olaz_dec=" + Self.stableHash(media.originalURL.absoluteString)) ?? media.networkURL
             if let cached = urlCache.cachedResponse(for: URLRequest(url: cacheURL)) { return cached.data }
+            if let core = rustMedia {
+                return try await join(key: "d:dec:" + media.originalURL.absoluteString) { [self] in
+                    let plain = try await Self.rustData(core, media: media, deadline: deadline)
+                    await self.store(plain, for: cacheURL, contentType: nil)
+                    return plain
+                }
+            }
             return try await join(key: "d:dec:" + media.originalURL.absoluteString) { [self] in
                 try await self.withSlot {
                     try await Self.withDeadline(deadline) {
@@ -381,6 +404,13 @@ actor MediaLoader {
         case .none:
             let cleanURL = media.networkURL
             if let cached = urlCache.cachedResponse(for: URLRequest(url: cleanURL)) { return cached.data }
+            if let core = rustMedia {
+                return try await join(key: "d:" + cleanURL.absoluteString) { [self] in
+                    let data = try await Self.rustData(core, media: media, deadline: deadline)
+                    await self.store(data, for: cleanURL, contentType: nil)
+                    return data
+                }
+            }
             return try await join(key: "d:" + cleanURL.absoluteString) { [self] in
                 try await self.withSlot {
                     try await Self.withDeadline(deadline) {
@@ -494,6 +524,9 @@ actor MediaLoader {
     /// Sensitive headers are dropped when a redirect changes host. Does not use the image download slots.
     func downloadWithHeaders(_ url: URL, headers: [String: String], maxBytes: Int = MediaLoader.maxFileBytes,
                              ttfb: TimeInterval? = nil, progress: (@Sendable (Double) -> Void)? = nil) async throws -> URL {
+        if let core = rustMedia {
+            return try await Self.rustHeaders(core, url: url, headers: headers, maxBytes: maxBytes, ttfb: ttfb, progress: progress)
+        }
         guard let url = Self.normalized(url) else { throw LoadError.badURL }
         try failIfDead(url.host?.lowercased() ?? "")
         var request = URLRequest(url: url)
@@ -793,6 +826,10 @@ actor MediaLoader {
         return directory.appendingPathComponent(name)
     }
 
+    nonisolated static func cachedFileName(for media: ZaloMediaURL) -> String {
+        cachedFileLocation(for: media, in: URL(fileURLWithPath: "/")).lastPathComponent
+    }
+
     func evictCachedFile(for url: URL) {
         guard !url.isFileURL, let media = ZaloMediaURL.parse(url) else { return }
         let file = Self.cachedFileLocation(for: media, in: filesDirectory)
@@ -815,10 +852,15 @@ actor MediaLoader {
             progress?(1)
             return url
         }
-        guard let media = ZaloMediaURL.parse(url) else { throw LoadError.badURL }
+        guard let media = ZaloMediaURL.parse(url, allowPlainHTTP: allowPlainHTTP) else { throw LoadError.badURL }
         if case .invalid = media.encryption { throw LoadError.undecodable }
         let directory = filesDirectory
         let file = Self.cachedFileLocation(for: media, in: directory)
+        if let core = rustMedia {
+            let path = try await Self.rustLocalFile(core, media: media, fileName: file.lastPathComponent, progress: progress)
+            progress?(1)
+            return URL(fileURLWithPath: path)
+        }
         startMaintenanceIfNeeded()
         if FileManager.default.fileExists(atPath: file.path) {
             try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)   // LRU use
@@ -1079,5 +1121,8 @@ actor MediaLoader {
     }
 
     /// Test hook: has this host been switched to the DoH path?
-    func usesDoH(host: String) -> Bool { (dohHosts[host.lowercased()] ?? .distantPast) > Date() }
+    func usesDoH(host: String) -> Bool {
+        if let core = rustMedia { return core.usesDoh(host: host) }
+        return (dohHosts[host.lowercased()] ?? .distantPast) > Date()
+    }
 }

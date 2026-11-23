@@ -1040,6 +1040,7 @@ dependencies = [
  "olaz-api",
  "olaz-crypto",
  "olaz-json",
+ "olaz-media",
  "olaz-net",
  "olaz-store",
  "olaz-wire",
@@ -1058,6 +1059,27 @@ dependencies = [
  "base64 0.23.1",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "olaz-media"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "ctr",
+ "futures-util",
+ "ghash",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "url",
 ]
 
 [[package]]

@@ -9,6 +9,7 @@
 //! | session | [`CoreSession`] (restore/snapshot, QR login, status), [`QrListener`] |
 //! | api | [`CoreApi`] over a shared [`CoreSession`], [`poll_state_initial`] |
 //! | http | [`CoreHttp`]: generic signed GET / POST / multipart for every other endpoint |
+//! | media | [`CoreMedia`] (image bytes, files cache, header/staged downloads, DoH + pinned TLS), [`MediaCancel`] |
 //! | wire | [`parse_wire_event`], [`parse_wire_batch`] -> [`WireEvent`] |
 //! | crypto | [`decrypt_ws_frame`], [`inflate`] |
 //! | websocket | [`ws_start`] -> [`WsSession`], callbacks via [`WsListener`] |
@@ -38,6 +39,7 @@ mod chat;
 mod crypto;
 mod error;
 mod http;
+mod media;
 mod runtime;
 mod session;
 mod store;
@@ -53,6 +55,7 @@ pub use chat::*;
 pub use crypto::{decrypt_ws_frame, inflate};
 pub use error::{CoreError, NetworkKind};
 pub use http::{CoreHttp, HttpMethod, HttpRequestRecord, UploadPartRecord};
+pub use media::*;
 pub use session::{CoreSession, CoreSessionStatus, QrListener, QrScanRecord, QrTicketRecord};
 pub use store::{
     ConversationRow, CoreStore, MessageRow, MessagesAroundRow, StoredChat, StoredChatAround,
@@ -79,3 +82,6 @@ pub fn core_version() -> String {
 mod perf;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod media_tests;

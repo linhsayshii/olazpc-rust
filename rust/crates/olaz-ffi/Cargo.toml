@@ -15,6 +15,7 @@ crate-type = ["staticlib", "lib"]
 olaz-api = { path = "../olaz-api" }
 olaz-crypto = { path = "../olaz-crypto" }
 olaz-json = { path = "../olaz-json" }
+olaz-media = { path = "../olaz-media" }
 olaz-net = { path = "../olaz-net" }
 olaz-store = { path = "../olaz-store" }
 olaz-wire = { path = "../olaz-wire" }
@@ -26,3 +27,4 @@ uniffi = "0.32.2"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net", "io-util", "time"] }

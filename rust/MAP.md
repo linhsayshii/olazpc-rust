@@ -31,6 +31,8 @@ Workflow per unit: claim here, port into its own crate, port Swift fixtures as R
 | 5a | typed history/lookup/envelopes | done 2026-11-23 (rust 258, swift 449 both modes; non-plain ws envelopes stay raw, ADR-013) |
 | 5b | generic signed HTTP seam (all feature endpoints) + timeout fix | done 2026-11-23 (rust 271 = +8 golden/seam, +2 timeout, +5 ffi; swift 452 both modes). `CoreHttp` (`request`, `post_multipart`, `post_multipart_file`) over `olaz_net::GenericCall`; Swift `ZaloSessionClient.get/post/postMultipart` delegate to it when `useRustCore`. Still Swift: `rawGetJSON`/`rawRequest` callers (QR/login already Rust), `zCloudGet` (cloud-viewer-key header, no ParamCipher), `rawDownloadData`, `downloadSyncBatch` |
 
+| 5c | media/download network + disk cache (`olaz-media`) | done 2026-11-23 (rust +50: olaz-media 19 unit + 26 local-server/TLS, ffi 5; swift 462 both modes, 6 new in `RustMediaTests`). `CoreMedia` (`data`, `local_file`, `download_with_headers`, `download_to`, `evict`, `uses_doh`) behind `MediaLoader`/`DownloadManager`; 200 parallel local fetches via `MediaLoader` 0.07-0.17 s on the Rust path (Swift path cannot reach a plain-http server: ATS upgrade). See ADR-014 |
+
 Live check 2026-11-23 (release build 9c47e82, merged 5a+5b): clean engine.log, no `rust: error` lines; the periodic `network timeout` is gone. Found on the way: `/api/friend/received/list` 404 on both paths (endpoint does not exist; fixed to `recommendsv2/list`). One startup `http status=429` from a typed endpoint (no path logged) seen once, not reproduced.
 
 ## Later waves (out of milestone 1)
@@ -55,3 +57,5 @@ SwiftUI views (`App/`, `Shell/`, `Views/`), `ShellModel`, Keychain glue, QR PNG 
 - Lossless JSON accessors are duplicated in `olaz-crypto`, `olaz-wire`, `olaz-ws` (`json.rs`), `olaz-store` (`helpers.rs`). Unify into `olaz-crypto::json` (or a tiny `olaz-json`) at the start of wave 2.
 - Sorted JSON keys: server accepts them (live send ok 2026-11-22).
 - Live check 2026-11-22 passed for WS auth, receive, send text. Not yet live-checked: history paging, seen/typing, recall, reactions, group mentions.
+
+- Wave 5c debt: the image-bytes cache stays Swift `URLCache` (lookup/store on the `MediaLoader` actor; Apple's on-disk format cannot be shared) so existing caches stay valid. `forget_failures` stays Swift (failure memory is keyed by decode key). Quarantine xattr, ImageIO decode, `NSCache` and `stills` stay Swift. `encrypt_e2ee_file` exists in Rust (`media_encrypt_e2ee_file`, tested) but the Swift upload caller still uses CryptoKit. GCM with an IV other than 12/16 bytes is rejected in Rust (Swift accepted any >= 12). DoH/pinned trust uses webpki roots (like `olaz-net`), not the macOS keychain: a TLS-intercepting proxy CA is not trusted on the Rust path. `MediaDiagnostics.report` is not emitted on the Rust staged-download path. Redirect budget is 3 hops for data/files (as the Swift DoH path), 10 for header downloads.
