@@ -78,6 +78,8 @@ enum ScrollBench {
             id: conversationId, isGroup: true, name: "Nhóm thử cuộn", avatar: nil, pinned: false, members: 6, unread: 0, preview: nil)
 
         let screen = pickScreen(env["OLAZ_BENCH_SCREEN"])
+        // OLAZ_BENCH_DECODE=source: thumbnails stay in their own color space (as before display-ready decoding).
+        MediaLoader.setDisplayColorSpace(env["OLAZ_BENCH_DECODE"] == "source" ? nil : screen.colorSpace?.cgColorSpace)
         // The pointer decides whether rows passing under it are hovered, which changes the work of a frame a lot. The pointer
         // is never moved: OLAZ_BENCH_POINTER=over puts the window under it (a reader scrolling with the trackpad), the
         // default `away` on the side of the screen it is not on.
@@ -116,6 +118,7 @@ enum ScrollBench {
                    label, messages.count, speed, screen.localizedName, screen.maximumFramesPerSecond, refresh * 1000,
                    RustCore.isEnabled ? "rust" : "swift", frame.width, frame.height))
 
+        log(String(format: "memory start rss=%.0fMB footprint=%.0fMB", residentMB(), footprintMB()))
         guard let scroll = largestScrollView(in: host) else { log("no scroll view"); return }
         if let list = ChatListController.forScrollView(scroll) { log("list " + list.debugGeometry) }
 
@@ -155,6 +158,7 @@ enum ScrollBench {
             allCPU += r.cpu
             allInstr += r.instructions
             log(stats(name, intervals: r.intervals, busy: r.busy, seconds: r.seconds, refresh: refresh, distance: r.distance, cpu: r.cpu, instructions: r.instructions))
+            log(String(format: "memory after %@ rss=%.0fMB footprint=%.0fMB", name, residentMB(), footprintMB()))
             try? await Task.sleep(for: .milliseconds(600))
         }
         log("pointerOverWindow=\(window.frame.contains(NSEvent.mouseLocation)) asked=\(pointerOver ? "over" : "away")")
@@ -216,7 +220,7 @@ enum ScrollBench {
             if let a = anchorBefore, let after = position(of: a.view, in: scroll) { drift.append(abs(after - a.y) - 180) }
             if loaded - keep >= 250 { break }
         }
-        log(String(format: "memory rss=%.0fMB", residentMB()))
+        log(String(format: "memory rss=%.0fMB footprint=%.0fMB", residentMB(), footprintMB()))
         log(stats("PREPEND-PAGES", intervals: pageIntervals, busy: pageBusy, seconds: pageIntervals.reduce(0, +) / 1000, refresh: refresh, distance: 0, cpu: pageCPU, instructions: pageInstr))
 
         let text = report.joined(separator: "\n") + "\n\n"
@@ -227,6 +231,16 @@ enum ScrollBench {
             try? text.write(to: file, atomically: true, encoding: .utf8)
         }
         _ = drift
+        await holdIfRequested(window)
+    }
+
+    /// OLAZ_BENCH_HOLD=<s>: the window stays open at the end so `heap` / `vmmap` can look at the process.
+    private static func holdIfRequested(_ window: NSWindow) async {
+        guard let hold = Double(ProcessInfo.processInfo.environment["OLAZ_BENCH_HOLD"] ?? "") else { return }
+        print("bench: holding pid=\(getpid()) for \(Int(hold))s")
+        fflush(stdout)
+        try? await Task.sleep(for: .seconds(hold))
+        withExtendedLifetime(window) {}
     }
 
     // MARK: Scrolling
@@ -308,6 +322,16 @@ enum ScrollBench {
                       label, intervals.count, Double(intervals.count) / seconds, p(0.5), p(0.95), p(0.99), sorted.last!,
                       missed, Double(missed) / Double(intervals.count + missed) * 100, hitchMs / seconds,
                       busyTotal / (seconds * 1000) * 100, busyTotal / Double(intervals.count), distance > 0 ? busyTotal / distance * 1000 : 0, cpu / Double(intervals.count), instructions / Double(intervals.count), bp(0.5), bp(0.99), busySorted.last ?? 0, distance)
+    }
+
+    /// What Activity Monitor calls Memory (dirty + compressed), the figure that matters more than RSS.
+    static func footprintMB() -> Double {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
+        }
+        return kr == KERN_SUCCESS ? Double(info.phys_footprint) / 1_048_576 : -1
     }
 
     private static func residentMB() -> Double {

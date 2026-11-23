@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import ImageIO
+import os
 import Network
 import CoreServices
 import OlazCore
@@ -360,8 +361,59 @@ actor MediaLoader {
         } else {
             cgImage = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
         }
-        guard let cgImage else { return nil }
-        return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+        guard let decoded = cgImage else { return nil }
+        let image = displayReady(decoded)
+        return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+    }
+
+    // MARK: Display-ready pixels
+
+    /// The color space of the screen the app is on. Core Animation shows an image in any other space through a converted
+    /// copy it keeps as long as the image lives, so every cached thumbnail cost twice its pixels (measured: ~165 MB of
+    /// `CoreAnimation` copies next to ~160 MB of decoded thumbnails after scrolling a chat with many photos).
+    private static let displaySpace = OSAllocatedUnfairLock<CGColorSpace?>(initialState: nil)
+    @MainActor private static var displaySpaceObservers: [NSObjectProtocol] = []
+
+    /// Keeps `displaySpace` on the screen of the key window (launch, display changes, a window moving to another screen).
+    @MainActor static func trackDisplayColorSpace() {
+        func update() {
+            let screen = NSApp.keyWindow?.screen ?? NSScreen.main
+            let space = screen?.colorSpace?.cgColorSpace
+            displaySpace.withLock { current in
+                if current != space { current = space }
+            }
+        }
+        update()
+        guard displaySpaceObservers.isEmpty else { return }
+        let center = NotificationCenter.default
+        for name in [NSApplication.didChangeScreenParametersNotification, NSWindow.didChangeScreenNotification,
+                     NSWindow.didBecomeKeyNotification] {
+            displaySpaceObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { update() }
+            })
+        }
+    }
+
+    /// For tests and the scroll bench.
+    nonisolated static func setDisplayColorSpace(_ space: CGColorSpace?) { displaySpace.withLock { $0 = space } }
+
+    /// `image` drawn once, off the main thread, in the screen's color space and the little-endian BGRA layout Core Animation
+    /// uses as is. Images it cannot improve on (no known screen, more than 8 bits per component, non-RGB screens) stay as
+    /// they are.
+    nonisolated static func displayReady(_ image: CGImage) -> CGImage {
+        guard let space = displaySpace.withLock({ $0 }), space.model == .rgb, image.bitsPerComponent <= 8 else { return image }
+        let alpha = image.alphaInfo
+        let order = image.bitmapInfo.intersection(.byteOrderMask)
+        if image.colorSpace == space, image.bitsPerPixel == 32, order == .byteOrder32Little,
+           alpha == .premultipliedFirst || alpha == .noneSkipFirst { return image }
+        let opaque = alpha == .none || alpha == .noneSkipFirst || alpha == .noneSkipLast
+        let info = CGBitmapInfo.byteOrder32Little.rawValue
+            | (opaque ? CGImageAlphaInfo.noneSkipFirst : CGImageAlphaInfo.premultipliedFirst).rawValue
+        guard let ctx = CGContext(data: nil, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space, bitmapInfo: info) else { return image }
+        ctx.interpolationQuality = .none
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return ctx.makeImage() ?? image
     }
 
     // MARK: Raw data

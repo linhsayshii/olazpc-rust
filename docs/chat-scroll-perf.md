@@ -155,8 +155,8 @@ per 1000 pt scrolled. The frame columns are wall-clock at 60 Hz on a loaded mach
 | live chat, drag up | 437 | 492 | 2.86 | 2.98 | 3.9% | 6.1% | 16.7 | 25.0 |
 | older pages landing | — | — | 2.63 | **1.35** | 0.3% | 2.4% | 10.7 | 15.0 |
 
-Memory (RSS at the end of a run): base ~110 MB, new ~170–260 MB. The cost is per-row hosts and their decoded images; a
-smaller host cache (80 hosts, 4 spares per kind) saved nothing measurable and was slower.
+Memory: see "Memory" below. RSS was misleading here (most of the growth is compressed); the physical footprint is what
+counts, and the list itself adds only ~30 MB to it.
 
 ### Reading the numbers
 
@@ -177,13 +177,45 @@ smaller host cache (80 hosts, 4 spares per kind) saved nothing measurable and wa
 Earlier wall-clock-only runs during this work (for example base 8.5 vs new 4.5 ms per frame) were skewed by the
 machine's load and by where the pointer was. They are superseded by the tables above.
 
+## Memory
+
+Measured with the physical footprint (`footprint -p`, the "Memory" column of Activity Monitor), not RSS: RSS swung by
+100 MB between identical runs because macOS compresses pages nobody touches. `Olaz --scroll-bench` now logs both after
+every pass, and `OLAZ_BENCH_HOLD=<s>` keeps the window open at the end for `vmmap` / `footprint` / `heap`.
+
+After the bench (1200 messages, ~250 distinct photos), before this fix:
+
+| | footprint |
+|---|---|
+| base (`LazyVStack`) | 433 MB |
+| new list, 120 hosts | 465 MB |
+| new list, no host cache | 409 MB |
+
+So the hosts were not the problem. `footprint` put the rest in two equal halves: ~162 MB of `CG Raster Data` (the
+decoded thumbnails in `MediaLoader`'s 160 MB cache) and ~164 MB of `CoreAnimation`, region for region the same sizes
++32 KB. Core Animation kept a color-converted copy of every thumbnail it had shown, for as long as the image lived:
+ImageIO hands JPEGs back as big-endian XRGB in sRGB, and the screen has its own profile.
+
+Fix: `MediaLoader.displayReady` redraws each decoded thumbnail once, on the decode task, in the screen's color space
+(`trackDisplayColorSpace`: the key window's screen, updated on display and window-screen changes) and in little-endian
+BGRA. Converting the layout alone saved nothing; the color space is what matters.
+
+| pass | footprint before | after |
+|---|---|---|
+| after DRAG-UP-COLD | 239 MB | 130 MB |
+| after FLING-DOWN | 459 MB | 142 MB |
+| end of run | 460 MB | 143 MB |
+
+Frame drops and instructions per frame are unchanged (TOTAL 13.6 M instr/frame both, 1.4–2.0% dropped both, built-in
+120 Hz display). Pixels look identical in `OLAZ_BENCH_SHOT` screenshots. `OLAZ_BENCH_DECODE=source` runs the bench the old
+way. A window moved to a screen with another profile shows already-cached thumbnails through a CA copy again until they
+are evicted; that costs memory only.
+
 ## Not done / follow-ups
 
 - **Cold rows still cost one SwiftUI render each** (~1–3 ms for a photo or link card) the first time they appear. The next
   step is a CoreText / CALayer layout model per message kind (Telegram's approach). It would make cold scrolling as
   cheap as warm scrolling, but it means rewriting every bubble outside SwiftUI.
-- **Memory.** RSS is ~60–150 MB higher in the bench (per-row hosts and their images). `hostLimit` and the spare pools
-  were not where it goes; it is worth an Allocations trace.
 - **Flaky test.** `MediaRecoveryTests.queueIsLIFOAndDropsCancelledWork` failed once in an `OLAZ_RUST_CORE=0` run under load
   (it uses 20 ms sleeps) and passed 3/3 alone. It is not touched by this change.
 - **Top scroll edge effect.** The bottom soft edge effect under the composer still applies; SwiftUI's `safeAreaBar`

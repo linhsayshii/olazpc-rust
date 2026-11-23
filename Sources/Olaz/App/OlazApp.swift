@@ -13,6 +13,7 @@ final class OlazAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSWindow.allowsAutomaticWindowTabbing = false
         NSApp.setActivationPolicy(.regular)
+        MediaLoader.trackDisplayColorSpace()
         onLaunch?()
         DispatchQueue.main.async { [weak self] in
             if NSApp.windows.filter({ $0.canBecomeMain && $0.isVisible }).isEmpty {
