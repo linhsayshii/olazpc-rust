@@ -15,7 +15,7 @@ struct SettingsView: View {
                 SettingsPane(height: 440) { NotificationSettingsView() }
             }
             Tab("Quyền riêng tư", systemImage: "lock") {
-                SettingsPane(height: 300) { PrivacySettings() }
+                SettingsPane(height: 460) { PrivacySettings() }
             }
             Tab("Sticker", systemImage: "face.smiling") {
                 SettingsPane(height: 160) { StickerSettingsSection() }
@@ -87,6 +87,44 @@ private struct PrivacySettings: View {
                     .foregroundStyle(.secondary)
             }
         }
+        BlockedUsersSection()
+    }
+}
+
+/// "Tài khoản đã chặn" (official Cài đặt ▸ Quyền riêng tư ▸ Danh sách chặn): who I blocked, with "Bỏ chặn".
+private struct BlockedUsersSection: View {
+    @Environment(ZaloEngine.self) private var engine
+    @State private var busy: String?
+
+    var body: some View {
+        Section("Tài khoản đã chặn") {
+            if let users = engine.blockedUsers {
+                if users.isEmpty {
+                    Text("Bạn chưa chặn tài khoản nào.").foregroundStyle(.secondary)
+                }
+                ForEach(users) { user in
+                    HStack(spacing: 10) {
+                        RemoteImage(url: user.avatar, contentMode: .fill, maxPixelSize: 64) {
+                            Image(systemName: "person.crop.circle.fill").resizable().foregroundStyle(.tertiary)
+                        }
+                        .frame(width: 28, height: 28)
+                        .clipShape(Circle())
+                        Text(user.name.isEmpty ? "Người dùng Zalo" : user.name)
+                        Spacer()
+                        if busy == user.id {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Button("Bỏ chặn") {
+                                Task { busy = user.id; await engine.setBlocked(user.id, blocked: false); busy = nil }
+                            }
+                        }
+                    }
+                }
+            } else {
+                Text("Đang tải…").foregroundStyle(.secondary)
+            }
+        }
+        .task { await engine.loadBlockedUsers() }
     }
 }
 

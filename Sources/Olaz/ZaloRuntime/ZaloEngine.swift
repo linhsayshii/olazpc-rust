@@ -73,6 +73,8 @@ final class ZaloEngine {
     var messages: [String: [ChatMessage]] = [:] {
         didSet { messageSignal.changed(from: oldValue, to: messages) }
     }
+    /// Accounts I blocked (messages and calls), from `/api/friend/blocklistv2`; nil until loaded.
+    var blockedUsers: [BlockedUser]?
     var hasMoreHistory: [String: Bool] = [:] {
         didSet { hasMoreSignal.changed(from: oldValue, to: hasMoreHistory) }
     }

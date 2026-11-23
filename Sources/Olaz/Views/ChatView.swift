@@ -78,6 +78,19 @@ struct ChatView: View {
             }
         }
         .safeAreaBar(edge: .bottom, spacing: 0) {
+            if !conversation.isGroup, engine.isBlocked(id) {
+                // Official: a blocked user's chat offers "Bỏ chặn" instead of the composer.
+                HStack(spacing: 10) {
+                    Image(systemName: "hand.raised").foregroundStyle(.secondary)
+                    Text("Bỏ chặn để gửi tin nhắn tới người này.").foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Bỏ chặn") { Task { await engine.setBlocked(id, blocked: false) } }
+                        .buttonStyle(.borderedProminent)
+                }
+                .font(.system(size: 13))
+                .padding(.horizontal, 16).padding(.vertical, 12)
+                .background(.bar)
+            } else {
             ChatComposer(
                 name: conversation.displayName,
                 conversationId: id,
@@ -93,6 +106,10 @@ struct ChatView: View {
                     Task { if await !engine.sendText("👍", to: id) { notice = .like } }
                 })
             .id(id)
+            }
+        }
+        .task(id: id) {
+            if !conversation.isGroup, engine.blockedUsers == nil { await engine.loadBlockedUsers() }
         }
         .alert("Chưa gửi được tin nhắn", isPresented: Binding(get: { notice != nil }, set: { if !$0 { notice = nil } })) {
             Button("OK", role: .cancel) {}

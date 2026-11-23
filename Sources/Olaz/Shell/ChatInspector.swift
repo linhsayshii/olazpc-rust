@@ -20,6 +20,8 @@ struct ChatInspector: View {
     @State private var memberToKick: MentionCandidate?
     @State private var confirmLeaveGroup = false
     @State private var leavingGroup = false
+    @State private var confirmBlock = false
+    @State private var blockBusy = false
     /// Width of the overview's scroll view itself (not of its content, see `SharedMediaGrid`).
     @State private var outerWidth: CGFloat = 300
     /// Photos / files / links ever shared, read from the official media service (the overview shows the newest of each).
@@ -83,6 +85,21 @@ struct ChatInspector: View {
         } message: { member in
             Text("Bạn có chắc muốn xóa \(member.name) khỏi nhóm này?")
         }
+        .alert("Chặn tin nhắn và cuộc gọi?", isPresented: $confirmBlock) {
+            Button("Chặn", role: .destructive) {
+                Task {
+                    blockBusy = true
+                    await engine.setBlocked(id, blocked: true, name: conversation.displayName)
+                    blockBusy = false
+                }
+            }
+            Button("Hủy", role: .cancel) {}
+        } message: {
+            Text("\(conversation.displayName) sẽ không thể nhắn tin hay gọi điện cho bạn.")
+        }
+        .task(id: id) {
+            if !conversation.isGroup, engine.blockedUsers == nil { await engine.loadBlockedUsers() }
+        }
         .alert("Rời khỏi nhóm?", isPresented: $confirmLeaveGroup) {
             Button("Rời nhóm", role: .destructive) {
                 Task {
@@ -116,6 +133,8 @@ struct ChatInspector: View {
                 linksSection(preview(.links, loaded))
                 if conversation.isGroup {
                     leaveGroupSection
+                } else if id != engine.selfConversationId {
+                    securitySection
                 }
             }
             .padding(.horizontal, 16)
@@ -240,6 +259,41 @@ struct ChatInspector: View {
                 row(symbol: "pencil", title: "Đổi tên nhóm") { showRenameGroup = true }
                 Divider().padding(.leading, 40)
                 row(symbol: "person.badge.plus", title: "Thêm thành viên") { showAddMembers = true }
+            }
+        }
+    }
+
+    /// 1-1 "Thiết lập bảo mật": block / unblock messages and calls (official `setBlockFriend`).
+    private var securitySection: some View {
+        let blocked = engine.isBlocked(id)
+        return section("Thiết lập bảo mật") {
+            list {
+                Button {
+                    if blocked {
+                        Task { blockBusy = true; await engine.setBlocked(id, blocked: false); blockBusy = false }
+                    } else {
+                        confirmBlock = true
+                    }
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: blocked ? "hand.raised.slash" : "hand.raised")
+                            .font(.system(size: 14))
+                            .frame(width: 18)
+                        if blockBusy {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text(blocked ? "Bỏ chặn" : "Chặn tin nhắn").font(.system(size: 13, weight: .medium))
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .foregroundStyle(blocked ? Color.primary : Color.red)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .frame(minHeight: 38)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(blockBusy || engine.blockedUsers == nil)
             }
         }
     }
