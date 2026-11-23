@@ -19,6 +19,7 @@ BUNDLE_ID="app.olaz.mac"
 # Marketing version and build number; scripts/release.sh sets them for a tagged release.
 VERSION="${OLAZ_VERSION:-1.0}"
 BUILD_NUMBER="${OLAZ_BUILD:-$VERSION}"
+./scripts/build-rust.sh
 swift build -c "$CONFIG"
 BIN=".build/${CONFIG}/Olaz"
 

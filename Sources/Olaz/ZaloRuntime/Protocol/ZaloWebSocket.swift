@@ -1,4 +1,5 @@
 import Foundation
+import OlazCore
 
 struct ZaloWSQueue: Hashable, Sendable {
     let cmd: UInt16
@@ -10,11 +11,21 @@ struct ZaloWSQueueCursorSnapshot: Codable, Equatable, Sendable {
     var preIds: [String]
 }
 
+/// A plain chat-message envelope the Rust core already parsed (ADR-011): typed events, the contact uids the parse looked
+/// names up for, and the core-side payload used to re-parse when Swift's names or uid differ (`WirePayload.resolve`).
+struct ZaloWSTypedChat: @unchecked Sendable {
+    let events: [ParsedWireEvent]
+    let uids: [String]
+    let payload: WirePayload
+}
+
 struct ZaloWSEvent: @unchecked Sendable {
     let cmd: UInt16
     let subCmd: UInt8
     let version: UInt8
     let payload: [String: Any]
+    /// Set (and `payload` empty) when the Rust core delivered the envelope pre-parsed.
+    var typed: ZaloWSTypedChat? = nil
 
     var isChatPushOrPull: Bool {
         switch cmd {
@@ -69,6 +80,98 @@ private final class ZaloWebSocketDelegate: NSObject, URLSessionWebSocketDelegate
     }
 }
 
+/// Thread-safe cursor mirror + persistence observer shared by the actor and the Rust listener (which runs on a Rust pool thread).
+final class RustWSCursorBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cursors: [String: ZaloWSQueueCursorSnapshot] = [:]
+    private var observer: (@Sendable ([String: ZaloWSQueueCursorSnapshot]) -> Void)?
+
+    static func snapshots(_ entries: [CursorEntry]) -> [String: ZaloWSQueueCursorSnapshot] {
+        var out: [String: ZaloWSQueueCursorSnapshot] = [:]
+        for e in entries {
+            let last = e.lastId.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !last.isEmpty, last != "0", last != "1" else { continue }
+            out[e.queueKey] = ZaloWSQueueCursorSnapshot(lastId: last, preIds: e.preIds.filter { !$0.isEmpty })
+        }
+        return out
+    }
+
+    static func entries(_ snapshots: [String: ZaloWSQueueCursorSnapshot]) -> [CursorEntry] {
+        snapshots.map { CursorEntry(queueKey: $0.key, lastId: $0.value.lastId, preIds: $0.value.preIds) }
+    }
+
+    func setObserver(_ o: (@Sendable ([String: ZaloWSQueueCursorSnapshot]) -> Void)?) {
+        lock.lock(); observer = o; lock.unlock()
+    }
+
+    func seed(_ snaps: [String: ZaloWSQueueCursorSnapshot]) {
+        lock.lock(); defer { lock.unlock() }
+        for (k, v) in snaps {
+            let last = v.lastId.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !last.isEmpty, last != "0", last != "1" else { continue }
+            cursors[k] = ZaloWSQueueCursorSnapshot(lastId: last, preIds: v.preIds)
+        }
+    }
+
+    func current() -> [String: ZaloWSQueueCursorSnapshot] {
+        lock.lock(); defer { lock.unlock() }
+        return cursors
+    }
+
+    func clear() {
+        lock.lock(); cursors.removeAll(); lock.unlock()
+    }
+
+    /// Replaces the mirror with the core's latest snapshot and notifies the observer when it changed.
+    func update(_ entries: [CursorEntry]) {
+        let next = Self.snapshots(entries)
+        lock.lock()
+        let changed = next != cursors
+        cursors = next
+        let obs = observer
+        lock.unlock()
+        if changed { obs?(next) }
+    }
+}
+
+/// Bridges the Rust `zpw_ws` session into the `AsyncStream<ZaloWSEvent>` the engine consumes. Callbacks arrive on a Rust
+/// blocking-pool thread: parse there, yield, return (the engine hops to the MainActor itself).
+private final class RustWSListener: WsListener, @unchecked Sendable {
+    let continuation: AsyncStream<ZaloWSEvent>.Continuation
+    let cursors: RustWSCursorBox
+
+    init(continuation: AsyncStream<ZaloWSEvent>.Continuation, cursors: RustWSCursorBox) {
+        self.continuation = continuation
+        self.cursors = cursors
+    }
+
+    func onEvent(event: WsEventRecord) {
+        let payload = JSONLossless.parseObject(string: event.payloadJson) ?? [:]
+        if event.cmd == ZaloWebSocket.cmdAuthen {
+            // Shape only (ADR-008): the auth result code, never keys.
+            let code = JSONLossless.int64(payload["error_code"]) ?? -1
+            Task { @MainActor in EngineLog.shared.write("ws: rust auth event error_code=\(code)") }
+        }
+        continuation.yield(ZaloWSEvent(cmd: event.cmd, subCmd: event.subCmd, version: event.version, payload: payload))
+    }
+
+    func onWireEvents(cmd: UInt16, subCmd: UInt8, version: UInt8, events: [WireEvent], uids: [String], payload: WirePayload) {
+        let parsed = ZaloWireParser.parsedEvents(from: events)
+        continuation.yield(ZaloWSEvent(
+            cmd: cmd, subCmd: subCmd, version: version, payload: [:],
+            typed: ZaloWSTypedChat(events: parsed, uids: uids, payload: payload)))
+    }
+
+    func onCursorsChanged(cursors entries: [CursorEntry]) {
+        cursors.update(entries)
+    }
+
+    func onStopped() {
+        Task { @MainActor in EngineLog.shared.write("ws: rust session stopped") }
+        continuation.finish()
+    }
+}
+
 actor ZaloWebSocket {
     static let cmdAuthen: UInt16 = 1
     static let cmdPing: UInt16 = 2
@@ -118,13 +221,39 @@ actor ZaloWebSocket {
     private var queueCursors: [String: QueueCursor] = [:]
     private var onQueueCursorsChanged: (@Sendable ([String: ZaloWSQueueCursorSnapshot]) -> Void)?
 
-    var isAuthed: Bool { authed }
+    /// Rust path (ADR-011): the socket, framing, auth, pings, queue pulls and cursors live in the core.
+    private let useRustCore: Bool
+    private var rustSession: WsSession?
+    private let rustCursors = RustWSCursorBox()
+
+    init(useRustCore: Bool = RustCore.isEnabled) {
+        self.useRustCore = useRustCore
+    }
+
+    var isAuthed: Bool {
+        get async {
+            if useRustCore {
+                guard let session = rustSession else { return false }
+                return (try? await session.isAuthed()) ?? false
+            }
+            return authed
+        }
+    }
 
     func setQueueCursorObserver(_ observer: (@Sendable ([String: ZaloWSQueueCursorSnapshot]) -> Void)?) {
         onQueueCursorsChanged = observer
+        if useRustCore { rustCursors.setObserver(observer) }
     }
 
     func seedQueueCursors(_ snapshots: [String: ZaloWSQueueCursorSnapshot]) {
+        if useRustCore {
+            rustCursors.seed(snapshots)
+            if let session = rustSession {
+                let entries = RustWSCursorBox.entries(snapshots)
+                Task { try? await session.seedCursors(cursors: entries) }
+            }
+            return
+        }
         for (qkey, snap) in snapshots {
             let trimmed = snap.lastId.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty, trimmed != "0", trimmed != "1" else { continue }
@@ -134,6 +263,7 @@ actor ZaloWebSocket {
     }
 
     func currentQueueCursors() -> [String: ZaloWSQueueCursorSnapshot] {
+        if useRustCore { return rustCursors.current() }
         var out: [String: ZaloWSQueueCursorSnapshot] = [:]
         for (qkey, cursor) in queueCursors {
             let lastStr = JSONLossless.string(cursor.lastId).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -144,11 +274,33 @@ actor ZaloWebSocket {
         return out
     }
 
-    func start(endpoints: [String], zpwSek: String) -> AsyncStream<ZaloWSEvent> {
+    func start(endpoints: [String], zpwSek: String, myUid: String? = nil, selfConvId: String? = nil) -> AsyncStream<ZaloWSEvent> {
         stop(resetCursors: false)
         stopped = false
         let (stream, continuation) = AsyncStream.makeStream(of: ZaloWSEvent.self)
         self.continuation = continuation
+
+        if useRustCore {
+            let listener = RustWSListener(continuation: continuation, cursors: rustCursors)
+            let config = WsConfigRecord(
+                endpoints: endpoints.isEmpty ? ZaloDomains().ws : endpoints,
+                zpwSek: zpwSek,
+                seedCursors: RustWSCursorBox.entries(rustCursors.current()),
+                eventCapacity: nil,
+                myUid: myUid,
+                selfConvId: selfConvId
+            )
+            do {
+                rustSession = try wsStart(config: config, listener: listener)
+                let count = config.endpoints.count
+                Task { @MainActor in EngineLog.shared.write("ws: rust core started endpoints=\(count)") }
+            } catch {
+                Task { @MainActor in EngineLog.shared.write("ws: rust core start failed") }
+                continuation.finish()
+                self.continuation = nil
+            }
+            return stream
+        }
 
         let config = URLSessionConfiguration.ephemeral
         config.httpShouldSetCookies = false
@@ -169,6 +321,19 @@ actor ZaloWebSocket {
 
     func stop(resetCursors: Bool = true) {
         stopped = true
+        if useRustCore {
+            if let session = rustSession {
+                rustSession = nil
+                Task.detached { _ = try? await session.stop(resetCursors: resetCursors) }
+            }
+            for (_, list) in fileWaiters { for cont in list { cont.resume(returning: nil) } }
+            fileWaiters.removeAll()
+            completedFileURLs.removeAll()
+            if resetCursors { rustCursors.clear() }
+            continuation?.finish()
+            continuation = nil
+            return
+        }
         pingTask?.cancel()
         pingTask = nil
         runnerTask?.cancel()
@@ -200,6 +365,11 @@ actor ZaloWebSocket {
         if let existing = completedFileURLs[fileId], !existing.isEmpty {
             return existing
         }
+        if useRustCore {
+            // The core records `file_done` from its own socket; its wait window is fixed (12 s).
+            guard let session = rustSession else { return nil }
+            return (try? await session.waitForFileDone(fileId: fileId, timeoutSecs: timeoutSeconds)) ?? nil
+        }
         return await withCheckedContinuation { continuation in
             var waiters = fileWaiters[fileId] ?? []
             waiters.append(continuation)
@@ -228,6 +398,11 @@ actor ZaloWebSocket {
     }
 
     func sendFrame(cmd: UInt16, subCmd: UInt8 = 0, version: UInt8 = 1, payloadJSON: Data? = nil) async -> Bool {
+        if useRustCore {
+            guard let session = rustSession else { return false }
+            let text = payloadJSON.flatMap { String(data: $0, encoding: .utf8) }
+            return (try? await session.sendFrame(cmd: cmd, subCmd: subCmd, version: version, payloadJson: text)) ?? false
+        }
         guard authed, let task else { return false }
         let frame = Self.encodeFrame(cmd: cmd, subCmd: subCmd, version: version, payloadJSON: payloadJSON)
         do {
@@ -265,6 +440,16 @@ actor ZaloWebSocket {
         innerData: ZaloJSONBox,
         timeoutSeconds: Double = 10
     ) async -> ZaloJSONBox? {
+        if useRustCore {
+            guard let session = rustSession,
+                  JSONSerialization.isValidJSONObject(innerData.dict),
+                  let inner = try? JSONSerialization.data(withJSONObject: innerData.dict),
+                  let innerText = String(data: inner, encoding: .utf8) else { return nil }
+            guard let text = (try? await session.sendRequestWithTimeout(
+                cmd: cmd, subCmd: subCmd, reqId: explicitReqId, innerDataJson: innerText, timeoutSecs: timeoutSeconds
+            )) ?? nil else { return nil }
+            return ZaloJSONBox(JSONLossless.parseObject(string: text) ?? [:])
+        }
         guard authed, let task else { return nil }
         let reqId = explicitReqId ?? nextReqId()
         guard let frame = Self.encodeRequestFrame(

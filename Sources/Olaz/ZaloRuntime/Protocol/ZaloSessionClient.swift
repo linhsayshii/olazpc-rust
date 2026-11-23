@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import OlazCore
 import Security
 
 enum ZaloSessionStatus: Equatable, Sendable {
@@ -84,6 +85,11 @@ actor ZaloSessionClient {
     let dataDirectory: URL
     private let session: URLSession
     private let useKeychain: Bool
+    /// Rust chat path (ADR-011). Swift stays the owner of Keychain persistence; the core session mirrors our state.
+    let useRustCore: Bool
+    private var coreSession: CoreSession?
+    private var coreApiHandle: CoreApi?
+    private var corePushedSnapshot = ""
 
     var domains = ZaloDomains()
     var imei: String
@@ -112,10 +118,12 @@ actor ZaloSessionClient {
     init(
         dataDirectory: URL = ZaloPlatform.defaultUserData,
         useKeychain: Bool = true,
-        urlSession: URLSession? = nil
+        urlSession: URLSession? = nil,
+        useRustCore: Bool = RustCore.isEnabled
     ) {
         self.dataDirectory = dataDirectory
         self.useKeychain = useKeychain
+        self.useRustCore = useRustCore
         self.computerName = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
 
         if let urlSession {
@@ -213,6 +221,36 @@ actor ZaloSessionClient {
             return nil
         }
         return try? AESCBC.crypt(ct, key: enc, iv: iv, encrypt: false)
+    }
+
+    /// The `CoreApi` over a `CoreSession` restored from our live state, or `nil` (Swift path, or no usable session).
+    /// The snapshot is rebuilt from the current fields and pushed only when it changed, so credential / domain updates
+    /// made anywhere in this class (login, `applyLoginConfig`, `updateCredentials`, `markExpired`) reach the core on
+    /// the next call. The account is carried in the clear inside the in-memory snapshot only; Rust never persists it.
+    func coreApi() -> CoreApi? {
+        guard useRustCore, let account else { return nil }
+        let snapshot = StoredNativeSession(
+            zpwType: ZaloDomains.zpwType,
+            imei: imei,
+            computerName: computerName,
+            domains: domains,
+            sealedSecretsBase64: nil,
+            plainAccount: account,
+            expiredAt: expiredAt
+        )
+        guard let data = try? JSONEncoder().encode(snapshot), let json = String(data: data, encoding: .utf8) else { return nil }
+        if coreSession == nil {
+            guard let created = try? CoreSession(computerName: computerName) else { return nil }
+            coreSession = created
+            coreApiHandle = CoreApi(session: created)
+            corePushedSnapshot = ""
+        }
+        guard let coreSession, let coreApiHandle else { return nil }
+        if json != corePushedSnapshot {
+            guard (try? coreSession.restore(snapshotJson: json)) == true else { return nil }
+            corePushedSnapshot = json
+        }
+        return coreApiHandle
     }
 
     func commonParams() -> String {
@@ -355,6 +393,8 @@ actor ZaloSessionClient {
     }
 
     func clearSession() {
+        coreSession?.clearSession()
+        corePushedSnapshot = ""
         account = nil
         zpwSek = nil
         secretKey = nil

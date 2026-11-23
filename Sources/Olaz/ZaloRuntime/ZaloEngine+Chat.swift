@@ -14,8 +14,8 @@ extension ZaloEngine {
             messages[id] = []
         }
         // Synchronous WAL snapshot read (< 0.5ms) so synced local history appears on the very first frame.
-        if let syncCached = sqliteStore?.readMessagesNow(convId: id, limit: 50) {
-            let decoded = syncCached.compactMap { ZaloWireParser.decodeStoredMessage($0) }
+        if let syncCached = sqliteStore?.readDecodedMessagesNow(convId: id, limit: 50) {
+            let decoded = syncCached.map(\.message)
             for msg in decoded { mergeMessageIntoMemory(msg) }
             if decoded.count >= 45 {
                 hasMoreHistory[id] = true
@@ -29,8 +29,8 @@ extension ZaloEngine {
             guard let self else { return }
             // 1. Fallback async read for in-memory test DBs without a separate WAL handle.
             if (self.messages[id]?.isEmpty ?? true),
-               let cached = try? await self.sqliteStore?.messages(convId: id, limit: 50) {
-                let decoded = cached.compactMap { ZaloWireParser.decodeStoredMessage($0) }
+               let cached = try? await self.sqliteStore?.decodedMessages(convId: id, limit: 50) {
+                let decoded = cached.map(\.message)
                 for msg in decoded { self.mergeMessageIntoMemory(msg) }
                 if decoded.count >= 45 {
                     self.hasMoreHistory[id] = true
@@ -165,14 +165,14 @@ extension ZaloEngine {
 
             var addedCount = 0
             if let beforeTsMs {
-                let cachedOlder: [StoredMessage]?
-                if let syncOlder = self.sqliteStore?.readMessagesNow(convId: id, beforeTsMs: beforeTsMs, limit: 50) {
+                let cachedOlder: [DecodedMessageRow]?
+                if let syncOlder = self.sqliteStore?.readDecodedMessagesNow(convId: id, beforeTsMs: beforeTsMs, limit: 50) {
                     cachedOlder = syncOlder
                 } else {
-                    cachedOlder = try? await self.sqliteStore?.messages(convId: id, beforeTsMs: beforeTsMs, limit: 50)
+                    cachedOlder = try? await self.sqliteStore?.decodedMessages(convId: id, beforeTsMs: beforeTsMs, limit: 50)
                 }
                 if let cachedOlder, !cachedOlder.isEmpty {
-                    let decoded = cachedOlder.compactMap { ZaloWireParser.decodeStoredMessage($0) }
+                    let decoded = cachedOlder.map(\.message)
                     for msg in decoded {
                         if !(self.messages[id]?.contains(where: { $0.id == msg.id }) ?? false) {
                             addedCount += 1
@@ -212,7 +212,7 @@ extension ZaloEngine {
         let myUid = profile?.userId ?? ""
         let isGrp = ZaloWireParser.isGroupId(convId)
         let isSelf = (convId == selfConversationId)
-        let events = ZaloWireParser.extractBatchEvents(
+        let events = await ZaloWireParser.extractBatchEventsAsync(
             box.dict,
             myUid: myUid,
             selfConvId: selfConversationId,

@@ -72,27 +72,28 @@ extension ZaloEngine {
             }
         }
 
-        let storedMatches = (try? await sqliteStore?.searchMessages(conversationId: convId, query: trimmed, limit: clampedLimit)) ?? []
-        for stored in storedMatches {
-            if pendingDeletedIds.contains(stored.id) || (!stored.clientId.isEmpty && pendingDeletedIds.contains(stored.clientId)) {
+        let storedMatches = (try? await sqliteStore?.decodedSearch(conversationId: convId, query: trimmed, limit: clampedLimit)) ?? []
+        for row in storedMatches {
+            let storedId = row.rowId, storedClientId = row.rowClientId
+            if pendingDeletedIds.contains(storedId) || (!storedClientId.isEmpty && pendingDeletedIds.contains(storedClientId)) {
                 continue
             }
-            if seenIds.contains(stored.id) || (!stored.clientId.isEmpty && seenIds.contains(stored.clientId)) {
+            if seenIds.contains(storedId) || (!storedClientId.isEmpty && seenIds.contains(storedClientId)) {
                 continue
             }
             // If the live in-memory list already holds this message (e.g., recalled in memory), trust memory state.
-            if memoryById[stored.id] != nil || (!stored.clientId.isEmpty && memoryById[stored.clientId] != nil) {
-                seenIds.insert(stored.id)
-                if !stored.clientId.isEmpty { seenIds.insert(stored.clientId) }
+            if memoryById[storedId] != nil || (!storedClientId.isEmpty && memoryById[storedClientId] != nil) {
+                seenIds.insert(storedId)
+                if !storedClientId.isEmpty { seenIds.insert(storedClientId) }
                 continue
             }
-            guard let decoded = ZaloWireParser.decodeStoredMessage(stored) else { continue }
+            let decoded = row.message
             if case .recalled = decoded.kind { continue }
             if case .placeholder = decoded.kind, decoded.isE2EE { continue }
 
-            seenIds.insert(stored.id)
+            seenIds.insert(storedId)
             seenIds.insert(decoded.id)
-            if !stored.clientId.isEmpty { seenIds.insert(stored.clientId) }
+            if !storedClientId.isEmpty { seenIds.insert(storedClientId) }
             results.append(decoded)
         }
 
@@ -115,7 +116,7 @@ extension ZaloEngine {
         let oldestTsMs = messages[convId]?.first.map { Int64(($0.date.timeIntervalSince1970 * 1000).rounded()) }
 
         if let store = sqliteStore,
-           let window = try? await store.messagesAround(
+           let window = try? await store.decodedMessagesAround(
                convId: convId,
                targetTsMs: targetTsMs,
                beforeOldestTsMs: oldestTsMs
@@ -125,11 +126,9 @@ extension ZaloEngine {
                     .filter { $0.conversationId == convId }
                     .map(\.id)
             )
-            for stored in window.messages {
-                if pendingDeletedIds.contains(stored.id) { continue }
-                if let decoded = ZaloWireParser.decodeStoredMessage(stored) {
-                    mergeMessageIntoMemory(decoded, replacingClientId: stored.clientId)
-                }
+            for row in window.rows {
+                if pendingDeletedIds.contains(row.rowId) { continue }
+                mergeMessageIntoMemory(row.message, replacingClientId: row.rowClientId)
             }
             if window.hasMoreOlder {
                 hasMoreHistory[convId] = true

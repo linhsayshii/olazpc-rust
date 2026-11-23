@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import OlazCore
 
 struct SendMessageResult: Sendable {
     var msgId: String
@@ -101,6 +102,20 @@ extension ZaloSessionClient {
     // MARK: - Contacts & Profiles
 
     func fetchFriends(page: Int = 1, count: Int = 20000) async throws -> ZaloJSONArrayBox {
+        if let core = coreApi() {
+            do {
+                let rows = RustCore.objects(try await core.fetchFriends(page: Int64(page), count: Int64(count)))
+                for row in rows {
+                    let uid = ZaloWireParser.stripUserPrefix(JSONLossless.string(row["userId"] ?? row["uid"] ?? row["id"]))
+                    let gid = JSONLossless.string(row["globalId"])
+                    if !uid.isEmpty && !gid.isEmpty {
+                        globalIdToUidCache[gid] = uid
+                        uidToGlobalIdCache[uid] = gid
+                    }
+                }
+                return ZaloJSONArrayBox(rows)
+            } catch { throw RustCore.mapError(error) }
+        }
         let resp = try await get(
             service: "profile",
             path: "/api/social/friend/getfriends",
@@ -211,6 +226,11 @@ extension ZaloSessionClient {
     }
 
     func fetchGroupsList() async throws -> ZaloJSONBox {
+        if let core = coreApi() {
+            do {
+                return ZaloJSONBox(RustCore.object(try await core.fetchGroupsList()))
+            } catch { throw RustCore.mapError(error) }
+        }
         let listResp = try await get(service: "group", path: "/api/group/getlg/v4")
         let outerData = listResp["data"] as? [String: Any] ?? [:]
         let dataDict = (outerData["data"] as? [String: Any]) ?? outerData
@@ -246,6 +266,17 @@ extension ZaloSessionClient {
     }
 
     func fetchProfiles(uids: [String]) async throws -> ZaloJSONBox {
+        if let core = coreApi() {
+            var seen = Set<String>()
+            let clean = uids.compactMap { raw -> String? in
+                guard let uid = ZaloWireParser.sanitizeProfileUid(raw), seen.insert(uid).inserted else { return nil }
+                return uid
+            }
+            guard !clean.isEmpty else { return ZaloJSONBox([:]) }
+            do {
+                return ZaloJSONBox(RustCore.object(try await core.fetchProfiles(uids: clean)))
+            } catch { throw RustCore.mapError(error) }
+        }
         var seen = Set<String>()
         var clean: [String] = []
         clean.reserveCapacity(uids.count)
@@ -315,6 +346,11 @@ extension ZaloSessionClient {
     }
 
     func fetchAliases() async throws -> [String: String] {
+        if let core = coreApi() {
+            do {
+                return try await core.fetchAliases()
+            } catch { throw RustCore.mapError(error) }
+        }
         var result: [String: String] = [:]
         let pageSize = 100
         for page in 1...20 {
@@ -455,6 +491,24 @@ extension ZaloSessionClient {
     // MARK: - Conversations, Pins, Archive, Mute, Polling, History
 
     func fetchChatFromPolling(state: ZaloPollState) async throws -> (box: ZaloJSONBox, nextState: ZaloPollState, more: Bool) {
+        if let core = coreApi() {
+            do {
+                let record = PollStateRecord(
+                    lastActionId: state.lastActionId,
+                    lastActionIdOther: state.lastActionIdOther,
+                    queues: state.queues.keys.sorted().map { key in
+                        PollQueueRecord(key: key, lastId: state.queues[key]?.lastId ?? "1", ids: state.queues[key]?.ids ?? [])
+                    })
+                let out = try await core.fetchChatFromPolling(state: record)
+                var next = ZaloPollState()
+                next.lastActionId = out.nextState.lastActionId
+                next.lastActionIdOther = out.nextState.lastActionIdOther
+                next.queues = Dictionary(uniqueKeysWithValues: out.nextState.queues.map {
+                    ($0.key, ZaloPollQueueCursor(lastId: $0.lastId, ids: $0.ids))
+                })
+                return (ZaloJSONBox(RustCore.object(out.rawJson)), next, out.more)
+            } catch { throw RustCore.mapError(error) }
+        }
         let ts = Int64(Date().timeIntervalSince1970)
         let base = ZaloDomains.normalizeHost(domains.lpChat)
         guard let url = URL(string: "\(base)/?\(commonParams())&params=\(state.encodedParams())&ts=\(ts)") else {
@@ -468,6 +522,11 @@ extension ZaloSessionClient {
     }
 
     func fetchPinnedConversations() async throws -> [String] {
+        if let core = coreApi() {
+            do {
+                return try await core.fetchPinnedConversations()
+            } catch { throw RustCore.mapError(error) }
+        }
         let resp = try await get(service: "conversation", path: "/api/pinconvers/list", encryptedPayload: nil)
         let rawIds: [String] = {
             if let list = resp["data"] as? [Any] {
@@ -496,6 +555,13 @@ extension ZaloSessionClient {
     }
 
     func fetchArchivedChats() async throws -> [String] {
+        if let core = coreApi() {
+            do {
+                let ids = try await core.fetchArchivedChats()
+                archivedVersion = core.archivedVersion()
+                return ids
+            } catch { throw RustCore.mapError(error) }
+        }
         let resp = try await get(
             service: "label",
             path: "/api/archivedchat/list",
@@ -539,6 +605,13 @@ extension ZaloSessionClient {
     }
 
     func fetchConversationLabels() async throws -> ZaloJSONBox {
+        if let core = coreApi() {
+            do {
+                let box = ZaloJSONBox(RustCore.object(try await core.fetchConversationLabels()))
+                labelVersion = core.labelVersion()
+                return box
+            } catch { throw RustCore.mapError(error) }
+        }
         let resp = try await get(
             service: "label",
             path: "/api/convlabel/get",
@@ -567,6 +640,12 @@ extension ZaloSessionClient {
     }
 
     func setUnreadMarkAPI(convId: String, unread: Bool) async throws {
+        if let core = coreApi() {
+            do {
+                try await core.setUnreadMark(convId: convId, unread: unread)
+                return
+            } catch { throw RustCore.mapError(error) }
+        }
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
         let convsGroup: [String] = isGroup ? [cleanId] : []
@@ -644,6 +723,11 @@ extension ZaloSessionClient {
     }
 
     func fetchMuteList() async throws -> ZaloJSONArrayBox {
+        if let core = coreApi() {
+            do {
+                return ZaloJSONArrayBox(RustCore.objects(try await core.fetchMuteList()))
+            } catch { throw RustCore.mapError(error) }
+        }
         let resp = try await get(service: "profile", path: "/api/social/profile/getmute", encryptedPayload: ["imei": imei])
         let d = resp["data"] as? [String: Any] ?? [:]
         var normalized: [[String: Any]] = []
@@ -683,6 +767,11 @@ extension ZaloSessionClient {
     }
 
     func fetchPreloadConversations(threadIds: [String] = []) async throws -> ZaloJSONBox {
+        if let core = coreApi() {
+            do {
+                return ZaloJSONBox(RustCore.object(try await core.fetchPreloadConversations(threadIds: threadIds)))
+            } catch { throw RustCore.mapError(error) }
+        }
         var mapDict: [String: String] = [:]
         for rawId in threadIds.prefix(25) {
             if ZaloWireParser.isGroupId(rawId) {
@@ -724,6 +813,12 @@ extension ZaloSessionClient {
     }
 
     func fetchHistory(convId: String, lastMsgId: String?, count: Int = 50, isOld: Bool? = nil) async throws -> ZaloJSONBox {
+        if let core = coreApi() {
+            do {
+                let h = try await core.fetchHistory(convId: convId, lastMsgId: lastMsgId, count: Int64(count), isOld: isOld)
+                return ZaloJSONBox(RustCore.object(h.rawJson))
+            } catch { throw RustCore.mapError(error) }
+        }
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
         let isSelfCloud = !isGroup && (
@@ -834,6 +929,15 @@ extension ZaloSessionClient {
         quoteTsMs: Int64? = nil,
         mentions: [Mention] = []
     ) async throws -> SendMessageResult {
+        if let core = coreApi() {
+            do {
+                let r = try await core.sendText(args: SendTextRecord(
+                    convId: convId, text: text, cliMsgId: cliMsgId, quoteMsgId: quoteMsgId, quoteCliMsgId: quoteCliMsgId,
+                    quoteOwnerId: quoteOwnerId, quoteText: quoteText, quoteTsMs: quoteTsMs,
+                    mentions: mentions.map { MentionRecord(uid: $0.uid, pos: Int64($0.pos), len: Int64($0.len), isAll: $0.isAll) }))
+                return SendMessageResult(msgId: r.msgId, cliMsgId: r.cliMsgId, tsMs: r.tsMs)
+            } catch { throw RustCore.mapError(error) }
+        }
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
         let cliInt = Int64(cliMsgId) ?? nextClientId()
@@ -1154,6 +1258,10 @@ extension ZaloSessionClient {
     }
 
     func sendTypingAPI(convId: String) async {
+        if let core = coreApi() {
+            try? await core.sendTyping(convId: convId)
+            return
+        }
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
         let service = isGroup ? "group" : "chat"
@@ -1165,6 +1273,10 @@ extension ZaloSessionClient {
     }
 
     func sendSeenAPI(convId: String, msgId: String, cliMsgId: String, senderId: String) async {
+        if let core = coreApi() {
+            try? await core.sendSeen(convId: convId, msgId: msgId, cliMsgId: cliMsgId, senderId: senderId)
+            return
+        }
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
         let trimmedMsg = msgId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1238,6 +1350,13 @@ extension ZaloSessionClient {
         msgType: Int = 1,
         clientId: Int64? = nil
     ) async throws -> Int64 {
+        if let core = coreApi() {
+            do {
+                return try await core.sendReaction(
+                    convId: convId, msgId: msgId, cliMsgId: cliMsgId, rIcon: rIcon, rType: Int64(rType),
+                    msgType: Int64(msgType), clientId: clientId)
+            } catch { throw RustCore.mapError(error) }
+        }
         let nowInt = clientId ?? nextClientId()
         let spec = Self.buildReactionRequest(
             convId: convId,
@@ -1304,6 +1423,12 @@ extension ZaloSessionClient {
     }
 
     func recallMessageAPI(convId: String, msgId: String, cliMsgId: String, isE2EE: Bool = false) async throws {
+        if let core = coreApi() {
+            do {
+                try await core.recallMessage(convId: convId, msgId: msgId, cliMsgId: cliMsgId, isE2ee: isE2EE)
+                return
+            } catch { throw RustCore.mapError(error) }
+        }
         let spec = Self.buildRecallMessageRequest(
             convId: convId,
             msgId: msgId,
@@ -1316,6 +1441,12 @@ extension ZaloSessionClient {
     }
 
     func deleteMessageForMeAPI(convId: String, msgId: String, cliMsgId: String, senderId: String) async throws {
+        if let core = coreApi() {
+            do {
+                try await core.deleteMessageForMe(convId: convId, msgId: msgId, cliMsgId: cliMsgId, senderId: senderId)
+                return
+            } catch { throw RustCore.mapError(error) }
+        }
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
         let msgDel: [String: Any] = [

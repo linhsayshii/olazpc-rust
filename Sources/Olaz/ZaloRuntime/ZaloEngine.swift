@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import Observation
+import OlazCore
 import os
 
 private let engineLog = Logger(subsystem: "app.olaz", category: "engine")
@@ -184,7 +185,7 @@ final class ZaloEngine {
                 self?.recentLog.removeFirst(count - 200)
             }
         }
-        EngineLog.shared.write("engine: start pure Swift native runtime (zpw_ver=\(ZaloDomains.zpwVer))")
+        EngineLog.shared.write("engine: start native runtime core=\(RustCore.isEnabled ? "rust" : "swift") (zpw_ver=\(ZaloDomains.zpwVer))")
         NativeNotifier.shared.attach(engine: self)
         ZaloRuntime.prepareForLaunch()
         call.helperInstalled = CallBridge.isHelperInstalled()
@@ -934,7 +935,7 @@ final class ZaloEngine {
         } else {
             effectiveRoot = root
         }
-        let events = ZaloWireParser.extractBatchEvents(
+        let events = await ZaloWireParser.extractBatchEventsAsync(
             effectiveRoot,
             myUid: myUid,
             selfConvId: selfConversationId,
@@ -943,6 +944,20 @@ final class ZaloEngine {
             isGroupHint: isGroupHint,
             nameLookup: { [weak self] uid in self?.lookupPersonInfo(uid) }
         )
+        return await applyParsedEvents(
+            events, incrementUnread: incrementUnread, notifyIncoming: notifyIncoming, persistConversations: persistConversations)
+    }
+
+    /// Applies parsed wire events: persists messages, applies reactions / recalls / deletes / typing, refreshes the
+    /// conversation list and raises notifications. Shared by the JSON path (`applyBatchResponse`) and the typed path.
+    @discardableResult
+    internal func applyParsedEvents(
+        _ events: [ParsedWireEvent],
+        incrementUnread: Bool = false,
+        notifyIncoming: Bool = false,
+        persistConversations: Bool = true
+    ) async -> Int {
+        let myUid = profile?.userId ?? ""
         guard !events.isEmpty else { return 0 }
 
         var storedBatch: [StoredMessage] = []
@@ -1210,7 +1225,8 @@ final class ZaloEngine {
         guard !zpwSek.isEmpty else { return }
         wsTask = Task { [weak self] in
             guard let self else { return }
-            let stream = await self.webSocket.start(endpoints: endpoints, zpwSek: zpwSek)
+            let stream = await self.webSocket.start(
+                endpoints: endpoints, zpwSek: zpwSek, myUid: self.profile?.userId, selfConvId: self.selfConversationId)
             let authWatchTask = Task { [weak self] in
                 guard let self else { return }
                 var wasAuthed = false
@@ -1244,6 +1260,10 @@ final class ZaloEngine {
     }
 
     private func handleWSEvent(_ event: ZaloWSEvent) async {
+        if let typed = event.typed {
+            await handleTypedChatEvent(event, typed)
+            return
+        }
         let payload = event.payload
 
         // Duplicate login / kicked check
@@ -1292,6 +1312,30 @@ final class ZaloEngine {
             || event.cmd == ZaloE2EEManager.cmdReceiveGroup
         )
         _ = await applyBatchResponse(payload, defaultCmd: event.cmd, incrementUnread: isLivePush, notifyIncoming: isLivePush)
+    }
+
+    /// Rust-core hot path: a plain chat envelope arrives parsed. The core guarantees nothing else in it needs the JSON
+    /// (no error code, E2EE cipher, control or sync item), so only name resolution and the batch apply remain.
+    private func handleTypedChatEvent(_ event: ZaloWSEvent, _ typed: ZaloWSTypedChat) async {
+        let myUid = profile?.userId ?? ""
+        var names: [NameEntry] = []
+        for uid in typed.uids {
+            if let hit = lookupPersonInfo(uid) { names.append(NameEntry(uid: uid, name: hit.name, avatar: hit.avatar)) }
+        }
+        let selfConv = selfConversationId
+        let payload = typed.payload
+        var events = typed.events
+        // nil = the core parsed with exactly this uid and these names; otherwise re-parse with them (off the MainActor).
+        if let fresh = await Task.detached(priority: .userInitiated, operation: {
+            payload.resolve(myUid: myUid, selfConvId: selfConv, names: names).map { ZaloWireParser.parsedEvents(from: $0) }
+        }).value {
+            events = fresh
+        }
+        let isLivePush = (
+            event.cmd == ZaloWebSocket.cmdPushMsg11
+            || event.cmd == ZaloWebSocket.cmdPushMsgGroup
+        )
+        _ = await applyParsedEvents(events, incrementUnread: isLivePush, notifyIncoming: isLivePush)
     }
 
     internal func processControlEnvelope(_ payload: [String: Any], cmd: UInt16 = 0) async {

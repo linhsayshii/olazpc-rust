@@ -1249,8 +1249,16 @@ enum ZaloWireParser {
         defaultCmd: UInt16 = 0,
         fallbackConvId: String? = nil,
         isGroupHint: Bool? = nil,
-        nameLookup: ((String) -> (name: String, avatar: String)?)? = nil
+        nameLookup: ((String) -> (name: String, avatar: String)?)? = nil,
+        useRustCore: Bool = RustCore.isEnabled
     ) -> [ParsedWireEvent] {
+        if useRustCore,
+           let rust = rustExtractBatchEvents(
+               root, myUid: myUid, selfConvId: selfConvId, defaultCmd: defaultCmd,
+               fallbackConvId: fallbackConvId, isGroupHint: isGroupHint, nameLookup: nameLookup
+           ) {
+            return rust
+        }
         var events: [ParsedWireEvent] = []
 
         func unwrapValue(_ v: Any) -> Any {

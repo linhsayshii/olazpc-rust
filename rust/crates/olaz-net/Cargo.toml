@@ -1,0 +1,22 @@
+[package]
+name = "olaz-net"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+olaz-crypto = { path = "../olaz-crypto" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["arbitrary_precision"] }
+thiserror = "2.0.21"
+tokio = { version = "1", features = ["time", "sync"] }
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }

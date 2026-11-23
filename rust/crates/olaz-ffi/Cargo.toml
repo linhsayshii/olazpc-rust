@@ -1,0 +1,28 @@
+[package]
+name = "olaz-ffi"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["staticlib", "lib"]
+
+[dependencies]
+olaz-api = { path = "../olaz-api" }
+olaz-crypto = { path = "../olaz-crypto" }
+olaz-json = { path = "../olaz-json" }
+olaz-net = { path = "../olaz-net" }
+olaz-store = { path = "../olaz-store" }
+olaz-wire = { path = "../olaz-wire" }
+olaz-ws = { path = "../olaz-ws" }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+uniffi = "0.32.2"
+
+[dev-dependencies]
+tempfile = "3"
