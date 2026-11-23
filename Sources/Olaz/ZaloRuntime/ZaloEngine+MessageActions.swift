@@ -155,26 +155,81 @@ extension ZaloEngine {
         CardActionCenter.shared.show("Đã sao chép", in: conversationId)
     }
 
+    /// "Copy hình ảnh": the full-resolution picture (the message's hd URL, or the decrypted E2EE file), never the chat thumbnail.
     func copyPhoto(_ message: ChatMessage) {
         guard case .photo(let url, _, _) = message.kind else { return }
-        let conversation = message.conversationId
+        copyPhoto(conversationId: message.conversationId, messageId: message.id, url: message.isE2EE ? nil : url)
+    }
+
+    func copyPhoto(conversationId: String, messageId: String, url: URL?) {
         Task {
-            var data: Data?
-            if case .file(let file) = await resolveMedia(conversationId: conversation, messageId: message.id, kind: .photo),
-               MediaLoader.isAllowedLocalFile(file) {
-                data = try? Data(contentsOf: file)
-            }
-            if data == nil, !message.isE2EE, let url, url.scheme == "https" {
-                data = try? await MediaLoader.shared.data(for: url)
-            }
-            guard let data, let image = NSImage(data: data) else {
-                CardActionCenter.shared.show("Không sao chép được hình ảnh. Hãy thử lại.", in: conversation)
+            guard let original = await photoOriginal(conversationId: conversationId, messageId: messageId, url: url),
+                  let image = NSImage(data: original.data) else {
+                CardActionCenter.shared.show("Không sao chép được hình ảnh. Hãy thử lại.", in: conversationId)
                 return
             }
+            let item = NSPasteboardItem()
+            if let tiff = image.tiffRepresentation {
+                item.setData(tiff, forType: .tiff)
+                if let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
+                    item.setData(png, forType: .png)
+                }
+            }
+            if let file = original.file {
+                item.setString(file.absoluteString, forType: .fileURL)
+            }
             NSPasteboard.general.clearContents()
-            NSPasteboard.general.writeObjects([image])
-            CardActionCenter.shared.show("Đã sao chép", in: conversation)
+            NSPasteboard.general.writeObjects([item])
+            CardActionCenter.shared.show("Đã sao chép", in: conversationId)
         }
+    }
+
+    /// "Tải về": the original into Downloads. "Lưu về máy…" (`askLocation`): the same through a save panel.
+    func downloadPhoto(_ message: ChatMessage, askLocation: Bool = false) {
+        guard case .photo(let url, _, _) = message.kind else { return }
+        downloadPhoto(conversationId: message.conversationId, messageId: message.id, url: message.isE2EE ? nil : url,
+                      date: message.date, askLocation: askLocation)
+    }
+
+    func downloadPhoto(conversationId: String, messageId: String, url: URL?, date: Date, askLocation: Bool = false) {
+        Task {
+            guard let original = await photoOriginal(conversationId: conversationId, messageId: messageId, url: url) else {
+                CardActionCenter.shared.show("Không tải được hình ảnh. Hãy thử lại.", in: conversationId)
+                return
+            }
+            // Always a file on disk to copy from: the cached original when there is one, else the downloaded bytes.
+            var staged = original.file
+            if staged == nil {
+                let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-photo-\(UUID().uuidString)")
+                guard (try? original.data.write(to: tmp)) != nil else {
+                    CardActionCenter.shared.show("Không tải được hình ảnh. Hãy thử lại.", in: conversationId)
+                    return
+                }
+                staged = tmp
+            }
+            defer { if original.file == nil, let staged { try? FileManager.default.removeItem(at: staged) } }
+            guard let staged else { return }
+            let name = PhotoSaveName.make(date: date, data: original.data, sourceURL: url)
+            if askLocation {
+                _ = await ChatFileSavePanel.saveAs(staged: staged, displayName: name)
+            } else if (try? ChatFileResolver.saveToDownloads(staged: staged, displayName: name)) != nil {
+                CardActionCenter.shared.show("Đã tải ảnh về thư mục Downloads", in: conversationId)
+            } else {
+                CardActionCenter.shared.show("Không tải được hình ảnh. Hãy thử lại.", in: conversationId)
+            }
+        }
+    }
+
+    /// The photo's full-resolution bytes: the resolver's cached/decrypted local file first, then the CDN URL (never E2EE).
+    private func photoOriginal(conversationId: String, messageId: String, url: URL?) async -> (data: Data, file: URL?)? {
+        if case .file(let file) = await resolveMedia(conversationId: conversationId, messageId: messageId, kind: .photo),
+           MediaLoader.isAllowedLocalFile(file), let data = try? Data(contentsOf: file) {
+            return (data, MediaLoader.isOwnLocalFile(file) ? file : nil)
+        }
+        if let url, url.scheme == "https", let data = try? await MediaLoader.shared.data(for: url) {
+            return (data, nil)
+        }
+        return nil
     }
 
     // MARK: Chia sẻ
@@ -674,5 +729,27 @@ extension ZaloEngine {
         pins = [:]
         messageActionsBusy = []
         pendingDeletedMessages = [:]
+    }
+}
+
+
+/// File name for a saved chat photo: "Zalo_yyyyMMdd_HHmmss.ext", the extension from the bytes (the CDN URL often has none).
+enum PhotoSaveName {
+    nonisolated static func make(date: Date, data: Data, sourceURL: URL?) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyyMMdd_HHmmss"
+        return "Zalo_\(f.string(from: date)).\(fileExtension(data: data, sourceURL: sourceURL))"
+    }
+
+    nonisolated static func fileExtension(data: Data, sourceURL: URL?) -> String {
+        let b = [UInt8](data.prefix(12))
+        if b.starts(with: [0xFF, 0xD8, 0xFF]) { return "jpg" }
+        if b.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "png" }
+        if b.starts(with: [0x47, 0x49, 0x46]) { return "gif" }
+        if b.count >= 12, b[0..<4] == [0x52, 0x49, 0x46, 0x46], b[8..<12] == [0x57, 0x45, 0x42, 0x50] { return "webp" }
+        if b.count >= 12, b[4..<8] == [0x66, 0x74, 0x79, 0x70], b[8..<12] == [0x68, 0x65, 0x69, 0x63] { return "heic" }
+        if let ext = sourceURL?.pathExtension.lowercased(), ["jpg", "jpeg", "png", "gif", "webp", "heic"].contains(ext) { return ext }
+        return "jpg"
     }
 }

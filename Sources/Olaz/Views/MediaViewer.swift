@@ -427,7 +427,7 @@ private struct MediaViewerContent: View {
                         .frame(width: 340, height: 220)
                         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                 }
-                .rendering { image in ZoomableImageView(image: image, zoom: state.zoom) }
+                .rendering { image in ZoomableImageView(image: image, zoom: state.zoom, menu: { photoMenu(url: url) }) }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 // The top bar gets its own band instead of covering the top of the photo.
                 .padding(.top, MediaViewerLayout.photoTopBar)
@@ -438,6 +438,27 @@ private struct MediaViewerContent: View {
                 })
             }
         }
+    }
+
+    // MARK: Photo menu
+
+    /// Right-click on the photo: the same copy / download items as the chat's message menu.
+    private func photoMenu(url: URL?) -> NSMenu {
+        let (conversationId, messageId, date) = (item.conversationId, item.messageId, item.date)
+        let engine = engine
+        let encrypted: Bool = { if case .photo(_, _, _, let e) = item.media { return e }; return false }()
+        let source = encrypted ? nil : url
+        let menu = NSMenu()
+        menu.addAction("Copy hình ảnh", symbol: "photo.on.rectangle") {
+            engine.copyPhoto(conversationId: conversationId, messageId: messageId, url: source)
+        }
+        menu.addAction("Tải về", symbol: "arrow.down.circle") {
+            engine.downloadPhoto(conversationId: conversationId, messageId: messageId, url: source, date: date)
+        }
+        menu.addAction("Lưu về máy…", symbol: "folder") {
+            engine.downloadPhoto(conversationId: conversationId, messageId: messageId, url: source, date: date, askLocation: true)
+        }
+        return menu
     }
 
     // MARK: Top bar
@@ -501,4 +522,23 @@ private struct WindowDragArea: NSViewRepresentable {
 
     func makeNSView(context: Context) -> DragView { DragView() }
     func updateNSView(_ view: DragView, context: Context) {}
+}
+
+
+/// Closure-backed menu items (the menu keeps them alive through `representedObject`).
+private final class MenuAction: NSObject {
+    let run: () -> Void
+    init(_ run: @escaping () -> Void) { self.run = run }
+    @objc func fire() { run() }
+}
+
+private extension NSMenu {
+    func addAction(_ title: String, symbol: String, _ run: @escaping () -> Void) {
+        let action = MenuAction(run)
+        let entry = NSMenuItem(title: title, action: #selector(MenuAction.fire), keyEquivalent: "")
+        entry.target = action
+        entry.representedObject = action
+        entry.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        addItem(entry)
+    }
 }

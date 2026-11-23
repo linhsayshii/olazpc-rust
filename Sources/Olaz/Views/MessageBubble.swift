@@ -392,6 +392,10 @@ struct MessageRow: View {
                 if case .photo = message.kind {
                     Button("Copy hình ảnh", systemImage: "photo.on.rectangle") { engine.copyPhoto(message) }
                 }
+                if case .photo = message.kind {
+                    Button("Tải về", systemImage: "arrow.down.circle") { engine.downloadPhoto(message) }
+                    Button("Lưu về máy…", systemImage: "folder") { engine.downloadPhoto(message, askLocation: true) }
+                }
                 if let caption = message.caption {
                     Button("Copy chú thích", systemImage: "text.quote") { engine.copyText(caption, in: message.conversationId) }
                 }
