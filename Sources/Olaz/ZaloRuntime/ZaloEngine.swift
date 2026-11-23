@@ -1397,6 +1397,11 @@ final class ZaloEngine {
             controlItems.append(dataNode)
         }
 
+        if payload["encrypt"] != nil {
+            // The frame body was not decoded (the envelope came through). Shapes only, never ids or bodies.
+            EngineLog.shared.write("ctrl: undecoded cmd=\(cmd) encrypt=\(JSONLossless.int64(payload["encrypt"]) ?? -1) data=\(payload["data"] is String ? "string" : "other")")
+        }
+
         for ctrl in controlItems {
             let contentObj: [String: Any] = {
                 if let c = ctrl["content"] as? [String: Any] { return c }
@@ -1423,6 +1428,9 @@ final class ZaloEngine {
                 let uid = ZaloWireParser.stripUserPrefix(JSONLossless.string(actData["uid"] ?? actData["uidFrom"]))
                 let gid = JSONLossless.string(actData["gid"] ?? actData["grid"])
                 let convId = (!gid.isEmpty || act == "gtyping") ? ZaloWireParser.groupConvId(gid.isEmpty ? uid : gid) : uid
+                // Shapes only, once per distinct shape: key names and the isPC flag, never ids.
+                let shape = "\(act) keys=\(actData.keys.sorted().joined(separator: ",")) isPC=\(actData["isPC"].map { "\($0)" } ?? "nil")"
+                if Self.loggedTypingShapes.insert(shape).inserted { EngineLog.shared.write("typing: shape \(shape)") }
                 if !convId.isEmpty, uid != myUid {
                     let name = lookupPersonInfo(uid)?.name ?? "Ai đó"
                     showTyping(convId: convId, name: name, onPC: JSONLossless.int64(actData["isPC"]) == 1)
@@ -1717,6 +1725,8 @@ final class ZaloEngine {
         }
         try? await store.saveConversations(rows)
     }
+
+    @MainActor static var loggedTypingShapes: Set<String> = []
 
     internal func showTyping(convId: String, name: String, onPC: Bool = false) {
         let status = TypingStatus(name: name, onPC: onPC)

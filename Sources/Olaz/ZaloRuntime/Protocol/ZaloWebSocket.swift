@@ -705,7 +705,9 @@ actor ZaloWebSocket {
 
         let payload: [String: Any]
         if encrypt == 0 {
-            payload = envelope
+            // Plain frames can carry `data` as a JSON string (cmd 602 typing): official `decodeEventData`
+            // returns `JSON.parse(data)` for encrypt 0.
+            payload = (envelope["data"] as? String).flatMap { JSONLossless.parseObject(string: $0) } ?? envelope
         } else if let rawData = envelope["data"] as? String,
                   let plainData = try? ZaloCrypto.decryptWSFrame(cipherKey: cipherKey, encrypt: encrypt, dataField: rawData),
                   let decoded = JSONLossless.parseObject(plainData) {

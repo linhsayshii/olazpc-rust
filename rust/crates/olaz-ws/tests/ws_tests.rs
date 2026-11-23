@@ -849,3 +849,19 @@ fn json_helpers_match_swift_lossless() {
     let f = decode_frame(&bytes).unwrap();
     assert_eq!(string_of(f.envelope.get("i")), "12345678901234567890");
 }
+
+#[test]
+fn plain_frame_with_json_string_data_is_parsed() {
+    // cmd 602 typing arrives as encrypt 0 with `data` holding JSON text (official decodeEventData: JSON.parse).
+    let (mut core, _) = authed_core(json!({"error_code": 0, "data": {}}));
+    let inner = json!({"data": {"actions": [{"act_type": "typing", "act": "typing", "data": "\"uid\":\"200\",\"isPC\":1"}]}});
+    let env = json!({"encrypt": 0, "error_code": 0, "error_message": "", "data": inner.to_string()});
+    let out = core.handle_binary_frame(&frame_of(602, 0, env), &no_decrypt());
+    let ev = out.event.unwrap();
+    assert_eq!(ev.cmd, 602);
+    assert_eq!(ev.payload["data"]["actions"][0]["act_type"], json!("typing"));
+    // A plain frame whose data is not JSON text keeps the envelope.
+    let env = json!({"encrypt": 0, "data": {"x": 1}});
+    let out = core.handle_binary_frame(&frame_of(602, 0, env), &no_decrypt());
+    assert_eq!(out.event.unwrap().payload["data"], json!({"x": 1}));
+}

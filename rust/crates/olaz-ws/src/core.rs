@@ -237,7 +237,12 @@ impl WsCore {
         }
 
         let payload: Map<String, Value> = if encrypt == 0 {
-            frame.envelope.clone()
+            // Plain frames can carry `data` as a JSON string (cmd 602 typing): official `decodeEventData`
+            // returns `JSON.parse(data)` for encrypt 0.
+            frame
+                .data_field()
+                .and_then(|raw| parse_object(raw.as_bytes()))
+                .unwrap_or_else(|| frame.envelope.clone())
         } else {
             frame
                 .data_field()
