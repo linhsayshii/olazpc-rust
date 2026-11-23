@@ -2172,7 +2172,8 @@ extension ZaloSessionClient {
             let d = resp["data"] as? [String: Any] ?? [:]
             let items = (d["topics"] as? [[String: Any]]) ?? (d["items"] as? [[String: Any]]) ?? []
             let ver = JSONLossless.int64(d["version"] ?? d["boardVersion"]) ?? 0
-            return ZaloJSONBox(["items": items, "boardVersion": ver])
+            let limit = JSONLossless.int64(d["pinLimit"] ?? d["pin_limit"]) ?? 0
+            return ZaloJSONBox(["items": items, "boardVersion": ver, "pinLimit": limit])
         }
         let grid = ZaloWireParser.cleanGroupId(convId)
         let resp = try await get(
@@ -2183,7 +2184,9 @@ extension ZaloSessionClient {
         let d = resp["data"] as? [String: Any] ?? [:]
         let items = (d["topics"] as? [[String: Any]]) ?? (d["items"] as? [[String: Any]]) ?? []
         let ver = JSONLossless.int64(d["boardVersion"] ?? d["version"]) ?? 0
-        return ZaloJSONBox(["items": items, "boardVersion": ver])
+        // Official topic controller keeps `pinLimit` of this response as the board's limit.
+        let limit = JSONLossless.int64(d["pinLimit"] ?? d["pin_limit"]) ?? 0
+        return ZaloJSONBox(["items": items, "boardVersion": ver, "pinLimit": limit])
     }
 
     func pinBoardMessage(convId: String, msgId: String, cliMsgId: String, senderId: String, text: String) async throws -> ZaloJSONBox {

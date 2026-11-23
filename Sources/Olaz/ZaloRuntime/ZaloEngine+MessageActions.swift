@@ -111,10 +111,13 @@ struct PinnedList: Equatable, Sendable {
     /// I may pin / unpin here (group allowance; friends always).
     var canPin = false
     var items: [PinnedItem] = []
+    /// Pins the board holds at most (official `pinLimit`).
+    var limit = ZaloWireParser.defaultPinLimit
 
     init(json: [String: Any]) {
         ready = json["ready"] as? Bool ?? false
         canPin = json["canPin"] as? Bool ?? false
+        if let l = json["limit"] as? Int, l > 0 { limit = l }
         items = (json["items"] as? [[String: Any]] ?? []).compactMap { row in
             guard let ref = row["ref"] as? String, !ref.isEmpty else { return nil }
             return PinnedItem(ref: ref, kind: PinnedItem.Kind(rawValue: row["kind"] as? String ?? "") ?? .note,
@@ -524,6 +527,7 @@ extension ZaloEngine {
         let conversation = message.conversationId
         let key = "\(conversation)|\(message.id)|pin"
         guard messageActionsBusy.insert(key).inserted else { return }
+        insertPinOptimistically(message, replacing: ref)
         Task {
             defer { messageActionsBusy.remove(key) }
             do {
@@ -545,6 +549,7 @@ extension ZaloEngine {
                 )
                 await refreshBoardPins(for: conversation)
             } catch {
+                await refreshBoardPins(for: conversation)
                 CardActionCenter.shared.show("Ghim tin nhắn không thành công.", in: conversation)
             }
         }
@@ -576,6 +581,8 @@ extension ZaloEngine {
     private func unpin(_ ref: String, in conversationId: String) {
         let key = "\(conversationId)|\(ref)|unpin"
         guard messageActionsBusy.insert(key).inserted else { return }
+        let rawTopic = cachedBoardRawTopics[conversationId]?.topics[ref]
+        removePinOptimistically(ref, in: conversationId)
         Task {
             defer { messageActionsBusy.remove(key) }
             do {
@@ -583,11 +590,12 @@ extension ZaloEngine {
                 try await sessionClient.unpinBoardTopic(
                     convId: conversationId,
                     topicId: ref,
-                    rawTopic: boardCache?.topics[ref].map { ZaloJSONBox($0) },
+                    rawTopic: rawTopic.map { ZaloJSONBox($0) },
                     boardVersion: boardCache?.version ?? 0
                 )
                 await refreshBoardPins(for: conversationId)
             } catch {
+                await refreshBoardPins(for: conversationId)
                 CardActionCenter.shared.show("Yêu cầu thực hiện không thành công", in: conversationId)
             }
         }
@@ -610,45 +618,11 @@ extension ZaloEngine {
         guard let box = try? await sessionClient.fetchBoardPins(convId: convId) else {
             return
         }
-        let rawRows = (box.dict["items"] as? [[String: Any]]) ?? []
-        let boardVer = JSONLossless.int64(box.dict["boardVersion"]) ?? 0
-        var rawMap: [String: [String: Any]] = [:]
-        let items: [[String: Any]] = rawRows.compactMap { row in
-            let ref = JSONLossless.string(row["id"] ?? row["topicId"] ?? row["topic_id"])
-            guard !ref.isEmpty else { return nil }
-            rawMap[ref] = row
-            let params: [String: Any] = {
-                if let p = row["params"] as? [String: Any] { return p }
-                if let pStr = row["params"] as? String,
-                   let pData = pStr.data(using: .utf8),
-                   let parsed = JSONLossless.parseObject(pData) {
-                    return parsed
-                }
-                return [:]
-            }()
-            let topicType = JSONLossless.int64(row["type"]) ?? 2
-            let kindStr: String = {
-                if topicType == 3 { return "poll" }
-                if topicType == 0 || topicType == 1 { return "reminder" }
-                return "message"
-            }()
-            let senderUid = ZaloWireParser.stripUserPrefix(JSONLossless.string(params["senderUid"] ?? params["senderId"] ?? row["creatorId"]))
-            let resolvedSender = !senderUid.isEmpty ? (lookupPersonInfo(senderUid)?.name ?? "") : ""
-            return [
-                "ref": ref,
-                "kind": kindStr,
-                "title": JSONLossless.string(params["title"] ?? params["content"] ?? params["msg"] ?? params["message"] ?? params["description"] ?? row["title"] ?? row["content"]),
-                "sender": JSONLossless.string(params["senderName"] ?? params["sender_name"] ?? params["dName"] ?? params["fromName"] ?? row["creatorName"]).isEmpty
-                    ? resolvedSender
-                    : JSONLossless.string(params["senderName"] ?? params["sender_name"] ?? params["dName"] ?? params["fromName"] ?? row["creatorName"]),
-                "thumb": JSONLossless.string(params["thumb"]),
-                "msgId": JSONLossless.string(params["globalMsgId"] ?? params["global_msg_id"] ?? params["msgId"] ?? params["msg_id"]),
-                "cliMsgId": JSONLossless.string(params["cliMsgId"] ?? params["client_msg_id"])
-            ]
+        let parsed = ZaloWireParser.parseBoardTopics(box.dict, convId: convId) { [weak self] uid in
+            self?.lookupPersonInfo(uid)?.name
         }
-        cachedBoardRawTopics[convId] = (version: boardVer, topics: rawMap)
-        let list = PinnedList(json: ["convId": convId, "ready": true, "canPin": true, "items": items])
-        if pins[convId] != list { pins[convId] = list }
+        cachedBoardRawTopics[convId] = (version: parsed.version, topics: parsed.raw)
+        if pins[convId] != parsed.list { pins[convId] = parsed.list }
     }
 
     func handlePins(state: [String: Any]) {

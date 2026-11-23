@@ -401,12 +401,13 @@ struct MessageRow: View {
                     Button(emoji) { onReact(emoji, message) }
                 }
             }
-            if actions.pin || actions.star != nil {
+            let canPin = actions.pin || engine.canPinMessage(message)
+            if canPin || actions.star != nil {
                 Divider()
-                if actions.pinned {
+                if actions.pinned || engine.isPinned(message) {
                     Button("Bỏ ghim tin nhắn", systemImage: "pin.slash") { engine.requestUnpin(message) }
-                } else if actions.pin {
-                    Button("Ghim tin nhắn", systemImage: "pin") { engine.pin(message) }
+                } else if canPin {
+                    Button("Ghim tin nhắn", systemImage: "pin") { engine.pinMessage(message) }
                 }
                 switch actions.star {
                 case .unstar: Button("Bỏ đánh dấu tin nhắn", systemImage: "star.slash") { engine.setStarred(message, false) }

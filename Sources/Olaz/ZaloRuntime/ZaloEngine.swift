@@ -1435,6 +1435,8 @@ final class ZaloEngine {
                     let name = lookupPersonInfo(uid)?.name ?? "Ai đó"
                     showTyping(convId: convId, name: name, onPC: JSONLossless.int64(actData["isPC"]) == 1)
                 }
+            } else if let pinConv = ZaloWireParser.pinTopicEventConversation(actType: actType, act: act, data: actData) {
+                handlePinTopicEvent(conversationId: pinConv)
             } else if actType == "mute" {
                 let rawId = JSONLossless.string(actData["toId"] ?? actData["toid"] ?? actData["id"])
                 let muteType = JSONLossless.int64(actData["muteType"]) ?? 1
