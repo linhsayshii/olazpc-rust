@@ -455,9 +455,6 @@ private struct MediaViewerContent: View {
         menu.addAction("Tải về", symbol: "arrow.down.circle") {
             engine.downloadPhoto(conversationId: conversationId, messageId: messageId, url: source, date: date)
         }
-        menu.addAction("Lưu về máy…", symbol: "folder") {
-            engine.downloadPhoto(conversationId: conversationId, messageId: messageId, url: source, date: date, askLocation: true)
-        }
         return menu
     }
 

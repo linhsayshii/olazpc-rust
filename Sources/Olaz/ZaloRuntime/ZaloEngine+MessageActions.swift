@@ -187,14 +187,14 @@ extension ZaloEngine {
         }
     }
 
-    /// "Tải về": the original into Downloads. "Lưu về máy…" (`askLocation`): the same through a save panel.
-    func downloadPhoto(_ message: ChatMessage, askLocation: Bool = false) {
+    /// "Tải về": the original through a save panel (`askLocation`), or straight into Downloads when `false`.
+    func downloadPhoto(_ message: ChatMessage, askLocation: Bool = true) {
         guard case .photo(let url, _, _) = message.kind else { return }
         downloadPhoto(conversationId: message.conversationId, messageId: message.id, url: message.isE2EE ? nil : url,
                       date: message.date, askLocation: askLocation)
     }
 
-    func downloadPhoto(conversationId: String, messageId: String, url: URL?, date: Date, askLocation: Bool = false) {
+    func downloadPhoto(conversationId: String, messageId: String, url: URL?, date: Date, askLocation: Bool = true) {
         Task {
             guard let original = await photoOriginal(conversationId: conversationId, messageId: messageId, url: url) else {
                 CardActionCenter.shared.show("Không tải được hình ảnh. Hãy thử lại.", in: conversationId)

@@ -140,23 +140,6 @@ struct SharedFileRow: View {
                             res = await ChatFileResolver.resolve(name: name, url: url)
                         }
                         if case .ready(let staged) = res,
-                           let saved = try? ChatFileResolver.saveToDownloads(staged: staged, displayName: name),
-                           let engine {
-                            let key = engine.fileDownloadKey(conversationId: message.conversationId, messageId: message.id, url: url, name: name)
-                            engine.downloadedFilePaths[key] = saved
-                        }
-                    }
-                }
-                .disabled(url == nil && message.id.isEmpty)
-                Button("Lưu về máy…", systemImage: "folder") {
-                    Task {
-                        let res: FileResolution
-                        if let engine {
-                            res = await engine.resolveFile(conversationId: message.conversationId, messageId: message.id, name: name, url: url)
-                        } else {
-                            res = await ChatFileResolver.resolve(name: name, url: url)
-                        }
-                        if case .ready(let staged) = res,
                            case .success(let chosen?) = await ChatFileSavePanel.saveAs(staged: staged, displayName: name),
                            let engine {
                             let key = engine.fileDownloadKey(conversationId: message.conversationId, messageId: message.id, url: url, name: name)

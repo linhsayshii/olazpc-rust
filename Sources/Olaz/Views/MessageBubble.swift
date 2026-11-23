@@ -396,19 +396,6 @@ struct MessageRow: View {
                     Task {
                         let key = engine.fileDownloadKey(conversationId: message.conversationId, messageId: message.id, url: fileURL, name: fileName)
                         if case .ready(let staged) = await engine.resolveFile(conversationId: message.conversationId, messageId: message.id, name: fileName, url: fileURL),
-                           let saved = try? ChatFileResolver.saveToDownloads(staged: staged, displayName: fileName) {
-                            engine.downloadedFilePaths[key] = saved
-                            CardActionCenter.shared.show("Đã tải tệp về thư mục Downloads", in: message.conversationId)
-                        } else {
-                            CardActionCenter.shared.show("Không tải được tệp đính kèm", in: message.conversationId)
-                        }
-                    }
-                }
-                .disabled(fileURL == nil)
-                Button("Lưu về máy…", systemImage: "folder") {
-                    Task {
-                        let key = engine.fileDownloadKey(conversationId: message.conversationId, messageId: message.id, url: fileURL, name: fileName)
-                        if case .ready(let staged) = await engine.resolveFile(conversationId: message.conversationId, messageId: message.id, name: fileName, url: fileURL),
                            case .success(let chosen?) = await ChatFileSavePanel.saveAs(staged: staged, displayName: fileName) {
                             engine.downloadedFilePaths[key] = chosen
                         }
@@ -443,7 +430,6 @@ struct MessageRow: View {
                 }
                 if case .photo = message.kind {
                     Button("Tải về", systemImage: "arrow.down.circle") { engine.downloadPhoto(message) }
-                    Button("Lưu về máy…", systemImage: "folder") { engine.downloadPhoto(message, askLocation: true) }
                 }
                 if let caption = message.caption {
                     Button("Copy chú thích", systemImage: "text.quote") { engine.copyText(caption, in: message.conversationId) }
