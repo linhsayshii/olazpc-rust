@@ -31,6 +31,8 @@ Workflow per unit: claim here, port into its own crate, port Swift fixtures as R
 | 5a | typed history/lookup/envelopes | done 2026-11-23 (rust 258, swift 449 both modes; non-plain ws envelopes stay raw, ADR-013) |
 | 5b | generic signed HTTP seam (all feature endpoints) + timeout fix | done 2026-11-23 (rust 271 = +8 golden/seam, +2 timeout, +5 ffi; swift 452 both modes). `CoreHttp` (`request`, `post_multipart`, `post_multipart_file`) over `olaz_net::GenericCall`; Swift `ZaloSessionClient.get/post/postMultipart` delegate to it when `useRustCore`. Still Swift: `rawGetJSON`/`rawRequest` callers (QR/login already Rust), `zCloudGet` (cloud-viewer-key header, no ParamCipher), `rawDownloadData`, `downloadSyncBatch` |
 
+Live check 2026-11-23 (release build 9c47e82, merged 5a+5b): clean engine.log, no `rust: error` lines; the periodic `network timeout` is gone. Found on the way: `/api/friend/received/list` 404 on both paths (endpoint does not exist; fixed to `recommendsv2/list`). One startup `http status=429` from a typed endpoint (no path logged) seen once, not reproduced.
+
 ## Later waves (out of milestone 1)
 
 Media/Download, Poll, Cloud, Contacts, GroupMgmt, Transfer, Search, Stickers, Notifications, Calls (CallBridge), E2EE, Phone sync (libzproto WASM), WebKit migrator.
