@@ -620,6 +620,13 @@ pub fn parse_wire_message(
     let raw_content_str = raw_content.and_then(Value::as_str);
 
     match msg_type.as_str() {
+        // Info notices (pin / unpin / … synced from the phone) come as `webchat` with an object content whose
+        // `action` is `msginfo.actionlist`: a system line, like the same action under `chat.recommended`.
+        "" | "webchat" | "chat.text" if dd.ds("action") == "msginfo.actionlist" => {
+            kind_dict = obj(json!({"type": "system"}));
+            kind_tag = "system".into();
+            text_body = first_non_empty(&[&dd.ds("title"), &dd.ds("description"), "Thông báo hệ thống"]);
+        }
         "" | "webchat" | "chat.text" => {
             if let (Some(s), None) = (raw_content_str, &content_dict) {
                 text_body = s.to_string();

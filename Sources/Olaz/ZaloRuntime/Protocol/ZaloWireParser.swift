@@ -441,6 +441,12 @@ enum ZaloWireParser {
         var suggestsStickers = false
 
         switch msgType {
+        case "", "webchat", "chat.text" where JSONLossless.string(contentDict?["action"]) == "msginfo.actionlist":
+            // Info notices (pin / unpin … synced from the phone): a system line, like under `chat.recommended`.
+            kindDict = ["type": "system"]
+            kindTag = "system"
+            textBody = firstNonEmpty(JSONLossless.string(contentDict?["title"]), JSONLossless.string(contentDict?["description"]), "Thông báo hệ thống")
+
         case "", "webchat", "chat.text":
             if let str = rawContent as? String, contentDict == nil {
                 textBody = str

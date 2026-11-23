@@ -50,6 +50,8 @@ extension ZaloEngine {
             }
             if isGrp || self.contacts.friends.contains(where: { $0.id == id }) {
                 await self.refreshBoardPins(for: id)
+            } else {
+                EngineLog.shared.write("pins: list skipped (1-1 not in friends)")
             }
 
             // 3. Mark read locally & remotely.

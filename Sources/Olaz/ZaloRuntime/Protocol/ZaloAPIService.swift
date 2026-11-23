@@ -2159,38 +2159,17 @@ extension ZaloSessionClient {
 
     // MARK: - Board Pins, Polls, Reminders
 
+    /// 1-1 pins live on `friend_board` (official `getListOneOnOnePinTopics`, cmd 12065); `group_board /api/board/oneone/*`
+    /// is the 1-1 *reminder* board, not the pinned bar.
     func fetchBoardPins(convId: String) async throws -> ZaloJSONBox {
         let isGroup = ZaloWireParser.isGroupId(convId)
         if !isGroup {
-            let toUid = ZaloWireParser.stripUserPrefix(convId)
-            let objDict: [String: Any] = [
-                "uid": toUid,
-                "board_type": 0,
-                "page": 1,
-                "count": 20,
-                "last_id": 0,
-                "last_type": 0
-            ]
-            let objStr = (try? JSONSerialization.data(withJSONObject: objDict)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-            let resp: [String: Any]
-            do {
-                resp = try await get(
-                    service: "group_board",
-                    path: "/api/board/oneone/list",
-                    encryptedPayload: ["objectData": objStr]
-                )
-            } catch let err as ZaloSessionError where err.code == -1 {
-                // Official `/api/board/oneone/list` returns `error_code: -1, data: "[]"` when empty.
-                return ZaloJSONBox(["items": [], "boardVersion": 0])
-            }
-            if let arr = resp["data"] as? [[String: Any]] {
-                return ZaloJSONBox(["items": arr, "boardVersion": 0])
-            }
-            let d = resp["data"] as? [String: Any] ?? [:]
-            let items = (d["topics"] as? [[String: Any]]) ?? (d["items"] as? [[String: Any]]) ?? []
-            let ver = JSONLossless.int64(d["version"] ?? d["boardVersion"]) ?? 0
-            let limit = JSONLossless.int64(d["pinLimit"] ?? d["pin_limit"]) ?? 0
-            return ZaloJSONBox(["items": items, "boardVersion": ver, "pinLimit": limit])
+            let resp = try await get(
+                service: "friend_board",
+                path: "/api/friendboard/list",
+                encryptedPayload: ["conversationId": ZaloWireParser.stripUserPrefix(convId), "version": 0]
+            )
+            return ZaloJSONBox(ZaloWireParser.friendBoardListBox(resp))
         }
         let grid = ZaloWireParser.cleanGroupId(convId)
         let resp = try await get(
@@ -2206,44 +2185,36 @@ extension ZaloSessionClient {
         return ZaloJSONBox(["items": items, "boardVersion": ver, "pinLimit": limit])
     }
 
-    func pinBoardMessage(convId: String, msgId: String, cliMsgId: String, senderId: String, text: String) async throws -> ZaloJSONBox {
+    /// Pins a message topic. `params` = `ZaloWireParser.pinTopicParams` (official `getTopicDataFromMessage`).
+    /// Group: `group_board /api/board/topic/createv2`; 1-1: `friend_board /api/friendboard/create` (cmd 12067).
+    func pinBoardMessage(convId: String, params: [String: Any], boardVersion: Int64 = 0) async throws -> ZaloJSONBox {
+        let paramsStr = (try? JSONSerialization.data(withJSONObject: params)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
         let isGroup = ZaloWireParser.isGroupId(convId)
         if !isGroup {
-            let toUid = ZaloWireParser.stripUserPrefix(convId)
-            let objDict: [String: Any] = [
-                "toUid": toUid,
+            let topic: [String: Any] = [
                 "type": 2,
                 "color": -16_777_216,
                 "emoji": "",
                 "startTime": -1,
                 "duration": -1,
-                "params": [
-                    "senderUid": ZaloWireParser.stripUserPrefix(senderId),
-                    "msgType": 1,
-                    "client_msg_id": cliMsgId,
-                    "global_msg_id": msgId,
-                    "title": text
-                ],
-                "repeat": 0,
+                "params": paramsStr,
+                "pinAct": 1,
+                "isCreated": true,
                 "src": -1
             ]
-            let objStr = (try? JSONSerialization.data(withJSONObject: objDict)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-            let resp = try await post(
-                service: "group_board",
-                path: "/api/board/oneone/create",
-                encryptedPayload: ["objectData": objStr, "imei": imei]
+            let resp = try await get(
+                service: "friend_board",
+                path: "/api/friendboard/create",
+                encryptedPayload: [
+                    "conversationId": ZaloWireParser.stripUserPrefix(convId),
+                    "topic": topic,
+                    "version": boardVersion,
+                    "lang": "vi"
+                ]
             )
             return ZaloJSONBox(resp)
         }
         let grid = ZaloWireParser.cleanGroupId(convId)
-        let paramsDict: [String: Any] = [
-            "senderUid": ZaloWireParser.stripUserPrefix(senderId),
-            "msgType": 1,
-            "client_msg_id": cliMsgId,
-            "global_msg_id": msgId,
-            "title": text
-        ]
-        let paramsStr = (try? JSONSerialization.data(withJSONObject: paramsDict)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
         let resp = try await post(
             service: "group_board",
             path: "/api/board/topic/createv2",
@@ -2264,14 +2235,19 @@ extension ZaloSessionClient {
         return ZaloJSONBox(resp)
     }
 
+    /// Group: `group_board /api/board/unpinv2`; 1-1: `friend_board /api/friendboard/multi_unpin` (cmd 12069).
     func unpinBoardTopic(convId: String, topicId: String, rawTopic: ZaloJSONBox? = nil, boardVersion: Int64 = 0) async throws {
         let isGroup = ZaloWireParser.isGroupId(convId)
         if !isGroup {
-            let toUid = ZaloWireParser.stripUserPrefix(convId)
-            _ = try await post(
-                service: "group_board",
-                path: "/api/board/oneone/remove",
-                encryptedPayload: ["uid": toUid, "topicId": topicId, "imei": imei]
+            _ = try await get(
+                service: "friend_board",
+                path: "/api/friendboard/multi_unpin",
+                encryptedPayload: [
+                    "conversationId": ZaloWireParser.stripUserPrefix(convId),
+                    "topics": ZaloWireParser.friendBoardUnpinTopics(ref: topicId, rawTopic: rawTopic?.dict),
+                    "version": boardVersion,
+                    "lang": "vi"
+                ]
             )
             return
         }

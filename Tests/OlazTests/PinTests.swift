@@ -71,6 +71,20 @@ struct PinTests {
         #expect(ZaloWireParser.pinTopicEventConversation(actType: "group", act: "unpin_topic", data: [:]) == nil)
     }
 
+    /// Friend control (`act_type:"fr"`): pin_create / pin_unpin / pin_reorder carry `conversationId` (the peer uid),
+    /// pin_force_sync carries `conversationIds` (official `_processFriendCtrlEvents` → OneOnOne controller).
+    @Test func friendPinEventConversations() throws {
+        for act in ["pin_create", "pin_unpin", "pin_reorder"] {
+            #expect(ZaloWireParser.pinTopicEventConversations(actType: "fr", act: act, data: ["conversationId": "8268371147601882821"]) == ["8268371147601882821"])
+        }
+        #expect(ZaloWireParser.pinTopicEventConversations(actType: "fr", act: "pin_force_sync", data: ["conversationIds": [111, "222"]]) == ["111", "222"])
+        #expect(ZaloWireParser.pinTopicEventConversations(actType: "fr", act: "add", data: ["conversationId": "1"]).isEmpty)
+        #expect(ZaloWireParser.pinTopicEventConversations(actType: "fr", act: "pin_create", data: [:]).isEmpty)
+        let raw = #"{"groupId":"6543210987654321","topic":{"id":"8812300009","type":2}}"#
+        let group = try #require(JSONLossless.parseObject(Data(raw.utf8)))
+        #expect(ZaloWireParser.pinTopicEventConversations(actType: "group", act: "new_pin_topic", data: group) == [ZaloWireParser.groupConvId("6543210987654321")])
+    }
+
     @Test func pinMatchesLoadedMessageByEitherId() {
         let item = PinnedItem(ref: "1", kind: .message, title: "", sender: "", thumbnail: nil, msgId: "7401234567890123456", cliMsgId: "1700000000123")
         let poll = PinnedItem(ref: "2", kind: .poll, title: "", sender: "", thumbnail: nil, msgId: "7401234567890123456", cliMsgId: "")
@@ -80,6 +94,50 @@ struct PinTests {
         #expect(item.message(in: [byClient])?.id == byClient.id)
         #expect(item.message(in: [ChatMessage.stub(id: "999")]) == nil)
         #expect(poll.message(in: [byServer]) == nil)
+    }
+
+    /// 1-1 pins live on `friend_board /api/friendboard/list`: `data` = {data:[topics], version}, sometimes a JSON string of it.
+    @Test func friendBoardListBoxing() throws {
+        let topic: [String: Any] = [
+            "id": 9_100_000_000_123 as Int64, "type": 2,
+            "params": #"{"senderUid":"0","client_msg_id":"1700000000123","global_msg_id":"7401234567890123456","msg_type":1,"title":"a đi dạy về ah"}"#
+        ]
+        let asObject = ZaloWireParser.friendBoardListBox(["data": ["data": [topic], "version": 4]])
+        let parsed = ZaloWireParser.parseBoardTopics(asObject, convId: "12345")
+        #expect(parsed.version == 4)
+        #expect(parsed.list.items.map(\.ref) == ["9100000000123"])
+        #expect(parsed.list.items.first?.msgId == "7401234567890123456")
+        #expect(parsed.list.items.first?.title == "a đi dạy về ah")
+
+        let json = #"{"data":[{"id":9100000000124,"type":2,"params":{"global_msg_id":"7401234567890000001","client_msg_id":"1699999999000","title":"x"}}],"version":5}"#
+        let asString = ZaloWireParser.friendBoardListBox(["data": json])
+        #expect(ZaloWireParser.parseBoardTopics(asString, convId: "12345").list.items.map(\.ref) == ["9100000000124"])
+        #expect(JSONLossless.int64(asString["boardVersion"]) == 5)
+
+        let empty = ZaloWireParser.friendBoardListBox(["data": "[]"])
+        #expect((empty["items"] as? [Any])?.isEmpty == true)
+    }
+
+    /// Official `getTopicDataFromMessage`: both ids, the sender, `msg_type` by the client message type, the title.
+    @Test func pinTopicParamsMatchOfficial() {
+        let p = ZaloWireParser.pinTopicParams(
+            msgId: "7401234567890123456", cliMsgId: "1700000000123", senderUid: "1001", senderName: "Minh",
+            kind: .photo(url: nil, width: 0, height: 0), title: "ảnh")
+        #expect(p["global_msg_id"] as? String == "7401234567890123456")
+        #expect(p["client_msg_id"] as? String == "1700000000123")
+        #expect(p["senderUid"] as? String == "1001")
+        #expect(p["senderName"] as? String == "Minh")
+        #expect(p["msg_type"] as? Int == 32)
+        #expect(p["title"] as? String == "ảnh")
+    }
+
+    /// `/api/friendboard/multi_unpin` takes [{topicId, topicType}] (official `AM`).
+    @Test func friendBoardUnpinTopics() {
+        let topics = ZaloWireParser.friendBoardUnpinTopics(ref: "9100000000123", rawTopic: ["id": "9100000000123", "type": 2])
+        #expect(topics.count == 1)
+        #expect(topics[0]["topicId"] as? String == "9100000000123")
+        #expect(topics[0]["topicType"] as? Int == 2)
+        #expect(ZaloWireParser.friendBoardUnpinTopics(ref: "7", rawTopic: nil)[0]["topicType"] as? Int == 2)
     }
 
     @Test func pinnedListLimitFromJSON() {

@@ -230,6 +230,22 @@ import Testing
         #expect(decoded.menu.delete == .plain)
     }
 
+    /// Phone-synced info notices (pin / unpin …): `webchat` + object content with `action: msginfo.actionlist` is a
+    /// system line, not a text bubble (Rust `webchat_msginfo_actionlist_is_system`).
+    @Test func webchatMsgInfoActionListIsSystem() {
+        let evt = ZaloWireParser.parseWireMessage(
+            [
+                "msgId": "8522", "cliMsgId": "1795", "uidFrom": "0", "idTo": "peer", "msgType": "webchat", "ts": 1_795_463_690_898,
+                "content": ["action": "msginfo.actionlist", "title": "Hoàng Việt Linh đã ghim tin nhắn a đi dạy về ah.",
+                            "description": "", "href": "", "params": "{}", "thumb": "", "type": "", "childnumber": 0]
+            ],
+            myUid: "me"
+        )
+        guard case .message(let msg, _) = evt else { Issue.record("expected message"); return }
+        #expect(msg.kind == .system)
+        #expect(msg.text == "Hoàng Việt Linh đã ghim tin nhắn a đi dạy về ah.")
+    }
+
     @Test @MainActor func recallEnforces24hGuardAndApplyRemoteRecallUpdatesBubbleSQLiteAndPreview() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-recall-engine-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

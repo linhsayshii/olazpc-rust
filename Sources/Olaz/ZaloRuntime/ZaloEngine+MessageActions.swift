@@ -594,16 +594,26 @@ extension ZaloEngine {
                         rawTopic: boardCache?.topics[ref].map { ZaloJSONBox($0) },
                         boardVersion: boardCache?.version ?? 0
                     )
+                    await refreshBoardPins(for: conversation)
                 }
+                // Official `getTopicDataFromMessage`: the real server/client id pair (own messages are not keyed by msgId).
+                let ids = await resolveServerAndClientIds(for: message)
+                let me = profile?.userId ?? ""
+                let senderUid = message.isMine || message.senderId.isEmpty || message.senderId == "0" ? me : message.senderId
+                let senderName = message.isMine
+                    ? (profile?.displayName ?? "")
+                    : (lookupPersonInfo(message.senderId)?.name ?? message.senderName)
+                let params = ZaloWireParser.pinTopicParams(
+                    msgId: ids.msgId, cliMsgId: ids.cliMsgId.isEmpty ? ids.msgId : ids.cliMsgId,
+                    senderUid: senderUid, senderName: senderName, kind: message.kind, title: message.text)
                 _ = try await sessionClient.pinBoardMessage(
                     convId: conversation,
-                    msgId: message.id,
-                    cliMsgId: message.id,
-                    senderId: message.senderId,
-                    text: message.text
+                    params: params,
+                    boardVersion: cachedBoardRawTopics[conversation]?.version ?? 0
                 )
                 await refreshBoardPins(for: conversation)
             } catch {
+                EngineLog.shared.write("pins: pin failed group=\(ZaloWireParser.isGroupId(conversation)) replacing=\(ref != nil) \(Self.pinErrorShape(error))")
                 await refreshBoardPins(for: conversation)
                 CardActionCenter.shared.show("Ghim tin nhắn không thành công.", in: conversation)
             }
@@ -670,14 +680,27 @@ extension ZaloEngine {
     // MARK: Pins of the open conversation
 
     internal func refreshBoardPins(for convId: String) async {
-        guard let box = try? await sessionClient.fetchBoardPins(convId: convId) else {
+        let group = ZaloWireParser.isGroupId(convId)
+        let box: ZaloJSONBox
+        do {
+            box = try await sessionClient.fetchBoardPins(convId: convId)
+        } catch {
+            EngineLog.shared.write("pins: list failed group=\(group) \(Self.pinErrorShape(error))")
             return
         }
         let parsed = ZaloWireParser.parseBoardTopics(box.dict, convId: convId) { [weak self] uid in
             self?.lookupPersonInfo(uid)?.name
         }
+        EngineLog.shared.write("pins: list ok group=\(group) rows=\((box.dict["items"] as? [Any])?.count ?? -1) items=\(parsed.list.items.count)")
         cachedBoardRawTopics[convId] = (version: parsed.version, topics: parsed.raw)
         if pins[convId] != parsed.list { pins[convId] = parsed.list }
+    }
+
+    /// Log shape of a board request error: the server code and the API path, never ids or text.
+    nonisolated static func pinErrorShape(_ error: Error) -> String {
+        guard let err = error as? ZaloSessionError else { return "error=\(type(of: error))" }
+        let path = URL(string: err.url)?.path ?? ""
+        return "code=\(err.code) path=\(path)"
     }
 
     func handlePins(state: [String: Any]) {

@@ -38,6 +38,20 @@ extension ZaloWireParser {
     /// Group control acts that change a conversation's pin board.
     static let pinTopicActs: Set<String> = ["new_pin_topic", "update_pin_topic", "unpin_topic", "reorder_pin_topic"]
 
+    /// 1-1 pin events (friend control `act_type:"fr"`, official OneOnOne pin-topic acts).
+    static let friendPinTopicActs: Set<String> = ["pin_create", "pin_unpin", "pin_reorder", "pin_force_sync"]
+
+    /// Conversations whose pinned board a control event changed: groups (`act_type:"group"`) and 1-1
+    /// (`act_type:"fr"`, `data.conversationId`, or `data.conversationIds` for `pin_force_sync`). Empty when not a pin event.
+    static func pinTopicEventConversations(actType: String, act: String, data: [String: Any]) -> [String] {
+        if actType == "fr" {
+            guard friendPinTopicActs.contains(act) else { return [] }
+            let ids = (data["conversationIds"] as? [Any])?.map { JSONLossless.string($0) } ?? [JSONLossless.string(data["conversationId"])]
+            return ids.map(stripUserPrefix).filter { !$0.isEmpty && $0 != "0" }
+        }
+        return pinTopicEventConversation(actType: actType, act: act, data: data).map { [$0] } ?? []
+    }
+
     /// The conversation whose board a control event changed, or nil when it is not a pin event.
     static func pinTopicEventConversation(actType: String, act: String, data: [String: Any]) -> String? {
         guard actType.isEmpty || actType == "group", pinTopicActs.contains(act) else { return nil }
@@ -51,6 +65,40 @@ extension ZaloWireParser {
         if let p = row["params"] as? [String: Any] { return p }
         if let s = row["params"] as? String, let d = s.data(using: .utf8), let p = JSONLossless.parseObject(d) { return p }
         return [:]
+    }
+
+    /// `friend_board /api/friendboard/list` answer (`data` = {data:[topics], version}, or a JSON string of it, `"[]"` when
+    /// empty) boxed like the group board: {items, boardVersion, pinLimit}.
+    static func friendBoardListBox(_ resp: [String: Any]) -> [String: Any] {
+        var payload: Any? = resp["data"]
+        if let s = payload as? String { payload = JSONLossless.parseAny(Data(s.utf8)) }
+        if let arr = payload as? [[String: Any]] { return ["items": arr, "boardVersion": 0, "pinLimit": 0] }
+        let d = payload as? [String: Any] ?? [:]
+        let items = (d["data"] as? [[String: Any]]) ?? (d["topics"] as? [[String: Any]]) ?? []
+        let version = JSONLossless.int64(d["version"]) ?? 0
+        let limit = JSONLossless.int64(d["pinLimit"] ?? d["pin_limit"]) ?? 0
+        return ["items": items, "boardVersion": version, "pinLimit": limit]
+    }
+
+    /// Official `getTopicDataFromMessage` params of a message topic: both ids, the sender, `msg_type` (client message
+    /// type), the title.
+    static func pinTopicParams(
+        msgId: String, cliMsgId: String, senderUid: String, senderName: String, kind: ChatMessage.Kind, title: String
+    ) -> [String: Any] {
+        [
+            "client_msg_id": cliMsgId,
+            "global_msg_id": msgId,
+            "senderUid": stripUserPrefix(senderUid),
+            "senderName": senderName,
+            "msg_type": reactionClientMsgType(for: kind),
+            "title": title
+        ]
+    }
+
+    /// `/api/friendboard/multi_unpin` topics (official `AM`): [{topicId, topicType}].
+    static func friendBoardUnpinTopics(ref: String, rawTopic: [String: Any]?) -> [[String: Any]] {
+        let type = rawTopic.flatMap { JSONLossless.int64($0["type"]) }.map(Int.init) ?? 2
+        return [["topicId": ref, "topicType": type]]
     }
 
     /// The board list (`fetchBoardPins` box: {items, boardVersion, pinLimit}) as the pinned bar's list, newest first,
@@ -177,6 +225,7 @@ extension ZaloEngine {
 
     /// A pin control event: re-read the board of the open chat; others are dropped so their next open reads it fresh.
     func handlePinTopicEvent(conversationId: String) {
+        EngineLog.shared.write("pins: event group=\(ZaloWireParser.isGroupId(conversationId)) open=\(openConversationId == conversationId)")
         if openConversationId == conversationId {
             Task { await refreshBoardPins(for: conversationId) }
         } else {

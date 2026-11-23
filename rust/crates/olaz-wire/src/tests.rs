@@ -1099,3 +1099,22 @@ fn web_link_sanitizing_in_link_cards() {
         other => panic!("{other:?}"),
     }
 }
+
+/// Info notices synced from the phone (pin / unpin / …) arrive as `webchat` with an object content whose
+/// `action` is `msginfo.actionlist`: a centered system line, not a text bubble (same as under `chat.recommended`).
+#[test]
+fn webchat_msginfo_actionlist_is_system() {
+    let (m, s) = msg_of(parse(
+        r#"{"msgId":"8522","cliMsgId":"1795","msgType":"webchat","uidFrom":"0","idTo":"peer","ts":"1795463690898",
+            "content":{"action":"msginfo.actionlist","title":"Hoàng Việt Linh đã ghim tin nhắn a đi dạy về ah.","description":"","href":"","params":"{}","thumb":"","type":"","childnumber":0}}"#,
+        "me",
+    ));
+    assert_eq!(s.kind_tag, "system");
+    assert_eq!(m.text, "Hoàng Việt Linh đã ghim tin nhắn a đi dạy về ah.");
+    // A plain webchat with an object content stays text.
+    let (_, plain) = msg_of(parse(
+        r#"{"msgId":"8523","msgType":"webchat","uidFrom":"peer","idTo":"me","ts":"1","content":{"title":"hi"}}"#,
+        "me",
+    ));
+    assert_eq!(plain.kind_tag, "text");
+}
