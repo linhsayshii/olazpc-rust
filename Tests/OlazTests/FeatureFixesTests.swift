@@ -1100,6 +1100,32 @@ private final class MockReactionURLProtocol: URLProtocol, @unchecked Sendable {
         #expect(capturedMsgTypes.withLock { $0 } == [32, 32, 46, 1])
     }
 
+    @Test @MainActor func removeAllMyReactionsKeepsOthers() {
+        var reactions = [
+            ChatMessage.Reaction(icon: ReactionIcon(type: "5", key: "/-heart", emoji: "❤️"), count: 2,
+                                 includesMe: true, names: ["Bạn", "Lan"], people: 2, userCounts: ["100": 1, "200": 1]),
+            ChatMessage.Reaction(icon: ReactionIcon(type: "3", key: "/-strong", emoji: "👍"), count: 1,
+                                 includesMe: true, names: ["Bạn"], people: 1, userCounts: ["100": 1]),
+        ]
+        ZaloEngine.mutateReactions(&reactions, actorUid: "100", myUid: "100", isMe: true, rType: "-1", rIcon: "",
+                                   allowDuplicateSameUser: true, nameLookup: { _ in "Lan" })
+        #expect(reactions.count == 1)
+        #expect(reactions[0].icon.type == "5")
+        #expect(reactions[0].includesMe == false)
+        #expect(reactions[0].userCounts == ["200": 1])
+    }
+
+    @Test func removeReactionWireFormat() throws {
+        let spec = ZaloSessionClient.buildReactionRequest(
+            convId: "200", msgId: "88001", cliMsgId: "17001", rIcon: "", rType: -1,
+            msgType: 1, clientId: 1, imei: "i")
+        let list = try #require(spec.payload["react_list"] as? [[String: Any]])
+        let msg = try #require(list.first?["message"] as? String)
+        let inner = try #require(JSONLossless.parseObject(Data(msg.utf8)))
+        #expect((inner["rType"] as? NSNumber)?.intValue == -1)
+        #expect(inner["rIcon"] as? String == "")
+    }
+
     @Test @MainActor func remoteUnreactAndCorruptedGhostReactionsAreEliminated() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-ghost-react-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
