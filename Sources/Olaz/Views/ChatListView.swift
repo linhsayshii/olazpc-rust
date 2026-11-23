@@ -199,7 +199,7 @@ final class ChatListController: NSObject {
         case row(String, CGFloat)
     }
 
-    let scrollView = NSScrollView()
+    let scrollView = ChatScrollView()
     let document = DocumentView()
     let actions = ChatRowActions()
     var onMetrics: ((ChatListMetrics) -> Void)?
@@ -242,6 +242,9 @@ final class ChatListController: NSObject {
     private var lastClipSize: NSSize = .zero
     /// A chat was just opened: it shows its newest rows as soon as the list has a width.
     private var needsInitialPosition = false
+    /// Swipe to reply: the row being swiped and its horizontal shift.
+    private var swipeShift: (id: String, x: CGFloat)?
+    private var swipe: ChatSwipeReplyTracker?
 
     /// The controller of a list's scroll view (benchmark / probes).
     static func forScrollView(_ view: NSScrollView) -> ChatListController? {
@@ -268,6 +271,50 @@ final class ChatListController: NSObject {
         scrollView.documentView = document
         NotificationCenter.default.addObserver(self, selector: #selector(boundsChanged), name: NSView.boundsDidChangeNotification, object: scrollView.contentView)
         NotificationCenter.default.addObserver(self, selector: #selector(frameChanged), name: NSView.frameDidChangeNotification, object: scrollView)
+        setUpSwipeReply()
+    }
+
+    private func setUpSwipeReply() {
+        let swipe = ChatSwipeReplyTracker(scrollView: scrollView, document: document)
+        swipe.rowAt = { [unowned self] event in self.swipeableRow(at: document.convert(event.locationInWindow, from: nil)) }
+        swipe.rowFrame = { [unowned self] id in hosts[id]?.view.superview === document ? rowFrame(id) : nil }
+        swipe.setShift = { [unowned self] id, x, animated in shiftRow(id, by: x, animated: animated) }
+        swipe.reply = { [unowned self] id in
+            guard let i = indexById[id], case .message(let m, _, _, _) = models[i].row.kind else { return }
+            actions.reply(m)
+        }
+        self.swipe = swipe
+    }
+
+    /// The message under `point` (document coordinates) when it is on screen and can be replied to (as the context menu's
+    /// "Trả lời": bubbles, not notices or recalled messages).
+    private func swipeableRow(at point: NSPoint) -> String? {
+        let i = firstRow(below: point.y)
+        guard i < models.count, tops[i] <= point.y, case .message(let m, _, _, _) = models[i].row.kind else { return nil }
+        switch m.kind {
+        case .system, .notice, .ecard, .recalled: return nil
+        default: break
+        }
+        let id = models[i].row.id
+        return hosts[id]?.view.superview === document ? id : nil
+    }
+
+    private func rowFrame(_ id: String) -> NSRect? {
+        guard let i = indexById[id] else { return nil }
+        return NSRect(x: id == swipeShift?.id ? swipeShift?.x ?? 0 : 0, y: tops[i], width: width, height: heights[i])
+    }
+
+    private func shiftRow(_ id: String, by x: CGFloat, animated: Bool) {
+        swipeShift = x == 0 ? nil : (id, x)
+        guard let host = hosts[id], let frame = rowFrame(id) else { return }
+        guard animated else { host.view.frame = frame; return }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.32
+            // A little overshoot: the bubble springs back.
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.3, 1.35, 0.5, 1)
+            context.allowsImplicitAnimation = true
+            host.view.animator().frame = frame
+        }
     }
 
     func teardown() {
@@ -403,6 +450,7 @@ final class ChatListController: NSObject {
     }
 
     private func resetForConversation() {
+        swipe?.cancel()
         for host in hosts.values { recycle(host) }
         hosts.removeAll()
         attachedIds.removeAll()
@@ -659,7 +707,7 @@ final class ChatListController: NSObject {
         while i < models.count, tops[i] < hi {
             let host = host(for: models[i])
             host.lastUse = useClock
-            let frame = NSRect(x: 0, y: tops[i], width: width, height: heights[i])
+            let frame = NSRect(x: swipeX(models[i].row.id), y: tops[i], width: width, height: heights[i])
             if host.view.frame != frame { host.view.frame = frame }
             if host.view.superview !== document { document.addSubview(host.view) }
             wanted.insert(models[i].row.id)
@@ -669,7 +717,7 @@ final class ChatListController: NSObject {
         for id in attachedIds where !wanted.contains(id) {
             guard let host = hosts[id] else { continue }
             if let idx = indexById[id], tops[idx] + heights[idx] > lo - Self.attachMargin, tops[idx] < hi + Self.attachMargin {
-                let frame = NSRect(x: 0, y: tops[idx], width: width, height: heights[idx])
+                let frame = NSRect(x: swipeX(id), y: tops[idx], width: width, height: heights[idx])
                 if host.view.frame != frame { host.view.frame = frame }
                 wanted.insert(id)
             } else {
@@ -685,6 +733,8 @@ final class ChatListController: NSObject {
         reportMetrics()
         scheduleIdleMeasuring()
     }
+
+    private func swipeX(_ id: String) -> CGFloat { id == swipeShift?.id ? swipeShift?.x ?? 0 : 0 }
 
     private func host(for model: ChatRowModel) -> Host {
         let id = model.row.id
