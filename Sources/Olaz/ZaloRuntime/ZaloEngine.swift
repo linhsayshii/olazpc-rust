@@ -703,8 +703,9 @@ final class ZaloEngine {
 
         // 2. New messages first: drain the HTTP long-polling queue (queued recent 1-1 & group messages) alongside the
         // metadata below, so what arrived while Olaz was closed shows up without waiting on contacts/labels. It runs
-        // concurrently because an empty queue holds the long-poll request open for ~12 s. The preload (step 3) waits
-        // for it: the freshness probe relies on the queue having been stored first.
+        // concurrently because an empty queue holds the long-poll request open for ~12 s. Nothing below waits for it:
+        // the drain only adds rows, so a freshness probe that runs before it at worst sees a thread as stale (and fetches
+        // it as before), and whatever is still queued is stored by the drain itself.
         let fullRefresh = await beginHistoryFreshnessPass()
         async let drained = drainChatPolling(maxBatches: 4, notifyIncoming: false)
 
@@ -742,8 +743,6 @@ final class ZaloEngine {
         ensureKnownContactsInConversations()
         rebuildConversationFlags()
         rebuildConversationExtras()
-
-        _ = await drained
 
         // 3. Preload active threads + last messages (`threadIdLocalMsgId: "{}"` + 25-thread batches)
         var groupActivityRank: [String: Int64] = [:]
@@ -850,6 +849,7 @@ final class ZaloEngine {
         rebuildConversationFlags()
         rebuildConversationExtras()
         await persistConversationsToSQLite()
+        _ = await drained
         await finishFullHistoryRefresh()
         refreshCloud()
         EngineLog.shared.write("bootstrap: convs=\(conversations.count) friends=\(contacts.friends.count) groups=\(contacts.groups.count)")
