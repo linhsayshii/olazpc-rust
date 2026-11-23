@@ -791,13 +791,13 @@ private struct MessageList: View {
             .overlay {
                 ChatListView(
                     conversationId: id, rows: rows, isGroup: conversation.isGroup, newestId: newestId,
-                    highlightedId: highlightedMessageId,
-                    pollsReady: Set(engine.polls.details.keys).union(engine.polls.failed),
-                    loadingOlder: loadingOlder, insets: insets, commands: commands,
+                    highlightedId: highlightedMessageId, loadingOlder: loadingOlder, insets: insets, commands: commands,
                     onReply: onReply,
                     onReact: { emoji, msg in engine.react(emoji, to: msg.id, in: id) },
                     onMetrics: { m in metricsChanged(m, hasMore: hasMore, count: msgs.count) })
-                .ignoresSafeArea()
+                // Vertical only: the list scrolls under the top/bottom bars, but not under the inspector on the side
+                // (it would keep its old width there and centered rows would be cut off).
+                .ignoresSafeArea(edges: .vertical)
                 // The part of the list the bars cover (it is drawn under them, edge to edge).
                 .onGeometryChange(for: EdgeInsets.self) { $0.safeAreaInsets } action: { insets = $0 }
             }

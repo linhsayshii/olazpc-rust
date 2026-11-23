@@ -168,6 +168,10 @@ struct PollMessageView: View {
             }
         }
         .frame(maxWidth: 420)
+        // The card grows when its detail loads: the list measures this row again.
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { _ in
+            NotificationCenter.default.post(name: ChatListController.rowSizeChangedNotification, object: message.id)
+        }
         .sheet(item: $sheet) { mode in
             PollDetailSheet(pollId: poll.pollId, conversationId: conversationId, question: poll.question, startOnVoters: mode == .voters)
         }

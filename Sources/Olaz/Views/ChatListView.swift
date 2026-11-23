@@ -30,12 +30,10 @@ struct ChatRowModel: Equatable {
     var isHighlighted: Bool
     /// A poll event row that is the newest event of its poll in the list: it carries the poll card (taller).
     var showsPollCard = false
-    /// That card's poll detail is loaded (or failed): the card has its final height.
-    var pollReady = false
 
     /// Same height: newest / highlighted only change a background; the poll card changes the height.
     func sameLayout(as other: ChatRowModel) -> Bool {
-        row == other.row && isGroup == other.isGroup && showsPollCard == other.showsPollCard && pollReady == other.pollReady
+        row == other.row && isGroup == other.isGroup && showsPollCard == other.showsPollCard
     }
 
     /// Rows of one kind share hosts: re-rooting a host with a row of the same structure is a cheap SwiftUI update.
@@ -135,8 +133,6 @@ struct ChatListView: NSViewRepresentable {
     let isGroup: Bool
     let newestId: String?
     let highlightedId: String?
-    /// Polls whose detail is loaded or failed (their card no longer changes height on its own).
-    var pollsReady: Set<String> = []
     let loadingOlder: Bool
     /// Room the bars over the list take (the list scrolls under them).
     let insets: EdgeInsets
@@ -159,7 +155,7 @@ struct ChatListView: NSViewRepresentable {
         controller.actions.react = onReact
         controller.onMetrics = onMetrics
         controller.update(conversationId: conversationId, rows: rows, isGroup: isGroup, newestId: newestId,
-                          highlightedId: highlightedId, pollsReady: pollsReady, loadingOlder: loadingOlder, insets: insets,
+                          highlightedId: highlightedId, loadingOlder: loadingOlder, insets: insets,
                           environment: context.environment)
     }
 
@@ -280,7 +276,17 @@ final class ChatListController: NSObject {
         scrollView.documentView = document
         NotificationCenter.default.addObserver(self, selector: #selector(boundsChanged), name: NSView.boundsDidChangeNotification, object: scrollView.contentView)
         NotificationCenter.default.addObserver(self, selector: #selector(frameChanged), name: NSView.frameDidChangeNotification, object: scrollView)
+        NotificationCenter.default.addObserver(self, selector: #selector(rowSizeChanged(_:)), name: Self.rowSizeChangedNotification, object: nil)
         setUpSwipeReply()
+    }
+
+    /// Posted by a row whose content changes height on its own (a poll card whose detail arrived), `object` = message id.
+    /// `preferredContentSize` of the row host does not report these changes.
+    static let rowSizeChangedNotification = Notification.Name("OlazChatRowSizeChanged")
+
+    @objc private func rowSizeChanged(_ note: Notification) {
+        guard let id = note.object as? String, indexById[id] != nil, hosts[id] != nil else { return }
+        rowContentChanged(id)
     }
 
     private func setUpSwipeReply() {
@@ -333,7 +339,7 @@ final class ChatListController: NSObject {
     // MARK: Update from SwiftUI
 
     func update(conversationId: String, rows: [ChatRow], isGroup: Bool, newestId: String?, highlightedId: String?,
-                pollsReady: Set<String> = [], loadingOlder: Bool, insets: EdgeInsets, environment: EnvironmentValues) {
+                loadingOlder: Bool, insets: EdgeInsets, environment: EnvironmentValues) {
         applyingUpdate = true
         defer { applyingUpdate = false }
         self.environment = environment
@@ -365,13 +371,11 @@ final class ChatListController: NSObject {
         let newModels = rows.map { row -> ChatRowModel in
             let id: String? = if case .message(let m, _, _, _) = row.kind { m.id } else { nil }
             var showsPollCard = false
-            var pollReady = false
             if case .message(let m, _, _, _) = row.kind, case .poll(let info) = m.kind {
                 showsPollCard = info.pollId.isEmpty || newestPollEvent[info.pollId] == m.id
-                pollReady = showsPollCard && pollsReady.contains(info.pollId)
             }
             return ChatRowModel(row: row, isGroup: isGroup, isNewest: id != nil && id == newestId,
-                                isHighlighted: id != nil && id == highlightedId, showsPollCard: showsPollCard, pollReady: pollReady)
+                                isHighlighted: id != nil && id == highlightedId, showsPollCard: showsPollCard)
         }
 
         if conversationId != self.conversationId {
