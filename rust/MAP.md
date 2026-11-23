@@ -1,6 +1,6 @@
 # Olaz Rust port map
 
-Goal: move Olaz's protocol engine to a Rust core called from the existing SwiftUI app (macOS only), for speed and a smoother main thread. Decisions: [DECISIONS.md](DECISIONS.md) (ADR-001..013). Terms: [GLOSSARY.md](GLOSSARY.md).
+Goal: move Olaz's protocol engine to a Rust core called from the existing SwiftUI app (macOS only), for speed and a smoother main thread. Decisions: [DECISIONS.md](DECISIONS.md) (ADR-001..015). Terms: [GLOSSARY.md](GLOSSARY.md).
 
 Workflow per unit: claim here, port into its own crate, port Swift fixtures as Rust tests, `cargo fmt --check && cargo clippy -p <crate> -- -D warnings && cargo test -p <crate>` green, mark done with test counts.
 
@@ -38,6 +38,13 @@ Workflow per unit: claim here, port into its own crate, port Swift fixtures as R
 Live check 2026-11-23 (release 5e274ba, wave 5c): image-heavy chat scrolling noticeably smoother (user report); engine.log has no `rust: error` lines.
 
 Live check 2026-11-23 (release build 9c47e82, merged 5a+5b): clean engine.log, no `rust: error` lines; the periodic `network timeout` is gone. Found on the way: `/api/friend/received/list` 404 on both paths (endpoint does not exist; fixed to `recommendsv2/list`). One startup `http status=429` from a typed endpoint (no path logged) seen once, not reproduced.
+
+## Wave 6 (E2EE)
+
+| Unit | Scope | State |
+|---|---|---|
+| 6b | E2EE compatibility spike: `olaz-signal` = libsignal-protocol v0.73.0 (vendored + 5-line Zalo patch) over the JS-persisted `zaloE2EEPCStoreV1` records; fixtures from the real bundled JS library; NOT wired, no FFI | done 2026-11-23 (verdict: compatible both ways, see ADR-015; olaz-signal 20 tests: 3 unit, 3 JS->Rust, 3 round-trip, 3 Rust->JS via node, 8 store; workspace 291) |
+| 6c | shadow-decrypt in the app (Rust decrypts a copy, JS stays authoritative), then cutover with JS fallback | open (plan in ADR-015) |
 
 ## Later waves (out of milestone 1)
 
