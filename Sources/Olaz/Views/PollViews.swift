@@ -140,7 +140,7 @@ struct PollMessageView: View {
     /// This message is the newest poll event of its poll in the loaded list.
     private var isNewest: Bool {
         guard !poll.pollId.isEmpty else { return true }
-        let newest = engine.messages[message.conversationId]?.last { other in
+        let newest = engine.messages(in: message.conversationId)?.last { other in
             if case .poll(let info) = other.kind { return info.pollId == poll.pollId }
             return false
         }

@@ -2,12 +2,16 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 /// Native chat pane for one conversation. All data comes from `ZaloEngine`.
+///
+/// The view stays alive when another chat is opened (`ConversationDetail` gives it no `.id`): rebuilding the whole chat, its
+/// safe-area bars and composer, made AppKit re-tile the window toolbar and recompute the key-view loop on every switch. The
+/// per-chat pieces below (message list, composer, read tracker) carry `.id(conversation.id)` instead, and the chat's own state
+/// is reset in `startConversation()`.
 struct ChatView: View {
     let conversation: ZaloEngine.ConversationSummary
 
     @Environment(ZaloEngine.self) private var engine
     @Environment(ShellModel.self) private var shell
-    @Environment(\.scenePhase) private var scenePhase
 
     @State private var draft = ""
     @State private var draftMentions: [Mention] = []
@@ -15,9 +19,6 @@ struct ChatView: View {
     @State private var focusTick = 0
     @State private var sendTick = 0
     @State private var notice: SendNotice?
-    @State private var lastMarkedId: String?
-    /// Width of the chat column; the header's room in the toolbar is what the buttons leave of it.
-    @State private var columnWidth: CGFloat = 400
     /// A loaded message to bring on screen (a pin of the pinned bar or a search match).
     @State private var jumpTarget: String?
     @State private var searchOpen = false
@@ -37,43 +38,18 @@ struct ChatView: View {
 
     private var id: String { conversation.id }
 
+    // The body reads nothing of `engine.messages` / `engine.typing`: those change for every conversation, and re-running this
+    // body rebuilds the whole toolbar. The parts that show messages observe them in their own views below.
     var body: some View {
         @Bindable var shell = shell
-        let loaded = engine.messages[id]
-        Group {
-            if let loaded {
-                if loaded.isEmpty {
-                    ContentUnavailableView {
-                        Label("Chưa có tin nhắn", systemImage: "bubble.left")
-                    } description: {
-                        Text("Tin nhắn cũ nằm trên điện thoại của bạn. Đồng bộ để xem lịch sử trò chuyện với \(conversation.displayName) trên máy tính.")
-                    } actions: {
-                        if engine.canStartTransfer {
-                            Button("Đồng bộ tin nhắn", systemImage: "iphone.and.arrow.forward") { engine.startTransfer() }
-                                .buttonStyle(.glassProminent)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .tourAnchor(.message, arrowEdge: .trailing)
-                } else {
-                    MessageList(
-                        conversation: conversation,
-                        scrollToBottomTick: sendTick,
-                        jumpTarget: $jumpTarget,
-                        highlightedMessageId: highlightedMessageId,
-                        suppressRestore: activeJumpId != nil,
-                        onReply: reply
-                    )
-                }
-            } else {
-                VStack(spacing: 10) {
-                    ProgressView()
-                    Text("Đang tải tin nhắn…").font(.system(size: 12.5)).foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .tourAnchor(.message, arrowEdge: .trailing)
-            }
-        }
+        ChatMessagesPane(
+            conversation: conversation,
+            sendTick: sendTick,
+            jumpTarget: $jumpTarget,
+            highlightedMessageId: highlightedMessageId,
+            suppressRestore: activeJumpId != nil,
+            onReply: reply
+        )
         .background {
             ChatWallpaperBackground()
             Button("") { openSearch() }
@@ -81,6 +57,8 @@ struct ChatView: View {
                 .frame(width: 0, height: 0)
                 .opacity(0)
                 .accessibilityHidden(true)
+            ChatReadTracker(conversation: conversation)
+                .id(id)
         }
         .safeAreaBar(edge: .top, spacing: 0) {
             VStack(spacing: 0) {
@@ -109,69 +87,32 @@ struct ChatView: View {
                 draft: $draft,
                 mentions: $draftMentions,
                 replyTo: $replyTo,
-                typingName: engine.typing[id],
                 focusTick: focusTick,
                 send: send,
                 sendLike: {
                     sendTick += 1
+                    let (engine, id) = (engine, id)
                     Task { if await !engine.sendText("👍", to: id) { notice = .like } }
                 })
+            .id(id)
         }
         .alert("Chưa gửi được tin nhắn", isPresented: Binding(get: { notice != nil }, set: { if !$0 { notice = nil } })) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(notice == .like ? "Không gửi được biểu tượng 👍. Hãy thử lại." : "Nội dung đã được trả lại vào ô soạn thảo. Hãy thử gửi lại.")
         }
-        .toolbar {
-            // macOS 27 lays the detail column's toolbar items out from its leading edge, so the header (avatar, name, subtitle)
-            // is the first item, like Mail's, and the flexible spacer keeps the buttons at the trailing edge. A toolbar item has a
-            // fixed ideal width, so the header is capped at what the column leaves beside the buttons, or a long name would push
-            // them into the overflow menu; the name truncates instead.
-            ToolbarItem(placement: .primaryAction) {
-                header(subtitle: subtitle(last: loaded?.last))
-                    .frame(maxWidth: max(0, columnWidth - Self.toolbarButtonsRoom), alignment: .leading)
-            }
-            .sharedBackgroundVisibility(.hidden)
-            ToolbarSpacer(.flexible, placement: .primaryAction)
-            ToolbarItemGroup(placement: .primaryAction) {
-                ChatCallButtons(conversation: conversation)
-            }
-            ToolbarSpacer(.fixed, placement: .primaryAction)
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button {
-                    toggleSearch()
-                } label: {
-                    Label("Tìm kiếm tin nhắn", systemImage: "magnifyingglass")
-                }
-                .help("Tìm tin nhắn (⌘F)")
-                .accessibilityLabel("Tìm tin nhắn")
-                Button {
-                    shell.toggleInspector()
-                } label: {
-                    Label("Thông tin", systemImage: "sidebar.right")
-                }
-                .help("Thông tin (⌥⌘I)")
-                .tourAnchor(.toolbar, arrowEdge: .bottom)
-                ConversationHeaderMenu(conversationId: id)
-            }
-        }
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { columnWidth = $0 }
         .cardActionPresenter()
         .messageActionPresenter(conversationId: id)
-        .onAppear {
-            focusTick += 1
-            restoreFailedDraft()
-            markReadIfNeeded(last: loaded?.last, newIncomingOnly: false)
+        .onAppear { startConversation() }
+        .onChange(of: id) { _, _ in
+            resetForAnotherConversation()
+            startConversation()
         }
         .onChange(of: engine.failedDrafts.revision) { _, _ in restoreFailedDraft() }
-        .onChange(of: loaded?.last?.id) { _, _ in markReadIfNeeded(last: engine.messages[id]?.last, newIncomingOnly: true) }
-        .onChange(of: conversation.unread) { _, _ in markReadIfNeeded(last: engine.messages[id]?.last, newIncomingOnly: false) }
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active { markReadIfNeeded(last: engine.messages[id]?.last, newIncomingOnly: false) }
-        }
         // ⌘R: reply to the newest incoming message.
+        .onChange(of: shell.chatSearchTick) { _, _ in toggleSearch() }
         .onChange(of: shell.replyTick) { _, _ in
-            if let newest = engine.messages[id]?.last(where: { !$0.isMine && !$0.kind.isStandalone && $0.kind != .recalled }) { reply(newest) }
+            if let newest = engine.messages(in: id)?.last(where: { !$0.isMine && !$0.kind.isStandalone && $0.kind != .recalled }) { reply(newest) }
         }
         .onChange(of: searchQuery) { _, newValue in
             scheduleSearch(for: newValue)
@@ -263,50 +204,30 @@ struct ChatView: View {
         }
     }
 
-    /// Toolbar room kept free of the header: the call buttons, search button, the info button and the "⋯" menu with their spacing.
-    private static let toolbarButtonsRoom: CGFloat = 270
-
-    /// Avatar, name and subtitle: the first toolbar item of the chat column.
-    private func header(subtitle: String) -> some View {
-        HStack(spacing: 10) {
-            RemoteAvatar(url: conversation.avatar, name: conversation.displayName, size: 30)
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 5) {
-                    Text(conversation.displayName)
-                        .font(.system(size: 14, weight: .semibold))
-                        .lineLimit(1)
-                    MutedBell(conversationId: id, size: 11)
-                }
-                if !subtitle.isEmpty {
-                    Text(subtitle)
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(engine.typing[id] != nil ? AnyShapeStyle(TintShapeStyle()) : AnyShapeStyle(HierarchicalShapeStyle.secondary))
-                        .lineLimit(1)
-                }
-            }
-        }
-        .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(.isHeader)
+    private func startConversation() {
+        focusTick += 1
+        restoreFailedDraft()
     }
 
-    private func subtitle(last: ChatMessage?) -> String {
-        if let name = engine.typing[id] { return "\(name) đang soạn tin…" }
-        if conversation.isGroup, conversation.members > 0 { return "\(conversation.members) thành viên" }
-        if last?.isE2EE == true { return "Mã hóa đầu cuối" }
-        return ""
-    }
-
-    /// Marks read only when there is something unread: `unread > 0`, or an incoming
-    /// last message whose id has not been marked yet. Avoids redundant server round trips.
-    private func markReadIfNeeded(last: ChatMessage?, newIncomingOnly: Bool) {
-        guard scenePhase == .active, engine.openConversationId == id else { return }
-        if let last, !last.isMine, last.id != lastMarkedId, newIncomingOnly || conversation.unread > 0 {
-            lastMarkedId = last.id
-            engine.markRead(id)
-        } else if !newIncomingOnly, conversation.unread > 0 {
-            engine.markRead(id)
-        }
-        if lastMarkedId == nil { lastMarkedId = last?.id }
+    /// What a freshly created chat view would start with (the view is reused for the next conversation).
+    private func resetForAnotherConversation() {
+        searchTask?.cancel()
+        searchTask = nil
+        jumpTask?.cancel()
+        jumpTask = nil
+        draft = ""
+        draftMentions = []
+        replyTo = nil
+        notice = nil
+        jumpTarget = nil
+        searchOpen = false
+        searchQuery = ""
+        searchMatches = []
+        searchMatchIndex = 0
+        searchSearching = false
+        activeJumpId = nil
+        highlightedMessageId = nil
+        isDropTargeted = false
     }
 
     private func reply(_ message: ChatMessage) {
@@ -318,7 +239,7 @@ struct ChatView: View {
     private func openPin(_ item: PinnedItem) {
         switch item.kind {
         case .message:
-            if let target = item.message(in: engine.messages[id] ?? []) {
+            if let target = item.message(in: engine.messages(in: id) ?? []) {
                 jumpTarget = target.id
             } else {
                 CardActionCenter.shared.show("Tin nhắn đã ghim chưa được tải. Kéo lên để xem tin nhắn cũ hơn.", in: id)
@@ -461,6 +382,191 @@ struct ChatView: View {
                 activeJumpId = nil
             }
         }
+    }
+}
+
+// MARK: - Toolbar
+
+extension View {
+    /// The chat column's toolbar. Applied by `ConversationDetail` outside the chat's `.id(conversation.id)`, so switching chats
+    /// updates the same toolbar items in place: recreating them (NSToolbar item views, menus, layout) was the largest single cost
+    /// of opening a chat.
+    func chatToolbar(conversation: ZaloEngine.ConversationSummary) -> some View {
+        modifier(ChatToolbarModifier(conversation: conversation))
+    }
+}
+
+private struct ChatToolbarModifier: ViewModifier {
+    let conversation: ZaloEngine.ConversationSummary
+    @Environment(ShellModel.self) private var shell
+    /// Width of the chat column; the header's room in the toolbar is what the buttons leave of it.
+    @State private var columnWidth: CGFloat = 400
+
+    /// Toolbar room kept free of the header: the call buttons, search button, the info button and the "⋯" menu with their spacing.
+    private static let toolbarButtonsRoom: CGFloat = 270
+
+    func body(content: Content) -> some View {
+        content
+            .toolbar {
+                // macOS 27 lays the detail column's toolbar items out from its leading edge, so the header (avatar, name, subtitle)
+                // is the first item, like Mail's, and the flexible spacer keeps the buttons at the trailing edge. A toolbar item has a
+                // fixed ideal width, so the header is capped at what the column leaves beside the buttons, or a long name would push
+                // them into the overflow menu; the name truncates instead.
+                ToolbarItem(placement: .primaryAction) {
+                    ChatHeaderTitle(conversation: conversation)
+                        .frame(maxWidth: max(0, columnWidth - Self.toolbarButtonsRoom), alignment: .leading)
+                }
+                .sharedBackgroundVisibility(.hidden)
+                ToolbarSpacer(.flexible, placement: .primaryAction)
+                ToolbarItemGroup(placement: .primaryAction) {
+                    ChatCallButtons(conversation: conversation)
+                }
+                ToolbarSpacer(.fixed, placement: .primaryAction)
+                ToolbarItemGroup(placement: .primaryAction) {
+                    Button {
+                        shell.toggleChatSearch()
+                    } label: {
+                        Label("Tìm kiếm tin nhắn", systemImage: "magnifyingglass")
+                    }
+                    .help("Tìm tin nhắn (⌘F)")
+                    .accessibilityLabel("Tìm tin nhắn")
+                    Button {
+                        shell.toggleInspector()
+                    } label: {
+                        Label("Thông tin", systemImage: "sidebar.right")
+                    }
+                    .help("Thông tin (⌥⌘I)")
+                    .tourAnchor(.toolbar, arrowEdge: .bottom)
+                    ConversationHeaderMenu(conversationId: conversation.id)
+                }
+            }
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
+                if columnWidth != width { columnWidth = width }
+            }
+    }
+}
+
+// MARK: - Pieces that observe the messages
+
+/// Loading / empty state or the message list: the part of the chat that changes with `engine.messages`.
+private struct ChatMessagesPane: View {
+    let conversation: ZaloEngine.ConversationSummary
+    let sendTick: Int
+    @Binding var jumpTarget: String?
+    let highlightedMessageId: String?
+    let suppressRestore: Bool
+    let onReply: (ChatMessage) -> Void
+
+    @Environment(ZaloEngine.self) private var engine
+
+    var body: some View {
+        Group {
+            if let loaded = engine.messages(in: conversation.id) {
+                if loaded.isEmpty {
+                    ContentUnavailableView {
+                        Label("Chưa có tin nhắn", systemImage: "bubble.left")
+                    } description: {
+                        Text("Tin nhắn cũ nằm trên điện thoại của bạn. Đồng bộ để xem lịch sử trò chuyện với \(conversation.displayName) trên máy tính.")
+                    } actions: {
+                        if engine.canStartTransfer {
+                            Button("Đồng bộ tin nhắn", systemImage: "iphone.and.arrow.forward") { engine.startTransfer() }
+                                .buttonStyle(.glassProminent)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .tourAnchor(.message, arrowEdge: .trailing)
+                } else {
+                    MessageList(
+                        conversation: conversation,
+                        scrollToBottomTick: sendTick,
+                        jumpTarget: $jumpTarget,
+                        highlightedMessageId: highlightedMessageId,
+                        suppressRestore: suppressRestore,
+                        onReply: onReply
+                    )
+                }
+            } else {
+                VStack(spacing: 10) {
+                    ProgressView()
+                    Text("Đang tải tin nhắn…").font(.system(size: 12.5)).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .tourAnchor(.message, arrowEdge: .trailing)
+            }
+        }
+    }
+}
+
+/// Avatar, name and subtitle: the first toolbar item of the chat column. A view of its own so typing / new messages update
+/// this item in place instead of re-running `ChatView.body` (which rebuilds every toolbar item).
+private struct ChatHeaderTitle: View {
+    let conversation: ZaloEngine.ConversationSummary
+    @Environment(ZaloEngine.self) private var engine
+
+    private var id: String { conversation.id }
+
+    var body: some View {
+        let subtitle = subtitle(last: engine.messages(in: id)?.last)
+        HStack(spacing: 10) {
+            RemoteAvatar(url: conversation.avatar, name: conversation.displayName, size: 30)
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(spacing: 5) {
+                    Text(conversation.displayName)
+                        .font(.system(size: 14, weight: .semibold))
+                        .lineLimit(1)
+                    MutedBell(conversationId: id, size: 11)
+                }
+                if !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(engine.typingName(in: id) != nil ? AnyShapeStyle(TintShapeStyle()) : AnyShapeStyle(HierarchicalShapeStyle.secondary))
+                        .lineLimit(1)
+                }
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
+    }
+
+    private func subtitle(last: ChatMessage?) -> String {
+        if let name = engine.typingName(in: id) { return "\(name) đang soạn tin…" }
+        if conversation.isGroup, conversation.members > 0 { return "\(conversation.members) thành viên" }
+        if last?.isE2EE == true { return "Mã hóa đầu cuối" }
+        return ""
+    }
+}
+
+/// Marks the open chat read when something new arrives while it is on screen (invisible; lives in the chat's background).
+private struct ChatReadTracker: View {
+    let conversation: ZaloEngine.ConversationSummary
+    @Environment(ZaloEngine.self) private var engine
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var lastMarkedId: String?
+
+    private var id: String { conversation.id }
+
+    var body: some View {
+        Color.clear
+            .accessibilityHidden(true)
+            .onAppear { markReadIfNeeded(last: engine.messages(in: id)?.last, newIncomingOnly: false) }
+            .onChange(of: engine.messages(in: id)?.last?.id) { _, _ in markReadIfNeeded(last: engine.messages(in: id)?.last, newIncomingOnly: true) }
+            .onChange(of: conversation.unread) { _, _ in markReadIfNeeded(last: engine.messages(in: id)?.last, newIncomingOnly: false) }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active { markReadIfNeeded(last: engine.messages(in: id)?.last, newIncomingOnly: false) }
+            }
+    }
+
+    /// Marks read only when there is something unread: `unread > 0`, or an incoming
+    /// last message whose id has not been marked yet. Avoids redundant server round trips.
+    private func markReadIfNeeded(last: ChatMessage?, newIncomingOnly: Bool) {
+        guard scenePhase == .active, engine.openConversationId == id else { return }
+        if let last, !last.isMine, last.id != lastMarkedId, newIncomingOnly || conversation.unread > 0 {
+            lastMarkedId = last.id
+            engine.markRead(id)
+        } else if !newIncomingOnly, conversation.unread > 0 {
+            engine.markRead(id)
+        }
+        if lastMarkedId == nil { lastMarkedId = last?.id }
     }
 }
 
@@ -679,6 +785,11 @@ private struct MessageList: View {
     /// False from the moment an older page lands until the reader leaves the top: one page per pull, like the official
     /// client, instead of paging on and on while the restored position still reads as "at the top".
     @State private var olderArmed = true
+    /// Right after a chat opens its rows are still being measured: the bottom stays anchored through those size changes until
+    /// the reader scrolls or a moment has passed (the list is reused from chat to chat, so the initial-offset anchor alone
+    /// only covers the first chat).
+    @State private var pinBottom = true
+    @State private var pinTask: Task<Void, Never>?
 
     private var id: String { conversation.id }
 
@@ -690,9 +801,9 @@ private struct MessageList: View {
     }
 
     var body: some View {
-        let msgs = engine.messages[id] ?? []
+        let msgs = engine.messages(in: id) ?? []
         let rows = cache.rows(for: msgs)
-        let hasMore = engine.hasMoreHistory[id] ?? false
+        let hasMore = engine.hasMoreHistory(in: id) ?? false
         let newestId = msgs.last?.id
         ScrollViewReader { proxy in
             ScrollView {
@@ -711,6 +822,7 @@ private struct MessageList: View {
                                        isNewest: m.id == newestId,
                                        onReply: onReply,
                                        onReact: { emoji, msg in engine.react(emoji, to: msg.id, in: id) })
+                                .equatable()
                                 .background {
                                     if isHighlighted {
                                         RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -734,6 +846,7 @@ private struct MessageList: View {
             }
             // Only the initial offset is anchored; later size changes must not yank the view.
             .defaultScrollAnchor(.bottom, for: .initialOffset)
+            .defaultScrollAnchor(pinBottom ? .bottom : nil, for: .sizeChanges)
             .scrollPosition(id: $topId, anchor: .top)
             .scrollEdgeEffectStyle(.hard, for: .top)
             .scrollEdgeEffectStyle(.soft, for: .bottom)
@@ -752,7 +865,15 @@ private struct MessageList: View {
                     let near = m.fromBottom < 160
                     if near != nearBottom { nearBottom = near }
                 }
+                if pinBottom, m.fromBottom > 1 {
+                    // The new chat's rows are still being measured (a scroll issued before that lands short): follow the bottom.
+                    proxy.scrollTo("bottom", anchor: .bottom)
+                }
                 lastContentHeight = m.content
+            }
+            // Only the reader's own scrolling ends the bottom pin.
+            .onScrollPhaseChange { _, phase in
+                if pinBottom, phase == .interacting || phase == .tracking { pinBottom = false }
             }
             .onChange(of: atTop) { _, _ in maybeLoadOlder(hasMore: hasMore, count: msgs.count) }
             .onChange(of: olderArmed) { _, _ in maybeLoadOlder(hasMore: hasMore, count: msgs.count) }
@@ -795,15 +916,24 @@ private struct MessageList: View {
             }
             // The tour's message step points at the newest row: make sure it exists in the lazy stack.
             .onChange(of: shell.tour) { _, step in if step == .message { scrollToBottom(proxy) } }
-            .onAppear {
-                if let pending = jumpTarget {
-                    jumpTarget = nil
-                    DispatchQueue.main.async { proxy.scrollTo(pending, anchor: .center) }
-                } else if highlightedMessageId == nil {
-                    DispatchQueue.main.async { proxy.scrollTo("bottom", anchor: .bottom) }
-                }
+            .onAppear { showInitialPosition(proxy) }
+            // The list (and its scroll view) is reused for the next chat: a new scroll view under the glass toolbar made AppKit
+            // re-tile the toolbar on every switch. Start over as a new list would.
+            .onChange(of: id) { _, _ in
+                olderTask?.cancel()
+                olderTask = nil
+                loadingOlder = false
+                atTop = false
+                nearBottom = true
+                lastContentHeight = 0
+                topId = nil
+                restoreId = nil
+                // Disarmed until the list has left the top band once (the geometry action re-arms it): while the new rows
+                // settle the list can read as "at the top" for a moment, and an older page loaded then would pin it there.
+                olderArmed = false
+                showInitialPosition(proxy)
             }
-            .onDisappear { olderTask?.cancel() }
+            .onDisappear { olderTask?.cancel(); pinTask?.cancel() }
             .overlay(alignment: .bottomTrailing) {
                 if !nearBottom {
                     Button {
@@ -822,6 +952,24 @@ private struct MessageList: View {
         }
     }
 
+    /// A chat opens at its newest message, or at the message a pin / search asked for.
+    private func showInitialPosition(_ proxy: ScrollViewProxy) {
+        PerfProbe.appearedChat = id
+        pinBottom = jumpTarget == nil && highlightedMessageId == nil
+        pinTask?.cancel()
+        pinTask = Task {
+            try? await Task.sleep(for: .seconds(2))
+            if !Task.isCancelled { pinBottom = false }
+        }
+        if let pending = jumpTarget {
+            jumpTarget = nil
+            DispatchQueue.main.async { proxy.scrollTo(pending, anchor: .center) }
+        } else if highlightedMessageId == nil {
+            proxy.scrollTo("bottom", anchor: .bottom)
+            DispatchQueue.main.async { proxy.scrollTo("bottom", anchor: .bottom) }
+        }
+    }
+
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
         withAnimation(.snappy(duration: 0.25)) { proxy.scrollTo("bottom", anchor: .bottom) }
     }
@@ -831,7 +979,7 @@ private struct MessageList: View {
         olderTask?.cancel()
         olderTask = Task {
             try? await Task.sleep(for: .milliseconds(250)) // debounce
-            guard !Task.isCancelled, atTop, olderArmed, engine.hasMoreHistory[id] == true else { return }
+            guard !Task.isCancelled, atTop, olderArmed, engine.hasMoreHistory(in: id) == true else { return }
             restoreId = topId
             loadingOlder = true
             engine.loadOlderMessages(id)

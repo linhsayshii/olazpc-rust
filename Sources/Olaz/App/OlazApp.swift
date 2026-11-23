@@ -52,6 +52,7 @@ struct OlazApp: App {
                 .task {
                     engine.start()
                     await EngineProbe.runUISmokeIfRequested(engine: engine, shell: shell)
+                    await PerfProbe.runIfRequested(engine: engine, shell: shell)
                 }
         }
         .defaultLaunchBehavior(.presented)

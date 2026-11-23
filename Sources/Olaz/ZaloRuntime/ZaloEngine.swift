@@ -70,10 +70,21 @@ final class ZaloEngine {
 
     var openConversationId: String?
     var failedDrafts = FailedDraftStore()
-    var messages: [String: [ChatMessage]] = [:]
-    var hasMoreHistory: [String: Bool] = [:]
+    var messages: [String: [ChatMessage]] = [:] {
+        didSet { messageSignal.changed(from: oldValue, to: messages) }
+    }
+    var hasMoreHistory: [String: Bool] = [:] {
+        didSet { hasMoreSignal.changed(from: oldValue, to: hasMoreHistory) }
+    }
     var historyTicks: [String: Int] = [:]
-    var typing: [String: String] = [:]
+    var typing: [String: String] = [:] {
+        didSet { typingSignal.changed(from: oldValue, to: typing) }
+    }
+    // Per-conversation observation of the three dictionaries above (see `KeyedSignal`). Views read them through
+    // `messages(in:)`, `hasMoreHistory(in:)` and `typingName(in:)` so a change in one chat does not re-render another.
+    @ObservationIgnored let messageSignal = KeyedSignal()
+    @ObservationIgnored let hasMoreSignal = KeyedSignal()
+    @ObservationIgnored let typingSignal = KeyedSignal()
     var transfer: MessageTransferState?
     var canStartTransfer = false
     var transferStartBlockedReason: String?
@@ -1533,6 +1544,7 @@ final class ZaloEngine {
             }
         }
         var list = messages[msg.conversationId] ?? []
+        let originalCount = list.count
         let incomingIsLockedPlaceholder: Bool = {
             if case .placeholder = msg.kind, msg.isE2EE { return true }
             return false
@@ -1584,9 +1596,14 @@ final class ZaloEngine {
             }
         }
         if let idx = list.firstIndex(where: { $0.id == msg.id }) {
+            // The same message again (history refresh, WAL re-read): no write, so observers (the open chat) are not invalidated.
+            let untouched = list.count == originalCount
+            if untouched, list[idx] == msg { return }
             if incomingIsLockedPlaceholder {
                 if case .placeholder = list[idx].kind, list[idx].isE2EE {
                     list[idx] = msg
+                } else if untouched {
+                    return
                 }
             } else {
                 list[idx] = msg
@@ -1620,6 +1637,9 @@ final class ZaloEngine {
             if incrementUnread {
                 item.unread += 1
             }
+            // Nothing changed (re-merged history, an open without new messages): leave the list, its order and the store alone,
+            // so the conversation list is not re-diffed for nothing.
+            if item == list[idx] { return }
             list[idx] = item
         } else {
             let identity = lookupConversationIdentity(msg.conversationId)
@@ -2143,5 +2163,27 @@ final class ZaloEngine {
             if ad != bd { return ad > bd }
             return a.id < b.id
         }
+    }
+}
+
+// MARK: - Per-conversation reads for views
+
+extension ZaloEngine {
+    /// `messages[id]`, observed for this conversation only.
+    func messages(in id: String) -> [ChatMessage]? {
+        messageSignal.track(id)
+        return _messages[id]
+    }
+
+    /// `hasMoreHistory[id]`, observed for this conversation only.
+    func hasMoreHistory(in id: String) -> Bool? {
+        hasMoreSignal.track(id)
+        return _hasMoreHistory[id]
+    }
+
+    /// Who is typing in `id` (`typing[id]`), observed for this conversation only.
+    func typingName(in id: String) -> String? {
+        typingSignal.track(id)
+        return _typing[id]
     }
 }

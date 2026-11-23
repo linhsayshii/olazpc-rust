@@ -69,7 +69,7 @@ struct SharedMediaBrowser: View {
     @ViewBuilder
     private var content: some View {
         let feed = model.feed(kind)
-        let listing = model.listing(kind, loaded: engine.messages[conversationId] ?? [])
+        let listing = model.listing(kind, loaded: engine.messages(in: conversationId) ?? [])
         if listing.items.isEmpty {
             placeholder(feed)
         } else {

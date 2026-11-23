@@ -93,7 +93,7 @@ struct ConversationListRow: View {
     }
 
     @ViewBuilder private var previewLine: some View {
-        if let who = engine.typing[conversation.id] {
+        if let who = engine.typingName(in: conversation.id) {
             Text("\(who) đang soạn tin…")
                 .foregroundStyle(prominence == .increased ? AnyShapeStyle(.primary) : AnyShapeStyle(.tint))
         } else {
@@ -107,6 +107,15 @@ struct ConversationListRow: View {
         if isSelf { return "Lưu trữ và truy cập nhanh những nội dung quan trọng" }
         let stranger = isStranger || engine.conversationExtras.strangerIds.contains(conversation.id)
         return conversation.isGroup ? "Nhóm" : (stranger ? "Chưa là bạn" : "Bạn bè")
+    }
+}
+
+/// Rows are compared on their data so a list re-render (every message bumps `engine.conversations`) skips unchanged rows.
+/// What a row reads from the engine itself (typing, mute, stranger ids) still updates it through observation.
+extension ConversationListRow: Equatable {
+    nonisolated static func == (a: ConversationListRow, b: ConversationListRow) -> Bool {
+        a.conversation == b.conversation && a.label == b.label && a.showsPin == b.showsPin
+            && a.unreadMark == b.unreadMark && a.isStranger == b.isStranger && a.isSelf == b.isSelf
     }
 }
 

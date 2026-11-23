@@ -48,7 +48,7 @@ struct ChatInspector: View {
         }
         // On the container, not the overview: leaving for the storage page must not restart these.
         .task(id: id) { await loadMembers() }
-        .task(id: engine.messages[id]?.last?.id) { await refreshPreview() }
+        .task(id: engine.messages(in: id)?.last?.id) { await refreshPreview() }
         .sheet(item: $pollSheet) { poll in
             PollDetailSheet(pollId: poll.pollId, conversationId: id, question: poll.question)
         }
@@ -101,7 +101,7 @@ struct ChatInspector: View {
     }
 
     private var overview: some View {
-        let loaded = engine.messages[id] ?? []
+        let loaded = engine.messages(in: id) ?? []
         return ScrollView {
             VStack(spacing: 20) {
                 header

@@ -9,7 +9,8 @@ extension ZaloEngine {
         let changed = openConversationId != id
         openConversationId = id
         if changed { dropMessagePrompts() }
-        typing[id] = nil
+        // Observable writes invalidate every reader even when the value is the same: write only real changes.
+        if typing[id] != nil { typing[id] = nil }
         if messages[id] == nil {
             messages[id] = []
         }
@@ -17,7 +18,7 @@ extension ZaloEngine {
         if let syncCached = sqliteStore?.readDecodedMessagesNow(convId: id, limit: 50) {
             let decoded = syncCached.map(\.message)
             for msg in decoded { mergeMessageIntoMemory(msg) }
-            if decoded.count >= 45 {
+            if decoded.count >= 45, hasMoreHistory[id] != true {
                 hasMoreHistory[id] = true
             }
         }

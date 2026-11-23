@@ -208,6 +208,7 @@ struct ConversationListColumn: View {
                                     unreadMark: engine.conversationActions.hasUnreadMark(conversation.id),
                                     isStranger: destination != .strangers && extras.strangerIds.contains(conversation.id),
                                     isSelf: conversation.id == engine.selfConversationId)
+                    .equatable()
                     .tag(conversation.id)
                     .listRowInsets(EdgeInsets(top: 5, leading: 10, bottom: 5, trailing: 10))
                     .alignmentGuide(.listRowSeparatorLeading) { _ in 64 }

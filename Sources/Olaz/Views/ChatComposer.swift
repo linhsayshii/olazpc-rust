@@ -11,7 +11,6 @@ struct ChatComposer: View {
     @Binding var draft: String
     @Binding var mentions: [Mention]
     @Binding var replyTo: ChatMessage?
-    let typingName: String?
     let focusTick: Int
     let send: () -> Void
     let sendLike: () -> Void
@@ -19,6 +18,8 @@ struct ChatComposer: View {
     @Environment(ZaloEngine.self) private var engine
     @AppStorage(OlazPrefs.accent) private var accentStored = OlazAccent.blue.rawValue
     @Namespace private var glassNamespace
+    /// Read here, not passed in by the chat: `typing` changes for any conversation, and only the composer shows it.
+    private var typingName: String? { engine.typingName(in: conversationId) }
     @State private var textHeight: CGFloat = ComposerTextView.lineHeight
     @State private var handle = ComposerHandle()
     @State private var query: MentionQuery?

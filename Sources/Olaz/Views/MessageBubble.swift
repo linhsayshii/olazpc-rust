@@ -628,6 +628,16 @@ struct MessageRow: View {
     }
 }
 
+/// Rows are compared by their data only: the reply / react closures are rebuilt with every pass of the message list, and
+/// without this every visible row would re-run its body whenever any conversation's messages change. Engine state a row
+/// reads in its body (profile, call availability) still updates it through observation.
+extension MessageRow: Equatable {
+    nonisolated static func == (a: MessageRow, b: MessageRow) -> Bool {
+        a.message == b.message && a.isGroup == b.isGroup && a.firstInGroup == b.firstInGroup
+            && a.lastInGroup == b.lastInGroup && a.showStatus == b.showStatus && a.isNewest == b.isNewest
+    }
+}
+
 /// The six Zalo reactions in a popover, Tapback style.
 private struct ReactionPicker: View {
     let emojis: [String]
