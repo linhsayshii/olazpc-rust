@@ -23,7 +23,7 @@ pub mod session;
 mod client;
 mod login;
 
-pub use client::{RawOutcome, SessionClient};
+pub use client::{RawOutcome, SessionClient, download_data, download_sync_batch_with, send_raw};
 pub use cookie::{extract_zpw_sek, extract_zpw_sek_cookie, is_valid_zpw_sek};
 pub use decode::{
     check_response_error, decode_response, parse_and_decrypt_response, unwrap_decrypted_response,

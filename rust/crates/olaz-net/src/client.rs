@@ -161,14 +161,13 @@ impl<T: Transport> SessionClient<T> {
     /// Swift `rawRequest`: builds headers from the current session and sends.
     pub async fn raw_request(&self, options: RequestOptions) -> Result<RawOutcome, NetError> {
         let sek = self.zpw_sek();
-        let spec = build_request(&options, sek.as_deref())?;
-        let response = self.transport.send(spec).await?;
-        let now_unix = self.now_ms() / 1000;
-        let zpw_sek_cookie = extract_zpw_sek_cookie(&response.headers, now_unix);
-        Ok(RawOutcome {
-            response,
-            zpw_sek_cookie,
-        })
+        send_raw(
+            &self.transport,
+            &options,
+            sek.as_deref(),
+            self.now_ms() / 1000,
+        )
+        .await
     }
 
     /// Swift `rawGetJSON`: one GET, 2xx required, decoded and `error_code` checked.
@@ -200,16 +199,7 @@ impl<T: Transport> SessionClient<T> {
         url: &str,
         timeout: Duration,
     ) -> Result<Vec<u8>, NetError> {
-        let spec = bare_request(url, timeout, None)?;
-        let response = self.transport.send(spec).await?;
-        if (200..300).contains(&response.status) {
-            Ok(response.body)
-        } else {
-            Err(NetError::Http {
-                status: response.status,
-                body: String::new(),
-            })
-        }
+        download_data(&self.transport, url, timeout).await
     }
 
     /// Swift `downloadSyncBatch`: GET; on 401/403 retries once with
@@ -219,36 +209,21 @@ impl<T: Transport> SessionClient<T> {
         url: &str,
         timeout: Duration,
     ) -> Result<Vec<u8>, NetError> {
-        let spec = bare_request(url, timeout, None)?;
-        let response = self.transport.send(spec).await?;
-        if (200..300).contains(&response.status) {
-            return Ok(response.body);
-        }
-        if response.status == 401 || response.status == 403 {
-            let (sek, uid) = {
-                let s = self.lock();
-                (
-                    s.zpw_sek.clone(),
-                    s.account.as_ref().map(|a| a.user_id.clone()),
-                )
-            };
-            if let (Some(sek), Some(uid)) = (sek, uid)
-                && is_valid_zpw_sek(Some(&sek))
-                && !uid.is_empty()
-            {
-                let cookie = format!("zpw_sek={sek}; zpw_uin={uid}");
-                let retry = bare_request(url, timeout, Some(&cookie))?;
-                let retried = self.transport.send(retry).await?;
-                if (200..300).contains(&retried.status) {
-                    return Ok(retried.body);
-                }
-            }
-        }
-        tracing::debug!(http = response.status, "sync batch download failed");
-        Err(NetError::Http {
-            status: response.status,
-            body: String::new(),
-        })
+        let (sek, uid) = {
+            let s = self.lock();
+            (
+                s.zpw_sek.clone(),
+                s.account.as_ref().map(|a| a.user_id.clone()),
+            )
+        };
+        download_sync_batch_with(
+            &self.transport,
+            url,
+            timeout,
+            sek.as_deref(),
+            uid.as_deref(),
+        )
+        .await
     }
 
     // MARK: authenticated API
@@ -358,6 +333,74 @@ impl<T: Transport> SessionClient<T> {
         }
         Err(last_error)
     }
+}
+
+/// Session-free Swift `rawRequest`: one request with the caller's `zpw_sek` (Swift owns the
+/// session and passes it on every call), any status returned as is, plus the `zpw_sek` cookie
+/// found in `Set-Cookie`. There is no cookie jar anywhere: the cookie is only read out.
+pub async fn send_raw<T: Transport>(
+    transport: &T,
+    options: &RequestOptions,
+    zpw_sek: Option<&str>,
+    now_unix: i64,
+) -> Result<RawOutcome, NetError> {
+    let spec = build_request(options, zpw_sek)?;
+    let response = transport.send(spec).await?;
+    let zpw_sek_cookie = extract_zpw_sek_cookie(&response.headers, now_unix);
+    Ok(RawOutcome {
+        response,
+        zpw_sek_cookie,
+    })
+}
+
+/// Session-free Swift `rawDownloadData`.
+pub async fn download_data<T: Transport>(
+    transport: &T,
+    url: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>, NetError> {
+    let spec = bare_request(url, timeout, None)?;
+    let response = transport.send(spec).await?;
+    if (200..300).contains(&response.status) {
+        Ok(response.body)
+    } else {
+        Err(NetError::Http {
+            status: response.status,
+            body: String::new(),
+        })
+    }
+}
+
+/// Session-free Swift `downloadSyncBatch` (see [`SessionClient::download_sync_batch`]).
+pub async fn download_sync_batch_with<T: Transport>(
+    transport: &T,
+    url: &str,
+    timeout: Duration,
+    zpw_sek: Option<&str>,
+    user_id: Option<&str>,
+) -> Result<Vec<u8>, NetError> {
+    let spec = bare_request(url, timeout, None)?;
+    let response = transport.send(spec).await?;
+    if (200..300).contains(&response.status) {
+        return Ok(response.body);
+    }
+    if (response.status == 401 || response.status == 403)
+        && let (Some(sek), Some(uid)) = (zpw_sek, user_id)
+        && is_valid_zpw_sek(Some(sek))
+        && !uid.is_empty()
+    {
+        let cookie = format!("zpw_sek={sek}; zpw_uin={uid}");
+        let retry = bare_request(url, timeout, Some(&cookie))?;
+        let retried = transport.send(retry).await?;
+        if (200..300).contains(&retried.status) {
+            return Ok(retried.body);
+        }
+    }
+    tracing::debug!(http = response.status, "sync batch download failed");
+    Err(NetError::Http {
+        status: response.status,
+        body: String::new(),
+    })
 }
 
 fn bare_request(

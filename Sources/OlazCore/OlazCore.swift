@@ -1686,6 +1686,204 @@ public func FfiConverterTypeCoreMedia_lower(_ value: CoreMedia) -> UInt64 {
 
 
 /**
+ * Raw HTTP over the shared rustls transport. Cheap to create; every method is async, runs on the
+ * shared runtime and throws `CoreError` (transport failures and non-2xx downloads only: a raw
+ * request returns any status).
+ */
+public protocol CoreRawHttpProtocol: AnyObject, Sendable {
+    
+    /**
+     * Swift `rawDownloadData`: GET with only the `User-Agent` header; non-2xx is `CoreError.http`.
+     */
+    func download(url: String, timeoutSecs: Double) async throws  -> Data
+    
+    /**
+     * Swift `downloadSyncBatch`: like `download`, plus one retry with
+     * `Cookie: zpw_sek=..; zpw_uin=..` on 401/403 when both values are given.
+     */
+    func downloadSyncBatch(url: String, timeoutSecs: Double, zpwSek: String?, userId: String?) async throws  -> Data
+    
+    /**
+     * Swift `rawRequest`.
+     */
+    func request(request: RawRequestRecord) async throws  -> RawResponseRecord
+    
+}
+/**
+ * Raw HTTP over the shared rustls transport. Cheap to create; every method is async, runs on the
+ * shared runtime and throws `CoreError` (transport failures and non-2xx downloads only: a raw
+ * request returns any status).
+ */
+open class CoreRawHttp: CoreRawHttpProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_olaz_ffi_fn_clone_corerawhttp(self.handle, $0) }
+    }
+public convenience init()throws  {
+    let handle =
+        try rustCallWithError(FfiConverterTypeCoreError_lift) {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_constructor_corerawhttp_new(uniffiCallStatus
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_olaz_ffi_fn_free_corerawhttp(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Swift `rawDownloadData`: GET with only the `User-Agent` header; non-2xx is `CoreError.http`.
+     */
+open func download(url: String, timeoutSecs: Double)async throws  -> Data  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corerawhttp_download(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(url),FfiConverterDouble.lower(timeoutSecs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterData.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Swift `downloadSyncBatch`: like `download`, plus one retry with
+     * `Cookie: zpw_sek=..; zpw_uin=..` on 401/403 when both values are given.
+     */
+open func downloadSyncBatch(url: String, timeoutSecs: Double, zpwSek: String?, userId: String?)async throws  -> Data  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corerawhttp_download_sync_batch(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(url),FfiConverterDouble.lower(timeoutSecs),FfiConverterOptionString.lower(zpwSek),FfiConverterOptionString.lower(userId)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterData.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Swift `rawRequest`.
+     */
+open func request(request: RawRequestRecord)async throws  -> RawResponseRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corerawhttp_request(
+                        self.uniffiCloneHandle(),FfiConverterTypeRawRequestRecord_lower(request)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeRawResponseRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRawHttp: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = CoreRawHttp
+
+    public static func lift(_ handle: UInt64) throws -> CoreRawHttp {
+        return CoreRawHttp(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: CoreRawHttp) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRawHttp {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: CoreRawHttp, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRawHttp_lift(_ handle: UInt64) throws -> CoreRawHttp {
+    return try FfiConverterTypeCoreRawHttp.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRawHttp_lower(_ value: CoreRawHttp) -> UInt64 {
+    return FfiConverterTypeCoreRawHttp.lower(value)
+}
+
+
+
+
+
+
+/**
  * The logged-in (or logging-in) session. Share it with [`crate::CoreApi`] (`CoreApi(session:)`).
  */
 public protocol CoreSessionProtocol: AnyObject, Sendable {
@@ -7157,6 +7355,168 @@ public func FfiConverterTypeQuoteRecord_lower(_ value: QuoteRecord) -> RustBuffe
 }
 
 
+/**
+ * One raw request (Swift `rawRequest` arguments plus the session cookie to send).
+ */
+public struct RawRequestRecord: Equatable, Hashable {
+    public var method: HttpMethod
+    /**
+     * Absolute URL including the query string, exactly as it must be sent.
+     */
+    public var url: String
+    public var body: Data?
+    public var contentType: String?
+    /**
+     * Inactivity timeout in seconds; `None` = the 35 s default.
+     */
+    public var timeoutSecs: Double?
+    public var headers: [String: String]
+    /**
+     * Sent as `Cookie: zpw_sek=..; _zlang=vi` + `zpw_sek:` header on Zalo hosts only.
+     */
+    public var zpwSek: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(method: HttpMethod, 
+        /**
+         * Absolute URL including the query string, exactly as it must be sent.
+         */url: String, body: Data?, contentType: String?, 
+        /**
+         * Inactivity timeout in seconds; `None` = the 35 s default.
+         */timeoutSecs: Double?, headers: [String: String], 
+        /**
+         * Sent as `Cookie: zpw_sek=..; _zlang=vi` + `zpw_sek:` header on Zalo hosts only.
+         */zpwSek: String?) {
+        self.method = method
+        self.url = url
+        self.body = body
+        self.contentType = contentType
+        self.timeoutSecs = timeoutSecs
+        self.headers = headers
+        self.zpwSek = zpwSek
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension RawRequestRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRawRequestRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RawRequestRecord {
+        return
+            try RawRequestRecord(
+                method: FfiConverterTypeHttpMethod.read(from: &buf), 
+                url: FfiConverterString.read(from: &buf), 
+                body: FfiConverterOptionData.read(from: &buf), 
+                contentType: FfiConverterOptionString.read(from: &buf), 
+                timeoutSecs: FfiConverterOptionDouble.read(from: &buf), 
+                headers: FfiConverterDictionaryStringString.read(from: &buf), 
+                zpwSek: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RawRequestRecord, into buf: inout [UInt8]) {
+        FfiConverterTypeHttpMethod.write(value.method, into: &buf)
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterOptionData.write(value.body, into: &buf)
+        FfiConverterOptionString.write(value.contentType, into: &buf)
+        FfiConverterOptionDouble.write(value.timeoutSecs, into: &buf)
+        FfiConverterDictionaryStringString.write(value.headers, into: &buf)
+        FfiConverterOptionString.write(value.zpwSek, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRawRequestRecord_lift(_ buf: RustBuffer) throws -> RawRequestRecord {
+    return try FfiConverterTypeRawRequestRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRawRequestRecord_lower(_ value: RawRequestRecord) -> RustBuffer {
+    return FfiConverterTypeRawRequestRecord.lower(value)
+}
+
+
+/**
+ * Any HTTP answer (no status mapping), like Swift's `(status, data, cookieSek)`.
+ */
+public struct RawResponseRecord: Equatable, Hashable {
+    public var status: UInt16
+    public var body: Data
+    /**
+     * Valid `zpw_sek` found in `Set-Cookie`, when any.
+     */
+    public var zpwSekCookie: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(status: UInt16, body: Data, 
+        /**
+         * Valid `zpw_sek` found in `Set-Cookie`, when any.
+         */zpwSekCookie: String?) {
+        self.status = status
+        self.body = body
+        self.zpwSekCookie = zpwSekCookie
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension RawResponseRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRawResponseRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RawResponseRecord {
+        return
+            try RawResponseRecord(
+                status: FfiConverterUInt16.read(from: &buf), 
+                body: FfiConverterData.read(from: &buf), 
+                zpwSekCookie: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RawResponseRecord, into buf: inout [UInt8]) {
+        FfiConverterUInt16.write(value.status, into: &buf)
+        FfiConverterData.write(value.body, into: &buf)
+        FfiConverterOptionString.write(value.zpwSekCookie, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRawResponseRecord_lift(_ buf: RustBuffer) throws -> RawResponseRecord {
+    return try FfiConverterTypeRawResponseRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRawResponseRecord_lower(_ value: RawResponseRecord) -> RustBuffer {
+    return FfiConverterTypeRawResponseRecord.lower(value)
+}
+
+
 public struct ReactionIconRecord: Equatable, Hashable {
     public var kind: String
     public var key: String
@@ -11084,6 +11444,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_mediapublishhook_before_publish() != 3838) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_corerawhttp_download() != 44253) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corerawhttp_download_sync_batch() != 17218) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corerawhttp_request() != 41914) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coresession_clear_session() != 4619) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11280,6 +11649,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_constructor_mediacancel_new() != 57572) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_constructor_corerawhttp_new() != 28295) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_constructor_coresession_new() != 51392) {

@@ -40,6 +40,7 @@ mod crypto;
 mod error;
 mod http;
 mod media;
+mod raw_http;
 mod runtime;
 mod session;
 mod store;
@@ -56,6 +57,7 @@ pub use crypto::{decrypt_ws_frame, inflate};
 pub use error::{CoreError, NetworkKind};
 pub use http::{CoreHttp, HttpMethod, HttpRequestRecord, UploadPartRecord};
 pub use media::*;
+pub use raw_http::{CoreRawHttp, RawRequestRecord, RawResponseRecord};
 pub use session::{CoreSession, CoreSessionStatus, QrListener, QrScanRecord, QrTicketRecord};
 pub use store::{
     ConversationRow, CoreStore, MessageRow, MessagesAroundRow, StoredChat, StoredChatAround,

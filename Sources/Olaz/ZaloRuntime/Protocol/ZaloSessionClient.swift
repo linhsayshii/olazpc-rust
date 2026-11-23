@@ -90,6 +90,7 @@ actor ZaloSessionClient {
     private var coreSession: CoreSession?
     private var coreApiHandle: CoreApi?
     private var coreHttpHandle: CoreHttp?
+    private var coreRawHandle: CoreRawHttp?
     private var corePushedSnapshot = ""
 
     var domains = ZaloDomains()
@@ -237,6 +238,14 @@ actor ZaloSessionClient {
     /// The generic signed-request seam (`get` / `post` / `postMultipart`) over the same core session as `coreApi()`.
     func coreHttp() -> CoreHttp? {
         syncCoreSession() ? coreHttpHandle : nil
+    }
+
+    /// The session-free raw HTTP seam (`rawRequest`, downloads), or `nil` on the Swift path. It needs no account: the QR
+    /// login flow uses it before one exists, and Swift passes its own `zpwSek` on every call so there is one owner.
+    private func coreRaw() -> CoreRawHttp? {
+        guard useRustCore else { return nil }
+        if coreRawHandle == nil { coreRawHandle = try? CoreRawHttp() }
+        return coreRawHandle
     }
 
     /// Creates the core session on first use and pushes our current state into it when it changed.
@@ -1003,6 +1012,10 @@ actor ZaloSessionClient {
     }
 
     func rawDownloadData(url: URL, timeout: TimeInterval = 20) async throws -> Data {
+        if let raw = coreRaw() {
+            do { return try await raw.download(url: url.absoluteString, timeoutSecs: timeout) }
+            catch { throw RustCore.mapError(error, quietTimeout: true) }
+        }
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         req.timeoutInterval = timeout
@@ -1016,6 +1029,20 @@ actor ZaloSessionClient {
     }
 
     func downloadSyncBatch(url: URL, timeout: TimeInterval = 45) async throws -> Data {
+        if let raw = coreRaw() {
+            do {
+                return try await raw.downloadSyncBatch(
+                    url: url.absoluteString, timeoutSecs: timeout, zpwSek: zpwSek, userId: account?.userId)
+            } catch {
+                if case CoreError.Http(let status) = error {
+                    let host = url.host ?? "-"
+                    Task { @MainActor in
+                        EngineLog.shared.write("sync-v2: batch download failed http=\(status) host=\(host)")
+                    }
+                }
+                throw RustCore.mapError(error, quietTimeout: true)
+            }
+        }
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         req.timeoutInterval = timeout
@@ -1273,6 +1300,15 @@ actor ZaloSessionClient {
         timeout: TimeInterval? = nil,
         extraHeaders: [String: String] = [:]
     ) async throws -> (Int, Data, String?) {
+        if let raw = coreRaw() {
+            let record = RawRequestRecord(
+                method: method.uppercased() == "POST" ? .post : .get, url: url.absoluteString, body: body,
+                contentType: contentType, timeoutSecs: timeout, headers: extraHeaders, zpwSek: zpwSek)
+            do {
+                let out = try await raw.request(request: record)
+                return (Int(out.status), out.body, out.zpwSekCookie)
+            } catch { throw RustCore.mapError(error, quietTimeout: true) }
+        }
         var req = URLRequest(url: url)
         req.httpMethod = method
         if let timeout {
