@@ -178,7 +178,7 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
         /// Kinds the official client lays out centered, outside the message bubbles.
         var isStandalone: Bool {
             switch self {
-            case .system, .notice, .ecard: true
+            case .system, .notice, .ecard, .poll: true
             default: false
             }
         }

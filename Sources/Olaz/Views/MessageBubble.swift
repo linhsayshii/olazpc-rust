@@ -169,6 +169,8 @@ struct MessageRow: View {
     let showStatus: Bool
     /// The chat's newest message: it carries the coach mark of the tour.
     var isNewest = false
+    /// Poll event rows: this is the newest event of its poll, so it shows the card.
+    var showsPollCard = true
     var onReply: (ChatMessage) -> Void
     var onReact: (String, ChatMessage) -> Void
 
@@ -193,6 +195,12 @@ struct MessageRow: View {
         case .notice(let symbol, let text):
             NoticeRow(symbol: symbol, text: text, buttons: message.cardButtons)
                 .cardActionHost(message)
+                .messageTourAnchor(isNewest)
+        case .poll(let poll):
+            // Official layout: poll events are centered info lines, the card under the newest one; no sender bubble.
+            PollMessageView(poll: poll, message: message, showsCard: showsPollCard)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 4)
                 .messageTourAnchor(isNewest)
         case .ecard(let card):
             ECardView(card: card, buttons: message.cardButtons, suggestsStickers: message.suggestsStickers)
@@ -690,6 +698,7 @@ extension MessageRow: Equatable {
     nonisolated static func == (a: MessageRow, b: MessageRow) -> Bool {
         a.message == b.message && a.isGroup == b.isGroup && a.firstInGroup == b.firstInGroup
             && a.lastInGroup == b.lastInGroup && a.showStatus == b.showStatus && a.isNewest == b.isNewest
+            && a.showsPollCard == b.showsPollCard
     }
 }
 

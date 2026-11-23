@@ -246,6 +246,26 @@ import Testing
         #expect(msg.text == "Hoàng Việt Linh đã ghim tin nhắn a đi dạy về ah.")
     }
 
+    /// `group.poll` events: actor + verb of `content.action` + question (Rust `group_poll_event_info_line`).
+    @Test func groupPollEventInfoLine() {
+        func header(_ action: String, from: String) -> String {
+            let evt = ZaloWireParser.parseWireMessage(
+                [
+                    "msgId": "9\(action)", "uidFrom": from, "idTo": "3993665107146848278", "msgType": "group.poll", "ts": 1,
+                    "content": ["action": action, "title": "", "description": "",
+                                "params": #"{"pollId":1192926841,"question":"Khỏe không","uid":"x","dName":"Việt Linh","pollVer":2}"#]
+                ],
+                myUid: "me", isGroupHint: true
+            )
+            guard case .message(let msg, _) = evt, case .poll(let info) = msg.kind else { return "" }
+            return info.header
+        }
+        #expect(header("create", from: "peer") == "Việt Linh tạo cuộc bình chọn mới: Khỏe không")
+        #expect(header("vote", from: "peer") == "Việt Linh tham gia cuộc bình chọn: Khỏe không")
+        #expect(header("update", from: "peer") == "Việt Linh đổi lựa chọn trong cuộc bình chọn: Khỏe không")
+        #expect(header("vote", from: "0") == "Bạn tham gia cuộc bình chọn: Khỏe không")
+    }
+
     @Test @MainActor func recallEnforces24hGuardAndApplyRemoteRecallUpdatesBubbleSQLiteAndPreview() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-recall-engine-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

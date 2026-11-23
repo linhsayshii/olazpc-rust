@@ -1118,3 +1118,26 @@ fn webchat_msginfo_actionlist_is_system() {
     ));
     assert_eq!(plain.kind_tag, "text");
 }
+
+/// `group.poll` events (official `_onMessageInfoEvent`): the info line is the actor + the verb of `content.action` + the
+/// question from `content.params`; the actor is "Bạn" for my own events.
+#[test]
+fn group_poll_event_info_line() {
+    let ev = |action: &str, from: &str| {
+        let raw = format!(
+            r#"{{"msgId":"9{action}","msgType":"group.poll","uidFrom":"{from}","idTo":"3993665107146848278","ts":"1",
+                "content":{{"action":"{action}","title":"","description":"","params":"{{\"pollId\":1192926841,\"question\":\"Khỏe không\",\"uid\":\"{from}\",\"dName\":\"Việt Linh\",\"pollVer\":2}}"}}}}"#
+        );
+        let mut o = WireParseOptions::default();
+        o.is_group_hint = Some(true);
+        let (_, s) = msg_of(parse_wire_message(&obj(&raw), "me", &o));
+        let kind: serde_json::Value = serde_json::from_slice(&s.raw_json_data).unwrap();
+        kind["kind"]["header"].as_str().unwrap().to_string()
+    };
+    assert_eq!(ev("create", "peer"), "Việt Linh tạo cuộc bình chọn mới: Khỏe không");
+    assert_eq!(ev("vote", "peer"), "Việt Linh tham gia cuộc bình chọn: Khỏe không");
+    assert_eq!(ev("update", "peer"), "Việt Linh đổi lựa chọn trong cuộc bình chọn: Khỏe không");
+    assert_eq!(ev("share", "peer"), "Việt Linh chia sẻ cuộc bình chọn: Khỏe không");
+    assert_eq!(ev("close", "peer"), "Việt Linh khóa bình chọn: Khỏe không");
+    assert_eq!(ev("vote", "0"), "Bạn tham gia cuộc bình chọn: Khỏe không");
+}

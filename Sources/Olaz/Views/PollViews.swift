@@ -137,22 +137,23 @@ struct PollMessageView: View {
 
     private var conversationId: String { poll.conversationId.isEmpty ? message.conversationId : poll.conversationId }
 
-    /// This message is the newest poll event of its poll in the loaded list.
-    private var isNewest: Bool {
-        guard !poll.pollId.isEmpty else { return true }
-        let newest = engine.messages(in: message.conversationId)?.last { other in
-            if case .poll(let info) = other.kind { return info.pollId == poll.pollId }
-            return false
-        }
-        return newest == nil || newest?.id == message.id
+    /// This message is the newest event of its poll in the list (decided by the list, part of its row layout).
+    var showsCard = true
+    private var isNewest: Bool { showsCard }
+
+    /// The event line; events stored before the header was parsed fall back to the official generic line.
+    private var infoLine: String {
+        if !poll.header.isEmpty { return poll.header }
+        guard !poll.pollId.isEmpty, !isNewest else { return "" }
+        return "Có thành viên tham gia cuộc bình chọn: \(poll.question)"
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if !poll.header.isEmpty {
+        VStack(alignment: .center, spacing: 8) {
+            if !infoLine.isEmpty {
                 HStack(spacing: 6) {
                     Image(systemName: "chart.bar.fill").foregroundStyle(.tint)
-                    Text(poll.header).lineLimit(2)
+                    Text(infoLine).lineLimit(2).multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
                     if !poll.pollId.isEmpty {
                         Button("Xem") { sheet = .vote }.buttonStyle(.plain).foregroundStyle(.tint)
                     }
@@ -166,7 +167,7 @@ struct PollMessageView: View {
                 PollDetailCard(poll: poll, conversationId: conversationId, open: { sheet = $0 })
             }
         }
-        .frame(maxWidth: 300, alignment: .leading)
+        .frame(maxWidth: 420)
         .sheet(item: $sheet) { mode in
             PollDetailSheet(pollId: poll.pollId, conversationId: conversationId, question: poll.question, startOnVoters: mode == .voters)
         }

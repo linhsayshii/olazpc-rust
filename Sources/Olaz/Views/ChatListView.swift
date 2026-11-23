@@ -28,9 +28,15 @@ struct ChatRowModel: Equatable {
     var isGroup: Bool
     var isNewest: Bool
     var isHighlighted: Bool
+    /// A poll event row that is the newest event of its poll in the list: it carries the poll card (taller).
+    var showsPollCard = false
+    /// That card's poll detail is loaded (or failed): the card has its final height.
+    var pollReady = false
 
-    /// Same height: newest / highlighted only change a background.
-    func sameLayout(as other: ChatRowModel) -> Bool { row == other.row && isGroup == other.isGroup }
+    /// Same height: newest / highlighted only change a background; the poll card changes the height.
+    func sameLayout(as other: ChatRowModel) -> Bool {
+        row == other.row && isGroup == other.isGroup && showsPollCard == other.showsPollCard && pollReady == other.pollReady
+    }
 
     /// Rows of one kind share hosts: re-rooting a host with a row of the same structure is a cheap SwiftUI update.
     var reuseKind: Int {
@@ -74,6 +80,7 @@ struct ChatRowContent: View {
             let actions = actions
             MessageRow(message: m, isGroup: model.isGroup, firstInGroup: first, lastInGroup: last, showStatus: status,
                        isNewest: model.isNewest,
+                       showsPollCard: model.showsPollCard,
                        onReply: { actions.reply($0) },
                        onReact: { actions.react($0, $1) })
                 .equatable()
@@ -128,6 +135,8 @@ struct ChatListView: NSViewRepresentable {
     let isGroup: Bool
     let newestId: String?
     let highlightedId: String?
+    /// Polls whose detail is loaded or failed (their card no longer changes height on its own).
+    var pollsReady: Set<String> = []
     let loadingOlder: Bool
     /// Room the bars over the list take (the list scrolls under them).
     let insets: EdgeInsets
@@ -150,7 +159,7 @@ struct ChatListView: NSViewRepresentable {
         controller.actions.react = onReact
         controller.onMetrics = onMetrics
         controller.update(conversationId: conversationId, rows: rows, isGroup: isGroup, newestId: newestId,
-                          highlightedId: highlightedId, loadingOlder: loadingOlder, insets: insets,
+                          highlightedId: highlightedId, pollsReady: pollsReady, loadingOlder: loadingOlder, insets: insets,
                           environment: context.environment)
     }
 
@@ -292,7 +301,7 @@ final class ChatListController: NSObject {
         let i = firstRow(below: point.y)
         guard i < models.count, tops[i] <= point.y, case .message(let m, _, _, _) = models[i].row.kind else { return nil }
         switch m.kind {
-        case .system, .notice, .ecard, .recalled: return nil
+        case .system, .notice, .ecard, .poll, .recalled: return nil
         default: break
         }
         let id = models[i].row.id
@@ -324,7 +333,7 @@ final class ChatListController: NSObject {
     // MARK: Update from SwiftUI
 
     func update(conversationId: String, rows: [ChatRow], isGroup: Bool, newestId: String?, highlightedId: String?,
-                loadingOlder: Bool, insets: EdgeInsets, environment: EnvironmentValues) {
+                pollsReady: Set<String> = [], loadingOlder: Bool, insets: EdgeInsets, environment: EnvironmentValues) {
         applyingUpdate = true
         defer { applyingUpdate = false }
         self.environment = environment
@@ -346,9 +355,23 @@ final class ChatListController: NSObject {
             memo.removeAll()
         }
 
+        // The newest event of each poll shows its card (official list: one card per poll, under its last event).
+        var newestPollEvent: [String: String] = [:]
+        for row in rows {
+            if case .message(let m, _, _, _) = row.kind, case .poll(let info) = m.kind, !info.pollId.isEmpty {
+                newestPollEvent[info.pollId] = m.id
+            }
+        }
         let newModels = rows.map { row -> ChatRowModel in
             let id: String? = if case .message(let m, _, _, _) = row.kind { m.id } else { nil }
-            return ChatRowModel(row: row, isGroup: isGroup, isNewest: id != nil && id == newestId, isHighlighted: id != nil && id == highlightedId)
+            var showsPollCard = false
+            var pollReady = false
+            if case .message(let m, _, _, _) = row.kind, case .poll(let info) = m.kind {
+                showsPollCard = info.pollId.isEmpty || newestPollEvent[info.pollId] == m.id
+                pollReady = showsPollCard && pollsReady.contains(info.pollId)
+            }
+            return ChatRowModel(row: row, isGroup: isGroup, isNewest: id != nil && id == newestId,
+                                isHighlighted: id != nil && id == highlightedId, showsPollCard: showsPollCard, pollReady: pollReady)
         }
 
         if conversationId != self.conversationId {

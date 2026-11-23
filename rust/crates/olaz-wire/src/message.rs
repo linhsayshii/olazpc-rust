@@ -922,8 +922,26 @@ pub fn parse_wire_message(
             let poll_id = string(pick_opt(dd.cp, &["poll_id", "pollId"]).or(dd.d("pollId")));
             let question =
                 first_non_empty(&[&string(dd.p("question").or(dd.d("title"))), "Bình chọn"]);
+            // Official `_onMessageInfoEvent`: actor + verb of `content.action` + question (params).
+            let verb = match dd.ds("action").as_str() {
+                "create" => "tạo cuộc bình chọn mới",
+                "share" => "chia sẻ cuộc bình chọn",
+                "vote" => "tham gia cuộc bình chọn",
+                "update" => "đổi lựa chọn trong cuộc bình chọn",
+                "close" => "khóa bình chọn",
+                _ => "",
+            };
+            let actor = if is_mine { "Bạn".to_string() } else { dd.ps("dName") };
+            let header = first_non_empty(&[
+                &dd.ds("description"),
+                &if !verb.is_empty() && !actor.is_empty() {
+                    format!("{actor} {verb}: {question}")
+                } else {
+                    String::new()
+                },
+            ]);
             kind_dict = obj(json!({
-                "type": "poll", "question": question, "header": dd.ds("description"),
+                "type": "poll", "question": question, "header": header,
                 "anonymous": ns_bool(dd.p("is_anonymous")).unwrap_or(false),
                 "pollId": poll_id, "conversationId": conv_id
             }));

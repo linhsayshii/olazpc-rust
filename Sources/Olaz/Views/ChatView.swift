@@ -791,7 +791,9 @@ private struct MessageList: View {
             .overlay {
                 ChatListView(
                     conversationId: id, rows: rows, isGroup: conversation.isGroup, newestId: newestId,
-                    highlightedId: highlightedMessageId, loadingOlder: loadingOlder, insets: insets, commands: commands,
+                    highlightedId: highlightedMessageId,
+                    pollsReady: Set(engine.polls.details.keys).union(engine.polls.failed),
+                    loadingOlder: loadingOlder, insets: insets, commands: commands,
                     onReply: onReply,
                     onReact: { emoji, msg in engine.react(emoji, to: msg.id, in: id) },
                     onMetrics: { m in metricsChanged(m, hasMore: hasMore, count: msgs.count) })

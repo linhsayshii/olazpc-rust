@@ -692,7 +692,16 @@ enum ZaloWireParser {
         case "group.poll", "chat.poll":
             let pollId = JSONLossless.string(contentParams?["poll_id"] ?? contentParams?["pollId"] ?? contentDict?["pollId"])
             let question = firstNonEmpty(JSONLossless.string(contentParams?["question"] ?? contentDict?["title"]), "Bình chọn")
-            let header = JSONLossless.string(contentDict?["description"])
+            // Official `_onMessageInfoEvent`: actor + verb of `content.action` + question (params).
+            let verb: String = [
+                "create": "tạo cuộc bình chọn mới", "share": "chia sẻ cuộc bình chọn", "vote": "tham gia cuộc bình chọn",
+                "update": "đổi lựa chọn trong cuộc bình chọn", "close": "khóa bình chọn"
+            ][JSONLossless.string(contentDict?["action"])] ?? ""
+            let actor = isMine ? "Bạn" : JSONLossless.string(contentParams?["dName"])
+            let header = firstNonEmpty(
+                JSONLossless.string(contentDict?["description"]),
+                (!verb.isEmpty && !actor.isEmpty) ? "\(actor) \(verb): \(question)" : ""
+            )
             kindDict = [
                 "type": "poll",
                 "question": question,
