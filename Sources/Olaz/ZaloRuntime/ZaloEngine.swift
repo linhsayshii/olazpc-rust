@@ -1448,6 +1448,9 @@ final class ZaloEngine {
                 }
             } else if case let pinConvs = ZaloWireParser.pinTopicEventConversations(actType: actType, act: act, data: actData), !pinConvs.isEmpty {
                 for pinConv in pinConvs { handlePinTopicEvent(conversationId: pinConv) }
+            } else if actType == "group", ZaloWireParser.groupEventNoticeActs.contains(act) {
+                let ts = JSONLossless.int64(ctrl["ts"] ?? contentObj["ts"] ?? actData["ts"]) ?? 0
+                await handleGroupEventNotice(act: act, data: actData, ts: ts)
             } else if actType == "mute" {
                 let rawId = JSONLossless.string(actData["toId"] ?? actData["toid"] ?? actData["id"])
                 let muteType = JSONLossless.int64(actData["muteType"]) ?? 1
