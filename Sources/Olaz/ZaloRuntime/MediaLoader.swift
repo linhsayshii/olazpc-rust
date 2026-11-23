@@ -21,7 +21,10 @@ struct SendableImage: @unchecked Sendable {
 /// Decoded (downsampled) images are kept in an `NSCache`; concurrent requests for the same URL share
 /// one download, which is cancelled when every waiter cancels. Downloads are capped at 6 concurrent.
 actor MediaLoader {
-    static let shared = MediaLoader()
+    /// Cache root for `shared` (nil: ~/Library/Caches/Olaz). Set only by the offline scroll benchmark, before first use, so a
+    /// benchmark run never touches the real caches.
+    nonisolated(unsafe) static var sharedCacheDirectory: URL?
+    static let shared = MediaLoader(cacheDirectory: sharedCacheDirectory)
 
     enum LoadError: Error, LocalizedError {
         case badURL
