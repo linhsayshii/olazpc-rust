@@ -44,6 +44,14 @@ actor ZaloE2EEManager {
     private var peerDeviceMeta: [String: [(deviceId: Int, sessionKey: Int64)]] = [:]
     private var fetchedBundlePeers: Set<String> = []
     private var didLoadThreadsFromStore = false
+    /// Global id -> uid (`/api/gid/decrypt`), for the owner of an E2EE quote.
+    /// `(globalId, candidate uids)` -> (uid, how it was found).
+    typealias GlobalIdResolver = @Sendable (String, [String]) async -> (uid: String, via: String)?
+    private var globalIdResolver: GlobalIdResolver?
+
+    func setGlobalIdResolver(_ resolver: @escaping GlobalIdResolver) {
+        globalIdResolver = resolver
+    }
 
     /// `mode == nil` resolves the flags (`OLAZ_RUST_CORE`, `OLAZ_E2EE_RUST`, `olaz.e2eeRust`); tests pass one.
     /// `logSink == nil` writes to the engine log.
@@ -109,11 +117,19 @@ actor ZaloE2EEManager {
         ]
     }
 
-    static func buildAckInitSessionInnerData(uidTo: String, deviceId: Int, ts: Int64) -> [String: Any] {
-        [
-            "type": 0,
+    /// Official `ACK_TYPE`.
+    static let ackTypeFailed = 0
+    static let ackTypeSuccess = 1
+
+    /// Official `sendAckSession`: on success the entry carries `data`, the encrypted `{"subDevice":[...]}` the initiator
+    /// decrypts to finish the session (until then it keeps sending PreKey messages); on failure `iid`, our registration id.
+    static func buildAckInitSessionInnerData(uidTo: String, deviceId: Int, ts: Int64, cipher: String?, registrationId: Int) -> [String: Any] {
+        var entry: [String: Any] = ["deviceId": deviceId, "ts": ts]
+        if let cipher { entry["data"] = cipher } else { entry["iid"] = registrationId }
+        return [
+            "type": cipher == nil ? ackTypeFailed : ackTypeSuccess,
             "uidTo": uidTo,
-            "data": [["deviceId": deviceId, "ts": ts]],
+            "data": [entry],
         ]
     }
 
@@ -488,16 +504,24 @@ actor ZaloE2EEManager {
                 let ts = JSONLossless.int64(sData["reqServerTs"] ?? sData["ts"]) ?? Int64(Date().timeIntervalSince1970 * 1000)
 
                 if !fromUid.isEmpty && ZaloWireParser.isSignalCiphertext(cipher) {
+                    var ackCipher: String?
                     if let _ = await decryptString(uid: uid, senderUid: fromUid, preferredDeviceId: devId, cipher: cipher) {
                         storeDirty = true
                         if fromUid != uid {
                             await markE2EEConversation(fromUid, enabled: true, store: store)
                         }
+                        let subDevices = await listSessions(remoteUid: uid).map(\.deviceId).filter { $0 != Self.localDeviceId }
+                        let body = "{\"subDevice\":[\(Set(subDevices).sorted().map(String.init).joined(separator: ","))]}"
+                        ackCipher = await encryptOne(remoteUid: fromUid, device: devId, text: body)
+                    }
+                    if fromUid != uid {
+                        logSink("e2ee: init session dev=\(devId) cipher=\(E2EEShadow.cipherType(cipher)) ack=\(ackCipher == nil ? "failed" : "success")")
                         _ = await webSocket.sendRequestFrame(
                             cmd: Self.cmdAckInitSession,
                             subCmd: 0,
                             version: 1,
-                            innerData: ZaloJSONBox(Self.buildAckInitSessionInnerData(uidTo: fromUid, deviceId: devId, ts: ts)),
+                            innerData: ZaloJSONBox(Self.buildAckInitSessionInnerData(
+                                uidTo: fromUid, deviceId: devId, ts: ts, cipher: ackCipher, registrationId: registrationId)),
                             timeoutSeconds: 6
                         )
                     }
@@ -614,8 +638,13 @@ actor ZaloE2EEManager {
         if !needsFetch && !fetchedBundlePeers.contains(cleanPeer) && cleanPeer != cleanMe && mySessions.isEmpty {
             needsFetch = true
         }
-        guard needsFetch else { return !peerSessions.isEmpty }
+        let before = peerSessions.map { "\($0.deviceId)" }.joined(separator: ",")
+        guard needsFetch else {
+            logSink("e2ee send: sessions devices=[\(before)] own=\(mySessions.count) fetch=no")
+            return !peerSessions.isEmpty
+        }
         guard await webSocket.isAuthed else { return !peerSessions.isEmpty }
+        var rebuilt: [String] = []
 
         let resp = await webSocket.sendRequestFrame(
             cmd: Self.cmdGetBundle,
@@ -653,7 +682,10 @@ actor ZaloE2EEManager {
                     continue
                 }
 
-                if await processPreKeyBundle(myUid: cleanMe, remoteUid: entry.uid, deviceId: devId, bundle: bundleObj) {
+                let hadSession = existingSessions.contains { $0.deviceId == devId }
+                let processed = await processPreKeyBundle(myUid: cleanMe, remoteUid: entry.uid, deviceId: devId, bundle: bundleObj)
+                rebuilt.append("\(entry.uid == cleanPeer ? "peer" : "own"):\(devId):\(hadSession ? "replaced" : "new"):\(processed ? "ok" : "fail")")
+                if processed {
                     storeDirty = true
                     if entry.uid == cleanPeer && bundleRegId > 0 {
                         var list = peerDeviceMeta[cleanPeer] ?? []
@@ -670,6 +702,8 @@ actor ZaloE2EEManager {
 
         await persistStoreIfNeeded(store: store)
         peerSessions = await listSessions(remoteUid: cleanPeer)
+        logSink("e2ee send: sessions before=[\(before)] own=\(mySessions.count) fetch=yes bundles=\(bundleEntries.map { $0.devices.count }) "
+                + "processed=[\(rebuilt.joined(separator: ","))] after=[\(peerSessions.map { "\($0.deviceId)" }.joined(separator: ","))]")
         if !peerSessions.isEmpty {
             fetchedBundlePeers.insert(cleanPeer)
         }
@@ -681,13 +715,17 @@ actor ZaloE2EEManager {
         myUid: String,
         text: String,
         quoteText: String? = nil,
+        quoteExtras: [String] = [],
         store: ZaloSQLiteStore?
     ) async -> [(toId: String, platform: Int, registrationId: Int, ciphers: [String])] {
         var values: [JSBridgeValue] = [.string(text)]
         var formats: [String] = ["string"]
         if let quoteText {
-            values.append(.string(quoteText))
-            formats.append("string")
+            // Official `sendMsgQuote`: text, quote text, then the attach JSON, text styles, owner name, owner global id.
+            for value in [quoteText] + quoteExtras {
+                values.append(.string(value))
+                formats.append("string")
+            }
         }
         return await encryptBatch(peerUid: peerUid, myUid: myUid, values: values, formats: formats, store: store)
     }
@@ -813,10 +851,33 @@ actor ZaloE2EEManager {
         }
 
         output = output.filter { $0.ciphers.count == values.count }
+        logSink("e2ee send: encrypt values=\(values.count) targets=\(targets.count) out=["
+                + output.map { "\($0.toId == cleanPeer ? "peer" : "own"):\($0.platform):"
+                    + $0.ciphers.map(E2EEShadow.cipherType).joined(separator: "+") }.joined(separator: ",") + "]")
         guard output.contains(where: { $0.toId == cleanPeer }) else {
             return []
         }
         return output
+    }
+
+    /// This client's Signal device id (official `DeviceIds.PC`).
+    static let localDeviceId = 2
+
+    /// One UTF-8 value encrypted for one device on whichever backend is live; nil on failure.
+    private func encryptOne(remoteUid: String, device: Int, text: String) async -> String? {
+        if let rust {
+            guard let enc = try? await rust.encryptCipher(remoteUid: remoteUid, device: UInt32(device), plaintext: Data(text.utf8))
+            else { return nil }
+            storeDirty = true
+            return enc.cipher
+        }
+        guard let rt = runtime else { return nil }
+        jsSnapshotCache = nil
+        guard let res = try? await rt.callAsync("ZaloE2EE.pc.encryptCipher", [
+            .string(loadedUid), .string(remoteUid), .number(Double(device)), .string(text), .string("string"),
+        ]), res["ok"]?.boolValue == true, let cipher = res["cipher"]?.stringValue else { return nil }
+        storeDirty = true
+        return cipher
     }
 
     /// Plaintext bytes of one batch value as `encryptCipher` frames it: UTF-8 text, or a 4-byte LE uint32.
@@ -892,12 +953,31 @@ actor ZaloE2EEManager {
         let msgType = ZaloWireParser.normalizedMsgType(JSONLossless.string(raw["msgType"]))
         var updated = raw
 
-        // Decrypt quote fields if E2EE-encrypted
+        // Decrypt quote fields if E2EE-encrypted: the text, the owner's name (`fromD`) and the owner, sent as an
+        // encrypted global id (official `sendMsgQuote`) that maps back to a uid.
         if var quote = (raw["quote"] as? [String: Any]) {
-            let qMsg = JSONLossless.string(quote["msg"])
-            if ZaloWireParser.isSignalCiphertext(qMsg),
-               let plainQ = await decryptString(uid: myUid, senderUid: senderUid, preferredDeviceId: preferredDev, cipher: qMsg) {
-                quote["msg"] = plainQ
+            var changed = false
+            for key in ["msg", "fromD", "attach"] {
+                let value = JSONLossless.string(quote[key])
+                if ZaloWireParser.isSignalCiphertext(value),
+                   let plain = await decryptString(uid: myUid, senderUid: senderUid, preferredDeviceId: preferredDev, cipher: value) {
+                    quote[key] = plain
+                    changed = true
+                }
+            }
+            // Official `decryptMsgFromServer`: the owner arrives as `gOwnerId`, an encrypted global id; once mapped it
+            // becomes `ownerId` and the name shown is the local one for that uid, not the sender's `fromD`.
+            let owner = JSONLossless.string(quote["gOwnerId"])
+            if ZaloWireParser.isSignalCiphertext(owner),
+               let gid = await decryptString(uid: myUid, senderUid: senderUid, preferredDeviceId: preferredDev, cipher: owner) {
+                let found = gid.isEmpty ? nil : await globalIdResolver?(gid, [myUid, senderUid])
+                // Unresolved: drop the cipher so the name in `fromD` is shown.
+                quote["ownerId"] = found?.uid ?? ""
+                quote["gOwnerId"] = nil
+                changed = true
+                logSink("e2ee: quote owner via=\(found?.via ?? "none") keys=\(quote.keys.sorted().joined(separator: ","))")
+            }
+            if changed {
                 updated["quote"] = quote
                 updated["isE2EE"] = true
             }

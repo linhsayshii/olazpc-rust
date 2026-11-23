@@ -1870,10 +1870,17 @@ private final class MockProfileURLProtocol: URLProtocol, @unchecked Sendable {
         #expect((submitPreKeys["opKeys"] as? [[String: Any]])?.count == 1)
         #expect(submitPreKeys["data"] == nil)
 
-        let ackInit = ZaloE2EEManager.buildAckInitSessionInnerData(uidTo: "222", deviceId: 0, ts: 1700000000000)
-        #expect(ackInit["type"] as? Int == 0)
+        // Official sendAckSession: SUCCESS (1) carries the encrypted subDevice payload, FAILED (0) our iid.
+        let ackInit = ZaloE2EEManager.buildAckInitSessionInnerData(uidTo: "222", deviceId: 0, ts: 1700000000000, cipher: "Mw==", registrationId: 7)
+        #expect(ackInit["type"] as? Int == 1)
         #expect(ackInit["uidTo"] as? String == "222")
-        #expect((ackInit["data"] as? [[String: Any]])?.count == 1)
+        let ackEntry = try #require((ackInit["data"] as? [[String: Any]])?.first)
+        #expect(ackEntry["data"] as? String == "Mw==")
+        #expect(ackEntry["iid"] == nil)
+        #expect(ackEntry["ts"] as? Int64 == 1700000000000)
+        let ackFail = ZaloE2EEManager.buildAckInitSessionInnerData(uidTo: "222", deviceId: 0, ts: 1, cipher: nil, registrationId: 7)
+        #expect(ackFail["type"] as? Int == 0)
+        #expect((ackFail["data"] as? [[String: Any]])?.first?["iid"] as? Int == 7)
 
         let doneProc = ZaloE2EEManager.buildDoneProcessSessionInnerData(info: [["gid": "10", "cmd": 543]])
         #expect(doneProc["queueName"] as? String == "")

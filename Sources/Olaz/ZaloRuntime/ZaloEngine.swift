@@ -535,6 +535,17 @@ final class ZaloEngine {
             }
         }
         await e2eeManager.loadPersistedThreads(store: store)
+        let client = sessionClient
+        // The owner of an E2EE quote is nearly always one of the two people in the chat: their global ids come from
+        // `/api/gid/encrypt` (cached), the same call that builds our own quotes; anyone else goes through `/api/gid/decrypt`.
+        await e2eeManager.setGlobalIdResolver { gid, candidates in
+            let known = await client.encryptGlobalIds(candidates)
+            for (index, uid) in candidates.map(ZaloWireParser.stripUserPrefix).enumerated() where known[uid] == gid {
+                return (uid, index == 0 ? "own" : "sender")
+            }
+            if let uid = await client.decryptGlobalIds([gid])[gid] { return (uid, "decrypt") }
+            return nil
+        }
         if let myUid = profile?.userId, !myUid.isEmpty {
             let mgr = e2eeManager
             Task.detached(priority: .utility) {

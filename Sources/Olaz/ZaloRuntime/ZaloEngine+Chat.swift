@@ -361,13 +361,27 @@ extension ZaloEngine {
                 }
 
                 let qMsgInt = quote.flatMap { Int64($0.id.trimmingCharacters(in: .whitespacesAndNewlines)) }
-                let hasValidQuote = (quote != nil && qMsgInt != nil && qMsgInt != 0)
+                // The peer decrypts the quoted message's owner as an encrypted global id; without one the whole message
+                // fails on their side ("tạm thời chưa hiển thị"), so a quote whose owner has none goes out as a plain text.
+                let quoteOwner = quote.map { ZaloWireParser.stripUserPrefix($0.senderId.isEmpty ? myUid : $0.senderId) } ?? ""
+                var ownerGlobalId = ""
+                if quote != nil, qMsgInt != nil, qMsgInt != 0, !quoteOwner.isEmpty {
+                    if let cached = cachedFriendGlobalIds[quoteOwner] {
+                        ownerGlobalId = cached
+                    } else {
+                        ownerGlobalId = await sessionClient.encryptGlobalIds([quoteOwner])[quoteOwner] ?? ""
+                    }
+                    if ownerGlobalId.isEmpty { EngineLog.shared.write("sendText e2ee: quote owner has no global id, sending without quote") }
+                }
+                let hasValidQuote = (quote != nil && qMsgInt != nil && qMsgInt != 0 && !ownerGlobalId.isEmpty)
                 let quotePlain = hasValidQuote ? (quote!.text.isEmpty ? "[Tin nhắn]" : quote!.text) : nil
+                let ownerName = quote.map { $0.isMine ? (profile?.displayName ?? $0.senderName) : $0.senderName } ?? ""
                 let encryptedDevices = await e2eeManager.encryptTextMessage(
                     peerUid: id,
                     myUid: myUid,
                     text: text,
                     quoteText: quotePlain,
+                    quoteExtras: hasValidQuote ? ["{}", "", ownerName, ownerGlobalId] : [],
                     store: sqliteStore
                 )
                 guard !encryptedDevices.isEmpty else {
@@ -382,14 +396,10 @@ extension ZaloEngine {
                     guard let msgCipher = dev.ciphers.first else { return nil }
                     var extra: [String: Any] = ["message": msgCipher]
                     if hasValidQuote, let qMsgInt, let quote {
-                        let rawOwner = quote.senderId.isEmpty ? myUid : quote.senderId
-                        extra["qmsgOwner"] = ZaloWireParser.stripUserPrefix(rawOwner)
-                        extra["qmsgId"] = qMsgInt
-                        extra["qmsgCliId"] = qMsgInt
-                        extra["qmsgType"] = 1
-                        extra["qmsg"] = dev.ciphers.count > 1 ? dev.ciphers[1] : ""
-                        extra["qmsgTs"] = quoteTsMs ?? Int64(Date().timeIntervalSince1970 * 1000)
-                        extra["zsource"] = 101
+                        guard let fields = Self.e2eeQuoteFields(
+                            ciphers: dev.ciphers, msgId: qMsgInt, cliMsgId: Int64(quote.clientId) ?? qMsgInt,
+                            ts: quoteTsMs ?? Int64(Date().timeIntervalSince1970 * 1000)) else { return nil }
+                        extra.merge(fields) { _, new in new }
                     }
                     return ZaloSessionClient.buildE2EEListParamEntry(
                         toId: dev.toId,
@@ -921,5 +931,24 @@ private enum OutgoingTypingStore {
         let created = OutgoingTypingThrottle()
         byEngine.setObject(created, forKey: engine)
         return created
+    }
+}
+
+extension ZaloEngine {
+    /// Quote fields of one device's E2EE `/api/e2ee/pc/message/quote` entry, as the official `sendMsgQuote` builds them
+    /// from the ciphers of [text, quote text, attach JSON, text styles, owner name, owner global id]. The attach cipher
+    /// is not sent for a text quote (official `transformQuoteMessage`). Nil when a cipher is missing.
+    nonisolated static func e2eeQuoteFields(ciphers: [String], msgId: Int64, cliMsgId: Int64, ts: Int64) -> [String: Any]? {
+        guard ciphers.count >= 6 else { return nil }
+        return [
+            "qmsg": ciphers[1],
+            "textProperties": ciphers[3],
+            "qmsgOwnerDName": ciphers[4],
+            "qmsgOwner": ciphers[5],
+            "qmsgId": msgId,
+            "qmsgCliId": cliMsgId,
+            "qmsgType": 1,
+            "qmsgTs": ts,
+        ]
     }
 }

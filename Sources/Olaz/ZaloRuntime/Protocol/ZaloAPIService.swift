@@ -1267,6 +1267,12 @@ extension ZaloSessionClient {
             encryptedPayload: spec.payload
         )
         let extracted = Self.extractE2EESendResponse(resp)
+        do {
+            let path = spec.path
+            let code = JSONLossless.int64(resp["error_code"]).map(String.init) ?? "-"
+            let entries = listParams.array.count
+            Task { @MainActor in EngineLog.shared.write("e2ee send: post path=\(path) entries=\(entries) error_code=\(code) msgId=\(!extracted.msgId.isEmpty)") }
+        }
         if extracted.msgId.isEmpty {
             // Shapes only (key names), never values: the message keeps its clientId until the WS echo.
             let dataKeys = (resp["data"] as? [String: Any]).map { $0.keys.sorted().joined(separator: ",") }
