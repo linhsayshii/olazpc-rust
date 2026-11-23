@@ -30,7 +30,6 @@ struct ChatView: View {
     @State private var searchTask: Task<Void, Never>?
     @State private var jumpTask: Task<Void, Never>?
     @State private var jumpGeneration = 0
-    @State private var activeJumpId: String?
     @State private var highlightedMessageId: String?
     @State private var isDropTargeted = false
 
@@ -47,7 +46,6 @@ struct ChatView: View {
             sendTick: sendTick,
             jumpTarget: $jumpTarget,
             highlightedMessageId: highlightedMessageId,
-            suppressRestore: activeJumpId != nil,
             onReply: reply
         )
         .background {
@@ -225,7 +223,6 @@ struct ChatView: View {
         searchMatches = []
         searchMatchIndex = 0
         searchSearching = false
-        activeJumpId = nil
         highlightedMessageId = nil
         isDropTargeted = false
     }
@@ -300,7 +297,6 @@ struct ChatView: View {
         searchTask = nil
         jumpTask?.cancel()
         jumpTask = nil
-        activeJumpId = nil
         searchMatches = []
         searchMatchIndex = 0
         searchQuery = ""
@@ -366,7 +362,6 @@ struct ChatView: View {
         jumpGeneration += 1
         let gen = jumpGeneration
         jumpTask?.cancel()
-        activeJumpId = message.id
         highlightedMessageId = message.id
         jumpTask = Task {
             let ready = await engine.ensureMessageLoaded(message, in: id)
@@ -376,10 +371,6 @@ struct ChatView: View {
                 try? await Task.sleep(for: .milliseconds(20))
                 guard !Task.isCancelled, gen == jumpGeneration else { return }
                 jumpTarget = message.id
-            }
-            try? await Task.sleep(for: .milliseconds(100))
-            if !Task.isCancelled, gen == jumpGeneration {
-                activeJumpId = nil
             }
         }
     }
@@ -454,7 +445,6 @@ private struct ChatMessagesPane: View {
     let sendTick: Int
     @Binding var jumpTarget: String?
     let highlightedMessageId: String?
-    let suppressRestore: Bool
     let onReply: (ChatMessage) -> Void
 
     @Environment(ZaloEngine.self) private var engine
@@ -481,7 +471,6 @@ private struct ChatMessagesPane: View {
                         scrollToBottomTick: sendTick,
                         jumpTarget: $jumpTarget,
                         highlightedMessageId: highlightedMessageId,
-                        suppressRestore: suppressRestore,
                         onReply: onReply
                     )
                 }
@@ -699,8 +688,8 @@ private struct MessageSearchBar: View {
 
 // MARK: - Row model (memoized)
 
-struct ChatRow: Identifiable {
-    enum Kind {
+struct ChatRow: Identifiable, Equatable {
+    enum Kind: Equatable {
         case day(Date)
         case message(ChatMessage, first: Bool, last: Bool, status: Bool)
     }
@@ -708,19 +697,6 @@ struct ChatRow: Identifiable {
     static let dayPrefix = "day-"
     let id: String
     let kind: Kind
-
-    /// The row to bring back to the top after older history was prepended: the row that was there, unless it is gone. A
-    /// day separator is keyed by the day's first message, so older messages of that same day replace it; its message
-    /// stays.
-    static func restoreTarget(_ saved: String?, fallback: String, in rows: [ChatRow]) -> String {
-        guard let saved else { return fallback }
-        if rows.contains(where: { $0.id == saved }) { return saved }
-        if saved.hasPrefix(dayPrefix) {
-            let message = String(saved.dropFirst(dayPrefix.count))
-            if rows.contains(where: { $0.id == message }) { return message }
-        }
-        return fallback
-    }
 }
 
 /// Rebuilds rows only when the message array actually changed.
@@ -763,117 +739,51 @@ private final class RowCache {
 
 // MARK: - Message list
 
+/// The rows of the open chat in `ChatListView` (AppKit-backed, see there), plus the logic around them: older pages when the
+/// reader nears the top, following new messages, jumps to a pin / search match, and the "scroll to newest" button.
 private struct MessageList: View {
     let conversation: ZaloEngine.ConversationSummary
     let scrollToBottomTick: Int
     @Binding var jumpTarget: String?
     var highlightedMessageId: String?
-    var suppressRestore: Bool = false
     var onReply: (ChatMessage) -> Void
 
     @Environment(ZaloEngine.self) private var engine
     @Environment(ShellModel.self) private var shell
 
     @State private var cache = RowCache()
+    @State private var commands = ChatListCommands()
     @State private var atTop = false
     @State private var nearBottom = true
     @State private var lastContentHeight: CGFloat = 0
     @State private var loadingOlder = false
     @State private var olderTask: Task<Void, Never>?
-    @State private var topId: String?
-    @State private var restoreId: String?
     /// False from the moment an older page lands until the reader leaves the top: one page per pull, like the official
-    /// client, instead of paging on and on while the restored position still reads as "at the top".
+    /// client, instead of paging on and on while the kept position still reads as "at the top".
     @State private var olderArmed = true
-    /// Right after a chat opens its rows are still being measured: the bottom stays anchored through those size changes until
-    /// the reader scrolls or a moment has passed (the list is reused from chat to chat, so the initial-offset anchor alone
-    /// only covers the first chat).
-    @State private var pinBottom = true
-    @State private var pinTask: Task<Void, Never>?
+    /// Room the bars (pinned bar, composer, toolbar) take over the list; the list scrolls under them.
+    @State private var insets = EdgeInsets()
 
     private var id: String { conversation.id }
-
-    private struct Metrics: Equatable {
-        var top: CGFloat
-        var fromBottom: CGFloat
-        var content: CGFloat
-        var visible: CGFloat
-    }
 
     var body: some View {
         let msgs = engine.messages(in: id) ?? []
         let rows = cache.rows(for: msgs)
         let hasMore = engine.hasMoreHistory(in: id) ?? false
         let newestId = msgs.last?.id
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    if loadingOlder {
-                        ProgressView().controlSize(.small).padding(.vertical, 10)
-                    }
-                    ForEach(rows) { row in
-                        switch row.kind {
-                        case .day(let date):
-                            DaySeparator(date: date)
-                        case .message(let m, let first, let last, let status):
-                            let isHighlighted = (m.id == highlightedMessageId)
-                            MessageRow(message: m, isGroup: conversation.isGroup,
-                                       firstInGroup: first, lastInGroup: last, showStatus: status,
-                                       isNewest: m.id == newestId,
-                                       onReply: onReply,
-                                       onReact: { emoji, msg in engine.react(emoji, to: msg.id, in: id) })
-                                .equatable()
-                                .background {
-                                    if isHighlighted {
-                                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                            .fill(Color.accentColor.opacity(0.14))
-                                            .overlay {
-                                                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                                    .strokeBorder(Color.accentColor.opacity(0.35), lineWidth: 1)
-                                            }
-                                            .padding(.horizontal, -4)
-                                            .padding(.vertical, 1)
-                                    }
-                                }
-                                .animation(.easeOut(duration: 0.2), value: isHighlighted)
-                        }
-                    }
-                    Color.clear.frame(height: 8).id("bottom")
-                }
-                .scrollTargetLayout()
-                .padding(.horizontal, 16)
-                .padding(.top, 8)
-            }
-            // Only the initial offset is anchored; later size changes must not yank the view.
-            .defaultScrollAnchor(.bottom, for: .initialOffset)
-            .defaultScrollAnchor(pinBottom ? .bottom : nil, for: .sizeChanges)
-            .scrollPosition(id: $topId, anchor: .top)
-            .scrollEdgeEffectStyle(.hard, for: .top)
-            .scrollEdgeEffectStyle(.soft, for: .bottom)
-            .onScrollGeometryChange(for: Metrics.self) { geo in
-                Metrics(top: geo.contentOffset.y + geo.contentInsets.top,
-                        fromBottom: geo.contentSize.height - geo.visibleRect.maxY,
-                        content: geo.contentSize.height,
-                        visible: geo.visibleRect.height)
-            } action: { _, m in
-                let top = m.top < 120
-                // Re-armed once the reader is away from the top, or when the history is too short to ever leave the top band.
-                if !olderArmed, !top || m.content - m.visible < 120 { olderArmed = true }
-                if top != atTop { atTop = top }
-                // Only user scrolling (not content growth) changes "near bottom".
-                if abs(m.content - lastContentHeight) < 1 {
-                    let near = m.fromBottom < 160
-                    if near != nearBottom { nearBottom = near }
-                }
-                if pinBottom, m.fromBottom > 1 {
-                    // The new chat's rows are still being measured (a scroll issued before that lands short): follow the bottom.
-                    proxy.scrollTo("bottom", anchor: .bottom)
-                }
-                lastContentHeight = m.content
-            }
-            // Only the reader's own scrolling ends the bottom pin.
-            .onScrollPhaseChange { _, phase in
-                if pinBottom, phase == .interacting || phase == .tracking { pinBottom = false }
+        let engine = engine
+        let id = id
+        Color.clear
+            .overlay {
+                ChatListView(
+                    conversationId: id, rows: rows, isGroup: conversation.isGroup, newestId: newestId,
+                    highlightedId: highlightedMessageId, loadingOlder: loadingOlder, insets: insets, commands: commands,
+                    onReply: onReply,
+                    onReact: { emoji, msg in engine.react(emoji, to: msg.id, in: id) },
+                    onMetrics: { m in metricsChanged(m, hasMore: hasMore, count: msgs.count) })
+                .ignoresSafeArea()
+                // The part of the list the bars cover (it is drawn under them, edge to edge).
+                .onGeometryChange(for: EdgeInsets.self) { $0.safeAreaInsets } action: { insets = $0 }
             }
             .onChange(of: atTop) { _, _ in maybeLoadOlder(hasMore: hasMore, count: msgs.count) }
             .onChange(of: olderArmed) { _, _ in maybeLoadOlder(hasMore: hasMore, count: msgs.count) }
@@ -882,16 +792,10 @@ private struct MessageList: View {
                 maybeLoadOlder(hasMore: now, count: msgs.count)
             }
             .onChange(of: msgs.first?.id) { old, _ in
-                // Older history was prepended: put the row that was at the top back there, and wait for the reader to
-                // scroll up again before the next page.
-                guard !suppressRestore, jumpTarget == nil else { return }
+                // Older history was prepended (the list keeps the reader's row in place): wait for the reader to leave the
+                // top again before the next page.
                 guard let old, let idx = msgs.firstIndex(where: { $0.id == old }), idx > 0 else { return }
                 olderArmed = false
-                // A pull saved its row; a prepend nobody asked for keeps the row on screen now (the binding still holds it).
-                let target = ChatRow.restoreTarget(restoreId ?? topId, fallback: old, in: rows)
-                restoreId = nil
-                topId = target
-                proxy.scrollTo(target, anchor: .top)
             }
             .onChange(of: engine.historyTicks[id] ?? 0) { _, _ in
                 // An older page arrived but every message in it is a hidden card: ask for the next one.
@@ -906,19 +810,18 @@ private struct MessageList: View {
             }
             .onChange(of: msgs.last?.id) { old, _ in
                 guard old != nil else { return }
-                if nearBottom || msgs.last?.isMine == true { scrollToBottom(proxy) }
+                if nearBottom || msgs.last?.isMine == true { commands.scrollToBottom(animated: true) }
             }
-            .onChange(of: scrollToBottomTick) { _, _ in scrollToBottom(proxy) }
+            .onChange(of: scrollToBottomTick) { _, _ in commands.scrollToBottom(animated: true) }
             .onChange(of: jumpTarget) { _, target in
                 guard let target else { return }
                 jumpTarget = nil
-                withAnimation(.snappy(duration: 0.3)) { proxy.scrollTo(target, anchor: .center) }
+                commands.scrollTo(target, animated: true)
             }
-            // The tour's message step points at the newest row: make sure it exists in the lazy stack.
-            .onChange(of: shell.tour) { _, step in if step == .message { scrollToBottom(proxy) } }
-            .onAppear { showInitialPosition(proxy) }
-            // The list (and its scroll view) is reused for the next chat: a new scroll view under the glass toolbar made AppKit
-            // re-tile the toolbar on every switch. Start over as a new list would.
+            // The tour's message step points at the newest row: make sure it is on screen.
+            .onChange(of: shell.tour) { _, step in if step == .message { commands.scrollToBottom(animated: true) } }
+            .onAppear { showInitialPosition() }
+            // The list (and its scroll view) is reused for the next chat: start over as a new list would.
             .onChange(of: id) { _, _ in
                 olderTask?.cancel()
                 olderTask = nil
@@ -926,18 +829,15 @@ private struct MessageList: View {
                 atTop = false
                 nearBottom = true
                 lastContentHeight = 0
-                topId = nil
-                restoreId = nil
-                // Disarmed until the list has left the top band once (the geometry action re-arms it): while the new rows
-                // settle the list can read as "at the top" for a moment, and an older page loaded then would pin it there.
+                // Disarmed until the list has left the top band once (the metrics re-arm it).
                 olderArmed = false
-                showInitialPosition(proxy)
+                showInitialPosition()
             }
-            .onDisappear { olderTask?.cancel(); pinTask?.cancel() }
+            .onDisappear { olderTask?.cancel() }
             .overlay(alignment: .bottomTrailing) {
                 if !nearBottom {
                     Button {
-                        scrollToBottom(proxy)
+                        commands.scrollToBottom(animated: true)
                     } label: {
                         Image(systemName: "chevron.down").font(.system(size: 13, weight: .bold))
                     }
@@ -949,38 +849,40 @@ private struct MessageList: View {
                 }
             }
             .animation(.snappy(duration: 0.2), value: nearBottom)
+    }
+
+    private func metricsChanged(_ m: ChatListMetrics, hasMore: Bool, count: Int) {
+        // Older history is asked for about a screen before the top, so it is usually there before the reader is.
+        let band = max(120, m.visible)
+        let top = m.top < band
+        // Re-armed once the reader is away from the top, or when the history is too short to ever leave the top band.
+        if !olderArmed, !top || m.content - m.visible < band { olderArmed = true }
+        if top != atTop { atTop = top }
+        // Only scrolling (not content growth) changes "near bottom".
+        if abs(m.content - lastContentHeight) < 1 {
+            let near = m.fromBottom < 160
+            if near != nearBottom { nearBottom = near }
         }
+        if lastContentHeight != m.content { lastContentHeight = m.content }
     }
 
     /// A chat opens at its newest message, or at the message a pin / search asked for.
-    private func showInitialPosition(_ proxy: ScrollViewProxy) {
+    private func showInitialPosition() {
         PerfProbe.appearedChat = id
-        pinBottom = jumpTarget == nil && highlightedMessageId == nil
-        pinTask?.cancel()
-        pinTask = Task {
-            try? await Task.sleep(for: .seconds(2))
-            if !Task.isCancelled { pinBottom = false }
-        }
         if let pending = jumpTarget {
             jumpTarget = nil
-            DispatchQueue.main.async { proxy.scrollTo(pending, anchor: .center) }
+            DispatchQueue.main.async { commands.scrollTo(pending, animated: false) }
         } else if highlightedMessageId == nil {
-            proxy.scrollTo("bottom", anchor: .bottom)
-            DispatchQueue.main.async { proxy.scrollTo("bottom", anchor: .bottom) }
+            commands.scrollToBottom(animated: false)
         }
-    }
-
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        withAnimation(.snappy(duration: 0.25)) { proxy.scrollTo("bottom", anchor: .bottom) }
     }
 
     private func maybeLoadOlder(hasMore: Bool, count: Int) {
         guard atTop, olderArmed, hasMore, !loadingOlder, count > 0 else { return }
         olderTask?.cancel()
         olderTask = Task {
-            try? await Task.sleep(for: .milliseconds(250)) // debounce
+            try? await Task.sleep(for: .milliseconds(150)) // debounce
             guard !Task.isCancelled, atTop, olderArmed, engine.hasMoreHistory(in: id) == true else { return }
-            restoreId = topId
             loadingOlder = true
             engine.loadOlderMessages(id)
             try? await Task.sleep(for: .seconds(6)) // give up the spinner if nothing arrives
@@ -992,7 +894,7 @@ private struct MessageList: View {
 // MARK: - Day separator
 
 /// "Hôm nay 09:41" in a small glass capsule; the time is the day's first loaded message.
-private struct DaySeparator: View {
+struct DaySeparator: View {
     let date: Date
     var body: some View {
         HStack(spacing: 4) {

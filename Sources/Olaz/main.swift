@@ -2,7 +2,10 @@ import AppKit
 
 // `Olaz --engine-probe [login|main] [seconds]` runs the runtime harness;
 // otherwise the SwiftUI app starts.
-if CommandLine.arguments.contains("--engine-probe") {
+if CommandLine.arguments.contains("--scroll-bench") {
+    // Offline benchmark: synthetic data in its own folder, no session, store or instance lock (see ScrollBench).
+    MainActor.assumeIsolated { ScrollBench.runIfRequested() }
+} else if CommandLine.arguments.contains("--engine-probe") {
     // Same data as the app: never run beside it (see InstanceLock).
     guard InstanceLock.acquire() else {
         FileHandle.standardError.write(Data("Olaz is already running on this data directory; quit it first.\n".utf8))

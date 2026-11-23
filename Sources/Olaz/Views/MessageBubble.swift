@@ -191,6 +191,8 @@ struct MessageRow: View {
         .padding(.top, (firstInGroup ? 8 : 2) + (message.reactions.isEmpty ? 0 : 10))
         .contentShape(Rectangle())
         .onHover { inside in
+            // A row passing under a resting pointer while the list scrolls is not hovered (see ChatScrollActivity).
+            if inside, ChatScrollActivity.isScrolling { return }
             withAnimation(.easeOut(duration: 0.12)) { hovering = inside }
         }
     }
