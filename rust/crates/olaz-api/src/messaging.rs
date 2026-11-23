@@ -10,6 +10,9 @@ use crate::api::{SendMessageResult, ZaloApi};
 use crate::error::ApiError;
 use crate::util::{conv_target, parse_i64, swift_json};
 
+/// Official `DEST_TYPING.USER` (`PAGE` = 5 is for official accounts).
+const TYPING_DEST_USER: i64 = 3;
+
 /// A built request: service, path and the (unencrypted) params object.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CallSpec {
@@ -309,7 +312,8 @@ impl<T: Transport> ZaloApi<T> {
         })
     }
 
-    /// Swift `sendTypingAPI` (errors are ignored, like Swift's `try?`).
+    /// Swift `sendTypingAPI` (errors are ignored, like Swift's `try?`). `destType` is the official
+    /// `DEST_TYPING.USER`: with 0 the peer shows no typing indicator.
     pub async fn send_typing(&self, conv_id: &str) {
         let (is_group, clean_id) = conv_target(conv_id);
         let imei = self.imei();
@@ -323,7 +327,7 @@ impl<T: Transport> ZaloApi<T> {
             (
                 "chat",
                 "/api/message/typing",
-                json!({"toid": clean_id, "destType": 0, "imei": imei}),
+                json!({"toid": clean_id, "destType": TYPING_DEST_USER, "imei": imei}),
             )
         };
         let _ = self

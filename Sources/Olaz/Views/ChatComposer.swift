@@ -19,7 +19,9 @@ struct ChatComposer: View {
     @AppStorage(OlazPrefs.accent) private var accentStored = OlazAccent.blue.rawValue
     @Namespace private var glassNamespace
     /// Read here, not passed in by the chat: `typing` changes for any conversation, and only the composer shows it.
-    private var typingName: String? { engine.typingName(in: conversationId) }
+    private var typingLabel: String? {
+        engine.typingStatus(in: conversationId)?.label(isGroup: ZaloWireParser.isGroupId(conversationId))
+    }
     @State private var textHeight: CGFloat = ComposerTextView.lineHeight
     @State private var handle = ComposerHandle()
     @State private var query: MentionQuery?
@@ -48,10 +50,10 @@ struct ChatComposer: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            if let typingName {
+            if let typingLabel {
                 HStack(spacing: 6) {
                     Image(systemName: "ellipsis.bubble").symbolEffect(.pulse)
-                    Text("\(typingName) đang soạn tin…")
+                    Text(typingLabel + "…")
                 }
                 .font(.system(size: 11.5))
                 .foregroundStyle(.secondary)
@@ -105,7 +107,7 @@ struct ChatComposer: View {
         .animation(.snappy(duration: 0.18), value: suggestionsOpen)
         .animation(.snappy(duration: 0.18), value: stickerStripOpen)
         .animation(.snappy(duration: 0.18), value: replyTo?.id)
-        .animation(.snappy(duration: 0.18), value: typingName)
+        .animation(.snappy(duration: 0.18), value: typingLabel)
         .onAppear { ComposerTextView.accent = NSColor(ChatPalette.accent(accentStored)) }
         .onChange(of: accentStored) { _, now in ComposerTextView.accent = NSColor(ChatPalette.accent(now)) }
         .task(id: query) { await loadCandidates() }

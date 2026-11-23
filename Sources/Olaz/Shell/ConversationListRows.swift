@@ -93,8 +93,8 @@ struct ConversationListRow: View {
     }
 
     @ViewBuilder private var previewLine: some View {
-        if let who = engine.typingName(in: conversation.id) {
-            Text("\(who) đang soạn tin…")
+        if let who = engine.typingStatus(in: conversation.id) {
+            Text(who.label(isGroup: conversation.isGroup) + "…")
                 .foregroundStyle(prominence == .increased ? AnyShapeStyle(.primary) : AnyShapeStyle(.tint))
         } else {
             Text(subtitle).foregroundStyle(unread ? .primary : .secondary)

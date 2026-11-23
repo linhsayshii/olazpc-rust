@@ -158,7 +158,7 @@ enum PerfProbe {
                 while !Task.isCancelled {
                     on.toggle()
                     engine.messages[dummy] = on ? [] : nil
-                    engine.typing[dummy] = on ? "x" : nil
+                    engine.typing[dummy] = on ? TypingStatus(name: "x", onPC: false) : nil
                     try? await Task.sleep(for: .milliseconds(100))
                 }
             } : nil

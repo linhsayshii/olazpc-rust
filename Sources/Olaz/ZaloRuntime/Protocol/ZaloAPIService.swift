@@ -1285,6 +1285,9 @@ extension ZaloSessionClient {
         )
     }
 
+    /// Official `DEST_TYPING.USER` (`PAGE` = 5 is for official accounts). 0 is not a valid value: the peer shows nothing.
+    static let typingDestUser = 3
+
     func sendTypingAPI(convId: String) async {
         if let core = coreApi() {
             try? await core.sendTyping(convId: convId)
@@ -1296,7 +1299,7 @@ extension ZaloSessionClient {
         let path = isGroup ? "/api/group/typing" : "/api/message/typing"
         let payload: [String: Any] = isGroup
             ? ["grid": cleanId, "imei": imei]
-            : ["toid": cleanId, "destType": 0, "imei": imei]
+            : ["toid": cleanId, "destType": Self.typingDestUser, "imei": imei]
         _ = try? await post(service: service, path: path, encryptedPayload: payload)
     }
 

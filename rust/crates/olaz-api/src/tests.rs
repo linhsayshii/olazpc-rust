@@ -1171,7 +1171,7 @@ async fn typing_payloads() {
     assert_service(&api, &req, "chat");
     assert_eq!(
         params_of(&req),
-        json!({"toid": "200", "destType": 0, "imei": "imei-1"})
+        json!({"toid": "200", "destType": 3, "imei": "imei-1"})
     );
     api.send_typing("g555").await;
     let req = last(&api);

@@ -2,7 +2,7 @@ import Observation
 import Testing
 @testable import Olaz
 
-/// Views read the engine's per-conversation dictionaries through `messages(in:)` / `typingName(in:)` /
+/// Views read the engine's per-conversation dictionaries through `messages(in:)` / `typingStatus(in:)` /
 /// `hasMoreHistory(in:)`: a change in another conversation must not invalidate them.
 private final class Flag: @unchecked Sendable {
     private(set) var value = false
@@ -21,16 +21,16 @@ private final class Flag: @unchecked Sendable {
 
     @Test func typingInOtherChatDoesNotInvalidate() {
         let engine = ZaloEngine()
-        #expect(!invalidates({ _ = engine.typingName(in: "a") }, by: { engine.typing["b"] = "Lan" }))
-        #expect(invalidates({ _ = engine.typingName(in: "a") }, by: { engine.typing["a"] = "Lan" }))
-        #expect(engine.typingName(in: "a") == "Lan")
+        #expect(!invalidates({ _ = engine.typingStatus(in: "a") }, by: { engine.typing["b"] = TypingStatus(name: "Lan", onPC: false) }))
+        #expect(invalidates({ _ = engine.typingStatus(in: "a") }, by: { engine.typing["a"] = TypingStatus(name: "Lan", onPC: false) }))
+        #expect(engine.typingStatus(in: "a") == TypingStatus(name: "Lan", onPC: false))
     }
 
     @Test func sameValueWriteDoesNotInvalidate() {
         let engine = ZaloEngine()
-        engine.typing["a"] = "Lan"
-        #expect(!invalidates({ _ = engine.typingName(in: "a") }, by: { engine.typing["a"] = "Lan" }))
-        #expect(invalidates({ _ = engine.typingName(in: "a") }, by: { engine.typing["a"] = nil }))
+        engine.typing["a"] = TypingStatus(name: "Lan", onPC: false)
+        #expect(!invalidates({ _ = engine.typingStatus(in: "a") }, by: { engine.typing["a"] = TypingStatus(name: "Lan", onPC: false) }))
+        #expect(invalidates({ _ = engine.typingStatus(in: "a") }, by: { engine.typing["a"] = nil }))
     }
 
     @Test func messagesAndHistoryAreObservedPerConversation() {

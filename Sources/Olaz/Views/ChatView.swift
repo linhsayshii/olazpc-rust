@@ -519,7 +519,7 @@ private struct ChatHeaderTitle: View {
                 if !subtitle.isEmpty {
                     Text(subtitle)
                         .font(.system(size: 11.5))
-                        .foregroundStyle(engine.typingName(in: id) != nil ? AnyShapeStyle(TintShapeStyle()) : AnyShapeStyle(HierarchicalShapeStyle.secondary))
+                        .foregroundStyle(engine.typingStatus(in: id) != nil ? AnyShapeStyle(TintShapeStyle()) : AnyShapeStyle(HierarchicalShapeStyle.secondary))
                         .lineLimit(1)
                 }
             }
@@ -529,7 +529,7 @@ private struct ChatHeaderTitle: View {
     }
 
     private func subtitle(last: ChatMessage?) -> String {
-        if let name = engine.typingName(in: id) { return "\(name) đang soạn tin…" }
+        if let who = engine.typingStatus(in: id) { return who.label(isGroup: conversation.isGroup) + "…" }
         if conversation.isGroup, conversation.members > 0 { return "\(conversation.members) thành viên" }
         if last?.isE2EE == true { return "Mã hóa đầu cuối" }
         return ""

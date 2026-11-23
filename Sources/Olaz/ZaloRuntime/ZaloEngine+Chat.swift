@@ -846,7 +846,7 @@ extension ZaloEngine {
         if let info = state["typing"] as? [String: Any],
            let convId = info["convId"] as? String,
            let name = info["name"] as? String {
-            showTyping(convId: convId, name: name)
+            showTyping(convId: convId, name: name, onPC: info["isPC"] as? Bool ?? false)
         }
     }
 
@@ -870,10 +870,11 @@ extension ZaloEngine {
     }
 }
 
-/// Per-conversation outgoing typing throttle (~3.5s) stored outside `ZaloEngine` so engine state stays decoupled.
+/// Per-conversation outgoing typing throttle (10 s) stored outside `ZaloEngine` so engine state stays decoupled.
 @MainActor
 final class OutgoingTypingThrottle {
-    static let defaultInterval: TimeInterval = 3.5
+    /// The official client sends at most one typing ping per 10 s (`functionTyping`).
+    static let defaultInterval: TimeInterval = 10
 
     let interval: TimeInterval
     private var lastSentByConv: [String: Date] = [:]

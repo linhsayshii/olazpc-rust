@@ -77,7 +77,7 @@ final class ZaloEngine {
         didSet { hasMoreSignal.changed(from: oldValue, to: hasMoreHistory) }
     }
     var historyTicks: [String: Int] = [:]
-    var typing: [String: String] = [:] {
+    var typing: [String: TypingStatus] = [:] {
         didSet { typingSignal.changed(from: oldValue, to: typing) }
     }
     // Per-conversation observation of the three dictionaries above (see `KeyedSignal`). Views read them through
@@ -1425,7 +1425,7 @@ final class ZaloEngine {
                 let convId = (!gid.isEmpty || act == "gtyping") ? ZaloWireParser.groupConvId(gid.isEmpty ? uid : gid) : uid
                 if !convId.isEmpty, uid != myUid {
                     let name = lookupPersonInfo(uid)?.name ?? "Ai đó"
-                    showTyping(convId: convId, name: name)
+                    showTyping(convId: convId, name: name, onPC: JSONLossless.int64(actData["isPC"]) == 1)
                 }
             } else if actType == "mute" {
                 let rawId = JSONLossless.string(actData["toId"] ?? actData["toid"] ?? actData["id"])
@@ -1718,11 +1718,12 @@ final class ZaloEngine {
         try? await store.saveConversations(rows)
     }
 
-    internal func showTyping(convId: String, name: String) {
-        typing[convId] = name
+    internal func showTyping(convId: String, name: String, onPC: Bool = false) {
+        let status = TypingStatus(name: name, onPC: onPC)
+        if typing[convId] != status { typing[convId] = status }
         typingResetTasks[convId]?.cancel()
         typingResetTasks[convId] = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(4))
+            try? await Task.sleep(for: .seconds(TypingStatus.displaySeconds))
             guard !Task.isCancelled else { return }
             self?.typing[convId] = nil
             self?.typingResetTasks[convId] = nil
@@ -2206,7 +2207,7 @@ extension ZaloEngine {
     }
 
     /// Who is typing in `id` (`typing[id]`), observed for this conversation only.
-    func typingName(in id: String) -> String? {
+    func typingStatus(in id: String) -> TypingStatus? {
         typingSignal.track(id)
         return _typing[id]
     }

@@ -912,3 +912,19 @@ struct MessageTransferState: Equatable, Sendable {
     var officialDescription: String? = nil
     var officialSuggestion: String? = nil
 }
+
+/// Someone typing in a conversation, from a `typing` / `gtyping` control action.
+struct TypingStatus: Equatable, Sendable {
+    /// The official client keeps the indicator 10 s after the last ping (`typing: 1e4`).
+    static let displaySeconds: Double = 10
+
+    var name: String
+    /// `isPC == 1`: they type on Zalo PC/Web ("… trên máy tính").
+    var onPC: Bool
+
+    /// The official strings: `STR_TYPING_CHAT_ONE_ONE(_ON_PC)` in a 1-1 chat, `<name> STR_TYPING(_ON_PC)` in a group.
+    func label(isGroup: Bool) -> String {
+        let suffix = onPC ? " trên máy tính" : ""
+        return isGroup ? "\(name) đang soạn tin\(suffix)" : "Đang soạn tin\(suffix)"
+    }
+}
