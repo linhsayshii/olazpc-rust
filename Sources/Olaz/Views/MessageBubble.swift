@@ -565,10 +565,10 @@ struct MessageRow: View {
     }
 
     private func textBody(_ text: String) -> some View {
-        Text(message.mentions.isEmpty
+        Text(Emoticon.replacing(in: message.mentions.isEmpty
              ? ChatFormat.linkified(text, mine: mine)
              : ChatFormat.mentioned(text, mentions: message.mentions, mine: mine, myId: engine.profile?.userId,
-                                    size: scaled(14), accent: ChatPalette.accent(accentStored)))
+                                    size: scaled(14), accent: ChatPalette.accent(accentStored))))
             .font(.system(size: scaled(14)))
             .fixedSize(horizontal: false, vertical: true)
             .environment(\.openURL, OpenURLAction { url in
