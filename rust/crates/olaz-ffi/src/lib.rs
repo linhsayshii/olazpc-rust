@@ -43,8 +43,9 @@ mod wire;
 mod ws;
 
 pub use api::{
-    CoreApi, HistoryRecord, MentionRecord, PollOutcomeRecord, PollQueueRecord, PollStateRecord,
-    SendResultRecord, SendTextRecord, poll_state_initial,
+    CoreApi, HistoryBatch, HistoryRecord, MentionRecord, PollOutcomeRecord, PollQueueRecord,
+    PollStateRecord, SendResultRecord, SendTextRecord, history_record_from_json,
+    poll_state_initial,
 };
 pub use chat::*;
 pub use crypto::{decrypt_ws_frame, inflate};

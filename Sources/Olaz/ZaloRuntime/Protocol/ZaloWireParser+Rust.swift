@@ -132,4 +132,34 @@ extension ZaloWireParser {
             root, myUid: myUid, selfConvId: selfConvId, defaultCmd: defaultCmd, fallbackConvId: fallbackConvId,
             isGroupHint: isGroupHint, nameLookup: nameLookup, useRustCore: false)
     }
+
+    /// Typed events of a history page. Rust path: the core already holds the parsed body, so only the contact-name lookup
+    /// (on the caller's actor) and the typed mapping happen here, no JSON and no dictionary. Swift path: the Swift walk
+    /// over the page's dictionary, as before.
+    @MainActor
+    static func historyEventsAsync(
+        _ page: ZaloHistoryPage,
+        myUid: String,
+        selfConvId: String? = nil,
+        fallbackConvId: String? = nil,
+        isGroupHint: Bool? = nil,
+        nameLookup: ((String) -> (name: String, avatar: String)?)? = nil
+    ) async -> [ParsedWireEvent] {
+        guard let batch = page.rustBatch else {
+            return await extractBatchEventsAsync(
+                page.box.dict, myUid: myUid, selfConvId: selfConvId, fallbackConvId: fallbackConvId,
+                isGroupHint: isGroupHint, nameLookup: nameLookup, useRustCore: false)
+        }
+        var names: [NameEntry] = []
+        if let nameLookup {
+            for uid in page.uids {
+                if let hit = nameLookup(uid) { names.append(NameEntry(uid: uid, name: hit.name, avatar: hit.avatar)) }
+            }
+        }
+        let options = WireOptions(
+            cmd: 0, fallbackConvId: fallbackConvId, isGroupHint: isGroupHint, selfConvId: selfConvId, names: names)
+        return await Task.detached(priority: .userInitiated) {
+            parsedEvents(from: batch.events(myUid: myUid, options: options))
+        }.value
+    }
 }

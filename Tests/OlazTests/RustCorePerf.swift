@@ -149,6 +149,19 @@ import Testing
                   let events = try? parseWireBatch(json: input.json, myUid: input.myUid, options: input.options) else { return }
             legacyCount = Self.legacyMessages(events).count
         }
+        // Wave 5a: the engine's history route now: the core keeps the parsed answer (`HistoryBatch`), Swift resolves names and
+        // maps typed events. The body parse stands in for the HTTP answer the core already holds; no dict, no JSON text.
+        let jsonText = String(decoding: data, as: UTF8.self)
+        var typedCount = 0
+        let typedPage = Self.median {
+            guard let record = try? historyRecordFromJson(json: jsonText) else { return }
+            var resolved: [NameEntry] = []
+            for uid in record.uids { if let hit = Self.lookup(uid) { resolved.append(NameEntry(uid: uid, name: hit.name, avatar: hit.avatar)) } }
+            typedCount = ZaloWireParser.parsedEvents(from: record.batch.events(myUid: "me", options: WireOptions(cmd: 0, names: resolved))).count
+        }
+        print(Self.row("(b'') history page 2000: typed HistoryBatch (wave 5a)", swift: swift, rust: typedPage, note: "vs Swift bytes -> dict -> walk"))
+        print(Self.row("(b'') .. vs the previous engine route (dict -> JSON -> core)", swift: viaDict, rust: typedPage))
+        #expect(typedCount == 2000)
         print(Self.row("(b) history batch 2000: bytes -> ChatMessage", swift: swift, rust: rust))
         print(Self.row("(b) .. vs the Rust route before 4a (dict -> JSON -> core -> JSON decode)", swift: swift, rust: legacy))
         #expect(legacyCount == 2000)

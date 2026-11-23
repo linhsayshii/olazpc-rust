@@ -661,4 +661,100 @@ async fn typed_store_reads_match_the_raw_rows() {
         store2.messages_chat("u1".into(), None, 50).await.unwrap(),
         typed
     );
+    // Typed single lookup: by server id and by client id, equal to the batch read; a miss is None.
+    for key in ["2", "c2"] {
+        let one = store
+            .message_chat("u1".into(), key.into())
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(one.message, typed[1].message, "lookup by {key}");
+        assert_eq!(
+            (one.row_id.as_str(), one.row_client_id.as_str()),
+            ("2", "c2")
+        );
+    }
+    assert!(
+        store
+            .message_chat("u1".into(), "nope".into())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // A row whose JSON cannot be decoded is None, like Swift's `decodeStoredMessage`.
+    let mut bad = row("9", 3000);
+    bad.conv_id = "u1".into();
+    bad.raw_json = b"not json".to_vec();
+    store.save_messages(vec![bad]).await.unwrap();
+    assert!(
+        store
+            .message_chat("u1".into(), "9".into())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .message("u1".into(), "9".into())
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+const HISTORY_BODY: &str = r#"{"error_code":0,"data":{"hasMore":1,"isOld":0,"lastMsgId":7412345678901234500,"groupMsgs":[
+    {"msgId":7412345678901234567,"cliMsgId":"c1","uidFrom":"u1","idTo":"g1","msgType":"webchat","content":"Chào nhóm","ts":1795000000000},
+    {"msgId":"7412345678901234568","cliMsgId":"c2","uidFrom":"me","idTo":"g1","msgType":"webchat","content":"Tôi đây","ts":1795000001000}
+]}}"#;
+
+#[test]
+fn history_batch_types_head_uids_and_events_like_parse_wire_batch() {
+    let obj = olaz_json::parse_object_str(HISTORY_BODY).unwrap();
+    let h = HistoryBatch::from_object(obj).record();
+    assert!(h.has_more);
+    assert!(!h.is_old);
+    assert_eq!(
+        h.last_msg_id, "7412345678901234500",
+        "64-bit id stays exact"
+    );
+    assert_eq!(h.uids, vec!["me".to_owned(), "u1".to_owned()]);
+    let opts = || WireOptions {
+        fallback_conv_id: Some("g1".into()),
+        is_group_hint: Some(true),
+        names: vec![NameEntry {
+            uid: "u1".into(),
+            name: "An".into(),
+            avatar: String::new(),
+        }],
+        ..WireOptions::default()
+    };
+    let typed = h.batch.events("me".into(), opts());
+    // Same events as the JSON route Swift used before (history raw JSON -> parse_wire_batch).
+    let via_json = parse_wire_batch(h.batch.raw_json(), "me".into(), opts()).unwrap();
+    assert_eq!(typed, via_json);
+    let msgs: Vec<_> = typed
+        .iter()
+        .filter_map(|e| match e {
+            WireEvent::Message { message, .. } => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0].id, "7412345678901234567");
+    assert_eq!(msgs[0].sender_name, "An");
+    assert!(msgs[1].is_mine);
+}
+
+#[test]
+fn history_batch_head_defaults_when_data_is_missing() {
+    let h = HistoryBatch::from_object(olaz_json::parse_object_str(r#"{"error_code":0}"#).unwrap())
+        .record();
+    assert!(!h.has_more && !h.is_old);
+    assert_eq!(h.last_msg_id, "");
+    assert!(h.uids.is_empty());
+    assert!(
+        h.batch
+            .events("me".into(), WireOptions::default())
+            .is_empty()
+    );
 }

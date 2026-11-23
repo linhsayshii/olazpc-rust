@@ -1610,6 +1610,12 @@ public protocol CoreStoreProtocol: AnyObject, Sendable {
     func message(convId: String, idOrClientId: String) async throws  -> MessageRow?
     
     /**
+     * [`CoreStore::message`] decoded to a typed message in Rust (no JSON reaches Swift). `None` when the row is
+     * missing or its JSON cannot be decoded (Swift's `decodeStoredMessage` returns nil for those).
+     */
+    func messageChat(convId: String, idOrClientId: String) async throws  -> StoredChat?
+    
+    /**
      * Messages of `conv_id`, oldest to newest; `before_ts_ms` fetches strictly older rows;
      * `limit` is clamped to 1...500.
      */
@@ -1889,6 +1895,26 @@ open func message(convId: String, idOrClientId: String)async throws  -> MessageR
             completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeMessageRow.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * [`CoreStore::message`] decoded to a typed message in Rust (no JSON reaches Swift). `None` when the row is
+     * missing or its JSON cannot be decoded (Swift's `decodeStoredMessage` returns nil for those).
+     */
+open func messageChat(convId: String, idOrClientId: String)async throws  -> StoredChat?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corestore_message_chat(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(idOrClientId)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeStoredChat.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
 }
@@ -2364,6 +2390,156 @@ public func FfiConverterTypeCoreStore_lift(_ handle: UInt64) throws -> CoreStore
 #endif
 public func FfiConverterTypeCoreStore_lower(_ value: CoreStore) -> UInt64 {
     return FfiConverterTypeCoreStore.lower(value)
+}
+
+
+
+
+
+
+/**
+ * The server answer of a history call, parsed on demand. Ids stay exact (lossless JSON never leaves Rust).
+ */
+public protocol HistoryBatchProtocol: AnyObject, Sendable {
+    
+    /**
+     * Every message and live reaction / recall / delete in the answer, parsed with `options` (`extractBatchEvents`).
+     * Synchronous and CPU-bound: call it off the main actor for big pages.
+     */
+    func events(myUid: String, options: WireOptions)  -> [WireEvent]
+    
+    /**
+     * The answer as lossless JSON text, for the few callers that read raw fields (cloud-message lookups, audits).
+     */
+    func rawJson()  -> String
+    
+}
+/**
+ * The server answer of a history call, parsed on demand. Ids stay exact (lossless JSON never leaves Rust).
+ */
+open class HistoryBatch: HistoryBatchProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_olaz_ffi_fn_clone_historybatch(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_olaz_ffi_fn_free_historybatch(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Every message and live reaction / recall / delete in the answer, parsed with `options` (`extractBatchEvents`).
+     * Synchronous and CPU-bound: call it off the main actor for big pages.
+     */
+open func events(myUid: String, options: WireOptions) -> [WireEvent]  {
+    return try!  FfiConverterSequenceTypeWireEvent.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_historybatch_events(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(myUid),
+        FfiConverterTypeWireOptions_lower(options),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * The answer as lossless JSON text, for the few callers that read raw fields (cloud-message lookups, audits).
+     */
+open func rawJson() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_historybatch_raw_json(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeHistoryBatch: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = HistoryBatch
+
+    public static func lift(_ handle: UInt64) throws -> HistoryBatch {
+        return HistoryBatch(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: HistoryBatch) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> HistoryBatch {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: HistoryBatch, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHistoryBatch_lift(_ handle: UInt64) throws -> HistoryBatch {
+    return try FfiConverterTypeHistoryBatch.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHistoryBatch_lower(_ value: HistoryBatch) -> UInt64 {
+    return FfiConverterTypeHistoryBatch.lower(value)
 }
 
 
@@ -4119,22 +4295,31 @@ public func FfiConverterTypeECardRecord_lower(_ value: ECardRecord) -> RustBuffe
 
 
 /**
- * `fetch_history` answer: paging head plus the lossless body. For 1-1 chats this is the
- * `get-last-msgs` answer (head fields stay at their defaults).
+ * `fetch_history` answer: paging head plus the parsed body kept Rust-side. For 1-1 chats this is the
+ * `get-last-msgs` answer (head fields stay at their defaults). No JSON crosses the FFI: Swift resolves `uids` to
+ * contact names, then asks `batch.events(...)` for the typed events (same flow as [`crate::WirePayload`]).
  */
-public struct HistoryRecord: Equatable, Hashable {
+public struct HistoryRecord {
     public var hasMore: Bool
     public var isOld: Bool
     public var lastMsgId: String
-    public var rawJson: String
+    /**
+     * Sender / quote-owner uids a parse looks names up for (`NameEntry.uid`).
+     */
+    public var uids: [String]
+    public var batch: HistoryBatch
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(hasMore: Bool, isOld: Bool, lastMsgId: String, rawJson: String) {
+    public init(hasMore: Bool, isOld: Bool, lastMsgId: String, 
+        /**
+         * Sender / quote-owner uids a parse looks names up for (`NameEntry.uid`).
+         */uids: [String], batch: HistoryBatch) {
         self.hasMore = hasMore
         self.isOld = isOld
         self.lastMsgId = lastMsgId
-        self.rawJson = rawJson
+        self.uids = uids
+        self.batch = batch
     }
 
     
@@ -4156,7 +4341,8 @@ public struct FfiConverterTypeHistoryRecord: FfiConverterRustBuffer {
                 hasMore: FfiConverterBool.read(from: &buf), 
                 isOld: FfiConverterBool.read(from: &buf), 
                 lastMsgId: FfiConverterString.read(from: &buf), 
-                rawJson: FfiConverterString.read(from: &buf)
+                uids: FfiConverterSequenceString.read(from: &buf), 
+                batch: FfiConverterTypeHistoryBatch.read(from: &buf)
         )
     }
 
@@ -4164,7 +4350,8 @@ public struct FfiConverterTypeHistoryRecord: FfiConverterRustBuffer {
         FfiConverterBool.write(value.hasMore, into: &buf)
         FfiConverterBool.write(value.isOld, into: &buf)
         FfiConverterString.write(value.lastMsgId, into: &buf)
-        FfiConverterString.write(value.rawJson, into: &buf)
+        FfiConverterSequenceString.write(value.uids, into: &buf)
+        FfiConverterTypeHistoryBatch.write(value.batch, into: &buf)
     }
 }
 
@@ -7401,6 +7588,30 @@ fileprivate struct FfiConverterOptionTypeQuoteRecord: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeStoredChat: FfiConverterRustBuffer {
+    typealias SwiftType = StoredChat?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeStoredChat.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeStoredChat.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeTypedEnvelope: FfiConverterRustBuffer {
     typealias SwiftType = TypedEnvelope?
 
@@ -7977,6 +8188,18 @@ public func coreVersion() -> String  {
 })
 }
 /**
+ * Wraps a history answer given as JSON text the way [`CoreApi::fetch_history`] would return it (tests and benchmarks:
+ * the same typed path without a network call).
+ */
+public func historyRecordFromJson(json: String)throws  -> HistoryRecord  {
+    return try  FfiConverterTypeHistoryRecord_lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_history_record_from_json(
+        FfiConverterString.lower(json),uniffiCallStatus
+    )
+})
+}
+/**
  * The initial poll state (queues "1", "2", "3" at id "1").
  */
 public func pollStateInitial() -> PollStateRecord  {
@@ -8085,6 +8308,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_func_core_version() != 33401) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_func_history_record_from_json() != 51167) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_func_poll_state_initial() != 13566) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8169,6 +8395,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreapi_set_unread_mark() != 40097) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_historybatch_events() != 34484) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_historybatch_raw_json() != 50277) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coresession_clear_session() != 4619) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8227,6 +8459,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_corestore_message() != 1925) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corestore_message_chat() != 38421) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_corestore_messages() != 17054) {

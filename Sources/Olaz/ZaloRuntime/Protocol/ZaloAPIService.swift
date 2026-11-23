@@ -812,13 +812,24 @@ extension ZaloSessionClient {
         return ZaloJSONBox(resp)
     }
 
-    func fetchHistory(convId: String, lastMsgId: String?, count: Int = 50, isOld: Bool? = nil) async throws -> ZaloJSONBox {
+    /// History as a typed page: on the Rust path the answer stays in the core (no JSON in Swift, see `ZaloHistoryPage`);
+    /// on the Swift path it wraps the dictionary the Swift walk produces.
+    func fetchHistoryPage(convId: String, lastMsgId: String?, count: Int = 50, isOld: Bool? = nil) async throws -> ZaloHistoryPage {
         if let core = coreApi() {
             do {
                 let h = try await core.fetchHistory(convId: convId, lastMsgId: lastMsgId, count: Int64(count), isOld: isOld)
-                return ZaloJSONBox(RustCore.object(h.rawJson))
+                return ZaloHistoryPage(record: h)
             } catch { throw RustCore.mapError(error) }
         }
+        return ZaloHistoryPage(box: try await fetchHistorySwift(convId: convId, lastMsgId: lastMsgId, count: count, isOld: isOld))
+    }
+
+    /// History as a raw dictionary, for callers that read raw fields or feed `applyBatchResponse`.
+    func fetchHistory(convId: String, lastMsgId: String?, count: Int = 50, isOld: Bool? = nil) async throws -> ZaloJSONBox {
+        try await fetchHistoryPage(convId: convId, lastMsgId: lastMsgId, count: count, isOld: isOld).box
+    }
+
+    private func fetchHistorySwift(convId: String, lastMsgId: String?, count: Int, isOld: Bool?) async throws -> ZaloJSONBox {
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
         let isSelfCloud = !isGroup && (
@@ -2955,5 +2966,45 @@ enum ZaloVoiceCallProtocol {
             return "{}"
         }
         return json
+    }
+}
+
+/// One history answer. Rust path: the core keeps the parsed body (`HistoryBatch`) and Swift reads the paging head and the
+/// typed events from it, never a JSON dictionary (`box` re-materialises one only for callers that need raw fields).
+/// Swift path: wraps the dictionary.
+struct ZaloHistoryPage: @unchecked Sendable {
+    let hasMore: Bool
+    let isOld: Bool
+    let lastMsgId: String
+    /// Sender / quote-owner uids a parse looks contact names up for (Rust path only).
+    let uids: [String]
+    let rustBatch: HistoryBatch?
+    private let swiftBox: ZaloJSONBox?
+
+    init(record: HistoryRecord) {
+        hasMore = record.hasMore
+        isOld = record.isOld
+        lastMsgId = record.lastMsgId
+        uids = record.uids
+        rustBatch = record.batch
+        swiftBox = nil
+    }
+
+    init(box: ZaloJSONBox) {
+        let data = box.dict["data"] as? [String: Any]
+        func flag(_ v: Any?) -> Bool { JSONLossless.int64(v) == 1 || (v as? Bool) == true }
+        hasMore = flag(data?["hasMore"])
+        isOld = flag(data?["isOld"])
+        lastMsgId = JSONLossless.string(data?["lastMsgId"])
+        uids = []
+        rustBatch = nil
+        swiftBox = box
+    }
+
+    /// The raw answer (`{error_code, data}`); on the Rust path this crosses the bridge as JSON, so use it sparingly.
+    var box: ZaloJSONBox {
+        if let swiftBox { return swiftBox }
+        guard let rustBatch else { return ZaloJSONBox() }
+        return ZaloJSONBox(RustCore.object(rustBatch.rawJson()))
     }
 }

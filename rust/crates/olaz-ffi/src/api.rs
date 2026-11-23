@@ -1,8 +1,8 @@
 //! `CoreApi`: the chat-path API calls (`olaz-api`) as a Swift object.
 //!
-//! Heterogeneous server answers come back as lossless JSON text (`raw_json`, 64-bit ids exact,
-//! see `olaz_json::to_swift_json_string`) so Swift can keep its existing parsing during cutover;
-//! small well-known shapes are typed records.
+//! Heterogeneous server answers come back as lossless JSON text (64-bit ids exact, see
+//! `olaz_json::to_swift_json_string`) so Swift can keep its existing parsing during cutover; small well-known
+//! shapes are typed records, and chat history is a [`HistoryBatch`] parsed to typed events (no JSON in Swift).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,12 +10,13 @@ use std::sync::Arc;
 use olaz_api::{JsonObject, PollQueueCursor, PollState, SendTextArgs, ZaloApi};
 use olaz_json::{parse_object_str, to_swift_json_string};
 use olaz_net::ReqwestTransport;
-use olaz_wire::Mention;
+use olaz_wire::{Mention, collect_name_uids, extract_batch_events};
 use serde_json::Value;
 
 use crate::error::CoreError;
 use crate::runtime::run;
 use crate::session::CoreSession;
+use crate::wire::{WireEvent, WireOptions, convert, with_options};
 
 type Api = ZaloApi<ReqwestTransport>;
 
@@ -140,14 +141,71 @@ pub struct PollOutcomeRecord {
     pub more: bool,
 }
 
-/// `fetch_history` answer: paging head plus the lossless body. For 1-1 chats this is the
-/// `get-last-msgs` answer (head fields stay at their defaults).
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+/// `fetch_history` answer: paging head plus the parsed body kept Rust-side. For 1-1 chats this is the
+/// `get-last-msgs` answer (head fields stay at their defaults). No JSON crosses the FFI: Swift resolves `uids` to
+/// contact names, then asks `batch.events(...)` for the typed events (same flow as [`crate::WirePayload`]).
+#[derive(Clone, uniffi::Record)]
 pub struct HistoryRecord {
     pub has_more: bool,
     pub is_old: bool,
     pub last_msg_id: String,
-    pub raw_json: String,
+    /// Sender / quote-owner uids a parse looks names up for (`NameEntry.uid`).
+    pub uids: Vec<String>,
+    pub batch: Arc<HistoryBatch>,
+}
+
+/// The server answer of a history call, parsed on demand. Ids stay exact (lossless JSON never leaves Rust).
+#[derive(uniffi::Object)]
+pub struct HistoryBatch {
+    root: Value,
+}
+
+impl HistoryBatch {
+    pub(crate) fn from_object(o: JsonObject) -> Self {
+        Self {
+            root: Value::Object(o),
+        }
+    }
+
+    pub(crate) fn record(self) -> HistoryRecord {
+        let data = self.root.get("data").and_then(Value::as_object);
+        HistoryRecord {
+            has_more: data.is_some_and(|d| flag(d.get("hasMore"))),
+            is_old: data.is_some_and(|d| flag(d.get("isOld"))),
+            last_msg_id: data.map_or_else(String::new, |d| olaz_json::string(d.get("lastMsgId"))),
+            uids: collect_name_uids(&self.root),
+            batch: Arc::new(self),
+        }
+    }
+}
+
+#[uniffi::export]
+impl HistoryBatch {
+    /// Every message and live reaction / recall / delete in the answer, parsed with `options` (`extractBatchEvents`).
+    /// Synchronous and CPU-bound: call it off the main actor for big pages.
+    pub fn events(&self, my_uid: String, options: WireOptions) -> Vec<WireEvent> {
+        with_options(&options, |o| {
+            extract_batch_events(&self.root, &my_uid, o)
+                .into_iter()
+                .map(convert)
+                .collect()
+        })
+    }
+
+    /// The answer as lossless JSON text, for the few callers that read raw fields (cloud-message lookups, audits).
+    pub fn raw_json(&self) -> String {
+        to_swift_json_string(&self.root)
+    }
+}
+
+/// Wraps a history answer given as JSON text the way [`CoreApi::fetch_history`] would return it (tests and benchmarks:
+/// the same typed path without a network call).
+#[uniffi::export]
+pub fn history_record_from_json(json: String) -> Result<HistoryRecord, CoreError> {
+    let o = olaz_json::parse_object_str(&json).ok_or_else(|| CoreError::Parse {
+        message: "history answer is not a JSON object".to_owned(),
+    })?;
+    Ok(HistoryBatch::from_object(o).record())
 }
 
 fn flag(v: Option<&Value>) -> bool {
@@ -270,13 +328,7 @@ impl CoreApi {
                 .await
         })
         .await??;
-        let data = o.get("data").and_then(Value::as_object);
-        Ok(HistoryRecord {
-            has_more: data.is_some_and(|d| flag(d.get("hasMore"))),
-            is_old: data.is_some_and(|d| flag(d.get("isOld"))),
-            last_msg_id: data.map_or_else(String::new, |d| olaz_json::string(d.get("lastMsgId"))),
-            raw_json: blob(&o),
-        })
+        Ok(HistoryBatch::from_object(o).record())
     }
 
     pub async fn send_text(&self, args: SendTextRecord) -> Result<SendResultRecord, CoreError> {
