@@ -33,6 +33,8 @@ Workflow per unit: claim here, port into its own crate, port Swift fixtures as R
 
 | 5c | media/download network + disk cache (`olaz-media`) | done 2026-11-23 (rust +50: olaz-media 19 unit + 26 local-server/TLS, ffi 5; swift 462 both modes, 6 new in `RustMediaTests`). `CoreMedia` (`data`, `local_file`, `download_with_headers`, `download_to`, `evict`, `uses_doh`) behind `MediaLoader`/`DownloadManager`; 200 parallel local fetches via `MediaLoader` 0.07-0.17 s on the Rust path (Swift path cannot reach a plain-http server: ATS upgrade). See ADR-014 |
 
+Live check 2026-11-23 (release 5e274ba, wave 5c): image-heavy chat scrolling noticeably smoother (user report); engine.log has no `rust: error` lines.
+
 Live check 2026-11-23 (release build 9c47e82, merged 5a+5b): clean engine.log, no `rust: error` lines; the periodic `network timeout` is gone. Found on the way: `/api/friend/received/list` 404 on both paths (endpoint does not exist; fixed to `recommendsv2/list`). One startup `http status=429` from a typed endpoint (no path logged) seen once, not reproduced.
 
 ## Later waves (out of milestone 1)
