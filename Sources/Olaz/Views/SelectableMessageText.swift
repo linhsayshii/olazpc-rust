@@ -132,7 +132,14 @@ final class MessageTextSelectionView: NSView, NSTextViewDelegate {
     private func activate() -> MessageTextView? {
         if let textView { return textView }
         guard let config else { return nil }
-        let view = MessageTextView(frame: bounds)
+        // Own TextKit 1 stack: the layout manager paints every selection (focused or not) in the translucent color.
+        let storage = NSTextStorage()
+        let layout = SelectionLayoutManager()
+        layout.selectionColor = config.selectionColor
+        storage.addLayoutManager(layout)
+        let container = NSTextContainer(size: bounds.size)
+        layout.addTextContainer(container)
+        let view = MessageTextView(frame: bounds, textContainer: container)
         view.isEditable = false
         view.isSelectable = true
         view.isRichText = false
@@ -224,6 +231,21 @@ final class MessageTextSelectionView: NSView, NSTextViewDelegate {
         } else {
             NSCursor.arrow.set()
         }
+    }
+}
+
+/// Paints the selection of the overlay text view. AppKit draws an unfocused selection (after ⌘C, or once the composer has
+/// focus again) in the opaque `unemphasizedSelectedTextBackgroundColor`, ignoring `selectedTextAttributes`, which hid the
+/// SwiftUI glyphs under it. The overlay text has no background attribute of its own, so every fill here is the selection.
+final class SelectionLayoutManager: NSLayoutManager {
+    var selectionColor: NSColor = .selectedTextBackgroundColor.withAlphaComponent(0.45)
+
+    override func fillBackgroundRectArray(_ rectArray: UnsafePointer<NSRect>, count rectCount: Int,
+                                          forCharacterRange charRange: NSRange, color: NSColor) {
+        // `color` is informational only (AppKit has already set it on the context): fill here, blending, not copying.
+        selectionColor.setFill()
+        let rects = UnsafeBufferPointer(start: rectArray, count: rectCount)
+        for rect in rects { rect.fill(using: .sourceOver) }
     }
 }
 
