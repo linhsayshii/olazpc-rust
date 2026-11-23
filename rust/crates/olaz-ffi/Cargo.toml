@@ -17,9 +17,11 @@ olaz-crypto = { path = "../olaz-crypto" }
 olaz-json = { path = "../olaz-json" }
 olaz-media = { path = "../olaz-media" }
 olaz-net = { path = "../olaz-net" }
+olaz-signal = { path = "../olaz-signal" }
 olaz-store = { path = "../olaz-store" }
 olaz-wire = { path = "../olaz-wire" }
 olaz-ws = { path = "../olaz-ws" }
+rand = "0.9"
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }

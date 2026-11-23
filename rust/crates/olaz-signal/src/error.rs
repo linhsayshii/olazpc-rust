@@ -19,6 +19,29 @@ pub enum SignalError {
     Curve(#[from] libsignal_core::curve::CurveError),
 }
 
+impl SignalError {
+    /// Short class name without any detail (a protocol error's text can carry the peer address,
+    /// so only the variant name leaves this crate; ADR-008).
+    #[must_use]
+    pub fn kind(&self) -> String {
+        match self {
+            Self::Json(_) => "json".to_owned(),
+            Self::Base64(_) => "base64".to_owned(),
+            Self::Proto(_) => "protobuf".to_owned(),
+            Self::Format(_) => "format".to_owned(),
+            Self::Curve(_) => "curve".to_owned(),
+            Self::Protocol(e) => {
+                let dbg = format!("{e:?}");
+                let name: String = dbg
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                format!("protocol_{}", name.to_ascii_lowercase())
+            }
+        }
+    }
+}
+
 pub(crate) fn format_err<T>(msg: impl Into<String>) -> Result<T> {
     Err(SignalError::Format(msg.into()))
 }

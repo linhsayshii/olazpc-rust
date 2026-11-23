@@ -44,7 +44,7 @@ Live check 2026-11-23 (release build 9c47e82, merged 5a+5b): clean engine.log, n
 | Unit | Scope | State |
 |---|---|---|
 | 6b | E2EE compatibility spike: `olaz-signal` = libsignal-protocol v0.73.0 (vendored + 5-line Zalo patch) over the JS-persisted `zaloE2EEPCStoreV1` records; fixtures from the real bundled JS library; NOT wired, no FFI | done 2026-11-23 (verdict: compatible both ways, see ADR-015; olaz-signal 20 tests: 3 unit, 3 JS->Rust, 3 round-trip, 3 Rust->JS via node, 8 store; workspace 291) |
-| 6c | shadow-decrypt in the app (Rust decrypts a copy, JS stays authoritative), then cutover with JS fallback | open (plan in ADR-015) |
+| 6c | `CoreSignal` FFI (`olaz-ffi/src/signal.rs`) wired into `ZaloE2EEManager`: shadow decrypt by default (JS authoritative, Rust compares a copy, counters + `e2ee-shadow:` log lines), `OLAZ_E2EE_RUST=1` / `olaz.e2eeRust` makes Rust authoritative for decrypt+encrypt and persist, JS restore from the Rust-written JSON tested; JS runtime kept | done 2026-11-23 (not yet live-checked; ffi 3 new tests, Swift 6 new in `RustE2EEModeTests`; workspace 354; see ADR-015) |
 
 ## Later waves (out of milestone 1)
 

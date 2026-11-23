@@ -94,6 +94,62 @@ impl ZaloSignalStore {
         })
     }
 
+    /// `initOrRestore`: restores from the saved `zaloE2EEPCStoreV1` JSON, or generates a fresh
+    /// identity when there is none (empty / shorter than 3 chars, as the JS check). Returns
+    /// whether the store was restored.
+    ///
+    /// Deviation from JS: a non-empty value that fails to parse is an error, not a silent
+    /// regeneration. Regenerating would replace the account's identity key and, once persisted,
+    /// destroy every session; the caller decides what to do (the app falls back to the JS path).
+    pub fn init_or_restore<R: Rng + rand::CryptoRng>(
+        saved_json: &str,
+        rng: &mut R,
+    ) -> Result<(Self, bool)> {
+        if saved_json.len() > 2 {
+            Ok((Self::from_js_json(saved_json, now_ms())?, true))
+        } else {
+            Ok((Self::generate(rng)?, false))
+        }
+    }
+
+    /// `refillPreKeys`: generates `count` (at least 1) one-time prekeys with the next ids and
+    /// returns `(id, base64 public key)` for the `opKeys` upload.
+    pub fn refill_pre_keys<R: Rng + rand::CryptoRng>(
+        &mut self,
+        count: u32,
+        rng: &mut R,
+    ) -> Vec<(u32, String)> {
+        let mut out = Vec::new();
+        for _ in 0..count.max(1) {
+            let id = self.next_pre_key_id;
+            self.next_pre_key_id += 1;
+            let kp = KeyPair::generate(rng);
+            out.push((id, STANDARD.encode(kp.public_key.serialize())));
+            self.pre_keys
+                .keys
+                .insert(id, PreKeyRecord::new(PreKeyId::from(id), &kp));
+        }
+        out
+    }
+
+    /// `listSessions`: devices 0...3 of `remote_uid` with an open session and the remote
+    /// registration id of that session.
+    pub async fn list_sessions(&self, remote_uid: &str) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        for device in 0..=3u32 {
+            if self.has_session(remote_uid, device).await {
+                let reg = self
+                    .sessions
+                    .sessions
+                    .get(&zalo_address(remote_uid, device).to_string())
+                    .and_then(|(rec, _)| rec.remote_registration_id().ok())
+                    .unwrap_or(0);
+                out.push((device, reg));
+            }
+        }
+        out
+    }
+
     /// `buildSubmitBundlePayload`: what Zalo's server stores for this device.
     pub fn bundle_payload(&self) -> Result<Value> {
         let spk = match self.signed_pre_keys.keys.get(&self.signed_pre_key_id) {

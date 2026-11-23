@@ -2255,6 +2255,350 @@ public func FfiConverterTypeCoreSession_lower(_ value: CoreSession) -> UInt64 {
 
 
 /**
+ * The Zalo PC device's Signal store.
+ */
+public protocol CoreSignalProtocol: AnyObject, Sendable {
+    
+    /**
+     * `buildSubmitBundlePayload` as JSON text.
+     */
+    func bundlePayloadJson() async throws  -> String
+    
+    /**
+     * `decryptCipher`: the raw plaintext of a wire cipher from `sender_uid` / `device`.
+     */
+    func decryptCipher(senderUid: String, device: UInt32, cipherB64: String) async throws  -> Data
+    
+    /**
+     * `encryptCipher`: encrypts `plaintext` for the open session with `remote_uid` / `device`.
+     */
+    func encryptCipher(remoteUid: String, device: UInt32, plaintext: Data) async throws  -> SignalCipherRecord
+    
+    /**
+     * The whole store as `zaloE2EEPCStoreV1` JSON (what `exportStore` returns).
+     */
+    func exportStoreJson() async throws  -> String
+    
+    /**
+     * `hasSession`.
+     */
+    func hasSession(remoteUid: String, device: UInt32) async throws  -> Bool
+    
+    /**
+     * `listSessions`: open sessions of devices 0...3.
+     */
+    func listSessions(remoteUid: String) async throws  -> [SignalSessionRecord]
+    
+    /**
+     * `processPreKeyBundle`: starts a session from a server bundle (`bundle_json` is either
+     * shape the JS accepts: `{key:{preKey,opKeys}}` / `{preKey, opKey}` or the flat
+     * `{identityKey, signedPreKey, preKey}`). Retries once after dropping a changed identity pin,
+     * like the JS glue.
+     */
+    func processPrekeyBundle(remoteUid: String, device: UInt32, bundleJson: String) async throws 
+    
+    /**
+     * `refillPreKeys`: new one-time prekeys for the `opKeys` upload.
+     */
+    func refillPreKeys(count: UInt32) async throws  -> [SignalPreKeyRecord]
+    
+    /**
+     * The local registration id (`iKey.id` of the bundle).
+     */
+    func registrationId()  -> UInt32
+    
+    /**
+     * True when the store came from saved JSON, false for a freshly generated identity.
+     */
+    func restored()  -> Bool
+    
+}
+/**
+ * The Zalo PC device's Signal store.
+ */
+open class CoreSignal: CoreSignalProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_olaz_ffi_fn_clone_coresignal(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_olaz_ffi_fn_free_coresignal(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * `buildSubmitBundlePayload` as JSON text.
+     */
+open func bundlePayloadJson()async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coresignal_bundle_payload_json(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * `decryptCipher`: the raw plaintext of a wire cipher from `sender_uid` / `device`.
+     */
+open func decryptCipher(senderUid: String, device: UInt32, cipherB64: String)async throws  -> Data  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coresignal_decrypt_cipher(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(senderUid),FfiConverterUInt32.lower(device),FfiConverterString.lower(cipherB64)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterData.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * `encryptCipher`: encrypts `plaintext` for the open session with `remote_uid` / `device`.
+     */
+open func encryptCipher(remoteUid: String, device: UInt32, plaintext: Data)async throws  -> SignalCipherRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coresignal_encrypt_cipher(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(remoteUid),FfiConverterUInt32.lower(device),FfiConverterData.lower(plaintext)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeSignalCipherRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * The whole store as `zaloE2EEPCStoreV1` JSON (what `exportStore` returns).
+     */
+open func exportStoreJson()async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coresignal_export_store_json(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * `hasSession`.
+     */
+open func hasSession(remoteUid: String, device: UInt32)async throws  -> Bool  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coresignal_has_session(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(remoteUid),FfiConverterUInt32.lower(device)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_i8,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_i8,
+            freeFunc: ffi_olaz_ffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * `listSessions`: open sessions of devices 0...3.
+     */
+open func listSessions(remoteUid: String)async throws  -> [SignalSessionRecord]  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coresignal_list_sessions(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(remoteUid)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeSignalSessionRecord.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * `processPreKeyBundle`: starts a session from a server bundle (`bundle_json` is either
+     * shape the JS accepts: `{key:{preKey,opKeys}}` / `{preKey, opKey}` or the flat
+     * `{identityKey, signedPreKey, preKey}`). Retries once after dropping a changed identity pin,
+     * like the JS glue.
+     */
+open func processPrekeyBundle(remoteUid: String, device: UInt32, bundleJson: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coresignal_process_prekey_bundle(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(remoteUid),FfiConverterUInt32.lower(device),FfiConverterString.lower(bundleJson)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
+            freeFunc: ffi_olaz_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * `refillPreKeys`: new one-time prekeys for the `opKeys` upload.
+     */
+open func refillPreKeys(count: UInt32)async throws  -> [SignalPreKeyRecord]  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coresignal_refill_pre_keys(
+                        self.uniffiCloneHandle(),FfiConverterUInt32.lower(count)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeSignalPreKeyRecord.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * The local registration id (`iKey.id` of the bundle).
+     */
+open func registrationId() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coresignal_registration_id(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * True when the store came from saved JSON, false for a freshly generated identity.
+     */
+open func restored() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coresignal_restored(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreSignal: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = CoreSignal
+
+    public static func lift(_ handle: UInt64) throws -> CoreSignal {
+        return CoreSignal(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: CoreSignal) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreSignal {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: CoreSignal, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSignal_lift(_ handle: UInt64) throws -> CoreSignal {
+    return try FfiConverterTypeCoreSignal.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSignal_lower(_ value: CoreSignal) -> UInt64 {
+    return FfiConverterTypeCoreSignal.lower(value)
+}
+
+
+
+
+
+
+/**
  * SQLite store handle. Methods are `async` (they run on the blocking pool); `open` is sync but
  * only creates/opens a file, so call it from a background task on first launch.
  */
@@ -7797,6 +8141,205 @@ public func FfiConverterTypeSendTextRecord_lower(_ value: SendTextRecord) -> Rus
 
 
 /**
+ * Result of an encrypt: what `encryptCipher` returns in JS.
+ */
+public struct SignalCipherRecord: Equatable, Hashable {
+    /**
+     * base64 of `[type][libsignal message]`, the wire cipher.
+     */
+    public var cipher: String
+    /**
+     * 3 = PreKeyWhisperMessage, 1 = WhisperMessage.
+     */
+    public var messageType: UInt8
+    /**
+     * Remote registration id of the session used.
+     */
+    public var registrationId: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * base64 of `[type][libsignal message]`, the wire cipher.
+         */cipher: String, 
+        /**
+         * 3 = PreKeyWhisperMessage, 1 = WhisperMessage.
+         */messageType: UInt8, 
+        /**
+         * Remote registration id of the session used.
+         */registrationId: UInt32) {
+        self.cipher = cipher
+        self.messageType = messageType
+        self.registrationId = registrationId
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SignalCipherRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSignalCipherRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SignalCipherRecord {
+        return
+            try SignalCipherRecord(
+                cipher: FfiConverterString.read(from: &buf), 
+                messageType: FfiConverterUInt8.read(from: &buf), 
+                registrationId: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SignalCipherRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.cipher, into: &buf)
+        FfiConverterUInt8.write(value.messageType, into: &buf)
+        FfiConverterUInt32.write(value.registrationId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSignalCipherRecord_lift(_ buf: RustBuffer) throws -> SignalCipherRecord {
+    return try FfiConverterTypeSignalCipherRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSignalCipherRecord_lower(_ value: SignalCipherRecord) -> RustBuffer {
+    return FfiConverterTypeSignalCipherRecord.lower(value)
+}
+
+
+/**
+ * A generated one-time prekey as uploaded in `opKeys`.
+ */
+public struct SignalPreKeyRecord: Equatable, Hashable {
+    public var id: UInt32
+    /**
+     * base64 of the 33-byte public key.
+     */
+    public var key: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: UInt32, 
+        /**
+         * base64 of the 33-byte public key.
+         */key: String) {
+        self.id = id
+        self.key = key
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SignalPreKeyRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSignalPreKeyRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SignalPreKeyRecord {
+        return
+            try SignalPreKeyRecord(
+                id: FfiConverterUInt32.read(from: &buf), 
+                key: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SignalPreKeyRecord, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.id, into: &buf)
+        FfiConverterString.write(value.key, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSignalPreKeyRecord_lift(_ buf: RustBuffer) throws -> SignalPreKeyRecord {
+    return try FfiConverterTypeSignalPreKeyRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSignalPreKeyRecord_lower(_ value: SignalPreKeyRecord) -> RustBuffer {
+    return FfiConverterTypeSignalPreKeyRecord.lower(value)
+}
+
+
+/**
+ * One open session of a peer (`listSessions` row).
+ */
+public struct SignalSessionRecord: Equatable, Hashable {
+    public var deviceId: UInt32
+    public var registrationId: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(deviceId: UInt32, registrationId: UInt32) {
+        self.deviceId = deviceId
+        self.registrationId = registrationId
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SignalSessionRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSignalSessionRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SignalSessionRecord {
+        return
+            try SignalSessionRecord(
+                deviceId: FfiConverterUInt32.read(from: &buf), 
+                registrationId: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SignalSessionRecord, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.deviceId, into: &buf)
+        FfiConverterUInt32.write(value.registrationId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSignalSessionRecord_lift(_ buf: RustBuffer) throws -> SignalSessionRecord {
+    return try FfiConverterTypeSignalSessionRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSignalSessionRecord_lower(_ value: SignalSessionRecord) -> RustBuffer {
+    return FfiConverterTypeSignalSessionRecord.lower(value)
+}
+
+
+/**
  * A stored message decoded in Rust. `row_id` / `row_client_id` are the table columns (callers match on them).
  */
 public struct StoredChat: Equatable, Hashable {
@@ -10958,6 +11501,56 @@ fileprivate struct FfiConverterSequenceTypeReactionRecord: FfiConverterRustBuffe
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeSignalPreKeyRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [SignalPreKeyRecord]
+
+    public static func write(_ value: [SignalPreKeyRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSignalPreKeyRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SignalPreKeyRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SignalPreKeyRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSignalPreKeyRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSignalSessionRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [SignalSessionRecord]
+
+    public static func write(_ value: [SignalSessionRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSignalSessionRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SignalSessionRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SignalSessionRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSignalSessionRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeStoredChat: FfiConverterRustBuffer {
     typealias SwiftType = [StoredChat]
 
@@ -11228,6 +11821,44 @@ public func mediaStableHash(text: String) -> String  {
 })
 }
 /**
+ * `initOrRestore`: loads the saved `zaloE2EEPCStoreV1` JSON (`""` for none, which generates a
+ * fresh identity, signed prekey and 25 one-time prekeys). A non-empty value that does not parse
+ * is an error (JS would silently regenerate the identity; see `ZaloSignalStore::init_or_restore`).
+ */
+public func signalInitOrRestore(savedJson: String)async throws  -> CoreSignal  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_func_signal_init_or_restore(FfiConverterString.lower(savedJson)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterTypeCoreSignal_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+/**
+ * Shadow decrypt: loads `store_json` into a throw-away store, decrypts one cipher as
+ * `decryptCipher(sender_uid, device, cipher)` would and returns the plaintext bytes. The store
+ * is dropped afterwards; nothing is written anywhere.
+ */
+public func signalShadowDecrypt(storeJson: String, senderUid: String, device: UInt32, cipherB64: String)async throws  -> Data  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_func_signal_shadow_decrypt(FfiConverterString.lower(storeJson),FfiConverterString.lower(senderUid),FfiConverterUInt32.lower(device),FfiConverterString.lower(cipherB64)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterData.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+/**
  * Walks a whole envelope (history response, push body, polling result) and parses every message
  * and live reaction in it (`extractBatchEvents`).
  */
@@ -11325,6 +11956,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_func_media_stable_hash() != 42448) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_signal_init_or_restore() != 8413) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_signal_shadow_decrypt() != 52930) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_func_parse_wire_batch() != 55226) {
@@ -11490,6 +12127,36 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_qrlistener_on_rotated() != 9202) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coresignal_bundle_payload_json() != 37238) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coresignal_decrypt_cipher() != 65153) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coresignal_encrypt_cipher() != 59892) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coresignal_export_store_json() != 29591) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coresignal_has_session() != 63599) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coresignal_list_sessions() != 39718) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coresignal_process_prekey_bundle() != 25535) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coresignal_refill_pre_keys() != 26312) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coresignal_registration_id() != 45317) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coresignal_restored() != 43934) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_corestore_delete_conversation() != 30172) {

@@ -12,6 +12,7 @@
 //! | media | [`CoreMedia`] (image bytes, files cache, header/staged downloads, DoH + pinned TLS), [`MediaCancel`] |
 //! | wire | [`parse_wire_event`], [`parse_wire_batch`] -> [`WireEvent`] |
 //! | crypto | [`decrypt_ws_frame`], [`inflate`] |
+//! | signal | [`CoreSignal`], [`signal_init_or_restore`], [`signal_shadow_decrypt`] (1-1 E2EE, ADR-015) |
 //! | websocket | [`ws_start`] -> [`WsSession`], callbacks via [`WsListener`] |
 //!
 //! # Threading
@@ -43,6 +44,7 @@ mod media;
 mod raw_http;
 mod runtime;
 mod session;
+mod signal;
 mod store;
 mod wire;
 mod ws;
@@ -59,6 +61,10 @@ pub use http::{CoreHttp, HttpMethod, HttpRequestRecord, UploadPartRecord};
 pub use media::*;
 pub use raw_http::{CoreRawHttp, RawRequestRecord, RawResponseRecord};
 pub use session::{CoreSession, CoreSessionStatus, QrListener, QrScanRecord, QrTicketRecord};
+pub use signal::{
+    CoreSignal, SignalCipherRecord, SignalPreKeyRecord, SignalSessionRecord,
+    signal_init_or_restore, signal_shadow_decrypt,
+};
 pub use store::{
     ConversationRow, CoreStore, MessageRow, MessagesAroundRow, StoredChat, StoredChatAround,
 };
@@ -87,3 +93,5 @@ mod tests;
 
 #[cfg(test)]
 mod media_tests;
+#[cfg(test)]
+mod signal_tests;
