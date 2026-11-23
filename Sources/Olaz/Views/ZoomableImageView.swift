@@ -39,15 +39,19 @@ final class ZoomController {
 struct ZoomableImageView: NSViewRepresentable {
     let image: NSImage
     let zoom: ZoomController
+    /// Right-click menu of the picture (nil: none).
+    var menu: (() -> NSMenu?)?
 
     func makeNSView(context: Context) -> ZoomScrollView {
         let view = ZoomScrollView(frame: .zero)
         view.attach(zoom)
         view.setImage(image)
+        view.menuProvider = menu
         return view
     }
 
     func updateNSView(_ view: ZoomScrollView, context: Context) {
+        view.menuProvider = menu
         view.attach(zoom)
         view.setImage(image)
     }
@@ -71,6 +75,7 @@ private final class CenteringClipView: NSClipView {
 
 /// The scroll view's document: hands every mouse event to the scroll view, which does the panning and double-click zoom.
 private final class ZoomImageView: NSImageView {
+    override func menu(for event: NSEvent) -> NSMenu? { enclosingScrollView?.menu(for: event) }
     override func mouseDown(with event: NSEvent) { enclosingScrollView?.mouseDown(with: event) }
     override func mouseDragged(with event: NSEvent) { enclosingScrollView?.mouseDragged(with: event) }
     override func mouseUp(with event: NSEvent) { enclosingScrollView?.mouseUp(with: event) }
@@ -87,6 +92,9 @@ final class ZoomScrollView: NSScrollView {
     /// The viewport size the current fit was computed for: layout only re-fits when it really changes.
     private var fittedViewport = NSSize.zero
     private var pan: (mouse: NSPoint, origin: NSPoint)?
+    var menuProvider: (() -> NSMenu?)?
+
+    override func menu(for event: NSEvent) -> NSMenu? { menuProvider?() }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
