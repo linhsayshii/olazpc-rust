@@ -99,6 +99,50 @@ enum ChatFormat {
         }
         return out
     }
+
+    nonisolated(unsafe) private static let messageTextCache: NSCache<NSString, MessageText> = {
+        let c = NSCache<NSString, MessageText>(); c.countLimit = 2000; return c
+    }()
+
+    /// AppKit form of `mentioned(…)` for the selectable bubble text (`SelectableMessageText`): same links, mention
+    /// weight / color / background. Cached per text, side, size, accent and mentions, with its measured sizes.
+    @MainActor
+    static func messageText(_ s: String, mentions: [Mention], mine: Bool, myId: String?,
+                            size: CGFloat, accent: NSColor) -> MessageText {
+        let mentionKey = mentions.map { "\($0.uid),\($0.pos),\($0.len),\($0.isAll)" }.joined(separator: ";")
+        let key = "\(mine ? 1 : 0)|\(size)|\(accent.description)|\(myId ?? "")|\(mentionKey)|\(s)" as NSString
+        if let hit = messageTextCache.object(forKey: key) { return hit }
+        let text = mine ? NSColor.white : NSColor.labelColor
+        let out = NSMutableAttributedString(string: s, attributes: [.font: NSFont.systemFont(ofSize: size), .foregroundColor: text])
+        if let detector {
+            for match in detector.matches(in: s, range: NSRange(location: 0, length: out.length)) {
+                guard let url = match.url else { continue }
+                out.addAttributes([.link: url, .underlineStyle: NSUnderlineStyle.single.rawValue,
+                                   .foregroundColor: mine ? NSColor.white : accent], range: match.range)
+            }
+        }
+        for mention in mentions {
+            guard mention.pos >= 0, mention.len > 1, mention.pos + mention.len <= out.length,
+                  (s as NSString).character(at: mention.pos) == 0x40 else { continue }
+            let range = NSRange(location: mention.pos, length: mention.len)
+            let aimsAtMe = mention.isAll || (myId != nil && mention.uid == myId)
+            out.addAttributes([.font: NSFont.systemFont(ofSize: size, weight: .semibold),
+                               .foregroundColor: mine ? NSColor.white : accent], range: range)
+            out.removeAttribute(.underlineStyle, range: range)
+            out.removeAttribute(.link, range: range)
+            if aimsAtMe {
+                out.addAttribute(.backgroundColor, value: mine ? NSColor.white.withAlphaComponent(0.22) : accent.withAlphaComponent(0.16), range: range)
+            }
+            if !mention.isAll, mention.uid != myId, let url = URL(string: "\(mentionScheme):\(mention.uid)") {
+                out.addAttribute(.link, value: url, range: range)
+            }
+        }
+        // Same emoji as the SwiftUI `Text` underneath, so the selectable layer lines up with it.
+        Emoticon.replace(in: out)
+        let result = MessageText(out)
+        messageTextCache.setObject(result, forKey: key)
+        return result
+    }
 }
 
 // MARK: - Row
@@ -569,19 +613,32 @@ struct MessageRow: View {
     }
 
     private func textBody(_ text: String) -> some View {
-        Text(Emoticon.replacing(in: message.mentions.isEmpty
+        let size = scaled(14), mentions = message.mentions, mine = mine, myId = engine.profile?.userId
+        let accent = ChatPalette.accent(accentStored)
+        return Text(Emoticon.replacing(in: mentions.isEmpty
              ? ChatFormat.linkified(text, mine: mine)
-             : ChatFormat.mentioned(text, mentions: message.mentions, mine: mine, myId: engine.profile?.userId,
-                                    size: scaled(14), accent: ChatPalette.accent(accentStored))))
-            .font(.system(size: scaled(14)))
+             : ChatFormat.mentioned(text, mentions: mentions, mine: mine, myId: myId, size: size, accent: accent)))
+            .font(.system(size: size))
             .fixedSize(horizontal: false, vertical: true)
             .environment(\.openURL, OpenURLAction { url in
-                // A clicked @mention opens that member's 1-1 chat.
+                // Links opened through the Text itself (accessibility): a @mention opens that member's 1-1 chat.
                 guard url.scheme == ChatFormat.mentionScheme else { return .systemAction }
                 let uid = String(url.absoluteString.dropFirst(ChatFormat.mentionScheme.count + 1))
                 if !uid.isEmpty { engine.navigationRequest = uid }
                 return .handled
             })
+            // Selectable (drag / double / triple click, ⌘C, "Copy" on the selection) and clickable links / @mentions;
+            // "Chặn chia sẻ" blocks selecting. Nothing but an empty view until clicked (see MessageTextSelection).
+            .overlay {
+                MessageTextSelection(
+                    text: { ChatFormat.messageText(text, mentions: mentions, mine: mine, myId: myId, size: size, accent: NSColor(accent)) },
+                    selectionColor: mine ? NSColor.white.withAlphaComponent(0.35) : NSColor.selectedTextBackgroundColor.withAlphaComponent(0.45),
+                    allowsSelection: !message.menu.isProtected,
+                    mentionScheme: ChatFormat.mentionScheme,
+                    // A clicked @mention opens that member's 1-1 chat.
+                    onMention: { uid in engine.navigationRequest = uid },
+                    identity: message.id + "|" + text)
+            }
     }
 
     private var stickerPlaceholder: some View {

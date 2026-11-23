@@ -108,4 +108,24 @@ enum Emoticon {
         }
         return out
     }
+
+    /// AppKit form of `replacing(in: AttributedString)` for the selectable bubble text: same matches, each emoji
+    /// keeps the attributes of the run it replaces. Run after links and mentions; linked text is left alone.
+    static func replace(in text: NSMutableAttributedString) {
+        let s = text.string
+        let found = matches(in: s)
+        guard !found.isEmpty else { return }
+        for m in found.reversed() {
+            let lo = s.index(s.startIndex, offsetBy: m.range.lowerBound)
+            let hi = s.index(s.startIndex, offsetBy: m.range.upperBound)
+            let range = NSRange(lo..<hi, in: s)
+            var linked = false
+            text.enumerateAttribute(.link, in: range) { value, _, stop in
+                if value != nil { linked = true; stop.pointee = true }
+            }
+            if linked { continue }
+            let attrs = text.attributes(at: range.location, effectiveRange: nil)
+            text.replaceCharacters(in: range, with: NSAttributedString(string: m.emoji, attributes: attrs))
+        }
+    }
 }

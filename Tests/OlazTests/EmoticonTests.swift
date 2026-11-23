@@ -74,4 +74,17 @@ import SwiftUI
         let text = AttributedString("no emoticon here")
         #expect(Emoticon.replacing(in: text) == text)
     }
+
+    @Test func appKitTextReplacedKeepingLinks() {
+        let text = NSMutableAttributedString(string: "hi :) https://a.vn :z")
+        text.addAttribute(.link, value: URL(string: "https://a.vn")!, range: NSRange(location: 6, length: 12))
+        Emoticon.replace(in: text)
+        #expect(text.string == "hi 🙂 https://a.vn 😴")
+        let link = (text.string as NSString).range(of: "https://a.vn")
+        #expect(text.attribute(.link, at: link.location, effectiveRange: nil) != nil)
+
+        let linked = NSMutableAttributedString(string: ":)", attributes: [.link: URL(string: "https://a.vn")!])
+        Emoticon.replace(in: linked)
+        #expect(linked.string == ":)")
+    }
 }
