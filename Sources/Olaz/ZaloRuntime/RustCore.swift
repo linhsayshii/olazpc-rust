@@ -18,20 +18,30 @@ enum RustCore {
 
     /// Maps a Rust-core error to the Swift error the engine already reacts to (`ZaloSessionError.isAuthError` re-login,
     /// `URLError` for connectivity, `ZaloTransportError` for the rest). Messages never carry tokens or bodies (ADR-008).
-    static func mapError(_ error: Error) -> Error {
+    /// `path` (request path, no host or query) is carried into `ZaloSessionError.url` like the Swift path does.
+    /// `quietTimeout` skips the log line for a network timeout: the HTTP long-poll times out by design when the server
+    /// has nothing to say, and the Swift path never logged it.
+    static func mapError(_ error: Error, path: String = "", quietTimeout: Bool = false) -> Error {
         guard let core = error as? CoreError else { return error }
         // Shape only (ADR-008): error case name and numeric code, never messages.
-        let shape: String
+        let shape: String?
         switch core {
-        case .Session(let code, _, let isAuth): shape = "session code=\(code) auth=\(isAuth)"
+        case .Session(let code, _, let isAuth):
+            // Expected board notices (pin disabled / empty): the Swift path skipped the log line too.
+            let expectedBoardNotice = path.contains("/api/board/")
+                && (code == 112 || code == 265 || (path.contains("/oneone/list") && code == -1))
+            shape = expectedBoardNotice ? nil : "session code=\(code) auth=\(isAuth)"
         case .Http(let status): shape = "http status=\(status)"
-        case .Network(let kind, _): shape = "network \(kind)"
+        case .Network(let kind, _): shape = quietTimeout && kind == .timeout ? nil : "network \(kind)"
         default: shape = "\(core)".split(separator: "(").first.map(String.init) ?? "other"
         }
-        Task { @MainActor in EngineLog.shared.write("rust: error \(shape)") }
+        if let shape {
+            let logged = path.isEmpty ? shape : "\(shape) path=\(path)"
+            Task { @MainActor in EngineLog.shared.write("rust: error \(logged)") }
+        }
         switch core {
         case .Session(let code, let message, _):
-            return ZaloSessionError(code: Int(code), message: message, url: "")
+            return ZaloSessionError(code: Int(code), message: message, url: path)
         case .Network(let kind, _):
             switch kind {
             case .timeout: return URLError(.timedOut)

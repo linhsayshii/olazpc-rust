@@ -105,3 +105,71 @@ async fn slow_server_maps_to_timeout_and_closed_port_to_network_error() {
     // The error text must not leak the URL (it can carry signed params).
     assert!(!err.to_string().contains("/closed"), "{err}");
 }
+
+/// Serves one 200 answer whose body arrives in `pieces`, `gap` apart. `announced` is the
+/// `Content-Length`; when it exceeds what is sent the socket then stays silent for 3 s.
+fn serve_trickle(pieces: Vec<&'static str>, gap: Duration, announced: usize) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {announced}\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let mut sent = 0;
+            for p in pieces {
+                std::thread::sleep(gap);
+                let _ = stream.write_all(p.as_bytes());
+                let _ = stream.flush();
+                sent += p.len();
+            }
+            if sent < announced {
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// The timeout is an inactivity timer (Swift `timeoutIntervalForRequest`), not a total deadline:
+/// a body that keeps trickling in must outlive it.
+#[tokio::test]
+async fn timeout_is_inactivity_not_total() {
+    let base = serve_trickle(
+        vec!["aaaa", "bbbb", "cccc", "dddd"],
+        Duration::from_millis(150),
+        16,
+    );
+    let t = ReqwestTransport::new().unwrap();
+    let mut s = spec(format!("{base}/trickle"), Method::Get, None);
+    // 4 x 150 ms = 600 ms in total, but never silent for more than ~150 ms.
+    s.timeout = Some(Duration::from_millis(400));
+    let resp = t.send(s).await.unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, b"aaaabbbbccccdddd");
+}
+
+/// A server that goes silent mid-body times out (`URLError.timedOut`).
+#[tokio::test]
+async fn silence_mid_body_times_out() {
+    let base = serve_trickle(vec!["abcd"], Duration::from_millis(10), 100);
+    let t = ReqwestTransport::new().unwrap();
+    let mut s = spec(format!("{base}/stall"), Method::Get, None);
+    s.timeout = Some(Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    let err = t.send(s).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            NetError::Network {
+                kind: NetworkErrorKind::Timeout,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+}

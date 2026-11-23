@@ -8,6 +8,7 @@
 //! | store | [`CoreStore`] (+ [`ConversationRow`], [`MessageRow`], [`MessagesAroundRow`]) |
 //! | session | [`CoreSession`] (restore/snapshot, QR login, status), [`QrListener`] |
 //! | api | [`CoreApi`] over a shared [`CoreSession`], [`poll_state_initial`] |
+//! | http | [`CoreHttp`]: generic signed GET / POST / multipart for every other endpoint |
 //! | wire | [`parse_wire_event`], [`parse_wire_batch`] -> [`WireEvent`] |
 //! | crypto | [`decrypt_ws_frame`], [`inflate`] |
 //! | websocket | [`ws_start`] -> [`WsSession`], callbacks via [`WsListener`] |
@@ -36,6 +37,7 @@ mod api;
 mod chat;
 mod crypto;
 mod error;
+mod http;
 mod runtime;
 mod session;
 mod store;
@@ -49,6 +51,7 @@ pub use api::{
 pub use chat::*;
 pub use crypto::{decrypt_ws_frame, inflate};
 pub use error::{CoreError, NetworkKind};
+pub use http::{CoreHttp, HttpMethod, HttpRequestRecord, UploadPartRecord};
 pub use session::{CoreSession, CoreSessionStatus, QrListener, QrScanRecord, QrTicketRecord};
 pub use store::{
     ConversationRow, CoreStore, MessageRow, MessagesAroundRow, StoredChat, StoredChatAround,

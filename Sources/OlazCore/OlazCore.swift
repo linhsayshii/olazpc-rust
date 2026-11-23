@@ -519,6 +519,22 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
+    typealias FfiType = UInt64
+    typealias SwiftType = UInt64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
     typealias FfiType = Int64
     typealias SwiftType = Int64
@@ -1205,6 +1221,207 @@ public func FfiConverterTypeCoreApi_lift(_ handle: UInt64) throws -> CoreApi {
 #endif
 public func FfiConverterTypeCoreApi_lower(_ value: CoreApi) -> UInt64 {
     return FfiConverterTypeCoreApi.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Generic authenticated requests over a shared [`CoreSession`]. Every method is async, runs on the
+ * shared runtime and throws `CoreError` (`.session(isAuth: true)` means re-login).
+ */
+public protocol CoreHttpProtocol: AnyObject, Sendable {
+    
+    /**
+     * `postMultipart` with the file part given as bytes.
+     */
+    func postMultipart(request: HttpRequestRecord, part: UploadPartRecord, data: Data) async throws  -> String
+    
+    /**
+     * `postMultipart` with the file part read from `file_path` (`length` bytes from `offset`, to
+     * EOF when `None`) on the blocking pool: the bytes never cross the FFI boundary. Pass one
+     * upload chunk at a time, the slice is held in memory while the request (and its failover
+     * retries) runs.
+     */
+    func postMultipartFile(request: HttpRequestRecord, part: UploadPartRecord, filePath: String, offset: UInt64, length: UInt64?) async throws  -> String
+    
+    /**
+     * `get` / `post`: the full decoded answer as lossless JSON text.
+     */
+    func request(request: HttpRequestRecord) async throws  -> String
+    
+}
+/**
+ * Generic authenticated requests over a shared [`CoreSession`]. Every method is async, runs on the
+ * shared runtime and throws `CoreError` (`.session(isAuth: true)` means re-login).
+ */
+open class CoreHttp: CoreHttpProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_olaz_ffi_fn_clone_corehttp(self.handle, $0) }
+    }
+public convenience init(session: CoreSession) {
+    let handle =
+        try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_constructor_corehttp_new(
+        FfiConverterTypeCoreSession_lower(session),uniffiCallStatus
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_olaz_ffi_fn_free_corehttp(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * `postMultipart` with the file part given as bytes.
+     */
+open func postMultipart(request: HttpRequestRecord, part: UploadPartRecord, data: Data)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehttp_post_multipart(
+                        self.uniffiCloneHandle(),FfiConverterTypeHttpRequestRecord_lower(request),FfiConverterTypeUploadPartRecord_lower(part),FfiConverterData.lower(data)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * `postMultipart` with the file part read from `file_path` (`length` bytes from `offset`, to
+     * EOF when `None`) on the blocking pool: the bytes never cross the FFI boundary. Pass one
+     * upload chunk at a time, the slice is held in memory while the request (and its failover
+     * retries) runs.
+     */
+open func postMultipartFile(request: HttpRequestRecord, part: UploadPartRecord, filePath: String, offset: UInt64, length: UInt64?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehttp_post_multipart_file(
+                        self.uniffiCloneHandle(),FfiConverterTypeHttpRequestRecord_lower(request),FfiConverterTypeUploadPartRecord_lower(part),FfiConverterString.lower(filePath),FfiConverterUInt64.lower(offset),FfiConverterOptionUInt64.lower(length)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * `get` / `post`: the full decoded answer as lossless JSON text.
+     */
+open func request(request: HttpRequestRecord)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehttp_request(
+                        self.uniffiCloneHandle(),FfiConverterTypeHttpRequestRecord_lower(request)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreHttp: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = CoreHttp
+
+    public static func lift(_ handle: UInt64) throws -> CoreHttp {
+        return CoreHttp(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: CoreHttp) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreHttp {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: CoreHttp, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreHttp_lift(_ handle: UInt64) throws -> CoreHttp {
+    return try FfiConverterTypeCoreHttp.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreHttp_lower(_ value: CoreHttp) -> UInt64 {
+    return FfiConverterTypeCoreHttp.lower(value)
 }
 
 
@@ -4184,6 +4401,129 @@ public func FfiConverterTypeHistoryRecord_lower(_ value: HistoryRecord) -> RustB
 }
 
 
+/**
+ * One authenticated call (Swift `get` / `post` / `postMultipart` arguments).
+ */
+public struct HttpRequestRecord: Equatable, Hashable {
+    public var method: HttpMethod
+    /**
+     * `SERVICE_MAP_V3` key, e.g. `"profile"`, `"file"`.
+     */
+    public var service: String
+    /**
+     * Path with leading slash.
+     */
+    public var path: String
+    /**
+     * Plain query parameters (sorted by key on the wire).
+     */
+    public var query: [String: String]
+    /**
+     * Extra headers (ignored by the multipart calls, like Swift).
+     */
+    public var headers: [String: String]
+    /**
+     * JSON object text encrypted into `params=` (required for POST and multipart).
+     */
+    public var payloadJson: String?
+    /**
+     * GET only, used when `payload_json` is `None`: plaintext to encrypt into `params=`.
+     */
+    public var rawEncrypted: String?
+    /**
+     * Decrypt the answer's `data` (multipart always does).
+     */
+    public var decryptResponse: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(method: HttpMethod, 
+        /**
+         * `SERVICE_MAP_V3` key, e.g. `"profile"`, `"file"`.
+         */service: String, 
+        /**
+         * Path with leading slash.
+         */path: String, 
+        /**
+         * Plain query parameters (sorted by key on the wire).
+         */query: [String: String], 
+        /**
+         * Extra headers (ignored by the multipart calls, like Swift).
+         */headers: [String: String], 
+        /**
+         * JSON object text encrypted into `params=` (required for POST and multipart).
+         */payloadJson: String?, 
+        /**
+         * GET only, used when `payload_json` is `None`: plaintext to encrypt into `params=`.
+         */rawEncrypted: String?, 
+        /**
+         * Decrypt the answer's `data` (multipart always does).
+         */decryptResponse: Bool) {
+        self.method = method
+        self.service = service
+        self.path = path
+        self.query = query
+        self.headers = headers
+        self.payloadJson = payloadJson
+        self.rawEncrypted = rawEncrypted
+        self.decryptResponse = decryptResponse
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension HttpRequestRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeHttpRequestRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> HttpRequestRecord {
+        return
+            try HttpRequestRecord(
+                method: FfiConverterTypeHttpMethod.read(from: &buf), 
+                service: FfiConverterString.read(from: &buf), 
+                path: FfiConverterString.read(from: &buf), 
+                query: FfiConverterDictionaryStringString.read(from: &buf), 
+                headers: FfiConverterDictionaryStringString.read(from: &buf), 
+                payloadJson: FfiConverterOptionString.read(from: &buf), 
+                rawEncrypted: FfiConverterOptionString.read(from: &buf), 
+                decryptResponse: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: HttpRequestRecord, into buf: inout [UInt8]) {
+        FfiConverterTypeHttpMethod.write(value.method, into: &buf)
+        FfiConverterString.write(value.service, into: &buf)
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterDictionaryStringString.write(value.query, into: &buf)
+        FfiConverterDictionaryStringString.write(value.headers, into: &buf)
+        FfiConverterOptionString.write(value.payloadJson, into: &buf)
+        FfiConverterOptionString.write(value.rawEncrypted, into: &buf)
+        FfiConverterBool.write(value.decryptResponse, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHttpRequestRecord_lift(_ buf: RustBuffer) throws -> HttpRequestRecord {
+    return try FfiConverterTypeHttpRequestRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHttpRequestRecord_lower(_ value: HttpRequestRecord) -> RustBuffer {
+    return FfiConverterTypeHttpRequestRecord.lower(value)
+}
+
+
 public struct LocationRecord: Equatable, Hashable {
     public var title: String
     public var address: String
@@ -5655,6 +5995,67 @@ public func FfiConverterTypeTypedEnvelope_lower(_ value: TypedEnvelope) -> RustB
 }
 
 
+/**
+ * Form field of the single file part of a multipart upload.
+ */
+public struct UploadPartRecord: Equatable, Hashable {
+    public var fieldName: String
+    public var fileName: String
+    public var mimeType: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(fieldName: String, fileName: String, mimeType: String) {
+        self.fieldName = fieldName
+        self.fileName = fileName
+        self.mimeType = mimeType
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension UploadPartRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeUploadPartRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UploadPartRecord {
+        return
+            try UploadPartRecord(
+                fieldName: FfiConverterString.read(from: &buf), 
+                fileName: FfiConverterString.read(from: &buf), 
+                mimeType: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: UploadPartRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.fieldName, into: &buf)
+        FfiConverterString.write(value.fileName, into: &buf)
+        FfiConverterString.write(value.mimeType, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUploadPartRecord_lift(_ buf: RustBuffer) throws -> UploadPartRecord {
+    return try FfiConverterTypeUploadPartRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUploadPartRecord_lower(_ value: UploadPartRecord) -> RustBuffer {
+    return FfiConverterTypeUploadPartRecord.lower(value)
+}
+
+
 public struct UserCountRecord: Equatable, Hashable {
     public var uid: String
     public var count: Int64
@@ -6540,6 +6941,75 @@ public func FfiConverterTypeECardStyleRecord_lower(_ value: ECardStyleRecord) ->
 
 
 /**
+ * HTTP method of a [`HttpRequestRecord`].
+ */
+
+public enum HttpMethod: Equatable, Hashable {
+    
+    case get
+    case post
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension HttpMethod: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeHttpMethod: FfiConverterRustBuffer {
+    typealias SwiftType = HttpMethod
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> HttpMethod {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .get
+        
+        case 2: return .post
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: HttpMethod, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .get:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .post:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHttpMethod_lift(_ buf: RustBuffer) throws -> HttpMethod {
+    return try FfiConverterTypeHttpMethod.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHttpMethod_lower(_ value: HttpMethod) -> RustBuffer {
+    return FfiConverterTypeHttpMethod.lower(value)
+}
+
+
+
+/**
  * `ChatMessage.Kind`. URLs are strings (Swift maps them with `URL(string:)`).
  */
 
@@ -7201,6 +7671,30 @@ fileprivate struct FfiConverterOptionUInt32: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterUInt32.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
+    typealias SwiftType = UInt64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt64.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -8169,6 +8663,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreapi_set_unread_mark() != 40097) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_corehttp_post_multipart() != 4369) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehttp_post_multipart_file() != 12365) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehttp_request() != 7496) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coresession_clear_session() != 4619) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8353,6 +8856,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_constructor_coreapi_new() != 49715) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_constructor_corehttp_new() != 27227) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_constructor_coresession_new() != 51392) {

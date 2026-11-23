@@ -14,6 +14,7 @@ pub mod cookie;
 pub mod decode;
 pub mod domains;
 mod error;
+pub mod generic;
 pub mod http;
 pub mod mock;
 pub mod request;
@@ -32,6 +33,7 @@ pub use domains::{
     canonical_service, default_service_hosts, fallback_service_hosts, normalize_host,
 };
 pub use error::{NetError, NetworkErrorKind, ZaloSessionError};
+pub use generic::GenericCall;
 pub use http::{
     DEFAULT_REQUEST_TIMEOUT, Method, RawResponse, RequestOptions, RequestSpec, ReqwestTransport,
     Transport, build_request, common_params, sorted_query_string, url_encode,

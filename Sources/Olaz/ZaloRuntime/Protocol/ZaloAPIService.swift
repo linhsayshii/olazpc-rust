@@ -507,7 +507,7 @@ extension ZaloSessionClient {
                     ($0.key, ZaloPollQueueCursor(lastId: $0.lastId, ids: $0.ids))
                 })
                 return (ZaloJSONBox(RustCore.object(out.rawJson)), next, out.more)
-            } catch { throw RustCore.mapError(error) }
+            } catch { throw RustCore.mapError(error, quietTimeout: true) }
         }
         let ts = Int64(Date().timeIntervalSince1970)
         let base = ZaloDomains.normalizeHost(domains.lpChat)

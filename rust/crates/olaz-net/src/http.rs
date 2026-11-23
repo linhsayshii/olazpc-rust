@@ -6,7 +6,8 @@ use std::time::Duration;
 use crate::domains::{USER_AGENT, ZPW_TYPE, ZPW_VER};
 use crate::error::{NetError, NetworkErrorKind};
 
-/// Default per-request timeout (Swift `timeoutIntervalForRequest = 35`).
+/// Default per-request INACTIVITY timeout (Swift `timeoutIntervalForRequest = 35`): it applies to
+/// each wait for headers or body bytes, not to the whole request.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 /// Whole-request cap used by the reqwest client (Swift `timeoutIntervalForResource = 180`).
 pub const RESOURCE_TIMEOUT: Duration = Duration::from_secs(180);
@@ -237,6 +238,10 @@ impl ReqwestTransport {
     }
 }
 
+fn idle_timeout() -> NetError {
+    NetError::network(NetworkErrorKind::Timeout, "request timed out")
+}
+
 fn map_reqwest_error(e: reqwest::Error) -> NetError {
     // Strip the URL: it carries encrypted params and signing material (ADR-008).
     let e = e.without_url();
@@ -268,8 +273,15 @@ impl Transport for ReqwestTransport {
             if let Some(body) = request.body {
                 builder = builder.body(body);
             }
-            builder = builder.timeout(request.timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT));
-            let response = builder.send().await.map_err(map_reqwest_error)?;
+            // Swift `URLRequest.timeoutInterval` is an inactivity timer: it restarts whenever bytes
+            // move. reqwest's per-request `timeout` is a total deadline, so apply the limit to each
+            // wait instead (headers, then every body chunk). The client-wide `RESOURCE_TIMEOUT`
+            // stays the total cap, like `timeoutIntervalForResource`.
+            let idle = request.timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+            let mut response = tokio::time::timeout(idle, builder.send())
+                .await
+                .map_err(|_| idle_timeout())?
+                .map_err(map_reqwest_error)?;
             let status = response.status().as_u16();
             let headers = response
                 .headers()
@@ -281,7 +293,14 @@ impl Transport for ReqwestTransport {
                     )
                 })
                 .collect();
-            let body = response.bytes().await.map_err(map_reqwest_error)?.to_vec();
+            let mut body = Vec::new();
+            while let Some(chunk) = tokio::time::timeout(idle, response.chunk())
+                .await
+                .map_err(|_| idle_timeout())?
+                .map_err(map_reqwest_error)?
+            {
+                body.extend_from_slice(&chunk);
+            }
             Ok(RawResponse {
                 status,
                 headers,

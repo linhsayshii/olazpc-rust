@@ -28,6 +28,7 @@ Workflow per unit: claim here, port into its own crate, port Swift fixtures as R
 | 4b | Chat state (conversation list merge/sort/unread, per-conversation message window) in Rust; Swift gets diffs | deferred (small remaining gain) |
 | 4c | Flip `OLAZ_RUST_CORE` default on (ADR-012) | done 2026-11-23 (swift 443 both modes) |
 | 4d | Delete Swift chat path | open (after commit + daily use) |
+| 5b | generic signed HTTP seam (all feature endpoints) + timeout fix | done 2026-11-23 (rust 271 = +8 golden/seam, +2 timeout, +5 ffi; swift 452 both modes). `CoreHttp` (`request`, `post_multipart`, `post_multipart_file`) over `olaz_net::GenericCall`; Swift `ZaloSessionClient.get/post/postMultipart` delegate to it when `useRustCore`. Still Swift: `rawGetJSON`/`rawRequest` callers (QR/login already Rust), `zCloudGet` (cloud-viewer-key header, no ParamCipher), `rawDownloadData`, `downloadSyncBatch` |
 
 ## Later waves (out of milestone 1)
 
@@ -38,6 +39,9 @@ Media/Download, Poll, Cloud, Contacts, GroupMgmt, Transfer, Search, Stickers, No
 SwiftUI views (`App/`, `Shell/`, `Views/`), `ShellModel`, Keychain glue, QR PNG rendering (CoreImage).
 
 ## Open questions / debt
+
+- `rust: error network timeout` every ~16 s (found 2026-11-23, fixed in 5b). Cause: the HTTP chat long-poll (`fetchChatFromPolling`, 12 s timeout, `conversations.rs` `raw_get_json(.., 12 s)`) is run by `startLongPollLoop` as `sleep 4 s` + poll, so a quiet server times out every 4 + 12 = 16 s. The Swift path times out identically but silently (`drainChatPolling` has `catch { break }` and `rawGetJSON` logs nothing), while `RustCore.mapError` logs every `.Network` error. Fix: `mapError(quietTimeout: true)` for the poll (an expected timeout is not an error). Separate real divergence also fixed: `ReqwestTransport` used reqwest's per-request `.timeout()` (TOTAL deadline) where Swift `URLRequest.timeoutInterval` is an inactivity timer (restarts on bytes), so slow uploads/downloads over the 35 s default died early; now `tokio::time::timeout` wraps the header wait and every body chunk, with the 180 s total cap kept client-wide (= `timeoutIntervalForResource`).
+- Rust seam keeps failover winners (`rememberWinner`) only in the core session; Swift's persisted `domains` no longer learn them from feature calls (typed endpoints already behaved so). Cost: first call after launch may try the default host order once.
 
 - Pre-existing bugs (both paths): typing indicator and in-message search do not work.
 
