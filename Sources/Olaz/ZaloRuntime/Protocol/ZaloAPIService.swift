@@ -1044,18 +1044,25 @@ extension ZaloSessionClient {
         )
     }
 
+    /// Official `VERSION_MSG` (text, sticker, file, photo, link, gif: `{version:0, compat_version:0}`). A receiver drops
+    /// any message whose `compat_version` is above the one it knows before decrypting it: Zalo PC 26.10 shows a text sent
+    /// with 1 as failed while the phone still opens it.
+    static let e2eeMsgVersion = 0
+    static let e2eeMsgCompatVersion = 0
+
     static func buildE2EEExtJSON(
         registrationId: Int,
         senderRegistrationId: Int,
-        version: Int = 1,
-        compatVersion: Int = 1
+        version: Int = e2eeMsgVersion,
+        compatVersion: Int = e2eeMsgCompatVersion
     ) -> String {
-        let obj: [String: Any] = [
+        // Official `buildE2eeParams` / `_enrichAdditionalParams`: iid and sender_iid only when known.
+        var obj: [String: Any] = [
             "version": version,
             "compat_version": compatVersion,
-            "iid": registrationId,
-            "sender_iid": senderRegistrationId,
         ]
+        if registrationId > 0 { obj["iid"] = registrationId }
+        if senderRegistrationId > 0 { obj["sender_iid"] = senderRegistrationId }
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]),
               let str = String(data: data, encoding: .utf8) else {
             return "{}"
@@ -1072,8 +1079,8 @@ extension ZaloSessionClient {
         senderIid: Int,
         ttl: Int = 0,
         useLegacyE2EEKey: Bool = false,
-        version: Int = 1,
-        compatVersion: Int = 1,
+        version: Int = e2eeMsgVersion,
+        compatVersion: Int = e2eeMsgCompatVersion,
         extraFields: [String: Any] = [:]
     ) -> [String: Any] {
         let extJSON = buildE2EEExtJSON(
@@ -1271,7 +1278,11 @@ extension ZaloSessionClient {
             let path = spec.path
             let code = JSONLossless.int64(resp["error_code"]).map(String.init) ?? "-"
             let entries = listParams.array.count
-            Task { @MainActor in EngineLog.shared.write("e2ee send: post path=\(path) entries=\(entries) error_code=\(code) msgId=\(!extracted.msgId.isEmpty)") }
+            let ext = (listParams.array.first?["e2eeExt"] as? String).flatMap { JSONLossless.parseObject(Data($0.utf8)) }
+            let versions = ext.map { "\(JSONLossless.int64($0["version"]) ?? -1)/\(JSONLossless.int64($0["compat_version"]) ?? -1)" } ?? "-"
+            Task { @MainActor in
+                EngineLog.shared.write("e2ee send: post path=\(path) entries=\(entries) version=\(versions) error_code=\(code) msgId=\(!extracted.msgId.isEmpty)")
+            }
         }
         if extracted.msgId.isEmpty {
             // Shapes only (key names), never values: the message keeps its clientId until the WS echo.

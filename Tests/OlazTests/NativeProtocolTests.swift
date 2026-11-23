@@ -2010,10 +2010,13 @@ private final class MockProfileURLProtocol: URLProtocol, @unchecked Sendable {
 
         let extStr = try #require(entry["e2eeExt"] as? String)
         let extObj = try #require(JSONLossless.parseObject(Data(extStr.utf8)))
-        #expect(JSONLossless.int64(extObj["version"]) == 1)
-        #expect(JSONLossless.int64(extObj["compat_version"]) == 1)
+        // Official VERSION_MSG.TEXT_MSG: Zalo PC drops anything with a higher compat_version before decrypting.
+        #expect(JSONLossless.int64(extObj["version"]) == 0)
+        #expect(JSONLossless.int64(extObj["compat_version"]) == 0)
         #expect(JSONLossless.int64(extObj["iid"]) == 3001)
         #expect(JSONLossless.int64(extObj["sender_iid"]) == 9002)
+        let noIid = try #require(JSONLossless.parseObject(Data(ZaloSessionClient.buildE2EEExtJSON(registrationId: 0, senderRegistrationId: 0).utf8)))
+        #expect(noIid["iid"] == nil && noIid["sender_iid"] == nil)
 
         let oneOneSpec = ZaloSessionClient.buildE2EEMessageRequestPayload(
             endpoint: "sms",
