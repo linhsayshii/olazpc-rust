@@ -38,8 +38,11 @@ extension ZaloEngine {
                 }
             }
 
-            // 2. Refresh recent history (and board pins) from server if authenticated.
-            let fetched = await self.fetchAndMergeHistory(convId: id, beforeMsgId: nil, isOld: false, count: 50)
+            // 2. Refresh recent history (and board pins) from server if authenticated. Skipped when this session already
+            // knows the store holds the newest message (launch preload probe, or an earlier open of this chat).
+            let fetched = self.isRecentHistoryUpToDate(id)
+                ? 0
+                : await self.fetchAndMergeHistory(convId: id, beforeMsgId: nil, isOld: false, count: 50)
             await self.resolveMissingSenderProfiles(in: id)
             if (fetched > 0 || self.conversations.first(where: { $0.id == id })?.preview == nil),
                let latest = self.messages[id]?.last {
@@ -210,6 +213,7 @@ extension ZaloEngine {
             return 0
         }
 
+        if beforeMsgId == nil { historyFreshness[convId] = .upToDate }
         let myUid = profile?.userId ?? ""
         let isGrp = ZaloWireParser.isGroupId(convId)
         let isSelf = (convId == selfConversationId)

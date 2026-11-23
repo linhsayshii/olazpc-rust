@@ -163,6 +163,9 @@ final class ZaloEngine {
     @ObservationIgnored internal var cachedProfiles: [String: ZaloWebKitMigrator.CachedProfile] = [:]
     @ObservationIgnored internal var cachedGroups: [String: ZaloWebKitMigrator.CachedGroup] = [:]
     @ObservationIgnored internal var cachedActivityRanks: [String: Int64] = [:]
+    /// Per-conversation result of the launch preload probe (see `ZaloEngine+HistoryFreshness.swift`).
+    @ObservationIgnored internal var historyFreshness: [String: HistoryFreshness] = [:]
+    @ObservationIgnored internal var historyFullRefreshDue = false
     @ObservationIgnored internal var cachedBoardRawTopics: [String: (version: Int64, topics: [String: [String: Any]])] = [:]
     @ObservationIgnored internal var cachedHiddenPinHash: String?
     @ObservationIgnored internal var cachedHiddenPinMD5: String?
@@ -317,6 +320,8 @@ final class ZaloEngine {
         cachedGroupDetails = [:]
         cachedFriendGlobalIds = [:]
         phoneSyncConvTimestamps = [:]
+        historyFreshness = [:]
+        historyFullRefreshDue = false
         isTransferHidden = false
         phoneSyncStatusSignal = nil
         cachedPinnedIds = []
@@ -695,15 +700,26 @@ final class ZaloEngine {
             handleSessionExpiredNotice("Phiên đăng nhập không hợp lệ hoặc đã hết hạn. Vui lòng quét mã QR để đăng nhập lại.")
             return
         } catch {}
-        if let pins = try? await sessionClient.fetchPinnedConversations() {
+
+        // 2. New messages first: drain the HTTP long-polling queue (queued recent 1-1 & group messages) before the
+        // metadata below, so what arrived while Olaz was closed shows up without waiting on contacts/labels.
+        let fullRefresh = await beginHistoryFreshnessPass()
+        await drainChatPolling(maxBatches: 4, notifyIncoming: false)
+
+        // Pins, archived and mutes are independent reads: fetch them together.
+        async let pinsFetch = try? sessionClient.fetchPinnedConversations()
+        async let archivedFetch = try? sessionClient.fetchArchivedChats()
+        async let mutesFetch = try? sessionClient.fetchMuteList()
+        let (pinsResult, archivedResult, mutesResult) = await (pinsFetch, archivedFetch, mutesFetch)
+        if let pins = pinsResult {
             cachedPinnedIds = Set(pins)
             try? await sqliteStore?.setPreferenceStrings(key: "pinnedIds", value: Array(cachedPinnedIds))
         }
-        if let archived = try? await sessionClient.fetchArchivedChats() {
+        if let archived = archivedResult {
             cachedArchivedIds = Set(archived)
             try? await sqliteStore?.setPreferenceStrings(key: "archivedIds", value: Array(cachedArchivedIds))
         }
-        if let mutesBox = try? await sessionClient.fetchMuteList() {
+        if let mutesBox = mutesResult {
             var map = notificationSettings.mutes
             for entry in mutesBox.array {
                 let idRaw = JSONLossless.string(entry["id"])
@@ -724,9 +740,6 @@ final class ZaloEngine {
         ensureKnownContactsInConversations()
         rebuildConversationFlags()
         rebuildConversationExtras()
-
-        // 2. Drain HTTP long-polling queue (queued recent 1-1 & group messages)
-        await drainChatPolling(maxBatches: 4, notifyIncoming: false)
 
         // 3. Preload active threads + last messages (`threadIdLocalMsgId: "{}"` + 25-thread batches)
         var groupActivityRank: [String: Int64] = [:]
@@ -756,7 +769,8 @@ final class ZaloEngine {
                     try? await sqliteStore?.setPreferenceData(key: "activityRanks", data: data)
                 }
             }
-            _ = await applyBatchResponse(preloadBox.dict, incrementUnread: false, persistConversations: false)
+            _ = await applyBatchResponse(
+                preloadBox.dict, incrementUnread: false, persistConversations: false, probeFreshness: !fullRefresh)
         }
         ensureKnownContactsInConversations()
         let orderedGroups = contacts.groups.map(\.id).sorted { a, b in
@@ -779,12 +793,13 @@ final class ZaloEngine {
             let chunk = Array(targetIds[idx..<end])
             idx = end
             if let chunkBox = try? await sessionClient.fetchPreloadConversations(threadIds: chunk) {
-                _ = await applyBatchResponse(chunkBox.dict, incrementUnread: false, persistConversations: false)
+                _ = await applyBatchResponse(
+                    chunkBox.dict, incrementUnread: false, persistConversations: false, probeFreshness: !fullRefresh)
             }
         }
 
         // 4. Fetch recent cloud history for "Cloud của tôi" and active groups concurrently (`/api/cm/getrecentv2`)
-        if let selfId = selfConversationId, !selfId.isEmpty,
+        if let selfId = selfConversationId, !selfId.isEmpty, !isRecentHistoryUpToDate(selfId),
            let selfHist = try? await sessionClient.fetchHistory(convId: selfId, lastMsgId: nil, count: 50, isOld: false) {
             _ = await applyBatchResponse(
                 selfHist.dict,
@@ -795,7 +810,9 @@ final class ZaloEngine {
             )
         }
 
-        let initialGroupIds = Array(orderedGroups.prefix(24))
+        // Groups whose newest message the store already had are skipped (see `ZaloEngine+HistoryFreshness.swift`).
+        let initialGroupIds = Array(orderedGroups.prefix(24)).filter { !isRecentHistoryUpToDate($0) }
+        EngineLog.shared.write("bootstrap: history full=\(fullRefresh) groups_fetch=\(initialGroupIds.count) up_to_date=\(historyFreshness.values.filter { $0 == .upToDate }.count)")
         for gOffset in stride(from: 0, to: initialGroupIds.count, by: 6) {
             let slice = Array(initialGroupIds[gOffset..<min(gOffset + 6, initialGroupIds.count)])
             let client = self.sessionClient
@@ -829,6 +846,7 @@ final class ZaloEngine {
         rebuildConversationFlags()
         rebuildConversationExtras()
         await persistConversationsToSQLite()
+        await finishFullHistoryRefresh()
         refreshCloud()
         EngineLog.shared.write("bootstrap: convs=\(conversations.count) friends=\(contacts.friends.count) groups=\(contacts.groups.count)")
     }
@@ -933,7 +951,8 @@ final class ZaloEngine {
         isGroupHint: Bool? = nil,
         incrementUnread: Bool = false,
         notifyIncoming: Bool = false,
-        persistConversations: Bool = true
+        persistConversations: Bool = true,
+        probeFreshness: Bool = false
     ) async -> Int {
         let myUid = profile?.userId ?? ""
         let effectiveRoot: Any
@@ -955,6 +974,7 @@ final class ZaloEngine {
             isGroupHint: isGroupHint,
             nameLookup: { [weak self] uid in self?.lookupPersonInfo(uid) }
         )
+        if probeFreshness { await probeHistoryFreshness(events) }
         return await applyParsedEvents(
             events, incrementUnread: incrementUnread, notifyIncoming: notifyIncoming, persistConversations: persistConversations)
     }
