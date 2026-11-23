@@ -724,7 +724,14 @@ extension ZaloEngine {
         }
     }
 
-    internal func performReact(_ emoji: String, to messageId: String, in conversationId: String) async {
+    /// Official "Gỡ": drops every reaction of mine on the message at once (wire: rType -1, rIcon "").
+    func removeMyReactions(from messageId: String, in conversationId: String) {
+        Task {
+            await performReact("", to: messageId, in: conversationId, removeAll: true)
+        }
+    }
+
+    internal func performReact(_ emoji: String, to messageId: String, in conversationId: String, removeAll: Bool = false) async {
         guard !conversationId.isEmpty, !messageId.isEmpty else { return }
         guard let initialMsg = messages[conversationId]?.first(where: { $0.id == messageId || $0.clientId == messageId }),
               initialMsg.kind != .recalled,
@@ -738,7 +745,8 @@ extension ZaloEngine {
         defer { reactionBusyKeys.remove(busyKey) }
 
         let spec = ZaloWireParser.reactionSpec(forEmoji: emoji)
-        let alreadyMine = initialMsg.reactions.contains(where: { $0.includesMe && $0.icon.type == "\(spec.rType)" })
+        if removeAll && !initialMsg.reactions.contains(where: \.includesMe) { return }
+        let alreadyMine = removeAll || initialMsg.reactions.contains(where: { $0.includesMe && $0.icon.type == "\(spec.rType)" })
         let effectiveType = alreadyMine ? -1 : spec.rType
         let effectiveIcon = alreadyMine ? "" : spec.rIcon
         let msgType = ZaloWireParser.reactionClientMsgType(for: initialMsg.kind)

@@ -300,7 +300,12 @@ struct MessageRow: View {
             if message.kind != .recalled {
                 barButton("Thả cảm xúc", symbol: "face.smiling") { showsReactionPicker.toggle() }
                     .popover(isPresented: $showsReactionPicker, arrowEdge: .top) {
-                        ReactionPicker(emojis: Self.reactionEmojis, mine: Set(message.reactions.filter(\.includesMe).map(\.emoji))) { emoji in
+                        ReactionPicker(emojis: Self.reactionEmojis, mine: Set(message.reactions.filter(\.includesMe).map(\.emoji)),
+                                       canRemove: message.reactions.contains(where: \.includesMe),
+                                       remove: {
+                            showsReactionPicker = false
+                            engine.removeMyReactions(from: message.id, in: message.conversationId)
+                        }) { emoji in
                             showsReactionPicker = false
                             onReact(emoji, message)
                         }
@@ -705,12 +710,22 @@ extension MessageRow: Equatable {
 private struct ReactionPicker: View {
     let emojis: [String]
     let mine: Set<String>
+    var canRemove = false
+    var remove: () -> Void = {}
     let pick: (String) -> Void
 
     var body: some View {
         HStack(spacing: 2) {
             ForEach(emojis, id: \.self) { emoji in
                 ReactionPickerButton(emoji: emoji, selected: mine.contains(emoji)) { pick(emoji) }
+            }
+            if canRemove {
+                Divider().frame(height: 22).padding(.horizontal, 4)
+                Button("Gỡ", action: remove)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
             }
         }
         .padding(6)
