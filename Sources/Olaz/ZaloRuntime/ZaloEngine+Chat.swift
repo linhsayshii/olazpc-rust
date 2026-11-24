@@ -976,3 +976,53 @@ extension ZaloEngine {
         ]
     }
 }
+
+extension ZaloEngine {
+    /// Official `processRequestResend` -> `_doResend`: a device reported it could not decrypt one of our messages, so
+    /// rebuild the session to that device and send the same message (same cliMsgId) to it alone, with `e2ee.retry = 1`.
+    /// Text messages only for now; the log keeps shapes (device, kind, codes), never ids or text.
+    func resendE2EEMessage(_ request: ZaloE2EEManager.ResendRequest) async {
+        let myUid = profile?.userId ?? ""
+        let peer = request.peerUid
+        guard !myUid.isEmpty,
+              let message = (messages[peer] ?? []).first(where: { msg in
+                  msg.isMine && (msg.clientId == request.cliMsgId || (!request.msgId.isEmpty && msg.id == request.msgId))
+              }) else {
+            EngineLog.shared.write("e2ee resend: skip dev=\(request.deviceId) reason=message-not-loaded")
+            return
+        }
+        guard case .text = message.kind, message.quote == nil, !message.text.isEmpty else {
+            EngineLog.shared.write("e2ee resend: skip dev=\(request.deviceId) reason=unsupported-kind")
+            return
+        }
+        guard await e2eeManager.reinitSession(
+            peerUid: peer, deviceId: request.deviceId, myUid: myUid, webSocket: webSocket, store: sqliteStore) else {
+            EngineLog.shared.write("e2ee resend: skip dev=\(request.deviceId) reason=reinit-failed")
+            return
+        }
+        let encrypted = await e2eeManager.encryptTextMessage(
+            peerUid: peer, myUid: myUid, text: message.text, onlyDevice: request.deviceId, store: sqliteStore)
+        guard let device = encrypted.first, let cipher = device.ciphers.first,
+              let clientId = Int64(request.cliMsgId) else {
+            EngineLog.shared.write("e2ee resend: skip dev=\(request.deviceId) reason=encrypt-failed")
+            return
+        }
+        let entry = ZaloSessionClient.buildE2EEListParamEntry(
+            toId: device.toId,
+            platform: device.platform,
+            clientId: clientId,
+            imei: await sessionClient.imei,
+            registrationId: device.registrationId,
+            senderIid: await e2eeManager.localRegistrationId(),
+            retry: 1,
+            extraFields: ["message": cipher]
+        )
+        do {
+            _ = try await sessionClient.sendE2EEMessageAPI(
+                endpoint: "sms", threadId: peer, isGroup: false, clientId: clientId, listParams: ZaloJSONArrayBox([entry]))
+            EngineLog.shared.write("e2ee resend: sent dev=\(request.deviceId) cipher=\(E2EEShadow.cipherType(cipher))")
+        } catch {
+            EngineLog.shared.write("e2ee resend: post failed dev=\(request.deviceId) error=\(type(of: error))")
+        }
+    }
+}

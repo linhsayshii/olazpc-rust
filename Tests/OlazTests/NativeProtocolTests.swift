@@ -1887,6 +1887,36 @@ private final class MockProfileURLProtocol: URLProtocol, @unchecked Sendable {
         #expect((doneProc["info"] as? [[String: Any]])?.count == 1)
         #expect(doneProc["data"] == nil)
 
+        // DELIVER_SEEN_ONEONE (553): a recipient device reports a message it could not decrypt; the log keeps shapes only.
+        let deliver: [String: Any] = ["data": ["delivereds": [
+            ["deviceId": 2, "err": -1, "errC": -7, "retry": 0, "fromDI": 2, "cliMsgId": "123", "threadId": "999"],
+            ["deviceId": 0, "err": 0, "fromDI": 2],
+        ]]]
+        let reports = ZaloE2EEManager.deliverReports(deliver)
+        #expect(reports.count == 2)
+        #expect(ZaloE2EEManager.deliverReportSummary(reports[0]) == "dev=2 err=-1 errC=-7 retry=0 fromDI=2")
+        #expect(ZaloE2EEManager.deliverReportSummary(reports[1]) == "dev=0 err=0 errC=- retry=- fromDI=2")
+        #expect(ZaloE2EEManager.deliverReports(["data": [:]]).isEmpty)
+
+        // Official processRequestResend gates: failed decrypt about our device's message, first retry only.
+        let failedReport: [String: Any] = ["deviceId": 2, "err": -1, "errC": -7, "retry": 0, "fromDI": 2,
+                                           "cliMsgId": "1700000000123", "msgId": "77", "threadId": "999", "deliveredUids": ["999"]]
+        #expect(ZaloE2EEManager.resendRequest(from: failedReport)
+                == .init(peerUid: "999", deviceId: 2, cliMsgId: "1700000000123", msgId: "77"))
+        #expect(ZaloE2EEManager.resendRequest(from: failedReport.merging(["retry": 1]) { _, n in n }) == nil)
+        #expect(ZaloE2EEManager.resendRequest(from: failedReport.merging(["fromDI": 0]) { _, n in n }) == nil)
+        #expect(ZaloE2EEManager.resendRequest(from: failedReport.merging(["err": -2]) { _, n in n }) == nil)
+        #expect(ZaloE2EEManager.resendRequest(from: failedReport.merging(["err": 0]) { _, n in n }) == nil)
+
+        let initSession = ZaloE2EEManager.buildInitSessionInnerData(uidTo: "999", deviceId: 2, cipher: "Mw==")
+        #expect(initSession["type"] as? Int == 1)
+        #expect((initSession["data"] as? [[String: Any]])?.first?["deviceId"] as? Int == 2)
+        let retryExt = JSONLossless.parseObject(Data(ZaloSessionClient.buildE2EEExtJSON(
+            registrationId: 5, senderRegistrationId: 6, retry: 1).utf8))
+        #expect(JSONLossless.int64(retryExt?["retry"]) == 1)
+        #expect(JSONLossless.parseObject(Data(ZaloSessionClient.buildE2EEExtJSON(
+            registrationId: 5, senderRegistrationId: 6).utf8))?["retry"] == nil)
+
         let peerList = ZaloE2EEManager.buildGetListUserE2EEInnerData()
         #expect(peerList["reqIid"] as? Int == 1)
         #expect(peerList["data"] == nil)

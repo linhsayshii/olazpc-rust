@@ -23,6 +23,8 @@ actor ZaloE2EEManager {
     static let cmdRequestPreKeys: UInt16 = 549
     static let cmdReceiveOneOne: UInt16 = 551
     static let cmdReceiveGroup: UInt16 = 552
+    static let cmdDeliverSeenOneOne: UInt16 = 553
+    static let cmdDeleteQueueAckOneOne: UInt16 = 557
     static let cmdGetListUserE2EE: UInt16 = 563
     static let cmdGetKeyId: UInt16 = 564
 
@@ -43,6 +45,8 @@ actor ZaloE2EEManager {
     private var e2eeThreads: Set<String> = []
     private var peerDeviceMeta: [String: [(deviceId: Int, sessionKey: Int64)]] = [:]
     private var fetchedBundlePeers: Set<String> = []
+    /// `cliMsgId.deviceId` already resent after a failed delivery report (official `MAX_RETRY_COUNT` is 1).
+    private var resentDeliveries: Set<String> = []
     private var didLoadThreadsFromStore = false
     /// Global id -> uid (`/api/gid/decrypt`), for the owner of an E2EE quote.
     /// `(globalId, candidate uids)` -> (uid, how it was found).
@@ -88,6 +92,7 @@ actor ZaloE2EEManager {
         peerDeviceMeta.removeAll()
         fetchedBundlePeers.removeAll()
         didLoadThreadsFromStore = false
+        resentDeliveries.removeAll()
     }
 
     func markDisconnected() {
@@ -138,6 +143,120 @@ actor ZaloE2EEManager {
             "queueName": "",
             "info": info,
         ]
+    }
+
+    // MARK: - Delivery Reports (official `handleAckMessage` / `resendService.processAck`)
+
+    /// A recipient device reports each E2EE message it got: `err` 0 when it decrypted, negative when it could not
+    /// (`errC` says why, e.g. -5 changed device, -7 bad MAC). Failed reports are acked with 557 so the server drops them.
+    static func deliverReports(_ payload: [String: Any]) -> [[String: Any]] {
+        let data = payload["data"] as? [String: Any] ?? payload
+        return data["delivereds"] as? [[String: Any]] ?? []
+    }
+
+    /// Shape only: device, error codes and retry count, never ids or uids.
+    static func deliverReportSummary(_ entry: [String: Any]) -> String {
+        func num(_ key: String) -> String { JSONLossless.int64(entry[key]).map(String.init) ?? "-" }
+        return "dev=\(num("deviceId")) err=\(num("err")) errC=\(num("errC")) retry=\(num("retry")) fromDI=\(num("fromDI"))"
+    }
+
+    struct ResendRequest: Equatable, Sendable {
+        var peerUid: String
+        var deviceId: Int
+        var cliMsgId: String
+        var msgId: String
+    }
+
+    /// Official `processRequestResend` gates: a failed decrypt (-1), duplicate (-4) or over-2000-keys (-6) report about a
+    /// message this device (2) sent, not resent yet (`retry` 0).
+    static func resendRequest(from entry: [String: Any]) -> ResendRequest? {
+        let err = JSONLossless.int64(entry["err"]) ?? 0
+        guard [-1, -4, -6].contains(err), (JSONLossless.int64(entry["retry"]) ?? 0) == 0 else { return nil }
+        if let from = JSONLossless.int64(entry["fromDI"]), from != Int64(localDeviceId) { return nil }
+        let delivered = (entry["deliveredUids"] as? [Any])?.first.map { JSONLossless.string($0) } ?? ""
+        let peer = ZaloWireParser.stripUserPrefix(delivered.isEmpty ? JSONLossless.string(entry["threadId"]) : delivered)
+        let cli = JSONLossless.string(entry["cliMsgId"])
+        guard let dev = JSONLossless.int64(entry["deviceId"]), !peer.isEmpty, !cli.isEmpty else { return nil }
+        return ResendRequest(peerUid: peer, deviceId: Int(dev), cliMsgId: cli, msgId: JSONLossless.string(entry["msgId"]))
+    }
+
+    /// Logs and acks the reports; returns the messages to send again (each message and device once per launch).
+    @discardableResult
+    func handleDeliverReports(cmd: UInt16, payload: ZaloJSONBox, webSocket: ZaloWebSocket) async -> [ResendRequest] {
+        let reports = Self.deliverReports(payload.dict)
+        guard !reports.isEmpty else {
+            logSink("e2ee deliver: cmd=\(cmd) reports=0 keys=\(payload.dict.keys.sorted().joined(separator: ","))")
+            return []
+        }
+        let failed = reports.filter { (JSONLossless.int64($0["err"]) ?? 0) != 0 }
+        let keys = Set(reports.flatMap(\.keys)).sorted().joined(separator: ",")
+        logSink("e2ee deliver: cmd=\(cmd) reports=\(reports.count) failed=\(failed.count) keys=\(keys) [\(reports.prefix(8).map(Self.deliverReportSummary).joined(separator: "; "))]")
+        guard cmd == Self.cmdDeliverSeenOneOne, !failed.isEmpty else { return [] }
+        for start in stride(from: 0, to: failed.count, by: 50) {
+            let chunk = Array(failed[start..<min(start + 50, failed.count)])
+            let resp = await webSocket.sendRequestFrame(
+                cmd: Self.cmdDeleteQueueAckOneOne,
+                subCmd: 0,
+                version: 1,
+                innerData: ZaloJSONBox(["delivereds": chunk]),
+                timeoutSeconds: 6
+            )
+            logSink("e2ee deliver: ack 557 count=\(chunk.count) error_code=\(resp.flatMap { JSONLossless.int64($0.dict["error_code"]) }.map(String.init) ?? "-")")
+        }
+        var requests: [ResendRequest] = []
+        for entry in failed {
+            guard let req = Self.resendRequest(from: entry) else { continue }
+            let key = "\(req.cliMsgId).\(req.peerUid).\(req.deviceId)"
+            guard !resentDeliveries.contains(key) else { continue }
+            resentDeliveries.insert(key)
+            requests.append(req)
+        }
+        return requests
+    }
+
+    /// INIT_SESSION (543) entry, official `initSessionWith`: the PreKey message carrying `{"subDevice":[...]}`.
+    static func buildInitSessionInnerData(uidTo: String, deviceId: Int, cipher: String) -> [String: Any] {
+        ["type": 1, "uidTo": uidTo, "data": [["deviceId": deviceId, "data": cipher]]]
+    }
+
+    /// Official `checkSessionReinit` -> `initSessionWith(uid, [device], {isReinit})`: a fresh session from the device's
+    /// current bundle, announced with INIT_SESSION so the device replaces the one it could not decrypt with.
+    func reinitSession(peerUid: String, deviceId: Int, myUid: String, webSocket: ZaloWebSocket, store: ZaloSQLiteStore?) async -> Bool {
+        let cleanPeer = ZaloWireParser.stripUserPrefix(peerUid)
+        let cleanMe = ZaloWireParser.stripUserPrefix(myUid)
+        await prepare(uid: cleanMe, store: store)
+        guard runtime != nil || rust != nil, registrationId > 0, !cleanPeer.isEmpty, await webSocket.isAuthed else { return false }
+        let resp = await webSocket.sendRequestFrame(
+            cmd: Self.cmdGetBundle, subCmd: 0, version: 1,
+            innerData: ZaloJSONBox(Self.buildGetBundleInnerData(peerUid: cleanPeer, myUid: nil, isReInit: 1)),
+            timeoutSeconds: 8
+        )
+        let entries = resp.map { Self.parseGetBundleResponse($0.dict) } ?? []
+        guard let bundle = entries.first(where: { $0.uid == cleanPeer })?.devices
+            .first(where: { Int(JSONLossless.int64($0["deviceId"]) ?? -1) == deviceId }) else {
+            logSink("e2ee resend: reinit dev=\(deviceId) no bundle")
+            return false
+        }
+        guard await processPreKeyBundle(myUid: cleanMe, remoteUid: cleanPeer, deviceId: deviceId, bundle: bundle) else {
+            logSink("e2ee resend: reinit dev=\(deviceId) bundle failed")
+            return false
+        }
+        storeDirty = true
+        let subDevices = Set(await listSessions(remoteUid: cleanMe).map(\.deviceId).filter { $0 != Self.localDeviceId }).sorted()
+        let body = "{\"subDevice\":[\(subDevices.map(String.init).joined(separator: ","))]}"
+        guard let cipher = await encryptOne(remoteUid: cleanPeer, device: deviceId, text: body) else {
+            await persistStoreIfNeeded(store: store)
+            return false
+        }
+        await persistStoreIfNeeded(store: store)
+        let ack = await webSocket.sendRequestFrame(
+            cmd: Self.cmdInitSession, subCmd: 0, version: 1,
+            innerData: ZaloJSONBox(Self.buildInitSessionInnerData(uidTo: cleanPeer, deviceId: deviceId, cipher: cipher)),
+            timeoutSeconds: 8
+        )
+        let code = ack.flatMap { JSONLossless.int64($0.dict["error_code"]) }
+        logSink("e2ee resend: reinit dev=\(deviceId) cipher=\(E2EEShadow.cipherType(cipher)) init error_code=\(code.map(String.init) ?? "-")")
+        return code == 0
     }
 
     static func buildGetListUserE2EEInnerData(reqIid: Int = 1) -> [String: Any] {
@@ -635,7 +754,10 @@ actor ZaloE2EEManager {
                 }
             }
         }
-        if !needsFetch && !fetchedBundlePeers.contains(cleanPeer) && cleanPeer != cleanMe && mySessions.isEmpty {
+        // Once per launch per peer, check the server's device list and keys: a device that reinstalled or signed in
+        // again has a new registration id, and a message on the old session never opens there (official client:
+        // devices from the server, stale ones re-initialised). Unchanged devices keep their session.
+        if !needsFetch && !fetchedBundlePeers.contains(cleanPeer) && cleanPeer != cleanMe {
             needsFetch = true
         }
         let before = peerSessions.map { "\($0.deviceId)" }.joined(separator: ",")
@@ -679,6 +801,7 @@ actor ZaloE2EEManager {
                 let bundleRegId = Int(JSONLossless.int64(iKeyDict?["id"]) ?? 0)
                 if bundleRegId > 0,
                    existingSessions.contains(where: { $0.deviceId == devId && $0.registrationId == bundleRegId }) {
+                    rebuilt.append("\(entry.uid == cleanPeer ? "peer" : "own"):\(devId):same")
                     continue
                 }
 
@@ -716,6 +839,7 @@ actor ZaloE2EEManager {
         text: String,
         quoteText: String? = nil,
         quoteExtras: [String] = [],
+        onlyDevice: Int? = nil,
         store: ZaloSQLiteStore?
     ) async -> [(toId: String, platform: Int, registrationId: Int, ciphers: [String])] {
         var values: [JSBridgeValue] = [.string(text)]
@@ -727,7 +851,7 @@ actor ZaloE2EEManager {
                 formats.append("string")
             }
         }
-        return await encryptBatch(peerUid: peerUid, myUid: myUid, values: values, formats: formats, store: store)
+        return await encryptBatch(peerUid: peerUid, myUid: myUid, values: values, formats: formats, onlyDevice: onlyDevice, store: store)
     }
 
     func encryptStickerMessage(
@@ -775,6 +899,7 @@ actor ZaloE2EEManager {
         myUid: String,
         values: [JSBridgeValue],
         formats: [String],
+        onlyDevice: Int? = nil,
         store: ZaloSQLiteStore?
     ) async -> [(toId: String, platform: Int, registrationId: Int, ciphers: [String])] {
         let cleanPeer = ZaloWireParser.stripUserPrefix(peerUid)
@@ -789,7 +914,13 @@ actor ZaloE2EEManager {
         var targets: [JSBridgeValue] = peerSessions.map { sess in
             .object(["userId": .string(cleanPeer), "deviceId": .number(Double(sess.deviceId))])
         }
-        if cleanMe != cleanPeer {
+        if let onlyDevice {
+            // Resend (official `encryptForAddresses`): just the device that reported the failure.
+            targets = peerSessions.filter { $0.deviceId == onlyDevice }.map { sess in
+                .object(["userId": .string(cleanPeer), "deviceId": .number(Double(sess.deviceId))])
+            }
+            guard !targets.isEmpty else { return [] }
+        } else if cleanMe != cleanPeer {
             let mySessions = await listSessions(remoteUid: cleanMe).filter { $0.deviceId != 2 }
             for sess in mySessions {
                 targets.append(.object(["userId": .string(cleanMe), "deviceId": .number(Double(sess.deviceId))]))

@@ -1062,7 +1062,8 @@ extension ZaloSessionClient {
         registrationId: Int,
         senderRegistrationId: Int,
         version: Int = e2eeMsgVersion,
-        compatVersion: Int = e2eeMsgCompatVersion
+        compatVersion: Int = e2eeMsgCompatVersion,
+        retry: Int = 0
     ) -> String {
         // Official `buildE2eeParams` / `_enrichAdditionalParams`: iid and sender_iid only when known.
         var obj: [String: Any] = [
@@ -1071,6 +1072,7 @@ extension ZaloSessionClient {
         ]
         if registrationId > 0 { obj["iid"] = registrationId }
         if senderRegistrationId > 0 { obj["sender_iid"] = senderRegistrationId }
+        if retry > 0 { obj["retry"] = retry }
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]),
               let str = String(data: data, encoding: .utf8) else {
             return "{}"
@@ -1089,13 +1091,15 @@ extension ZaloSessionClient {
         useLegacyE2EEKey: Bool = false,
         version: Int = e2eeMsgVersion,
         compatVersion: Int = e2eeMsgCompatVersion,
+        retry: Int = 0,
         extraFields: [String: Any] = [:]
     ) -> [String: Any] {
         let extJSON = buildE2EEExtJSON(
             registrationId: registrationId,
             senderRegistrationId: senderIid,
             version: version,
-            compatVersion: compatVersion
+            compatVersion: compatVersion,
+            retry: retry
         )
         var entry: [String: Any] = [
             "toId": ZaloWireParser.stripUserPrefix(toId),

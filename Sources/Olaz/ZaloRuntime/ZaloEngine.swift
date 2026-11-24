@@ -1348,6 +1348,12 @@ final class ZaloEngine {
             return
         }
 
+        if event.cmd == ZaloE2EEManager.cmdDeliverSeenOneOne {
+            let resends = await e2eeManager.handleDeliverReports(cmd: event.cmd, payload: ZaloJSONBox(payload), webSocket: webSocket)
+            for request in resends { await resendE2EEMessage(request) }
+            return
+        }
+
         if event.cmd == ZaloWebSocket.cmdSyncRequest || event.cmd == ZaloWebSocket.cmdSyncMobileWakeUp {
             let code = JSONLossless.int64(payload["error_code"]) ?? 0
             EngineLog.shared.write("sync-ws: ack cmd=\(event.cmd) code=\(code)")
