@@ -20,9 +20,10 @@ fn fake_domains() -> Value {
         "auth": "http://fake",
         "wpaChat": "http://fake",
         "ws": ["ws://fake/ws"],
-        "services": {
+        "serviceCandidates": {
             "profile": ["http://fake"]
-        }
+        },
+        "isolated": true
     })
 }
 

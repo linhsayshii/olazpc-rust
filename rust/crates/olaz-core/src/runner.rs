@@ -185,15 +185,18 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     self.cancel_active_tasks();
                 }
                 Effect::ClearCoreSession => {
-                    let isolated_domains = {
-                        let current = self.client.domains();
-                        current.isolated.then_some(current)
-                    };
+                    let pre_clear_domains = self.client.domains();
                     self.client.clear_session();
-                    if let Some(domains) =
-                        self.default_domains.as_ref().or(isolated_domains.as_ref())
-                    {
-                        self.client.with_session(|s| s.domains = domains.clone());
+                    let restore = if pre_clear_domains.isolated {
+                        Some(pre_clear_domains)
+                    } else {
+                        self.default_domains
+                            .as_ref()
+                            .filter(|d| d.isolated)
+                            .cloned()
+                    };
+                    if let Some(domains) = restore {
+                        self.client.with_session(|s| s.domains = domains);
                     }
                 }
                 Effect::MarkCoreSessionExpired => {
@@ -605,5 +608,89 @@ mod tests {
             .clone();
         assert_eq!(calls, vec!["clear_session", "reset_domains"]);
         core.stop();
+    }
+
+    fn custom_domains(auth: &str, isolated: bool) -> ZaloDomains {
+        ZaloDomains {
+            auth: auth.to_owned(),
+            wpa_chat: auth.to_owned(),
+            ws: vec!["ws://127.0.0.1:9999".to_owned()],
+            isolated,
+            ..ZaloDomains::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_core_session_resets_non_isolated_domains_to_default() {
+        let host = Arc::new(SlowOrderedHost::new());
+        let non_isolated = custom_domains("https://assigned.zalo.example", false);
+        let client = Arc::new(SessionClient::new(
+            MockTransport::scripted(vec![]),
+            "imei-1".to_owned(),
+            "Mac".to_owned(),
+        ));
+        client.with_session(|s| s.domains = non_isolated.clone());
+
+        let runner = Arc::new(SessionEffectRunner::with_default_domains(
+            Arc::clone(&client),
+            Arc::clone(&host) as Arc<dyn Host>,
+            Handle::current(),
+            Some(non_isolated),
+        ));
+        let core = CoreHandle::start(runner, Handle::current());
+        core.send(Command::LogOut);
+        core.wait_idle().await;
+
+        assert_eq!(client.domains(), ZaloDomains::default());
+        core.stop();
+    }
+
+    #[tokio::test]
+    async fn clear_core_session_preserves_isolated_domains() {
+        // Branch A: pre-clear domains are isolated (default_domains is None).
+        let host = Arc::new(SlowOrderedHost::new());
+        let isolated = custom_domains("http://127.0.0.1:18080", true);
+        let client = Arc::new(SessionClient::new(
+            MockTransport::scripted(vec![]),
+            "imei-1".to_owned(),
+            "Mac".to_owned(),
+        ));
+        client.with_session(|s| s.domains = isolated.clone());
+
+        let runner = Arc::new(SessionEffectRunner::new(
+            Arc::clone(&client),
+            Arc::clone(&host) as Arc<dyn Host>,
+            Handle::current(),
+        ));
+        let core = CoreHandle::start(runner, Handle::current());
+        core.send(Command::LogOut);
+        core.wait_idle().await;
+
+        assert_eq!(client.domains(), isolated);
+        core.stop();
+
+        // Branch B: pre-clear domains are non-isolated, default_domains is Some and isolated.
+        let host2 = Arc::new(SlowOrderedHost::new());
+        let isolated_default = custom_domains("http://127.0.0.1:18081", true);
+        let client2 = Arc::new(SessionClient::new(
+            MockTransport::scripted(vec![]),
+            "imei-2".to_owned(),
+            "Mac".to_owned(),
+        ));
+        client2
+            .with_session(|s| s.domains = custom_domains("https://assigned.zalo.example", false));
+
+        let runner2 = Arc::new(SessionEffectRunner::with_default_domains(
+            Arc::clone(&client2),
+            Arc::clone(&host2) as Arc<dyn Host>,
+            Handle::current(),
+            Some(isolated_default.clone()),
+        ));
+        let core2 = CoreHandle::start(runner2, Handle::current());
+        core2.send(Command::LogOut);
+        core2.wait_idle().await;
+
+        assert_eq!(client2.domains(), isolated_default);
+        core2.stop();
     }
 }
