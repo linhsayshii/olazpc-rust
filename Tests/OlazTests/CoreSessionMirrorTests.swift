@@ -285,7 +285,15 @@ import Testing
         let sessionURL = dir.appendingPathComponent("native-session.json")
         try Data(savedSession.canonicalString().utf8).write(to: sessionURL)
 
-        let engine = ZaloEngine(dataDirectory: dir, useKeychain: false, domains: isolatedDomains)
+        let storage = RecorderStorageIsolation(prefix: "olaz.core-mirror")
+        defer { storage.cleanup() }
+        let engine = ZaloEngine(
+            dataDirectory: dir,
+            useKeychain: false,
+            domains: isolatedDomains,
+            userDefaultsSuiteName: storage.userDefaultsSuiteName,
+            cookieStorage: storage.cookieStorage
+        )
         // Stub out side-effecting host hooks (SQLite/WS/bootstrap) to keep the test isolated and fast.
         engine.hostTrace = { _, _ in false }
 
@@ -380,7 +388,15 @@ import Testing
         var deinitBootTask: Task<Void, Never>?
         var deinitQrTask: Task<Void, Never>?
         do {
-            let ephemeral = ZaloEngine(dataDirectory: deinitDir, useKeychain: false, domains: deinitDomains)
+            let deinitStorage = RecorderStorageIsolation(prefix: "olaz.core-deinit")
+            defer { deinitStorage.cleanup() }
+            let ephemeral = ZaloEngine(
+                dataDirectory: deinitDir,
+                useKeychain: false,
+                domains: deinitDomains,
+                userDefaultsSuiteName: deinitStorage.userDefaultsSuiteName,
+                cookieStorage: deinitStorage.cookieStorage
+            )
             ephemeral.hostTrace = { _, _ in false }
             ephemeral.start()
             deinitBootTask = ephemeral.bootTask

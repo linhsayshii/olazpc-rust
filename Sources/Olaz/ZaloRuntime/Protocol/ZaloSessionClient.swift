@@ -84,6 +84,8 @@ private struct StoredNativeSession: Codable {
 actor ZaloSessionClient {
     let dataDirectory: URL
     private let useKeychain: Bool
+    private let userDefaults: UserDefaults
+    private let cookieStorage: HTTPCookieStorage
     /// Rust chat path (ADR-011). Swift stays the owner of Keychain persistence; the core session mirrors our state.
     private var coreSession: CoreSession?
     private var coreApiHandle: CoreApi?
@@ -121,20 +123,25 @@ actor ZaloSessionClient {
     init(
         dataDirectory: URL = ZaloPlatform.defaultUserData,
         useKeychain: Bool = true,
-        domains: ZaloDomains = ZaloDomains()
+        domains: ZaloDomains = ZaloDomains(),
+        userDefaultsSuiteName: String? = nil,
+        cookieStorage: HTTPCookieStorage = .shared
     ) {
         self.dataDirectory = dataDirectory
         self.useKeychain = useKeychain
         self.domains = domains
+        let defaults = userDefaultsSuiteName.flatMap { UserDefaults(suiteName: $0) } ?? .standard
+        self.userDefaults = defaults
+        self.cookieStorage = cookieStorage
         self.computerName = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
 
         let expectedSuffix = ZaloCrypto.md5Hex(ZaloDomains.userAgent)
-        let storedIMEI = UserDefaults.standard.string(forKey: Self.imeiDefaultsKey)
+        let storedIMEI = defaults.string(forKey: Self.imeiDefaultsKey)
         if let storedIMEI, storedIMEI.count == 69, storedIMEI.hasSuffix(expectedSuffix) {
             self.imei = storedIMEI
         } else {
             let fresh = Self.generateIMEI()
-            UserDefaults.standard.set(fresh, forKey: Self.imeiDefaultsKey)
+            defaults.set(fresh, forKey: Self.imeiDefaultsKey)
             self.imei = fresh
         }
     }
@@ -410,11 +417,11 @@ actor ZaloSessionClient {
     /// Reads any legacy WKWebView `zpw_sek` cookie and `olaz.imei` default for migration on boot.
     func readLegacyCookie() -> LegacyCookieRecord? {
         guard let authURL = URL(string: domains.auth),
-              let sek = HTTPCookieStorage.shared.cookies(for: authURL)?
+              let sek = cookieStorage.cookies(for: authURL)?
                 .first(where: { $0.name == "zpw_sek" && !$0.value.isEmpty })?.value else {
             return nil
         }
-        let legacyIMEI = UserDefaults.standard.string(forKey: "olaz.imei").flatMap { $0.count == 69 ? $0 : nil }
+        let legacyIMEI = userDefaults.string(forKey: "olaz.imei").flatMap { $0.count == 69 ? $0 : nil }
         return LegacyCookieRecord(zpwSek: sek, imei: legacyIMEI)
     }
 
@@ -477,8 +484,8 @@ actor ZaloSessionClient {
         }
         if clearDisk {
             try? FileManager.default.removeItem(at: sessionFileURL)
-            for cookie in HTTPCookieStorage.shared.cookies ?? [] where cookie.name == "zpw_sek" {
-                HTTPCookieStorage.shared.deleteCookie(cookie)
+            for cookie in cookieStorage.cookies ?? [] where cookie.name == "zpw_sek" {
+                cookieStorage.deleteCookie(cookie)
             }
         }
     }
@@ -616,10 +623,10 @@ actor ZaloSessionClient {
     /// Migrates an existing `zpw_sek` cookie from Olaz's legacy WKWebView/HTTPCookieStorage if present (only if minted for PC `type=23`).
     func tryRestoreLegacyCookieSession() async -> Bool {
         let authURL = URL(string: domains.auth)!
-        guard let sek = HTTPCookieStorage.shared.cookies(for: authURL)?.first(where: { $0.name == "zpw_sek" && !$0.value.isEmpty })?.value else {
+        guard let sek = cookieStorage.cookies(for: authURL)?.first(where: { $0.name == "zpw_sek" && !$0.value.isEmpty })?.value else {
             return false
         }
-        if let legacyIMEI = UserDefaults.standard.string(forKey: "olaz.imei"), legacyIMEI.count == 69 {
+        if let legacyIMEI = userDefaults.string(forKey: "olaz.imei"), legacyIMEI.count == 69 {
             self.imei = legacyIMEI
         }
         self.zpwSek = sek
@@ -657,8 +664,8 @@ actor ZaloSessionClient {
         }
         if clearDisk {
             try? FileManager.default.removeItem(at: sessionFileURL)
-            for cookie in HTTPCookieStorage.shared.cookies ?? [] where cookie.name == "zpw_sek" {
-                HTTPCookieStorage.shared.deleteCookie(cookie)
+            for cookie in cookieStorage.cookies ?? [] where cookie.name == "zpw_sek" {
+                cookieStorage.deleteCookie(cookie)
             }
         }
     }

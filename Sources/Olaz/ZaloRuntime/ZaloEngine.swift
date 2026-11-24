@@ -207,10 +207,18 @@ final class ZaloEngine {
     init(
         dataDirectory: URL = ZaloPlatform.defaultUserData,
         useKeychain: Bool = true,
-        domains: ZaloDomains = ZaloDomains()
+        domains: ZaloDomains = ZaloDomains(),
+        userDefaultsSuiteName: String? = nil,
+        cookieStorage: HTTPCookieStorage = .shared
     ) {
         self.dataDirectory = dataDirectory
-        self.sessionClient = ZaloSessionClient(dataDirectory: dataDirectory, useKeychain: useKeychain, domains: domains)
+        self.sessionClient = ZaloSessionClient(
+            dataDirectory: dataDirectory,
+            useKeychain: useKeychain,
+            domains: domains,
+            userDefaultsSuiteName: userDefaultsSuiteName,
+            cookieStorage: cookieStorage
+        )
     }
 
     deinit {
