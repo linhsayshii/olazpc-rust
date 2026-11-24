@@ -59,13 +59,13 @@ Decision: rusqlite links the system SQLite (no `bundled`). Same library, same lo
 Consequences: SQLite version = the macOS one. Swift and Rust may share the DB file during cutover.
 
 ## ADR-011: Cutover behind a flag
-Status: accepted (2026-11-22)
+Status: superseded by ADR-017 (2026-11-24); originally accepted (2026-11-22)
 Context: No live check has run yet; Zalo allows one PC session per account.
 Decision: The Rust chat path is enabled by `OLAZ_RUST_CORE=1` (env) or the `olaz.rustCore` UserDefaults bool. Default off until the live check passes; then default on, then delete the Swift path.
 Consequences: Both paths must build and pass tests until the Swift path is deleted.
 
 ## ADR-012: Rust chat path on by default
-Status: accepted (2026-11-23), supersedes the default in ADR-011
+Status: superseded by ADR-017 (2026-11-24); originally accepted (2026-11-23), superseded the default in ADR-011
 Context: Live check on 2026-11-23 passed for receive (1-1, group, media), history paging, send text/mention/quote, seen, reactions, recall, delete-for-me, restart persistence. Typing and in-message search fail on both paths (pre-existing bugs, not port regressions).
 Decision: `RustCore.isEnabled` defaults to true. `OLAZ_RUST_CORE=0` or `olaz.rustCore=false` falls back to Swift. The Swift chat path is deleted only after a commit and a period of daily use.
 Consequences: Tests run with the Rust path unless they set the flag; `OLAZ_RUST_CORE=0 swift test` covers the fallback.
@@ -142,3 +142,12 @@ Measured with a temporary FFI probe that linked `olaz-signal` into `olaz-ffi` (r
 - Build time: cold `./scripts/build-rust.sh` baseline 192 s; warm baseline (relink only) 59 s; with the Signal stack linked 283 s while the new crates compiled cold, so about +3.5 min on a cold cache (about +110 s per architecture) and an unmeasured, small increment once cached. New dependency crates: libsignal-protocol, libsignal-core, signal-crypto, libcrux-ml-kem, rayon, curve25519-dalek, x25519-dalek, prost (no `boring`, no C code, no `protoc`).
 - Size: universal static lib 149,965,944 -> 182,053,112 bytes (+32 MB, +21%); xcframework 143 MB -> 174 MB. A static archive keeps every object, so that overstates the shipped cost: an isolated release binary of the whole Signal stack (generate, X3DH, encrypt, decrypt, JSON export), stripped, is 1.16 MB on arm64, so expect about +1 MB per architecture in the final app binary after dead-stripping. The `rayon` and `libcrux-ml-kem` (Kyber) code is dead weight for v3 and can be trimmed later by vendoring away the `kyber`/`rayon` parts if size matters.
 - Debug `cargo build -p olaz-signal` from scratch: 33 s. `cargo test --workspace` adds about 1 s of test time (the node interop tests spawn one node process each).
+
+## ADR-017: Swift fallback removed
+Status: accepted (2026-11-24), supersedes ADR-011 and ADR-012 (and the `OLAZ_RUST_CORE=0` opt-out in ADR-014)
+Context: Waves 1–6a moved signing/crypto, wire batch parsing, `zpw_ws` WebSocket transport/cursors, SQLite core store, session/raw HTTP with failover, API service calls, and media/file downloads onto the Rust core (`OlazCore`), and U1a added the local `FakeZaloServer` + session recorder gate. Keeping the Swift fallback and the `OLAZ_RUST_CORE` / `olaz.rustCore` opt-out required maintaining two code paths, `URLSession` injection hooks, and duplicate parity tests.
+Decision:
+- Delete `RustCore.isEnabled`, `OLAZ_RUST_CORE`, `olaz.rustCore`, every `useRustCore` parameter/property, and the Swift fallback implementations for HTTP (`ZaloSessionClient(urlSession:)`), API (`ZaloAPIService`), WebSocket (`ZaloWebSocket`), SQLite core operations (`ZaloSQLiteStore`), wire batch walking (`ZaloWireParser`), media/file fetching (`MediaLoader` / `DownloadManager`), and session-mode E2EE flagging.
+- Move Swift `URLProtocol`-stubbed tests onto `FakeZaloServer` (`ZaloDomains(isolated: true)`), switch `:memory:` SQLite tests sharing Rust `CoreStore` onto temp-dir DB files, and ensure every removed Swift parity test has matching golden vectors in the Rust workspace tests.
+- Keep Swift code that still has live non-fallback callers: `ZaloCrypto` helpers (`ZaloSessionClient`, `ZaloAPIService+Cloud`, `EngineProbe`), `DoHResolver` / `PinnedHTTPSClient` / `HTTPResponseParser` (`ZaloRuntimeInstaller`), `ZaloSQLiteStore` verbatim schema DDL and unported migrations/cloud queries, `ZaloWireParser` single-message/encode helpers, and E2EE JS/shadow (`ZaloE2EEManager` / `ZaloE2EEShadow`, deferred to U0b).
+Consequences: Rust is the sole implementation of the ported layers (3,626 Swift production lines and 1,354 Swift test lines removed; net −4,236 Swift lines across 30 files). `ZaloSessionClient` no longer takes a custom `URLSession`; HTTP tests exercise the real Rust `olaz-net` stack against local servers.

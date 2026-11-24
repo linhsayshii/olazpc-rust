@@ -2,10 +2,10 @@
 
 **An unofficial, reverse-engineered native macOS client for [Zalo](https://zalo.me).**
 
-Olaz is a SwiftUI app on top of a protocol engine that is being moved into a Rust core. There is no `WKWebView`, no Electron bundle (`app.asar`), no Node.js sidecar and no idle helper process.
+Olaz is a SwiftUI app on top of a protocol engine whose core subsystems live in Rust. There is no `WKWebView`, no Electron bundle (`app.asar`), no Node.js sidecar and no idle helper process.
 
 - **UI and app logic**: Swift 6 / SwiftUI (`Sources/Olaz/App`, `Shell`, `Views`, `ZaloRuntime`).
-- **Protocol core**: a Rust workspace (`rust/`, crates `olaz-api`, `olaz-crypto`, `olaz-ffi`, `olaz-json`, `olaz-media`, `olaz-net`, `olaz-signal`, `olaz-store`, `olaz-wire`, `olaz-ws`) exported to Swift through UniFFI (`Sources/OlazCore`, `rust/build/OlazCoreFFI.xcframework`). It covers signing and `ParamCipher`, the `zpw_ws` WebSocket, HTTP with service-map failover, the SQLite store, media download and cache, and Signal E2EE. The Swift engine still exists and is used as a fallback and for features not yet ported (see `rust/MAP.md`).
+- **Protocol core**: a Rust workspace (`rust/`, crates `olaz-api`, `olaz-crypto`, `olaz-ffi`, `olaz-json`, `olaz-media`, `olaz-net`, `olaz-signal`, `olaz-store`, `olaz-wire`, `olaz-ws`) exported to Swift through UniFFI (`Sources/OlazCore`, `rust/build/OlazCoreFFI.xcframework`). It unconditionally owns signing and `ParamCipher`, the `zpw_ws` WebSocket, HTTP with service-map failover, the SQLite store, wire batch parsing, and media download and cache, plus `olaz-signal` for 1-1 E2EE. The Swift protocol layer retains only features not yet ported (E2EE JS runtime/shadow comparison, phone sync WASM, calls, runtime installer; see `rust/MAP.md`).
 - **JavaScriptCore**: still used in-process for two Zalo JS modules in `Sources/Olaz/JSModules/`: the Signal E2EE library (`zalo-e2ee.js`, being replaced by the Rust `olaz-signal`) and the phone-to-Mac history sync (`zalo-zproto-sync.js`, which runs Zalo's `libzproto` WASM).
 
 > [!IMPORTANT]
