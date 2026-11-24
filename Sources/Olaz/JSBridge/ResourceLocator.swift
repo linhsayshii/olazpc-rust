@@ -3,10 +3,10 @@ import Foundation
 /// Finds directories that SwiftPM copies into the target's resource bundle
 /// (`resources: [.copy("JSModules"), .copy("Resources")]`).
 ///
-/// `Bundle.module` alone breaks in a hand-assembled `.app` (its generated accessor
-/// looks next to the bundle URL and otherwise at an absolute `.build` path), so the
-/// app bundle's `Contents/Resources` is searched first; `scripts/make-app.sh` copies
-/// `Olaz_Olaz.bundle` there.
+/// `Bundle.module` is not used: in a hand-assembled `.app` its generated accessor looks next to the
+/// bundle URL and otherwise at an absolute `.build` path, and the native backend's accessor calls
+/// fatalError when both miss. The app bundle's `Contents/Resources` is searched first;
+/// `scripts/make-app.sh` copies `Olaz_Olaz.bundle` there.
 enum ResourceLocator {
     static let resourceBundleName = "Olaz_Olaz.bundle"
 
@@ -31,9 +31,14 @@ enum ResourceLocator {
             candidates.append(res)
         }
         candidates.append(contentsOf: candidateRoots(ofBundleAt: Bundle.main.bundleURL.appendingPathComponent(resourceBundleName)))
-        // Development / `swift test` fallback.
-        if let res = Bundle.module.resourceURL { candidates.append(res) }
-        candidates.append(Bundle.module.bundleURL)
+        // Development fallbacks: `.build/<config>/Olaz` and `swift test` (the test bundle sits next to the resource bundle).
+        // `Bundle.module` is never touched: SwiftPM's native-backend accessor calls fatalError when the bundle is not
+        // where it expects it, which crashed the v0.1.0-beta release at launch.
+        if let exe = Bundle.main.executableURL?.deletingLastPathComponent() {
+            candidates.append(contentsOf: candidateRoots(ofBundleAt: exe.appendingPathComponent(resourceBundleName)))
+        }
+        let codeBundle = Bundle(for: BundleToken.self).bundleURL.deletingLastPathComponent()
+        candidates.append(contentsOf: candidateRoots(ofBundleAt: codeBundle.appendingPathComponent(resourceBundleName)))
         for base in candidates {
             let url = base.appendingPathComponent(subdirectory, isDirectory: true)
             var isDir: ObjCBool = false
@@ -51,3 +56,6 @@ enum ResourceLocator {
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 }
+
+/// Anchors `Bundle(for:)` to the bundle holding this module's code (the test bundle under `swift test`).
+private final class BundleToken {}

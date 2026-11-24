@@ -1358,9 +1358,17 @@ async fn send_text_carries_text_properties() {
     })
     .await
     .unwrap();
-    assert_eq!(params_of(&last(&api))["textProperties"].as_str().unwrap(), tp);
-    api.send_text(&SendTextArgs { conv_id: "200", text: "x", cli_msg_id: "1", ..SendTextArgs::default() })
-        .await
-        .unwrap();
+    assert_eq!(
+        params_of(&last(&api))["textProperties"].as_str().unwrap(),
+        tp
+    );
+    api.send_text(&SendTextArgs {
+        conv_id: "200",
+        text: "x",
+        cli_msg_id: "1",
+        ..SendTextArgs::default()
+    })
+    .await
+    .unwrap();
     assert!(params_of(&last(&api)).get("textProperties").is_none());
 }

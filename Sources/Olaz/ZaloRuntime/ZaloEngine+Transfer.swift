@@ -95,6 +95,9 @@ extension ZaloEngine {
     }
 
     internal func offerFirstLoginTransferIfNeeded(forceOffer: Bool = false) async {
+        if !traceHost("offer_first_login_transfer", args: ["force": forceOffer]) {
+            return
+        }
         guard transfer == nil, transferTask == nil else { return }
         if !forceOffer {
             if (try? await sqliteStore?.getPreferenceString(key: "didOfferInitialSync")) == "1" {

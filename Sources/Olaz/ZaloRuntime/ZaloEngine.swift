@@ -135,9 +135,16 @@ final class ZaloEngine {
     @ObservationIgnored internal var mirrorVersionWaiters: [(target: UInt64, continuation: CheckedContinuation<Void, Never>)] = []
     @ObservationIgnored internal var cachedQRPayload: String?
     @ObservationIgnored internal var cachedQRPNG: Data?
-    @ObservationIgnored private var wsTask: Task<Void, Never>?
-    @ObservationIgnored private var lpPollTask: Task<Void, Never>?
-    @ObservationIgnored private var bootstrapTask: Task<Void, Never>?
+    @ObservationIgnored internal var hostTrace: ((String, [String: Any]) -> Bool)?
+    @ObservationIgnored internal var stateTrace: (() -> Void)?
+    @ObservationIgnored internal var recordedQRPayload: String?
+    @ObservationIgnored internal var recordedSessionPrefs: [String: String] = [:]
+    @ObservationIgnored internal var pendingCleanupTask: Task<Void, Never>?
+    @ObservationIgnored internal var bootTask: Task<Void, Never>?
+    @ObservationIgnored internal var qrTask: Task<Void, Never>?
+    @ObservationIgnored internal var wsTask: Task<Void, Never>?
+    @ObservationIgnored internal var lpPollTask: Task<Void, Never>?
+    @ObservationIgnored internal var bootstrapTask: Task<Void, Never>?
     @ObservationIgnored internal var transferTask: Task<Void, Never>?
     @ObservationIgnored internal var batchImportTask: Task<Void, Never>?
     @ObservationIgnored internal var activeSyncBatchTasks: [UUID: Task<Void, Never>] = [:]
@@ -201,10 +208,11 @@ final class ZaloEngine {
     init(
         dataDirectory: URL = ZaloPlatform.defaultUserData,
         useKeychain: Bool = true,
-        urlSession: URLSession? = nil
+        urlSession: URLSession? = nil,
+        domains: ZaloDomains = ZaloDomains()
     ) {
         self.dataDirectory = dataDirectory
-        self.sessionClient = ZaloSessionClient(dataDirectory: dataDirectory, useKeychain: useKeychain, urlSession: urlSession)
+        self.sessionClient = ZaloSessionClient(dataDirectory: dataDirectory, useKeychain: useKeychain, urlSession: urlSession, domains: domains)
     }
 
     deinit {
@@ -217,13 +225,34 @@ final class ZaloEngine {
         profile: Profile?,
         signOutNotice: String?,
         selfConversationId: String?,
-        clientVersion: String?
+        clientVersion: String?,
+        qrPayload: String? = nil
     ) {
-        if self.phase != phase { self.phase = phase }
-        if self.profile != profile { self.profile = profile }
-        if self.signOutNotice != signOutNotice { self.signOutNotice = signOutNotice }
-        if self.selfConversationId != selfConversationId { self.selfConversationId = selfConversationId }
+        var traceChanged = false
+        if self.recordedQRPayload != qrPayload {
+            self.recordedQRPayload = qrPayload
+            traceChanged = true
+        }
+        if self.phase != phase {
+            self.phase = phase
+            traceChanged = true
+        }
+        if self.profile != profile {
+            self.profile = profile
+            traceChanged = true
+        }
+        if self.signOutNotice != signOutNotice {
+            self.signOutNotice = signOutNotice
+            traceChanged = true
+        }
+        if self.selfConversationId != selfConversationId {
+            self.selfConversationId = selfConversationId
+            traceChanged = true
+        }
         if self.clientVersion != clientVersion { self.clientVersion = clientVersion }
+        if traceChanged {
+            stateTrace?()
+        }
     }
 
     // MARK: - Lifecycle
@@ -353,6 +382,9 @@ final class ZaloEngine {
     internal func prepareStoreAndLocalCache(for account: ZaloLoginAccount) async {
         canStartTransfer = true
         transferStartBlockedReason = nil
+        if !traceHost("prepare_store", args: ["user_id": account.userId]) {
+            return
+        }
         let dbURL = dataDirectory
             .appendingPathComponent("accounts", isDirectory: true)
             .appendingPathComponent(account.userId, isDirectory: true)
@@ -600,6 +632,9 @@ final class ZaloEngine {
     // MARK: - Online Bootstrap & WebSocket Loop
 
     func startBootstrapRefresh() {
+        if !traceHost("start_bootstrap") {
+            return
+        }
         bootstrapTask?.cancel()
         bootstrapTask = Task { [weak self] in
             await self?.performBootstrapSync()
@@ -805,6 +840,9 @@ final class ZaloEngine {
     }
 
     internal func startLongPollLoop() {
+        if !traceHost("start_long_poll") {
+            return
+        }
         lpPollTask?.cancel()
         lpPollTask = Task { [weak self] in
             guard let self else { return }
@@ -1178,6 +1216,9 @@ final class ZaloEngine {
     internal func startWebSocketLoop(endpoints: [String], zpwSek: String) {
         wsTask?.cancel()
         guard !zpwSek.isEmpty else { return }
+        if !traceHost("start_ws", args: ["endpoints": endpoints]) {
+            return
+        }
         wsTask = Task { [weak self] in
             guard let self else { return }
             let stream = await self.webSocket.start(

@@ -108,6 +108,8 @@ pub struct ZaloDomains {
     pub ws: Vec<String>,
     pub service_candidates: BTreeMap<String, Vec<String>>,
     pub preferred_hosts: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub isolated: bool,
 }
 
 impl Default for ZaloDomains {
@@ -122,6 +124,7 @@ impl Default for ZaloDomains {
                 .collect(),
             service_candidates: BTreeMap::new(),
             preferred_hosts: BTreeMap::new(),
+            isolated: false,
         }
     }
 }
@@ -258,14 +261,16 @@ impl ZaloDomains {
             append_unique(&self.auth);
             append_unique(&self.wpa_chat);
         }
-        if let Some(defaults) = default_service_hosts(key) {
-            for host in defaults {
-                append_unique(host);
+        if !self.isolated {
+            if let Some(defaults) = default_service_hosts(key) {
+                for host in defaults {
+                    append_unique(host);
+                }
             }
-        }
-        if let Some(fallbacks) = fallback_service_hosts(key) {
-            for host in fallbacks {
-                append_unique(host);
+            if let Some(fallbacks) = fallback_service_hosts(key) {
+                for host in fallbacks {
+                    append_unique(host);
+                }
             }
         }
         list
@@ -279,5 +284,40 @@ impl ZaloDomains {
             return;
         }
         self.preferred_hosts.insert(key, norm);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn isolated_omits_defaults_and_fallbacks_while_default_is_unchanged() {
+        let mut non_isolated = ZaloDomains::default();
+        non_isolated.service_candidates.insert(
+            "profile".to_owned(),
+            vec!["http://127.0.0.1:9999".to_owned()],
+        );
+        let full = non_isolated.candidates("profile");
+        assert!(full.len() > 1);
+        assert_eq!(full[0], "http://127.0.0.1:9999");
+        assert!(full.iter().any(|h| h.contains("zaloapp.com")));
+
+        let mut isolated = non_isolated.clone();
+        isolated.isolated = true;
+        assert_eq!(
+            isolated.candidates("profile"),
+            vec!["http://127.0.0.1:9999".to_owned()]
+        );
+        assert!(isolated.candidates("chat").is_empty());
+
+        let Ok(non_isolated_json) = serde_json::to_value(&non_isolated) else {
+            panic!("serialize non_isolated");
+        };
+        assert!(non_isolated_json.get("isolated").is_none());
+        let Ok(isolated_json) = serde_json::to_value(&isolated) else {
+            panic!("serialize isolated");
+        };
+        assert_eq!(isolated_json.get("isolated"), Some(&Value::Bool(true)));
     }
 }
