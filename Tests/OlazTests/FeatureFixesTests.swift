@@ -244,6 +244,13 @@ import Testing
         guard case .message(let msg, _) = evt else { Issue.record("expected message"); return }
         #expect(msg.kind == .system)
         #expect(msg.text == "Hoàng Việt Linh đã ghim tin nhắn a đi dạy về ah.")
+        // A plain webchat (string or object content) stays text.
+        for content: Any in ["hi", ["title": "hi"]] {
+            let plain = ZaloWireParser.parseWireMessage(
+                ["msgId": "8523", "uidFrom": "peer", "idTo": "me", "msgType": "webchat", "ts": 1, "content": content], myUid: "me")
+            guard case .message(let m, _) = plain else { Issue.record("expected message"); return }
+            #expect(m.kind == .text)
+        }
     }
 
     /// `group.poll` events: actor + verb of `content.action` + question (Rust `group_poll_event_info_line`).

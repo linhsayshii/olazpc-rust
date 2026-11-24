@@ -441,7 +441,10 @@ enum ZaloWireParser {
         var suggestsStickers = false
 
         switch msgType {
-        case "", "webchat", "chat.text" where JSONLossless.string(contentDict?["action"]) == "msginfo.actionlist":
+        // `where` binds to every pattern only when each carries it (a single trailing `where` guards "chat.text" alone).
+        case "" where JSONLossless.string(contentDict?["action"]) == "msginfo.actionlist",
+             "webchat" where JSONLossless.string(contentDict?["action"]) == "msginfo.actionlist",
+             "chat.text" where JSONLossless.string(contentDict?["action"]) == "msginfo.actionlist":
             // Info notices (pin / unpin … synced from the phone): a system line, like under `chat.recommended`.
             kindDict = ["type": "system"]
             kindTag = "system"
