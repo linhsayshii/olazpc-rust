@@ -350,7 +350,7 @@ enum ScrollBench {
         let visible = scroll.contentView.bounds
         var best: (NSView, Double)?
         for v in doc.subviews where v.frame.intersects(visible) {
-            let y = scroll.convert(v.bounds, from: v).minY
+            let y = Double(scroll.convert(v.bounds, from: v).minY)
             if best == nil || y < best!.1 { best = (v, y) }
         }
         return best.map { ($0.0, $0.1) }
@@ -358,7 +358,7 @@ enum ScrollBench {
 
     private static func position(of view: NSView, in scroll: NSScrollView) -> Double? {
         guard view.window != nil else { return nil }
-        return scroll.convert(view.bounds, from: view).minY
+        return Double(scroll.convert(view.bounds, from: view).minY)
     }
 
     private static func largestScrollView(in root: NSView) -> NSScrollView? {
