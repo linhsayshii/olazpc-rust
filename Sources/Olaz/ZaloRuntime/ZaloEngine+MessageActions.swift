@@ -697,7 +697,7 @@ extension ZaloEngine {
     // MARK: Pins of the open conversation
 
     internal func refreshBoardPins(for convId: String) async {
-        guard traceHost("refresh_board_pins", args: ["conv_id": convId]) else {
+        guard traceU4Host("refresh_board_pins", args: ["conv_id": convId]) else {
             return
         }
         let group = ZaloWireParser.isGroupId(convId)

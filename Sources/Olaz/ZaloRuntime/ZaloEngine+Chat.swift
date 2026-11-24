@@ -56,7 +56,7 @@ extension ZaloEngine {
             }
 
             // 3. Mark read locally & remotely.
-            if self.traceHost("mark_read", args: ["conv_id": id]) {
+            if self.traceU4Host("mark_read", args: ["conv_id": id]) {
                 self.markRead(id)
             }
         }

@@ -169,7 +169,7 @@ extension ZaloEngine {
     // MARK: Actions
 
     func refreshCloud() {
-        guard traceHost("refresh_cloud") else {
+        guard traceU4Host("refresh_cloud") else {
             return
         }
         if sqliteStore == nil {

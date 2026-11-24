@@ -8,6 +8,11 @@ extension ZaloEngine {
         return hostTrace(name, args())
     }
 
+    internal func traceU4Host(_ name: String, args: @autoclosure () -> [String: Any] = [:]) -> Bool {
+        guard traceU4HostEnabled else { return true }
+        return traceHost(name, args: args())
+    }
+
     internal func syncSessionClientTrace() async {
         guard hostTrace != nil else {
             await sessionClient.setSessionTrace(nil)
@@ -25,6 +30,7 @@ extension ZaloEngine {
 
     internal func cancelTasksForRecording() {
         hostTrace = nil
+        traceU4HostEnabled = false
         stateTrace = nil
         EngineLog.shared.onAppend = nil
         stopCoreEngine()

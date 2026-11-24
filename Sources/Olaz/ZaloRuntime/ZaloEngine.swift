@@ -136,6 +136,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var cachedQRPayload: String?
     @ObservationIgnored internal var cachedQRPNG: Data?
     @ObservationIgnored internal var hostTrace: ((String, [String: Any]) -> Bool)?
+    @ObservationIgnored internal var traceU4HostEnabled: Bool = false
     @ObservationIgnored internal var stateTrace: (() -> Void)?
     @ObservationIgnored internal var transportSettleTrace: (() -> Void)?
     @ObservationIgnored internal var nowMs: () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }
@@ -699,7 +700,7 @@ final class ZaloEngine {
                     "duration": Int64($0.duration),
                 ]
             }
-            if traceHost("apply_mutes", args: ["mutes": serializedMutes]) {
+            if traceU4Host("apply_mutes", args: ["mutes": serializedMutes]) {
                 var map = notificationSettings.mutes
                 for m in parsedMutes {
                     map[m.convId] = MuteInfo(startTime: m.start, duration: m.duration)
@@ -1820,7 +1821,7 @@ final class ZaloEngine {
         reactClientId: String = "",
         senderName: String = ""
     ) async {
-        guard traceHost("apply_remote_reaction", args: [
+        guard traceU4Host("apply_remote_reaction", args: [
             "conv_id": convId,
             "msg_id": msgId,
             "cli_msg_id": cliMsgId,
@@ -1982,7 +1983,7 @@ final class ZaloEngine {
     }
 
     internal func applyRemoteRecall(convId: String, msgId: String, cliMsgId: String) async {
-        guard traceHost("apply_remote_recall", args: [
+        guard traceU4Host("apply_remote_recall", args: [
             "conv_id": convId,
             "msg_id": msgId,
             "cli_msg_id": cliMsgId,
@@ -2059,7 +2060,7 @@ final class ZaloEngine {
     }
 
     internal func applyRemoteDelete(convId: String, msgId: String, cliMsgId: String) async {
-        guard traceHost("apply_remote_delete", args: [
+        guard traceU4Host("apply_remote_delete", args: [
             "conv_id": convId,
             "msg_id": msgId,
             "cli_msg_id": cliMsgId,

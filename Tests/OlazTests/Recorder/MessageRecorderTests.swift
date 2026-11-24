@@ -10,28 +10,173 @@ final class MessageRecorderTests: XCTestCase {
         )
     }
 
+    // MARK: - Message Builders
+
+    private static func wireMsg(
+        msgId: String,
+        cliMsgId: String? = nil,
+        uidFrom: String,
+        idTo: String,
+        dName: String? = nil,
+        avt: String? = nil,
+        ts: Int64,
+        msgType: String = "webchat",
+        content: CaseJSON,
+        isE2EE: Bool? = nil,
+        actionId: Int64? = nil
+    ) -> CaseJSON {
+        var obj: [String: CaseJSON] = [
+            "msgId": .string(msgId),
+            "cliMsgId": .string(cliMsgId ?? "cli_\(msgId)"),
+            "uidFrom": .string(uidFrom),
+            "idTo": .string(idTo),
+            "ts": .int(ts),
+            "msgType": .string(msgType),
+            "content": content,
+        ]
+        if let dName { obj["dName"] = .string(dName) }
+        if let avt { obj["avt"] = .string(avt) }
+        if let isE2EE { obj["isE2EE"] = .int(isE2EE ? 1 : 0) }
+        if let actionId { obj["actionId"] = .int(actionId) }
+        return .object(obj)
+    }
+
+    private static func storedMsg(
+        id: String,
+        convId: String,
+        clientId: String? = nil,
+        senderId: String,
+        senderName: String = "Alice",
+        senderAvatar: String = "https://cdn.example.invalid/a.jpg",
+        isMine: Bool = false,
+        text: String,
+        kindTag: String = "text",
+        tsMs: Int64,
+        status: String = "sent",
+        isE2EE: Bool = false,
+        reactions: [CaseJSON]? = nil
+    ) -> CaseJSON {
+        var obj: [String: CaseJSON] = [
+            "id": .string(id),
+            "conv_id": .string(convId),
+            "client_id": .string(clientId ?? "cli_\(id)"),
+            "sender_id": .string(senderId),
+            "sender_name": .string(senderName),
+            "sender_avatar": .string(senderAvatar),
+            "is_mine": .bool(isMine),
+            "text": .string(text),
+            "kind_tag": .string(kindTag),
+            "ts_ms": .int(tsMs),
+            "status": .string(status),
+            "is_e2ee": .bool(isE2EE),
+        ]
+        if let reactions {
+            obj["reactions"] = .array(reactions)
+        }
+        return .object(obj)
+    }
+
+    private static func localConv(
+        id: String,
+        isGroup: Bool = false,
+        name: String,
+        avatar: String = "https://cdn.example.invalid/a.jpg",
+        members: Int64 = 0,
+        unread: Int64 = 0,
+        previewText: String = "",
+        previewTsMs: Int64 = 0
+    ) -> CaseJSON {
+        .object([
+            "id": .string(id),
+            "is_group": .bool(isGroup),
+            "name": .string(name),
+            "avatar": .string(avatar),
+            "pinned": .bool(false),
+            "members": .int(members),
+            "unread": .int(unread),
+            "preview_text": .string(previewText),
+            "preview_ts_ms": .int(previewTsMs),
+            "preview_from_me": .bool(false),
+        ])
+    }
+
+    private static func preloadHistoryScript(convId: String, msgs: [CaseJSON]) -> CaseJSON {
+        MessageRecorderHarness.httpScript(
+            path: "/api/preloadconvers/get-last-msgs",
+            method: "GET",
+            json: .object([
+                "error_code": .int(0),
+                "data": .object([
+                    "msgs": .object([
+                        convId: .array(msgs),
+                    ]),
+                ]),
+            ])
+        )
+    }
+
+    private static func cloudHistoryScript(
+        path: String = "/api/cm/getrecentv2",
+        groupMsgs: [CaseJSON],
+        isOld: Int64 = 0,
+        hasMore: Int64 = 0,
+        lastMsgId: String = "0"
+    ) -> CaseJSON {
+        MessageRecorderHarness.httpScript(
+            path: path,
+            method: "GET",
+            json: .object([
+                "error_code": .int(0),
+                "data": .object([
+                    "groupMsgs": .array(groupMsgs),
+                    "isOld": .int(isOld),
+                    "hasMore": .int(hasMore),
+                    "lastMsgId": .string(lastMsgId),
+                ]),
+            ])
+        )
+    }
+
     // MARK: - Scenarios
 
     private static func messagesScenarios() -> [MessageRecorderHarness.ScenarioDef] {
-        let peerId = "3000001"
         let baseTs: Int64 = 1700000000000
+        let lockedCipher = Data([0x03, 0x33, 0x0a] + Array(repeating: UInt8(0x41), count: 37)).base64EncodedString()
+
+        let peer1 = "3000001"
         let sixtyStoredMessages: [CaseJSON] = (1...60).map { idx in
             let id = String(1000 + idx)
-            let ts = baseTs + Int64(idx) * 1000
-            return .object([
-                "id": .string(id),
-                "conv_id": .string(peerId),
-                "client_id": .string("cli_\(id)"),
-                "sender_id": .string(peerId),
-                "sender_name": .string("Alice"),
-                "sender_avatar": .string("https://cdn.example.invalid/a.jpg"),
-                "is_mine": .bool(false),
-                "text": .string("Msg \(idx)"),
-                "kind_tag": .string("text"),
-                "ts_ms": .int(ts),
-                "status": .string("sent"),
-            ])
+            return storedMsg(
+                id: id,
+                convId: peer1,
+                senderId: peer1,
+                text: "Msg \(idx)",
+                tsMs: baseTs + Int64(idx) * 1000
+            )
         }
+
+        let peer6 = "3000006"
+        let grp6 = "g500006"
+        let self6 = "9200406"
+        let store6PeerMsgs: [CaseJSON] = (1...55).map { idx in
+            storedMsg(id: String(1100 + idx), convId: peer6, senderId: peer6, text: "P6 \(idx)", tsMs: baseTs + Int64(idx) * 1000)
+        }
+        let store6GrpMsgs: [CaseJSON] = (1...55).map { idx in
+            storedMsg(id: String(1200 + idx), convId: grp6, senderId: peer6, text: "G6 \(idx)", tsMs: baseTs + Int64(idx) * 1000)
+        }
+        let store6SelfMsgs: [CaseJSON] = (1...55).map { idx in
+            storedMsg(id: String(1300 + idx), convId: self6, senderId: "2000406", senderName: "Bạn", senderAvatar: "", isMine: true, text: "S6 \(idx)", tsMs: baseTs + Int64(idx) * 1000)
+        }
+
+        let grp7 = "g500007"
+        let store7Msgs: [CaseJSON] = (1...46).map { idx in
+            storedMsg(id: String(2000 + idx), convId: grp7, senderId: "3000007", text: "G7 \(idx)", tsMs: baseTs + Int64(idx) * 1000)
+        }
+
+        let grp8True = "g500008"
+        let grp8False = "g500009"
+        let self8 = "9200408"
+        let peer8 = "3000008"
 
         return [
             // 1. open_local_cache: 60 stored rows: window holds the newest 50 sorted by date then id,
@@ -44,18 +189,7 @@ final class MessageRecorderTests: XCTestCase {
                     suppress: ["ws", "long_poll"],
                     extras: [
                         "local_conversations": .array([
-                            .object([
-                                "id": .string(peerId),
-                                "is_group": .bool(false),
-                                "name": .string("Alice"),
-                                "avatar": .string("https://cdn.example.invalid/a.jpg"),
-                                "pinned": .bool(false),
-                                "members": .int(0),
-                                "unread": .int(1),
-                                "preview_text": .string("Msg 60"),
-                                "preview_ts_ms": .int(baseTs + 60_000),
-                                "preview_from_me": .bool(false),
-                            ]),
+                            localConv(id: peer1, name: "Alice", unread: 1, previewText: "Msg 60", previewTsMs: baseTs + 60_000),
                         ]),
                         "local_messages": .array(sixtyStoredMessages),
                     ]
@@ -63,24 +197,671 @@ final class MessageRecorderTests: XCTestCase {
                 server: [
                     MessageRecorderHarness.loginInfoScript(uid: "2000401", displayName: "Msg User 1"),
                     MessageRecorderHarness.profileMeScript(uid: "2000401", displayName: "Msg User 1"),
+                    preloadHistoryScript(convId: peer1, msgs: [
+                        wireMsg(msgId: "1061", uidFrom: peer1, idTo: "2000401", dName: "Alice", ts: baseTs + 61_000, content: .string("Fresh 61")),
+                    ]),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string(peer1)])]),
+                ]
+            ),
+
+            // 2. open_up_to_date_skips_fetch: freshness upToDate for the id: no history request.
+            MessageRecorderHarness.ScenarioDef(
+                name: "open_up_to_date_skips_fetch",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000402",
+                    displayName: "Msg User 2",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "history_freshness": .object(["3000002": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000002", name: "Bob", unread: 1, previewText: "Cached 2", previewTsMs: baseTs + 2_000),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(id: "1001", convId: "3000002", senderId: "3000002", senderName: "Bob", text: "Cached 1", tsMs: baseTs + 1_000),
+                            storedMsg(id: "1002", convId: "3000002", senderId: "3000002", senderName: "Bob", text: "Cached 2", tsMs: baseTs + 2_000),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000402", displayName: "Msg User 2"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000402", displayName: "Msg User 2"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000002")])]),
+                ]
+            ),
+
+            // 3. open_empty_store_fetch: no local rows: server page merged and stored.
+            MessageRecorderHarness.ScenarioDef(
+                name: "open_empty_store_fetch",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000403",
+                    displayName: "Msg User 3",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "local_conversations": .array([
+                            localConv(id: "3000003", name: "Carol"),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000403", displayName: "Msg User 3"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000403", displayName: "Msg User 3"),
+                    preloadHistoryScript(convId: "3000003", msgs: [
+                        wireMsg(msgId: "2002", uidFrom: "3000003", idTo: "2000403", dName: "Carol", avt: "https://cdn.example.invalid/c.jpg", ts: baseTs + 2_000, content: .string("Second")),
+                        wireMsg(msgId: "2001", uidFrom: "3000003", idTo: "2000403", dName: "Carol", avt: "https://cdn.example.invalid/c.jpg", ts: baseTs + 1_000, content: .string("First")),
+                    ]),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000003")])]),
+                ]
+            ),
+
+            // 4. open_fetch_fails: request refused, empty window: has_more false.
+            MessageRecorderHarness.ScenarioDef(
+                name: "open_fetch_fails",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000404",
+                    displayName: "Msg User 4",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "local_conversations": .array([
+                            localConv(id: "3000004", name: "Dave"),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000404", displayName: "Msg User 4"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000404", displayName: "Msg User 4"),
+                    MessageRecorderHarness.httpScript(path: "/api/preloadconvers/get-last-msgs", method: "GET", error: "refused"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000004")])]),
+                ]
+            ),
+
+            // 5. open_twice: second open adds nothing, no duplicate rows, no extra list write.
+            MessageRecorderHarness.ScenarioDef(
+                name: "open_twice",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000405",
+                    displayName: "Msg User 5",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "local_conversations": .array([
+                            localConv(id: "3000005", name: "Eve", previewText: "Local 2", previewTsMs: baseTs + 2_000),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(id: "1501", convId: "3000005", senderId: "3000005", senderName: "Eve", text: "Local 1", tsMs: baseTs + 1_000),
+                            storedMsg(id: "1502", convId: "3000005", senderId: "3000005", senderName: "Eve", text: "Local 2", tsMs: baseTs + 2_000),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000405", displayName: "Msg User 5"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000405", displayName: "Msg User 5"),
+                    preloadHistoryScript(convId: "3000005", msgs: [
+                        wireMsg(msgId: "1503", uidFrom: "3000005", idTo: "2000405", dName: "Eve", avt: "https://cdn.example.invalid/a.jpg", ts: baseTs + 3_000, content: .string("Server 3")),
+                    ]),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000005")])]),
+                    .object(["snapshot": .string("after_first_open")]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000005")])]),
+                ]
+            ),
+
+            // 6. load_older_from_store: older rows by beforeTsMs; 1-1 with fewer than 45: has_more false;
+            // group and self keep it.
+            MessageRecorderHarness.ScenarioDef(
+                name: "load_older_from_store",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000406",
+                    displayName: "Msg User 6",
+                    send2MeId: self6,
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "history_freshness": .object([
+                            peer6: .string("up_to_date"),
+                            grp6: .string("up_to_date"),
+                            self6: .string("up_to_date"),
+                        ]),
+                        "local_conversations": .array([
+                            localConv(id: peer6, name: "Peer 6", previewText: "P6 55", previewTsMs: baseTs + 55_000),
+                            localConv(id: grp6, isGroup: true, name: "Group 6", members: 3, previewText: "G6 55", previewTsMs: baseTs + 55_000),
+                            localConv(id: self6, name: "Cloud của tôi", previewText: "S6 55", previewTsMs: baseTs + 55_000),
+                        ]),
+                        "local_messages": .array(store6PeerMsgs + store6GrpMsgs + store6SelfMsgs),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000406", displayName: "Msg User 6", send2MeId: self6),
+                    MessageRecorderHarness.profileMeScript(uid: "2000406", displayName: "Msg User 6"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string(peer6)])]),
+                    .object(["snapshot": .string("peer_opened")]),
+                    .object(["cmd": .string("load_older"), "args": .object(["id": .string(peer6)])]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string(grp6)])]),
+                    .object(["cmd": .string("load_older"), "args": .object(["id": .string(grp6)])]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string(self6)])]),
+                    .object(["cmd": .string("load_older"), "args": .object(["id": .string(self6)])]),
+                ]
+            ),
+
+            // 7. load_older_from_server: no older stored rows: cursor is the oldest numeric id;
+            // fetched 0: has_more false; history_ticks increments.
+            MessageRecorderHarness.ScenarioDef(
+                name: "load_older_from_server",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000407",
+                    displayName: "Msg User 7",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "history_freshness": .object([grp7: .string("up_to_date")]),
+                        "contacts": .object([
+                            "friends": .array([
+                                .object(["id": .string("3000007"), "name": .string("Alice"), "avatar": .string("https://cdn.example.invalid/a.jpg")]),
+                            ]),
+                        ]),
+                        "local_conversations": .array([
+                            localConv(id: grp7, isGroup: true, name: "Group 7", members: 4, previewText: "G7 46", previewTsMs: baseTs + 46_000),
+                        ]),
+                        "local_messages": .array(store7Msgs),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000407", displayName: "Msg User 7"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000407", displayName: "Msg User 7"),
+                    cloudHistoryScript(
+                        path: "/api/cm/getrecentv2",
+                        groupMsgs: [
+                            wireMsg(msgId: "2000", uidFrom: "3000007", idTo: grp7, dName: "Alice", avt: "https://cdn.example.invalid/a.jpg", ts: baseTs, content: .string("Older 2000")),
+                        ],
+                        isOld: 1,
+                        hasMore: 0,
+                        lastMsgId: "2000"
+                    ),
+                    cloudHistoryScript(
+                        path: "/api/cm/getoldv2",
+                        groupMsgs: [],
+                        isOld: 1,
+                        hasMore: 0,
+                        lastMsgId: "0"
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string(grp7)])]),
+                    .object(["snapshot": .string("after_open")]),
+                    .object(["cmd": .string("load_older"), "args": .object(["id": .string(grp7)])]),
+                    .object(["snapshot": .string("after_first_load_older")]),
+                    .object(["cmd": .string("load_older"), "args": .object(["id": .string(grp7)])]),
+                ]
+            ),
+
+            // 8. has_more_rules: group / self with totalParsed >= max(10, count / 2) vs below;
+            // 1-1 with fewer than 45 in memory.
+            MessageRecorderHarness.ScenarioDef(
+                name: "has_more_rules",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000408",
+                    displayName: "Msg User 8",
+                    send2MeId: self8,
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "contacts": .object([
+                            "friends": .array([
+                                .object(["id": .string(peer8), "name": .string("Peer 8"), "avatar": .string("https://cdn.example.invalid/p8.jpg")]),
+                            ]),
+                        ]),
+                        "local_conversations": .array([
+                            localConv(id: grp8True, isGroup: true, name: "Group >= 25", members: 3),
+                            localConv(id: grp8False, isGroup: true, name: "Group < 25", members: 3),
+                            localConv(id: self8, name: "Cloud của tôi"),
+                            localConv(id: peer8, name: "Peer 8", avatar: "https://cdn.example.invalid/p8.jpg"),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000408", displayName: "Msg User 8", send2MeId: self8),
+                    MessageRecorderHarness.profileMeScript(uid: "2000408", displayName: "Msg User 8"),
+                    // 25 msgs -> group has_more true
+                    cloudHistoryScript(
+                        groupMsgs: (1...25).map { i in
+                            wireMsg(msgId: String(3100 + i), uidFrom: peer8, idTo: grp8True, dName: "Peer 8", ts: baseTs + Int64(i) * 1000, content: .string("GT \(i)"))
+                        }
+                    ),
+                    // 24 msgs -> group has_more false
+                    cloudHistoryScript(
+                        groupMsgs: (1...24).map { i in
+                            wireMsg(msgId: String(3200 + i), uidFrom: peer8, idTo: grp8False, dName: "Peer 8", ts: baseTs + Int64(i) * 1000, content: .string("GF \(i)"))
+                        }
+                    ),
+                    // 25 msgs -> self has_more true
+                    cloudHistoryScript(
+                        groupMsgs: (1...25).map { i in
+                            wireMsg(msgId: String(3300 + i), uidFrom: "2000408", idTo: self8, ts: baseTs + Int64(i) * 1000, content: .string("Self \(i)"))
+                        }
+                    ),
+                    // 30 msgs in 1-1 (< 45 in memory) -> has_more false
+                    preloadHistoryScript(
+                        convId: peer8,
+                        msgs: (1...30).map { i in
+                            wireMsg(msgId: String(3400 + i), uidFrom: peer8, idTo: "2000408", dName: "Peer 8", ts: baseTs + Int64(i) * 1000, content: .string("P8 \(i)"))
+                        }
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string(grp8True)])]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string(grp8False)])]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string(self8)])]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string(peer8)])]),
+                ]
+            ),
+
+            // 9. merge_dedupe: same message by id; by client id replacing the optimistic row;
+            // reactions preserved on re-merge, dropped when the incoming kind is recalled.
+            MessageRecorderHarness.ScenarioDef(
+                name: "merge_dedupe",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000409",
+                    displayName: "Msg User 9",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "local_conversations": .array([
+                            localConv(id: "3000009", name: "Frank"),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(
+                                id: "2001",
+                                convId: "3000009",
+                                clientId: "cli_2001",
+                                senderId: "3000009",
+                                senderName: "Frank",
+                                text: "Saved 1",
+                                tsMs: baseTs + 1_000,
+                                reactions: [
+                                    .object([
+                                        "type": .string("5"),
+                                        "key": .string("/-heart"),
+                                        "emoji": .string("❤️"),
+                                        "image": .string(""),
+                                        "count": .int(1),
+                                        "includesMe": .bool(false),
+                                        "names": .array([.string("Frank")]),
+                                        "people": .int(1),
+                                    ]),
+                                ]
+                            ),
+                            storedMsg(
+                                id: "cli_2002",
+                                convId: "3000009",
+                                clientId: "cli_2002",
+                                senderId: "2000409",
+                                senderName: "Bạn",
+                                senderAvatar: "",
+                                isMine: true,
+                                text: "Optimistic 2",
+                                tsMs: baseTs + 2_000,
+                                status: "sending",
+                                reactions: [
+                                    .object([
+                                        "type": .string("3"),
+                                        "key": .string("/-strong"),
+                                        "emoji": .string("👍"),
+                                        "image": .string(""),
+                                        "count": .int(1),
+                                        "includesMe": .bool(false),
+                                        "names": .array([.string("Frank")]),
+                                        "people": .int(1),
+                                    ]),
+                                ]
+                            ),
+                            storedMsg(
+                                id: "cli_2003",
+                                convId: "3000009",
+                                clientId: "cli_2003",
+                                senderId: "2000409",
+                                senderName: "Bạn",
+                                senderAvatar: "",
+                                isMine: true,
+                                text: "Optimistic 3",
+                                tsMs: baseTs + 3_000,
+                                status: "sending",
+                                reactions: [
+                                    .object([
+                                        "type": .string("5"),
+                                        "key": .string("/-heart"),
+                                        "emoji": .string("❤️"),
+                                        "image": .string(""),
+                                        "count": .int(1),
+                                        "includesMe": .bool(false),
+                                        "names": .array([.string("Frank")]),
+                                        "people": .int(1),
+                                    ]),
+                                ]
+                            ),
+                            storedMsg(
+                                id: "2003",
+                                convId: "3000009",
+                                clientId: "cli_2003",
+                                senderId: "2000409",
+                                senderName: "Bạn",
+                                senderAvatar: "",
+                                isMine: true,
+                                text: "Tin nhắn đã được thu hồi",
+                                kindTag: "recalled",
+                                tsMs: baseTs + 4_000,
+                                status: "sent"
+                            ),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000409", displayName: "Msg User 9"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000409", displayName: "Msg User 9"),
+                    preloadHistoryScript(convId: "3000009", msgs: [
+                        wireMsg(msgId: "2001", cliMsgId: "cli_2001", uidFrom: "3000009", idTo: "2000409", dName: "Frank", avt: "https://cdn.example.invalid/a.jpg", ts: baseTs + 1_000, content: .string("Updated 1")),
+                        wireMsg(msgId: "2002", cliMsgId: "cli_2002", uidFrom: "2000409", idTo: "3000009", ts: baseTs + 2_000, content: .string("Acked 2")),
+                    ]),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000009")])]),
+                ]
+            ),
+
+            // 10. merge_e2ee_placeholder: locked E2EE placeholder arriving with a client id:
+            // id rewritten on the existing row; skipped when a decrypted row already holds the client id.
+            MessageRecorderHarness.ScenarioDef(
+                name: "merge_e2ee_placeholder",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000410",
+                    displayName: "Msg User 10",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "local_conversations": .array([
+                            localConv(id: "3000010", name: "E2EE Peer"),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(
+                                id: "cli_e2ee_1",
+                                convId: "3000010",
+                                clientId: "cli_e2ee_1",
+                                senderId: "2000410",
+                                senderName: "Bạn",
+                                senderAvatar: "",
+                                isMine: true,
+                                text: "My plain optimistic",
+                                tsMs: baseTs + 1_000,
+                                status: "sending",
+                                isE2EE: true
+                            ),
+                            storedMsg(
+                                id: "3002",
+                                convId: "3000010",
+                                clientId: "cli_e2ee_2",
+                                senderId: "3000010",
+                                senderName: "E2EE Peer",
+                                text: "Already decrypted",
+                                tsMs: baseTs + 2_000,
+                                isE2EE: true
+                            ),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000410", displayName: "Msg User 10"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000410", displayName: "Msg User 10"),
+                    preloadHistoryScript(convId: "3000010", msgs: [
+                        wireMsg(msgId: "3001", cliMsgId: "cli_e2ee_1", uidFrom: "2000410", idTo: "3000010", ts: baseTs + 1_000, content: .string(lockedCipher), isE2EE: true),
+                        wireMsg(msgId: "3003", cliMsgId: "cli_e2ee_2", uidFrom: "3000010", idTo: "2000410", dName: "E2EE Peer", avt: "https://cdn.example.invalid/a.jpg", ts: baseTs + 2_000, content: .string(lockedCipher), isE2EE: true),
+                    ]),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000010")])]),
+                ]
+            ),
+
+            // 11. merge_order: equal dates ordered by id.
+            MessageRecorderHarness.ScenarioDef(
+                name: "merge_order",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000411",
+                    displayName: "Msg User 11",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "local_conversations": .array([
+                            localConv(id: "3000011", name: "Order Peer"),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000411", displayName: "Msg User 11"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000411", displayName: "Msg User 11"),
+                    preloadHistoryScript(convId: "3000011", msgs: [
+                        wireMsg(msgId: "1004", uidFrom: "3000011", idTo: "2000411", dName: "Order Peer", avt: "https://cdn.example.invalid/a.jpg", ts: baseTs + 2_000, content: .string("Later")),
+                        wireMsg(msgId: "1003", uidFrom: "3000011", idTo: "2000411", dName: "Order Peer", avt: "https://cdn.example.invalid/a.jpg", ts: baseTs + 1_000, content: .string("Tie C")),
+                        wireMsg(msgId: "1001", uidFrom: "3000011", idTo: "2000411", dName: "Order Peer", avt: "https://cdn.example.invalid/a.jpg", ts: baseTs + 1_000, content: .string("Tie A")),
+                        wireMsg(msgId: "1002", uidFrom: "3000011", idTo: "2000411", dName: "Order Peer", avt: "https://cdn.example.invalid/a.jpg", ts: baseTs + 1_000, content: .string("Tie B")),
+                        wireMsg(msgId: "1000", uidFrom: "3000011", idTo: "2000411", dName: "Order Peer", avt: "https://cdn.example.invalid/a.jpg", ts: baseTs, content: .string("Earlier")),
+                    ]),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000011")])]),
+                ]
+            ),
+
+            // 12. known_sender: sender name and avatar filled from identity when the row lacks them.
+            MessageRecorderHarness.ScenarioDef(
+                name: "known_sender",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000412",
+                    displayName: "Msg User 12",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "history_freshness": .object(["3000012": .string("up_to_date")]),
+                        "contacts": .object([
+                            "friends": .array([
+                                .object([
+                                    "id": .string("3000012"),
+                                    "name": .string("Known Alice"),
+                                    "avatar": .string("https://cdn.example.invalid/known_alice.jpg"),
+                                ]),
+                                .object([
+                                    "id": .string("3000013"),
+                                    "name": .string("Known Bob"),
+                                    "avatar": .string("https://cdn.example.invalid/known_bob.jpg"),
+                                ]),
+                            ]),
+                        ]),
+                        "local_conversations": .array([
+                            localConv(id: "3000012", name: "Known Alice", avatar: "https://cdn.example.invalid/known_alice.jpg"),
+                            localConv(id: "g500012", isGroup: true, name: "Known Sender Group", members: 3),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(
+                                id: "2101",
+                                convId: "3000012",
+                                senderId: "3000012",
+                                senderName: "",
+                                senderAvatar: "",
+                                text: "Stored missing sender",
+                                tsMs: baseTs + 1_000
+                            ),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000412", displayName: "Msg User 12"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000412", displayName: "Msg User 12"),
+                    cloudHistoryScript(groupMsgs: [
+                        wireMsg(msgId: "2102", uidFrom: "3000013", idTo: "g500012", ts: baseTs + 2_000, content: .string("Wire missing sender")),
+                    ]),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000012")])]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("g500012")])]),
+                ]
+            ),
+
+            // 13. history_page_events: one page with messages, reactions out of order (applied chronologically),
+            // an undo and a delete: host calls for U6 handlers in that order.
+            MessageRecorderHarness.ScenarioDef(
+                name: "history_page_events",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000413",
+                    displayName: "Msg User 13",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "contacts": .object([
+                            "friends": .array([
+                                .object([
+                                    "id": .string("3000013"),
+                                    "name": .string("Alice"),
+                                    "avatar": .string("https://cdn.example.invalid/a.jpg"),
+                                ]),
+                            ]),
+                        ]),
+                        "local_conversations": .array([
+                            localConv(id: "g500013", isGroup: true, name: "Events Group", members: 3),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000413", displayName: "Msg User 13"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000413", displayName: "Msg User 13"),
+                    cloudHistoryScript(groupMsgs: [
+                        wireMsg(
+                            msgId: "4005",
+                            uidFrom: "3000013",
+                            idTo: "g500013",
+                            ts: baseTs + 5_000,
+                            msgType: "chat.undo",
+                            content: .object(["globalMsgId": .string("4001"), "cliMsgId": .string("cli_4001")])
+                        ),
+                        wireMsg(
+                            msgId: "4004",
+                            uidFrom: "3000013",
+                            idTo: "g500013",
+                            ts: baseTs + 4_000,
+                            msgType: "chat.delete",
+                            content: .object(["globalDelMsgId": .string("4001"), "clientDelMsgId": .string("cli_4001")])
+                        ),
+                        wireMsg(
+                            msgId: "4003",
+                            uidFrom: "3000013",
+                            idTo: "g500013",
+                            dName: "Alice",
+                            ts: baseTs + 3_000,
+                            msgType: "chat.reaction",
+                            content: .object([
+                                "rIcon": .string("/-heart"),
+                                "rType": .int(5),
+                                "rMsg": .array([.object(["gMsgID": .string("4001"), "cMsgID": .string("cli_4001")])]),
+                            ]),
+                            actionId: 20
+                        ),
+                        wireMsg(
+                            msgId: "4002",
+                            uidFrom: "3000013",
+                            idTo: "g500013",
+                            dName: "Alice",
+                            ts: baseTs + 2_000,
+                            msgType: "chat.reaction",
+                            content: .object([
+                                "rIcon": .string("/-strong"),
+                                "rType": .int(3),
+                                "rMsg": .array([.object(["gMsgID": .string("4001"), "cMsgID": .string("cli_4001")])]),
+                            ]),
+                            actionId: 10
+                        ),
+                        wireMsg(
+                            msgId: "4001",
+                            cliMsgId: "cli_4001",
+                            uidFrom: "3000013",
+                            idTo: "g500013",
+                            dName: "Alice",
+                            avt: "https://cdn.example.invalid/a.jpg",
+                            ts: baseTs + 1_000,
+                            content: .string("Target message")
+                        ),
+                    ]),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("g500013")])]),
+                ]
+            ),
+
+            // 14. sender_profiles: group window with unknown senders: profile fetch for missing names only.
+            MessageRecorderHarness.ScenarioDef(
+                name: "sender_profiles",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000414",
+                    displayName: "Msg User 14",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "contacts": .object([
+                            "friends": .array([
+                                .object([
+                                    "id": .string("3000014"),
+                                    "name": .string("Known Sender"),
+                                    "avatar": .string("https://cdn.example.invalid/s14.jpg"),
+                                ]),
+                            ]),
+                        ]),
+                        "local_conversations": .array([
+                            localConv(id: "g500014", isGroup: true, name: "Group 14", members: 4),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000414", displayName: "Msg User 14"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000414", displayName: "Msg User 14"),
+                    cloudHistoryScript(groupMsgs: [
+                        wireMsg(msgId: "5001", uidFrom: "3000014", idTo: "g500014", ts: baseTs + 1_000, content: .string("From known")),
+                        wireMsg(msgId: "5002", uidFrom: "3000015", idTo: "g500014", dName: "Inline Named", avt: "https://cdn.example.invalid/s15.jpg", ts: baseTs + 2_000, content: .string("From inline named")),
+                        wireMsg(msgId: "5003", uidFrom: "3000016", idTo: "g500014", ts: baseTs + 3_000, content: .string("From unknown")),
+                        wireMsg(msgId: "5004", uidFrom: "2000414", idTo: "g500014", ts: baseTs + 4_000, content: .string("From me")),
+                    ]),
                     MessageRecorderHarness.httpScript(
-                        path: "/api/preloadconvers/get-last-msgs",
-                        method: "GET",
+                        path: "/api/social/group/members",
+                        method: "POST",
                         json: .object([
                             "error_code": .int(0),
                             "data": .object([
-                                "msgs": .object([
-                                    peerId: .array([
-                                        .object([
-                                            "msgId": .string("1061"),
-                                            "cliMsgId": .string("cli_1061"),
-                                            "uidFrom": .string(peerId),
-                                            "idTo": .string("2000401"),
-                                            "dName": .string("Alice"),
-                                            "ts": .int(baseTs + 61_000),
-                                            "msgType": .string("webchat"),
-                                            "content": .string("Fresh 61"),
-                                        ]),
+                                "profiles": .object([
+                                    "3000016": .object([
+                                        "id": .string("3000016"),
+                                        "displayName": .string("Resolved Unknown"),
+                                        "avatar": .string("https://cdn.example.invalid/s16.jpg"),
                                     ]),
                                 ]),
                             ]),
@@ -90,7 +871,68 @@ final class MessageRecorderTests: XCTestCase {
                 steps: [
                     .object(["cmd": .string("start")]),
                     .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
-                    .object(["cmd": .string("open"), "args": .object(["id": .string(peerId)])]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("g500014")])]),
+                ]
+            ),
+
+            // 15. live_push_open_and_closed: a 501 push into the open window and into a closed one:
+            // windows, rows, results handed to U3.
+            MessageRecorderHarness.ScenarioDef(
+                name: "live_push_open_and_closed",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000415",
+                    displayName: "Msg User 15",
+                    suppress: ["long_poll"],
+                    extras: [
+                        "local_conversations": .array([
+                            localConv(id: "3000015", name: "Open Peer", unread: 0),
+                            localConv(id: "3000016", name: "Closed Peer", unread: 0),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000415", displayName: "Msg User 15"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000415", displayName: "Msg User 15"),
+                    MessageRecorderHarness.wsScript(),
+                    MessageRecorderHarness.wsFrameScript(cmd: 1, payload: .object(["error_code": .int(0)])),
+                    preloadHistoryScript(convId: "3000015", msgs: []),
+                    MessageRecorderHarness.wsFrameScript(
+                        cmd: 501,
+                        payload: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "msgs": .array([
+                                    wireMsg(msgId: "5101", uidFrom: "3000015", idTo: "2000415", dName: "Open Peer", avt: "https://cdn.example.invalid/a.jpg", ts: baseTs + 1_000, content: .string("Push to open")),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    MessageRecorderHarness.wsFrameScript(
+                        cmd: 501,
+                        payload: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "msgs": .array([
+                                    wireMsg(msgId: "5102", uidFrom: "3000016", idTo: "2000415", dName: "Closed Peer", avt: "https://cdn.example.invalid/b.jpg", ts: baseTs + 2_000, content: .string("Push to closed")),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["await_host": .string("start_bootstrap"), "timeout_ms": .int(5000)]),
+                    .object(["ws_push": .int(1)]),
+                    .object(["await_host": .string("e2ee_connected"), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000015")])]),
+                    .object(["ws_push": .int(1)]),
+                    .object(["await_host": .string("apply_parsed_events"), "timeout_ms": .int(5000)]),
+                    .object(["snapshot": .string("after_open_push")]),
+                    .object(["ws_push": .int(1)]),
+                    .object(["await_host": .string("apply_parsed_events"), "timeout_ms": .int(5000)]),
+                    .object(["snapshot": .string("after_closed_push")]),
+                    .object(["cmd": .string("close")]),
                 ]
             ),
         ]
@@ -316,6 +1158,7 @@ enum MessageRecorderHarness {
             }
         }
 
+        engine.traceU4HostEnabled = true
         engine.hostTrace = { name, args in
             let normalizedArgs = normalizeRecordedURLs(CaseJSON.fromAny(args))
             hostCalls.append(.object([
@@ -897,12 +1740,47 @@ enum MessageRecorderHarness {
         )
     }
 
+    static func serverInfoScript(error: String? = nil) -> CaseJSON {
+        if let error {
+            return httpScript(path: "/api/login/getServerInfo", error: error)
+        }
+        return httpScript(
+            path: "/api/login/getServerInfo",
+            json: .object(["error_code": .int(0), "data": .object([:])])
+        )
+    }
+
+    static func reqqrScript(
+        tokenId: String = "tok_qr_1",
+        qrCnt: String = "https://zalo.me/qr/test-1",
+        waitScanPath: String = "/api/login/waitScan",
+        waitCfirmPath: String = "/api/login/waitCfirm",
+        qrTimeout: Int64 = 60,
+        qrRetry: Int64 = 1
+    ) -> CaseJSON {
+        httpScript(
+            path: "/api/login/reqqr",
+            json: .object([
+                "error_code": .int(0),
+                "data": .object([
+                    "token_id": .string(tokenId),
+                    "qr_cnt": .string(qrCnt),
+                    "chk_wait_scan": .string("http://fake\(waitScanPath)"),
+                    "chk_wait_cfirm": .string("http://fake\(waitCfirmPath)"),
+                    "qr_timeout": .int(qrTimeout),
+                    "qr_retry": .int(qrRetry),
+                ]),
+            ])
+        )
+    }
+
     static func httpScript(
         path: String,
         method: String = "GET",
         status: Int64 = 200,
         json: CaseJSON? = nil,
-        error: String? = nil
+        error: String? = nil,
+        repeatResponse: Bool = false
     ) -> CaseJSON {
         var resp: [String: CaseJSON] = [:]
         if let error {
@@ -913,12 +1791,16 @@ enum MessageRecorderHarness {
                 resp["json"] = json
             }
         }
-        return .object([
+        var obj: [String: CaseJSON] = [
             "kind": .string("http"),
             "path": .string(path),
             "method": .string(method),
             "response": .object(resp),
-        ])
+        ]
+        if repeatResponse {
+            obj["repeat"] = .bool(true)
+        }
+        return .object(obj)
     }
 
     static func wsScript(path: String = "/", accept: Bool = true) -> CaseJSON {
