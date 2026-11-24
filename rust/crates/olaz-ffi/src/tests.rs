@@ -827,10 +827,7 @@ fn typed_wire_kinds_golden_fixtures() {
                 assert_eq!(message.quote.as_ref().unwrap().sender_name, "An");
             }
             if message.id == "1009" {
-                assert!(matches!(
-                    message.kind,
-                    KindRecord::Link { url: None, .. }
-                ));
+                assert!(matches!(message.kind, KindRecord::Link { url: None, .. }));
             }
             if message.id == "1017" || message.id == "1019" {
                 assert!(stored.locked);
@@ -839,8 +836,22 @@ fn typed_wire_kinds_golden_fixtures() {
         }
     }
     for tag in [
-        "text", "photo", "sticker", "gif", "video", "voice", "file", "link", "contactCard",
-        "location", "call", "ecard", "poll", "system", "placeholder", "unsupported",
+        "text",
+        "photo",
+        "sticker",
+        "gif",
+        "video",
+        "voice",
+        "file",
+        "link",
+        "contactCard",
+        "location",
+        "call",
+        "ecard",
+        "poll",
+        "system",
+        "placeholder",
+        "unsupported",
     ] {
         assert!(tags.contains(tag), "kind {tag} missing (got {tags:?})");
     }
@@ -856,7 +867,12 @@ fn typed_wire_kinds_golden_fixtures() {
 
 #[tokio::test]
 async fn typed_store_reads_and_single_lookup_golden_fixtures() {
-    fn stored_row(id: &str, ts: i64, kind: &str, mut dict: serde_json::Map<String, serde_json::Value>) -> MessageRow {
+    fn stored_row(
+        id: &str,
+        ts: i64,
+        kind: &str,
+        mut dict: serde_json::Map<String, serde_json::Value>,
+    ) -> MessageRow {
         dict.insert("id".into(), serde_json::json!(id));
         if !dict.contains_key("clientId") {
             dict.insert("clientId".into(), serde_json::json!(format!("cli{id}")));
@@ -971,15 +987,24 @@ async fn typed_store_reads_and_single_lookup_golden_fixtures() {
 
     // Sync reader agrees with async reader
     assert_eq!(
-        store.read_chat_messages_now("u1".into(), Some(20_500), 100).unwrap(),
-        store.messages_chat("u1".into(), Some(20_500), 100).await.unwrap()
+        store
+            .read_chat_messages_now("u1".into(), Some(20_500), 100)
+            .unwrap(),
+        store
+            .messages_chat("u1".into(), Some(20_500), 100)
+            .await
+            .unwrap()
     );
     assert_eq!(
         store.read_chat_messages_now("u1".into(), None, 5).unwrap(),
         store.messages_chat("u1".into(), None, 5).await.unwrap()
     );
     assert_eq!(
-        store.search_messages_chat("u1".into(), "xin".into(), 10).await.unwrap().len(),
+        store
+            .search_messages_chat("u1".into(), "xin".into(), 10)
+            .await
+            .unwrap()
+            .len(),
         1
     );
     let around = store
@@ -992,10 +1017,17 @@ async fn typed_store_reads_and_single_lookup_golden_fixtures() {
     let dir2 = tempfile::tempdir().unwrap();
     let store2 = CoreStore::open(dir2.path().join("t2.db").to_string_lossy().into_owned()).unwrap();
     store2
-        .save_chat_messages(all.iter().map(|r| r.message.clone()).collect(), false, false)
+        .save_chat_messages(
+            all.iter().map(|r| r.message.clone()).collect(),
+            false,
+            false,
+        )
         .await
         .unwrap();
-    assert_eq!(store2.messages_chat("u1".into(), None, 100).await.unwrap(), all);
+    assert_eq!(
+        store2.messages_chat("u1".into(), None, 100).await.unwrap(),
+        all
+    );
 
     // Every non-corrupt row resolves by server id and client id; 2025 corrupt and misses return None
     let mut found = 0usize;
@@ -1013,14 +1045,29 @@ async fn typed_store_reads_and_single_lookup_golden_fixtures() {
         }
     }
     assert!(found > 40);
-    assert!(store.message_chat("u1".into(), "missing".into()).await.unwrap().is_none());
-    assert!(store.message_chat("other".into(), "2001".into()).await.unwrap().is_none());
+    assert!(
+        store
+            .message_chat("u1".into(), "missing".into())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .message_chat("other".into(), "2001".into())
+            .await
+            .unwrap()
+            .is_none()
+    );
     let fallback = store
         .message_chat("u1".into(), "colcli".into())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!((fallback.row_id.as_str(), fallback.row_client_id.as_str()), ("2026", "colcli"));
+    assert_eq!(
+        (fallback.row_id.as_str(), fallback.row_client_id.as_str()),
+        ("2026", "colcli")
+    );
 }
 
 #[test]

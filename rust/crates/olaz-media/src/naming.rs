@@ -190,7 +190,10 @@ mod tests {
         // Exact URLs from Swift `RustMediaTests.stableHashAndFileNamesMatchSwift`.
         assert_eq!(
             cached_file_name("https://res-zalo.zadn.vn/upload/x.json", "json"),
-            format!("{}.json", stable_hash("https://res-zalo.zadn.vn/upload/x.json"))
+            format!(
+                "{}.json",
+                stable_hash("https://res-zalo.zadn.vn/upload/x.json")
+            )
         );
         assert_eq!(
             cached_file_name("https://a.zdn.vn/p/pic.jpeg?x=1", "jpeg"),
@@ -201,8 +204,14 @@ mod tests {
             stable_hash("https://a.zdn.vn/noext")
         );
         assert_eq!(
-            cached_file_name("https://a.zdn.vn/a.verylongextension99", "verylongextension99"),
-            format!("{}.verylong", stable_hash("https://a.zdn.vn/a.verylongextension99"))
+            cached_file_name(
+                "https://a.zdn.vn/a.verylongextension99",
+                "verylongextension99"
+            ),
+            format!(
+                "{}.verylong",
+                stable_hash("https://a.zdn.vn/a.verylongextension99")
+            )
         );
         assert_eq!(
             cached_file_name("https://a.zdn.vn/x.jxl?jxlstatus=1", "jxl"),
