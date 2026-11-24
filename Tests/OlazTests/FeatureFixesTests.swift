@@ -1730,3 +1730,32 @@ private final class MockReactionURLProtocol: URLProtocol, @unchecked Sendable {
         #expect(engine.messages["g900"]?.first?.reactions.first?.names == ["Hùng"])
     }
 }
+
+@Suite struct BatchMergeTests {
+    private func msg(_ id: String, _ ts: TimeInterval, clientId: String = "") -> ChatMessage {
+        ChatMessage(id: id, conversationId: "300", senderId: "300", senderName: "Lan", senderAvatar: nil, isMine: false,
+                    kind: .text, text: id, date: Date(timeIntervalSince1970: ts), status: .sent, quote: nil, reactions: [],
+                    isE2EE: false, clientId: clientId)
+    }
+
+    /// A jump to an old pin merges thousands of rows in one write: sorted, no duplicates, rows already shown kept.
+    @Test @MainActor func batchMergeSortsAndSkipsKnownRows() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-batch-merge-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let engine = ZaloEngine(dataDirectory: root, useKeychain: false)
+
+        engine.messages["300"] = [msg("9000", 9000, clientId: "c9000")]
+        var rows: [(message: ChatMessage, clientId: String?)] = (0..<3000).reversed().map { i in
+            (message: msg(String(1000 + i), TimeInterval(1000 + i)), clientId: nil)
+        }
+        rows.append((message: msg("9000", 9000, clientId: "c9000"), clientId: "c9000"))
+        engine.mergeMessagesIntoMemory(rows, in: "300")
+
+        let list = try #require(engine.messages["300"])
+        #expect(list.count == 3001)
+        #expect(list.first?.id == "1000")
+        #expect(list.last?.id == "9000")
+        #expect(zip(list, list.dropFirst()).allSatisfy { $0.date <= $1.date })
+    }
+}

@@ -1590,7 +1590,8 @@ final class ZaloEngine {
         return ("", nil, 0)
     }
 
-    internal func mergeMessageIntoMemory(_ rawMsg: ChatMessage, replacingClientId clientId: String? = nil) {
+    /// The sender's current name / avatar from the contact caches, for a message about to enter memory.
+    private func withKnownSender(_ rawMsg: ChatMessage) -> ChatMessage {
         var msg = rawMsg
         if !msg.isMine, !msg.senderId.isEmpty, msg.senderId != "0",
            let info = lookupPersonInfo(msg.senderId) {
@@ -1601,6 +1602,45 @@ final class ZaloEngine {
                 msg.senderAvatar = url
             }
         }
+        return msg
+    }
+
+    /// Many messages of one chat at once (a jump to an old pin / search match loads up to thousands): one write and one
+    /// sort, instead of `mergeMessageIntoMemory` per row (an array copy, a sort and an observer invalidation each, which
+    /// froze the main thread). Rows that may replace or match a row already in memory still go through the single merge.
+    internal func mergeMessagesIntoMemory(_ rows: [(message: ChatMessage, clientId: String?)], in convId: String) {
+        var known = Set<String>()
+        for m in messages[convId] ?? [] {
+            known.insert(m.id)
+            if !m.clientId.isEmpty { known.insert(m.clientId) }
+        }
+        var fresh: [ChatMessage] = []
+        var colliding: [(message: ChatMessage, clientId: String?)] = []
+        fresh.reserveCapacity(rows.count)
+        for row in rows {
+            let m = row.message
+            let keys = [m.id, m.clientId, row.clientId ?? ""].filter { !$0.isEmpty }
+            if m.conversationId != convId || keys.contains(where: known.contains) {
+                colliding.append(row)
+                continue
+            }
+            known.formUnion(keys)
+            fresh.append(withKnownSender(m))
+        }
+        if !fresh.isEmpty {
+            var list = messages[convId] ?? []
+            list.append(contentsOf: fresh)
+            list.sort { a, b in
+                if a.date != b.date { return a.date < b.date }
+                return a.id < b.id
+            }
+            messages[convId] = list
+        }
+        for row in colliding { mergeMessageIntoMemory(row.message, replacingClientId: row.clientId) }
+    }
+
+    internal func mergeMessageIntoMemory(_ rawMsg: ChatMessage, replacingClientId clientId: String? = nil) {
+        var msg = withKnownSender(rawMsg)
         var list = messages[msg.conversationId] ?? []
         let originalCount = list.count
         let incomingIsLockedPlaceholder: Bool = {

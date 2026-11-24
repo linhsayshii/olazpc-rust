@@ -126,10 +126,11 @@ extension ZaloEngine {
                     .filter { $0.conversationId == convId }
                     .map(\.id)
             )
-            for row in window.rows {
-                if pendingDeletedIds.contains(row.rowId) { continue }
-                mergeMessageIntoMemory(row.message, replacingClientId: row.rowClientId)
-            }
+            mergeMessagesIntoMemory(
+                window.rows
+                    .filter { !pendingDeletedIds.contains($0.rowId) }
+                    .map { (message: $0.message, clientId: $0.rowClientId) },
+                in: convId)
             if window.hasMoreOlder {
                 hasMoreHistory[convId] = true
             }
