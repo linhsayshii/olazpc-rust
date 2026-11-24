@@ -10,6 +10,8 @@ enum AppBrand {
 enum OlazPrefs {
     /// `OlazAccent.rawValue`.
     static let accent = "olaz.accent"
+    /// Bool, default on: send "đang soạn tin" to the other side.
+    static let sendTyping = "olaz.sendTyping"
     /// `OlazTextSize.rawValue`.
     static let textSize = "olaz.textSize"
     /// `ChatWallpaper.rawValue`.

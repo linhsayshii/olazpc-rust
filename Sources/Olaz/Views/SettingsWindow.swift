@@ -15,7 +15,7 @@ struct SettingsView: View {
                 SettingsPane(height: 440) { NotificationSettingsView() }
             }
             Tab("Quyền riêng tư", systemImage: "lock") {
-                SettingsPane(height: 460) { PrivacySettings() }
+                SettingsPane(height: 600) { PrivacySettings() }
             }
             Tab("Sticker", systemImage: "face.smiling") {
                 SettingsPane(height: 160) { StickerSettingsSection() }
@@ -87,7 +87,27 @@ private struct PrivacySettings: View {
                     .foregroundStyle(.secondary)
             }
         }
+        AccountPrivacySection()
         BlockedUsersSection()
+    }
+}
+
+/// Official privacy toggles: online status and "Đã xem" on the server, the typing indicator here.
+private struct AccountPrivacySection: View {
+    @Environment(ZaloEngine.self) private var engine
+    @AppStorage(OlazPrefs.sendTyping) private var sendTyping = true
+
+    var body: some View {
+        Section("Quyền riêng tư") {
+            ForEach(PrivacyKey.allCases, id: \.self) { key in
+                Toggle(key.title, isOn: Binding(
+                    get: { engine.privacy?[key] ?? true },
+                    set: { value in Task { await engine.setPrivacy(key, on: value) } }))
+                .disabled(engine.privacy == nil)
+            }
+            Toggle("Hiển thị trạng thái đang soạn tin", isOn: $sendTyping)
+        }
+        .task { if engine.privacy == nil { await engine.loadPrivacy() } }
     }
 }
 

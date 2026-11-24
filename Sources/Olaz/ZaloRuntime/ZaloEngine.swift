@@ -77,6 +77,8 @@ final class ZaloEngine {
     var blockedUsers: [BlockedUser]?
     /// "Tin nhắn tự xóa" per conversation (ms); nil until loaded.
     var autoDelete: [String: Int64]?
+    /// Account privacy settings (Cài đặt ▸ Quyền riêng tư); nil until loaded.
+    var privacy: [PrivacyKey: Bool]?
     var hasMoreHistory: [String: Bool] = [:] {
         didSet { hasMoreSignal.changed(from: oldValue, to: hasMoreHistory) }
     }

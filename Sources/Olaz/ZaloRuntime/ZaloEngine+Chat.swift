@@ -886,6 +886,8 @@ extension ZaloEngine {
     func notifyTyping(in convId: String) {
         let target = convId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !target.isEmpty, phase == .ready else { return }
+        // Cài đặt ▸ Quyền riêng tư: "Hiển thị trạng thái đang soạn tin" off sends nothing.
+        guard UserDefaults.standard.object(forKey: OlazPrefs.sendTyping) as? Bool ?? true else { return }
         guard OutgoingTypingStore.throttle(for: self).shouldSend(in: target) else { return }
         let client = sessionClient
         Task {

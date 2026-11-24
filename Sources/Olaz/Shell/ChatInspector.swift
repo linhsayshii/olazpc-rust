@@ -24,6 +24,7 @@ struct ChatInspector: View {
     @State private var memberToBlock: MentionCandidate?
     @State private var showGroupLink = false
     @State private var showApproval = false
+    @State private var showReport = false
     @State private var confirmLeaveGroup = false
     @State private var leavingGroup = false
     @State private var confirmBlock = false
@@ -74,6 +75,7 @@ struct ChatInspector: View {
                 Task { await loadMembers() }
             }
         }
+        .sheet(isPresented: $showReport) { ReportSheet(conversationId: id, name: conversation.displayName) }
         .sheet(isPresented: $showGroupLink) { GroupLinkSheet(groupId: id, canManage: myRoleCanManage) }
         .sheet(isPresented: $showApproval) {
             GroupApprovalSheet(groupId: id, approvalOn: roles.joinApproval) { Task { await loadMembers() } }
@@ -342,7 +344,17 @@ struct ChatInspector: View {
     }
 
     private var autoDeleteSection: some View {
-        section("Thiết lập bảo mật") { list { autoDeleteRow } }
+        section("Thiết lập bảo mật") {
+            list {
+                autoDeleteRow
+                Divider().padding(.leading, 40)
+                reportRow
+            }
+        }
+    }
+
+    private var reportRow: some View {
+        row(symbol: "exclamationmark.triangle", title: "Báo xấu") { showReport = true }
     }
 
     private var securitySection: some View {
@@ -350,6 +362,8 @@ struct ChatInspector: View {
         return section("Thiết lập bảo mật") {
             list {
                 autoDeleteRow
+                Divider().padding(.leading, 40)
+                reportRow
                 Divider().padding(.leading, 40)
                 Button {
                     if blocked {
