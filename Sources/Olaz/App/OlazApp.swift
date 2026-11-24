@@ -53,8 +53,7 @@ struct OlazApp: App {
         Window(AppBrand.name, id: "main") {
             RootView()
                 .olazAppearance(engine: engine, shell: shell)
-                // While the inspector shows, the window may not get narrower than what keeps the chat usable beside it.
-                .frame(minWidth: shell.holdsInspectorRoom ? InspectorRoom.windowMinWidthWithInspector : InspectorRoom.windowMinWidth, minHeight: 620)
+                .modifier(ShellMinimumSize(shell: shell))
                 .task {
                     engine.start()
                     await EngineProbe.runUISmokeIfRequested(engine: engine, shell: shell)
@@ -121,6 +120,17 @@ extension View {
     /// Root styling and environment shared by every window of the app (see `OlazAppearance`).
     func olazAppearance(engine: ZaloEngine, shell: ShellModel) -> some View {
         modifier(OlazAppearance(engine: engine, shell: shell))
+    }
+}
+
+/// While the inspector shows, the window may not get narrower than what keeps the chat usable beside it. Read in a modifier of
+/// its own, not in `OlazApp.body`: there every inspector toggle re-ran the scene and re-placed the whole window and its toolbar.
+private struct ShellMinimumSize: ViewModifier {
+    let shell: ShellModel
+
+    func body(content: Content) -> some View {
+        content.frame(minWidth: shell.holdsInspectorRoom ? InspectorRoom.windowMinWidthWithInspector : InspectorRoom.windowMinWidth,
+                      minHeight: 620)
     }
 }
 

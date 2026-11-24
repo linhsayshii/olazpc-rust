@@ -28,7 +28,7 @@ struct MainShellView: View {
         // On the split view, not inside the chat: inside a column it takes over that column's toolbar section.
         .inspector(isPresented: $shell.showInspector) {
             InspectorColumn()
-                .inspectorColumnWidth(min: 260, ideal: 300, max: 440)
+                .inspectorColumnWidth(min: 260, ideal: InspectorRoom.inspectorWidth, max: 440)
         }
         // Selection and call state are watched by a child view: read here, every chat switch (and the call gate it updates)
         // would re-run this whole body, split view and toolbar included.

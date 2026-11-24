@@ -180,6 +180,7 @@ struct ConversationListColumn: View {
         ConversationTableView(
             entries: entries(listing),
             selection: shell.selection,
+            selectionTint: NSColor(accent.color),
             onSelect: { shell.selection = $0 },
             onActivate: { _ in },
             swipeActions: swipeActions,

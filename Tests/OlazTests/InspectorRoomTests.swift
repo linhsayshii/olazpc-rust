@@ -2,7 +2,7 @@ import CoreGraphics
 import Testing
 @testable import Olaz
 
-/// The window is widened before the inspector opens, so the chat keeps its width instead of being squeezed to a sliver.
+/// Opening the inspector adds its width to the window (the chat keeps its width); closing it gives that width back.
 @MainActor @Suite struct InspectorRoomTests {
     let screen = CGRect(x: 0, y: 0, width: 1800, height: 1100)
 
@@ -12,9 +12,9 @@ import Testing
         #expect(grown == CGRect(x: 420, y: 243, width: 1260, height: 672))
     }
 
-    @Test func aWideEnoughWindowIsLeftAlone() {
-        let window = CGRect(x: 264, y: 151, width: 1368, height: 832)
-        #expect(InspectorRoom.frame(for: window, in: screen) == window)
+    @Test func aWideWindowStillGrowsByTheInspectorWidthOnly() {
+        let window = CGRect(x: 100, y: 151, width: 1368, height: 832)
+        #expect(InspectorRoom.frame(for: window, in: screen) == CGRect(x: 100, y: 151, width: 1668, height: 832))
     }
 
     @Test func growingPastTheScreenEdgeMovesTheWindowLeft() {
@@ -27,5 +27,24 @@ import Testing
         let small = CGRect(x: 0, y: 0, width: 1100, height: 800)
         let grown = InspectorRoom.frame(for: CGRect(x: 50, y: 0, width: 960, height: 600), in: small)
         #expect(grown.width == 1100 && grown.minX == 0)
+    }
+
+    @Test func aScreenWideWindowIsLeftAlone() {
+        let window = CGRect(x: 0, y: 0, width: 1800, height: 1000)
+        #expect(InspectorRoom.frame(for: window, in: screen) == window)
+    }
+
+    @Test func closingRestoresTheOriginalFrame() {
+        let window = CGRect(x: 800, y: 100, width: 1100, height: 600)
+        let grown = InspectorRoom.frame(for: window, in: screen)
+        let growth = InspectorRoom.Growth(added: grown.width - window.width, shifted: window.minX - grown.minX)
+        #expect(growth.shifted > 0)
+        #expect(InspectorRoom.restored(grown, undoing: growth) == window)
+    }
+
+    @Test func closingAfterTheUserNarrowedTheWindowStopsAtTheMinimum() {
+        let growth = InspectorRoom.Growth(added: 300, shifted: 0)
+        let narrowed = CGRect(x: 10, y: 0, width: 1100, height: 600)
+        #expect(InspectorRoom.restored(narrowed, undoing: growth) == CGRect(x: 10, y: 0, width: 960, height: 600))
     }
 }

@@ -224,6 +224,7 @@ enum PerfProbe {
                     try? await Task.sleep(for: .milliseconds(600))
                     clock.onFrame = nil
                     if round == 0 { log("  columns " + columns.joined(separator: " | ")) }
+                    log(String(format: "  window %.0f wide, inspector=%@", shell.window?.frame.width ?? 0, shell.showInspector ? "on" : "off"))
                     let firstFrameMs = ((clock.stamps.first ?? t0) - t0) * 1000
                     log(frameStats([t0] + clock.stamps, label: String(format: "%@ %@ r%d", conv.isGroup ? "group" : "1-1",
                                                                          opening ? "OPEN " : "CLOSE", round), refresh: link.duration)

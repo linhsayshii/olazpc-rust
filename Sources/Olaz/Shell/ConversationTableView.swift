@@ -59,6 +59,8 @@ struct ConversationRowModel: Equatable {
 struct ConversationTableView: NSViewRepresentable {
     let entries: [ConversationTableEntry]
     let selection: String?
+    /// Fill of the selected line (the Olaz accent).
+    let selectionTint: NSColor
     let onSelect: (String) -> Void
     /// A click on a line that cannot be selected (the stranger box).
     let onActivate: (ConversationTableEntry) -> Void
@@ -77,6 +79,7 @@ struct ConversationTableView: NSViewRepresentable {
         controller.onActivate = onActivate
         controller.swipeActions = swipeActions
         controller.rowContent = rowContent
+        controller.selectionTint = selectionTint
         controller.update(entries: entries, selection: selection, environment: context.environment)
     }
 
@@ -94,11 +97,10 @@ struct ConversationTableView: NSViewRepresentable {
 
 // MARK: - Rows
 
-/// The SwiftUI root of one cell: the row content with the list's environment, and the selected-row prominence.
+/// The SwiftUI root of one cell: the row content with the list's environment.
 private struct ConversationCellRoot: View {
     let content: AnyView
     let environment: EnvironmentValues
-    let prominent: Bool
     let header: Bool
 
     var body: some View {
@@ -106,7 +108,6 @@ private struct ConversationCellRoot: View {
             .padding(.vertical, header ? 0 : 5)
             .frame(maxWidth: .infinity, alignment: .leading)
             .environment(\.self, environment)
-            .environment(\.backgroundProminence, prominent ? .increased : .standard)
     }
 }
 
@@ -117,13 +118,12 @@ private final class ConversationCell: NSView {
     private(set) var entry: ConversationTableEntry?
     private var content = AnyView(EmptyView())
     private var environment = EnvironmentValues()
-    private var prominent = false
     /// Header lines (pinned tiles, banner buttons) take their own clicks; conversation lines leave them to the table.
     var takesClicks = false
 
     init() {
         host = NSHostingView(rootView: ConversationCellRoot(content: AnyView(EmptyView()), environment: EnvironmentValues(),
-                                                            prominent: false, header: false))
+                                                            header: false))
         host.sizingOptions = []
         super.init(frame: .zero)
         identifier = Self.identifier
@@ -149,36 +149,30 @@ private final class ConversationCell: NSView {
         render()
     }
 
-    func setProminent(_ value: Bool) {
-        guard value != prominent else { return }
-        prominent = value
-        render()
-    }
-
     private func render() {
-        host.rootView = ConversationCellRoot(content: content, environment: environment, prominent: prominent,
+        host.rootView = ConversationCellRoot(content: content, environment: environment,
                                              header: entry?.isHeader ?? false)
     }
 }
 
-/// Draws the separator under conversation lines (inset like the list's, where the text starts) and passes the selection
-/// state on to the cell.
-@MainActor
+/// Draws the separator under conversation lines (inset like the list's, where the text starts) and the selection: a light fill
+/// of the Olaz accent (Cài đặt › Màu nhấn), like the official list. The stock selection used the macOS accent while the list had
+/// focus and turned grey the moment the chat took it; this one looks the same either way.
 private final class ConversationRowView: NSTableRowView {
     static let identifier = NSUserInterfaceItemIdentifier("conversation-row")
     var drawsSeparatorLine = false
     static let separatorLeading: CGFloat = 64
-
-    override var isSelected: Bool { didSet { updateCell() } }
-    override var isEmphasized: Bool { didSet { updateCell() } }
-
-    private func updateCell() {
-        (subviews.first { $0 is ConversationCell } as? ConversationCell)?.setProminent(isSelected && isEmphasized)
+    var selectionTint: NSColor = .controlAccentColor {
+        didSet { if isSelected, selectionTint != oldValue { needsDisplay = true } }
     }
 
-    override func didAddSubview(_ subview: NSView) {
-        super.didAddSubview(subview)
-        updateCell()
+    override func drawSelection(in dirtyRect: NSRect) {
+        let isDark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        // The cell starts where the avatar does: the fill keeps a margin around it, the same on both sides of the row.
+        let cellX = subviews.first { $0 is ConversationCell }?.frame.minX ?? 10
+        let rect = bounds.insetBy(dx: max(4, cellX - 8), dy: 1)
+        selectionTint.withAlphaComponent(isDark ? 0.30 : 0.16).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8).fill()
     }
 
     override func drawBackground(in dirtyRect: NSRect) {
@@ -205,6 +199,12 @@ final class ConversationTableController: NSObject, NSTableViewDataSource, NSTabl
     var onActivate: (ConversationTableEntry) -> Void = { _ in }
     var swipeActions: (String, NSTableView.RowActionEdge) -> [NSTableViewRowAction] = { _, _ in [] }
     var rowContent: (ConversationTableEntry) -> AnyView = { _ in AnyView(EmptyView()) }
+    var selectionTint: NSColor = .controlAccentColor {
+        didSet {
+            guard selectionTint != oldValue else { return }
+            tableView.enumerateAvailableRowViews { view, _ in (view as? ConversationRowView)?.selectionTint = selectionTint }
+        }
+    }
 
     private(set) var entries: [ConversationTableEntry] = []
     private var environment = EnvironmentValues()
@@ -214,7 +214,7 @@ final class ConversationTableController: NSObject, NSTableViewDataSource, NSTabl
     private var measuredWidth: CGFloat = 0
     private var applyingSelection = false
     private let sizer = NSHostingController(rootView: ConversationCellRoot(content: AnyView(EmptyView()),
-                                                                         environment: EnvironmentValues(), prominent: false, header: false))
+                                                                         environment: EnvironmentValues(), header: false))
 
     override init() {
         super.init()
@@ -273,10 +273,16 @@ final class ConversationTableController: NSObject, NSTableViewDataSource, NSTabl
         if envChanged {
             heightsChanged = IndexSet(integersIn: 0..<entries.count)
         } else {
-            for (row, entry) in entries.enumerated() where entry.refreshesAlways { heightsChanged.insert(row) }
+            // Header lines are measured again, but the table only hears of the ones whose height really changed: noting any row
+            // makes it recompute the offsets of all ~700 rows (≈16 ms), and SwiftUI calls this update several times for
+            // changes that never touch the list (the inspector opening, the window resizing).
+            for (row, entry) in entries.enumerated() where entry.refreshesAlways {
+                let before = headerHeights[entry.id]
+                headerHeights[entry.id] = nil
+                if height(of: entry) != before { heightsChanged.insert(row) }
+            }
         }
         if !heightsChanged.isEmpty {
-            for row in heightsChanged where entries[row].refreshesAlways { headerHeights[entries[row].id] = nil }
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0
                 tableView.noteHeightOfRows(withIndexesChanged: heightsChanged)
@@ -352,7 +358,7 @@ final class ConversationTableController: NSObject, NSTableViewDataSource, NSTabl
     }
 
     private func measure(_ entry: ConversationTableEntry, width: CGFloat) -> CGFloat {
-        sizer.rootView = ConversationCellRoot(content: rowContent(entry), environment: environment, prominent: false,
+        sizer.rootView = ConversationCellRoot(content: rowContent(entry), environment: environment,
                                               header: entry.isHeader)
         let size = sizer.sizeThatFits(in: CGSize(width: width, height: 10_000))
         return max(1, ceil(size.height))
@@ -382,6 +388,7 @@ final class ConversationTableController: NSObject, NSTableViewDataSource, NSTabl
         if row < entries.count, case .conversation = entries[row] { separator = true }
         if row < entries.count, case .strangerBox = entries[row] { separator = true }
         view.drawsSeparatorLine = separator
+        view.selectionTint = selectionTint
         view.needsDisplay = true
         return view
     }
