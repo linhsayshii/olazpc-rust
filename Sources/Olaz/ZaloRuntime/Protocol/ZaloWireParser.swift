@@ -891,6 +891,8 @@ enum ZaloWireParser {
             canonical["undecryptedE2EE"] = true
         }
         if let quoteDict { canonical["quote"] = quoteDict }
+        // "Tin nhắn tự xóa": the message's lifetime (ms) from its timestamp.
+        if let ttl = JSONLossless.int64(raw["ttl"]), ttl > 0 { canonical["ttl"] = ttl }
         // Rich text (`action: rtf`): the official `params.styles` ranges over the text.
         if kindTag == "text" {
             let styles = TextStyle.list(json: contentParams?["styles"])
@@ -1050,6 +1052,7 @@ enum ZaloWireParser {
             "menu": menuDict
         ]
         if !msg.textStyles.isEmpty { canonical["styles"] = msg.textStyles.map(\.json) }
+        if msg.ttlMs > 0 { canonical["ttl"] = msg.ttlMs }
         if let quote = msg.quote {
             canonical["quote"] = ["senderName": quote.senderName, "text": quote.text]
         }

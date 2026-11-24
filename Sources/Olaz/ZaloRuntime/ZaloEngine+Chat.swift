@@ -335,6 +335,9 @@ extension ZaloEngine {
         )
         // Rich text goes out on the plain path only (E2EE text is sent unstyled).
         if !isE2EE { optimistic.textStyles = styles }
+        // "Tin nhắn tự xóa": the conversation's lifetime rides on the message.
+        let ttl = isE2EE ? 0 : autoDeleteTTL(id)
+        optimistic.ttlMs = ttl
         mergeMessageIntoMemory(optimistic)
 
         func removeOptimistic() {
@@ -439,7 +442,8 @@ extension ZaloEngine {
                     quoteText: quote?.text,
                     quoteTsMs: quoteTsMs,
                     mentions: mentions,
-                    textProperties: TextStyle.textProperties(styles)
+                    textProperties: TextStyle.textProperties(styles),
+                    ttl: ttl
                 )
             }
             // Replace temporary client id with server msgId while avoiding duplicates.

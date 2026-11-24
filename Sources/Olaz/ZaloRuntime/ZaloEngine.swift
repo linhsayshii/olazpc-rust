@@ -75,6 +75,8 @@ final class ZaloEngine {
     }
     /// Accounts I blocked (messages and calls), from `/api/friend/blocklistv2`; nil until loaded.
     var blockedUsers: [BlockedUser]?
+    /// "Tin nhắn tự xóa" per conversation (ms); nil until loaded.
+    var autoDelete: [String: Int64]?
     var hasMoreHistory: [String: Bool] = [:] {
         didSet { hasMoreSignal.changed(from: oldValue, to: hasMoreHistory) }
     }

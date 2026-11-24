@@ -34,7 +34,8 @@ extension ChatMessage {
             menu: MessageMenu(record: r.menu),
             fallbackURLs: r.fallbackUrls.compactMap { URL(string: $0) },
             clientId: r.clientId,
-            textStyles: r.textStyles.map { TextStyle(start: Int($0.start), len: Int($0.len), st: $0.st) }
+            textStyles: r.textStyles.map { TextStyle(start: Int($0.start), len: Int($0.len), st: $0.st) },
+            ttlMs: r.ttlMs
         )
     }
 }
@@ -228,6 +229,7 @@ extension ChatMessageRecord {
             cardButtons: m.cardButtons.map { CardButtonRecord(reference: $0.ref, label: $0.label, enabled: $0.enabled, help: $0.help) },
             suggestsStickers: m.suggestsStickers, menu: m.menu.record, fallbackUrls: m.fallbackURLs.map(\.absoluteString),
             clientId: m.clientId,
-            textStyles: m.textStyles.map { TextStyleRecord(start: Int64($0.start), len: Int64($0.len), st: $0.st) })
+            textStyles: m.textStyles.map { TextStyleRecord(start: Int64($0.start), len: Int64($0.len), st: $0.st) },
+            ttlMs: m.ttlMs)
     }
 }

@@ -5387,10 +5387,11 @@ public struct ChatMessageRecord: Equatable, Hashable {
     public var fallbackUrls: [String]
     public var clientId: String
     public var textStyles: [TextStyleRecord]
+    public var ttlMs: Int64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: String, conversationId: String, senderId: String, senderName: String, senderAvatar: String?, isMine: Bool, kind: KindRecord, text: String, dateMs: Int64, status: StatusRecord, quote: QuoteRecord?, reactions: [ReactionRecord], isE2ee: Bool, mentions: [MessageMention], cardButtons: [CardButtonRecord], suggestsStickers: Bool, menu: MenuRecord, fallbackUrls: [String], clientId: String, textStyles: [TextStyleRecord]) {
+    public init(id: String, conversationId: String, senderId: String, senderName: String, senderAvatar: String?, isMine: Bool, kind: KindRecord, text: String, dateMs: Int64, status: StatusRecord, quote: QuoteRecord?, reactions: [ReactionRecord], isE2ee: Bool, mentions: [MessageMention], cardButtons: [CardButtonRecord], suggestsStickers: Bool, menu: MenuRecord, fallbackUrls: [String], clientId: String, textStyles: [TextStyleRecord], ttlMs: Int64) {
         self.id = id
         self.conversationId = conversationId
         self.senderId = senderId
@@ -5411,6 +5412,7 @@ public struct ChatMessageRecord: Equatable, Hashable {
         self.fallbackUrls = fallbackUrls
         self.clientId = clientId
         self.textStyles = textStyles
+        self.ttlMs = ttlMs
     }
 
     
@@ -5448,7 +5450,8 @@ public struct FfiConverterTypeChatMessageRecord: FfiConverterRustBuffer {
                 menu: FfiConverterTypeMenuRecord.read(from: &buf), 
                 fallbackUrls: FfiConverterSequenceString.read(from: &buf), 
                 clientId: FfiConverterString.read(from: &buf), 
-                textStyles: FfiConverterSequenceTypeTextStyleRecord.read(from: &buf)
+                textStyles: FfiConverterSequenceTypeTextStyleRecord.read(from: &buf), 
+                ttlMs: FfiConverterInt64.read(from: &buf)
         )
     }
 
@@ -5473,6 +5476,7 @@ public struct FfiConverterTypeChatMessageRecord: FfiConverterRustBuffer {
         FfiConverterSequenceString.write(value.fallbackUrls, into: &buf)
         FfiConverterString.write(value.clientId, into: &buf)
         FfiConverterSequenceTypeTextStyleRecord.write(value.textStyles, into: &buf)
+        FfiConverterInt64.write(value.ttlMs, into: &buf)
     }
 }
 
@@ -8073,10 +8077,11 @@ public struct SendTextRecord: Equatable, Hashable {
     public var quoteTsMs: Int64?
     public var mentions: [MentionRecord]
     public var textProperties: String?
+    public var ttl: Int64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(convId: String, text: String, cliMsgId: String = "", quoteMsgId: String? = nil, quoteCliMsgId: String? = nil, quoteOwnerId: String? = nil, quoteText: String? = nil, quoteTsMs: Int64? = nil, mentions: [MentionRecord] = [], textProperties: String? = nil) {
+    public init(convId: String, text: String, cliMsgId: String = "", quoteMsgId: String? = nil, quoteCliMsgId: String? = nil, quoteOwnerId: String? = nil, quoteText: String? = nil, quoteTsMs: Int64? = nil, mentions: [MentionRecord] = [], textProperties: String? = nil, ttl: Int64 = Int64(0)) {
         self.convId = convId
         self.text = text
         self.cliMsgId = cliMsgId
@@ -8087,6 +8092,7 @@ public struct SendTextRecord: Equatable, Hashable {
         self.quoteTsMs = quoteTsMs
         self.mentions = mentions
         self.textProperties = textProperties
+        self.ttl = ttl
     }
 
     
@@ -8114,7 +8120,8 @@ public struct FfiConverterTypeSendTextRecord: FfiConverterRustBuffer {
                 quoteText: FfiConverterOptionString.read(from: &buf), 
                 quoteTsMs: FfiConverterOptionInt64.read(from: &buf), 
                 mentions: FfiConverterSequenceTypeMentionRecord.read(from: &buf), 
-                textProperties: FfiConverterOptionString.read(from: &buf)
+                textProperties: FfiConverterOptionString.read(from: &buf), 
+                ttl: FfiConverterInt64.read(from: &buf)
         )
     }
 
@@ -8129,6 +8136,7 @@ public struct FfiConverterTypeSendTextRecord: FfiConverterRustBuffer {
         FfiConverterOptionInt64.write(value.quoteTsMs, into: &buf)
         FfiConverterSequenceTypeMentionRecord.write(value.mentions, into: &buf)
         FfiConverterOptionString.write(value.textProperties, into: &buf)
+        FfiConverterInt64.write(value.ttl, into: &buf)
     }
 }
 

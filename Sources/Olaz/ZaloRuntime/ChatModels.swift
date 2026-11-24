@@ -313,6 +313,11 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
     var clientId: String = ""
     /// Rich text (official `textProperties.styles`): styled UTF-16 ranges of `text`; empty for plain text.
     var textStyles: [TextStyle] = []
+    /// "Tin nhắn tự xóa": lifetime in milliseconds from `date` (0 = kept).
+    var ttlMs: Int64 = 0
+
+    /// When a self-deleting message disappears.
+    var expiresAt: Date? { ttlMs > 0 ? date.addingTimeInterval(Double(ttlMs) / 1000) : nil }
 }
 
 /// The items of the official message context menu (message-actions-adapter.js `describe`, the builder's own conditions) with the
@@ -448,7 +453,8 @@ extension ChatMessage {
             menu: MessageMenu(json: json["menu"]),
             fallbackURLs: fallbacks,
             clientId: (json["clientId"] as? String) ?? (json["cliMsgId"] as? String) ?? "",
-            textStyles: TextStyle.list(json: json["styles"])
+            textStyles: TextStyle.list(json: json["styles"]),
+            ttlMs: max(0, (json["ttl"] as? NSNumber)?.int64Value ?? 0)
         )
     }
 }

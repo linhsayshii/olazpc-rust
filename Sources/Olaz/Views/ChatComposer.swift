@@ -210,7 +210,7 @@ struct ChatComposer: View {
                 .frame(height: textHeight)
                 .overlay(alignment: .topLeading) {
                     if draft.isEmpty {
-                        Text("Tin nhắn tới \(name)")
+                        Text(engine.autoDeleteTTL(conversationId) > 0 ? "Nhập tin nhắn tự xóa gửi đến \(name)" : "Tin nhắn tới \(name)")
                             .font(.system(size: 14))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)

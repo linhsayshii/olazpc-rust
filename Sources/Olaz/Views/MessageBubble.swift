@@ -236,6 +236,7 @@ struct MessageRow: View {
                         .padding(.leading, hasWallpaper ? 4 : 12)
                 }
                 bubbleStack
+                if let expires = message.expiresAt { ttlLine(expires) }
                 if mine && showStatus { statusLine }
             }
             .frame(maxWidth: 520, alignment: mine ? .trailing : .leading)
@@ -340,6 +341,17 @@ struct MessageRow: View {
         .buttonStyle(.plain)
         .help(title)
         .accessibilityLabel(title)
+    }
+
+    /// "Tự xóa sau $0$" (official `ttl-timer-message`), refreshed each minute.
+    private func ttlLine(_ expires: Date) -> some View {
+        TimelineView(.periodic(from: .now, by: 60)) { context in
+            Label("Tự xóa sau \(AutoDelete.remaining(expires.timeIntervalSince(context.date)))", systemImage: "timer")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+                .legibleOnWallpaper(hasWallpaper)
+                .padding(.horizontal, 6)
+        }
     }
 
     private var statusLine: some View {

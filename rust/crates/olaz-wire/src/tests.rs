@@ -626,6 +626,7 @@ fn base_message(kind: Kind, text: &str) -> ChatMessage {
         fallback_urls: vec![],
         client_id: "c7001".into(),
         text_styles: vec![],
+        ttl_ms: 0,
     }
 }
 
@@ -1165,4 +1166,21 @@ fn rtf_styles_parse_and_round_trip() {
     let stored = encode_chat_message(&m, "").unwrap();
     let decoded = decode_stored_message(&stored).unwrap();
     assert_eq!(decoded.text_styles, m.text_styles);
+}
+
+/// "Tin nhắn tự xóa": the wire `ttl` (ms) is kept on the message and through the store.
+#[test]
+fn ttl_parse_and_round_trip() {
+    let (m, _) = msg_of(parse(
+        r#"{"msgId":"8701","msgType":"webchat","uidFrom":"peer","idTo":"me","ts":"1000","ttl":86400000,"content":"hẹn"}"#,
+        "me",
+    ));
+    assert_eq!(m.ttl_ms, 86_400_000);
+    let decoded = decode_stored_message(&encode_chat_message(&m, "").unwrap()).unwrap();
+    assert_eq!(decoded.ttl_ms, 86_400_000);
+    let (plain, _) = msg_of(parse(
+        r#"{"msgId":"8702","msgType":"webchat","uidFrom":"peer","idTo":"me","ts":"1","ttl":0,"content":"x"}"#,
+        "me",
+    ));
+    assert_eq!(plain.ttl_ms, 0);
 }

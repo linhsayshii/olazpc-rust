@@ -415,6 +415,8 @@ pub struct ChatMessage {
     pub client_id: String,
     /// Rich-text styles of a text message (empty for plain text).
     pub text_styles: Vec<TextStyle>,
+    /// "Tin nhắn tự xóa": lifetime in milliseconds from `date_ms` (0 = kept).
+    pub ttl_ms: i64,
 }
 
 /// Row of the SQLite message table (`StoredMessage`).
@@ -835,6 +837,7 @@ impl ChatMessage {
                 .unwrap_or("")
                 .to_string(),
             text_styles: TextStyle::list(json.get("styles")),
+            ttl_ms: round_i64(ns_double(json.get("ttl")).unwrap_or(0.0)).max(0),
         })
     }
 }

@@ -956,7 +956,8 @@ extension ZaloSessionClient {
         quoteText: String? = nil,
         quoteTsMs: Int64? = nil,
         mentions: [Mention] = [],
-        textProperties: String? = nil
+        textProperties: String? = nil,
+        ttl: Int64 = 0
     ) async throws -> SendMessageResult {
         if let core = coreApi() {
             do {
@@ -964,7 +965,7 @@ extension ZaloSessionClient {
                     convId: convId, text: text, cliMsgId: cliMsgId, quoteMsgId: quoteMsgId, quoteCliMsgId: quoteCliMsgId,
                     quoteOwnerId: quoteOwnerId, quoteText: quoteText, quoteTsMs: quoteTsMs,
                     mentions: mentions.map { MentionRecord(uid: $0.uid, pos: Int64($0.pos), len: Int64($0.len), isAll: $0.isAll) },
-                    textProperties: textProperties))
+                    textProperties: textProperties, ttl: ttl))
                 return SendMessageResult(msgId: r.msgId, cliMsgId: r.cliMsgId, tsMs: r.tsMs)
             } catch { throw RustCore.mapError(error) }
         }
@@ -990,7 +991,7 @@ extension ZaloSessionClient {
                 "message": text,
                 "clientId": cliInt,
                 "imei": imei,
-                "ttl": 0
+                "ttl": ttl
             ]
             if let textProperties { payload["textProperties"] = textProperties }
             if isGroup {
@@ -1015,7 +1016,7 @@ extension ZaloSessionClient {
                 "qmsgType": 1,
                 "qmsg": quoteText ?? "",
                 "qmsgTs": quoteTsMs ?? Int64(Date().timeIntervalSince1970 * 1000),
-                "ttl": 0,
+                "ttl": ttl,
                 "zsource": 101,
                 "imei": imei
             ]

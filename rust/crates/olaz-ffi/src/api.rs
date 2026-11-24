@@ -67,6 +67,8 @@ pub struct SendTextRecord {
     pub mentions: Vec<MentionRecord>,
     #[uniffi(default = None)]
     pub text_properties: Option<String>,
+    #[uniffi(default = 0)]
+    pub ttl: i64,
 }
 
 /// One long-poll queue cursor.
@@ -357,6 +359,7 @@ impl CoreApi {
                 quote_ts_ms: args.quote_ts_ms,
                 mentions: &mentions,
                 text_properties: args.text_properties.as_deref(),
+                ttl: args.ttl,
             })
             .await
         })

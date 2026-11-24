@@ -36,6 +36,8 @@ pub struct SendTextArgs<'a> {
     pub mentions: &'a [Mention],
     /// Rich text: the official `textProperties` JSON (`{"styles":[…],"ver":0}`), sent with the message as is.
     pub text_properties: Option<&'a str>,
+    /// "Tin nhắn tự xóa": lifetime in ms (0 = kept), the conversation's setting.
+    pub ttl: i64,
 }
 
 fn mention_info(mentions: &[Mention]) -> Value {
@@ -244,7 +246,7 @@ impl<T: Transport> ZaloApi<T> {
                 "qmsgType": 1,
                 "qmsg": a.quote_text.unwrap_or(""),
                 "qmsgTs": q_ts,
-                "ttl": 0,
+                "ttl": a.ttl,
                 "zsource": 101,
                 "imei": imei,
             });
@@ -280,7 +282,7 @@ impl<T: Transport> ZaloApi<T> {
                     "message": a.text,
                     "clientId": cli_int,
                     "imei": imei,
-                    "ttl": 0,
+                    "ttl": a.ttl,
                 });
                 if let Some(tp) = a.text_properties.filter(|t| !t.is_empty()) {
                     insert(&mut payload, "textProperties", Value::from(tp));

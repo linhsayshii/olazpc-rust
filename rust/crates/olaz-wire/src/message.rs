@@ -1156,6 +1156,10 @@ pub fn parse_wire_message(
     if let Some(q) = quote {
         canonical.insert("quote".into(), q);
     }
+    // "Tin nhắn tự xóa": the message's lifetime (ms) from its timestamp.
+    if let Some(ttl) = int64(raw.get("ttl")).filter(|t| *t > 0) {
+        canonical.insert("ttl".into(), Value::from(ttl));
+    }
     // Rich text (`action: rtf`): the official `params.styles` ranges over the text.
     if kind_tag == "text" {
         let styles = TextStyle::list(dd.p("styles"));

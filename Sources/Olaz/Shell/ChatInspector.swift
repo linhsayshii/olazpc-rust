@@ -132,6 +132,7 @@ struct ChatInspector: View {
                 filesSection(preview(.files, loaded))
                 linksSection(preview(.links, loaded))
                 if conversation.isGroup {
+                    autoDeleteSection
                     leaveGroupSection
                 } else if id != engine.selfConversationId {
                     securitySection
@@ -264,10 +265,49 @@ struct ChatInspector: View {
     }
 
     /// 1-1 "Thiết lập bảo mật": block / unblock messages and calls (official `setBlockFriend`).
+    /// "Tin nhắn tự xóa" (official `STR_VANISH_MSGS`): the lifetime of new messages in this conversation.
+    private var autoDeleteRow: some View {
+        let ttl = engine.autoDeleteTTL(id)
+        return Menu {
+            ForEach(AutoDelete.options, id: \.ttl) { option in
+                Button {
+                    Task { await engine.setAutoDelete(id, ttl: option.ttl) }
+                } label: {
+                    if option.ttl == ttl { Label(option.label, systemImage: "checkmark") } else { Text(option.label) }
+                }
+            }
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "timer").font(.system(size: 14)).frame(width: 18)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Tin nhắn tự xóa").font(.system(size: 13, weight: .medium))
+                    Text(ttl > 0 ? AutoDelete.label(ttl) : "Không bao giờ").font(.system(size: 11.5)).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .frame(minHeight: 38)
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.button)
+        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
+        .disabled(engine.autoDelete == nil)
+        .help("Tin nhắn sẽ tự xóa sau khoảng thời gian bạn cài đặt")
+        .task(id: id) { if engine.autoDelete == nil { await engine.loadAutoDelete() } }
+    }
+
+    private var autoDeleteSection: some View {
+        section("Thiết lập bảo mật") { list { autoDeleteRow } }
+    }
+
     private var securitySection: some View {
         let blocked = engine.isBlocked(id)
         return section("Thiết lập bảo mật") {
             list {
+                autoDeleteRow
+                Divider().padding(.leading, 40)
                 Button {
                     if blocked {
                         Task { blockBusy = true; await engine.setBlocked(id, blocked: false); blockBusy = false }

@@ -115,6 +115,15 @@ struct ChatView: View {
         .task(id: id) {
             if !conversation.isGroup, engine.blockedUsers == nil { await engine.loadBlockedUsers() }
         }
+        .task(id: id) {
+            // "Tin nhắn tự xóa": the setting for the composer, then messages leave the chat when their time is over.
+            if engine.autoDelete == nil { await engine.loadAutoDelete() }
+            while !Task.isCancelled {
+                let next = engine.pruneExpiredMessages(in: id)
+                let wait = min(60, max(1, next.map { $0.timeIntervalSinceNow + 0.5 } ?? 60))
+                try? await Task.sleep(for: .seconds(wait))
+            }
+        }
         .onChange(of: id) { _, _ in
             if engine.messageSelection != nil { engine.endSelection() }
         }
