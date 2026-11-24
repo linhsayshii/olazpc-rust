@@ -697,7 +697,7 @@ struct ComposerTextView: NSViewRepresentable {
         let scroll = NSScrollView()
         scroll.drawsBackground = false
         scroll.borderType = .noBorder
-        scroll.hasVerticalScroller = true
+        scroll.hasVerticalScroller = false
         scroll.autohidesScrollers = true
         scroll.hasHorizontalScroller = false
         scroll.documentView = tv
@@ -910,6 +910,12 @@ struct ComposerTextView: NSViewRepresentable {
             let line = ComposerTextView.lineHeight
             let used = lm.usedRect(for: container).height
             let h = min(max(line, ceil(used)), line * ComposerTextView.maxLines)
+            // Scroller only once the text outgrows the max height: a short line must never show a knob
+            // (the text view's inset makes it a hair taller than the field, which would trigger autohide).
+            let overflow = ceil(used) > line * ComposerTextView.maxLines + 0.5
+            if let scroll = tv.enclosingScrollView, scroll.hasVerticalScroller != overflow {
+                scroll.hasVerticalScroller = overflow
+            }
             if abs(parent.height - h) > 0.5 {
                 DispatchQueue.main.async { [weak self] in self?.parent.height = h }
             }
