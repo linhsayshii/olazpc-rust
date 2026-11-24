@@ -2,10 +2,12 @@
 //! Archive, Mute, Polling" sections).
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::time::Duration;
 
-use olaz_json::{int64, string};
-use olaz_net::{ApiRequest, Transport, common_params, domains::normalize_host};
+use olaz_crypto::md5_hex;
+use olaz_json::{bool_value, int64, string};
+use olaz_net::{ApiRequest, NetError, Transport, common_params, domains::normalize_host};
 use olaz_wire::util::{as_dict_array, pick};
 use olaz_wire::{
     clean_group_id, group_conv_id, is_group_id, normalize_thread_id_from_list, strip_user_prefix,
@@ -23,6 +25,64 @@ pub struct PollOutcome {
     pub response: JsonObject,
     pub next_state: PollState,
     pub more: bool,
+}
+
+/// Server snapshot returned by [`ZaloApi::fetch_hidden_conversations`] (Swift
+/// `HiddenConversationsSnapshot`).
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct HiddenConversationsSnapshot {
+    /// Lowercase MD5 hex of the hidden-chat PIN, or empty when no PIN is configured.
+    pub pin: String,
+    /// Normalized conversation IDs (deduplicated, preserving server order).
+    pub thread_ids: Vec<String>,
+}
+
+impl fmt::Debug for HiddenConversationsSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HiddenConversationsSnapshot")
+            .field("has_pin", &!self.pin.is_empty())
+            .field("thread_count", &self.thread_ids.len())
+            .finish()
+    }
+}
+
+/// Parses a `/api/hiddenconvers/get-all` response (Swift `parseHiddenConversationsResponse`).
+#[must_use]
+pub fn parse_hidden_conversations_response(resp: &JsonObject) -> HiddenConversationsSnapshot {
+    let data_node = match resp.get("data") {
+        Some(Value::Object(d)) => d,
+        _ => resp,
+    };
+    let pin = string(data_node.get("pin")).trim().to_ascii_lowercase();
+    let raw_threads = as_dict_array(data_node.get("threads")).unwrap_or_default();
+
+    let mut seen = HashSet::with_capacity(raw_threads.len());
+    let mut normalized_ids = Vec::with_capacity(raw_threads.len());
+
+    for row in raw_threads {
+        let raw_id = string(pick(row, &["thread_id", "threadId"]));
+        if raw_id.is_empty() {
+            continue;
+        }
+        let is_group_val = pick(row, &["is_group", "isGroup"]);
+        let is_group = bool_value(is_group_val).unwrap_or_else(|| int64(is_group_val) == Some(1));
+        let normalized = if is_group {
+            group_conv_id(&raw_id)
+        } else {
+            strip_user_prefix(&raw_id)
+        };
+        if normalized.is_empty() || normalized == "0" || normalized == "g0" {
+            continue;
+        }
+        if seen.insert(normalized.clone()) {
+            normalized_ids.push(normalized);
+        }
+    }
+
+    HiddenConversationsSnapshot {
+        pin,
+        thread_ids: normalized_ids,
+    }
 }
 
 impl<T: Transport> ZaloApi<T> {
@@ -150,7 +210,7 @@ impl<T: Transport> ZaloApi<T> {
         let lp_chat = self.client().domains().lp_chat;
         let base = normalize_host(&lp_chat);
         if base.is_empty() {
-            return Err(olaz_net::NetError::InvalidUrl(lp_chat).into());
+            return Err(NetError::InvalidUrl(lp_chat).into());
         }
         let url = format!(
             "{base}/?{}&params={}&ts={ts}",
@@ -199,6 +259,28 @@ impl<T: Transport> ZaloApi<T> {
             .collect())
     }
 
+    /// Swift `updatePinnedConversation`.
+    pub async fn update_pinned_conversation(
+        &self,
+        conv_id: &str,
+        pinned: bool,
+    ) -> Result<(), ApiError> {
+        let wire_id = if is_group_id(conv_id) {
+            group_conv_id(conv_id)
+        } else {
+            format!("u{}", strip_user_prefix(conv_id))
+        };
+        self.post(
+            ApiRequest::new("conversation", "/api/pinconvers/updatev2").payload(json!({
+                "actionType": if pinned { 1 } else { 2 },
+                "conversations": [wire_id],
+                "tab": 0,
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Swift `fetchArchivedChats`. Remembers `data.version` (see [`Self::archived_version`]).
     pub async fn fetch_archived_chats(&self) -> Result<Vec<String>, ApiError> {
         let resp = self
@@ -236,6 +318,26 @@ impl<T: Transport> ZaloApi<T> {
         Ok(result)
     }
 
+    /// Swift `updateArchivedChat`.
+    pub async fn update_archived_chat(
+        &self,
+        conv_id: &str,
+        archived: bool,
+    ) -> Result<(), ApiError> {
+        let (is_group, clean_id) = crate::util::conv_target(conv_id);
+        let version = self.state().archived_version;
+        self.post(
+            ApiRequest::new("label", "/api/archivedchat/update").payload(json!({
+                "ids": [{"id": clean_id, "type": if is_group { 1 } else { 0 }}],
+                "version": version,
+                "actionType": if archived { 0 } else { 1 },
+                "imei": self.imei(),
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Swift `fetchConversationLabels`. Remembers `data.version` ([`Self::label_version`]).
     pub async fn fetch_conversation_labels(&self) -> Result<JsonObject, ApiError> {
         let resp = self
@@ -249,6 +351,121 @@ impl<T: Transport> ZaloApi<T> {
             self.state().label_version = ver;
         }
         Ok(d)
+    }
+
+    /// Swift `updateConversationLabels`. Remembers `data.version` when present.
+    pub async fn update_conversation_labels(&self, label_data_json: &str) -> Result<(), ApiError> {
+        let version = self.state().label_version;
+        let resp = self
+            .post(
+                ApiRequest::new("label", "/api/convlabel/update").payload(json!({
+                    "labelData": label_data_json,
+                    "version": version,
+                    "imei": self.imei(),
+                })),
+            )
+            .await?;
+        let d = data_object(&resp);
+        if let Some(ver) = int64(d.get("version")) {
+            self.state().label_version = ver;
+        }
+        Ok(())
+    }
+
+    /// Swift `deleteConversationAPI`.
+    pub async fn delete_conversation(
+        &self,
+        conv_id: &str,
+        last_cli_msg_id: &str,
+    ) -> Result<(), ApiError> {
+        let (is_group, clean_id) = crate::util::conv_target(conv_id);
+        let cli_id = if last_cli_msg_id.is_empty() {
+            self.client().next_client_id().to_string()
+        } else {
+            last_cli_msg_id.to_owned()
+        };
+        if is_group {
+            self.post(
+                ApiRequest::new("group", "/api/group/deleteconver").payload(json!({
+                    "grid": clean_id,
+                    "cliMsgId": cli_id,
+                    "conver": {},
+                    "onlyMe": 1,
+                    "imei": self.imei(),
+                })),
+            )
+            .await?;
+        } else {
+            self.post(
+                ApiRequest::new("chat", "/api/message/deleteconver").payload(json!({
+                    "toid": clean_id,
+                    "cliMsgId": cli_id,
+                    "conver": {},
+                    "onlyMe": 1,
+                    "imei": self.imei(),
+                })),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Swift `fetchHiddenConversationsAPI`.
+    pub async fn fetch_hidden_conversations(
+        &self,
+    ) -> Result<HiddenConversationsSnapshot, ApiError> {
+        let resp = self
+            .get(
+                ApiRequest::new("conversation", "/api/hiddenconvers/get-all")
+                    .payload(json!({"imei": self.imei()})),
+            )
+            .await?;
+        Ok(parse_hidden_conversations_response(&resp))
+    }
+
+    /// Swift `setHiddenConversationAPI`.
+    pub async fn set_hidden_conversation(
+        &self,
+        conv_id: &str,
+        hidden: bool,
+    ) -> Result<(), ApiError> {
+        let (is_group, clean_id) = crate::util::conv_target(conv_id);
+        let entry = json!([{"is_group": if is_group { 1 } else { 0 }, "thread_id": clean_id}]);
+        let entry_str = swift_json(&entry);
+        let (add_str, del_str) = if hidden {
+            (entry_str, "[]".to_owned())
+        } else {
+            ("[]".to_owned(), entry_str)
+        };
+        self.post(
+            ApiRequest::new("conversation", "/api/hiddenconvers/add-remove").payload(json!({
+                "del_threads": del_str,
+                "add_threads": add_str,
+                "imei": self.imei(),
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Swift `updateHiddenPinAPI`.
+    pub async fn update_hidden_pin(&self, pin: &str) -> Result<JsonObject, ApiError> {
+        if pin.is_empty() {
+            return Err(NetError::InvalidUrl("hiddenconvers:update-pin".to_owned()).into());
+        }
+        self.get(
+            ApiRequest::new("conversation", "/api/hiddenconvers/update-pin").payload(json!({
+                "new_pin": md5_hex(pin.as_bytes()),
+                "imei": self.imei(),
+            })),
+        )
+        .await
+    }
+
+    /// Swift `resetHiddenPinAPI`.
+    pub async fn reset_hidden_pin(&self) -> Result<JsonObject, ApiError> {
+        self.get(ApiRequest::new("conversation", "/api/hiddenconvers/reset"))
+            .await
     }
 
     /// Swift `fetchMuteList`: rows tagged `type` 1 (peer) / 2 (group), or the legacy fallbacks.
