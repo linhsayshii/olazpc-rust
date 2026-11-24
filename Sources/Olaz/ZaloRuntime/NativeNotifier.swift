@@ -279,6 +279,8 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
     private static let debugWindowTitle = "Zalo renderer (debug)"
 
     weak var engine: ZaloEngine?
+    /// Opens (or re-creates) the main window after Cmd+W closed it; set by `OlazApp`.
+    var openMainWindow: (() -> Void)?
 
     private var focusObservers: [NSObjectProtocol] = []
     private var sounds: [NSSound] = []
@@ -571,9 +573,12 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     func bringAppToFront() {
         NSApp?.activate()
-        if let window = mainWindow() {
+        if let window = mainWindow(), window.isVisible || window.isMiniaturized {
             if window.isMiniaturized { window.deminiaturize(nil) }
             window.makeKeyAndOrderFront(nil)
+        } else {
+            // Soft-closed (Cmd+W): the app kept running without a window, so bring one back.
+            openMainWindow?()
         }
     }
 

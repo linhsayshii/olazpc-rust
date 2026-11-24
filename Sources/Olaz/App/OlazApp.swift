@@ -23,6 +23,10 @@ final class OlazAppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Soft close: Cmd+W (or the red button) only closes the window. The engine, WebSocket and notifications keep
+    /// running, like the official Zalo PC; Cmd+Q quits. The Dock icon or a notification brings the window back.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
             openMainWindow?()
@@ -43,6 +47,7 @@ struct OlazApp: App {
             let open = openWindow
             let eng = engine
             appDelegate.openMainWindow = { open(id: "main") }
+            NativeNotifier.shared.openMainWindow = { open(id: "main") }
             appDelegate.onLaunch = { eng.start() }
         }()
         Window(AppBrand.name, id: "main") {
