@@ -1221,12 +1221,14 @@ impl Host for RecordingHost {
         self.record("prepare_store", json!({ "user_id": user_id }));
     }
 
-    async fn on_ws_started(&self, endpoints: Vec<String>) {
+    async fn on_ws_started(&self, endpoints: Vec<String>) -> bool {
         self.record("start_ws", json!({ "endpoints": endpoints }));
+        true
     }
 
-    async fn on_long_poll_started(&self) {
+    async fn on_long_poll_started(&self) -> bool {
         self.record("start_long_poll", json!({}));
+        true
     }
 
     async fn start_bootstrap(&self) {

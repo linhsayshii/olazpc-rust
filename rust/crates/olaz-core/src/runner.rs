@@ -313,10 +313,17 @@ pub trait Host: Send + Sync {
     async fn clear_session(&self);
     async fn mark_expired(&self, snapshot_json: String);
 
-    /// Replay trace hook emitted when the core starts WebSocket (no-op in production).
-    async fn on_ws_started(&self, _endpoints: Vec<String>) {}
-    /// Replay trace hook emitted when the core starts the long-poll loop (no-op in production).
-    async fn on_long_poll_started(&self) {}
+    /// Host hook emitted when the core starts WebSocket. Return `false` to suppress connecting
+    /// (used by session/transport recorders when `"ws"` is suppressed). Production returns `true`.
+    async fn on_ws_started(&self, _endpoints: Vec<String>) -> bool {
+        true
+    }
+    /// Host hook emitted when the core starts the long-poll loop. Return `false` to suppress
+    /// periodic ticks (used by session/transport recorders when `"long_poll"` is suppressed).
+    /// Production returns `true`.
+    async fn on_long_poll_started(&self) -> bool {
+        true
+    }
 
     // --- Transport domain callbacks (U2) ---
     async fn persist_poll_state(&self, state: PollState);
@@ -370,11 +377,15 @@ enum HostJob {
         sink: ActorSink,
         _guard: InFlightGuard,
     },
-    TraceStartWs {
-        endpoints: Vec<String>,
+    StartWs {
+        params: WsStartParams,
+        sink: ActorSink,
         _guard: InFlightGuard,
     },
-    TraceStartLongPoll {
+    StartLpInitial {
+        lp_gen: u64,
+        delay: Duration,
+        sink: ActorSink,
         _guard: InFlightGuard,
     },
     StartBootstrap {
@@ -483,9 +494,11 @@ pub struct SessionEffectRunner<T: Transport + 'static> {
     ws_driver: Arc<dyn WsDriver>,
     default_domains: Option<ZaloDomains>,
     suppress_long_poll: bool,
+    ws_active_gen: Arc<Mutex<Option<u64>>>,
+    lp_active_gen: Arc<Mutex<Option<u64>>>,
     host_tx: mpsc::UnboundedSender<HostJob>,
     active_tasks: Arc<Mutex<Vec<AbortHandle>>>,
-    lp_timer_abort: Mutex<Option<AbortHandle>>,
+    lp_timer_abort: Arc<Mutex<Option<AbortHandle>>>,
     lp_fetch_abort: Mutex<Option<AbortHandle>>,
     host_worker_abort: AbortHandle,
     runtime: Handle,
@@ -537,21 +550,31 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
     ) -> Self {
         let (host_tx, host_rx) = mpsc::unbounded_channel();
         let active_tasks: Arc<Mutex<Vec<AbortHandle>>> = Arc::new(Mutex::new(Vec::new()));
-        let worker_handle = runtime.spawn(run_host_worker(
-            host_rx,
-            Arc::clone(&client),
+        let ws_active_gen: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let lp_active_gen: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let lp_timer_abort: Arc<Mutex<Option<AbortHandle>>> = Arc::new(Mutex::new(None));
+        let worker_handle = runtime.spawn(run_host_worker(HostWorkerDeps {
+            rx: host_rx,
+            client: Arc::clone(&client),
             host,
-            Arc::clone(&active_tasks),
-            runtime.clone(),
-        ));
+            ws_driver: Arc::clone(&ws_driver),
+            ws_active_gen: Arc::clone(&ws_active_gen),
+            lp_active_gen: Arc::clone(&lp_active_gen),
+            lp_timer_abort: Arc::clone(&lp_timer_abort),
+            suppress_long_poll,
+            active_tasks: Arc::clone(&active_tasks),
+            runtime: runtime.clone(),
+        }));
         Self {
             client,
             ws_driver,
             default_domains,
             suppress_long_poll,
+            ws_active_gen,
+            lp_active_gen,
             host_tx,
             active_tasks,
-            lp_timer_abort: Mutex::new(None),
+            lp_timer_abort,
             lp_fetch_abort: Mutex::new(None),
             host_worker_abort: worker_handle.abort_handle(),
             runtime,
@@ -770,16 +793,14 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     my_uid,
                     self_conv_id,
                 } => {
-                    // Enqueue the serial replay trace marker first so it always precedes
-                    // `start_long_poll`, `start_bootstrap`, and any subsequent `e2ee_connected`.
-                    let guard = sink.track();
-                    let _ = self.host_tx.send(HostJob::TraceStartWs {
-                        endpoints: endpoints.clone(),
-                        _guard: guard,
-                    });
+                    *self
+                        .ws_active_gen
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = Some(ws_gen);
                     let zpw_sek = self.client.zpw_sek().unwrap_or_default();
-                    self.ws_driver.start(
-                        WsStartParams {
+                    let guard = sink.track();
+                    let _ = self.host_tx.send(HostJob::StartWs {
+                        params: WsStartParams {
                             ws_gen,
                             endpoints,
                             zpw_sek,
@@ -787,11 +808,15 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             my_uid,
                             self_conv_id,
                         },
-                        sink.clone(),
-                        &self.runtime,
-                    );
+                        sink: sink.clone(),
+                        _guard: guard,
+                    });
                 }
                 Effect::StopWs { reset_cursors } => {
+                    *self
+                        .ws_active_gen
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = None;
                     self.ws_driver.stop(reset_cursors);
                 }
                 Effect::RecordFileDone { file_id, url } => {
@@ -802,12 +827,6 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     initial,
                     delay,
                 } => {
-                    if initial {
-                        let guard = sink.track();
-                        let _ = self
-                            .host_tx
-                            .send(HostJob::TraceStartLongPoll { _guard: guard });
-                    }
                     if let Some(prev) = self
                         .lp_timer_abort
                         .lock()
@@ -816,7 +835,25 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     {
                         prev.abort();
                     }
-                    if !self.suppress_long_poll {
+                    if initial {
+                        *self
+                            .lp_active_gen
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) = Some(lp_gen);
+                        let guard = sink.track();
+                        let _ = self.host_tx.send(HostJob::StartLpInitial {
+                            lp_gen,
+                            delay,
+                            sink: sink.clone(),
+                            _guard: guard,
+                        });
+                    } else if !self.suppress_long_poll
+                        && *self
+                            .lp_active_gen
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            == Some(lp_gen)
+                    {
                         let timer_sink = sink.clone();
                         let handle = self
                             .runtime
@@ -832,6 +869,10 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     }
                 }
                 Effect::StopLongPoll => {
+                    *self
+                        .lp_active_gen
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = None;
                     self.cancel_long_poll();
                 }
                 Effect::FetchPollBatch {
@@ -1019,6 +1060,14 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
     }
 
     fn shutdown(&self) {
+        *self
+            .ws_active_gen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        *self
+            .lp_active_gen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
         self.cancel_active_tasks();
         self.cancel_long_poll();
         self.ws_driver.stop(false);
@@ -1032,13 +1081,32 @@ fn unix_now_secs() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
-async fn run_host_worker<T: Transport + 'static>(
-    mut rx: mpsc::UnboundedReceiver<HostJob>,
+struct HostWorkerDeps<T: Transport + 'static> {
+    rx: mpsc::UnboundedReceiver<HostJob>,
     client: Arc<SessionClient<T>>,
     host: Arc<dyn Host>,
+    ws_driver: Arc<dyn WsDriver>,
+    ws_active_gen: Arc<Mutex<Option<u64>>>,
+    lp_active_gen: Arc<Mutex<Option<u64>>>,
+    lp_timer_abort: Arc<Mutex<Option<AbortHandle>>>,
+    suppress_long_poll: bool,
     active_tasks: Arc<Mutex<Vec<AbortHandle>>>,
     runtime: Handle,
-) {
+}
+
+async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
+    let HostWorkerDeps {
+        mut rx,
+        client,
+        host,
+        ws_driver,
+        ws_active_gen,
+        lp_active_gen,
+        lp_timer_abort,
+        suppress_long_poll,
+        active_tasks,
+        runtime,
+    } = deps;
     while let Some(job) = rx.recv().await {
         match job {
             HostJob::LoadSavedSession {
@@ -1142,11 +1210,48 @@ async fn run_host_worker<T: Transport + 'static>(
                     transport_state,
                 });
             }
-            HostJob::TraceStartWs { endpoints, _guard } => {
-                host.on_ws_started(endpoints).await;
+            HostJob::StartWs {
+                params,
+                sink,
+                _guard,
+            } => {
+                let run_ws = host.on_ws_started(params.endpoints.clone()).await;
+                if run_ws
+                    && *ws_active_gen.lock().unwrap_or_else(PoisonError::into_inner)
+                        == Some(params.ws_gen)
+                {
+                    ws_driver.start(params, sink, &runtime);
+                }
             }
-            HostJob::TraceStartLongPoll { _guard } => {
-                host.on_long_poll_started().await;
+            HostJob::StartLpInitial {
+                lp_gen,
+                delay,
+                sink,
+                _guard,
+            } => {
+                let run_lp = host.on_long_poll_started().await;
+                if !run_lp {
+                    let mut active = lp_active_gen.lock().unwrap_or_else(PoisonError::into_inner);
+                    if *active == Some(lp_gen) {
+                        *active = None;
+                    }
+                } else if !suppress_long_poll
+                    && *lp_active_gen.lock().unwrap_or_else(PoisonError::into_inner) == Some(lp_gen)
+                {
+                    let handle = runtime
+                        .spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            sink.send(Input::LpTick { lp_gen });
+                        })
+                        .abort_handle();
+                    let prev = lp_timer_abort
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .replace(handle);
+                    if let Some(old) = prev {
+                        old.abort();
+                    }
+                }
             }
             HostJob::StartBootstrap { _guard } => {
                 host.start_bootstrap().await;
