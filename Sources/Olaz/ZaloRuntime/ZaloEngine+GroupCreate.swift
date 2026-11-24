@@ -477,7 +477,6 @@ extension ZaloEngine {
 
         do {
             _ = try await sessionClient.leaveGroupAPI(groupId: gid, silent: silent)
-            conversations.removeAll { $0.id == gid }
             contacts.groups.removeAll { $0.id == gid }
             cachedGroupDetails.removeValue(forKey: cleanGrid)
             groupMemberCache.removeValue(forKey: gid)
@@ -487,22 +486,24 @@ extension ZaloEngine {
             historyTicks.removeValue(forKey: gid)
             typing.removeValue(forKey: gid)
             pins.removeValue(forKey: gid)
-            cachedPinnedIds.remove(gid)
-            cachedArchivedIds.remove(gid)
-            cachedUnreadMarks.remove(gid)
             if openConversationId == gid {
                 openConversationId = nil
                 dropMessagePrompts()
             }
-            conversationUI.remove([gid])
-            rebuildConversationFlags()
-            rebuildConversationExtras()
+            if let core = coreLifecycle.core, let v = try? await core.removeLocalConversation(id: gid) {
+                await waitForMirrorVersion(v)
+            } else {
+                conversations.removeAll { $0.id == gid }
+                cachedPinnedIds.remove(gid)
+                cachedArchivedIds.remove(gid)
+                cachedUnreadMarks.remove(gid)
+                conversationUI.remove([gid])
+                rebuildConversationFlags()
+                rebuildConversationExtras()
+                try? await sqliteStore?.deleteConversation(id: gid)
+            }
 
-            try? await sqliteStore?.deleteConversation(id: gid)
             await persistCachedGroupsPreference()
-            try? await sqliteStore?.setPreferenceStrings(key: "pinnedIds", value: Array(cachedPinnedIds))
-            try? await sqliteStore?.setPreferenceStrings(key: "archivedIds", value: Array(cachedArchivedIds))
-            try? await sqliteStore?.setPreferenceStrings(key: "unreadMarks", value: Array(cachedUnreadMarks))
             conversationUI.show(.success, "Đã rời nhóm")
             return true
         } catch {

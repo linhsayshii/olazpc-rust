@@ -92,6 +92,8 @@ actor ZaloSQLiteStore {
     nonisolated(unsafe) private var db: OpaquePointer?
     /// Rust store on the same file (ADR-010: same system SQLite, WAL).
     private let core: CoreStore
+    /// Shared Rust store handle attached to `CoreEngine` (U3).
+    nonisolated var coreStoreHandle: CoreStore { core }
 
     init(path: String) throws {
         self.path = path
