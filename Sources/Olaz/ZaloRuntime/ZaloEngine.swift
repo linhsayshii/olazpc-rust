@@ -106,6 +106,8 @@ final class ZaloEngine {
     @ObservationIgnored internal var queuedComposerConfirms: [ComposerConfirm] = []
 
     var forwardRequest: ForwardRequest?
+    /// "Chọn nhiều tin nhắn" in progress (one conversation at a time).
+    var messageSelection: MessageSelection?
     var messageConfirm: MessageActionConfirm?
     var deleteUndo: DeleteUndo?
     var pins: [String: PinnedList] = [:]
@@ -138,7 +140,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var phoneSyncStatusSignal: ZaloMobileSyncEvent?
     @ObservationIgnored internal var pollState = ZaloPollState()
     @ObservationIgnored internal var typingResetTasks: [String: Task<Void, Never>] = [:]
-    @ObservationIgnored internal var pendingDeletedMessages: [String: ChatMessage] = [:]
+    @ObservationIgnored internal var pendingDeletedMessages: [String: [ChatMessage]] = [:]
     internal struct PendingLocalReaction {
         let id: UUID
         let convId: String

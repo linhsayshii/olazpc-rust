@@ -20,6 +20,8 @@ import SwiftUI
 final class ChatRowActions {
     var reply: (ChatMessage) -> Void = { _ in }
     var react: (String, ChatMessage) -> Void = { _, _ in }
+    /// "Chọn nhiều tin nhắn": a click on a row (message id, SHIFT held).
+    var select: (String, Bool) -> Void = { _, _ in }
 }
 
 /// What one row shows.
@@ -30,10 +32,13 @@ struct ChatRowModel: Equatable {
     var isHighlighted: Bool
     /// A poll event row that is the newest event of its poll in the list: it carries the poll card (taller).
     var showsPollCard = false
+    /// "Chọn nhiều tin nhắn" is on: message rows get a check column (narrower bubbles, so a new height).
+    var isSelecting = false
+    var isSelected = false
 
-    /// Same height: newest / highlighted only change a background; the poll card changes the height.
+    /// Same height: newest / highlighted / selected only change a background; the poll card and the check column change it.
     func sameLayout(as other: ChatRowModel) -> Bool {
-        row == other.row && isGroup == other.isGroup && showsPollCard == other.showsPollCard
+        row == other.row && isGroup == other.isGroup && showsPollCard == other.showsPollCard && isSelecting == other.isSelecting
     }
 
     /// Rows of one kind share hosts: re-rooting a host with a row of the same structure is a cheap SwiftUI update.
@@ -74,7 +79,31 @@ struct ChatRowContent: View {
         switch model.row.kind {
         case .day(let date):
             DaySeparator(date: date)
-        case .message(let m, let first, let last, let status):
+        case .message(let m, _, _, _) where model.isSelecting && m.isSelectable:
+            let actions = actions
+            // A plain button (not a tap gesture): clicks and VoiceOver / accessibility "press" both toggle the row.
+            Button {
+                actions.select(m.id, NSEvent.modifierFlags.contains(.shift))
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: model.isSelected ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 18))
+                        .foregroundStyle(model.isSelected ? AnyShapeStyle(.tint) : AnyShapeStyle(.tertiary))
+                        .accessibilityHidden(true)
+                    messageRow(m).allowsHitTesting(false)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityAddTraits(model.isSelected ? .isSelected : [])
+        case .message(let m, _, _, _):
+            messageRow(m)
+        }
+    }
+
+    @ViewBuilder
+    private func messageRow(_ m: ChatMessage) -> some View {
+        if case .message(_, let first, let last, let status) = model.row.kind {
             let actions = actions
             MessageRow(message: m, isGroup: model.isGroup, firstInGroup: first, lastInGroup: last, showStatus: status,
                        isNewest: model.isNewest,
@@ -133,12 +162,15 @@ struct ChatListView: NSViewRepresentable {
     let isGroup: Bool
     let newestId: String?
     let highlightedId: String?
+    /// "Chọn nhiều tin nhắn" of this conversation, if on.
+    var selection: MessageSelection? = nil
     let loadingOlder: Bool
     /// Room the bars over the list take (the list scrolls under them).
     let insets: EdgeInsets
     let commands: ChatListCommands
     let onReply: (ChatMessage) -> Void
     let onReact: (String, ChatMessage) -> Void
+    var onSelect: (String, Bool) -> Void = { _, _ in }
     let onMetrics: (ChatListMetrics) -> Void
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -153,9 +185,10 @@ struct ChatListView: NSViewRepresentable {
         commands.controller = controller
         controller.actions.reply = onReply
         controller.actions.react = onReact
+        controller.actions.select = onSelect
         controller.onMetrics = onMetrics
         controller.update(conversationId: conversationId, rows: rows, isGroup: isGroup, newestId: newestId,
-                          highlightedId: highlightedId, loadingOlder: loadingOlder, insets: insets,
+                          highlightedId: highlightedId, selection: selection, loadingOlder: loadingOlder, insets: insets,
                           environment: context.environment)
     }
 
@@ -305,7 +338,8 @@ final class ChatListController: NSObject {
     /// "Trả lời": bubbles, not notices or recalled messages).
     private func swipeableRow(at point: NSPoint) -> String? {
         let i = firstRow(below: point.y)
-        guard i < models.count, tops[i] <= point.y, case .message(let m, _, _, _) = models[i].row.kind else { return nil }
+        guard i < models.count, tops[i] <= point.y, !models[i].isSelecting,
+              case .message(let m, _, _, _) = models[i].row.kind else { return nil }
         switch m.kind {
         case .system, .notice, .ecard, .poll, .recalled: return nil
         default: break
@@ -339,7 +373,7 @@ final class ChatListController: NSObject {
     // MARK: Update from SwiftUI
 
     func update(conversationId: String, rows: [ChatRow], isGroup: Bool, newestId: String?, highlightedId: String?,
-                loadingOlder: Bool, insets: EdgeInsets, environment: EnvironmentValues) {
+                selection: MessageSelection? = nil, loadingOlder: Bool, insets: EdgeInsets, environment: EnvironmentValues) {
         applyingUpdate = true
         defer { applyingUpdate = false }
         self.environment = environment
@@ -375,7 +409,8 @@ final class ChatListController: NSObject {
                 showsPollCard = info.pollId.isEmpty || newestPollEvent[info.pollId] == m.id
             }
             return ChatRowModel(row: row, isGroup: isGroup, isNewest: id != nil && id == newestId,
-                                isHighlighted: id != nil && id == highlightedId, showsPollCard: showsPollCard)
+                                isHighlighted: id != nil && id == highlightedId, showsPollCard: showsPollCard,
+                                isSelecting: selection != nil, isSelected: id.map { selection?.contains($0) ?? false } ?? false)
         }
 
         if conversationId != self.conversationId {

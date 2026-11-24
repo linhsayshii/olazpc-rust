@@ -47,6 +47,9 @@ enum MessageActionOutcome: Equatable, Sendable {
 struct MessageActionConfirm: Identifiable, Equatable {
     enum Action: Equatable {
         case deleteForMe(ChatMessage)
+        /// "Chọn nhiều tin nhắn": delete / recall the selected messages.
+        case deleteMany([ChatMessage])
+        case recallMany([ChatMessage])
         /// Replace the pin `ref` (the oldest) to pin this message.
         case pin(ChatMessage, replacing: String)
         case unpin(ref: String)
@@ -74,6 +77,9 @@ struct ForwardRequest: Identifiable, Equatable {
     let id = UUID()
     var conversationId: String
     var message: ChatMessage
+    /// "Chọn nhiều tin nhắn": the other selected messages, oldest first, forwarded after `message`.
+    var more: [ChatMessage] = []
+    var all: [ChatMessage] { [message] + more }
 }
 
 /// One pin of a conversation (official group board topic / 1:1 pin topic), newest first.
@@ -496,16 +502,23 @@ extension ZaloEngine {
             ))
             return
         }
+        deleteMessages([message])
+    }
+
+    /// Hides the messages at once and deletes them on the server when the undo bar times out (one bar for the batch).
+    func deleteMessages(_ list: [ChatMessage]) {
+        guard let conversation = list.first?.conversationId else { return }
         let undoId = UUID().uuidString
-        pendingDeletedMessages[undoId] = message
-        if var list = messages[conversation] {
-            list.removeAll { $0.id == message.id }
-            messages[conversation] = list
+        pendingDeletedMessages[undoId] = list
+        let ids = Set(list.map(\.id))
+        if var current = messages[conversation] {
+            current.removeAll { ids.contains($0.id) }
+            messages[conversation] = current
         }
         showDeleteUndo(DeleteUndo(
             id: undoId,
             conversationId: conversation,
-            count: 1,
+            count: list.count,
             deadline: Date().addingTimeInterval(5)
         ))
     }
@@ -527,7 +540,7 @@ extension ZaloEngine {
         guard let undo = deleteUndo else { return }
         deleteUndo = nil
         if let restored = pendingDeletedMessages.removeValue(forKey: undo.id) {
-            mergeMessageIntoMemory(restored)
+            for message in restored { mergeMessageIntoMemory(message) }
             CardActionCenter.shared.show("Khôi phục thành công", in: undo.conversationId)
         }
     }
@@ -539,16 +552,18 @@ extension ZaloEngine {
     }
 
     private func commitPendingDelete(id: String) {
-        guard let msg = pendingDeletedMessages.removeValue(forKey: id) else { return }
-        let resolvedCliId = msg.clientId.isEmpty ? msg.id : msg.clientId
+        guard let list = pendingDeletedMessages.removeValue(forKey: id) else { return }
         Task {
-            try? await sessionClient.deleteMessageForMeAPI(
-                convId: msg.conversationId,
-                msgId: msg.id,
-                cliMsgId: resolvedCliId,
-                senderId: msg.senderId
-            )
-            try? await sqliteStore?.deleteMessage(convId: msg.conversationId, id: msg.id)
+            for msg in list {
+                let resolvedCliId = msg.clientId.isEmpty ? msg.id : msg.clientId
+                try? await sessionClient.deleteMessageForMeAPI(
+                    convId: msg.conversationId,
+                    msgId: msg.id,
+                    cliMsgId: resolvedCliId,
+                    senderId: msg.senderId
+                )
+                try? await sqliteStore?.deleteMessage(convId: msg.conversationId, id: msg.id)
+            }
         }
     }
 
@@ -631,7 +646,7 @@ extension ZaloEngine {
         ))
     }
 
-    private func ask(_ confirm: MessageActionConfirm) {
+    func ask(_ confirm: MessageActionConfirm) {
         guard openConversationId == confirm.conversationId, messageConfirm == nil else {
             return
         }
@@ -672,6 +687,8 @@ extension ZaloEngine {
         guard ok else { return }
         switch confirm.action {
         case .deleteForMe(let message): deleteForMe(message, confirmed: true)
+        case .deleteMany(let list): endSelection(); deleteMessages(list)
+        case .recallMany(let list): recallMessages(list)
         case .pin(let message, let replacing): pin(message, replacing: replacing)
         case .unpin(let ref): unpin(ref, in: confirm.conversationId)
         }

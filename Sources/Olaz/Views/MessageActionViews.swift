@@ -34,6 +34,9 @@ struct ForwardSheet: View {
             Divider()
             VStack(alignment: .leading, spacing: 10) {
                 ForwardPreview(message: request.message)
+                if !request.more.isEmpty {
+                    Text("và \(request.more.count) tin nhắn khác").font(.system(size: 12)).foregroundStyle(.secondary)
+                }
                 TextField("Tìm kiếm hội thoại cần chia sẻ", text: $search).textFieldStyle(.roundedBorder)
             }
             .padding(16)
@@ -77,8 +80,15 @@ struct ForwardSheet: View {
     private func send() async {
         guard !selected.isEmpty, !busy else { return }
         busy = true; failure = nil
-        let outcome = await engine.forward(request.message, to: selected)
+        // Several selected messages: forwarded oldest first; any success counts as shared.
+        var outcome = MessageActionOutcome.failed("Có lỗi khi chia sẻ tin nhắn")
+        for message in request.all {
+            let one = await engine.forward(message, to: selected)
+            if case .done = outcome { continue }
+            outcome = one
+        }
         busy = false
+        if case .done = outcome, !request.more.isEmpty { engine.endSelection() }
         switch outcome {
         case .done(let text):
             CardActionCenter.shared.show(text ?? "Đã chia sẻ tin nhắn", in: request.conversationId)

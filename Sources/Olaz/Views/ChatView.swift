@@ -78,7 +78,9 @@ struct ChatView: View {
             }
         }
         .safeAreaBar(edge: .bottom, spacing: 0) {
-            if !conversation.isGroup, engine.isBlocked(id) {
+            if let selection = engine.messageSelection, selection.conversationId == id {
+                MessageSelectionBar(selection: selection)
+            } else if !conversation.isGroup, engine.isBlocked(id) {
                 // Official: a blocked user's chat offers "Bỏ chặn" instead of the composer.
                 HStack(spacing: 10) {
                     Image(systemName: "hand.raised").foregroundStyle(.secondary)
@@ -110,6 +112,9 @@ struct ChatView: View {
         }
         .task(id: id) {
             if !conversation.isGroup, engine.blockedUsers == nil { await engine.loadBlockedUsers() }
+        }
+        .onChange(of: id) { _, _ in
+            if engine.messageSelection != nil { engine.endSelection() }
         }
         .alert("Chưa gửi được tin nhắn", isPresented: Binding(get: { notice != nil }, set: { if !$0 { notice = nil } })) {
             Button("OK", role: .cancel) {}
@@ -808,9 +813,12 @@ private struct MessageList: View {
             .overlay {
                 ChatListView(
                     conversationId: id, rows: rows, isGroup: conversation.isGroup, newestId: newestId,
-                    highlightedId: highlightedMessageId, loadingOlder: loadingOlder, insets: insets, commands: commands,
+                    highlightedId: highlightedMessageId,
+                    selection: engine.messageSelection?.conversationId == id ? engine.messageSelection : nil,
+                    loadingOlder: loadingOlder, insets: insets, commands: commands,
                     onReply: onReply,
                     onReact: { emoji, msg in engine.react(emoji, to: msg.id, in: id) },
+                    onSelect: { msgId, range in engine.toggleSelection(msgId, range: range) },
                     onMetrics: { m in metricsChanged(m, hasMore: hasMore, count: msgs.count) })
                 // Vertical only: the list scrolls under the top/bottom bars, but not under the inspector on the side
                 // (it would keep its old width there and centered rows would be cut off).

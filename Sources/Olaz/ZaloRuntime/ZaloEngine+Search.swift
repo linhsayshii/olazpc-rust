@@ -50,7 +50,7 @@ extension ZaloEngine {
         let clampedLimit = max(1, min(limit, 500))
 
         let pendingDeletedIds = Set(
-            pendingDeletedMessages.values
+            pendingDeletedMessages.values.joined()
                 .filter { $0.conversationId == convId }
                 .map(\.id)
         )
@@ -122,7 +122,7 @@ extension ZaloEngine {
                beforeOldestTsMs: oldestTsMs
            ) {
             let pendingDeletedIds = Set(
-                pendingDeletedMessages.values
+                pendingDeletedMessages.values.joined()
                     .filter { $0.conversationId == convId }
                     .map(\.id)
             )

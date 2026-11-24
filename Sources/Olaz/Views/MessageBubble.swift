@@ -448,6 +448,9 @@ struct MessageRow: View {
                     Button(emoji) { onReact(emoji, message) }
                 }
             }
+            if message.isSelectable {
+                Button("Chọn nhiều tin nhắn", systemImage: "checklist") { engine.beginSelection(message) }
+            }
             let canPin = actions.pin || engine.canPinMessage(message)
             if canPin || actions.star != nil {
                 Divider()
