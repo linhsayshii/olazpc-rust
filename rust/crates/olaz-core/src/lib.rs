@@ -9,6 +9,7 @@
 
 pub mod actor;
 pub mod changes;
+pub mod conversations;
 pub mod effect;
 pub mod input;
 pub mod reduce;
@@ -18,6 +19,13 @@ pub mod typed_chat;
 
 pub use actor::{ActorSink, CoreHandle};
 pub use changes::{ChangeHub, CoreChanges, DirtyKey, DirtySet};
+pub use conversations::{
+    BatchApplyDelta, CachedGroup, CachedProfile, ConvMessageDelta, ConversationActionResult,
+    ConversationActionUI, ConversationActionsState, ConversationExtras, ConversationLabel,
+    ConversationLeaveType, ConversationPreview, ConversationPrompt, ConversationRemoval,
+    ConversationSummary, ConversationToast, ConversationsState, FriendIdentity, GroupIdentity,
+    IdentityTable, LocalAccountHydration, MessagePreviewInput, PinBoard, StrangerBox, ToastKind,
+};
 pub use effect::{Effect, HostCall};
 pub use input::{
     Command, CompletedLogin, Input, LegacyCookie, PollBatchError, PollBatchOutcome, SessionFailure,
