@@ -125,7 +125,12 @@ final class ConversationRecorderTests: XCTestCase {
         }
 
         let initialSecretKey = extractInitialSecretKey(from: scenario.seed)
-        let server = try FakeZaloServer(serverScript: scenario.server, initialSecretKey: initialSecretKey)
+        let wsAuthManual = scenario.seed["ws_auth"]?.stringValue == "manual"
+        let server = try FakeZaloServer(
+            serverScript: scenario.server,
+            initialSecretKey: initialSecretKey,
+            wsAuthManual: wsAuthManual
+        )
         try await server.start()
 
         let baseURL = server.baseURLString
@@ -896,19 +901,14 @@ final class ConversationRecorderTests: XCTestCase {
     private static func wsFrameScript(
         cmd: Int64,
         subCmd: Int64 = 0,
-        payload: CaseJSON,
-        delayMs: Int64? = nil
+        payload: CaseJSON
     ) -> CaseJSON {
-        var obj: [String: CaseJSON] = [
+        .object([
             "kind": .string("ws_frame"),
             "cmd": .int(cmd),
             "sub_cmd": .int(subCmd),
             "payload": payload,
-        ]
-        if let delayMs {
-            obj["delay_ms"] = .int(delayMs)
-        }
-        return .object(obj)
+        ])
     }
 
     private static func loginInfoScript(uid: String, zpwSek: String, displayName: String, send2MeId: String? = nil) -> CaseJSON {
@@ -1072,6 +1072,7 @@ final class ConversationRecorderTests: XCTestCase {
                     zpwSek: "saved.200.a0.sek_c1",
                     suppress: ["long_poll"],
                     extras: [
+                        "ws_auth": .string("manual"),
                         "contacts": .object([
                             "friends_loaded": .bool(true),
                             "friends": .array([
@@ -1088,7 +1089,7 @@ final class ConversationRecorderTests: XCTestCase {
                     loginInfoScript(uid: "2000101", zpwSek: "saved.200.a0.sek_c1", displayName: "Conv User 1"),
                     profileMeScript(uid: "2000101", displayName: "Conv User 1"),
                     wsScript(),
-                    wsFrameScript(cmd: 1, payload: .object(["error_code": .int(0)]), delayMs: 50),
+                    wsFrameScript(cmd: 1, payload: .object(["error_code": .int(0)])),
                     wsFrameScript(
                         cmd: 501,
                         payload: .object([
@@ -1135,6 +1136,8 @@ final class ConversationRecorderTests: XCTestCase {
                 steps: [
                     .object(["cmd": .string("start")]),
                     .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["await_host": .string("start_bootstrap"), "timeout_ms": .int(5000)]),
+                    .object(["ws_push": .int(1)]),
                     .object(["await_host": .string("e2ee_connected"), "timeout_ms": .int(5000)]),
                     .object(["ws_push": .int(1)]),
                     .object(["await_host": .string("apply_parsed_events"), "timeout_ms": .int(5000)]),
@@ -1153,6 +1156,7 @@ final class ConversationRecorderTests: XCTestCase {
                     zpwSek: "saved.200.a0.sek_c2",
                     suppress: ["long_poll"],
                     extras: [
+                        "ws_auth": .string("manual"),
                         "local_conversations": .array([
                             localConv(
                                 id: "3000103",
@@ -1168,7 +1172,7 @@ final class ConversationRecorderTests: XCTestCase {
                     loginInfoScript(uid: "2000102", zpwSek: "saved.200.a0.sek_c2", displayName: "Conv User 2"),
                     profileMeScript(uid: "2000102", displayName: "Conv User 2"),
                     wsScript(),
-                    wsFrameScript(cmd: 1, payload: .object(["error_code": .int(0)]), delayMs: 50),
+                    wsFrameScript(cmd: 1, payload: .object(["error_code": .int(0)])),
                     // 1. Older history on pull (510) -> keeps preview, unread stays 0
                     wsFrameScript(
                         cmd: 510,
@@ -1221,6 +1225,8 @@ final class ConversationRecorderTests: XCTestCase {
                 steps: [
                     .object(["cmd": .string("start")]),
                     .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["await_host": .string("start_bootstrap"), "timeout_ms": .int(5000)]),
+                    .object(["ws_push": .int(1)]),
                     .object(["await_host": .string("e2ee_connected"), "timeout_ms": .int(5000)]),
                     .object(["ws_push": .int(1)]),
                     .object(["await_host": .string("apply_parsed_events"), "timeout_ms": .int(5000)]),
@@ -1243,13 +1249,16 @@ final class ConversationRecorderTests: XCTestCase {
                     userId: "2000103",
                     displayName: "Conv User 3",
                     zpwSek: "saved.200.a0.sek_c3",
-                    suppress: ["long_poll"]
+                    suppress: ["long_poll"],
+                    extras: [
+                        "ws_auth": .string("manual"),
+                    ]
                 ),
                 server: [
                     loginInfoScript(uid: "2000103", zpwSek: "saved.200.a0.sek_c3", displayName: "Conv User 3"),
                     profileMeScript(uid: "2000103", displayName: "Conv User 3"),
                     wsScript(),
-                    wsFrameScript(cmd: 1, payload: .object(["error_code": .int(0)]), delayMs: 50),
+                    wsFrameScript(cmd: 1, payload: .object(["error_code": .int(0)])),
                     wsFrameScript(
                         cmd: 501,
                         payload: .object([
@@ -1277,6 +1286,8 @@ final class ConversationRecorderTests: XCTestCase {
                 steps: [
                     .object(["cmd": .string("start")]),
                     .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["await_host": .string("start_bootstrap"), "timeout_ms": .int(5000)]),
+                    .object(["ws_push": .int(1)]),
                     .object(["await_host": .string("e2ee_connected"), "timeout_ms": .int(5000)]),
                     .object(["ws_push": .int(1)]),
                     .object(["await_host": .string("apply_parsed_events"), "timeout_ms": .int(5000)]),
@@ -1524,6 +1535,7 @@ final class ConversationRecorderTests: XCTestCase {
                     zpwSek: "saved.200.a0.sek_c7",
                     suppress: ["long_poll"],
                     extras: [
+                        "ws_auth": .string("manual"),
                         "contacts": .object([
                             "groups": .array([
                                 .object([
@@ -1540,7 +1552,7 @@ final class ConversationRecorderTests: XCTestCase {
                     loginInfoScript(uid: "2000107", zpwSek: "saved.200.a0.sek_c7", displayName: "Conv User 7"),
                     profileMeScript(uid: "2000107", displayName: "Conv User 7"),
                     wsScript(),
-                    wsFrameScript(cmd: 1, payload: .object(["error_code": .int(0)]), delayMs: 50),
+                    wsFrameScript(cmd: 1, payload: .object(["error_code": .int(0)])),
                     wsFrameScript(
                         cmd: 521,
                         payload: .object([
@@ -1564,6 +1576,8 @@ final class ConversationRecorderTests: XCTestCase {
                 steps: [
                     .object(["cmd": .string("start")]),
                     .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["await_host": .string("start_bootstrap"), "timeout_ms": .int(5000)]),
+                    .object(["ws_push": .int(1)]),
                     .object(["await_host": .string("e2ee_connected"), "timeout_ms": .int(5000)]),
                     .object(["ws_push": .int(1)]),
                     .object(["await_host": .string("apply_parsed_events"), "timeout_ms": .int(5000)]),
