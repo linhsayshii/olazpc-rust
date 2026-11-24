@@ -192,9 +192,15 @@ impl CoreHandle {
         ack_rx.await.ok()
     }
 
-    /// Pulls the next coalesced batch of dirty domain snapshots (`None` once stopped and drained).
+    /// Pulls the next batch of dirty domain snapshots (`None` once stopped and drained).
     pub async fn next_changes(&self) -> Option<CoreChanges> {
         self.changes.next_changes().await
+    }
+
+    /// Returns the latest monotonic revision published to the change hub.
+    #[must_use]
+    pub fn current_version(&self) -> u64 {
+        self.changes.current_version()
     }
 
     /// Reads the current [`SessionSnapshot`] directly from the actor (tests / diagnostics).

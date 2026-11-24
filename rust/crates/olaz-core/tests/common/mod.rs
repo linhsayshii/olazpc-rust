@@ -781,10 +781,26 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         match step {
             Step::Cmd { cmd, args } => {
                 let parsed = parse_command(cmd, args)?;
-                if matches!(parsed, Command::ApplyAccountProfile(_)) {
-                    let _ = core.send_and_ack(parsed).await;
-                } else {
-                    core.send(parsed);
+                match parsed {
+                    Command::LogOut | Command::SessionExpired { .. } => {
+                        // Match `SessionRecorderTests`: await boot completion before interrupting.
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                        core.send(parsed);
+                    }
+                    Command::RefreshQr => {
+                        // Allow any in-flight scripted waitScan request to reach the transport
+                        // before `refresh_qr` cancels it, without advancing into a 60s timeout.
+                        let _ = tokio::time::timeout(Duration::from_millis(500), core.wait_idle())
+                            .await;
+                        core.send(parsed);
+                    }
+                    Command::ApplyAccountProfile(_) => {
+                        let _ = core.send_and_ack(parsed).await;
+                    }
+                    Command::Start => {
+                        core.send(parsed);
+                    }
                 }
             }
             Step::Await { predicate, .. } => {
@@ -799,10 +815,11 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         }
     }
 
-    // Drain remaining finite work cleanly without letting a `repeat: true` long-poll sleep
-    // advance virtual time into a 60s QR timeout.
+    // Drain remaining finite work (each normal scripted HTTP call uses 10ms virtual RTT)
+    // without letting a stalled `"error": "timeout"` or `repeat: true` waitScan sleep advance
+    // virtual time past the 60s QR timeout floor.
     if !transport.has_repeat_entries() {
-        let _ = tokio::time::timeout(Duration::from_secs(3600), core.wait_idle()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
     } else {
         let mut prev_reqs = transport.recorded_count();
         for _ in 0..200 {

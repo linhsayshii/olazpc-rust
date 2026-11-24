@@ -356,11 +356,11 @@ fn enter_session_expired(state: &mut SessionState, reason: String, out: &mut Red
     state.phase = Phase::Login(LoginState::generating());
     out.dirty.insert(DirtyKey::Session);
 
-    // Order matches Swift `handleSessionExpiredNotice`: cancel, mark_expired, reset_domains, QR.
+    // Order matches Swift `handleSessionExpiredNotice`: cancel, mark_expired, QR.
+    // Unlike `logOut`, session expiry does not reset `ZaloDomains`.
     out.effects.push(Effect::CancelSessionTasks);
     out.effects.push(Effect::MarkCoreSessionExpired);
     out.effects.push(Effect::Host(HostCall::MarkExpired));
-    out.effects.push(Effect::Host(HostCall::ResetDomains));
     out.effects.push(Effect::RequestQr {
         qr_gen: state.qr_gen,
         language: DEFAULT_QR_LANGUAGE.to_owned(),
@@ -706,7 +706,6 @@ mod tests {
                 Effect::CancelSessionTasks,
                 Effect::MarkCoreSessionExpired,
                 Effect::Host(HostCall::MarkExpired),
-                Effect::Host(HostCall::ResetDomains),
                 Effect::RequestQr { qr_gen: 2, .. }
             ]
         ));

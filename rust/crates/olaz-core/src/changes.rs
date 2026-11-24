@@ -1,11 +1,19 @@
-//! Coalesced dirty-key change stream pulled by Swift (`next_changes()`, D2/D3).
+//! Dirty-key change stream pulled by Swift (`next_changes()`, D2/D3).
+//!
+//! High-frequency domain keys (conversations, messages, typing added in later units) coalesce in
+//! place in `O(dirty keys)` memory. Low-frequency `Session` lifecycle transitions are buffered in
+//! a small bounded queue (`MAX_SESSION_QUEUE`) with consecutive-duplicate coalescing so fast local
+//! or loopback servers never skip intermediate login/ready transitions before Swift pulls.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Mutex, PoisonError};
 
 use tokio::sync::Notify;
 
 use crate::state::{CoreState, SessionSnapshot};
+
+/// Upper bound on queued distinct session transitions; keeps hub memory strictly `O(1)`.
+const MAX_SESSION_QUEUE: usize = 64;
 
 /// Domain/entity keys dirtied by a `reduce` step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -16,7 +24,7 @@ pub enum DirtyKey {
 /// Set of keys dirtied by one `reduce` step.
 pub type DirtySet = BTreeSet<DirtyKey>;
 
-/// One coalesced batch returned by [`ChangeHub::next_changes`].
+/// One batch returned by [`ChangeHub::next_changes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreChanges {
     /// Monotonic revision of the latest change included in this batch.
@@ -28,14 +36,11 @@ pub struct CoreChanges {
 struct DirtyBuffer {
     version: u64,
     dirty: DirtySet,
-    session: Option<SessionSnapshot>,
+    session_queue: VecDeque<(u64, SessionSnapshot)>,
     closed: bool,
 }
 
-/// Coalescing hub between the actor and the Swift `next_changes()` consumer.
-///
-/// Memory is O(number of dirty keys): rapid state transitions overwrite the latest snapshot
-/// until Swift pulls it.
+/// Change hub between the actor and the Swift `next_changes()` consumer.
 pub struct ChangeHub {
     buf: Mutex<DirtyBuffer>,
     notify: Notify,
@@ -63,15 +68,25 @@ impl ChangeHub {
             return buf.version;
         }
         buf.version = buf.version.saturating_add(1);
+        let version = buf.version;
         for &key in dirty {
-            buf.dirty.insert(key);
             match key {
                 DirtyKey::Session => {
-                    buf.session = Some(state.session.snapshot());
+                    let snap = state.session.snapshot();
+                    if let Some((last_ver, last_snap)) = buf.session_queue.back_mut()
+                        && *last_snap == snap
+                    {
+                        *last_ver = version;
+                    } else {
+                        if buf.session_queue.len() >= MAX_SESSION_QUEUE {
+                            buf.session_queue.pop_front();
+                        }
+                        buf.session_queue.push_back((version, snap));
+                    }
                 }
             }
+            buf.dirty.insert(key);
         }
-        let version = buf.version;
         drop(buf);
         self.notify.notify_waiters();
         version
@@ -94,7 +109,7 @@ impl ChangeHub {
         self.notify.notify_waiters();
     }
 
-    /// Waits until at least one key is dirty, returns the latest values and clears the dirty set.
+    /// Waits until at least one change is pending, returning the next batch.
     /// Returns `None` after [`Self::close`] once no buffered changes remain.
     pub async fn next_changes(&self) -> Option<CoreChanges> {
         loop {
@@ -105,12 +120,20 @@ impl ChangeHub {
 
             {
                 let mut buf = self.buf.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some((version, session)) = buf.session_queue.pop_front() {
+                    if buf.session_queue.is_empty() {
+                        buf.dirty.remove(&DirtyKey::Session);
+                    }
+                    return Some(CoreChanges {
+                        version,
+                        session: Some(session),
+                    });
+                }
                 if !buf.dirty.is_empty() {
                     buf.dirty.clear();
-                    let session = buf.session.take();
                     return Some(CoreChanges {
                         version: buf.version,
-                        session,
+                        session: None,
                     });
                 }
                 if buf.closed {
@@ -129,7 +152,7 @@ mod tests {
     use crate::state::{LoginState, Phase};
 
     #[tokio::test]
-    async fn coalesces_multiple_publishes_into_latest_snapshot() {
+    async fn preserves_distinct_session_transitions_and_coalesces_duplicates() {
         let hub = ChangeHub::new();
         let mut state = CoreState::default();
         let dirty = DirtySet::from([DirtyKey::Session]);
@@ -138,18 +161,25 @@ mod tests {
         let v1 = hub.publish(&dirty, &state);
         assert_eq!(v1, 1);
 
-        state.session.phase = Phase::Ready;
+        // Identical consecutive snapshot coalesces in place with bumped revision.
         let v2 = hub.publish(&dirty, &state);
         assert_eq!(v2, 2);
 
-        let changes = hub.next_changes().await;
+        state.session.phase = Phase::Ready;
+        let v3 = hub.publish(&dirty, &state);
+        assert_eq!(v3, 3);
+
+        let first = hub.next_changes().await;
+        assert_eq!(first.as_ref().map(|c| c.version), Some(2));
         assert_eq!(
-            changes.as_ref().map(|c| c.version),
-            Some(2),
-            "only the latest version should be delivered"
+            first.and_then(|c| c.session).map(|s| s.phase),
+            Some(Phase::Login(LoginState::generating()))
         );
+
+        let second = hub.next_changes().await;
+        assert_eq!(second.as_ref().map(|c| c.version), Some(3));
         assert_eq!(
-            changes.and_then(|c| c.session).map(|s| s.phase),
+            second.and_then(|c| c.session).map(|s| s.phase),
             Some(Phase::Ready)
         );
     }

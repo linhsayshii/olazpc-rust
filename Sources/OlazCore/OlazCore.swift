@@ -1244,6 +1244,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func applyAccountProfile(account: LoginAccountRecord) async throws  -> UInt64
     
     /**
+     * Returns the latest monotonic revision published to the change stream.
+     */
+    func currentVersion()  -> UInt64
+    
+    /**
      * Handles a server-reported session expiry (`600` / `-102`) from any domain.
      */
     func handleSessionExpiredNotice(reason: String) 
@@ -1365,6 +1370,18 @@ open func applyAccountProfile(account: LoginAccountRecord)async throws  -> UInt6
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
+}
+    
+    /**
+     * Returns the latest monotonic revision published to the change stream.
+     */
+open func currentVersion() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_current_version(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
 }
     
     /**
@@ -14275,6 +14292,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_apply_account_profile() != 24350) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_current_version() != 33807) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_handle_session_expired_notice() != 44648) {

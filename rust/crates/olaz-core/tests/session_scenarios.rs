@@ -632,7 +632,6 @@ async fn s12_boot_saved_session_expired() -> Result<(), String> {
         vec![
             json!({ "call": "prepare_store", "args": { "user_id": "502" } }),
             json!({ "call": "mark_expired", "args": {} }),
-            json!({ "call": "reset_domains", "args": {} }),
         ]
     );
     Ok(())
@@ -818,11 +817,8 @@ async fn s17_and_s18_session_expired_mid_session_then_refresh_qr() -> Result<(),
     );
     assert_eq!(res.final_state["sign_out_notice"], Value::Null);
     assert_eq!(res.final_state["phase"]["qr"], "zalo://qr/refreshed-2");
-    assert!(
-        res.host
-            .windows(2)
-            .any(|w| w[0]["call"] == "mark_expired" && w[1]["call"] == "reset_domains")
-    );
+    assert!(res.host.iter().any(|h| h["call"] == "mark_expired"));
+    assert!(!res.host.iter().any(|h| h["call"] == "reset_domains"));
     Ok(())
 }
 

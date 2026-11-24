@@ -517,6 +517,11 @@ impl CoreEngine {
         Ok(batch.map(Into::into))
     }
 
+    /// Returns the latest monotonic revision published to the change stream.
+    pub fn current_version(&self) -> u64 {
+        self.handle.current_version()
+    }
+
     /// Stops the actor, aborts in-flight session tasks, and closes `next_changes()`.
     pub fn stop(&self) {
         self.handle.stop();

@@ -185,8 +185,14 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     self.cancel_active_tasks();
                 }
                 Effect::ClearCoreSession => {
+                    let isolated_domains = {
+                        let current = self.client.domains();
+                        current.isolated.then_some(current)
+                    };
                     self.client.clear_session();
-                    if let Some(domains) = &self.default_domains {
+                    if let Some(domains) =
+                        self.default_domains.as_ref().or(isolated_domains.as_ref())
+                    {
                         self.client.with_session(|s| s.domains = domains.clone());
                     }
                 }
