@@ -164,7 +164,10 @@ final class ZaloEngine {
     @ObservationIgnored internal var cachedSentRequestsRaw: [[String: Any]] = []
     @ObservationIgnored internal var cachedReceivedRequestsRaw: [[String: Any]] = []
     @ObservationIgnored internal var cachedGroupDetails: [String: [String: Any]] = [:]
-    @ObservationIgnored internal var cachedFriendGlobalIds: [String: String] = [:]
+    @ObservationIgnored internal var cachedFriendGlobalIds: [String: String] = [:] { didSet { friendUidByGlobalId = nil } }
+    /// `cachedFriendGlobalIds` reversed (global id → uid), built on first use: looking a sender up scanned the whole map for every
+    /// message (50 per chat opened, ~25 ms of main thread).
+    @ObservationIgnored private var friendUidByGlobalId: [String: String]?
     @ObservationIgnored internal var cachedPinnedIds: Set<String> = []
     @ObservationIgnored internal var cachedArchivedIds: Set<String> = []
     @ObservationIgnored internal var cachedStarredIds: Set<String> = []
@@ -1546,7 +1549,10 @@ final class ZaloEngine {
         if let sanitized = ZaloWireParser.sanitizeProfileUid(clean), sanitized != clean {
             candidates.append(sanitized)
         }
-        if let mappedUid = cachedFriendGlobalIds.first(where: { candidates.contains($0.value) })?.key,
+        if friendUidByGlobalId == nil {
+            friendUidByGlobalId = Dictionary(cachedFriendGlobalIds.map { ($0.value, $0.key) }, uniquingKeysWith: { a, _ in a })
+        }
+        if let mappedUid = candidates.lazy.compactMap({ self.friendUidByGlobalId?[$0] }).first,
            !candidates.contains(mappedUid) {
             candidates.append(mappedUid)
         }

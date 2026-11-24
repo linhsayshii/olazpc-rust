@@ -17,7 +17,8 @@ extension ZaloEngine {
         // Synchronous WAL snapshot read (< 0.5ms) so synced local history appears on the very first frame.
         if let syncCached = sqliteStore?.readDecodedMessagesNow(convId: id, limit: 50) {
             let decoded = syncCached.map(\.message)
-            for msg in decoded { mergeMessageIntoMemory(msg) }
+            // One write for the whole page (a merge per row copied, sorted and published the list 50 times).
+            mergeMessagesIntoMemory(decoded.map { (message: $0, clientId: nil) }, in: id)
             if decoded.count >= 45, hasMoreHistory[id] != true {
                 hasMoreHistory[id] = true
             }
