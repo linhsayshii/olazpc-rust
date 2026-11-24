@@ -106,6 +106,7 @@ impl WsClient {
         let mut core = WsCore::new();
         core.cursors.seed(&config.seed_cursors);
         let (cursors_tx, cursors_rx) = watch::channel(core.cursors.current());
+        let (authed_tx, authed_rx) = watch::channel(core.is_authed());
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (event_tx, event_rx) = mpsc::channel(config.event_capacity.max(1));
         let t = config.timings;
@@ -124,10 +125,11 @@ impl WsClient {
             cmds: cmd_rx,
             events: event_tx,
             cursors_tx,
+            authed_tx,
             on_cursors: config.on_cursors_changed,
         });
         tokio::spawn(actor.run());
-        (WsHandle::new(cmd_tx, cursors_rx), event_rx)
+        (WsHandle::new(cmd_tx, cursors_rx, authed_rx), event_rx)
     }
 }
 

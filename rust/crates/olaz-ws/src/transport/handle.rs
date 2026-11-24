@@ -14,11 +14,20 @@ use crate::consts::FRAME_VERSION;
 pub struct WsHandle {
     cmds: mpsc::Sender<Cmd>,
     cursors: watch::Receiver<CursorMap>,
+    authed: watch::Receiver<bool>,
 }
 
 impl WsHandle {
-    pub(crate) fn new(cmds: mpsc::Sender<Cmd>, cursors: watch::Receiver<CursorMap>) -> Self {
-        Self { cmds, cursors }
+    pub(crate) fn new(
+        cmds: mpsc::Sender<Cmd>,
+        cursors: watch::Receiver<CursorMap>,
+        authed: watch::Receiver<bool>,
+    ) -> Self {
+        Self {
+            cmds,
+            cursors,
+            authed,
+        }
     }
 
     /// `sendFrame`: false unless authenticated and the write succeeded.
@@ -78,6 +87,19 @@ impl WsHandle {
             Some(timeout),
         )
         .await
+    }
+
+    pub async fn send_request_versioned_with_timeout(
+        &self,
+        cmd: u16,
+        sub_cmd: u8,
+        version: u8,
+        req_id: Option<String>,
+        inner_data: Map<String, Value>,
+        timeout: Duration,
+    ) -> Option<Map<String, Value>> {
+        self.request(cmd, sub_cmd, version, req_id, inner_data, Some(timeout))
+            .await
     }
 
     async fn request(
@@ -148,9 +170,20 @@ impl WsHandle {
         self.cursors.borrow().clone()
     }
 
+    /// Record a `file_done` / `video_done` completion discovered outside the WS stream
+    /// (for example via long-poll), waking any pending `wait_for_file_done` waiters.
+    pub async fn record_file_done(&self, file_id: String, url: String) {
+        let _ = self.cmds.send(Cmd::RecordFileDone { file_id, url }).await;
+    }
+
     /// Live cursor snapshots (updated on every change, also after `stop`).
     pub fn watch_cursors(&self) -> watch::Receiver<CursorMap> {
         self.cursors.clone()
+    }
+
+    /// Live authentication state (updated on every connect/auth/disconnect/stop transition).
+    pub fn watch_authed(&self) -> watch::Receiver<bool> {
+        self.authed.clone()
     }
 
     /// `isAuthed`.

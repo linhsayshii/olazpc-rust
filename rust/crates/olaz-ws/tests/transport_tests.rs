@@ -562,3 +562,62 @@ async fn dropping_every_handle_stops_the_task() {
     assert_eq!(c.recv_close_code().await, Some(1000));
     assert!(timeout(T, ev.recv()).await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn watch_authed_tracks_auth_disconnect_reauth_and_stop() {
+    let mut srv = Server::start().await;
+    let (h, mut ev) = start(vec![srv.addr.clone()], fast());
+    let mut rx = h.watch_authed();
+    assert!(!*rx.borrow());
+
+    let mut c1 = srv.accept().await;
+    c1.auth_ok().await;
+    next_event(&mut ev).await;
+    timeout(T, rx.changed()).await.unwrap().unwrap();
+    assert!(*rx.borrow());
+
+    // Disconnect drops auth to false, reconnect + re-auth brings it back to true.
+    c1.ws.close(None).await.unwrap();
+    timeout(T, rx.changed()).await.unwrap().unwrap();
+    assert!(!*rx.borrow());
+
+    let mut c2 = srv.accept().await;
+    c2.auth_ok().await;
+    next_event(&mut ev).await;
+    timeout(T, rx.changed()).await.unwrap().unwrap();
+    assert!(*rx.borrow());
+
+    // Stop drops auth to false.
+    h.stop(false).await;
+    timeout(T, rx.changed()).await.unwrap().unwrap();
+    assert!(!*rx.borrow());
+}
+
+#[tokio::test]
+async fn record_file_done_wakes_waiter_and_caches_for_later_wait() {
+    let mut srv = Server::start().await;
+    let (h, mut ev) = start(vec![srv.addr.clone()], fast());
+    let mut c = srv.accept().await;
+    c.auth_ok().await;
+    next_event(&mut ev).await;
+
+    let h_wait = h.clone();
+    let waiter = tokio::spawn(async move { h_wait.wait_for_file_done("poll-f1").await });
+    // Ensure waiter is registered before recording.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    h.record_file_done("poll-f1".into(), "https://cdn.example/poll-f1.jpg".into())
+        .await;
+    assert_eq!(
+        timeout(T, waiter).await.unwrap().unwrap(),
+        Some("https://cdn.example/poll-f1.jpg".into())
+    );
+
+    // Later waiter hits cache immediately.
+    h.record_file_done("poll-f2".into(), "https://cdn.example/poll-f2.mp4".into())
+        .await;
+    assert_eq!(
+        timeout(T, h.wait_for_file_done("poll-f2")).await.unwrap(),
+        Some("https://cdn.example/poll-f2.mp4".into())
+    );
+    h.stop(false).await;
+}
