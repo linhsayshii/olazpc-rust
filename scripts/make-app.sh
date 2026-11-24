@@ -21,17 +21,34 @@ VERSION="${OLAZ_VERSION:-1.0}"
 BUILD_NUMBER="${OLAZ_BUILD:-$VERSION}"
 ./scripts/build-rust.sh
 # OLAZ_UNIVERSAL=1 builds arm64 + x86_64 (release workflow); default is the host architecture only.
-SWIFT_ARGS=(-c "$CONFIG")
-[[ "${OLAZ_UNIVERSAL:-0}" == 1 ]] && SWIFT_ARGS+=(--arch arm64 --arch x86_64)
-swift build $SWIFT_ARGS
-BIN_DIR="$(swift build $SWIFT_ARGS --show-bin-path)"
-BIN="$BIN_DIR/Olaz"
+# Each architecture is built on its own and the slices are joined with lipo: a single multi-arch
+# `swift build --arch arm64 --arch x86_64` fails to link the OlazCoreFFI xcframework on Xcode 26.6
+# ("library not found for -lolaz_ffi"). Some build systems reuse one output directory for every
+# architecture, so each slice is copied out before the next build.
+if [[ "${OLAZ_UNIVERSAL:-0}" == 1 ]]; then
+    mkdir -p build
+    SLICES=()
+    for arch in arm64 x86_64; do
+        swift build -c "$CONFIG" --arch "$arch"
+        BIN_DIR="$(swift build -c "$CONFIG" --arch "$arch" --show-bin-path)"
+        cp "$BIN_DIR/Olaz" "build/Olaz-$arch"
+        SLICES+=("build/Olaz-$arch")
+    done
+    lipo -create $SLICES -output build/Olaz-universal
+    rm -f $SLICES
+    BIN="build/Olaz-universal"
+else
+    swift build -c "$CONFIG"
+    BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
+    BIN="$BIN_DIR/Olaz"
+fi
 
 APP="build/Olaz.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$BIN" "$APP/Contents/MacOS/Olaz"
+lipo -info "$APP/Contents/MacOS/Olaz"
 cp Assets/olaz.icns "$APP/Contents/Resources/AppIcon.icns"
 
 # SwiftPM resource bundle (JSModules/, Resources/) — found via ResourceLocator.
