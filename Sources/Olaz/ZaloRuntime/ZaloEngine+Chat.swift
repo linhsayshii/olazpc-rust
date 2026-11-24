@@ -291,7 +291,7 @@ extension ZaloEngine {
     // MARK: - Send Text / Mentions
 
     func sendText(_ text: String, to id: String, quoting quoteId: String? = nil, mentions: [Mention] = [],
-                  styles: [TextStyle] = []) async -> Bool {
+                  styles: [TextStyle] = [], urgency: Int = 0) async -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !id.isEmpty else { return false }
         resetOutgoingTyping(in: id)
@@ -338,6 +338,9 @@ extension ZaloEngine {
         // "Tin nhắn tự xóa": the conversation's lifetime rides on the message.
         let ttl = isE2EE ? 0 : autoDeleteTTL(id)
         optimistic.ttlMs = ttl
+        // "Quan trọng" / "Khẩn cấp" (plain path only, like the styles).
+        let urgency = isE2EE ? 0 : urgency
+        optimistic.urgency = urgency
         mergeMessageIntoMemory(optimistic)
 
         func removeOptimistic() {
@@ -443,7 +446,8 @@ extension ZaloEngine {
                     quoteTsMs: quoteTsMs,
                     mentions: mentions,
                     textProperties: TextStyle.textProperties(styles),
-                    ttl: ttl
+                    ttl: ttl,
+                    urgency: urgency
                 )
             }
             // Replace temporary client id with server msgId while avoiding duplicates.

@@ -233,6 +233,9 @@ pub fn encode_chat_message(msg: &ChatMessage, client_id: &str) -> Option<StoredM
         "stickers": msg.suggests_stickers,
         "menu": menu
     });
+    if let (true, Value::Object(m)) = (msg.urgency > 0, &mut canonical) {
+        m.insert("urgency".into(), Value::from(msg.urgency));
+    }
     if let (true, Value::Object(m)) = (msg.ttl_ms > 0, &mut canonical) {
         m.insert("ttl".into(), Value::from(msg.ttl_ms));
     }

@@ -315,6 +315,8 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
     var textStyles: [TextStyle] = []
     /// "Tin nhắn tự xóa": lifetime in milliseconds from `date` (0 = kept).
     var ttlMs: Int64 = 0
+    /// Official `URGENCY_MODE`: 1 "Quan trọng", 2 "Khẩn cấp", 0 normal.
+    var urgency: Int = 0
 
     /// When a self-deleting message disappears.
     var expiresAt: Date? { ttlMs > 0 ? date.addingTimeInterval(Double(ttlMs) / 1000) : nil }
@@ -454,7 +456,8 @@ extension ChatMessage {
             fallbackURLs: fallbacks,
             clientId: (json["clientId"] as? String) ?? (json["cliMsgId"] as? String) ?? "",
             textStyles: TextStyle.list(json: json["styles"]),
-            ttlMs: max(0, (json["ttl"] as? NSNumber)?.int64Value ?? 0)
+            ttlMs: max(0, (json["ttl"] as? NSNumber)?.int64Value ?? 0),
+            urgency: min(2, max(0, (json["urgency"] as? NSNumber)?.intValue ?? 0))
         )
     }
 }

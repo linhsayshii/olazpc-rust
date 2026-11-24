@@ -957,7 +957,8 @@ extension ZaloSessionClient {
         quoteTsMs: Int64? = nil,
         mentions: [Mention] = [],
         textProperties: String? = nil,
-        ttl: Int64 = 0
+        ttl: Int64 = 0,
+        urgency: Int = 0
     ) async throws -> SendMessageResult {
         if let core = coreApi() {
             do {
@@ -965,7 +966,7 @@ extension ZaloSessionClient {
                     convId: convId, text: text, cliMsgId: cliMsgId, quoteMsgId: quoteMsgId, quoteCliMsgId: quoteCliMsgId,
                     quoteOwnerId: quoteOwnerId, quoteText: quoteText, quoteTsMs: quoteTsMs,
                     mentions: mentions.map { MentionRecord(uid: $0.uid, pos: Int64($0.pos), len: Int64($0.len), isAll: $0.isAll) },
-                    textProperties: textProperties, ttl: ttl))
+                    textProperties: textProperties, ttl: ttl, urgency: Int64(urgency)))
                 return SendMessageResult(msgId: r.msgId, cliMsgId: r.cliMsgId, tsMs: r.tsMs)
             } catch { throw RustCore.mapError(error) }
         }
@@ -994,6 +995,7 @@ extension ZaloSessionClient {
                 "ttl": ttl
             ]
             if let textProperties { payload["textProperties"] = textProperties }
+            if urgency > 0 { payload["metaData"] = ["urgency": urgency] }
             if isGroup {
                 payload["grid"] = cleanId
                 payload["visibility"] = 0
@@ -1021,6 +1023,7 @@ extension ZaloSessionClient {
                 "imei": imei
             ]
             if let textProperties { qPayload["textProperties"] = textProperties }
+            if urgency > 0 { qPayload["metaData"] = ["urgency": urgency] }
             if isGroup {
                 qPayload["grid"] = cleanId
                 qPayload["visibility"] = 0

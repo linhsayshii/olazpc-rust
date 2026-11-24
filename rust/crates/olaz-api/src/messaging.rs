@@ -38,6 +38,8 @@ pub struct SendTextArgs<'a> {
     pub text_properties: Option<&'a str>,
     /// "Tin nhắn tự xóa": lifetime in ms (0 = kept), the conversation's setting.
     pub ttl: i64,
+    /// "Quan trọng" (1) / "Khẩn cấp" (2): sent as `metaData: {urgency}`.
+    pub urgency: i64,
 }
 
 fn mention_info(mentions: &[Mention]) -> Value {
@@ -253,6 +255,9 @@ impl<T: Transport> ZaloApi<T> {
             if let Some(tp) = a.text_properties.filter(|t| !t.is_empty()) {
                 insert(&mut payload, "textProperties", Value::from(tp));
             }
+            if a.urgency > 0 {
+                insert(&mut payload, "metaData", json!({"urgency": a.urgency}));
+            }
             if is_group {
                 insert(&mut payload, "grid", Value::from(clean_id.clone()));
                 insert(&mut payload, "visibility", Value::from(0));
@@ -286,6 +291,9 @@ impl<T: Transport> ZaloApi<T> {
                 });
                 if let Some(tp) = a.text_properties.filter(|t| !t.is_empty()) {
                     insert(&mut payload, "textProperties", Value::from(tp));
+                }
+                if a.urgency > 0 {
+                    insert(&mut payload, "metaData", json!({"urgency": a.urgency}));
                 }
                 if is_group {
                     insert(&mut payload, "grid", Value::from(clean_id));

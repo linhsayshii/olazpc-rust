@@ -235,6 +235,7 @@ struct MessageRow: View {
                         .legibleOnWallpaper(hasWallpaper)
                         .padding(.leading, hasWallpaper ? 4 : 12)
                 }
+                if message.urgency > 0 { urgencyTag }
                 bubbleStack
                 if let expires = message.expiresAt { ttlLine(expires) }
                 if mine && showStatus { statusLine }
@@ -341,6 +342,15 @@ struct MessageRow: View {
         .buttonStyle(.plain)
         .help(title)
         .accessibilityLabel(title)
+    }
+
+    /// "Quan trọng" / "Khẩn cấp" over the bubble (official `message-urgency-indicator`).
+    private var urgencyTag: some View {
+        let urgent = message.urgency == 2
+        return Label(urgent ? "Khẩn cấp" : "Quan trọng", systemImage: urgent ? "bell.badge.fill" : "exclamationmark.circle.fill")
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(urgent ? Color.red : Color.orange)
+            .padding(.horizontal, 6)
     }
 
     /// "Tự xóa sau $0$" (official `ttl-timer-message`), refreshed each minute.

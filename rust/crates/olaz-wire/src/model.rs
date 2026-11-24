@@ -417,6 +417,8 @@ pub struct ChatMessage {
     pub text_styles: Vec<TextStyle>,
     /// "Tin nhắn tự xóa": lifetime in milliseconds from `date_ms` (0 = kept).
     pub ttl_ms: i64,
+    /// Official `URGENCY_MODE`: 1 "Quan trọng", 2 "Khẩn cấp", 0 normal.
+    pub urgency: i64,
 }
 
 /// Row of the SQLite message table (`StoredMessage`).
@@ -838,6 +840,7 @@ impl ChatMessage {
                 .to_string(),
             text_styles: TextStyle::list(json.get("styles")),
             ttl_ms: round_i64(ns_double(json.get("ttl")).unwrap_or(0.0)).max(0),
+            urgency: round_i64(ns_double(json.get("urgency")).unwrap_or(0.0)).clamp(0, 2),
         })
     }
 }

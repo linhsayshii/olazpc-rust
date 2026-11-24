@@ -627,6 +627,7 @@ fn base_message(kind: Kind, text: &str) -> ChatMessage {
         client_id: "c7001".into(),
         text_styles: vec![],
         ttl_ms: 0,
+        urgency: 0,
     }
 }
 
@@ -1183,4 +1184,20 @@ fn ttl_parse_and_round_trip() {
         "me",
     ));
     assert_eq!(plain.ttl_ms, 0);
+}
+
+/// "Quan trọng" / "Khẩn cấp": `metaData.urgency` (object or JSON string) or a top-level `urgency`, kept through the store.
+#[test]
+fn urgency_parse_and_round_trip() {
+    let (m, _) = msg_of(parse(
+        r#"{"msgId":"8801","msgType":"webchat","uidFrom":"peer","idTo":"me","ts":"1","metaData":"{\"urgency\":2}","content":"gấp"}"#,
+        "me",
+    ));
+    assert_eq!(m.urgency, 2);
+    assert_eq!(decode_stored_message(&encode_chat_message(&m, "").unwrap()).unwrap().urgency, 2);
+    let (n, _) = msg_of(parse(
+        r#"{"msgId":"8802","msgType":"webchat","uidFrom":"peer","idTo":"me","ts":"1","urgency":1,"content":"x"}"#,
+        "me",
+    ));
+    assert_eq!(n.urgency, 1);
 }

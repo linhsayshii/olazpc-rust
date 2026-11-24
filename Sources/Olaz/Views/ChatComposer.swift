@@ -12,6 +12,8 @@ struct ChatComposer: View {
     @Binding var mentions: [Mention]
     /// Rich-text runs of the draft (sent as `textProperties`).
     var styles: Binding<[TextStyle]>? = nil
+    /// "Quan trọng" (1) / "Khẩn cấp" (2) for the next message.
+    var urgency: Binding<Int>? = nil
     @Binding var replyTo: ChatMessage?
     let focusTick: Int
     let send: () -> Void
@@ -218,6 +220,27 @@ struct ChatComposer: View {
                     }
                 }
                 .padding(.vertical, 10)
+            if let urgency {
+                Menu {
+                    Button("Bình thường") { urgency.wrappedValue = 0 }
+                    Button("Quan trọng", systemImage: "exclamationmark.circle") { urgency.wrappedValue = 1 }
+                    Button("Khẩn cấp", systemImage: "bell.badge") { urgency.wrappedValue = 2 }
+                } label: {
+                    Image(systemName: urgency.wrappedValue == 2 ? "bell.badge.fill" : "exclamationmark.circle\(urgency.wrappedValue == 1 ? ".fill" : "")")
+                        .font(.system(size: 15))
+                        .foregroundStyle(urgency.wrappedValue == 2 ? AnyShapeStyle(Color.red)
+                                         : urgency.wrappedValue == 1 ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.secondary))
+                        .frame(width: 28, height: 28)
+                        .contentShape(Circle())
+                }
+                .menuStyle(.button)
+                .menuIndicator(.hidden)
+                .buttonStyle(.plain)
+                .fixedSize()
+                .padding(.bottom, 4)
+                .help(urgency.wrappedValue == 2 ? "Tin khẩn cấp" : urgency.wrappedValue == 1 ? "Tin quan trọng" : "Đánh dấu tin quan trọng hoặc khẩn cấp")
+                .accessibilityLabel("Mức độ tin nhắn")
+            }
             if styles != nil {
                 Button {
                     showFormat.toggle()

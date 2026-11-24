@@ -274,6 +274,7 @@ pub struct ChatMessageRecord {
     pub client_id: String,
     pub text_styles: Vec<TextStyleRecord>,
     pub ttl_ms: i64,
+    pub urgency: i64,
 }
 
 // ----- ChatMessage -> record -------------------------------------------------------------------
@@ -725,6 +726,7 @@ impl From<ChatMessage> for ChatMessageRecord {
                 .map(|s| TextStyleRecord { start: s.start, len: s.len, st: s.st })
                 .collect(),
             ttl_ms: m.ttl_ms,
+            urgency: m.urgency,
         }
     }
 }
@@ -798,6 +800,7 @@ impl From<&ChatMessageRecord> for ChatMessage {
                 .map(|s| TextStyle { start: s.start, len: s.len, st: s.st.clone() })
                 .collect(),
             ttl_ms: r.ttl_ms,
+            urgency: r.urgency,
         }
     }
 }

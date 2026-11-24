@@ -1156,6 +1156,18 @@ pub fn parse_wire_message(
     if let Some(q) = quote {
         canonical.insert("quote".into(), q);
     }
+    // "Quan trọng" / "Khẩn cấp": `urgency` on the message or in its `metaData` (object or JSON string).
+    let meta = match raw.get("metaData") {
+        Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok(),
+        Some(v) => Some(v.clone()),
+        None => None,
+    };
+    let urgency = int64(raw.get("urgency"))
+        .or_else(|| meta.as_ref().and_then(|m| int64(m.get("urgency"))))
+        .unwrap_or(0);
+    if urgency == 1 || urgency == 2 {
+        canonical.insert("urgency".into(), Value::from(urgency));
+    }
     // "Tin nhắn tự xóa": the message's lifetime (ms) from its timestamp.
     if let Some(ttl) = int64(raw.get("ttl")).filter(|t| *t > 0) {
         canonical.insert("ttl".into(), Value::from(ttl));

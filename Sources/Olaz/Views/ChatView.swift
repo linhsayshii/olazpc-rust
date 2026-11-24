@@ -16,6 +16,7 @@ struct ChatView: View {
     @State private var draft = ""
     @State private var draftMentions: [Mention] = []
     @State private var draftStyles: [TextStyle] = []
+    @State private var draftUrgency = 0
     @State private var replyTo: ChatMessage?
     @State private var focusTick = 0
     @State private var sendTick = 0
@@ -101,6 +102,7 @@ struct ChatView: View {
                 draft: $draft,
                 mentions: $draftMentions,
                 styles: $draftStyles,
+                urgency: $draftUrgency,
                 replyTo: $replyTo,
                 focusTick: focusTick,
                 send: send,
@@ -249,6 +251,7 @@ struct ChatView: View {
         draft = ""
         draftMentions = []
         draftStyles = []
+        draftUrgency = 0
         replyTo = nil
         notice = nil
         jumpTarget = nil
@@ -302,15 +305,17 @@ struct ChatView: View {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         // Untrimmed draft: the engine re-bases mention offsets when it trims.
-        let (sentDraft, sentMentions, sentReply, sentStyles) = (draft, draftMentions, replyTo, draftStyles)
+        let (sentDraft, sentMentions, sentReply, sentStyles, sentUrgency) = (draft, draftMentions, replyTo, draftStyles, draftUrgency)
         draft = ""
         draftMentions = []
         draftStyles = []
+        draftUrgency = 0
         replyTo = nil
         sendTick += 1
         let (engine, id) = (engine, id)
         Task {
-            guard await !engine.sendText(sentDraft, to: id, quoting: sentReply?.id, mentions: sentMentions, styles: sentStyles) else { return }
+            guard await !engine.sendText(sentDraft, to: id, quoting: sentReply?.id, mentions: sentMentions, styles: sentStyles,
+                                         urgency: sentUrgency) else { return }
             // Nothing was sent. The view may be gone by now (conversation switched): the engine keeps the text and the
             // composer shown for this conversation takes it back (`restoreFailedDraft`).
             engine.failedDrafts.stash(ComposerDraft(text: sentDraft, mentions: sentMentions, replyTo: sentReply), for: id)

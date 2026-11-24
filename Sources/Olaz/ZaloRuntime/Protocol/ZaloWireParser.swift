@@ -893,6 +893,12 @@ enum ZaloWireParser {
         if let quoteDict { canonical["quote"] = quoteDict }
         // "Tin nhắn tự xóa": the message's lifetime (ms) from its timestamp.
         if let ttl = JSONLossless.int64(raw["ttl"]), ttl > 0 { canonical["ttl"] = ttl }
+        // "Quan trọng" / "Khẩn cấp": `urgency` on the message or in its `metaData` (object or JSON string).
+        let meta: [String: Any]? = (raw["metaData"] as? [String: Any])
+            ?? (raw["metaData"] as? String).flatMap { $0.data(using: .utf8) }.flatMap { JSONLossless.parseObject($0) }
+        if let urgency = JSONLossless.int64(raw["urgency"]) ?? JSONLossless.int64(meta?["urgency"]), urgency == 1 || urgency == 2 {
+            canonical["urgency"] = urgency
+        }
         // Rich text (`action: rtf`): the official `params.styles` ranges over the text.
         if kindTag == "text" {
             let styles = TextStyle.list(json: contentParams?["styles"])
@@ -1053,6 +1059,7 @@ enum ZaloWireParser {
         ]
         if !msg.textStyles.isEmpty { canonical["styles"] = msg.textStyles.map(\.json) }
         if msg.ttlMs > 0 { canonical["ttl"] = msg.ttlMs }
+        if msg.urgency > 0 { canonical["urgency"] = msg.urgency }
         if let quote = msg.quote {
             canonical["quote"] = ["senderName": quote.senderName, "text": quote.text]
         }
