@@ -1308,11 +1308,11 @@ final class ZaloEngine {
     }
 
     private func startWebSocketLoop(endpoints: [String], zpwSek: String) {
+        wsTask?.cancel()
         guard !zpwSek.isEmpty else { return }
         if !traceHost("start_ws", args: ["endpoints": endpoints]) {
             return
         }
-        wsTask?.cancel()
         wsTask = Task { [weak self] in
             guard let self else { return }
             let stream = await self.webSocket.start(
