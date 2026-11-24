@@ -346,6 +346,24 @@ fn build_reaction_request_formatting_and_routes() {
 }
 
 #[test]
+fn remove_reaction_wire_format() {
+    // Swift FeatureFixesTests.removeReactionWireFormat
+    let spec = build_reaction_request(&ReactionParams {
+        conv_id: "200",
+        msg_id: "88001",
+        cli_msg_id: "17001",
+        r_icon: "",
+        r_type: -1,
+        msg_type: 1,
+        client_id: 1,
+        imei: "i",
+    });
+    let inner = parsed_json_string(&spec.call.payload["react_list"][0]["message"]);
+    assert_eq!(inner["rType"], -1);
+    assert_eq!(inner["rIcon"], "");
+}
+
+#[test]
 fn build_e2ee_ext_json_matches_swift_sorted_golden() {
     assert_eq!(
         build_e2ee_ext_json(3001, 9002, 1, 1),

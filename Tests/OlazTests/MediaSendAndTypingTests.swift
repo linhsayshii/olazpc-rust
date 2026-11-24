@@ -9,73 +9,6 @@ import Testing
 import UniformTypeIdentifiers
 @testable import Olaz
 
-private final class MockMediaURLProtocol: URLProtocol, @unchecked Sendable {
-    struct CapturedRequest: @unchecked Sendable {
-        let path: String
-        let query: String
-        let contentType: String
-        let body: Data
-    }
-
-    typealias Handler = @Sendable (URLRequest, Data) -> (Int, [String: Any])
-    static let handlers = OSAllocatedUnfairLock<[String: Handler]>(initialState: [:])
-
-    override class func canInit(with request: URLRequest) -> Bool {
-        guard let host = request.url?.host else { return false }
-        return handlers.withLock { $0[host] != nil }
-    }
-
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
-        request
-    }
-
-    override func startLoading() {
-        guard let url = request.url,
-              let host = url.host,
-              let handler = Self.handlers.withLock({ $0[host] }) else {
-            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
-            return
-        }
-        var bodyData = request.httpBody ?? Data()
-        if bodyData.isEmpty, let stream = request.httpBodyStream {
-            stream.open()
-            defer { stream.close() }
-            var buf = [UInt8](repeating: 0, count: 4096)
-            while stream.hasBytesAvailable {
-                let n = stream.read(&buf, maxLength: buf.count)
-                if n > 0 { bodyData.append(contentsOf: buf.prefix(n)) }
-                else { break }
-            }
-        }
-        let (status, jsonObj) = handler(request, bodyData)
-        let respData = (try? JSONSerialization.data(withJSONObject: jsonObj)) ?? Data("{}".utf8)
-        let http = HTTPURLResponse(
-            url: url,
-            statusCode: status,
-            httpVersion: "HTTP/1.1",
-            headerFields: ["Content-Type": "application/json"]
-        )!
-        client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: respData)
-        client?.urlProtocolDidFinishLoading(self)
-    }
-
-    override func stopLoading() {}
-}
-
-private func decodeEncryptedParams(fromQueryOrBody raw: String, key: Data) -> [String: Any]? {
-    guard let paramsPart = raw.split(separator: "&").first(where: { $0.hasPrefix("params=") }) else {
-        return nil
-    }
-    let encoded = String(paramsPart.dropFirst("params=".count))
-    let b64 = encoded.removingPercentEncoding ?? encoded
-    guard let plain = try? ZaloCrypto.decodeAES(key: key, base64: b64),
-          let obj = JSONLossless.parseObject(Data(plain.utf8)) else {
-        return nil
-    }
-    return obj
-}
-
 private func makeTinyVideoClip(
     at url: URL,
     fileType: AVFileType,
@@ -294,50 +227,41 @@ private func makeTinyVideoClip(
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let host = "mock-video-\(UUID().uuidString.lowercased()).invalid"
         let key = Data("0123456789abcdef".utf8)
         let shouldFailForward = OSAllocatedUnfairLock<Bool>(initialState: false)
         let captured = OSAllocatedUnfairLock<[(path: String, query: String, payload: ZaloJSONBox)]>(initialState: [])
 
-        MockMediaURLProtocol.handlers.withLock { handlers in
-            handlers[host] = { req, bodyData in
-                let path = req.url?.path ?? ""
-                let query = req.url?.query ?? ""
-                let decodedQuery = decodeEncryptedParams(fromQueryOrBody: query, key: key)
-                let decodedBody = decodeEncryptedParams(fromQueryOrBody: String(decoding: bodyData, as: UTF8.self), key: key)
-                let box = ZaloJSONBox(decodedBody ?? decodedQuery ?? [:])
-                captured.withLock { $0.append((path: path, query: query, payload: box)) }
+        let server = try FakeZaloServer { req in
+            let box = ZaloJSONBox(req.decodeEncryptedParams(key: key) ?? [:])
+            captured.withLock { $0.append((path: req.path, query: req.query, payload: box)) }
 
-                if path == "/api/message/video/file/upload" || path == "/api/group/video/file/upload" {
-                    let chunkId = JSONLossless.int64(box.dict["chunkId"]) ?? 1
-                    let totalChunk = JSONLossless.int64(box.dict["totalChunk"]) ?? 1
-                    if chunkId == totalChunk {
-                        return (200, ["error_code": 0, "data": ["fileId": "901234", "fileUrl": "https://cdn.example/video_901234.mp4"]])
-                    }
-                    return (200, ["error_code": 0, "data": [:]])
+            if req.path == "/api/message/video/file/upload" || req.path == "/api/group/video/file/upload" {
+                let chunkId = JSONLossless.int64(box.dict["chunkId"]) ?? 1
+                let totalChunk = JSONLossless.int64(box.dict["totalChunk"]) ?? 1
+                if chunkId == totalChunk {
+                    return .json(200, ["error_code": 0, "data": ["fileId": "901234", "fileUrl": "https://cdn.example/video_901234.mp4"]])
                 }
-                if path == "/api/message/video/thumb/upload" || path == "/api/group/video/thumb/upload" {
-                    return (200, ["error_code": 0, "data": ["url": "https://cdn.example/thumb_901234.jpg"]])
-                }
-                if path == "/api/message/forward" || path == "/api/group/forward" {
-                    if shouldFailForward.withLock({ $0 }) {
-                        return (200, ["error_code": 114, "error_message": "Forward unavailable"])
-                    }
-                    return (200, ["error_code": 0, "data": ["msgId": "55001122"]])
-                }
-                if path == "/api/message/asyncfile/msg" || path == "/api/group/asyncfile/msg" {
-                    return (200, ["error_code": 0, "data": ["msgId": "55009999"]])
-                }
-                return (404, ["error_code": -1])
+                return .json(200, ["error_code": 0, "data": [:]])
             }
+            if req.path == "/api/message/video/thumb/upload" || req.path == "/api/group/video/thumb/upload" {
+                return .json(200, ["error_code": 0, "data": ["url": "https://cdn.example/thumb_901234.jpg"]])
+            }
+            if req.path == "/api/message/forward" || req.path == "/api/group/forward" {
+                if shouldFailForward.withLock({ $0 }) {
+                    return .json(200, ["error_code": 114, "error_message": "Forward unavailable"])
+                }
+                return .json(200, ["error_code": 0, "data": ["msgId": "55001122"]])
+            }
+            if req.path == "/api/message/asyncfile/msg" || req.path == "/api/group/asyncfile/msg" {
+                return .json(200, ["error_code": 0, "data": ["msgId": "55009999"]])
+            }
+            return .json(404, ["error_code": -1])
         }
-        defer { _ = MockMediaURLProtocol.handlers.withLock { $0.removeValue(forKey: host) } }
+        try await server.start()
+        defer { server.stop() }
 
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [MockMediaURLProtocol.self]
-        let client = ZaloSessionClient(dataDirectory: root, useKeychain: false, urlSession: URLSession(configuration: config))
-        var domains = ZaloDomains()
-        domains.serviceCandidates["file"] = ["https://\(host)"]
+        let client = ZaloSessionClient(dataDirectory: root, useKeychain: false)
+        let domains = server.domains(for: ["file"])
         var account = ZaloLoginAccount()
         account.userId = "100"
         await client.updateCredentials(account: account, secretKey: key, zpwSek: "sek.1.2", domains: domains)
