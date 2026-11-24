@@ -23,6 +23,7 @@ extension ZaloEngine {
 
     internal func cancelTasksForRecording() {
         hostTrace = nil
+        stateTrace = nil
         EngineLog.shared.onAppend = nil
         bootTask?.cancel()
         qrTask?.cancel()

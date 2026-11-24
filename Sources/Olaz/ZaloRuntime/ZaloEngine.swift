@@ -61,10 +61,16 @@ final class ZaloEngine {
         var displayName: String { name.isEmpty ? (isGroup ? "Nhóm" : "Người dùng Zalo") : name }
     }
 
-    private(set) var phase: Phase = .starting
+    private(set) var phase: Phase = .starting {
+        didSet { stateTrace?() }
+    }
     var conversations: [ConversationSummary] = []
-    private(set) var profile: Profile?
-    private(set) var signOutNotice: String?
+    private(set) var profile: Profile? {
+        didSet { stateTrace?() }
+    }
+    private(set) var signOutNotice: String? {
+        didSet { stateTrace?() }
+    }
     private(set) var clientVersion: String? = "694 (Native)"
     private(set) var recentLog: [String] = []
 
@@ -97,7 +103,9 @@ final class ZaloEngine {
     var canStartTransfer = false
     var transferStartBlockedReason: String?
 
-    var selfConversationId: String?
+    var selfConversationId: String? {
+        didSet { stateTrace?() }
+    }
     var navigationRequest: String?
     var conversationExtras = ConversationExtras()
     var conversationActions = ConversationActionsState()
@@ -129,6 +137,7 @@ final class ZaloEngine {
     @ObservationIgnored private var started = false
     internal var isEngineStarted: Bool { started }
     @ObservationIgnored internal var hostTrace: ((String, [String: Any]) -> Bool)?
+    @ObservationIgnored internal var stateTrace: (() -> Void)?
     @ObservationIgnored internal var recordedQRPayload: String?
     @ObservationIgnored internal var recordedSessionPrefs: [String: String] = [:]
     @ObservationIgnored internal var pendingCleanupTask: Task<Void, Never>?

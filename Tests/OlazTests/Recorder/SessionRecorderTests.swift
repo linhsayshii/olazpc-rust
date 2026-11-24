@@ -1,5 +1,4 @@
 import Foundation
-import Observation
 import Testing
 @testable import Olaz
 
@@ -178,6 +177,13 @@ struct SessionRecorderTests {
             return false
         }
 
+        let transitionRecorder = TransitionRecorder {
+            normalizeRecordedURLs(SessionSnapshot.capture(from: engine))
+        }
+        engine.stateTrace = { [weak transitionRecorder] in
+            transitionRecorder?.recordTransition()
+        }
+
         var snapshots: [String: CaseJSON] = [:]
 
         do {
@@ -186,6 +192,7 @@ struct SessionRecorderTests {
                     switch cmd {
                     case "start":
                         engine.start()
+                        transitionRecorder.advanceSearchToLatestSyncState()
                     case "refresh_qr":
                         if case .login(let login) = engine.phase,
                            case .waitingScan = login.step,
@@ -195,21 +202,24 @@ struct SessionRecorderTests {
                             await server.waitForConsumed(path: waitScanPath, timeoutMs: 2000)
                         }
                         engine.refreshQR()
+                        transitionRecorder.advanceSearchToLatestSyncState()
                     case "log_out":
                         _ = await engine.bootTask?.value
                         engine.logOut()
+                        transitionRecorder.advanceSearchToLatestSyncState()
                     case "session_expired":
                         _ = await engine.bootTask?.value
                         let reason = step["args"]?["reason"]?.stringValue ?? ""
                         engine.handleSessionExpiredNotice(reason)
+                        transitionRecorder.advanceSearchToLatestSyncState()
                     default:
                         throw RecorderError.invalidStep("Unknown cmd: \(cmd)")
                     }
                 } else if let pred = step["await"] {
                     let timeoutMs = Int(step["timeout_ms"]?.int64Value ?? 5000)
-                    try await awaitPredicate(engine: engine, predicate: pred, timeoutMs: timeoutMs)
+                    try await transitionRecorder.awaitPredicate(pred, timeoutMs: timeoutMs)
                 } else if let label = step["snapshot"]?.stringValue {
-                    snapshots[label] = normalizeRecordedURLs(SessionSnapshot.capture(from: engine))
+                    snapshots[label] = transitionRecorder.currentCursorSnapshot()
                 } else {
                     throw RecorderError.invalidStep("Unknown step: \(step.canonicalString())")
                 }
@@ -262,6 +272,7 @@ struct SessionRecorderTests {
             }
             return .object(caseDict)
         } catch {
+            transitionRecorder.cancelWaiters()
             engine.cancelTasksForRecording()
             server.stop()
             await engine.finishTearDownForRecording()
@@ -301,48 +312,6 @@ struct SessionRecorderTests {
         }
     }
 
-    @MainActor
-    private static func awaitPredicate(
-        engine: ZaloEngine,
-        predicate: CaseJSON,
-        timeoutMs: Int
-    ) async throws {
-        let deadline = ContinuousClock.now + .milliseconds(timeoutMs)
-        while !SessionSnapshot.matchesPredicate(engine, predicate: predicate) {
-            if ContinuousClock.now >= deadline {
-                throw RecorderError.timeout(
-                    "Timed out waiting for \(predicate.canonicalString()), current: \(SessionSnapshot.capture(from: engine).canonicalString())"
-                )
-            }
-            await waitForPhaseChangeOrTick(engine: engine, predicate: predicate, maxWaitMs: 50)
-        }
-    }
-
-    @MainActor
-    private static func waitForPhaseChangeOrTick(
-        engine: ZaloEngine,
-        predicate: CaseJSON,
-        maxWaitMs: Int
-    ) async {
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            let gate = ResumeOnce(continuation: cont)
-            withObservationTracking {
-                _ = engine.phase
-            } onChange: {
-                Task { @MainActor in
-                    gate.resume()
-                }
-            }
-            if SessionSnapshot.matchesPredicate(engine, predicate: predicate) {
-                gate.resume()
-                return
-            }
-            Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(maxWaitMs))
-                gate.resume()
-            }
-        }
-    }
 
     // MARK: - Helpers & Scenarios
 
@@ -1093,19 +1062,81 @@ struct SessionRecorderTests {
     }
 }
 
-private final class ResumeOnce: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<Void, Never>?
+@MainActor
+private final class TransitionRecorder {
+    private(set) var history: [CaseJSON] = []
+    private(set) var cursor: Int = 0
+    private var searchStart: Int = 0
+    private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private let capture: () -> CaseJSON
 
-    init(continuation: CheckedContinuation<Void, Never>) {
-        self.continuation = continuation
+    init(capture: @escaping () -> CaseJSON) {
+        self.capture = capture
+        self.history.append(capture())
     }
 
-    func resume() {
-        lock.lock()
-        let c = continuation
-        continuation = nil
-        lock.unlock()
-        c?.resume()
+    func recordTransition() {
+        let snap = capture()
+        if history.last == snap {
+            return
+        }
+        history.append(snap)
+        let pending = waiters
+        waiters.removeAll()
+        for cont in pending.values {
+            cont.resume()
+        }
+    }
+
+    func advanceSearchToLatestSyncState() {
+        searchStart = max(searchStart, history.count - 1)
+    }
+
+    func currentCursorSnapshot() -> CaseJSON {
+        history[cursor]
+    }
+
+    func cancelWaiters() {
+        let pending = waiters
+        waiters.removeAll()
+        for cont in pending.values {
+            cont.resume()
+        }
+    }
+
+    func awaitPredicate(_ predicate: CaseJSON, timeoutMs: Int) async throws {
+        let deadline = ContinuousClock.now + .milliseconds(timeoutMs)
+        while true {
+            if searchStart < history.count {
+                for idx in searchStart..<history.count {
+                    if SessionSnapshot.matchesPredicate(history[idx], predicate: predicate) {
+                        cursor = idx
+                        searchStart = idx + 1
+                        return
+                    }
+                }
+                searchStart = history.count
+            }
+
+            let remaining = deadline - ContinuousClock.now
+            if remaining <= .zero {
+                let lastDesc = (history.last ?? capture()).canonicalString()
+                throw SessionRecorderTests.RecorderError.timeout(
+                    "Timed out waiting for \(predicate.canonicalString()), current: \(lastDesc)"
+                )
+            }
+
+            let waiterId = UUID()
+            let timeoutTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: remaining)
+                if let cont = self?.waiters.removeValue(forKey: waiterId) {
+                    cont.resume()
+                }
+            }
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                waiters[waiterId] = cont
+            }
+            timeoutTask.cancel()
+        }
     }
 }

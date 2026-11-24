@@ -62,29 +62,21 @@ enum SessionSnapshot {
         ])
     }
 
+    static func matchesPredicate(_ snapshot: CaseJSON, predicate: CaseJSON) -> Bool {
+        guard let wantPhase = predicate["phase"]?.stringValue,
+              let snapPhase = snapshot["phase"],
+              snapPhase["kind"]?.stringValue == wantPhase
+        else {
+            return false
+        }
+        guard let wantStep = predicate["step"]?.stringValue else {
+            return true
+        }
+        return snapPhase["step"]?.stringValue == wantStep
+    }
+
     @MainActor
     static func matchesPredicate(_ engine: ZaloEngine, predicate: CaseJSON) -> Bool {
-        guard let wantPhase = predicate["phase"]?.stringValue else { return false }
-        let wantStep = predicate["step"]?.stringValue
-        switch engine.phase {
-        case .starting:
-            return wantPhase == "starting"
-        case .preparing:
-            return wantPhase == "preparing"
-        case .login(let login):
-            guard wantPhase == "login" else { return false }
-            guard let wantStep else { return true }
-            switch login.step {
-            case .generating: return wantStep == "generating"
-            case .waitingScan: return wantStep == "waiting_scan"
-            case .waitingConfirm: return wantStep == "waiting_confirm"
-            case .expired: return wantStep == "expired"
-            case .failed: return wantStep == "failed"
-            }
-        case .signingIn:
-            return wantPhase == "signing_in"
-        case .ready:
-            return wantPhase == "ready"
-        }
+        matchesPredicate(capture(from: engine), predicate: predicate)
     }
 }
