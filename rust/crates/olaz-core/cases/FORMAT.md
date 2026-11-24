@@ -69,6 +69,7 @@ Run in order:
   - `update_contacts`: same fields as `seed.contacts` — updates in-memory `contacts` / `cachedAliases` mid-scenario before `ensure_known_contacts`.
   - `open_conversation`: `{"id": <str|null>}` — sets `openConversationId`.
 - Conversation action `cmd` steps (`conversation_actions` domain):
+  - Optional step-level deterministic inputs on `cmd` steps: `"now_ms": <int64>` and `"rand4": "<string>"` seed wall-clock milliseconds (`nowMs`) and 4-char random tags (`randomTag4`) for the duration of that single step.
   - `pin`: `{"id": "<convId>"}` — calls `pinConversation(id)` and awaits its completion (`toast` seq advance or `prompt == .pinBoard`).
   - `unpin`: `{"id": "<convId>"}` — calls `unpinConversation(id)` and awaits its completion (`toast` seq advance).
   - `pin_board`: `{"id": "<convId>"}` — awaits `pinBoard(for: id)` and records the result in `pin_board`.
@@ -89,7 +90,7 @@ Run in order:
   - `unlock_from_pin_search`: `{"id": "<convId>"}` — calls `unlockFromPINSearch(id)`.
   - `relock_hidden`: `{}` — calls `conversationUI.relock()`.
   - `handle_conversation_actions`: `{"state": {...}}` — calls `handleConversationActions(state: state)`.
-  - `label_create`: `{"name": "...", "color_hex": "...", "conversation_ids": [...]}` — calls `createConversationLabel(...)` and awaits store/API sync.
+  - `label_create`: `{"name": "...", "color_hex": "...", "conversation_ids": [...]}` (with step inputs `"now_ms": <int64>`, `"rand4": "<4-char string>"`) — sets the engine's `nowMs` / `randomTag4` seams for this step and calls `createConversationLabel(...)`, yielding deterministic id `"lbl_<now_ms>_<rand4>"`, then awaits store/API sync.
   - `label_update`: `{"id": "...", "name": "...", "color_hex": "..."}` — calls `updateConversationLabel(...)` and awaits store/API sync.
   - `label_delete`: `{"id": "..."}` — calls `deleteConversationLabel(id)` and awaits store/API sync.
   - `label_assign`: `{"conversation_id": "...", "label_id": <str|null>}` — calls `setConversationLabel(...)` and awaits store/API sync.

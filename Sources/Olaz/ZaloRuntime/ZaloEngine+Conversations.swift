@@ -136,7 +136,7 @@ extension ZaloEngine {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         var next = conversationExtras
-        let id = "lbl_\(Int64(Date().timeIntervalSince1970 * 1000))_\(UUID().uuidString.prefix(4))"
+        let id = "lbl_\(nowMs())_\(randomTag4())"
         let label = ConversationExtras.Label(id: id, name: trimmed, colorHex: colorHex, convIds: conversationIds)
         next.labels.append(label)
         var map = next.labelByConversation
