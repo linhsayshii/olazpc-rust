@@ -3,8 +3,8 @@ import OlazCore
 
 /// How the Rust Signal engine (`olaz-signal`, ADR-015) takes part in 1-1 E2EE.
 ///
-/// * `.off`: JavaScriptCore only (`OLAZ_RUST_CORE=0`, or the Rust store failed to load).
-/// * `.shadow` (default when the Rust core is on): JS stays authoritative and the only writer of
+/// * `.off`: JavaScriptCore only (the Rust store failed to load, or explicit test mode).
+/// * `.shadow` (default): JS stays authoritative and the only writer of
 ///   `zaloE2EEPCStoreV1`; Rust decrypts a throw-away copy of every incoming cipher and only
 ///   compares plaintext.
 /// * `.authoritative`: `OLAZ_E2EE_RUST=1` or the `olaz.e2eeRust` UserDefaults bool. Rust decrypts,
@@ -15,13 +15,11 @@ enum E2EERustMode: Sendable, Equatable {
 
     static let defaultsKey = "olaz.e2eeRust"
 
-    /// Read once per manager. `OLAZ_RUST_CORE=0` (RustCore.isEnabled false) disables both modes.
+    /// Read once per manager.
     static func resolve(
-        rustCoreEnabled: Bool = RustCore.isEnabled,
         env: [String: String] = ProcessInfo.processInfo.environment,
         defaults: UserDefaults = .standard
     ) -> E2EERustMode {
-        guard rustCoreEnabled else { return .off }
         if let flag = env["OLAZ_E2EE_RUST"] { return flag == "1" ? .authoritative : .shadow }
         if defaults.object(forKey: defaultsKey) as? Bool == true { return .authoritative }
         return .shadow

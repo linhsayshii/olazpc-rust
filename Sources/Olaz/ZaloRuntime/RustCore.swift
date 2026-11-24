@@ -1,19 +1,8 @@
 import Foundation
 import OlazCore
 
-/// Flag and shared helpers for the Rust core cutover (rust/DECISIONS.md ADR-011). The Swift path is the opt-out fallback;
-/// `OLAZ_RUST_CORE` / the `olaz.rustCore` UserDefaults bool (default on, ADR-012) routes the chat path (store, wire parser, `zpw_ws`
-/// socket, chat HTTP calls) through the `OlazCore` UniFFI module. Read once at launch.
+/// Shared helpers for the `OlazCore` UniFFI boundary (ADR-017: Rust is the sole implementation).
 enum RustCore {
-    static let defaultsKey = "olaz.rustCore"
-
-    /// On by default since the live check of 2026-11-23 (ADR-012). Opt out with `OLAZ_RUST_CORE=0`
-    /// or `defaults write app.olaz.mac olaz.rustCore -bool false`.
-    static let isEnabled: Bool = {
-        if let env = ProcessInfo.processInfo.environment["OLAZ_RUST_CORE"] { return env != "0" }
-        return UserDefaults.standard.object(forKey: defaultsKey) as? Bool ?? true
-    }()
-
     // MARK: Errors
 
     /// Maps a Rust-core error to the Swift error the engine already reacts to (`ZaloSessionError.isAuthError` re-login,

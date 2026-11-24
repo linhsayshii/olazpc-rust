@@ -214,13 +214,11 @@ private func converse(_ mgr: ZaloE2EEManager, store: ZaloSQLiteStore, idBase: In
         let suite = "olaz.test.e2eeRust.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
-        #expect(E2EERustMode.resolve(rustCoreEnabled: true, env: [:], defaults: defaults) == .shadow)
-        #expect(E2EERustMode.resolve(rustCoreEnabled: false, env: ["OLAZ_E2EE_RUST": "1"], defaults: defaults) == .off)
-        #expect(E2EERustMode.resolve(rustCoreEnabled: true, env: ["OLAZ_E2EE_RUST": "1"], defaults: defaults) == .authoritative)
-        #expect(E2EERustMode.resolve(rustCoreEnabled: true, env: ["OLAZ_E2EE_RUST": "0"], defaults: defaults) == .shadow)
+        #expect(E2EERustMode.resolve(env: [:], defaults: defaults) == .shadow)
+        #expect(E2EERustMode.resolve(env: ["OLAZ_E2EE_RUST": "1"], defaults: defaults) == .authoritative)
+        #expect(E2EERustMode.resolve(env: ["OLAZ_E2EE_RUST": "0"], defaults: defaults) == .shadow)
         defaults.set(true, forKey: E2EERustMode.defaultsKey)
-        #expect(E2EERustMode.resolve(rustCoreEnabled: true, env: [:], defaults: defaults) == .authoritative)
-        #expect(E2EERustMode.resolve(rustCoreEnabled: false, env: [:], defaults: defaults) == .off)
+        #expect(E2EERustMode.resolve(env: [:], defaults: defaults) == .authoritative)
     }
 
     @Test func shadowComparatorClassifiesWithoutLeakingValues() {

@@ -2296,7 +2296,7 @@ struct ZaloHistoryPage: @unchecked Sendable {
     let lastMsgId: String
     /// Sender / quote-owner uids a parse looks contact names up for.
     let uids: [String]
-    let rustBatch: HistoryBatch?
+    let rustBatch: HistoryBatch
 
     init(record: HistoryRecord) {
         hasMore = record.hasMore
@@ -2308,7 +2308,6 @@ struct ZaloHistoryPage: @unchecked Sendable {
 
     /// The raw answer (`{error_code, data}`); this crosses the bridge as JSON, so use it sparingly.
     var box: ZaloJSONBox {
-        guard let rustBatch else { return ZaloJSONBox() }
-        return ZaloJSONBox(RustCore.object(rustBatch.rawJson()))
+        ZaloJSONBox(RustCore.object(rustBatch.rawJson()))
     }
 }

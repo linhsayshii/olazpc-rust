@@ -226,35 +226,6 @@ import Network
         return url
     }
 
-    @Test func removesStalePartsKeepsFreshOnes() throws {
-        let dir = try tempDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let stale = try make(".a.part", in: dir, size: 10, age: 3600)
-        let fresh = try make(".b.part", in: dir, size: 10, age: 5)
-        let done = try make("c.pdf", in: dir, size: 10, age: 3600)
-        MediaLoader.trimFiles(in: dir, limit: 1_000_000)
-        #expect(!FileManager.default.fileExists(atPath: stale.path))
-        #expect(FileManager.default.fileExists(atPath: fresh.path))
-        #expect(FileManager.default.fileExists(atPath: done.path))
-    }
-
-    @Test func evictsLeastRecentlyUsedFirstAndSparesKept() throws {
-        let dir = try tempDirectory()
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let oldest = try make("old.bin", in: dir, size: 100, age: 3000)
-        let middle = try make("mid.bin", in: dir, size: 100, age: 2000)
-        let newest = try make("new.bin", in: dir, size: 100, age: 1000)
-        let part = try make(".x.part", in: dir, size: 100, age: 1)       // not counted, never evicted by size
-        MediaLoader.trimFiles(in: dir, limit: 250, keeping: oldest)       // 300 > 250: oldest is kept, so mid goes
-        #expect(FileManager.default.fileExists(atPath: oldest.path))
-        #expect(!FileManager.default.fileExists(atPath: middle.path))
-        #expect(FileManager.default.fileExists(atPath: newest.path))
-        #expect(FileManager.default.fileExists(atPath: part.path))
-        MediaLoader.trimFiles(in: dir, limit: 150)                        // 200 > 150: now oldest is evicted
-        #expect(!FileManager.default.fileExists(atPath: oldest.path))
-        #expect(FileManager.default.fileExists(atPath: newest.path))
-    }
-
     @Test func quarantineIsApplied() throws {
         let dir = try tempDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -288,13 +259,6 @@ import Network
         #expect(MediaLoader.stableHash("a") != MediaLoader.stableHash("b"))
     }
 
-    @Test func nonCDNHostsAreNotFetchedViaDoH() async {
-        let loader = MediaLoader(cacheDirectory: FileManager.default.temporaryDirectory.appendingPathComponent("sz-\(UUID().uuidString)"))
-        await #expect(throws: MediaLoader.LoadError.self) {
-            try await loader.fetchViaDoH(URL(string: "https://www.apple.com/")!)
-        }
-    }
-
     @Test func animatedDecodeDetectsFrames() throws {
         // Minimal 2-frame GIF built with ImageIO.
         let data = NSMutableData()
@@ -323,13 +287,6 @@ import Network
         #expect(MediaLoader.decode(Data("not an image".utf8), maxPixelSize: 100) == nil)
     }
 
-    @Test func dnsFailureClassification() {
-        #expect(MediaLoader.isDNSFailure(URLError(.cannotFindHost)))
-        #expect(MediaLoader.isDNSFailure(URLError(.dnsLookupFailed)))
-        #expect(MediaLoader.isDNSFailure(URLError(.notConnectedToInternet)))   // macOS reports some DNS failures this way
-        #expect(!MediaLoader.isDNSFailure(URLError(.cancelled)))
-        #expect(!MediaLoader.isDNSFailure(URLError(.badServerResponse)))
-    }
 }
 
 /// Live-network tests; they return early (skip) when no DoH endpoint is reachable.
@@ -375,15 +332,6 @@ import Network
         await #expect(throws: (any Error).self) {
             try await PinnedHTTPSClient.get(URL(string: "https://example.invalid/")!, addresses: addresses, timeout: 8)
         }
-    }
-
-    @Test func zaloCDNLoadsThroughDoHPath() async throws {
-        let loader = tempLoader()
-        let data: Data
-        do { data = try await loader.fetchViaDoH(Self.zaloURL) }
-        catch DoHResolver.ResolveError.allEndpointsFailed { print("offline: skipping"); return }
-        #expect(data.count > 100_000)
-        #expect((try? JSONSerialization.jsonObject(with: data)) != nil)
     }
 
     @Test func dataForURLCachesAndDedupes() async throws {

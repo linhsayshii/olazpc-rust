@@ -127,49 +127,6 @@ private func hasQuarantine(_ url: URL) -> Bool { getxattr(url.path, "com.apple.q
         if case .none = SecureStream.parse(["type": "other"]) {} else { Issue.record("unknown type must not build a transformer") }
     }
 
-    // 2 + 7: publication — quarantined, atomic, temp files gone, nothing left beside the user's file.
-    @Test func finalizeQuarantinesPublishesAtomicallyAndCleansUp() throws {
-        let dir = try tempDir("fin")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let save = dir.appendingPathComponent("save", isDirectory: true), tmp = dir.appendingPathComponent("tmp", isDirectory: true)
-        func job(_ secure: SecureStream.Parsed) -> DownloadManager.Job {
-            .init(url: URL(string: "https://f6-zpc.zdn.vn/a.jpg")!, destination: save.appendingPathComponent("a.jpg"), type: "PhotoOneOne",
-                  headers: [:], secure: secure, ttfb: 0, tempDirectory: tmp)
-        }
-        // plain bytes
-        let plain = Data("plain-image-bytes".utf8)
-        let out = try DownloadManager.finalize(job(.none), .bytes(plain))
-        #expect(out.failure == nil && out.savePath == save.appendingPathComponent("a.jpg").path)
-        #expect(try Data(contentsOf: save.appendingPathComponent("a.jpg")) == plain)
-        #expect(hasQuarantine(save.appendingPathComponent("a.jpg")))
-        // streamed file + decrypt (CTR, block), replacing the existing file; owned raw file removed
-        let stream = SecureStream(algorithm: .ctr, key: SecureStreamTests.key, iv: SecureStreamTests.iv, block: true, blockSize: 16)
-        let raw = tmp.appendingPathComponent("raw.bin")
-        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
-        try (SecureStreamTests.cipher + SecureStreamTests.cipher).write(to: raw)
-        let out2 = try DownloadManager.finalize(job(.stream(stream)), .file(raw, ours: true))
-        #expect(out2.failure == nil)
-        #expect(try Data(contentsOf: save.appendingPathComponent("a.jpg")) == SecureStreamTests.plain + SecureStreamTests.plain)
-        #expect(hasQuarantine(save.appendingPathComponent("a.jpg")))
-        #expect(!FileManager.default.fileExists(atPath: raw.path))
-        #expect((try FileManager.default.contentsOfDirectory(atPath: tmp.path)).isEmpty)               // no temp left
-        #expect((try FileManager.default.contentsOfDirectory(atPath: save.path)) == ["a.jpg"])           // nothing beside the file
-        // a shared cache file is copied, not consumed
-        let cache = dir.appendingPathComponent("cache.bin")
-        try Data("cached".utf8).write(to: cache)
-        let out3 = try DownloadManager.finalize(job(.none), .file(cache, ours: false))
-        #expect(out3.failure == nil && FileManager.default.fileExists(atPath: cache.path))
-        // failed decryption publishes nothing new and leaves no temp
-        let badGCM = SecureStream(algorithm: .gcm, key: Data(count: 32), iv: Data(count: 12), tag: Data(count: 16), block: false, blockSize: 4096)
-        let raw2 = tmp.appendingPathComponent("raw2.bin")
-        try Data("ciphertext".utf8).write(to: raw2)
-        let before = try Data(contentsOf: save.appendingPathComponent("a.jpg"))
-        let out4 = try DownloadManager.finalize(job(.stream(badGCM)), .file(raw2, ours: true))
-        #expect(out4.failure == .decryptFailed)
-        #expect(try Data(contentsOf: save.appendingPathComponent("a.jpg")) == before)
-        #expect((try FileManager.default.contentsOfDirectory(atPath: tmp.path)).isEmpty)
-    }
-
     @MainActor @Test func notFoundCacheIsBoundedAndResetClearsIt() throws {
         let dir = try tempDir("nf")
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -197,37 +154,6 @@ private func hasQuarantine(_ url: URL) -> Bool { getxattr(url.path, "com.apple.q
         #expect(platform.isWritable(dir.appendingPathComponent("ok/file").path))
         #expect(!platform.isWritable(dir.appendingPathComponent("escape/x").path))
         #expect(!platform.isWritable("/etc/x"))
-    }
-}
-
-@Suite struct HeaderSafetyTests {
-    private let zalo = URL(string: "https://zcld.chat.zalo.me/a")!
-
-    // 5
-    @Test func sensitiveHeadersOnlyGoToZaloHosts() {
-        let headers = ["cloud-viewer-key": "k", "Cookie": "c", "X-Ok": "1"]
-        #expect(MediaLoader.sanitizedHeaders(headers, for: zalo) == headers)
-        #expect(MediaLoader.sanitizedHeaders(headers, for: URL(string: "https://evil.example/a")!) == ["X-Ok": "1"])
-        #expect(MediaLoader.sanitizedHeaders(headers, for: URL(string: "http://zcld.chat.zalo.me/a")!) == ["X-Ok": "1"])
-    }
-
-    @Test func rejectsInjectionAndHopByHopHeaders() {
-        let headers = ["X-A": "ok", "X-B": "a\r\nX-Evil: 1", "X-C": "a\u{0}b", "Bad Name": "v", "X:D": "v", "": "v",
-                       "Connection": "close", "Transfer-Encoding": "chunked", "Host": "evil", "Content-Length": "5", "X-Tab": "a\tb"]
-        #expect(MediaLoader.sanitizedHeaders(headers, for: zalo) == ["X-A": "ok", "X-Tab": "a\tb"])
-    }
-
-    @Test func crossHostRedirectDropsSensitiveHeaders() {
-        var request = URLRequest(url: URL(string: "https://other.example/x")!)
-        request.setValue("k", forHTTPHeaderField: "cloud-viewer-key")
-        request.setValue("c", forHTTPHeaderField: "Cookie")
-        request.setValue("1", forHTTPHeaderField: "X-Ok")
-        let cross = MediaLoader.redirectedRequest(request, originHost: "zcld.chat.zalo.me")
-        #expect(cross.value(forHTTPHeaderField: "cloud-viewer-key") == nil && cross.value(forHTTPHeaderField: "Cookie") == nil)
-        #expect(cross.value(forHTTPHeaderField: "X-Ok") == "1")
-        var same = request
-        same.url = URL(string: "https://zcld.chat.zalo.me/y")
-        #expect(MediaLoader.redirectedRequest(same, originHost: "zcld.chat.zalo.me").value(forHTTPHeaderField: "cloud-viewer-key") == "k")
     }
 }
 

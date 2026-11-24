@@ -57,7 +57,7 @@ actor ZaloE2EEManager {
         globalIdResolver = resolver
     }
 
-    /// `mode == nil` resolves the flags (`OLAZ_RUST_CORE`, `OLAZ_E2EE_RUST`, `olaz.e2eeRust`); tests pass one.
+    /// `mode == nil` resolves the flags (`OLAZ_E2EE_RUST`, `olaz.e2eeRust`); tests pass one.
     /// `logSink == nil` writes to the engine log.
     init(mode: E2EERustMode? = nil, logSink: (@Sendable (String) -> Void)? = nil) {
         let resolved = mode ?? E2EERustMode.resolve()

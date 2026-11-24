@@ -226,7 +226,7 @@ final class ZaloEngine {
                 self?.recentLog.removeFirst(count - 200)
             }
         }
-        EngineLog.shared.write("engine: start native runtime core=\(RustCore.isEnabled ? "rust" : "swift") (zpw_ver=\(ZaloDomains.zpwVer))")
+        EngineLog.shared.write("engine: start native runtime core=rust (zpw_ver=\(ZaloDomains.zpwVer))")
         NativeNotifier.shared.attach(engine: self)
         ZaloRuntime.prepareForLaunch()
         call.helperInstalled = CallBridge.isHelperInstalled()
