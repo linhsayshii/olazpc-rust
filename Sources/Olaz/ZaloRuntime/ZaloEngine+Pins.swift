@@ -120,7 +120,9 @@ extension ZaloWireParser {
             let kind: String
             switch JSONLossless.int64(row["type"]) ?? 2 {
             case 3: kind = "poll"
-            case 0, 1: kind = "reminder"
+            // Official topic types: 0 note ("tạo ghi chú"), 1 reminder.
+            case 0: kind = "note"
+            case 1: kind = "reminder"
             default: kind = "message"
             }
             let senderUid = stripUserPrefix(JSONLossless.string(params["senderUid"] ?? params["senderId"] ?? row["creatorId"]))

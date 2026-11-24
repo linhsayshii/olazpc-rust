@@ -25,6 +25,7 @@ struct ChatInspector: View {
     @State private var showGroupLink = false
     @State private var showApproval = false
     @State private var showReport = false
+    @State private var showNote = false
     @State private var confirmLeaveGroup = false
     @State private var leavingGroup = false
     @State private var confirmBlock = false
@@ -75,6 +76,7 @@ struct ChatInspector: View {
                 Task { await loadMembers() }
             }
         }
+        .sheet(isPresented: $showNote) { GroupNoteSheet(groupId: id) }
         .sheet(isPresented: $showReport) { ReportSheet(conversationId: id, name: conversation.displayName) }
         .sheet(isPresented: $showGroupLink) { GroupLinkSheet(groupId: id, canManage: myRoleCanManage) }
         .sheet(isPresented: $showApproval) {
@@ -277,6 +279,8 @@ struct ChatInspector: View {
     private func groupBoard(_ polls: [LoadedPolls.Poll]) -> some View {
         section("Bảng tin nhóm") {
             list {
+                row(symbol: "note.text.badge.plus", title: "Tạo ghi chú") { showNote = true }
+                Divider().padding(.leading, 40)
                 row(symbol: "plus.circle", title: "Tạo bình chọn") { showPollCreate = true }
                 ForEach(polls.prefix(listLimit)) { poll in
                     Divider().padding(.leading, 40)
