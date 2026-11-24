@@ -850,9 +850,17 @@ private struct MessageList: View {
         let rows = cache.rows(for: msgs)
         let hasMore = engine.hasMoreHistory(in: id) ?? false
         let newestId = msgs.last?.id
+        let base = listOverlay(msgs: msgs, rows: rows, hasMore: hasMore, newestId: newestId)
+        let withHistory = withHistoryObservers(base, msgs: msgs, hasMore: hasMore)
+        withNavigationObservers(withHistory, msgs: msgs)
+            .overlay(alignment: .bottomTrailing) { scrollToBottomButton }
+            .animation(.snappy(duration: 0.2), value: nearBottom)
+    }
+
+    private func listOverlay(msgs: [ChatMessage], rows: [ChatRow], hasMore: Bool, newestId: String?) -> some View {
         let engine = engine
         let id = id
-        Color.clear
+        return Color.clear
             .overlay {
                 ChatListView(
                     conversationId: id, rows: rows, isGroup: conversation.isGroup, newestId: newestId,
@@ -869,6 +877,10 @@ private struct MessageList: View {
                 // The part of the list the bars cover (it is drawn under them, edge to edge).
                 .onGeometryChange(for: EdgeInsets.self) { $0.safeAreaInsets } action: { insets = $0 }
             }
+    }
+
+    private func withHistoryObservers<V: View>(_ content: V, msgs: [ChatMessage], hasMore: Bool) -> some View {
+        content
             .onChange(of: atTop) { _, _ in maybeLoadOlder(hasMore: hasMore, count: msgs.count) }
             .onChange(of: olderArmed) { _, _ in maybeLoadOlder(hasMore: hasMore, count: msgs.count) }
             .onChange(of: hasMore) { _, now in
@@ -892,6 +904,10 @@ private struct MessageList: View {
                 olderTask?.cancel()
                 maybeLoadOlder(hasMore: hasMore, count: msgs.count)
             }
+    }
+
+    private func withNavigationObservers<V: View>(_ content: V, msgs: [ChatMessage]) -> some View {
+        content
             .onChange(of: msgs.last?.id) { old, _ in
                 guard old != nil else { return }
                 if nearBottom || msgs.last?.isMine == true { commands.scrollToBottom(animated: true) }
@@ -918,21 +934,22 @@ private struct MessageList: View {
                 showInitialPosition()
             }
             .onDisappear { olderTask?.cancel() }
-            .overlay(alignment: .bottomTrailing) {
-                if !nearBottom {
-                    Button {
-                        commands.scrollToBottom(animated: true)
-                    } label: {
-                        Image(systemName: "chevron.down").font(.system(size: 13, weight: .bold))
-                    }
-                    .buttonStyle(.glass)
-                    .buttonBorderShape(.circle)
-                    .padding(14)
-                    .transition(.scale.combined(with: .opacity))
-                    .accessibilityLabel("Cuộn xuống tin nhắn mới nhất")
-                }
+    }
+
+    @ViewBuilder
+    private var scrollToBottomButton: some View {
+        if !nearBottom {
+            Button {
+                commands.scrollToBottom(animated: true)
+            } label: {
+                Image(systemName: "chevron.down").font(.system(size: 13, weight: .bold))
             }
-            .animation(.snappy(duration: 0.2), value: nearBottom)
+            .buttonStyle(.glass)
+            .buttonBorderShape(.circle)
+            .padding(14)
+            .transition(.scale.combined(with: .opacity))
+            .accessibilityLabel("Cuộn xuống tin nhắn mới nhất")
+        }
     }
 
     private func metricsChanged(_ m: ChatListMetrics, hasMore: Bool, count: Int) {
