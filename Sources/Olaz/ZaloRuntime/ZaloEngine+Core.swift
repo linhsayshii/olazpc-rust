@@ -2,19 +2,86 @@ import Foundation
 import OlazCore
 import os
 
-/// Thread-safe holder for the `CoreEngine` handle and its `@MainActor` change-mirror task so
-/// `ZaloEngine.deinit` (nonisolated) can cleanly stop the Rust actor without racing with init.
+/// Thread-safe, cancellation-safe one-shot gate backing `bootTask` / `qrTask` / `pendingCleanupTask`
+/// so recorder and lifecycle waiters complete on every terminal path without leaking tasks.
+internal final class CorePhaseGate: Sendable {
+    private struct State: @unchecked Sendable {
+        var completed = false
+        var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    func finish() {
+        let pending: [CheckedContinuation<Void, Never>] = state.withLock { st in
+            guard !st.completed else { return [] }
+            st.completed = true
+            let list = Array(st.waiters.values)
+            st.waiters.removeAll()
+            return list
+        }
+        for waiter in pending {
+            waiter.resume()
+        }
+    }
+
+    private func cancelWaiter(_ id: UUID) {
+        let waiter: CheckedContinuation<Void, Never>? = state.withLock { st in
+            st.waiters.removeValue(forKey: id)
+        }
+        waiter?.resume()
+    }
+
+    func wait() async {
+        let alreadyDone = state.withLock { $0.completed }
+        guard !alreadyDone else { return }
+        let id = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let resumeNow: Bool = state.withLock { st in
+                    if st.completed || Task.isCancelled {
+                        return true
+                    }
+                    st.waiters[id] = continuation
+                    return false
+                }
+                if resumeNow {
+                    continuation.resume()
+                }
+            }
+        } onCancel: { [weak self] in
+            self?.cancelWaiter(id)
+        }
+    }
+}
+
+/// Thread-safe holder for the `CoreEngine` handle, its `@MainActor` change-mirror task, and active
+/// lifecycle gates so `ZaloEngine.deinit` (nonisolated), `stopCoreEngine()`, and change-loop exit
+/// can cleanly stop the Rust actor and finish all gates without racing or leaking tasks.
 final class CoreEngineLifecycle: Sendable {
+    enum GateSlot {
+        case boot
+        case qr
+        case cleanup
+    }
+
     private struct State: @unchecked Sendable {
         var core: CoreEngine?
         var changeTask: Task<Void, Never>?
         var isShutDown = false
+        var bootGate: CorePhaseGate?
+        var qrGate: CorePhaseGate?
+        var cleanupGate: CorePhaseGate?
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
 
     var core: CoreEngine? {
         state.withLock { $0.core }
+    }
+
+    var isShutDown: Bool {
+        state.withLock { $0.isShutDown }
     }
 
     /// Installs a freshly created `CoreEngine` and its change-stream task. Returns `false` if
@@ -28,18 +95,97 @@ final class CoreEngineLifecycle: Sendable {
         }
     }
 
-    /// Stops the Rust actor and cancels the change-mirror loop. Safe to call from `deinit`.
+    /// Replaces the gate in `slot`, finishing any previous gate. Returns `nil` if already shut down.
+    func replaceGate(_ slot: GateSlot) -> CorePhaseGate? {
+        let (previous, fresh): (CorePhaseGate?, CorePhaseGate?) = state.withLock { st in
+            let old: CorePhaseGate?
+            switch slot {
+            case .boot:
+                old = st.bootGate
+                st.bootGate = nil
+            case .qr:
+                old = st.qrGate
+                st.qrGate = nil
+            case .cleanup:
+                old = st.cleanupGate
+                st.cleanupGate = nil
+            }
+            guard !st.isShutDown else { return (old, nil) }
+            let next = CorePhaseGate()
+            switch slot {
+            case .boot: st.bootGate = next
+            case .qr: st.qrGate = next
+            case .cleanup: st.cleanupGate = next
+            }
+            return (old, next)
+        }
+        previous?.finish()
+        return fresh
+    }
+
+    func hasGate(_ slot: GateSlot) -> Bool {
+        state.withLock { st in
+            switch slot {
+            case .boot: return st.bootGate != nil
+            case .qr: return st.qrGate != nil
+            case .cleanup: return st.cleanupGate != nil
+            }
+        }
+    }
+
+    func finishGate(_ slot: GateSlot) {
+        let gate: CorePhaseGate? = state.withLock { st in
+            switch slot {
+            case .boot:
+                let g = st.bootGate
+                st.bootGate = nil
+                return g
+            case .qr:
+                let g = st.qrGate
+                st.qrGate = nil
+                return g
+            case .cleanup:
+                let g = st.cleanupGate
+                st.cleanupGate = nil
+                return g
+            }
+        }
+        gate?.finish()
+    }
+
+    func finishAllGates() {
+        let gates: [CorePhaseGate] = state.withLock { st in
+            let list = [st.bootGate, st.qrGate, st.cleanupGate].compactMap { $0 }
+            st.bootGate = nil
+            st.qrGate = nil
+            st.cleanupGate = nil
+            return list
+        }
+        for gate in gates {
+            gate.finish()
+        }
+    }
+
+    /// Stops the Rust actor, cancels the change-mirror loop, and finishes all active gates.
+    /// Safe to call from nonisolated `deinit`.
     func shutdown() {
-        let (core, task): (CoreEngine?, Task<Void, Never>?) = state.withLock { st in
+        let (core, task, gates): (CoreEngine?, Task<Void, Never>?, [CorePhaseGate]) = state.withLock { st in
             st.isShutDown = true
             let c = st.core
             let t = st.changeTask
+            let g = [st.bootGate, st.qrGate, st.cleanupGate].compactMap { $0 }
             st.core = nil
             st.changeTask = nil
-            return (c, t)
+            st.bootGate = nil
+            st.qrGate = nil
+            st.cleanupGate = nil
+            return (c, t, g)
         }
         task?.cancel()
         core?.stop()
+        for gate in gates {
+            gate.finish()
+        }
     }
 }
 
@@ -49,35 +195,6 @@ enum PendingCoreCommand {
     case refreshQr
     case logOut
     case sessionExpired(String)
-}
-
-/// One-shot `@MainActor` gate backing `bootTask` / `qrTask` / `pendingCleanupTask` so recorder
-/// tests awaiting lifecycle completion synchronize with the Rust actor cleanly.
-@MainActor
-internal final class CorePhaseGate {
-    private var completed = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    func finish() {
-        guard !completed else { return }
-        completed = true
-        let pending = waiters
-        waiters.removeAll()
-        for waiter in pending {
-            waiter.resume()
-        }
-    }
-
-    func wait() async {
-        guard !completed else { return }
-        await withCheckedContinuation { continuation in
-            if completed {
-                continuation.resume()
-                return
-            }
-            waiters.append(continuation)
-        }
-    }
 }
 
 /// Bridges `olaz-core` host effects onto `ZaloEngine` and `ZaloSessionClient` (ADR-016).
@@ -232,23 +349,46 @@ extension ZaloEngine {
         if let existing = coreLifecycle.core {
             return existing
         }
+        if coreLifecycle.isShutDown {
+            pendingCoreCommands.removeAll()
+            failAllMirrorWaiters()
+            coreLifecycle.finishAllGates()
+            return nil
+        }
         if let existingTask = coreInitTask {
             return await existingTask.value
         }
 
         let initTask = Task<CoreEngine?, Never> { @MainActor [weak self] in
             guard let self else { return nil }
+            guard !self.coreLifecycle.isShutDown else {
+                self.pendingCoreCommands.removeAll()
+                self.failAllMirrorWaiters()
+                self.coreLifecycle.finishAllGates()
+                return nil
+            }
             guard let coreSession = await self.sessionClient.sharedCoreSession() else {
                 EngineLog.shared.write("core: failed to create shared CoreSession")
+                self.pendingCoreCommands.removeAll()
+                self.failAllMirrorWaiters()
+                self.coreLifecycle.finishAllGates()
                 return nil
             }
             let host = ZaloEngineCoreHost(engine: self)
             guard let core = try? CoreEngine(session: coreSession, host: host) else {
                 EngineLog.shared.write("core: failed to start CoreEngine")
+                self.pendingCoreCommands.removeAll()
+                self.failAllMirrorWaiters()
+                self.coreLifecycle.finishAllGates()
                 return nil
             }
 
-            let changeTask = Task { @MainActor [weak self, core] in
+            let lifecycle = self.coreLifecycle
+            let changeTask = Task { @MainActor [weak self, core, lifecycle] in
+                defer {
+                    lifecycle.finishAllGates()
+                    self?.failAllMirrorWaiters()
+                }
                 while !Task.isCancelled {
                     do {
                         guard let batch = try await core.nextChanges() else { break }
@@ -258,13 +398,14 @@ extension ZaloEngine {
                         break
                     }
                 }
-                self?.failAllMirrorWaiters()
-                self?.finishAllCorePhaseGates()
             }
 
             guard self.coreLifecycle.install(core: core, changeTask: changeTask) else {
                 changeTask.cancel()
                 core.stop()
+                self.pendingCoreCommands.removeAll()
+                self.failAllMirrorWaiters()
+                self.coreLifecycle.finishAllGates()
                 return nil
             }
 
@@ -284,6 +425,7 @@ extension ZaloEngine {
 
     /// Sends a command to `CoreEngine`, preserving FIFO order if `CoreEngine` is still initializing.
     internal func dispatchCoreCommand(_ command: PendingCoreCommand) {
+        guard !coreLifecycle.isShutDown else { return }
         armCorePhaseGates(for: command)
         if let core = coreLifecycle.core, pendingCoreCommands.isEmpty {
             Self.sendCommand(command, to: core)
@@ -298,58 +440,47 @@ extension ZaloEngine {
     private func armCorePhaseGates(for command: PendingCoreCommand) {
         switch command {
         case .start:
-            let gate = CorePhaseGate()
-            bootPhaseGate = gate
-            bootTask = Task { @MainActor in
-                await gate.wait()
+            if let gate = coreLifecycle.replaceGate(.boot) {
+                bootTask = Task { @MainActor in
+                    await gate.wait()
+                }
             }
         case .refreshQr:
-            qrPhaseGate?.finish()
-            let gate = CorePhaseGate()
-            qrPhaseGate = gate
-            qrTask = Task { @MainActor in
-                await gate.wait()
+            coreLifecycle.finishGate(.boot)
+            if let gate = coreLifecycle.replaceGate(.qr) {
+                qrTask = Task { @MainActor in
+                    await gate.wait()
+                }
             }
         case .logOut, .sessionExpired:
-            bootPhaseGate?.finish()
-            bootPhaseGate = nil
-            cleanupPhaseGate?.finish()
-            let cleanupGate = CorePhaseGate()
-            cleanupPhaseGate = cleanupGate
-            pendingCleanupTask = Task { @MainActor in
-                await cleanupGate.wait()
+            coreLifecycle.finishGate(.boot)
+            if let cleanupGate = coreLifecycle.replaceGate(.cleanup) {
+                pendingCleanupTask = Task { @MainActor in
+                    await cleanupGate.wait()
+                }
             }
-            qrPhaseGate?.finish()
-            let qrGate = CorePhaseGate()
-            qrPhaseGate = qrGate
-            qrTask = Task { @MainActor in
-                await qrGate.wait()
+            if let qrGate = coreLifecycle.replaceGate(.qr) {
+                qrTask = Task { @MainActor in
+                    await qrGate.wait()
+                }
             }
         }
     }
 
     internal func noteCoreBootCompleted() {
-        bootPhaseGate?.finish()
-        bootPhaseGate = nil
+        coreLifecycle.finishGate(.boot)
     }
 
     internal func noteCoreQRCompleted() {
-        qrPhaseGate?.finish()
-        qrPhaseGate = nil
+        coreLifecycle.finishGate(.qr)
     }
 
     internal func noteCoreCleanupCompleted() {
-        cleanupPhaseGate?.finish()
-        cleanupPhaseGate = nil
+        coreLifecycle.finishGate(.cleanup)
     }
 
     internal func finishAllCorePhaseGates() {
-        bootPhaseGate?.finish()
-        bootPhaseGate = nil
-        qrPhaseGate?.finish()
-        qrPhaseGate = nil
-        cleanupPhaseGate?.finish()
-        cleanupPhaseGate = nil
+        coreLifecycle.finishAllGates()
     }
 
     /// Applies an account profile update through `olaz-core` and suspends until the resulting
@@ -364,9 +495,9 @@ extension ZaloEngine {
 
     /// Stops `CoreEngine` and its change-mirror loop (used in tests and teardown).
     internal func stopCoreEngine() {
+        pendingCoreCommands.removeAll()
         coreLifecycle.shutdown()
         failAllMirrorWaiters()
-        finishAllCorePhaseGates()
     }
 
     internal func hostNotePrepareStoreStarted() {
@@ -414,19 +545,22 @@ extension ZaloEngine {
 
             // Update lifecycle gates when boot hands off to QR or QR reaches a terminal failure/expiry.
             if case .login(let login) = mappedPhase {
-                if bootPhaseGate != nil {
-                    noteCoreBootCompleted()
-                    if qrPhaseGate == nil {
-                        let qrGate = CorePhaseGate()
-                        qrPhaseGate = qrGate
-                        qrTask = Task { @MainActor in
-                            await qrGate.wait()
+                if coreLifecycle.hasGate(.boot) {
+                    coreLifecycle.finishGate(.boot)
+                    switch login.step {
+                    case .generating, .waitingScan, .waitingConfirm:
+                        if !coreLifecycle.hasGate(.qr), let qrGate = coreLifecycle.replaceGate(.qr) {
+                            qrTask = Task { @MainActor in
+                                await qrGate.wait()
+                            }
                         }
+                    case .expired, .failed:
+                        break
                     }
                 }
                 switch login.step {
                 case .expired, .failed:
-                    noteCoreQRCompleted()
+                    coreLifecycle.finishGate(.qr)
                 case .generating, .waitingScan, .waitingConfirm:
                     break
                 }

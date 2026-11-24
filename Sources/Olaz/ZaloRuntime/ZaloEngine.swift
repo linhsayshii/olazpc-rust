@@ -142,9 +142,6 @@ final class ZaloEngine {
     @ObservationIgnored internal var pendingCleanupTask: Task<Void, Never>?
     @ObservationIgnored internal var bootTask: Task<Void, Never>?
     @ObservationIgnored internal var qrTask: Task<Void, Never>?
-    @ObservationIgnored internal var bootPhaseGate: CorePhaseGate?
-    @ObservationIgnored internal var qrPhaseGate: CorePhaseGate?
-    @ObservationIgnored internal var cleanupPhaseGate: CorePhaseGate?
     @ObservationIgnored internal var wsTask: Task<Void, Never>?
     @ObservationIgnored internal var lpPollTask: Task<Void, Never>?
     @ObservationIgnored internal var bootstrapTask: Task<Void, Never>?
