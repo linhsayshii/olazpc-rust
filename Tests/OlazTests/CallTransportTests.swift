@@ -296,7 +296,9 @@ private final class CallHarness {
 
     deinit { try? FileManager.default.removeItem(at: base) }
 
-    func wait(_ what: String, timeout: Double = 5, _ condition: () -> Bool) async -> Bool {
+    /// Polls `condition`; returns as soon as it holds. The budget is generous because CI runners can starve the main
+    /// actor for seconds while other suites run in parallel.
+    func wait(_ what: String, timeout: Double = 30, _ condition: () -> Bool) async -> Bool {
         let end = Date.now.addingTimeInterval(timeout)
         while Date.now < end {
             if condition() { return true }
@@ -323,7 +325,7 @@ private final class CallHarness {
         let got = await h.wait("3 messages") { native.received.count >= 3 }
         #expect(got)
         let received = native.received
-        #expect(received.count == 3)
+        try #require(received.count == 3)
         #expect(received[0].contains("\"command\":\"init\""))
         #expect(received[1].contains("\"act\":\"x\""))
         #expect(received[2] == big)   // multi-chunk message arrives intact

@@ -148,13 +148,13 @@ private final class LocalServer: @unchecked Sendable {
         let loader = MediaLoader(cacheDirectory: dir, allowPlainHTTP: true)
         let url = URL(string: "http://127.0.0.1:\(server.port)/hang.bin")!
         let task = Task { try await loader.data(for: url, deadline: 60) }
-        for _ in 0..<100 where server.hits == 0 { try await Task.sleep(for: .milliseconds(20)) }
+        await pollUntil { server.hits > 0 }
         #expect(server.hits == 1)
         let started = ContinuousClock.now
         task.cancel()
         await #expect(throws: CancellationError.self) { try await task.value }
         #expect(ContinuousClock.now - started < .seconds(3))
-        for _ in 0..<100 where server.closed == 0 { try await Task.sleep(for: .milliseconds(20)) }
+        await pollUntil { server.closed > 0 }
         #expect(server.closed == 1, "the client connection must be closed after cancel")
     }
 

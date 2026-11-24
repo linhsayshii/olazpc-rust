@@ -370,19 +370,28 @@ private func hasQuarantine(_ url: URL) -> Bool { getxattr(url.path, "com.apple.q
     }
 
     // 8: queued work whose views are gone is dropped, and the newest request is served first.
-    @MainActor @Test func queueIsLIFOAndDropsCancelledWork() async {
+    // Driven by state, not sleeps: a slow runner must not let the head finish before the others queue.
+    @MainActor @Test func queueIsLIFOAndDropsCancelledWork() async throws {
         let resolver = MediaResolver(maxConcurrent: 1)
         var order: [String] = []
-        let gate = Task { @MainActor in
-            await resolver.resolve(key: "head") { try? await Task.sleep(for: .milliseconds(80)); order.append("head"); return .expired }
+        var openHead: CheckedContinuation<Void, Never>?
+        let head = Task { @MainActor in
+            await resolver.resolve(key: "head") {
+                await withCheckedContinuation { openHead = $0 }      // holds the only slot until the test opens it
+                order.append("head"); return .expired
+            }
         }
-        try? await Task.sleep(for: .milliseconds(20))             // head holds the only slot
+        try #require(await pollUntil { openHead != nil })
         let stale = Task { @MainActor in await resolver.resolve(key: "stale") { order.append("stale"); return .expired } }
+        try #require(await pollUntil { resolver.queuedCount == 1 })
         let older = Task { @MainActor in await resolver.resolve(key: "older") { order.append("older"); return .expired } }
+        try #require(await pollUntil { resolver.queuedCount == 2 })
         let newest = Task { @MainActor in await resolver.resolve(key: "newest") { order.append("newest"); return .expired } }
-        try? await Task.sleep(for: .milliseconds(20))
+        try #require(await pollUntil { resolver.queuedCount == 3 })
         stale.cancel()                                            // its view scrolled away while queued
-        _ = await gate.value; _ = await older.value; _ = await newest.value; _ = await stale.value
+        try #require(await pollUntil { resolver.queuedCount == 2 })
+        openHead?.resume()
+        _ = await head.value; _ = await older.value; _ = await newest.value; _ = await stale.value
         #expect(order == ["head", "newest", "older"])
     }
 }

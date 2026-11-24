@@ -123,7 +123,7 @@ import AppKit
 
     /// Animated zooms take their time under a loaded test run: wait for `condition` instead of for a fixed delay.
     @MainActor private func settle(_ condition: () -> Bool) async {
-        for _ in 0..<300 where !condition() { try? await Task.sleep(for: .milliseconds(10)) }
+        await pollUntil(condition)
     }
 
     @MainActor @Test func lockedChatNeverOrdersTheViewerFront() {
@@ -265,7 +265,7 @@ import AppKit
     }
 
     @MainActor private func waitUntilLoaded(_ playback: VideoPlayback) async {
-        for _ in 0..<100 where playback.status == .loading { try? await Task.sleep(for: .milliseconds(50)) }
+        await pollUntil { playback.status != .loading }
     }
 
     /// Runs `body` with the persisted volume / mute restored afterwards (the keys are shared by every test and player).
@@ -303,7 +303,7 @@ import AppKit
     }
 
     @MainActor private func waitUntilSeekLands(_ playback: VideoPlayback) async {
-        for _ in 0..<200 where playback.isSeeking { try? await Task.sleep(for: .milliseconds(10)) }
+        await pollUntil { !playback.isSeeking }
     }
 
     @Test @MainActor func scrubEndsAtOnceAndPlaybackResumesEvenIfALaterSeekSupersedesTheExactOne() async throws {
