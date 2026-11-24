@@ -233,4 +233,51 @@ import UserNotifications
         #expect(groupIntent.__image(forParameterNamed: "speakableGroupName") != nil)
         #expect(groupIntent.keyImage() != nil)
     }
+
+    @Test func badgedAvatarPutsAccountAvatarInBottomRightCorner() throws {
+        let sender = try #require(Self.solidPNG(red: 0, green: 0, blue: 255))
+        let badge = try #require(Self.solidPNG(red: 255, green: 0, blue: 0))
+        let png = try #require(NotificationPolicy.badgedAvatarPNGData(sender: sender, badge: badge, size: 100))
+        let pixels = try Self.rgba(png, size: 100)
+        // Top-left corner lies outside the sender circle: transparent.
+        #expect(pixels(2, 2).a == 0)
+        // Center is the sender (blue); the bottom-right badge center (0.79, 0.79) is the account (red).
+        #expect(pixels(50, 50) == (0, 0, 255, 255))
+        #expect(pixels(79, 79) == (255, 0, 0, 255))
+        // The white ring separates them.
+        #expect(pixels(79, 59) == (255, 255, 255, 255))
+
+        let plain = try #require(NotificationPolicy.badgedAvatarPNGData(sender: sender, badge: nil, size: 100))
+        #expect(try Self.rgba(plain, size: 100)(79, 79) == (0, 0, 255, 255))
+    }
+
+    private static func solidPNG(red: UInt8, green: UInt8, blue: UInt8) -> Data? {
+        let size = 32
+        guard let ctx = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.setFillColor(red: CGFloat(red) / 255, green: CGFloat(green) / 255, blue: CGFloat(blue) / 255, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
+        guard let image = ctx.makeImage() else { return nil }
+        let out = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(out, UTType.png.identifier as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(dest, image, nil)
+        return CGImageDestinationFinalize(dest) ? out as Data : nil
+    }
+
+    /// Pixel reader with a top-left origin (x right, y down), RGBA premultiplied.
+    private static func rgba(_ png: Data, size: Int) throws -> (Int, Int) -> (r: UInt8, g: UInt8, b: UInt8, a: UInt8) {
+        let source = try #require(CGImageSourceCreateWithData(png as CFData, nil))
+        let image = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        var buffer = [UInt8](repeating: 0, count: size * size * 4)
+        let ctx = try #require(CGContext(data: &buffer, width: size, height: size, bitsPerComponent: 8, bytesPerRow: size * 4,
+                                         space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: size, height: size))
+        let copy = buffer
+        return { x, y in
+            let i = (y * size + x) * 4
+            return (copy[i], copy[i + 1], copy[i + 2], copy[i + 3])
+        }
+    }
 }

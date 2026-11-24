@@ -216,6 +216,48 @@ enum NotificationPolicy {
         return encodePNG(outImage)
     }
 
+    /// Banner image: the sender's avatar as a circle, with the active account's avatar in a small circle at the
+    /// bottom-right corner (white ring), on a transparent square. Without `badgePNGData` it is the plain circle.
+    static func badgedAvatarPNGData(sender senderPNGData: Data, badge badgePNGData: Data?, size: Int = 256) -> Data? {
+        guard size > 0,
+              let senderSource = CGImageSourceCreateWithData(senderPNGData as CFData, nil),
+              let senderImage = CGImageSourceCreateImageAtIndex(senderSource, 0, nil),
+              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(
+                  data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
+                  space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else {
+            return nil
+        }
+        ctx.interpolationQuality = .high
+        let side = CGFloat(size)
+        let full = CGRect(x: 0, y: 0, width: side, height: side)
+        ctx.saveGState()
+        ctx.addEllipse(in: full)
+        ctx.clip()
+        ctx.draw(senderImage, in: full)
+        ctx.restoreGState()
+
+        if let badgePNGData,
+           let badgeSource = CGImageSourceCreateWithData(badgePNGData as CFData, nil),
+           let badgeImage = CGImageSourceCreateImageAtIndex(badgeSource, 0, nil) {
+            // CoreGraphics origin is bottom-left: x near the right edge, y near 0 is the bottom-right corner.
+            let ringDiameter = side * 0.42
+            let ring = CGRect(x: side - ringDiameter, y: 0, width: ringDiameter, height: ringDiameter)
+            ctx.setFillColor(CGColor(colorSpace: colorSpace, components: [1, 1, 1, 1])!)
+            ctx.fillEllipse(in: ring)
+            let inset = ringDiameter * 0.08
+            let badgeRect = ring.insetBy(dx: inset, dy: inset)
+            ctx.saveGState()
+            ctx.addEllipse(in: badgeRect)
+            ctx.clip()
+            ctx.draw(badgeImage, in: badgeRect)
+            ctx.restoreGState()
+        }
+        guard let outImage = ctx.makeImage() else { return nil }
+        return encodePNG(outImage)
+    }
+
     static func buildCommunicationIntent(
         for request: NativeNotificationRequest,
         body: String,
@@ -284,6 +326,7 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     private var focusObservers: [NSObjectProtocol] = []
     private var sounds: [NSSound] = []
+    private var accountBadgeCache: (key: String, png: Data?)?
     private var attached = false
     private var orphanDrafts = FailedDraftStore()
     private var knownHidden: Set<String> = []
@@ -367,14 +410,21 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
         interaction.direction = .incoming
         await Self.donateIncomingInteraction(interaction, timeoutSeconds: 1)
 
+        // Thumbnail on the banner's right: sender avatar with the active account's avatar in the corner. macOS
+        // keeps the app icon on the left unless the build carries the communication-notifications entitlement.
+        if let avatarPNG {
+            let accountBadge = await accountAvatarPNGData()
+            let composite = NotificationPolicy.badgedAvatarPNGData(sender: avatarPNG, badge: accountBadge) ?? avatarPNG
+            if let attachment = makeAttachment(pngData: composite) {
+                content.attachments = [attachment]
+            }
+        }
+
         let finalContent: UNNotificationContent
         do {
             finalContent = try content.updating(from: intent)
         } catch {
             notifierLog.error("updating notification from INSendMessageIntent failed: \(error.localizedDescription, privacy: .public)")
-            if let avatarPNG, let attachment = makeAttachment(pngData: avatarPNG) {
-                content.attachments = [attachment]
-            }
             finalContent = content
         }
 
@@ -404,6 +454,20 @@ final class NativeNotifier: NSObject, UNUserNotificationCenterDelegate {
             return normalized
         }
         return NotificationPolicy.monogramAvatarPNGData(for: fallbackName)
+    }
+
+    /// The logged-in account's avatar (normalized PNG), cached per account + avatar URL so each banner
+    /// does not refetch it. Falls back to a monogram of the display name.
+    private func accountAvatarPNGData() async -> Data? {
+        guard let profile = engine?.profile else { return nil }
+        let key = profile.userId + "|" + (profile.avatar?.absoluteString ?? "")
+        if let accountBadgeCache, accountBadgeCache.key == key { return accountBadgeCache.png }
+        let png = await resolveAvatarPNGData(for: profile.avatar.map { .remote($0) }, fallbackName: profile.displayName)
+        // Keep a monogram fallback only briefly: a failed download should be retried on the next banner.
+        if profile.avatar == nil || png != NotificationPolicy.monogramAvatarPNGData(for: profile.displayName) {
+            accountBadgeCache = (key, png)
+        }
+        return png
     }
 
     private func makeAttachment(pngData: Data) -> UNNotificationAttachment? {
