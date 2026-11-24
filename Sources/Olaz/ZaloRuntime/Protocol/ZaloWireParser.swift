@@ -63,6 +63,16 @@ enum ZaloWireParser {
         id.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// A person's name from a friend / profile row, as the official `getDName` falls back after the alias: `zaloName`
+    /// first. `displayName` on friend rows can carry the name from the phone's contacts, which the official PC does not show.
+    static func preferredName(_ row: [String: Any]) -> String {
+        for key in ["zaloName", "zalo_name", "displayName", "display_name", "dName", "name"] {
+            let value = JSONLossless.string(row[key]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !value.isEmpty { return value }
+        }
+        return ""
+    }
+
     static func sanitizeProfileUid(_ raw: String) -> String? {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !s.isEmpty else { return nil }

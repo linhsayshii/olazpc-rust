@@ -109,7 +109,7 @@ extension ZaloEngine {
             for (uid, row) in profilesMap {
                 let trimmed = ZaloWireParser.stripUserPrefix(uid)
                 let clean = ZaloWireParser.sanitizeProfileUid(trimmed) ?? trimmed
-                let fetchedName = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+                let fetchedName = ZaloWireParser.preferredName(row)
                 let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
                 if !clean.isEmpty, (!fetchedName.isEmpty || !avt.isEmpty) {
                     cachedProfiles[clean] = ZaloWebKitMigrator.CachedProfile(name: fetchedName, avatar: avt)
@@ -499,7 +499,7 @@ extension ZaloEngine {
                     let profilesMap = ZaloWireParser.extractProfilesMap(profBox.dict)
                     for uid in cleanIds {
                         guard let row = profilesMap[uid] else { continue }
-                        let name = JSONLossless.string(row["dName"] ?? row["displayName"] ?? row["zaloName"] ?? row["name"])
+                        let name = ZaloWireParser.preferredName(row)
                         let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
                         if !name.isEmpty {
                             candidates.append(MentionCandidate(id: uid, name: name, avatar: avt.isEmpty ? nil : URL(string: avt), isAll: false))
@@ -616,7 +616,7 @@ extension ZaloEngine {
             var cacheChanged = false
             for (uid, row) in profilesMap {
                 let clean = ZaloWireParser.sanitizeProfileUid(uid) ?? ZaloWireParser.stripUserPrefix(uid)
-                let fetchedName = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+                let fetchedName = ZaloWireParser.preferredName(row)
                 let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
                 if !clean.isEmpty && (!fetchedName.isEmpty || !avt.isEmpty) {
                     cachedProfiles[clean] = ZaloWebKitMigrator.CachedProfile(name: fetchedName, avatar: avt)

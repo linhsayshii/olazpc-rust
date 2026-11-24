@@ -70,6 +70,33 @@ enum ChatFormat {
     /// URL scheme used for clickable @mentions (handled by `MessageRow`, never opened externally).
     static let mentionScheme = "zalomention"
 
+    /// Official MENTION_TOKEN rendering: a mention shows "@" + the member's current name (`getMemberFriendlyName`:
+    /// alias first), else the text as sent. Returns the text with each known mention replaced and the ranges moved.
+    static func renamingMentions(_ s: String, mentions: [Mention], name: (String) -> String?) -> (text: String, mentions: [Mention]) {
+        guard !mentions.isEmpty else { return (s, mentions) }
+        let ns = s as NSString
+        let valid = mentions.filter { $0.pos >= 0 && $0.len > 1 && $0.pos + $0.len <= ns.length && ns.character(at: $0.pos) == 0x40 }
+        // Overlapping ranges: keep the text as sent.
+        let sorted = valid.sorted { $0.pos < $1.pos }
+        guard valid.count == mentions.count,
+              zip(sorted, sorted.dropFirst()).allSatisfy({ $0.pos + $0.len <= $1.pos }) else { return (s, mentions) }
+        let out = NSMutableString(string: s)
+        var renamed: [Mention] = []
+        var shift = 0
+        for var m in sorted {
+            let replacement = m.isAll ? nil : name(m.uid).map { "@" + $0 }
+            m.pos += shift
+            if let replacement, replacement != ns.substring(with: NSRange(location: m.pos - shift, length: m.len)) {
+                out.replaceCharacters(in: NSRange(location: m.pos, length: m.len), with: replacement)
+                let newLen = (replacement as NSString).length
+                shift += newLen - m.len
+                m.len = newLen
+            }
+            renamed.append(m)
+        }
+        return (out as String, renamed)
+    }
+
     /// Link-detected text plus official @mention highlighting. Ranges are the message's
     /// `mentions` (UTF-16 offsets); a range that does not start with "@" is ignored.
     /// Mentions of me (or everyone) get a subtle background.
@@ -638,14 +665,19 @@ struct MessageRow: View {
         }
     }
 
-    private func textBody(_ original: String) -> some View {
+    private func textBody(_ sent: String) -> some View {
         let size = scaled(14), mine = mine, myId = engine.profile?.userId
         let accent = ChatPalette.accent(accentStored)
-        // Rich text: list markers go into the drawn text, the message's offsets move with them.
         let styles = message.textStyles
+        // @mentions show the member's current name (alias first). Not with text styles: their offsets index the sent text.
+        let named = styles.isEmpty && sent == message.text
+            ? ChatFormat.renamingMentions(sent, mentions: message.mentions, name: { engine.mentionDisplayName($0) })
+            : (text: sent, mentions: message.mentions)
+        let original = named.text
+        // Rich text: list markers go into the drawn text, the message's offsets move with them.
         let rich = styles.isEmpty ? nil : ChatFormat.richLayout(original, styles: styles)
         let text = rich?.text ?? original
-        let mentions = rich.map { ChatFormat.mapped(message.mentions, $0) } ?? message.mentions
+        let mentions = rich.map { ChatFormat.mapped(named.mentions, $0) } ?? named.mentions
         let styleKey = styles.map { "\($0.start),\($0.len),\($0.st)" }.joined(separator: ";")
         var attributed = mentions.isEmpty
             ? ChatFormat.linkified(text, mine: mine)

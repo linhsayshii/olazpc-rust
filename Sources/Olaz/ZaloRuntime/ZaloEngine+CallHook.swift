@@ -538,7 +538,7 @@ extension ZaloEngine {
            let profBox = try? await sessionClient.fetchProfiles(uids: profileUids) {
             for (uid, row) in ZaloWireParser.extractProfilesMap(profBox.dict) {
                 let c = ZaloWireParser.stripUserPrefix(uid)
-                let n = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+                let n = ZaloWireParser.preferredName(row)
                 let a = JSONLossless.string(row["avatar"] ?? row["avt"])
                 if !c.isEmpty, (!n.isEmpty || !a.isEmpty) {
                     cachedProfiles[c] = ZaloWebKitMigrator.CachedProfile(name: n, avatar: a)
@@ -652,7 +652,7 @@ extension ZaloEngine {
                    let profBox = try? await sessionClient.fetchProfiles(uids: profileFetchUids) {
                     for (uid, row) in ZaloWireParser.extractProfilesMap(profBox.dict) {
                         let c = ZaloWireParser.stripUserPrefix(uid)
-                        let n = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+                        let n = ZaloWireParser.preferredName(row)
                         let a = JSONLossless.string(row["avatar"] ?? row["avt"])
                         if !c.isEmpty, (!n.isEmpty || !a.isEmpty) {
                             cachedProfiles[c] = ZaloWebKitMigrator.CachedProfile(name: n, avatar: a)

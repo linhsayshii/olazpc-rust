@@ -676,6 +676,7 @@ final class ZaloEngine {
                 }
             sortConversations(&summaries)
             conversations = summaries
+            await refreshMentionPreviews()
         }
 
         let hiddenIds = Set((try? await store.getPreferenceStrings(key: "hiddenIds")) ?? [])
@@ -935,7 +936,7 @@ final class ZaloEngine {
             guard !profilesMap.isEmpty else { continue }
             for (uid, row) in profilesMap {
                 let clean = ZaloWireParser.stripUserPrefix(uid)
-                let fetchedName = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+                let fetchedName = ZaloWireParser.preferredName(row)
                 let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
                 if !clean.isEmpty, (!fetchedName.isEmpty || !avt.isEmpty) {
                     cachedProfiles[clean] = ZaloWebKitMigrator.CachedProfile(name: fetchedName, avatar: avt)
@@ -947,7 +948,7 @@ final class ZaloEngine {
             for i in list.indices {
                 guard !list[i].isGroup, let row = profilesMap[list[i].id] else { continue }
                 let alias = cachedAliases[list[i].id]
-                let fetchedName = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+                let fetchedName = ZaloWireParser.preferredName(row)
                 let bestName = (alias?.isEmpty == false) ? alias! : fetchedName
                 let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
                 if !bestName.isEmpty && list[i].name != bestName {
@@ -1160,7 +1161,7 @@ final class ZaloEngine {
                     if let profBox = try? await sessionClient.fetchProfiles(uids: [cleanSenderId]) {
                         let profilesMap = ZaloWireParser.extractProfilesMap(profBox.dict)
                         if let row = profilesMap[cleanSenderId] {
-                            let fetchedName = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+                            let fetchedName = ZaloWireParser.preferredName(row)
                             let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
                             if !fetchedName.isEmpty || !avt.isEmpty {
                                 cachedProfiles[cleanSenderId] = ZaloWebKitMigrator.CachedProfile(name: fetchedName, avatar: avt)
@@ -1485,6 +1486,30 @@ final class ZaloEngine {
 
     // MARK: - Shared Helpers for Extensions
 
+    /// The list preview of `msg`: `messagePreviewLabel` with its @mentions showing the member's current name (alias first),
+    /// as in the chat.
+    internal func conversationPreviewText(_ msg: ChatMessage) -> String {
+        let label = Self.messagePreviewLabel(msg)
+        guard !msg.mentions.isEmpty, label == msg.text.trimmingCharacters(in: .whitespacesAndNewlines) else { return label }
+        return ChatFormat.renamingMentions(msg.text, mentions: msg.mentions, name: { self.mentionDisplayName($0) })
+            .text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Stored list previews hold the text as sent: redo those that may carry an @mention from the newest stored message.
+    internal func refreshMentionPreviews() async {
+        guard let store = sqliteStore else { return }
+        for conv in conversations where conv.isGroup && (conv.preview?.text.contains("@") ?? false) {
+            guard let latest = (try? await store.decodedMessages(convId: conv.id, limit: 1))?.last?.message,
+                  !latest.mentions.isEmpty,
+                  let idx = conversations.firstIndex(where: { $0.id == conv.id }),
+                  let preview = conversations[idx].preview,
+                  preview.text == Self.messagePreviewLabel(latest) else { continue }
+            let text = conversationPreviewText(latest)
+            guard text != preview.text else { continue }
+            conversations[idx].preview?.text = text
+        }
+    }
+
     internal static func messagePreviewLabel(_ msg: ChatMessage) -> String {
         let trimmed = msg.text.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty { return trimmed }
@@ -1723,7 +1748,7 @@ final class ZaloEngine {
         var list = conversations
         let isGrp = ZaloWireParser.isGroupId(msg.conversationId)
         let preview = ConversationSummary.Preview(
-            text: Self.messagePreviewLabel(msg),
+            text: conversationPreviewText(msg),
             date: msg.date,
             fromMe: msg.isMine
         )
