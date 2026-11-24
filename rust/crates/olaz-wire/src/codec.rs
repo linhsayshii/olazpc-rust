@@ -2,7 +2,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::model::{Availability, ChatMessage, DeleteMode, Kind, StarMode, StoredMessage};
+use crate::model::{Availability, ChatMessage, DeleteMode, Kind, StarMode, StoredMessage, TextStyle};
 
 fn opt(url: &Option<String>) -> &str {
     url.as_deref().unwrap_or("")
@@ -233,6 +233,9 @@ pub fn encode_chat_message(msg: &ChatMessage, client_id: &str) -> Option<StoredM
         "stickers": msg.suggests_stickers,
         "menu": menu
     });
+    if let (false, Value::Object(m)) = (msg.text_styles.is_empty(), &mut canonical) {
+        m.insert("styles".into(), TextStyle::to_json(&msg.text_styles));
+    }
     if let (Some(q), Value::Object(m)) = (&msg.quote, &mut canonical) {
         m.insert(
             "quote".into(),

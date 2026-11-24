@@ -1343,3 +1343,24 @@ async fn api_error_exposes_session_error_and_auth_flag() {
     let e = unauth.fetch_archived_chats().await.unwrap_err();
     assert_eq!(e, ApiError::Net(NetError::NotAuthenticated));
 }
+
+/// Rich text: `textProperties` rides along unchanged on the plain and the quote payload (official `buildMsgParams`).
+#[tokio::test]
+async fn send_text_carries_text_properties() {
+    let api = api_with(|_| ok(json!({"msgId": "8800112299"})));
+    let tp = r#"{"styles":[{"len":3,"st":"b","start":0}],"ver":0}"#;
+    api.send_text(&SendTextArgs {
+        conv_id: "200",
+        text: "Đậm",
+        cli_msg_id: "1795000000999",
+        text_properties: Some(tp),
+        ..SendTextArgs::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(params_of(&last(&api))["textProperties"].as_str().unwrap(), tp);
+    api.send_text(&SendTextArgs { conv_id: "200", text: "x", cli_msg_id: "1", ..SendTextArgs::default() })
+        .await
+        .unwrap();
+    assert!(params_of(&last(&api)).get("textProperties").is_none());
+}

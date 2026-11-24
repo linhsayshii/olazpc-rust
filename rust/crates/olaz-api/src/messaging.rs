@@ -34,6 +34,8 @@ pub struct SendTextArgs<'a> {
     pub quote_text: Option<&'a str>,
     pub quote_ts_ms: Option<i64>,
     pub mentions: &'a [Mention],
+    /// Rich text: the official `textProperties` JSON (`{"styles":[…],"ver":0}`), sent with the message as is.
+    pub text_properties: Option<&'a str>,
 }
 
 fn mention_info(mentions: &[Mention]) -> Value {
@@ -246,6 +248,9 @@ impl<T: Transport> ZaloApi<T> {
                 "zsource": 101,
                 "imei": imei,
             });
+            if let Some(tp) = a.text_properties.filter(|t| !t.is_empty()) {
+                insert(&mut payload, "textProperties", Value::from(tp));
+            }
             if is_group {
                 insert(&mut payload, "grid", Value::from(clean_id.clone()));
                 insert(&mut payload, "visibility", Value::from(0));
@@ -277,6 +282,9 @@ impl<T: Transport> ZaloApi<T> {
                     "imei": imei,
                     "ttl": 0,
                 });
+                if let Some(tp) = a.text_properties.filter(|t| !t.is_empty()) {
+                    insert(&mut payload, "textProperties", Value::from(tp));
+                }
                 if is_group {
                     insert(&mut payload, "grid", Value::from(clean_id));
                     insert(&mut payload, "visibility", Value::from(0));

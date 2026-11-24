@@ -891,6 +891,11 @@ enum ZaloWireParser {
             canonical["undecryptedE2EE"] = true
         }
         if let quoteDict { canonical["quote"] = quoteDict }
+        // Rich text (`action: rtf`): the official `params.styles` ranges over the text.
+        if kindTag == "text" {
+            let styles = TextStyle.list(json: contentParams?["styles"])
+            if !styles.isEmpty { canonical["styles"] = styles.map(\.json) }
+        }
 
         guard let rawJSONData = try? JSONSerialization.data(withJSONObject: canonical, options: []),
               let chatMessage = ChatMessage(json: canonical, fallbackConversation: convId) else {
@@ -1044,6 +1049,7 @@ enum ZaloWireParser {
             "stickers": msg.suggestsStickers,
             "menu": menuDict
         ]
+        if !msg.textStyles.isEmpty { canonical["styles"] = msg.textStyles.map(\.json) }
         if let quote = msg.quote {
             canonical["quote"] = ["senderName": quote.senderName, "text": quote.text]
         }

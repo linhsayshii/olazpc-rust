@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::util::{
     as_bool_cast, as_dict, as_dict_array, as_str, clamped_int, ns_bool, ns_double, ns_int,
@@ -22,6 +22,35 @@ pub struct Mention {
     pub pos: i64,
     pub len: i64,
     pub is_all: bool,
+}
+
+/// One styled range of a rich-text message (official `textProperties.styles`): `start` / `len` are UTF-16 offsets,
+/// `st` the comma-separated style tokens (`b`, `i`, `u`, `s`, `c_<hex>`, `f_<size>`, `lst_1`, `lst_2`, `ind_<n>`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TextStyle {
+    pub start: i64,
+    pub len: i64,
+    pub st: String,
+}
+
+impl TextStyle {
+    /// `[{start, len, st}]`; entries without a style or a positive length are dropped.
+    pub fn list(value: Option<&Value>) -> Vec<TextStyle> {
+        as_dict_array(value)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|m| {
+                let st = as_str(m.get("st")).unwrap_or("").trim().to_string();
+                let start = clamped_int(ns_double(m.get("start")).unwrap_or(0.0));
+                let len = clamped_int(ns_double(m.get("len")).unwrap_or(0.0));
+                (!st.is_empty() && len > 0 && start >= 0).then_some(TextStyle { start, len, st })
+            })
+            .collect()
+    }
+
+    pub fn to_json(list: &[TextStyle]) -> Value {
+        Value::Array(list.iter().map(|s| json!({"start": s.start, "len": s.len, "st": s.st})).collect())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -384,6 +413,8 @@ pub struct ChatMessage {
     pub menu: MessageMenu,
     pub fallback_urls: Vec<String>,
     pub client_id: String,
+    /// Rich-text styles of a text message (empty for plain text).
+    pub text_styles: Vec<TextStyle>,
 }
 
 /// Row of the SQLite message table (`StoredMessage`).
@@ -803,6 +834,7 @@ impl ChatMessage {
                 .or_else(|| as_str(json.get("cliMsgId")))
                 .unwrap_or("")
                 .to_string(),
+            text_styles: TextStyle::list(json.get("styles")),
         })
     }
 }

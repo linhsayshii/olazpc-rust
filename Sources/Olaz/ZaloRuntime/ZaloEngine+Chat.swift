@@ -290,7 +290,8 @@ extension ZaloEngine {
 
     // MARK: - Send Text / Mentions
 
-    func sendText(_ text: String, to id: String, quoting quoteId: String? = nil, mentions: [Mention] = []) async -> Bool {
+    func sendText(_ text: String, to id: String, quoting quoteId: String? = nil, mentions: [Mention] = [],
+                  styles: [TextStyle] = []) async -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !id.isEmpty else { return false }
         resetOutgoingTyping(in: id)
@@ -332,6 +333,8 @@ extension ZaloEngine {
             ]),
             clientId: cliId
         )
+        // Rich text goes out on the plain path only (E2EE text is sent unstyled).
+        if !isE2EE { optimistic.textStyles = styles }
         mergeMessageIntoMemory(optimistic)
 
         func removeOptimistic() {
@@ -435,7 +438,8 @@ extension ZaloEngine {
                     quoteOwnerId: quote?.senderId,
                     quoteText: quote?.text,
                     quoteTsMs: quoteTsMs,
-                    mentions: mentions
+                    mentions: mentions,
+                    textProperties: TextStyle.textProperties(styles)
                 )
             }
             // Replace temporary client id with server msgId while avoiding duplicates.

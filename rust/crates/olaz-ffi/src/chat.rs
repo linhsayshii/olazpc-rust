@@ -4,7 +4,7 @@
 use olaz_wire::{
     Availability, CardButton, ChatMessage, ContactCard, DeleteMode, ECard, ECardStyle, Kind,
     LocationInfo, Mention, MessageMenu, OaPart, PollInfo, Quote, Reaction, ReactionIcon, StarMode,
-    Status,
+    Status, TextStyle,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -13,6 +13,14 @@ pub struct MessageMention {
     pub pos: i64,
     pub len: i64,
     pub is_all: bool,
+}
+
+/// A styled range of a rich-text message (see `olaz_wire::TextStyle`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TextStyleRecord {
+    pub start: i64,
+    pub len: i64,
+    pub st: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -264,6 +272,7 @@ pub struct ChatMessageRecord {
     pub menu: MenuRecord,
     pub fallback_urls: Vec<String>,
     pub client_id: String,
+    pub text_styles: Vec<TextStyleRecord>,
 }
 
 // ----- ChatMessage -> record -------------------------------------------------------------------
@@ -709,6 +718,11 @@ impl From<ChatMessage> for ChatMessageRecord {
             menu: (&m.menu).into(),
             fallback_urls: m.fallback_urls,
             client_id: m.client_id,
+            text_styles: m
+                .text_styles
+                .into_iter()
+                .map(|s| TextStyleRecord { start: s.start, len: s.len, st: s.st })
+                .collect(),
         }
     }
 }
@@ -776,6 +790,11 @@ impl From<&ChatMessageRecord> for ChatMessage {
             menu: (&r.menu).into(),
             fallback_urls: r.fallback_urls.clone(),
             client_id: r.client_id.clone(),
+            text_styles: r
+                .text_styles
+                .iter()
+                .map(|s| TextStyle { start: s.start, len: s.len, st: s.st.clone() })
+                .collect(),
         }
     }
 }

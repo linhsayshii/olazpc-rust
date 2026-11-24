@@ -108,9 +108,9 @@ enum ChatFormat {
     /// weight / color / background. Cached per text, side, size, accent and mentions, with its measured sizes.
     @MainActor
     static func messageText(_ s: String, mentions: [Mention], mine: Bool, myId: String?,
-                            size: CGFloat, accent: NSColor) -> MessageText {
+                            size: CGFloat, accent: NSColor, rich: RichLayout? = nil, styleKey: String = "") -> MessageText {
         let mentionKey = mentions.map { "\($0.uid),\($0.pos),\($0.len),\($0.isAll)" }.joined(separator: ";")
-        let key = "\(mine ? 1 : 0)|\(size)|\(accent.description)|\(myId ?? "")|\(mentionKey)|\(s)" as NSString
+        let key = "\(mine ? 1 : 0)|\(size)|\(accent.description)|\(myId ?? "")|\(mentionKey)|\(styleKey)|\(s)" as NSString
         if let hit = messageTextCache.object(forKey: key) { return hit }
         let text = mine ? NSColor.white : NSColor.labelColor
         let out = NSMutableAttributedString(string: s, attributes: [.font: NSFont.systemFont(ofSize: size), .foregroundColor: text])
@@ -137,6 +137,7 @@ enum ChatFormat {
                 out.addAttribute(.link, value: url, range: range)
             }
         }
+        if let rich { applyRich(rich, to: out, base: size) }
         // Same emoji as the SwiftUI `Text` underneath, so the selectable layer lines up with it.
         Emoticon.replace(in: out)
         let result = MessageText(out)
@@ -615,12 +616,20 @@ struct MessageRow: View {
         }
     }
 
-    private func textBody(_ text: String) -> some View {
-        let size = scaled(14), mentions = message.mentions, mine = mine, myId = engine.profile?.userId
+    private func textBody(_ original: String) -> some View {
+        let size = scaled(14), mine = mine, myId = engine.profile?.userId
         let accent = ChatPalette.accent(accentStored)
-        return Text(Emoticon.replacing(in: mentions.isEmpty
-             ? ChatFormat.linkified(text, mine: mine)
-             : ChatFormat.mentioned(text, mentions: mentions, mine: mine, myId: myId, size: size, accent: accent)))
+        // Rich text: list markers go into the drawn text, the message's offsets move with them.
+        let styles = message.textStyles
+        let rich = styles.isEmpty ? nil : ChatFormat.richLayout(original, styles: styles)
+        let text = rich?.text ?? original
+        let mentions = rich.map { ChatFormat.mapped(message.mentions, $0) } ?? message.mentions
+        let styleKey = styles.map { "\($0.start),\($0.len),\($0.st)" }.joined(separator: ";")
+        var attributed = mentions.isEmpty
+            ? ChatFormat.linkified(text, mine: mine)
+            : ChatFormat.mentioned(text, mentions: mentions, mine: mine, myId: myId, size: size, accent: accent)
+        if let rich { ChatFormat.applyRich(rich, to: &attributed, mine: mine, base: size) }
+        return Text(Emoticon.replacing(in: attributed))
             .font(.system(size: size))
             .fixedSize(horizontal: false, vertical: true)
             .environment(\.openURL, OpenURLAction { url in
@@ -634,13 +643,14 @@ struct MessageRow: View {
             // "Chặn chia sẻ" blocks selecting. Nothing but an empty view until clicked (see MessageTextSelection).
             .overlay {
                 MessageTextSelection(
-                    text: { ChatFormat.messageText(text, mentions: mentions, mine: mine, myId: myId, size: size, accent: NSColor(accent)) },
+                    text: { ChatFormat.messageText(text, mentions: mentions, mine: mine, myId: myId, size: size, accent: NSColor(accent),
+                                                   rich: rich, styleKey: styleKey) },
                     selectionColor: mine ? NSColor.white.withAlphaComponent(0.35) : NSColor.selectedTextBackgroundColor.withAlphaComponent(0.45),
                     allowsSelection: !message.menu.isProtected,
                     mentionScheme: ChatFormat.mentionScheme,
                     // A clicked @mention opens that member's 1-1 chat.
                     onMention: { uid in engine.navigationRequest = uid },
-                    identity: message.id + "|" + text)
+                    identity: message.id + "|" + text + "|" + styleKey)
             }
     }
 

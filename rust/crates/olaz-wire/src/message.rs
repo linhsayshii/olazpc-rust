@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 
 use crate::ids::{clean_group_id, group_conv_id, is_group_id, strip_user_prefix};
 use crate::lossless::{self, int64, string};
-use crate::model::{ChatMessage, Kind, ParsedWireEvent, ReactionIcon, StoredMessage, UNKNOWN_NAME};
+use crate::model::{ChatMessage, Kind, ParsedWireEvent, ReactionIcon, StoredMessage, TextStyle, UNKNOWN_NAME};
 use crate::signal::{is_signal_ciphertext, url_has_undecrypted_signal_cipher};
 use crate::util::{
     as_bool_cast, as_dict, as_dict_array, first_non_empty, ns_bool, ns_double, pick, pick_opt,
@@ -1155,6 +1155,13 @@ pub fn parse_wire_message(
     }
     if let Some(q) = quote {
         canonical.insert("quote".into(), q);
+    }
+    // Rich text (`action: rtf`): the official `params.styles` ranges over the text.
+    if kind_tag == "text" {
+        let styles = TextStyle::list(dd.p("styles"));
+        if !styles.is_empty() {
+            canonical.insert("styles".into(), TextStyle::to_json(&styles));
+        }
     }
 
     let Ok(raw_json_data) = serde_json::to_vec(&canonical) else {

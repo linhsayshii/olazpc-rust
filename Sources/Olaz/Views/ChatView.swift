@@ -15,6 +15,7 @@ struct ChatView: View {
 
     @State private var draft = ""
     @State private var draftMentions: [Mention] = []
+    @State private var draftStyles: [TextStyle] = []
     @State private var replyTo: ChatMessage?
     @State private var focusTick = 0
     @State private var sendTick = 0
@@ -99,6 +100,7 @@ struct ChatView: View {
                 isGroup: conversation.isGroup,
                 draft: $draft,
                 mentions: $draftMentions,
+                styles: $draftStyles,
                 replyTo: $replyTo,
                 focusTick: focusTick,
                 send: send,
@@ -237,6 +239,7 @@ struct ChatView: View {
         jumpTask = nil
         draft = ""
         draftMentions = []
+        draftStyles = []
         replyTo = nil
         notice = nil
         jumpTarget = nil
@@ -290,14 +293,15 @@ struct ChatView: View {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         // Untrimmed draft: the engine re-bases mention offsets when it trims.
-        let (sentDraft, sentMentions, sentReply) = (draft, draftMentions, replyTo)
+        let (sentDraft, sentMentions, sentReply, sentStyles) = (draft, draftMentions, replyTo, draftStyles)
         draft = ""
         draftMentions = []
+        draftStyles = []
         replyTo = nil
         sendTick += 1
         let (engine, id) = (engine, id)
         Task {
-            guard await !engine.sendText(sentDraft, to: id, quoting: sentReply?.id, mentions: sentMentions) else { return }
+            guard await !engine.sendText(sentDraft, to: id, quoting: sentReply?.id, mentions: sentMentions, styles: sentStyles) else { return }
             // Nothing was sent. The view may be gone by now (conversation switched): the engine keeps the text and the
             // composer shown for this conversation takes it back (`restoreFailedDraft`).
             engine.failedDrafts.stash(ComposerDraft(text: sentDraft, mentions: sentMentions, replyTo: sentReply), for: id)

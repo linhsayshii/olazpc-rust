@@ -625,6 +625,7 @@ fn base_message(kind: Kind, text: &str) -> ChatMessage {
         menu: MessageMenu::default(),
         fallback_urls: vec![],
         client_id: "c7001".into(),
+        text_styles: vec![],
     }
 }
 
@@ -1140,4 +1141,28 @@ fn group_poll_event_info_line() {
     assert_eq!(ev("share", "peer"), "Việt Linh chia sẻ cuộc bình chọn: Khỏe không");
     assert_eq!(ev("close", "peer"), "Việt Linh khóa bình chọn: Khỏe không");
     assert_eq!(ev("vote", "0"), "Bạn tham gia cuộc bình chọn: Khỏe không");
+}
+
+/// Rich text (official `action: rtf`, sent with `textProperties`): the text is `title`, the styles come from
+/// `params.styles` and survive the store round trip.
+#[test]
+fn rtf_styles_parse_and_round_trip() {
+    let (m, s) = msg_of(parse(
+        r#"{"msgId":"8601","cliMsgId":"1801","msgType":"webchat","uidFrom":"peer","idTo":"me","ts":"1",
+            "content":{"action":"rtf","title":"Đậm nghiêng","description":"","href":"","thumb":"","type":"","childnumber":0,
+            "params":"{\"styles\":[{\"start\":0,\"len\":3,\"st\":\"b\"},{\"start\":4,\"len\":7,\"st\":\"i,c_db342e\"},{\"start\":0,\"len\":0,\"st\":\"u\"}],\"ver\":0}"}}"#,
+        "me",
+    ));
+    assert_eq!(s.kind_tag, "text");
+    assert_eq!(m.text, "Đậm nghiêng");
+    assert_eq!(
+        m.text_styles,
+        vec![
+            TextStyle { start: 0, len: 3, st: "b".into() },
+            TextStyle { start: 4, len: 7, st: "i,c_db342e".into() },
+        ]
+    );
+    let stored = encode_chat_message(&m, "").unwrap();
+    let decoded = decode_stored_message(&stored).unwrap();
+    assert_eq!(decoded.text_styles, m.text_styles);
 }

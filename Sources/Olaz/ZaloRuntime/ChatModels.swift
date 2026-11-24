@@ -311,6 +311,8 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
     var fallbackURLs: [URL] = []
     /// Client-assigned ID (`cliMsgId` / `clientId`) required for recall (`undo`) and local correlation.
     var clientId: String = ""
+    /// Rich text (official `textProperties.styles`): styled UTF-16 ranges of `text`; empty for plain text.
+    var textStyles: [TextStyle] = []
 }
 
 /// The items of the official message context menu (message-actions-adapter.js `describe`, the builder's own conditions) with the
@@ -445,7 +447,8 @@ extension ChatMessage {
             suggestsStickers: json["stickers"] as? Bool ?? false,
             menu: MessageMenu(json: json["menu"]),
             fallbackURLs: fallbacks,
-            clientId: (json["clientId"] as? String) ?? (json["cliMsgId"] as? String) ?? ""
+            clientId: (json["clientId"] as? String) ?? (json["cliMsgId"] as? String) ?? "",
+            textStyles: TextStyle.list(json: json["styles"])
         )
     }
 }

@@ -36,7 +36,7 @@ pub use message::{
 pub use model::{
     Availability, CardButton, ChatMessage, ContactCard, DeleteMode, ECard, ECardStyle, Kind,
     LocationInfo, Mention, MessageMenu, OaPart, ParsedWireEvent, PollInfo, Quote, Reaction,
-    ReactionIcon, StarMode, Status, StoredMessage, UNKNOWN_NAME, web_link_sanitized,
+    ReactionIcon, StarMode, Status, StoredMessage, TextStyle, UNKNOWN_NAME, web_link_sanitized,
 };
 pub use signal::{
     is_signal_ciphertext, removing_percent_encoding, url_has_undecrypted_signal_cipher,
