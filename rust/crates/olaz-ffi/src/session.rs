@@ -4,7 +4,9 @@
 use std::sync::Arc;
 
 use olaz_json::to_swift_json_string;
-use olaz_net::{QrTicket, ReqwestTransport, SessionClient, SessionSnapshot, SessionStatus};
+use olaz_net::{
+    QrTicket, ReqwestTransport, SessionClient, SessionSnapshot, SessionStatus, ZaloDomains,
+};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -91,10 +93,12 @@ pub trait QrListener: Send + Sync {
     fn on_rotated(&self, ticket: QrTicketRecord);
 }
 
-/// The logged-in (or logging-in) session. Share it with [`crate::CoreApi`] (`CoreApi(session:)`).
+/// The logged-in (or logging-in) session. Share it with [`crate::CoreApi`] (`CoreApi(session:)`),
+/// [`crate::CoreHttp`] (`CoreHttp(session:)`), and [`crate::CoreEngine`] (`CoreEngine(session:host:)`).
 #[derive(uniffi::Object)]
 pub struct CoreSession {
     pub(crate) client: Arc<SessionClient<ReqwestTransport>>,
+    pub(crate) default_domains: Option<ZaloDomains>,
 }
 
 #[uniffi::export]
@@ -106,6 +110,36 @@ impl CoreSession {
         let client = SessionClient::new(transport, olaz_net::generate_imei(), computer_name);
         Ok(Arc::new(Self {
             client: Arc::new(client),
+            default_domains: None,
+        }))
+    }
+
+    /// A fresh session configured with an explicit IMEI and optional `ZaloDomains` JSON override.
+    /// Used so `CoreEngine`, `CoreApi`, and `CoreHttp` share one `SessionClient` from startup.
+    #[uniffi::constructor]
+    pub fn with_config(
+        imei: String,
+        computer_name: String,
+        domains_json: Option<String>,
+    ) -> Result<Arc<Self>, CoreError> {
+        let domains = match domains_json {
+            Some(json) => {
+                let parsed: ZaloDomains =
+                    serde_json::from_str(&json).map_err(|e| CoreError::Parse {
+                        message: format!("domains json: {e}"),
+                    })?;
+                Some(parsed)
+            }
+            None => None,
+        };
+        let transport = ReqwestTransport::new()?;
+        let client = SessionClient::new(transport, imei, computer_name);
+        if let Some(d) = &domains {
+            client.with_session(|s| s.domains = d.clone());
+        }
+        Ok(Arc::new(Self {
+            client: Arc::new(client),
+            default_domains: domains,
         }))
     }
 

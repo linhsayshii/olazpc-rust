@@ -5,6 +5,7 @@
 //! | Area | Items |
 //! |---|---|
 //! | misc | [`core_version`] |
+//! | core | [`CoreEngine`], [`CoreHost`], [`CoreChangesRecord`], [`SessionStateRecord`] (ADR-016) |
 //! | store | [`CoreStore`] (+ [`ConversationRow`], [`MessageRow`], [`MessagesAroundRow`]) |
 //! | session | [`CoreSession`] (restore/snapshot, QR login, status), [`QrListener`] |
 //! | api | [`CoreApi`] over a shared [`CoreSession`], [`poll_state_initial`] |
@@ -37,6 +38,7 @@
 
 mod api;
 mod chat;
+mod core;
 mod crypto;
 mod error;
 mod http;
@@ -55,6 +57,11 @@ pub use api::{
     poll_state_initial,
 };
 pub use chat::*;
+pub use core::{
+    CoreChangesRecord, CoreEngine, CoreFailKindRecord, CoreHost, FailReasonRecord,
+    LegacyCookieRecord, LoginAccountRecord, LoginStateRecord, LoginStepRecord, PhaseRecord,
+    ProfileRecord, SessionStateRecord,
+};
 pub use crypto::{decrypt_ws_frame, inflate};
 pub use error::{CoreError, NetworkKind};
 pub use http::{CoreHttp, HttpMethod, HttpRequestRecord, UploadPartRecord};
