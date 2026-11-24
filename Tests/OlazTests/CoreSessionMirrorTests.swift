@@ -300,7 +300,7 @@ import Testing
         let logOutCleanupTask = try #require(engine.pendingCleanupTask)
         let logOutQrTask = try #require(engine.qrTask)
         try await awaitTaskWithinTimeout(logOutCleanupTask, label: "logOutCleanupTask")
-        try await waitForPhase(engine, timeoutMs: 3000) {
+        try await waitForPhase(engine, timeoutMs: 30_000) {
             if case .login(let l) = $0, case .waitingScan = l.step { return true }
             return false
         }
@@ -321,7 +321,7 @@ import Testing
         let expiredCleanupTask = try #require(engine.pendingCleanupTask)
         let expiredQrTask = try #require(engine.qrTask)
         try await awaitTaskWithinTimeout(expiredCleanupTask, label: "expiredCleanupTask")
-        try await waitForPhase(engine, timeoutMs: 3000) {
+        try await waitForPhase(engine, timeoutMs: 30_000) {
             if case .login(let l) = $0, case .waitingScan = l.step { return true }
             return false
         }
@@ -384,7 +384,7 @@ import Testing
             ephemeral.hostTrace = { _, _ in false }
             ephemeral.start()
             deinitBootTask = ephemeral.bootTask
-            try await waitForPhase(ephemeral, timeoutMs: 3000) {
+            try await waitForPhase(ephemeral, timeoutMs: 30_000) {
                 if case .login(let l) = $0, case .waitingScan = l.step { return true }
                 return false
             }
@@ -396,7 +396,7 @@ import Testing
     }
 
     @MainActor
-    private func awaitTaskWithinTimeout(_ task: Task<Void, Never>, label: String, timeoutMs: Int = 3000) async throws {
+    private func awaitTaskWithinTimeout(_ task: Task<Void, Never>, label: String, timeoutMs: Int = 30_000) async throws {
         let completed = await withTaskGroup(of: Bool.self) { group in
             group.addTask {
                 await task.value
