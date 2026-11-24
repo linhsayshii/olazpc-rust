@@ -1,4 +1,5 @@
 import Foundation
+import OlazCore
 
 @MainActor
 extension ZaloEngine {
@@ -32,6 +33,20 @@ extension ZaloEngine {
         lpPollTask?.cancel()
         bootstrapTask?.cancel()
         transferTask?.cancel()
+    }
+
+    internal func settleForRecording() async {
+        let core: CoreEngine?
+        if let existing = coreLifecycle.core {
+            core = existing
+        } else if let initTask = coreInitTask {
+            core = await initTask.value
+        } else {
+            return
+        }
+        guard let core else { return }
+        guard let version = try? await core.settle() else { return }
+        await waitForMirrorVersion(version)
     }
 
     internal func finishTearDownForRecording() async {

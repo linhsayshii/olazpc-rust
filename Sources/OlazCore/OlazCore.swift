@@ -1269,6 +1269,12 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func refreshQr() 
     
     /**
+     * Enqueues a barrier on the actor mailbox and returns the change revision once every input
+     * enqueued before this call has been reduced and published (`0` if already stopped).
+     */
+    func settle() async throws  -> UInt64
+    
+    /**
      * Starts the engine (idempotent; subsequent calls are no-ops).
      */
     func start() 
@@ -1435,6 +1441,26 @@ open func refreshQr()  {try! rustCall() {
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
+}
+    
+    /**
+     * Enqueues a barrier on the actor mailbox and returns the change revision once every input
+     * enqueued before this call has been reduced and published (`0` if already stopped).
+     */
+open func settle()async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_settle(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -14307,6 +14333,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_refresh_qr() != 24041) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_settle() != 21321) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_start() != 22299) {

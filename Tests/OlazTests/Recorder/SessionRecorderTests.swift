@@ -238,6 +238,7 @@ struct SessionRecorderTests {
             }
             _ = await engine.pendingCleanupTask?.value
             await server.waitForScriptedRequests(timeoutMs: 2000)
+            await engine.settleForRecording()
             await Task.yield()
 
             try assertOnlyLocalFakeHosts(await engine.sessionClient.domains, context: "\(scenario.name) final")

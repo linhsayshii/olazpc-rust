@@ -21,6 +21,7 @@ enum ActorMsg {
         ack: Option<oneshot::Sender<u64>>,
     },
     Snapshot(oneshot::Sender<SessionSnapshot>),
+    Settle(oneshot::Sender<u64>),
     Stop,
 }
 
@@ -203,6 +204,16 @@ impl CoreHandle {
         self.changes.current_version()
     }
 
+    /// Enqueues a barrier on the actor mailbox and returns the change revision once every input
+    /// enqueued before this call has been reduced and published. Returns `None` once stopped.
+    pub async fn settle(&self) -> Option<u64> {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(ActorMsg::Settle(tx)).is_err() {
+            return None;
+        }
+        rx.await.ok()
+    }
+
     /// Reads the current [`SessionSnapshot`] directly from the actor (tests / diagnostics).
     pub async fn snapshot(&self) -> Option<SessionSnapshot> {
         let (tx, rx) = oneshot::channel();
@@ -290,6 +301,9 @@ async fn run_actor(
             ActorMsg::Snapshot(reply) => {
                 let _ = reply.send(state.session.snapshot());
             }
+            ActorMsg::Settle(reply) => {
+                let _ = reply.send(changes.current_version());
+            }
             ActorMsg::Stop => {
                 break;
             }
@@ -339,5 +353,24 @@ mod tests {
         );
         core.stop();
         assert!(core.next_changes().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn settle_waits_for_earlier_enqueued_inputs() {
+        let core = CoreHandle::start(Arc::new(NoopRunner), Handle::current());
+        let acc = LoginAccount {
+            user_id: "99".to_owned(),
+            display_name: "Barrier".to_owned(),
+            ..LoginAccount::default()
+        };
+        core.send(Command::ApplyAccountProfile(acc));
+        let rev = core.settle().await;
+        assert_eq!(rev, Some(1));
+
+        let batch = core.next_changes().await;
+        assert_eq!(batch.as_ref().map(|b| b.version), Some(1));
+
+        core.stop();
+        assert_eq!(core.settle().await, None);
     }
 }

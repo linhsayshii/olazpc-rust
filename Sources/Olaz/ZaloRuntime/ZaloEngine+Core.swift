@@ -651,10 +651,10 @@ extension ZaloEngine {
         await waitForMirrorVersion(target)
     }
 
-    private func waitForMirrorVersion(_ target: UInt64) async {
-        guard appliedMirrorVersion < target else { return }
+    internal func waitForMirrorVersion(_ target: UInt64) async {
+        guard appliedMirrorVersion < target, !coreLifecycle.isShutDown else { return }
         await withCheckedContinuation { continuation in
-            if appliedMirrorVersion >= target {
+            if appliedMirrorVersion >= target || coreLifecycle.isShutDown {
                 continuation.resume()
                 return
             }

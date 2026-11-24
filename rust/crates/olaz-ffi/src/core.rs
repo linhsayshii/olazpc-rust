@@ -522,6 +522,14 @@ impl CoreEngine {
         self.handle.current_version()
     }
 
+    /// Enqueues a barrier on the actor mailbox and returns the change revision once every input
+    /// enqueued before this call has been reduced and published (`0` if already stopped).
+    pub async fn settle(&self) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let version = run(async move { handle.settle().await.unwrap_or(0) }).await?;
+        Ok(version)
+    }
+
     /// Stops the actor, aborts in-flight session tasks, and closes `next_changes()`.
     pub fn stop(&self) {
         self.handle.stop();
