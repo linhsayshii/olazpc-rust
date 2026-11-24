@@ -1114,3 +1114,49 @@ fn links_system_sqlite_new_enough() {
         "SQLite {v} too old for RETURNING/UPSERT paths"
     );
 }
+
+#[test]
+fn provisional_own_row_after_server_copy_is_dropped() {
+    // 1-1 E2EE: the websocket echo (server id) lands before the send reply, which has no msgId.
+    let mine = |m: StoredMessage| StoredMessage { is_mine: true, ..m };
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .save_messages(&[mine(msg("srv1", "c", "cli1", "hi", 10, "text", "sent"))])
+        .unwrap();
+    store
+        .save_messages(&[mine(msg("cli1", "c", "cli1", "hi", 9, "text", "sent"))])
+        .unwrap();
+    assert!(store.message("c", "srv1").unwrap().is_some());
+    let row = store.message("c", "cli1").unwrap().unwrap();
+    assert_eq!(row.id, "srv1");
+    // Someone else's message whose id equals its client id is untouched.
+    store
+        .save_messages(&[msg("x", "c", "x", "yo", 11, "text", "sent")])
+        .unwrap();
+    assert!(store.message("c", "x").unwrap().is_some());
+}
+
+#[test]
+fn open_drops_stored_provisional_twins() {
+    let dir = std::env::temp_dir().join(format!("olaz-twins-{}", std::process::id()));
+    let path = dir.join("h.sqlite3");
+    {
+        let mut store = Store::open(&path).unwrap();
+        let mine = |m: StoredMessage| StoredMessage { is_mine: true, ..m };
+        // The skip-twin fast path writes both, like older builds did.
+        store
+            .save_messages_with(
+                &[
+                    mine(msg("cli1", "c", "cli1", "hi", 9, "text", "sent")),
+                    mine(msg("srv1", "c", "cli1", "hi", 10, "text", "sent")),
+                    mine(msg("cli2", "c", "cli2", "alone", 12, "text", "sent")),
+                ],
+                crate::model::SaveOptions { skip_twin_checks: true, ..Default::default() },
+            )
+            .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.message("c", "cli1").unwrap().unwrap().id, "srv1");
+    assert!(store.message("c", "cli2").unwrap().is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}

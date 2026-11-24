@@ -293,6 +293,12 @@ impl Status {
 pub struct Quote {
     pub sender_name: String,
     pub text: String,
+    /// The quoted message's server id (`globalMsgId`), empty when the wire did not carry it.
+    #[serde(default)]
+    pub msg_id: String,
+    /// The quoted message's `cliMsgId`, empty when unknown.
+    #[serde(default)]
+    pub cli_msg_id: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -782,6 +788,8 @@ impl ChatMessage {
         let quote = as_dict(json.get("quote")).map(|q| Quote {
             sender_name: as_str(q.get("senderName")).unwrap_or("").to_string(),
             text: as_str(q.get("text")).unwrap_or("").to_string(),
+            msg_id: as_str(q.get("msgId")).unwrap_or("").to_string(),
+            cli_msg_id: as_str(q.get("cliMsgId")).unwrap_or("").to_string(),
         });
         let reactions = as_dict_array(json.get("reactions"))
             .unwrap_or_default()

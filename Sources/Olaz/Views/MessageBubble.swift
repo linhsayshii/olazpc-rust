@@ -578,7 +578,7 @@ struct MessageRow: View {
         case .file(let name, let size, let url):
             // Files are cards, not bubbles: neutral for both sides, no tail.
             VStack(alignment: .leading, spacing: 6) {
-                if let quote = message.quote { QuoteBlock(quote: quote, mine: false) }
+                if let quote = message.quote { QuoteBlock(quote: quote, mine: false) { CardActionCenter.shared.quoteJump = QuoteJumpRequest(message: message) } }
                 FileCard(
                     name: name,
                     size: size,
@@ -738,7 +738,9 @@ struct MessageRow: View {
         let shape = bubbleShape(tail: wantsTail && !muted && lastInGroup)
         return VStack(alignment: .leading, spacing: 6) {
             if let quote = message.quote {
-                QuoteBlock(quote: quote, mine: mine && !muted)
+                QuoteBlock(quote: quote, mine: mine && !muted) {
+                    CardActionCenter.shared.quoteJump = QuoteJumpRequest(message: message)
+                }
             }
             inner()
         }
@@ -824,6 +826,8 @@ private struct ReactionPickerButton: View {
 private struct QuoteBlock: View {
     let quote: ChatMessage.Quote
     let mine: Bool
+    /// Scrolls to the quoted message.
+    var onTap: () -> Void = {}
     @Environment(\.olazTextScale) private var textScale
 
     var body: some View {
@@ -838,6 +842,10 @@ private struct QuoteBlock: View {
         .padding(.vertical, 4).padding(.horizontal, 6)
         .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
             .fill(mine ? Color.white.opacity(0.18) : Color.primary.opacity(0.06)))
+        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .onTapGesture(perform: onTap)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction(named: "Xem tin nhắn gốc", onTap)
     }
 }
 

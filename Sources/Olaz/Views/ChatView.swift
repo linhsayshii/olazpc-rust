@@ -50,6 +50,7 @@ struct ChatView: View {
             highlightedMessageId: highlightedMessageId,
             onReply: reply
         )
+        .onChange(of: CardActionCenter.shared.quoteJump) { _, request in jumpToQuoted(request) }
         .background {
             ChatWallpaperBackground()
             Button("") { openSearch() }
@@ -411,6 +412,29 @@ struct ChatView: View {
         let count = searchMatches.count
         searchMatchIndex = (searchMatchIndex + delta + count) % count
         jumpToSearchMatch(searchMatches[searchMatchIndex])
+    }
+
+    /// A tap on a reply's quote: loads the quoted message when it is older than the shown page, scrolls there and
+    /// flashes it.
+    private func jumpToQuoted(_ request: QuoteJumpRequest?) {
+        guard let request, request.message.conversationId == id else { return }
+        CardActionCenter.shared.quoteJump = nil
+        jumpGeneration += 1
+        let gen = jumpGeneration
+        jumpTask?.cancel()
+        jumpTask = Task {
+            guard let target = await engine.loadQuotedMessage(of: request.message, in: id) else {
+                if !Task.isCancelled { CardActionCenter.shared.show("Không tìm thấy tin nhắn gốc.", in: id) }
+                return
+            }
+            guard !Task.isCancelled, gen == jumpGeneration else { return }
+            try? await Task.sleep(for: .milliseconds(20))
+            guard !Task.isCancelled, gen == jumpGeneration else { return }
+            highlightedMessageId = target
+            jumpTarget = target
+            try? await Task.sleep(for: .seconds(1.6))
+            if !searchOpen, gen == jumpGeneration, highlightedMessageId == target { highlightedMessageId = nil }
+        }
     }
 
     private func jumpToSearchMatch(_ message: ChatMessage) {

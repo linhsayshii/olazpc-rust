@@ -243,10 +243,16 @@ pub fn encode_chat_message(msg: &ChatMessage, client_id: &str) -> Option<StoredM
         m.insert("styles".into(), TextStyle::to_json(&msg.text_styles));
     }
     if let (Some(q), Value::Object(m)) = (&msg.quote, &mut canonical) {
-        m.insert(
-            "quote".into(),
-            json!({"senderName": q.sender_name, "text": q.text}),
-        );
+        let mut qd = json!({"senderName": q.sender_name, "text": q.text});
+        if let Value::Object(o) = &mut qd {
+            if !q.msg_id.is_empty() {
+                o.insert("msgId".into(), json!(q.msg_id));
+            }
+            if !q.cli_msg_id.is_empty() {
+                o.insert("cliMsgId".into(), json!(q.cli_msg_id));
+            }
+        }
+        m.insert("quote".into(), qd);
     }
     let data = serde_json::to_vec(&canonical).ok()?;
     Some(StoredMessage {

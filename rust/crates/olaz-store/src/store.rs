@@ -123,6 +123,9 @@ impl Store {
         register_search_functions(&conn)?;
         conn.execute_batch(PRAGMAS_SQL)?;
         conn.execute_batch(SCHEMA_SQL)?;
+        // Older builds kept a sent message twice when its server copy (websocket echo) was saved before the send
+        // reply, which for 1-1 E2EE carries no msgId: drop the provisional `id = client_id` row of such pairs.
+        conn.execute_batch(DELETE_PROVISIONAL_TWINS_SQL)?;
 
         let read_conn = if is_memory {
             None
@@ -1289,6 +1292,13 @@ LIMIT 1;"
         .optional()?)
 }
 
+/// Own provisional rows (`id = client_id`, saved before the server id is known) that already have a server copy.
+const DELETE_PROVISIONAL_TWINS_SQL: &str = "DELETE FROM messages
+WHERE is_mine = 1 AND client_id != '' AND id = client_id
+  AND EXISTS (SELECT 1 FROM messages t
+              WHERE t.conv_id = messages.conv_id AND t.client_id = messages.client_id
+                AND t.id != messages.id AND t.status != 'e2ee_locked');";
+
 fn save_messages_in(conn: &Connection, items: &[StoredMessage], opts: SaveOptions) -> Result<()> {
     let raw_json_update_expr = if opts.preserve_existing_reactions {
         "CASE
@@ -1328,6 +1338,8 @@ WHERE excluded.status != 'e2ee_locked' OR messages.status = 'e2ee_locked';"
 WHERE conv_id = ?1 AND id = ?3 AND id != ?2;";
     let delete_stale_client_twin_sql = "DELETE FROM messages
 WHERE conv_id = ?1 AND client_id = ?3 AND id != ?2 AND status = 'e2ee_locked';";
+    let server_twin_sql = "SELECT 1 FROM messages
+WHERE conv_id = ?1 AND client_id = ?2 AND id != ?2 AND status != 'e2ee_locked' LIMIT 1;";
 
     let mut upsert = conn.prepare_cached(&upsert_sql)?;
     let mut twin = if opts.skip_twin_checks {
@@ -1337,15 +1349,25 @@ WHERE conv_id = ?1 AND client_id = ?3 AND id != ?2 AND status = 'e2ee_locked';";
             conn.prepare_cached(check_plain_twin_sql)?,
             conn.prepare_cached(delete_stale_id_twin_sql)?,
             conn.prepare_cached(delete_stale_client_twin_sql)?,
+            conn.prepare_cached(server_twin_sql)?,
         ))
     };
 
     for m in items {
         let is_locked = m.status == "e2ee_locked";
-        if let Some((check, del_id, del_client)) = twin.as_mut()
+        if let Some((check, del_id, del_client, server_twin)) = twin.as_mut()
             && !m.client_id.is_empty()
         {
-            if is_locked {
+            if !is_locked && m.is_mine && m.client_id == m.id {
+                // A provisional row (the send reply had no server id): the server copy already saved wins.
+                if server_twin
+                    .query_row(params![m.conv_id, m.client_id], |_| Ok(()))
+                    .optional()?
+                    .is_some()
+                {
+                    continue;
+                }
+            } else if is_locked {
                 let existing = check
                     .query_row(params![m.conv_id, m.client_id], |r| col_text(r, 0))
                     .optional()?;

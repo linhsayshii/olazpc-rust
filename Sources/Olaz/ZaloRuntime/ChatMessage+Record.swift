@@ -18,7 +18,7 @@ extension ChatMessage {
             text: r.text,
             date: Date(timeIntervalSince1970: Double(r.dateMs) / 1000),
             status: Status(record: r.status),
-            quote: r.quote.map { Quote(senderName: $0.senderName, text: $0.text) },
+            quote: r.quote.map { Quote(senderName: $0.senderName, text: $0.text, msgId: $0.msgId, cliMsgId: $0.cliMsgId) },
             reactions: r.reactions.map { x in
                 var counts: [String: Int] = [:]
                 counts.reserveCapacity(x.userCounts.count)
@@ -218,7 +218,7 @@ extension ChatMessageRecord {
             id: m.id, conversationId: m.conversationId, senderId: m.senderId, senderName: m.senderName,
             senderAvatar: m.senderAvatar?.absoluteString, isMine: m.isMine, kind: m.kind.record, text: m.text,
             dateMs: Int64((m.date.timeIntervalSince1970 * 1000).rounded()), status: m.status.record,
-            quote: m.quote.map { QuoteRecord(senderName: $0.senderName, text: $0.text) },
+            quote: m.quote.map { QuoteRecord(senderName: $0.senderName, text: $0.text, msgId: $0.msgId, cliMsgId: $0.cliMsgId) },
             reactions: m.reactions.map { r in
                 ReactionRecord(
                     icon: ReactionIconRecord(kind: r.icon.type, key: r.icon.key, emoji: r.icon.emoji, image: r.icon.image),

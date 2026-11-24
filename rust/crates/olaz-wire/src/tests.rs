@@ -877,7 +877,9 @@ fn quote_and_signal_quote_are_sanitized() {
         m.quote,
         Some(Quote {
             sender_name: "Bạn".into(),
-            text: "hello".into()
+            text: "hello".into(),
+            msg_id: String::new(),
+            cli_msg_id: String::new(),
         })
     );
     let q = serde_json::json!({"msgId":"2","uidFrom":"peer","idTo":"100","msgType":"webchat","content":"ok",
@@ -887,7 +889,9 @@ fn quote_and_signal_quote_are_sanitized() {
         m.quote,
         Some(Quote {
             sender_name: "Người dùng Zalo".into(),
-            text: "[Tin nhắn mã hóa đầu cuối]".into()
+            text: "[Tin nhắn mã hóa đầu cuối]".into(),
+            msg_id: String::new(),
+            cli_msg_id: String::new(),
         })
     );
 }
@@ -1200,4 +1204,21 @@ fn urgency_parse_and_round_trip() {
         "me",
     ));
     assert_eq!(n.urgency, 1);
+}
+
+#[test]
+fn quote_keeps_the_quoted_message_ids() {
+    let (m, stored) = msg_of(parse(
+        r#"{"msgId":"9","uidFrom":"peer","idTo":"100","msgType":"webchat","content":"ok","ts":1760000000000,
+        "quote":{"ownerId":"peer","msg":"hello","fromD":"P","globalMsgId":8521991431452,"cliMsgId":"1795441030216"}}"#,
+        "100",
+    ));
+    let q = m.quote.unwrap();
+    assert_eq!((q.msg_id.as_str(), q.cli_msg_id.as_str()), ("8521991431452", "1795441030216"));
+    let back = crate::model::ChatMessage::from_json(
+        serde_json::from_slice::<serde_json::Value>(&stored.raw_json_data).unwrap().as_object().unwrap(),
+        "",
+    )
+    .unwrap();
+    assert_eq!(back.quote.unwrap().msg_id, "8521991431452");
 }

@@ -804,7 +804,13 @@ enum ZaloWireParser {
             let rawQText = firstNonEmpty(JSONLossless.string(q["msg"] ?? q["text"]), "[Tin nhắn]")
             let qText = Self.isSignalCiphertext(rawQText) ? "[Tin nhắn mã hóa đầu cuối]" : rawQText
             if !qName.isEmpty || !qText.isEmpty {
-                quoteDict = ["senderName": qName, "text": qText]
+                var d: [String: Any] = ["senderName": qName, "text": qText]
+                // The quoted message's ids, so tapping the quote can scroll to it ("0" means none).
+                let qMsgId = JSONLossless.string(q["globalMsgId"] ?? q["msgId"])
+                let qCliId = JSONLossless.string(q["cliMsgId"] ?? q["clientId"])
+                if !qMsgId.isEmpty, qMsgId != "0" { d["msgId"] = qMsgId }
+                if !qCliId.isEmpty, qCliId != "0" { d["cliMsgId"] = qCliId }
+                quoteDict = d
             }
         }
 
@@ -1071,7 +1077,10 @@ enum ZaloWireParser {
         if msg.ttlMs > 0 { canonical["ttl"] = msg.ttlMs }
         if msg.urgency > 0 { canonical["urgency"] = msg.urgency }
         if let quote = msg.quote {
-            canonical["quote"] = ["senderName": quote.senderName, "text": quote.text]
+            var q: [String: Any] = ["senderName": quote.senderName, "text": quote.text]
+            if !quote.msgId.isEmpty { q["msgId"] = quote.msgId }
+            if !quote.cliMsgId.isEmpty { q["cliMsgId"] = quote.cliMsgId }
+            canonical["quote"] = q
         }
         guard let data = try? JSONSerialization.data(withJSONObject: canonical, options: []) else { return nil }
         return StoredMessage(

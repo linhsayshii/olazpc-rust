@@ -7660,12 +7660,16 @@ public func FfiConverterTypeQrTicketRecord_lower(_ value: QrTicketRecord) -> Rus
 public struct QuoteRecord: Equatable, Hashable {
     public var senderName: String
     public var text: String
+    public var msgId: String
+    public var cliMsgId: String
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(senderName: String, text: String) {
+    public init(senderName: String, text: String, msgId: String, cliMsgId: String) {
         self.senderName = senderName
         self.text = text
+        self.msgId = msgId
+        self.cliMsgId = cliMsgId
     }
 
     
@@ -7685,13 +7689,17 @@ public struct FfiConverterTypeQuoteRecord: FfiConverterRustBuffer {
         return
             try QuoteRecord(
                 senderName: FfiConverterString.read(from: &buf), 
-                text: FfiConverterString.read(from: &buf)
+                text: FfiConverterString.read(from: &buf), 
+                msgId: FfiConverterString.read(from: &buf), 
+                cliMsgId: FfiConverterString.read(from: &buf)
         )
     }
 
     public static func write(_ value: QuoteRecord, into buf: inout [UInt8]) {
         FfiConverterString.write(value.senderName, into: &buf)
         FfiConverterString.write(value.text, into: &buf)
+        FfiConverterString.write(value.msgId, into: &buf)
+        FfiConverterString.write(value.cliMsgId, into: &buf)
     }
 }
 

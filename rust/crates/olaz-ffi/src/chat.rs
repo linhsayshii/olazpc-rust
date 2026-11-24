@@ -51,6 +51,8 @@ pub struct ReactionRecord {
 pub struct QuoteRecord {
     pub sender_name: String,
     pub text: String,
+    pub msg_id: String,
+    pub cli_msg_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -670,6 +672,8 @@ impl From<ChatMessage> for ChatMessageRecord {
             quote: m.quote.map(|q| QuoteRecord {
                 sender_name: q.sender_name,
                 text: q.text,
+                msg_id: q.msg_id,
+                cli_msg_id: q.cli_msg_id,
             }),
             reactions: m
                 .reactions
@@ -747,6 +751,8 @@ impl From<&ChatMessageRecord> for ChatMessage {
             quote: r.quote.as_ref().map(|q: &QuoteRecord| Quote {
                 sender_name: q.sender_name.clone(),
                 text: q.text.clone(),
+                msg_id: q.msg_id.clone(),
+                cli_msg_id: q.cli_msg_id.clone(),
             }),
             reactions: r
                 .reactions

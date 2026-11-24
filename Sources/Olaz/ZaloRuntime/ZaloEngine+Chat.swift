@@ -302,7 +302,10 @@ extension ZaloEngine {
         let cliId = "\(cliInt)"
         let myUid = profile?.userId ?? ""
         let myName = profile?.displayName ?? "Bạn"
-        let quoteBlock = quote.map { ChatMessage.Quote(senderName: $0.isMine ? "Bạn" : $0.senderName, text: $0.text.isEmpty ? "[Tin nhắn]" : $0.text) }
+        let quoteBlock = quote.map {
+            ChatMessage.Quote(senderName: $0.isMine ? "Bạn" : $0.senderName, text: $0.text.isEmpty ? "[Tin nhắn]" : $0.text,
+                              msgId: $0.id, cliMsgId: $0.clientId)
+        }
         var isE2EE = false
         if !ZaloWireParser.isGroupId(id) {
             isE2EE = await e2eeManager.isE2EEConversation(id)
@@ -453,6 +456,17 @@ extension ZaloEngine {
             }
             // Replace temporary client id with server msgId while avoiding duplicates.
             let finalCliId = res.cliMsgId.isEmpty ? cliId : res.cliMsgId
+            // 1-1 E2EE replies carry no msgId (it falls back to the client id); the websocket echo may already have
+            // brought the server copy, which then stands for this message.
+            if res.msgId == cliId,
+               let echoed = messages[id]?.first(where: { $0.clientId == finalCliId && $0.id != cliId }) {
+                if var list = messages[id] {
+                    list.removeAll { $0.id == cliId }
+                    messages[id] = list
+                }
+                updateConversationOnMessage(echoed, incrementUnread: false)
+                return true
+            }
             if var list = messages[id] {
                 list.removeAll { $0.id == cliId || $0.id == res.msgId }
                 optimistic.id = res.msgId

@@ -410,11 +410,21 @@ actor ZaloSQLiteStore {
             defer { if let delIdStmt { sqlite3_finalize(delIdStmt) } }
             let delClientStmt = skipTwinChecks ? nil : try prepare(deleteStaleClientTwinSQL)
             defer { if let delClientStmt { sqlite3_finalize(delClientStmt) } }
+            let serverTwinStmt = skipTwinChecks ? nil : try prepare(
+                "SELECT 1 FROM messages WHERE conv_id = ?1 AND client_id = ?2 AND id != ?2 AND status != 'e2ee_locked' LIMIT 1;")
+            defer { if let serverTwinStmt { sqlite3_finalize(serverTwinStmt) } }
 
             for m in items {
                 let isLocked = (m.status == "e2ee_locked")
                 if !skipTwinChecks, !m.clientId.isEmpty {
-                    if isLocked, let checkStmt {
+                    if !isLocked, m.isMine, m.clientId == m.id, let serverTwinStmt {
+                        // A provisional row (the send reply had no server id): the server copy already saved wins.
+                        sqlite3_reset(serverTwinStmt)
+                        sqlite3_clear_bindings(serverTwinStmt)
+                        bindText(serverTwinStmt, 1, m.convId)
+                        bindText(serverTwinStmt, 2, m.clientId)
+                        if sqlite3_step(serverTwinStmt) == SQLITE_ROW { continue }
+                    } else if isLocked, let checkStmt {
                         sqlite3_reset(checkStmt)
                         sqlite3_clear_bindings(checkStmt)
                         bindText(checkStmt, 1, m.convId)

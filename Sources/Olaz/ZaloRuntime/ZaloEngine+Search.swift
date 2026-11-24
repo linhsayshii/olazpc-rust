@@ -142,4 +142,33 @@ extension ZaloEngine {
         }
         return messages[convId]?.contains(where: { $0.id == message.id }) == true
     }
+
+    /// The id of the message `message` quotes, loaded into memory so the list can scroll to it (nil when not found).
+    /// Quotes carry the original's ids; quotes stored by older builds have none and match the newest earlier message
+    /// with the same text (and sender, when it is "Bạn").
+    func loadQuotedMessage(of message: ChatMessage, in convId: String) async -> String? {
+        guard let quote = message.quote else { return nil }
+        let keys = [quote.msgId, quote.cliMsgId].filter { !$0.isEmpty && $0 != "0" }
+        let list = messages[convId] ?? []
+        for key in keys {
+            if let hit = list.first(where: { $0.id == key || $0.clientId == key }) { return hit.id }
+        }
+        if let store = sqliteStore {
+            for key in keys {
+                if let row = try? await store.decodedMessage(convId: convId, idOrClientId: key),
+                   await ensureMessageLoaded(row.message, in: convId) {
+                    return row.message.id
+                }
+            }
+        }
+        guard keys.isEmpty else { return nil }
+        let text = quote.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        let mineOnly = quote.senderName == "Bạn"
+        return list.last(where: { m in
+            m.id != message.id && m.date <= message.date && m.kind != .recalled
+                && m.text.trimmingCharacters(in: .whitespacesAndNewlines) == text
+                && (!mineOnly || m.isMine)
+        })?.id
+    }
 }

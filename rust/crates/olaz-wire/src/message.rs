@@ -1063,7 +1063,17 @@ pub fn parse_wire_message(
             raw_q_text
         };
         if !q_name.is_empty() || !q_text.is_empty() {
-            quote = Some(json!({"senderName": q_name, "text": q_text}));
+            let mut qd = Map::new();
+            qd.insert("senderName".into(), json!(q_name));
+            qd.insert("text".into(), json!(q_text));
+            // The quoted message's ids, so tapping the quote can scroll to it ("0" means none).
+            for (key, names) in [("msgId", ["globalMsgId", "msgId"]), ("cliMsgId", ["cliMsgId", "clientId"])] {
+                let v = string(pick(q, &names));
+                if !v.is_empty() && v != "0" {
+                    qd.insert(key.into(), json!(v));
+                }
+            }
+            quote = Some(Value::Object(qd));
         }
     }
 
