@@ -138,6 +138,8 @@ final class ZaloEngine {
     @ObservationIgnored internal var hostTrace: ((String, [String: Any]) -> Bool)?
     @ObservationIgnored internal var stateTrace: (() -> Void)?
     @ObservationIgnored internal var transportSettleTrace: (() -> Void)?
+    @ObservationIgnored internal var nowMs: () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }
+    @ObservationIgnored internal var randomTag4: () -> String = { String(UUID().uuidString.prefix(4)) }
     @ObservationIgnored internal var recordedQRPayload: String?
     @ObservationIgnored internal var recordedSessionPrefs: [String: String] = [:]
     @ObservationIgnored internal var pendingCleanupTask: Task<Void, Never>?

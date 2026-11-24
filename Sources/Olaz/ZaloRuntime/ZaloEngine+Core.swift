@@ -348,6 +348,9 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
             incrementUnread: incrementUnread,
             notifyIncoming: notifyIncoming
         )
+        await MainActor.run {
+            engine.transportSettleTrace?()
+        }
         return UInt32(max(0, count))
     }
 
@@ -382,6 +385,9 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
                 notifyIncoming: notifyIncoming
             )
         }
+        await MainActor.run {
+            engine.transportSettleTrace?()
+        }
     }
 
     func mobileSync(events: [MobileSyncEventRecord]) async {
@@ -412,6 +418,9 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
     func e2eeConnected(uid: String) async {
         guard let engine else { return }
         await engine.hostHandleE2EEConnected(uid: uid)
+        await MainActor.run {
+            engine.transportSettleTrace?()
+        }
     }
 
     func e2eeDisconnected() async {
@@ -421,6 +430,9 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         }
         if allowDisconnect {
             await engine.e2eeManager.markDisconnected()
+        }
+        await MainActor.run {
+            engine.transportSettleTrace?()
         }
     }
 
