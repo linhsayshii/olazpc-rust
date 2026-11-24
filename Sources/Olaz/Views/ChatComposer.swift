@@ -34,6 +34,7 @@ struct ChatComposer: View {
     @State private var showPollCreate = false
     @State private var showStickers = false
     @State private var showFormat = false
+    @State private var showGif = false
     /// "Ảnh hoặc Video" / "Tệp": the open panel and what its pick is sent as.
     @State private var importing = false
     @State private var importKind = AttachmentKind.files
@@ -269,6 +270,25 @@ struct ChatComposer: View {
                 .accessibilityLabel("Định dạng tin nhắn")
                 .popover(isPresented: $showFormat, arrowEdge: .top) {
                     ComposerFormatBar(handle: handle)
+                }
+            }
+            if !conversationId.isEmpty {
+                Button {
+                    showGif.toggle()
+                } label: {
+                    Text("GIF").font(.system(size: 10.5, weight: .bold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 3).padding(.vertical, 1)
+                        .overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(.secondary, lineWidth: 1))
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.bottom, 4)
+                .help("Gửi GIF")
+                .accessibilityLabel("Gửi GIF")
+                .popover(isPresented: $showGif, arrowEdge: .top) {
+                    GifPicker(conversationId: conversationId) { showGif = false }
                 }
             }
             if !conversationId.isEmpty {
