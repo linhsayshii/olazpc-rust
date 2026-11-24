@@ -147,7 +147,7 @@ struct ChatInspector: View {
                     let ok = await engine.leaveGroup(id)
                     leavingGroup = false
                     if ok {
-                        shell.hideInspector(animated: false)
+                        shell.hideInspector()
                     }
                 }
             }

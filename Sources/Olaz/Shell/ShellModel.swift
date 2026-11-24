@@ -85,15 +85,6 @@ final class ShellModel {
     /// The window holds the inspector's room: its minimum width includes the inspector, from the end of the widening until the
     /// inspector is hidden. Raising it while the window is still widening would snap the window wide at once.
     var holdsInspectorRoom = false
-    /// Trailing room the detail column keeps free during the inspector's reveal: the width the column gained over `revealChatWidth`,
-    /// so the chat keeps its width while the window widens and the inspector then slides into that room (see `detailWidthChanged`).
-    var inspectorRoomReserve: CGFloat = 0
-    /// Width of the detail column at the moment a reveal that widens the window started; nil once the inspector has slid in.
-    @ObservationIgnored private var revealChatWidth: CGFloat?
-    /// Current width of the detail column (reported by the view).
-    @ObservationIgnored private var detailWidth: CGFloat = 0
-    /// Counts reveals, so the safety timeout of an earlier one cannot cut a later one short.
-    @ObservationIgnored private var revealGeneration = 0
     /// The signed-in window (set by `MainShellView`), widened for the inspector.
     @ObservationIgnored weak var window: NSWindow?
     /// ⌘K palette.
@@ -146,7 +137,6 @@ final class ShellModel {
         showQuickSwitcher = false
         showInspector = false
         holdsInspectorRoom = false
-        endReveal()
         groupCompose = nil
     }
 
@@ -154,54 +144,29 @@ final class ShellModel {
         withAnimation(.smooth(duration: 0.3)) { columns = columns == .all ? .doubleColumn : .all }
     }
 
+    /// Shows or hides the inspector at once, like the official info panel (no slide). The split view lays the inspector over
+    /// the detail column and hands it a trailing safe-area inset; animated, that inset changed every frame, so the chat re-measured
+    /// its rows and the inspector re-laid out its content on each of them (~35 fps for a quarter second, then a jump). Without
+    /// animation it is one layout pass.
     func toggleInspector() {
         guard destination.isConversationList, selection != nil, !showInspector else { hideInspector(); return }
-        // The window widens first, then the inspector slides in; throughout, `detailWidthChanged` keeps the chat at the width it had,
-        // handing the gained room to a trailing spacer and then to the inspector. The two AppKit animations (window frame, split
-        // view) start at their own pace, so nothing here is timed: the room is derived from the column's actual width each frame.
-        // A window that is wide enough already goes straight to the slide, with nothing to reserve.
-        let duration = InspectorRoom.revealDuration
-        revealChatWidth = detailWidth
+        // The window widens first (synchronously), so the inspector takes its width from the window, never from the chat.
         InspectorRoom.make(in: window) { [weak self] in
             guard let self else { return }
             holdsInspectorRoom = true
-            withAnimation(.easeInOut(duration: duration)) { showInspector = true }
-        }
-        // Should the slide never report back (no chat to show), the reserve must not stick.
-        revealGeneration += 1
-        let generation = revealGeneration
-        Task { [weak self] in
-            try? await Task.sleep(for: .seconds(2))
-            if let self, revealGeneration == generation { endReveal() }
+            Self.withoutAnimation { showInspector = true }
         }
     }
 
-    func hideInspector(animated: Bool = true) {
+    func hideInspector() {
         holdsInspectorRoom = false
-        endReveal()
-        if animated {
-            withAnimation(.easeInOut(duration: InspectorRoom.revealDuration)) { showInspector = false }
-        } else {
-            var tx = Transaction()
-            tx.disablesAnimations = true
-            withTransaction(tx) { showInspector = false }
-        }
+        Self.withoutAnimation { showInspector = false }
     }
 
-    /// The detail column's width, reported by `DetailColumn` whenever it changes. During a reveal the room the column gained
-    /// beyond the chat's width is reserved; once the inspector has taken it all back, the reveal is over.
-    func detailWidthChanged(_ width: CGFloat) {
-        detailWidth = width
-        guard let chatWidth = revealChatWidth else { return }
+    private static func withoutAnimation(_ body: () -> Void) {
         var transaction = Transaction()
         transaction.disablesAnimations = true
-        withTransaction(transaction) { inspectorRoomReserve = max(0, width - chatWidth) }
-        if showInspector, width <= chatWidth { endReveal() }
-    }
-
-    private func endReveal() {
-        revealChatWidth = nil
-        if inspectorRoomReserve != 0 { inspectorRoomReserve = 0 }
+        withTransaction(transaction, body)
     }
 
     // MARK: Tour
@@ -239,17 +204,13 @@ enum InspectorRoom {
         return CGRect(x: max(screen.minX, x), y: window.minY, width: width, height: window.height)
     }
 
-    /// How long the split view takes to slide the inspector in or out. It ignores the SwiftUI transaction (measured on macOS 27: about
-    /// a quarter second whatever `withAnimation` asks for); the window widening uses the same duration and curve.
-    static let revealDuration: TimeInterval = 0.25
-
-    /// Widens the shell window for the inspector; `completion` runs when the widening animation has ended, or at once when there is
-    /// nothing to widen (a window already wide enough, or a full-screen one, which is as wide as it gets).
+    /// Widens the shell window for the inspector, then runs `completion`; with nothing to widen (a window already wide enough, or a
+    /// full-screen one, which is as wide as it gets) it just runs `completion`.
     static func make(in window: NSWindow?, completion: @escaping @MainActor () -> Void) {
         guard let window, !window.styleMask.contains(.fullScreen), let screen = window.screen ?? NSScreen.main else { completion(); return }
         let target = frame(for: window.frame, in: screen.visibleFrame)
         guard target != window.frame else { completion(); return }
-        // Apply frame synchronously before sliding the inspector column so AppKit never leaves `NSTableView` stuck in `inLiveResize`.
+        // Apply the frame synchronously before showing the inspector column so AppKit never leaves `NSTableView` stuck in `inLiveResize`.
         window.setFrame(target, display: true, animate: false)
         completion()
     }

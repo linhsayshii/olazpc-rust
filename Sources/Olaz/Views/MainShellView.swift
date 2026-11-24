@@ -44,7 +44,7 @@ struct MainShellView: View {
             EngineLog.shared.write("shell destination \(destination.logName)")
             applyOfficialFilter(destination)
             // Leaving the conversation lists hides the inspector without triggering a simultaneous live-resize teardown on `NSOutlineView`.
-            if !destination.isConversationList { shell.hideInspector(animated: false) }
+            if !destination.isConversationList { shell.hideInspector() }
         }
         .onChange(of: engine.conversationExtras.loaded) { _, _ in applyOfficialFilter(shell.destination) }
         // A label deleted here or on another device takes its list with it.
@@ -284,9 +284,6 @@ private struct DetailColumn: View {
                 ContactsDetailColumn(destination: destination)
             }
         }
-        // Room kept free at the trailing edge during the inspector's reveal (see `ShellModel.toggleInspector`); measured outside it.
-        .safeAreaInset(edge: .trailing, spacing: 0) { Color.clear.frame(width: shell.inspectorRoomReserve) }
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { shell.detailWidthChanged($0) }
     }
 }
 

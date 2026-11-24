@@ -48,7 +48,7 @@ enum PerfProbe {
         win.setFrame(NSRect(x: 120, y: 100, width: 1260, height: 820), display: true)
         shell.destination = .inbox
         shell.selection = nil
-        if experiment.contains("noinspector") { shell.hideInspector(animated: false) }
+        if experiment.contains("noinspector") { shell.hideInspector() }
         try? await Task.sleep(for: .seconds(1))
         log("inspector=\(shell.showInspector) convs=\(engine.conversations.count)")
 
@@ -70,6 +70,13 @@ enum PerfProbe {
         watch(engine, shell)
         try? await Task.sleep(for: .seconds(2))
         log("idle-2s mutations: " + takeCounts())
+        // OLAZ_PERF_INSPECTOR: only time the inspector's open / close (frame intervals over each transition), then quit.
+        if ProcessInfo.processInfo.environment["OLAZ_PERF_INSPECTOR"] != nil {
+            await inspectorToggles(engine: engine, shell: shell, clock: clock, link: link, log: log)
+            try? report.joined(separator: "\n").write(toFile: outPath + "/perf.txt", atomically: true, encoding: .utf8)
+            if ProcessInfo.processInfo.environment["OLAZ_PERF_KEEP"] == nil { NSApp.terminate(nil) }
+            return
+        }
         // (a) Chat open latency.
         let candidates = engine.visibleConversations.filter { $0.preview != nil && !engine.isConversationLocked($0.id) }.prefix(12)
         let passes = Int(ProcessInfo.processInfo.environment["OLAZ_PERF_PASSES"] ?? "2") ?? 2
@@ -194,6 +201,51 @@ enum PerfProbe {
         if ProcessInfo.processInfo.environment["OLAZ_PERF_KEEP"] == nil { NSApp.terminate(nil) }
     }
 
+    /// Opens and closes the inspector on a group and a 1-1 chat, recording the frames of each 0.6 s transition.
+    private static func inspectorToggles(engine: ZaloEngine, shell: ShellModel, clock: FrameClock, link: CADisplayLink,
+                                         log: (String) -> Void) async {
+        let usable = engine.visibleConversations.filter { $0.preview != nil && !engine.isConversationLocked($0.id) }
+        let picks = [usable.first(where: \.isGroup), usable.first(where: { !$0.isGroup })].compactMap { $0 }
+        let width = Double(ProcessInfo.processInfo.environment["OLAZ_PERF_WIDTH"] ?? "") ?? 1372
+        if let win = shell.window { win.setFrame(NSRect(x: 80, y: 80, width: width, height: 873), display: true) }
+        for conv in picks {
+            shell.selection = conv.id
+            try? await Task.sleep(for: .seconds(3))
+            for round in 0..<3 {
+                for opening in [true, false] {
+                    clock.stamps.removeAll()
+                    var columns: [String] = []
+                    let splits = shell.window?.contentView.map(splitViews(in:)) ?? []
+                    clock.onFrame = { _ in
+                        columns.append(splits.map { s in s.arrangedSubviews.map { String(format: "%.0f+%.0f", $0.frame.minX, $0.frame.width) }.joined(separator: ",") }.joined(separator: " / "))
+                    }
+                    let t0 = CACurrentMediaTime()
+                    shell.toggleInspector()
+                    try? await Task.sleep(for: .milliseconds(600))
+                    clock.onFrame = nil
+                    if round == 0 { log("  columns " + columns.joined(separator: " | ")) }
+                    let firstFrameMs = ((clock.stamps.first ?? t0) - t0) * 1000
+                    log(frameStats([t0] + clock.stamps, label: String(format: "%@ %@ r%d", conv.isGroup ? "group" : "1-1",
+                                                                         opening ? "OPEN " : "CLOSE", round), refresh: link.duration)
+                        + String(format: " first=%.1fms", firstFrameMs))
+                    log("  mutations: " + takeCounts())
+                    try? await Task.sleep(for: .milliseconds(400))
+                }
+            }
+        }
+    }
+
+    /// The split views of the shell (outer first).
+    private static func splitViews(in root: NSView) -> [NSSplitView] {
+        var found: [NSSplitView] = []
+        func walk(_ v: NSView) {
+            if let s = v as? NSSplitView { found.append(s) }
+            v.subviews.forEach(walk)
+        }
+        walk(root.superview ?? root)
+        return found
+    }
+
     /// Counts observable mutations per engine property (re-arming `withObservationTracking` after each one).
     static var mutationCounts: [String: Int] = [:]
     /// OLAZ_PERF_EXPERIMENT: A/B switches for measurements only.
@@ -212,7 +264,7 @@ enum PerfProbe {
             ("pins", { _ = engine.pins }), ("polls", { _ = engine.polls }), ("cloud", { _ = engine.cloud }),
             ("openConversationId", { _ = engine.openConversationId }), ("canStartTransfer", { _ = engine.canStartTransfer }),
             ("profile", { _ = engine.profile }), ("downloadedFilePaths", { _ = engine.downloadedFilePaths }),
-            ("shell.selection", { _ = shell.selection }), ("shell.inspectorRoomReserve", { _ = shell.inspectorRoomReserve }),
+            ("shell.selection", { _ = shell.selection }),
             ("shell.showInspector", { _ = shell.showInspector }), ("shell.columns", { _ = shell.columns }),
         ]
         for (name, read) in probes { arm(name, read) }
