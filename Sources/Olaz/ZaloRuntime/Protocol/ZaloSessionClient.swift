@@ -90,6 +90,9 @@ actor ZaloSessionClient {
     private var coreHttpHandle: CoreHttp?
     private var coreRawHandle: CoreRawHttp?
     private var corePushedSnapshot = ""
+    /// True once `CoreEngine` owns the shared `CoreSession` (ADR-016). While owned, Swift reads
+    /// from the shared `CoreSession` instead of overwriting it from Swift fields.
+    private var coreOwned = false
 
     var domains = ZaloDomains()
     var imei: String
@@ -236,8 +239,62 @@ actor ZaloSessionClient {
         }
     }
 
+    /// Returns the single shared `CoreSession` owned by `CoreEngine` (ADR-016), creating it with
+    /// this client's IMEI, computer name, and any non-default domains if needed.
+    func sharedCoreSession() -> CoreSession? {
+        if let existing = coreSession {
+            if !coreOwned {
+                _ = syncCoreSession()
+            }
+            coreOwned = true
+            return existing
+        }
+        let customDomainsJSON: String? = {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            guard let current = try? encoder.encode(domains),
+                  let defaults = try? encoder.encode(ZaloDomains()),
+                  current != defaults else {
+                return nil
+            }
+            return String(data: current, encoding: .utf8)
+        }()
+        guard let created = try? CoreSession.withConfig(
+            imei: imei,
+            computerName: computerName,
+            domainsJson: customDomainsJSON
+        ) else {
+            return nil
+        }
+        coreSession = created
+        coreApiHandle = CoreApi(session: created)
+        coreHttpHandle = CoreHttp(session: created)
+        coreOwned = true
+        corePushedSnapshot = ""
+        if let account {
+            let snapshot = StoredNativeSession(
+                zpwType: ZaloDomains.zpwType,
+                imei: imei,
+                computerName: computerName,
+                domains: domains,
+                sealedSecretsBase64: nil,
+                plainAccount: account,
+                expiredAt: expiredAt
+            )
+            if let data = try? JSONEncoder().encode(snapshot),
+               let json = String(data: data, encoding: .utf8) {
+                _ = try? created.restore(snapshotJson: json)
+            }
+        }
+        return created
+    }
+
     /// Creates the core session on first use and pushes our current state into it when it changed.
     private func syncCoreSession() -> Bool {
+        if coreOwned {
+            guard let coreSession else { return false }
+            return coreSession.isAuthenticated()
+        }
         guard let account else { return false }
         let snapshot = StoredNativeSession(
             zpwType: ZaloDomains.zpwType,
@@ -290,6 +347,21 @@ actor ZaloSessionClient {
         self.expiredAt = nil
         self.cloudViewerKey = nil
         self.cloudEnk = nil
+        if coreOwned, let coreSession {
+            let snapshot = StoredNativeSession(
+                zpwType: ZaloDomains.zpwType,
+                imei: imei,
+                computerName: computerName,
+                domains: self.domains,
+                sealedSecretsBase64: nil,
+                plainAccount: updated,
+                expiredAt: nil
+            )
+            if let data = try? JSONEncoder().encode(snapshot),
+               let json = String(data: data, encoding: .utf8) {
+                _ = try? coreSession.restore(snapshotJson: json)
+            }
+        }
     }
 
     func seedGlobalIdMappings(_ map: [String: String]) {
@@ -301,6 +373,152 @@ actor ZaloSessionClient {
 
     func exportedGlobalIdMappings() -> [String: String] {
         globalIdToUidCache
+    }
+
+    // MARK: CoreHost Persistence & Mirror (ADR-016)
+
+    /// Reads `native-session.json` and unseals any vault/Keychain account into `plainAccount`
+    /// so `CoreEngine` can restore it into the shared `CoreSession`. Never logs credentials.
+    func readSavedSessionSnapshotJSON() -> String? {
+        guard let data = try? Data(contentsOf: sessionFileURL),
+              var stored = try? JSONDecoder().decode(StoredNativeSession.self, from: data) else {
+            return nil
+        }
+        if let sealedB64 = stored.sealedSecretsBase64,
+           let sealedData = Data(base64Encoded: sealedB64) {
+            var loadedAccount: ZaloLoginAccount?
+            if sealedData.first == Self.vaultMagic,
+               let unsealed = unsealWithVaultKey(sealedData),
+               let decoded = try? JSONDecoder().decode(ZaloLoginAccount.self, from: unsealed) {
+                loadedAccount = decoded
+            } else if sealedData.first == 0x49, useKeychain,
+                      let unsealed = try? KeychainCipher().decrypt(identifier: Self.keychainIdentifier, items: [sealedData]).first,
+                      let decoded = try? JSONDecoder().decode(ZaloLoginAccount.self, from: unsealed) {
+                loadedAccount = decoded
+            }
+            guard let loadedAccount else { return nil }
+            stored.plainAccount = loadedAccount
+            stored.sealedSecretsBase64 = nil
+        }
+        guard let encoded = try? JSONEncoder().encode(stored),
+              let json = String(data: encoded, encoding: .utf8) else {
+            return nil
+        }
+        return json
+    }
+
+    /// Reads any legacy WKWebView `zpw_sek` cookie and `olaz.imei` default for migration on boot.
+    func readLegacyCookie() -> LegacyCookieRecord? {
+        guard let authURL = URL(string: domains.auth),
+              let sek = HTTPCookieStorage.shared.cookies(for: authURL)?
+                .first(where: { $0.name == "zpw_sek" && !$0.value.isEmpty })?.value else {
+            return nil
+        }
+        let legacyIMEI = UserDefaults.standard.string(forKey: "olaz.imei").flatMap { $0.count == 69 ? $0 : nil }
+        return LegacyCookieRecord(zpwSek: sek, imei: legacyIMEI)
+    }
+
+    /// Persists a `CoreSession` snapshot to `native-session.json` (sealing credentials with the
+    /// local vault key when `useKeychain` is true) and refreshes transitional Swift mirror fields.
+    func saveSessionFromCore(snapshotJSON: String, writeDisk: Bool = true) {
+        guard let raw = snapshotJSON.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(StoredNativeSession.self, from: raw) else {
+            return
+        }
+        applyMirror(from: decoded)
+        guard writeDisk else { return }
+        do {
+            try FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
+            var sealedB64: String?
+            var plain: ZaloLoginAccount? = decoded.plainAccount
+            if useKeychain, let acc = decoded.plainAccount,
+               let encodedAcc = try? JSONEncoder().encode(acc),
+               let sealed = try? sealWithVaultKey(encodedAcc) {
+                sealedB64 = sealed.base64EncodedString()
+                plain = nil
+            }
+            let stored = StoredNativeSession(
+                zpwType: decoded.zpwType ?? ZaloDomains.zpwType,
+                imei: decoded.imei,
+                computerName: decoded.computerName,
+                domains: decoded.domains,
+                sealedSecretsBase64: sealedB64,
+                plainAccount: plain,
+                expiredAt: decoded.expiredAt
+            )
+            let data = try JSONEncoder().encode(stored)
+            try data.write(to: sessionFileURL, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: sessionFileURL.path)
+        } catch {
+            // File write errors match legacy `try? saveSession()` behavior without logging credentials.
+        }
+    }
+
+    /// Persists an expired `CoreSession` snapshot (with `expiredAt` already set by Rust).
+    func markExpiredFromCore(snapshotJSON: String, persist: Bool = true) {
+        saveSessionFromCore(snapshotJSON: snapshotJSON, writeDisk: persist)
+    }
+
+    /// Removes persisted session files and cookies and clears transitional Swift mirror fields.
+    /// Does not touch `coreSession` (already cleared by `olaz-core`).
+    func clearSessionStorage(clearDisk: Bool = true, resetDomains: Bool = true) {
+        corePushedSnapshot = ""
+        // U17: remove when ZaloAPIService is gone
+        account = nil
+        zpwSek = nil
+        secretKey = nil
+        expiredAt = nil
+        cloudViewerKey = nil
+        cloudEnk = nil
+        globalIdToUidCache.removeAll()
+        uidToGlobalIdCache.removeAll()
+        if resetDomains {
+            domains = ZaloDomains()
+        }
+        if clearDisk {
+            try? FileManager.default.removeItem(at: sessionFileURL)
+            for cookie in HTTPCookieStorage.shared.cookies ?? [] where cookie.name == "zpw_sek" {
+                HTTPCookieStorage.shared.deleteCookie(cookie)
+            }
+        }
+    }
+
+    /// Resets the transitional Swift `domains` mirror to default live endpoints.
+    func resetDomainsToDefault() {
+        domains = ZaloDomains()
+    }
+
+    /// Refreshes transitional Swift mirror fields from the shared `CoreSession` snapshot so
+    /// Swift-owned feature calls reading `sessionClient.account` / `domains` / `zpwSek` stay current.
+    func syncMirrorFromCoreSession() {
+        guard let json = try? coreSession?.snapshotJson(),
+              let raw = json.data(using: .utf8),
+              let stored = try? JSONDecoder().decode(StoredNativeSession.self, from: raw) else {
+            return
+        }
+        applyMirror(from: stored)
+    }
+
+    // U17: remove when ZaloAPIService is gone
+    private func applyMirror(from stored: StoredNativeSession) {
+        if !stored.imei.isEmpty {
+            self.imei = stored.imei
+        }
+        if !stored.computerName.isEmpty {
+            self.computerName = stored.computerName
+        }
+        self.domains = stored.domains
+        self.expiredAt = stored.expiredAt
+        if let acc = stored.plainAccount {
+            self.account = acc
+            self.zpwSek = acc.zpwSek.isEmpty ? nil : acc.zpwSek
+            let parsed = ZaloCrypto.parseSecretKey(acc.zpwEnk)
+            self.secretKey = (parsed.count == 16 || parsed.count == 32) ? parsed : nil
+        } else {
+            self.account = nil
+            self.zpwSek = nil
+            self.secretKey = nil
+        }
     }
 
     // MARK: Persistence
