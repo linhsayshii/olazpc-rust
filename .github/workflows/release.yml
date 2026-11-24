@@ -134,7 +134,7 @@ jobs:
               fi
               echo "> After copying Olaz.app to /Applications, run once:"
               echo '> `xattr -dr com.apple.quarantine /Applications/Olaz.app`'
-              echo "> or right-click Olaz.app and choose Open the first time."
+              echo "> or open it once, then allow it in System Settings > Privacy & Security > Open Anyway."
             fi
             echo
             echo "Verify downloads with \`SHA256SUMS.txt\`."

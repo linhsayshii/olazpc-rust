@@ -6,7 +6,7 @@
 #   unset                              ad-hoc signature, artifacts get an "-unsigned" suffix.
 #
 # Neither is notarized: users clear the quarantine attribute once (xattr -dr com.apple.quarantine /Applications/Olaz.app)
-# or right-click → Open on first launch. Used by the release workflow when no Developer ID secrets are configured.
+# or allow it via System Settings → Privacy & Security → Open Anyway. Used by the release workflow when no Developer ID secrets are configured.
 #
 #   OLAZ_VERSION=1.2.0 OLAZ_UNIVERSAL=1 OLAZ_SIGN_IDENTITY=93B3E5FF... ./scripts/package.sh
 set -euo pipefail

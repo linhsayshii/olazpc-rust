@@ -28,7 +28,7 @@ The workflow picks a mode from the secrets that exist:
 | `fixed` (current) | `MACOS_CERT_P12_BASE64` + `MACOS_CERT_PASSWORD` only | Signed with the self-signed **Olaz Release Signing** certificate. Every release has the same designated requirement (`identifier "app.olaz.mac" and certificate root = H"93b3e5ff88608c172c0278522ba2ec95f59581c1"`), so Keychain items and microphone/camera permissions survive updates. Not notarized. |
 | `adhoc` | none | Ad-hoc signature, artifacts suffixed `-unsigned`. The signature changes on every build. Not notarized. |
 
-For `fixed` and `adhoc`, users clear the quarantine attribute once (`xattr -dr com.apple.quarantine /Applications/Olaz.app`) or right-click, Open on first launch.
+For `fixed` and `adhoc`, users clear the quarantine attribute after each download (`xattr -dr com.apple.quarantine /Applications/Olaz.app`), or open the app once and click Open Anyway in System Settings → Privacy & Security. Right-click → Open no longer bypasses Gatekeeper on macOS 15 and later.
 
 ### The Olaz Release Signing certificate
 

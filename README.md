@@ -18,7 +18,7 @@ Olaz is a SwiftUI app on top of a protocol engine that is being moved into a Rus
 Olaz là ứng dụng Zalo không chính thức, viết native cho macOS (giao diện SwiftUI, lõi giao thức bằng Rust qua UniFFI, một số module JS chạy trong JavaScriptCore). Dự án nghiên cứu khả năng tương tác, không liên kết với VNG; dùng với tài khoản của bạn và tự chịu rủi ro.
 
 - Yêu cầu macOS 26 (Tahoe) trở lên. Bản phát hành là universal (Apple Silicon và Intel).
-- Cài đặt: tải file DMG mới nhất ở [Releases](https://github.com/linhsayshii/olazpc-rust/releases/latest), kéo Olaz vào Applications. Bản phát hành được ký bằng chứng chỉ cố định của Olaz (giữ quyền Keychain, micro, camera qua các lần cập nhật) nhưng chưa notarize, nên lần mở đầu hãy bấm chuột phải rồi chọn Open, hoặc chạy `xattr -dr com.apple.quarantine /Applications/Olaz.app`.
+- Cài đặt: tải file DMG mới nhất ở [Releases](https://github.com/linhsayshii/olazpc-rust/releases/latest), kéo Olaz vào Applications. Bản phát hành được ký bằng chứng chỉ cố định của Olaz (giữ quyền Keychain, micro, camera qua các lần cập nhật) nhưng chưa notarize, nên lần mở đầu sẽ bị Gatekeeper chặn. Chạy `xattr -dr com.apple.quarantine /Applications/Olaz.app`, hoặc mở app một lần rồi vào System Settings → Privacy & Security → Open Anyway. Mỗi file DMG/ZIP tải mới cần làm lại bước này.
 - Zalo chỉ cho một phiên PC trên mỗi tài khoản: hãy tắt Zalo PC chính thức khi dùng Olaz.
 - Giấy phép GPL-3.0. Mã gốc và phần nghiên cứu giao thức do Quan Nguyen ([zalo-swift-re](https://github.com/qnguyen3/zalo-swift-re)); xem mục Credits.
 
@@ -40,11 +40,13 @@ Olaz là ứng dụng Zalo không chính thức, viết native cho macOS (giao d
 
 1. Download the latest DMG from [GitHub Releases](https://github.com/linhsayshii/olazpc-rust/releases/latest).
 2. Open it and drag **Olaz** to **Applications**.
-3. Releases are signed with Olaz's own fixed certificate ("Olaz Release Signing"), so Keychain access and permissions carry over between updates, but they are not notarized by Apple. macOS blocks the first launch: right-click Olaz, choose **Open**, then confirm; or run once:
+3. Releases are signed with Olaz's own fixed certificate ("Olaz Release Signing"), so Keychain access and permissions carry over between updates, but they are not notarized by Apple. macOS blocks the first launch (right-click → Open no longer bypasses Gatekeeper since macOS 15). Either run:
 
    ```bash
    xattr -dr com.apple.quarantine /Applications/Olaz.app
    ```
+
+   or open Olaz once, then go to **System Settings → Privacy & Security** and click **Open Anyway**. Repeat after each new download.
 
 Releases list SHA-256 sums for every artifact.
 
