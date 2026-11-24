@@ -175,6 +175,7 @@ pub enum Route {
         conv_id: String,
         set: bool,
         start: i64,
+        start_explicit: bool,
         duration: i64,
     },
     ApplyBatch {
@@ -714,12 +715,13 @@ fn classify_controls(
                 };
                 let duration = int64(act_data.get("duration")).unwrap_or(-1);
                 let mute_mode = int64(act_data.get("muteMode")).unwrap_or(1);
-                let start = int64(
+                let explicit_start = int64(
                     act_data
                         .get("startTime")
                         .or_else(|| act_data.get("systemTime")),
-                )
-                .unwrap_or(now_unix_secs);
+                );
+                let start_explicit = explicit_start.is_some();
+                let start = explicit_start.unwrap_or(now_unix_secs);
                 let is_set = (act == "set"
                     || (act != "unset" && int64(act_data.get("action")) == Some(1)))
                     && mute_mode == 1
@@ -729,6 +731,7 @@ fn classify_controls(
                         conv_id,
                         set: is_set,
                         start,
+                        start_explicit,
                         duration,
                     });
                 }
@@ -1234,36 +1237,42 @@ mod tests {
                     conv_id: "401".to_owned(),
                     set: true,
                     start: 1000,
+                    start_explicit: true,
                     duration: 3600,
                 },
                 Route::Mute {
                     conv_id: "402".to_owned(),
                     set: false,
                     start: 2000,
+                    start_explicit: true,
                     duration: -1,
                 },
                 Route::Mute {
                     conv_id: "403".to_owned(),
                     set: false,
                     start: now,
+                    start_explicit: false,
                     duration: 600,
                 },
                 Route::Mute {
                     conv_id: "404".to_owned(),
                     set: false,
                     start: now,
+                    start_explicit: false,
                     duration: 0,
                 },
                 Route::Mute {
                     conv_id: "g555".to_owned(),
                     set: true,
                     start: 3000,
+                    start_explicit: true,
                     duration: -1,
                 },
                 Route::Mute {
                     conv_id: "g666".to_owned(),
                     set: true,
                     start: now,
+                    start_explicit: false,
                     duration: -1,
                 },
             ]

@@ -31,7 +31,7 @@ use olaz_net::http::{DEFAULT_REQUEST_TIMEOUT, RawResponse, RequestSpec, Transpor
 use olaz_net::{
     LoginAccount, NetError, NetworkErrorKind, SessionClient, ZaloDomains, ZaloSessionError,
 };
-use olaz_wire::{WireParseOptions, extract_batch_events};
+use olaz_wire::{NameLookup, ParsedWireEvent, WireParseOptions, extract_batch_events};
 use olaz_ws::consts::{CMD_AUTHEN, CMD_PING, CMD_PING_ACTIVE, DEFAULT_WS_ENDPOINTS, FRAME_VERSION};
 use olaz_ws::frame::encode_frame_json;
 use olaz_ws::{
@@ -43,6 +43,13 @@ use serde_json::{Map, Value, json};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::AbortHandle;
+
+/// Sentinel wall-clock timestamp used by `ScriptedWsDriver` so `RecordingHost::mute` can mark
+/// fallback timestamps (`startTime` and `systemTime` both absent) as `"<volatile>"`.
+const FIXED_TEST_NOW_SECS: i64 = 1_700_000_000;
+
+/// Keys replaced with `"<volatile>"` inside outgoing `ws_send` payloads (Case format v1).
+const WS_SEND_VOLATILE_KEYS: &[&str] = &["ts", "client_time", "timestamp"];
 
 /// Keys replaced with `"<volatile>"` before canonical request comparison (Case format v1).
 pub const VOLATILE_KEYS: &[&str] = &[
@@ -482,16 +489,43 @@ fn decrypt_request_params(
     (decrypted, param_cipher_key)
 }
 
+fn scrub_ws_send_value(val: Value) -> Value {
+    match val {
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (k, v) in map {
+                if WS_SEND_VOLATILE_KEYS.contains(&k.as_str()) {
+                    out.insert(k, Value::String("<volatile>".to_owned()));
+                } else {
+                    out.insert(k, scrub_ws_send_value(v));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(scrub_ws_send_value).collect()),
+        other => other,
+    }
+}
+
 fn canonical_http_request(
     req: &RequestSpec,
     session_key: Option<&[u8]>,
     unscripted: bool,
 ) -> (Value, Option<Vec<u8>>) {
-    let (params, param_cipher_key) = decrypt_request_params(req, session_key);
+    let is_long_poll_query = req.path() == "/"
+        && (req.query_value("zcid").is_none() || req.query_value("zcid_ext").is_none())
+        && req.query_value("params").is_some();
+    let (params, param_cipher_key) = if is_long_poll_query {
+        (Value::Null, None)
+    } else {
+        decrypt_request_params(req, session_key)
+    };
 
     let mut query_map = BTreeMap::new();
     for (k, v) in &req.query {
-        let scrubbed = if is_volatile_key(k) {
+        let scrubbed = if k == "params" && is_long_poll_query {
+            v.clone()
+        } else if is_volatile_key(k) {
             "<volatile>".to_owned()
         } else {
             v.clone()
@@ -673,7 +707,7 @@ impl ScriptedWsDriver {
                 push_tx: None,
                 task_abort: None,
                 core: Arc::new(Mutex::new(WsCore::new())),
-                fixed_now_secs: 1_700_000_000,
+                fixed_now_secs: FIXED_TEST_NOW_SECS,
             })),
         }
     }
@@ -760,7 +794,7 @@ fn record_ws_send_bytes(recorded: &Arc<Mutex<Vec<Value>>>, raw: &[u8]) {
     if frame.cmd == CMD_PING || frame.cmd == CMD_PING_ACTIVE {
         return;
     }
-    let payload = scrub_volatile_value(Value::Object(frame.envelope));
+    let payload = scrub_ws_send_value(Value::Object(frame.envelope));
     recorded
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -1099,10 +1133,19 @@ impl WsDriver for ScriptedWsDriver {
 
 /// Fake [`Host`] that answers `load_saved_session` / `load_legacy_cookie` / `load_transport_state`
 /// from the case `seed` and records every traced domain activity in Case format v1 `host` order.
+#[derive(Debug, Clone, Default)]
+struct HostSelfProfile {
+    user_id: String,
+    display_name: String,
+    avatar: String,
+    self_conv_id: Option<String>,
+}
+
 pub struct RecordingHost {
     saved_session: Option<String>,
     legacy_cookie: Option<LegacyCookie>,
     transport_state: PersistedTransportState,
+    self_profile: Mutex<Option<HostSelfProfile>>,
     calls: Mutex<Vec<Value>>,
     notify: Notify,
 }
@@ -1124,6 +1167,35 @@ impl RecordingHost {
             .as_ref()
             .and_then(|v| serde_json::from_value::<CursorMap>(v.clone()).ok())
             .unwrap_or_default();
+        let self_profile = seed.saved_session.as_ref().and_then(|saved| {
+            let acc = saved.get("plainAccount")?;
+            let user_id = acc.get("userId").and_then(Value::as_str)?.to_owned();
+            if user_id.is_empty() {
+                return None;
+            }
+            let display_name = acc
+                .get("displayName")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let avatar = acc
+                .get("avatar")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let send2me = acc
+                .get("send2MeId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+                .or_else(|| Some(user_id.clone()));
+            Some(HostSelfProfile {
+                user_id,
+                display_name,
+                avatar,
+                self_conv_id: send2me,
+            })
+        });
         Self {
             saved_session,
             legacy_cookie,
@@ -1131,6 +1203,7 @@ impl RecordingHost {
                 poll_state,
                 ws_cursors,
             },
+            self_profile: Mutex::new(self_profile),
             calls: Mutex::new(Vec::new()),
             notify: Notify::new(),
         }
@@ -1217,7 +1290,21 @@ impl Host for RecordingHost {
 
     async fn set_pref(&self, _key: String, _value: String) {}
 
-    async fn prepare_store(&self, user_id: String, _account: LoginAccount) {
+    async fn prepare_store(&self, user_id: String, account: LoginAccount) {
+        let self_conv_id = if account.send2me_id.is_empty() {
+            (!user_id.is_empty()).then(|| user_id.clone())
+        } else {
+            Some(account.send2me_id.clone())
+        };
+        *self
+            .self_profile
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(HostSelfProfile {
+            user_id: user_id.clone(),
+            display_name: account.display_name,
+            avatar: account.avatar,
+            self_conv_id,
+        });
         self.record("prepare_store", json!({ "user_id": user_id }));
     }
 
@@ -1299,20 +1386,50 @@ impl Host for RecordingHost {
         notify_incoming: bool,
         envelope: TypedChatEnvelope,
     ) {
+        let profile = self
+            .self_profile
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let events = if let Some(p) = profile {
+            let mut names = Vec::new();
+            for uid in &envelope.uids {
+                if uid == &p.user_id {
+                    names.push((
+                        uid.clone(),
+                        NameLookup {
+                            name: p.display_name.clone(),
+                            avatar: p.avatar.clone(),
+                        },
+                    ));
+                }
+            }
+            envelope
+                .payload
+                .resolve(&p.user_id, p.self_conv_id.as_deref(), &names)
+                .unwrap_or(envelope.events)
+        } else {
+            envelope.events
+        };
+        let serialized: Vec<Value> = events
+            .iter()
+            .filter(|ev| !matches!(ev, ParsedWireEvent::Ignore))
+            .map(serialize_parsed_wire_event)
+            .collect();
         self.record(
             "apply_parsed_events",
             json!({
                 "cmd": cmd,
                 "increment_unread": increment_unread,
                 "notify_incoming": notify_incoming,
-                "count": envelope.events.len(),
-                "uids": envelope.uids,
+                "events": serialized,
             }),
         );
     }
 
     async fn mobile_sync(&self, events: Vec<MobileSyncEvent>) {
-        self.record("mobile_sync", json!({ "count": events.len() }));
+        let serialized: Vec<Value> = events.iter().map(serialize_mobile_sync_event).collect();
+        self.record("mobile_sync", json!({ "events": serialized }));
     }
 
     async fn e2ee_signal(&self, cmd: u16, payload: Map<String, Value>) {
@@ -1362,11 +1479,128 @@ impl Host for RecordingHost {
         );
     }
 
-    async fn mute(&self, conv_id: String, set: bool, start: i64, duration: i64) {
+    async fn mute(
+        &self,
+        conv_id: String,
+        set: bool,
+        start: i64,
+        start_explicit: bool,
+        duration: i64,
+    ) {
+        let start_val = if start_explicit {
+            Value::from(start)
+        } else {
+            Value::String("<volatile>".to_owned())
+        };
         self.record(
             "mute",
-            json!({ "conv_id": conv_id, "set": set, "start": start, "duration": duration }),
+            json!({ "conv_id": conv_id, "set": set, "start": start_val, "duration": duration }),
         );
+    }
+}
+
+fn serialize_mobile_sync_event(ev: &MobileSyncEvent) -> Value {
+    match ev {
+        MobileSyncEvent::TransferAfterLogin { temp_key } => {
+            json!({ "kind": "transfer_after_login", "temp_key": temp_key })
+        }
+        MobileSyncEvent::WaitingConfirmOnPhone { sync_id } => {
+            json!({ "kind": "waiting_confirm_on_phone", "sync_id": sync_id })
+        }
+        MobileSyncEvent::UserConfirmed => json!({ "kind": "user_confirmed" }),
+        MobileSyncEvent::UserRejected => json!({ "kind": "user_rejected" }),
+        MobileSyncEvent::MobileBusy => json!({ "kind": "mobile_busy" }),
+        MobileSyncEvent::UploadBatch {
+            sync_id,
+            url,
+            batch_type,
+            idx,
+            is_last,
+        } => json!({
+            "kind": "upload_batch",
+            "sync_id": sync_id,
+            "url": url,
+            "batch_type": batch_type,
+            "idx": idx,
+            "is_last": is_last,
+        }),
+    }
+}
+
+fn serialize_parsed_wire_event(ev: &ParsedWireEvent) -> Value {
+    match ev {
+        ParsedWireEvent::Message(msg, stored) => json!({
+            "kind": "message",
+            "conv_id": msg.conversation_id,
+            "msg_id": msg.id,
+            "client_id": stored.client_id,
+            "sender_id": msg.sender_id,
+            "sender_name": msg.sender_name,
+            "sender_avatar": msg.sender_avatar,
+            "is_mine": msg.is_mine,
+            "kind_tag": stored.kind_tag,
+            "text": msg.text,
+            "ts_ms": stored.ts_ms,
+            "status": stored.status,
+            "is_e2ee": msg.is_e2ee,
+        }),
+        ParsedWireEvent::Reaction {
+            conv_id,
+            msg_id,
+            cli_msg_id,
+            sender_id,
+            r_type,
+            r_icon,
+            event_id,
+            react_client_id,
+            ts_ms,
+            seq_id,
+            sender_name,
+        } => json!({
+            "kind": "reaction",
+            "conv_id": conv_id,
+            "msg_id": msg_id,
+            "cli_msg_id": cli_msg_id,
+            "sender_id": sender_id,
+            "sender_name": sender_name,
+            "r_type": r_type,
+            "r_icon": r_icon,
+            "event_id": event_id,
+            "react_client_id": react_client_id,
+            "ts_ms": ts_ms,
+            "seq_id": seq_id,
+        }),
+        ParsedWireEvent::Undo {
+            conv_id,
+            msg_id,
+            cli_msg_id,
+        } => json!({
+            "kind": "undo",
+            "conv_id": conv_id,
+            "msg_id": msg_id,
+            "cli_msg_id": cli_msg_id,
+        }),
+        ParsedWireEvent::Delete {
+            conv_id,
+            msg_id,
+            cli_msg_id,
+        } => json!({
+            "kind": "delete",
+            "conv_id": conv_id,
+            "msg_id": msg_id,
+            "cli_msg_id": cli_msg_id,
+        }),
+        ParsedWireEvent::Typing {
+            conv_id,
+            sender_id,
+            is_group,
+        } => json!({
+            "kind": "typing",
+            "conv_id": conv_id,
+            "sender_id": sender_id,
+            "is_group": is_group,
+        }),
+        ParsedWireEvent::Ignore => json!({ "kind": "ignore" }),
     }
 }
 
@@ -1512,9 +1746,18 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                     }
                 }
             }
-            Step::Await { predicate, .. } => {
-                let wait_fut = core.wait_until(|snap| predicate.matches(snap));
-                let _ = tokio::time::timeout(Duration::from_secs(3600), wait_fut).await;
+            Step::Await {
+                predicate,
+                timeout_ms,
+            } => {
+                if case.domain == "session" {
+                    let wait_fut = core.wait_until(|snap| predicate.matches(snap));
+                    let _ = tokio::time::timeout(Duration::from_secs(3600), wait_fut).await;
+                } else {
+                    let dur = Duration::from_millis(timeout_ms.unwrap_or(10_000));
+                    let wait_fut = core.wait_for_predicate(|snap| predicate.matches(snap));
+                    let _ = tokio::time::timeout(dur, wait_fut).await;
+                }
             }
             Step::AwaitHost {
                 await_host,

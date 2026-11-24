@@ -14,7 +14,7 @@ use crate::reduce::classify::{
     CMD_PUSH_MSG_11, CMD_PUSH_MSG_GROUP, LP_EXPIRED_REASON, Route, classify, classify_poll,
 };
 use crate::reduce::session;
-use crate::state::{ActiveDrain, CoreState, PendingDrain, WsPhase};
+use crate::state::{ActiveDrain, CoreState, PendingDrain, Phase, WsPhase};
 use crate::typed_chat::{PlainChatParse, try_parse_plain_chat_pure};
 
 /// Sleep between periodic long-poll ticks (`ZaloEngine.startLongPollLoop`: 4 s).
@@ -35,7 +35,11 @@ pub(crate) fn start_transport(
     endpoints: Vec<String>,
     out: &mut ReduceOutput,
 ) {
-    finish_all_drains(state, out);
+    // Only cancel drains from a previously running transport session; preserve any explicit
+    // `DrainChatPolling` queued while `Phase::Ready` was waiting for boot validation to finish.
+    if state.transport.lp_running || state.transport.active_drain.is_some() {
+        finish_all_drains(state, out);
+    }
 
     state.transport.ws_gen = state.transport.ws_gen.saturating_add(1);
     state.transport.ws_phase = WsPhase::Running;
@@ -65,6 +69,10 @@ pub(crate) fn start_transport(
         initial: true,
         delay: LP_TICK_INTERVAL,
     });
+
+    if let Some(queued) = state.transport.pending_drains.pop_front() {
+        begin_drain(state, queued, out);
+    }
 }
 
 /// Stops WebSocket + long-poll loops, bumps both generation counters, and completes any pending
@@ -307,7 +315,8 @@ fn handle_drain_requested(
     notify_incoming: bool,
     out: &mut ReduceOutput,
 ) {
-    if !state.transport.lp_running || max_batches == 0 {
+    let is_ready = matches!(state.session.phase, Phase::Ready);
+    if max_batches == 0 || (!state.transport.lp_running && !is_ready) {
         out.effects.push(Effect::CompleteDrain {
             drain_id,
             total_events: 0,
@@ -320,7 +329,7 @@ fn handle_drain_requested(
         notify_incoming,
         is_periodic: false,
     };
-    if state.transport.active_drain.is_some() {
+    if !state.transport.lp_running || state.transport.active_drain.is_some() {
         state.transport.pending_drains.push_back(req);
     } else {
         begin_drain(state, req, out);
@@ -465,12 +474,14 @@ fn emit_routes(
                 conv_id,
                 set,
                 start,
+                start_explicit,
                 duration,
             } => {
                 out.effects.push(Effect::Host(HostCall::Mute {
                     conv_id,
                     set,
                     start,
+                    start_explicit,
                     duration,
                 }));
             }

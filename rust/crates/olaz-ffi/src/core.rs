@@ -559,6 +559,7 @@ pub enum ControlRouteRecord {
         conv_id: String,
         set: bool,
         start: i64,
+        start_explicit: bool,
         duration: i64,
     },
 }
@@ -668,11 +669,13 @@ pub fn classify_control_envelope(
                 conv_id,
                 set,
                 start,
+                start_explicit,
                 duration,
             } => Some(ControlRouteRecord::Mute {
                 conv_id,
                 set,
                 start,
+                start_explicit,
                 duration,
             }),
             Route::SessionExpired { .. }
@@ -737,7 +740,14 @@ pub trait CoreHost: Send + Sync {
     async fn show_typing(&self, conv_id: String, uid: String, on_pc: bool);
     async fn pin_topic(&self, conv_id: String);
     async fn group_notice(&self, act: String, data_json: String, ts: i64);
-    async fn mute(&self, conv_id: String, set: bool, start: i64, duration: i64);
+    async fn mute(
+        &self,
+        conv_id: String,
+        set: bool,
+        start: i64,
+        start_explicit: bool,
+        duration: i64,
+    );
 }
 
 struct FfiHostBridge(Arc<dyn CoreHost>);
@@ -891,8 +901,17 @@ impl Host for FfiHostBridge {
         self.0.group_notice(act, data_json, ts).await;
     }
 
-    async fn mute(&self, conv_id: String, set: bool, start: i64, duration: i64) {
-        self.0.mute(conv_id, set, start, duration).await;
+    async fn mute(
+        &self,
+        conv_id: String,
+        set: bool,
+        start: i64,
+        start_explicit: bool,
+        duration: i64,
+    ) {
+        self.0
+            .mute(conv_id, set, start, start_explicit, duration)
+            .await;
     }
 }
 
@@ -1153,7 +1172,15 @@ mod tests {
         async fn show_typing(&self, _conv_id: String, _uid: String, _on_pc: bool) {}
         async fn pin_topic(&self, _conv_id: String) {}
         async fn group_notice(&self, _act: String, _data_json: String, _ts: i64) {}
-        async fn mute(&self, _conv_id: String, _set: bool, _start: i64, _duration: i64) {}
+        async fn mute(
+            &self,
+            _conv_id: String,
+            _set: bool,
+            _start: i64,
+            _start_explicit: bool,
+            _duration: i64,
+        ) {
+        }
     }
 
     #[test]

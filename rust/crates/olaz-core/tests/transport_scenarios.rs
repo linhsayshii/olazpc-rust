@@ -646,8 +646,8 @@ async fn t13_ws_mute() {
         mutes[4]["args"],
         json!({ "conv_id": "g555", "set": true, "start": 2000, "duration": 60 })
     );
-    // Missing startTime & systemTime falls back to injected `now_unix_secs` (1_700_000_000 in ScriptedWsDriver).
-    assert_eq!(mutes[5]["args"]["start"], json!(1_700_000_000));
+    // Missing startTime & systemTime marks start as fallback (`"<volatile>"` in Case format v1).
+    assert_eq!(mutes[5]["args"]["start"], json!("<volatile>"));
 }
 
 // -----------------------------------------------------------------------------
@@ -1462,7 +1462,15 @@ async fn core_handle_drain_chat_polling_returns_total_event_count() {
         async fn show_typing(&self, _conv_id: String, _uid: String, _on_pc: bool) {}
         async fn pin_topic(&self, _conv_id: String) {}
         async fn group_notice(&self, _act: String, _data: Map<String, Value>, _ts: i64) {}
-        async fn mute(&self, _conv_id: String, _set: bool, _start: i64, _duration: i64) {}
+        async fn mute(
+            &self,
+            _conv_id: String,
+            _set: bool,
+            _start: i64,
+            _start_explicit: bool,
+            _duration: i64,
+        ) {
+        }
     }
 
     let transport = MockTransport::scripted(vec![
@@ -1526,4 +1534,71 @@ fn persisted_ws_cursors_roundtrip_key_and_values() {
     let json = serde_json::to_string(&map).expect("serialize");
     let decoded: olaz_ws::CursorMap = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(decoded, map);
+}
+
+#[test]
+fn drain_requested_while_ready_before_transport_start_queues_until_lp_running() {
+    let mut state = CoreState::default();
+    state.session.phase = Phase::Ready;
+    state.transport.lp_running = false;
+
+    let out = olaz_core::reduce::reduce(
+        &mut state,
+        Input::DrainRequested {
+            drain_id: 77,
+            max_batches: 4,
+            notify_incoming: false,
+        },
+    );
+    assert!(
+        out.effects.is_empty(),
+        "drain should queue until start_transport rather than completing immediately: {:?}",
+        out.effects
+    );
+
+    // Once boot validation completes and starts transport, the queued drain starts immediately.
+    let start_out = olaz_core::reduce::reduce(
+        &mut state,
+        Input::SyncProfileMeDone {
+            boot_gen: 0,
+            profile_synced: false,
+            account: None,
+            ws_endpoints: vec!["ws://fake".to_owned()],
+        },
+    );
+    assert!(
+        start_out.effects.iter().any(|e| matches!(
+            e,
+            olaz_core::effect::Effect::FetchPollBatch { drain_id: 77, .. }
+        )),
+        "expected queued drain_id=77 to start on start_transport: {:?}",
+        start_out.effects
+    );
+
+    // If session expires while another drain is queued before transport start, it completes with 0.
+    let mut exp_state = CoreState::default();
+    exp_state.session.phase = Phase::Ready;
+    exp_state.transport.lp_running = false;
+    let out2 = olaz_core::reduce::reduce(
+        &mut exp_state,
+        Input::DrainRequested {
+            drain_id: 88,
+            max_batches: 2,
+            notify_incoming: false,
+        },
+    );
+    assert!(out2.effects.is_empty());
+    let exp_out = olaz_core::reduce::reduce(
+        &mut exp_state,
+        Input::Command(olaz_core::input::Command::SessionExpired {
+            reason: "expired".to_owned(),
+        }),
+    );
+    assert!(exp_out.effects.iter().any(|e| matches!(
+        e,
+        olaz_core::effect::Effect::CompleteDrain {
+            drain_id: 88,
+            total_events: 0
+        }
+    )));
 }

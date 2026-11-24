@@ -93,6 +93,7 @@ pub enum HostCall {
         conv_id: String,
         set: bool,
         start: i64,
+        start_explicit: bool,
         duration: i64,
     },
 }

@@ -1792,7 +1792,7 @@ public protocol CoreHost: AnyObject, Sendable {
     
     func groupNotice(act: String, dataJson: String, ts: Int64) async 
     
-    func mute(convId: String, set: Bool, start: Int64, duration: Int64) async 
+    func mute(convId: String, set: Bool, start: Int64, startExplicit: Bool, duration: Int64) async 
     
 }
 /**
@@ -2303,12 +2303,12 @@ open func groupNotice(act: String, dataJson: String, ts: Int64)async   {
         )
 }
     
-open func mute(convId: String, set: Bool, start: Int64, duration: Int64)async   {
+open func mute(convId: String, set: Bool, start: Int64, startExplicit: Bool, duration: Int64)async   {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_olaz_ffi_fn_method_corehost_mute(
-                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterBool.lower(set),FfiConverterInt64.lower(start),FfiConverterInt64.lower(duration)
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterBool.lower(set),FfiConverterInt64.lower(start),FfiConverterBool.lower(startExplicit),FfiConverterInt64.lower(duration)
                 )
             },
             pollFunc: ffi_olaz_ffi_rust_future_poll_void,
@@ -3425,6 +3425,7 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
             convId: RustBuffer,
             set: Int8,
             start: Int64,
+            startExplicit: Int8,
             duration: Int64,
             uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
             uniffiCallbackData: UInt64,
@@ -3439,6 +3440,7 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                      convId: try FfiConverterString.lift(convId),
                      set: try FfiConverterBool.lift(set),
                      start: try FfiConverterInt64.lift(start),
+                     startExplicit: try FfiConverterBool.lift(startExplicit),
                      duration: try FfiConverterInt64.lift(duration)
                 )
             }
@@ -12090,7 +12092,7 @@ public enum ControlRouteRecord: Equatable, Hashable {
     )
     case groupNotice(act: String, dataJson: String, ts: Int64
     )
-    case mute(convId: String, set: Bool, start: Int64, duration: Int64
+    case mute(convId: String, set: Bool, start: Int64, startExplicit: Bool, duration: Int64
     )
 
 
@@ -12134,7 +12136,7 @@ public struct FfiConverterTypeControlRouteRecord: FfiConverterRustBuffer {
         case 7: return .groupNotice(act: try FfiConverterString.read(from: &buf), dataJson: try FfiConverterString.read(from: &buf), ts: try FfiConverterInt64.read(from: &buf)
         )
         
-        case 8: return .mute(convId: try FfiConverterString.read(from: &buf), set: try FfiConverterBool.read(from: &buf), start: try FfiConverterInt64.read(from: &buf), duration: try FfiConverterInt64.read(from: &buf)
+        case 8: return .mute(convId: try FfiConverterString.read(from: &buf), set: try FfiConverterBool.read(from: &buf), start: try FfiConverterInt64.read(from: &buf), startExplicit: try FfiConverterBool.read(from: &buf), duration: try FfiConverterInt64.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -12189,11 +12191,12 @@ public struct FfiConverterTypeControlRouteRecord: FfiConverterRustBuffer {
             FfiConverterInt64.write(ts, into: &buf)
             
         
-        case let .mute(convId,set,start,duration):
+        case let .mute(convId,set,start,startExplicit,duration):
             writeInt(&buf, Int32(8))
             FfiConverterString.write(convId, into: &buf)
             FfiConverterBool.write(set, into: &buf)
             FfiConverterInt64.write(start, into: &buf)
+            FfiConverterBool.write(startExplicit, into: &buf)
             FfiConverterInt64.write(duration, into: &buf)
             
         }
@@ -16162,7 +16165,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_corehost_group_notice() != 60883) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_mute() != 33513) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_mute() != 18866) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_corewirepayload_json_string() != 56764) {

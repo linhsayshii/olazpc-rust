@@ -351,7 +351,14 @@ pub trait Host: Send + Sync {
     async fn show_typing(&self, conv_id: String, uid: String, on_pc: bool);
     async fn pin_topic(&self, conv_id: String);
     async fn group_notice(&self, act: String, data: Map<String, Value>, ts: i64);
-    async fn mute(&self, conv_id: String, set: bool, start: i64, duration: i64);
+    async fn mute(
+        &self,
+        conv_id: String,
+        set: bool,
+        start: i64,
+        start_explicit: bool,
+        duration: i64,
+    );
 }
 
 enum HostJob {
@@ -480,6 +487,7 @@ enum HostJob {
         conv_id: String,
         set: bool,
         start: i64,
+        start_explicit: bool,
         duration: i64,
         _guard: InFlightGuard,
     },
@@ -1044,11 +1052,13 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             conv_id,
                             set,
                             start,
+                            start_explicit,
                             duration,
                         } => HostJob::Mute {
                             conv_id,
                             set,
                             start,
+                            start_explicit,
                             duration,
                             _guard: guard,
                         },
@@ -1367,10 +1377,12 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 conv_id,
                 set,
                 start,
+                start_explicit,
                 duration,
                 _guard,
             } => {
-                host.mute(conv_id, set, start, duration).await;
+                host.mute(conv_id, set, start, start_explicit, duration)
+                    .await;
             }
         }
     }
@@ -1463,7 +1475,15 @@ mod tests {
         async fn show_typing(&self, _conv_id: String, _uid: String, _on_pc: bool) {}
         async fn pin_topic(&self, _conv_id: String) {}
         async fn group_notice(&self, _act: String, _data: Map<String, Value>, _ts: i64) {}
-        async fn mute(&self, _conv_id: String, _set: bool, _start: i64, _duration: i64) {}
+        async fn mute(
+            &self,
+            _conv_id: String,
+            _set: bool,
+            _start: i64,
+            _start_explicit: bool,
+            _duration: i64,
+        ) {
+        }
     }
 
     #[tokio::test]

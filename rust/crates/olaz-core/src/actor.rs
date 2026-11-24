@@ -287,6 +287,27 @@ impl CoreHandle {
         }
     }
 
+    /// Waits until `predicate(&snapshot)` becomes true (or the actor stops), without returning
+    /// early when no tracked effects are in flight (needed when waiting for background timers such
+    /// as periodic long-poll ticks).
+    pub async fn wait_for_predicate<F>(&self, mut predicate: F) -> Option<SessionSnapshot>
+    where
+        F: FnMut(&SessionSnapshot) -> bool,
+    {
+        loop {
+            let state_notified = self.state_notify.notified();
+            tokio::pin!(state_notified);
+            state_notified.as_mut().enable();
+
+            let snap = self.snapshot().await?;
+            if predicate(&snap) {
+                return Some(snap);
+            }
+
+            state_notified.await;
+        }
+    }
+
     /// Stops the actor, aborts in-flight effects, and closes `next_changes()`.
     pub fn stop(&self) {
         let _ = self.tx.send(ActorMsg::Stop);
