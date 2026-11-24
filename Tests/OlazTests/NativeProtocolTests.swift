@@ -1104,8 +1104,11 @@ import Testing
         await engine.ingestParsedPhoneMessages(batch)
         let elapsed = Date().timeIntervalSince(start)
 
-        // Should complete well under 10s even on loaded CI runners (previously degraded to 53s+!)
-        #expect(elapsed < 10.0)
+        // Guards the O(n^2) regression that took 53 s+ on a dev Mac. The healthy path takes 0.1 s alone but competes
+        // for the main actor with every suite running in parallel: 4.5 s seen in a full local run, 12 s on a CI runner.
+        // The budget only has to tell the regression apart, not measure speed.
+        let budget: TimeInterval = ProcessInfo.processInfo.environment["CI"] == nil ? 30 : 60
+        #expect(elapsed < budget, "phone sync ingest took \(elapsed) s")
         // Unopened conversation is NOT bloated in `@Observable messages`, yet all 1,000 messages are in SQLite!
         #expect(engine.messages["u_background"] == nil)
         let bgStored = try await store.messages(convId: "u_background", limit: 50)

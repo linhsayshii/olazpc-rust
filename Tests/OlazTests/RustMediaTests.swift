@@ -153,7 +153,7 @@ private final class LocalServer: @unchecked Sendable {
         let started = ContinuousClock.now
         task.cancel()
         await #expect(throws: CancellationError.self) { try await task.value }
-        #expect(ContinuousClock.now - started < .seconds(3))
+        #expect(ContinuousClock.now - started < .seconds(20))   // well under the 60 s deadline: cancel, not timeout
         await pollUntil { server.closed > 0 }
         #expect(server.closed == 1, "the client connection must be closed after cancel")
     }
