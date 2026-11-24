@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import Network
+import zlib
 @testable import Olaz
 
 final class FakeZaloServer: @unchecked Sendable {
@@ -70,12 +71,19 @@ final class FakeZaloServer: @unchecked Sendable {
     }
 
     struct ScriptEntry: Sendable {
-        let kind: String // "http" | "ws"
+        let kind: String // "http" | "ws" | "ws_frame" | "ws_close"
         let path: String
         let method: String?
         let `repeat`: Bool
         let response: CaseJSON?
         let accept: Bool
+        let cmd: UInt16
+        let subCmd: UInt8
+        let payload: CaseJSON?
+        let encrypt: UInt8?
+        let key: String?
+        let delayMs: Int?
+        var claimed: Bool = false
         var consumed: Bool = false
 
         var isRefused: Bool {
@@ -97,6 +105,10 @@ final class FakeZaloServer: @unchecked Sendable {
     private(set) var port: UInt16 = 0
     private var stopped = false
 
+    private static let defaultWSCipherKeyB64 = Data("0123456789abcdef0123456789abcdef".utf8).base64EncodedString()
+    private static let fixedWSIV = Data("0123456789abcdef".utf8)
+    private static let fixedWSAAD = Data("fedcba9876543210".utf8)
+
     init(serverScript: [CaseJSON], initialSecretKey: Data? = nil) throws {
         self.entries = serverScript.map { item in
             let kind = item["kind"]?.stringValue ?? "http"
@@ -105,7 +117,26 @@ final class FakeZaloServer: @unchecked Sendable {
             let rep = item["repeat"]?.boolValue ?? false
             let resp = item["response"]
             let accept = item["accept"]?.boolValue ?? true
-            return ScriptEntry(kind: kind, path: path, method: method, repeat: rep, response: resp, accept: accept)
+            let cmd = UInt16(clamping: max(0, item["cmd"]?.int64Value ?? 0))
+            let subCmd = UInt8(clamping: max(0, item["sub_cmd"]?.int64Value ?? 0))
+            let payload = item["payload"]
+            let encrypt = item["encrypt"]?.int64Value.map { UInt8(clamping: max(0, $0)) }
+            let key = item["key"]?.stringValue
+            let delayMs = item["delay_ms"]?.int64Value.map { Int(max(0, $0)) }
+            return ScriptEntry(
+                kind: kind,
+                path: path,
+                method: method,
+                repeat: rep,
+                response: resp,
+                accept: accept,
+                cmd: cmd,
+                subCmd: subCmd,
+                payload: payload,
+                encrypt: encrypt,
+                key: key,
+                delayMs: delayMs
+            )
         }
         self.customHTTPHandler = nil
         self.sessionSecretKey = initialSecretKey
@@ -180,7 +211,7 @@ final class FakeZaloServer: @unchecked Sendable {
 
     func waitForConsumed(path: String, timeoutMs: Int = 2000) async {
         await waitUntil(timeoutMs: timeoutMs) {
-            entries.allSatisfy { $0.path != path || $0.repeat || $0.isRefused || $0.consumed }
+            entries.allSatisfy { ($0.kind != "http" && $0.kind != "ws") || $0.path != path || $0.repeat || $0.isRefused || $0.consumed }
         }
     }
 
@@ -347,13 +378,14 @@ final class FakeZaloServer: @unchecked Sendable {
         }
 
         let paramCipherKey = deriveParamCipherKey(from: rawQuery)
-        let decryptedParams = decryptRequestParams(
+        let isLongPollQuery = path == "/" && paramCipherKey == nil && rawQuery["params"] != nil
+        let decryptedParams: CaseJSON? = isLongPollQuery ? nil : decryptRequestParams(
             method: method,
             rawQuery: rawQuery,
             bodyData: bodyData,
             paramCipherKey: paramCipherKey
         )
-        let canonicalQuery = canonicalizeQuery(rawQuery)
+        let canonicalQuery = canonicalizeQuery(rawQuery, keepPlainParams: isLongPollQuery)
 
         let matched = consumeEntry(kind: "http", path: path, method: method)
 
@@ -494,7 +526,7 @@ final class FakeZaloServer: @unchecked Sendable {
         headers: [String: String]
     ) {
         let canonicalQuery = canonicalizeQuery(rawQuery)
-        let matched = consumeEntry(kind: "ws", path: path, method: nil)
+        let (matched, scheduledActions) = consumeWebSocketEntry(path: path)
         var reqDict: [String: CaseJSON] = [
             "kind": .string("ws_connect"),
             "path": .string(path),
@@ -513,7 +545,352 @@ final class FakeZaloServer: @unchecked Sendable {
         let digest = Insecure.SHA1.hash(data: Data((key + magic).utf8))
         let acceptKey = Data(digest).base64EncodedString()
         let handshake = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: \(acceptKey)\r\n\r\n"
-        connection.send(content: Data(handshake.utf8), completion: .contentProcessed { _ in })
+        connection.send(content: Data(handshake.utf8), completion: .contentProcessed { [weak self] error in
+            guard let self, error == nil else {
+                connection.cancel()
+                return
+            }
+            self.readWebSocketFrames(on: connection, buffer: Data())
+            self.runWebSocketActions(scheduledActions, index: 0, on: connection, cipherKey: nil)
+        })
+    }
+
+    private func consumeWebSocketEntry(path: String) -> (ScriptEntry?, [(Int, ScriptEntry)]) {
+        lock.lock()
+        var foundIndex: Int?
+        for i in entries.indices {
+            if entries[i].consumed { continue }
+            if entries[i].kind != "ws" { continue }
+            if entries[i].path != path { continue }
+            if !entries[i].repeat {
+                entries[i].consumed = true
+            }
+            foundIndex = i
+            break
+        }
+        var actions: [(Int, ScriptEntry)] = []
+        if let wsIdx = foundIndex, entries[wsIdx].accept {
+            var j = wsIdx + 1
+            while j < entries.count {
+                let kind = entries[j].kind
+                if kind == "ws" { break }
+                if (kind == "ws_frame" || kind == "ws_close"), !entries[j].consumed, !entries[j].claimed {
+                    entries[j].claimed = true
+                    actions.append((j, entries[j]))
+                }
+                j += 1
+            }
+        }
+        let matched = foundIndex.map { entries[$0] }
+        let pendingWaiters = waiters
+        waiters.removeAll()
+        lock.unlock()
+        for w in pendingWaiters { w() }
+        return (matched, actions)
+    }
+
+    private func markWebSocketActionConsumed(_ index: Int) {
+        lock.lock()
+        if index < entries.count {
+            entries[index].consumed = true
+        }
+        let pendingWaiters = waiters
+        waiters.removeAll()
+        lock.unlock()
+        for w in pendingWaiters { w() }
+    }
+
+    private func runWebSocketActions(
+        _ actions: [(Int, ScriptEntry)],
+        index: Int,
+        on connection: NWConnection,
+        cipherKey: Data?
+    ) {
+        guard index < actions.count else { return }
+        lock.lock()
+        let isStopped = stopped
+        lock.unlock()
+        guard !isStopped else { return }
+
+        let (entryIndex, entry) = actions[index]
+        let execute: @Sendable () -> Void = { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let isStoppedNow = self.stopped
+            self.lock.unlock()
+            guard !isStoppedNow else { return }
+
+            if entry.kind == "ws_close" {
+                self.sendWebSocketFrame(on: connection, opcode: 0x8, payload: Data([0x03, 0xE8])) {
+                    connection.cancel()
+                    self.markWebSocketActionConsumed(entryIndex)
+                }
+                return
+            }
+
+            var nextCipherKey = cipherKey
+            let frameBytes = self.encodeZaloWSFrame(entry: entry, cipherKey: &nextCipherKey)
+            let updatedKey = nextCipherKey
+            self.sendWebSocketFrame(on: connection, opcode: 0x2, payload: frameBytes) {
+                self.markWebSocketActionConsumed(entryIndex)
+                self.runWebSocketActions(actions, index: index + 1, on: connection, cipherKey: updatedKey)
+            }
+        }
+
+        if let delayMs = entry.delayMs, delayMs > 0 {
+            queue.asyncAfter(deadline: .now() + .milliseconds(delayMs), execute: execute)
+        } else {
+            execute()
+        }
+    }
+
+    private func encodeZaloWSFrame(entry: ScriptEntry, cipherKey: inout Data?) -> Data {
+        let cmd = entry.cmd
+        let subCmd = entry.subCmd
+        let payloadJSON = entry.payload ?? .object([:])
+        let payloadString = payloadJSON.canonicalString()
+        let payloadData = Data(payloadString.utf8)
+
+        let encrypt: UInt8 = {
+            if let explicit = entry.encrypt { return explicit }
+            if cmd == 1 || cmd == 602 { return 0 }
+            if let k = cipherKey, k.count == 16 || k.count == 32 { return 2 }
+            return 1
+        }()
+
+        let envelope: CaseJSON = {
+            if cmd == 1 {
+                let keyB64: String? = {
+                    if let explicitKey = entry.key {
+                        return explicitKey.isEmpty ? nil : explicitKey
+                    }
+                    return Self.defaultWSCipherKeyB64
+                }()
+                if let keyB64, let parsed = Data(base64Encoded: keyB64) {
+                    cipherKey = parsed
+                } else {
+                    cipherKey = nil
+                }
+                let encodedData: String = {
+                    switch encrypt {
+                    case 0:
+                        return payloadString
+                    case 1:
+                        return (try? Self.compressZlib(payloadData).base64EncodedString()) ?? ""
+                    case 2:
+                        guard let k = cipherKey,
+                              let compressed = try? Self.compressZlib(payloadData),
+                              let gcm = try? ZaloCrypto.gcmEncrypt16(key: k, plaintext: compressed, iv: Self.fixedWSIV, aad: Self.fixedWSAAD) else {
+                            return ""
+                        }
+                        return gcm.base64EncodedString()
+                    case 3:
+                        guard let k = cipherKey,
+                              let gcm = try? ZaloCrypto.gcmEncrypt16(key: k, plaintext: payloadData, iv: Self.fixedWSIV, aad: Self.fixedWSAAD) else {
+                            return ""
+                        }
+                        return gcm.base64EncodedString()
+                    default:
+                        return payloadString
+                    }
+                }()
+                var obj: [String: CaseJSON] = [
+                    "encrypt": .int(Int64(encrypt)),
+                    "data": .string(encodedData),
+                ]
+                if let keyB64 {
+                    obj["key"] = .string(keyB64)
+                }
+                return .object(obj)
+            }
+
+            switch encrypt {
+            case 0:
+                return .object([
+                    "encrypt": .int(0),
+                    "data": .string(payloadString),
+                ])
+            case 1:
+                let b64 = (try? Self.compressZlib(payloadData).base64EncodedString()) ?? ""
+                return .object([
+                    "encrypt": .int(1),
+                    "data": .string(b64),
+                ])
+            case 2:
+                if let k = cipherKey,
+                   let compressed = try? Self.compressZlib(payloadData),
+                   let gcm = try? ZaloCrypto.gcmEncrypt16(key: k, plaintext: compressed, iv: Self.fixedWSIV, aad: Self.fixedWSAAD) {
+                    return .object([
+                        "encrypt": .int(2),
+                        "data": .string(gcm.base64EncodedString()),
+                    ])
+                }
+                let b64 = (try? Self.compressZlib(payloadData).base64EncodedString()) ?? ""
+                return .object([
+                    "encrypt": .int(1),
+                    "data": .string(b64),
+                ])
+            case 3:
+                if let k = cipherKey,
+                   let gcm = try? ZaloCrypto.gcmEncrypt16(key: k, plaintext: payloadData, iv: Self.fixedWSIV, aad: Self.fixedWSAAD) {
+                    return .object([
+                        "encrypt": .int(3),
+                        "data": .string(gcm.base64EncodedString()),
+                    ])
+                }
+                return .object([
+                    "encrypt": .int(0),
+                    "data": .string(payloadString),
+                ])
+            default:
+                return .object([
+                    "encrypt": .int(Int64(encrypt)),
+                    "data": .string(payloadString),
+                ])
+            }
+        }()
+
+        var out = Data([
+            1, // FRAME_VERSION
+            UInt8(cmd & 0xFF),
+            UInt8((cmd >> 8) & 0xFF),
+            subCmd,
+        ])
+        out.append(Data(envelope.canonicalString().utf8))
+        return out
+    }
+
+    private func sendWebSocketFrame(
+        on connection: NWConnection,
+        opcode: UInt8,
+        payload: Data,
+        completion: (@Sendable () -> Void)? = nil
+    ) {
+        var frame = Data()
+        frame.append(0x80 | (opcode & 0x0F))
+        let len = payload.count
+        if len <= 125 {
+            frame.append(UInt8(len))
+        } else if len <= 65535 {
+            frame.append(126)
+            frame.append(UInt8((len >> 8) & 0xFF))
+            frame.append(UInt8(len & 0xFF))
+        } else {
+            frame.append(127)
+            let u64 = UInt64(len)
+            for shift in stride(from: 56, through: 0, by: -8) {
+                frame.append(UInt8((u64 >> shift) & 0xFF))
+            }
+        }
+        frame.append(payload)
+        connection.send(content: frame, completion: .contentProcessed { _ in
+            completion?()
+        })
+    }
+
+    private func readWebSocketFrames(on connection: NWConnection, buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+            var acc = buffer
+            if let data { acc.append(data) }
+
+            while acc.count >= 2 {
+                let b0 = acc[acc.startIndex]
+                let b1 = acc[acc.index(after: acc.startIndex)]
+                let opcode = b0 & 0x0F
+                let masked = (b1 & 0x80) != 0
+                let len7 = Int(b1 & 0x7F)
+                var headerLen = 2
+                var payloadLen = len7
+
+                if len7 == 126 {
+                    guard acc.count >= headerLen + 2 else { break }
+                    let hi = Int(acc[acc.startIndex + headerLen])
+                    let lo = Int(acc[acc.startIndex + headerLen + 1])
+                    payloadLen = (hi << 8) | lo
+                    headerLen += 2
+                } else if len7 == 127 {
+                    guard acc.count >= headerLen + 8 else { break }
+                    var len64: UInt64 = 0
+                    for i in 0..<8 {
+                        len64 = (len64 << 8) | UInt64(acc[acc.startIndex + headerLen + i])
+                    }
+                    guard len64 <= UInt64(Int.max) else {
+                        connection.cancel()
+                        return
+                    }
+                    payloadLen = Int(len64)
+                    headerLen += 8
+                }
+
+                var maskKey: [UInt8] = []
+                if masked {
+                    guard acc.count >= headerLen + 4 else { break }
+                    maskKey = Array(acc[(acc.startIndex + headerLen)..<(acc.startIndex + headerLen + 4)])
+                    headerLen += 4
+                }
+
+                guard acc.count >= headerLen + payloadLen else { break }
+                var payload = Data(acc[(acc.startIndex + headerLen)..<(acc.startIndex + headerLen + payloadLen)])
+                acc.removeFirst(headerLen + payloadLen)
+
+                if masked {
+                    for i in 0..<payload.count {
+                        payload[i] ^= maskKey[i % 4]
+                    }
+                }
+
+                switch opcode {
+                case 0x8:
+                    let closePayload = payload.count >= 2 ? Data(payload.prefix(2)) : Data([0x03, 0xE8])
+                    self.sendWebSocketFrame(on: connection, opcode: 0x8, payload: closePayload) {
+                        connection.cancel()
+                    }
+                    return
+                case 0x9:
+                    self.sendWebSocketFrame(on: connection, opcode: 0xA, payload: payload)
+                default:
+                    break
+                }
+            }
+
+            if isComplete || error != nil {
+                connection.cancel()
+                return
+            }
+            self.readWebSocketFrames(on: connection, buffer: acc)
+        }
+    }
+
+    private static func compressZlib(_ input: Data) throws -> Data {
+        var stream = z_stream()
+        guard deflateInit_(&stream, Z_DEFAULT_COMPRESSION, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size)) == Z_OK else {
+            throw ZaloCryptoError.inflateFailed
+        }
+        defer { deflateEnd(&stream) }
+        var output = Data(count: max(64, input.count + 64))
+        var status: Int32 = Z_OK
+        input.withUnsafeBytes { src in
+            stream.next_in = UnsafeMutablePointer(mutating: src.bindMemory(to: UInt8.self).baseAddress)
+            stream.avail_in = uInt(input.count)
+            repeat {
+                if Int(stream.total_out) >= output.count {
+                    output.count *= 2
+                }
+                let currentOut = Int(stream.total_out)
+                let avail = output.count - currentOut
+                status = output.withUnsafeMutableBytes { dst in
+                    stream.next_out = dst.bindMemory(to: UInt8.self).baseAddress?.advanced(by: currentOut)
+                    stream.avail_out = uInt(avail)
+                    return deflate(&stream, Z_FINISH)
+                }
+            } while status == Z_OK
+        }
+        guard status == Z_STREAM_END else {
+            throw ZaloCryptoError.inflateFailed
+        }
+        output.count = Int(stream.total_out)
+        return output
     }
 
     private func consumeEntry(kind: String, path: String, method: String?) -> ScriptEntry? {
@@ -649,7 +1026,7 @@ final class FakeZaloServer: @unchecked Sendable {
             if path == "/api/login/reqqr" || path == "/api/login/getLoginInfo" {
                 return paramCipherKey
             }
-            if path == "/api/social/profile/me-v2" {
+            if path == "/api/social/profile/me-v2" || path == "/" {
                 lock.lock()
                 defer { lock.unlock() }
                 return sessionSecretKey
@@ -668,17 +1045,19 @@ final class FakeZaloServer: @unchecked Sendable {
     }
 
     private static let volatileQueryKeys: Set<String> = [
-        "imei", "computer_name", "client_time", "ts", "zcid", "zcid_ext", "signkey", "params"
+        "imei", "computer_name", "client_time", "ts", "t", "zcid", "zcid_ext", "signkey", "params"
     ]
 
     private static let volatileParamKeys: Set<String> = [
         "imei", "computer_name", "client_time", "ts"
     ]
 
-    private func canonicalizeQuery(_ rawQuery: [String: String]) -> [String: CaseJSON] {
+    private func canonicalizeQuery(_ rawQuery: [String: String], keepPlainParams: Bool = false) -> [String: CaseJSON] {
         var out: [String: CaseJSON] = [:]
         for (k, v) in rawQuery {
-            if Self.volatileQueryKeys.contains(k) {
+            if k == "params" && keepPlainParams {
+                out[k] = .string(v)
+            } else if Self.volatileQueryKeys.contains(k) {
                 out[k] = .string("<volatile>")
             } else {
                 out[k] = .string(v)

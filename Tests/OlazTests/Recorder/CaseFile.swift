@@ -175,11 +175,15 @@ enum CaseJSON: Equatable, Sendable {
     }
 
     static func fromAny(_ value: Any) -> CaseJSON {
+        if type(of: value) == Bool.self, let b = value as? Bool {
+            return .bool(b)
+        }
+        if type(of: value) == UInt64.self, let u = value as? UInt64 {
+            return .uint(u)
+        }
         switch value {
         case is NSNull:
             return .null
-        case let b as Bool:
-            return .bool(b)
         case let n as NSNumber:
             if CFGetTypeID(n) == CFBooleanGetTypeID() {
                 return .bool(n.boolValue)
