@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import OlazCore
 
 struct SendMessageResult: Sendable {
     var msgId: String
@@ -101,6 +102,20 @@ extension ZaloSessionClient {
     // MARK: - Contacts & Profiles
 
     func fetchFriends(page: Int = 1, count: Int = 20000) async throws -> ZaloJSONArrayBox {
+        if let core = coreApi() {
+            do {
+                let rows = RustCore.objects(try await core.fetchFriends(page: Int64(page), count: Int64(count)))
+                for row in rows {
+                    let uid = ZaloWireParser.stripUserPrefix(JSONLossless.string(row["userId"] ?? row["uid"] ?? row["id"]))
+                    let gid = JSONLossless.string(row["globalId"])
+                    if !uid.isEmpty && !gid.isEmpty {
+                        globalIdToUidCache[gid] = uid
+                        uidToGlobalIdCache[uid] = gid
+                    }
+                }
+                return ZaloJSONArrayBox(rows)
+            } catch { throw RustCore.mapError(error) }
+        }
         let resp = try await get(
             service: "profile",
             path: "/api/social/friend/getfriends",
@@ -211,6 +226,11 @@ extension ZaloSessionClient {
     }
 
     func fetchGroupsList() async throws -> ZaloJSONBox {
+        if let core = coreApi() {
+            do {
+                return ZaloJSONBox(RustCore.object(try await core.fetchGroupsList()))
+            } catch { throw RustCore.mapError(error) }
+        }
         let listResp = try await get(service: "group", path: "/api/group/getlg/v4")
         let outerData = listResp["data"] as? [String: Any] ?? [:]
         let dataDict = (outerData["data"] as? [String: Any]) ?? outerData
@@ -246,6 +266,17 @@ extension ZaloSessionClient {
     }
 
     func fetchProfiles(uids: [String]) async throws -> ZaloJSONBox {
+        if let core = coreApi() {
+            var seen = Set<String>()
+            let clean = uids.compactMap { raw -> String? in
+                guard let uid = ZaloWireParser.sanitizeProfileUid(raw), seen.insert(uid).inserted else { return nil }
+                return uid
+            }
+            guard !clean.isEmpty else { return ZaloJSONBox([:]) }
+            do {
+                return ZaloJSONBox(RustCore.object(try await core.fetchProfiles(uids: clean)))
+            } catch { throw RustCore.mapError(error) }
+        }
         var seen = Set<String>()
         var clean: [String] = []
         clean.reserveCapacity(uids.count)
@@ -315,6 +346,11 @@ extension ZaloSessionClient {
     }
 
     func fetchAliases() async throws -> [String: String] {
+        if let core = coreApi() {
+            do {
+                return try await core.fetchAliases()
+            } catch { throw RustCore.mapError(error) }
+        }
         var result: [String: String] = [:]
         let pageSize = 100
         for page in 1...20 {
@@ -356,14 +392,31 @@ extension ZaloSessionClient {
         return ZaloJSONArrayBox(rows)
     }
 
+    /// Received friend requests. The official client has no `received/list` endpoint (it 404s on every host): it reads
+    /// `recommendsv2/list` (cmd 11437, params `{imei}`) and keeps the `recommItems` whose `dataInfo.recommType == 2`.
     func fetchReceivedFriendRequests() async throws -> ZaloJSONArrayBox {
         let resp = try await get(
             service: "friend",
-            path: "/api/friend/received/list",
-            encryptedPayload: ["page": 1, "count": 100, "avatar_size": 120]
+            path: "/api/friend/recommendsv2/list",
+            encryptedPayload: ["imei": imei]
         )
-        let rows = (resp["data"] as? [[String: Any]]) ?? ((resp["data"] as? [String: Any])?["list"] as? [[String: Any]]) ?? []
-        return ZaloJSONArrayBox(rows)
+        return ZaloJSONArrayBox(Self.receivedFriendRequestRows(resp["data"]))
+    }
+
+    /// Flattens `recommendsv2/list` items with `recommType == 2` into the row shape the contacts sync reads
+    /// (`userId`, `displayName`, `zaloName`, `avatar`, `message`, `time`), newest first like the official list.
+    static func receivedFriendRequestRows(_ data: Any?) -> [[String: Any]] {
+        let items = ((data as? [String: Any])?["recommItems"] as? [[String: Any]]) ?? []
+        var rows: [[String: Any]] = []
+        for item in items {
+            guard let info = item["dataInfo"] as? [String: Any], JSONLossless.int64(info["recommType"]) == 2 else { continue }
+            var row = info
+            let recomm = info["recommInfo"] as? [String: Any]
+            row["message"] = JSONLossless.string(recomm?["message"] ?? info["message"])
+            row["time"] = JSONLossless.int64(info["recommTime"] ?? info["friendRequestFetchTime"]) ?? 0
+            rows.append(row)
+        }
+        return rows.sorted { (JSONLossless.int64($0["time"]) ?? 0) > (JSONLossless.int64($1["time"]) ?? 0) }
     }
 
     static func normalizePhoneForLookup(_ raw: String) -> String {
@@ -455,6 +508,24 @@ extension ZaloSessionClient {
     // MARK: - Conversations, Pins, Archive, Mute, Polling, History
 
     func fetchChatFromPolling(state: ZaloPollState) async throws -> (box: ZaloJSONBox, nextState: ZaloPollState, more: Bool) {
+        if let core = coreApi() {
+            do {
+                let record = PollStateRecord(
+                    lastActionId: state.lastActionId,
+                    lastActionIdOther: state.lastActionIdOther,
+                    queues: state.queues.keys.sorted().map { key in
+                        PollQueueRecord(key: key, lastId: state.queues[key]?.lastId ?? "1", ids: state.queues[key]?.ids ?? [])
+                    })
+                let out = try await core.fetchChatFromPolling(state: record)
+                var next = ZaloPollState()
+                next.lastActionId = out.nextState.lastActionId
+                next.lastActionIdOther = out.nextState.lastActionIdOther
+                next.queues = Dictionary(uniqueKeysWithValues: out.nextState.queues.map {
+                    ($0.key, ZaloPollQueueCursor(lastId: $0.lastId, ids: $0.ids))
+                })
+                return (ZaloJSONBox(RustCore.object(out.rawJson)), next, out.more)
+            } catch { throw RustCore.mapError(error, quietTimeout: true) }
+        }
         let ts = Int64(Date().timeIntervalSince1970)
         let base = ZaloDomains.normalizeHost(domains.lpChat)
         guard let url = URL(string: "\(base)/?\(commonParams())&params=\(state.encodedParams())&ts=\(ts)") else {
@@ -468,6 +539,11 @@ extension ZaloSessionClient {
     }
 
     func fetchPinnedConversations() async throws -> [String] {
+        if let core = coreApi() {
+            do {
+                return try await core.fetchPinnedConversations()
+            } catch { throw RustCore.mapError(error) }
+        }
         let resp = try await get(service: "conversation", path: "/api/pinconvers/list", encryptedPayload: nil)
         let rawIds: [String] = {
             if let list = resp["data"] as? [Any] {
@@ -496,6 +572,13 @@ extension ZaloSessionClient {
     }
 
     func fetchArchivedChats() async throws -> [String] {
+        if let core = coreApi() {
+            do {
+                let ids = try await core.fetchArchivedChats()
+                archivedVersion = core.archivedVersion()
+                return ids
+            } catch { throw RustCore.mapError(error) }
+        }
         let resp = try await get(
             service: "label",
             path: "/api/archivedchat/list",
@@ -539,6 +622,13 @@ extension ZaloSessionClient {
     }
 
     func fetchConversationLabels() async throws -> ZaloJSONBox {
+        if let core = coreApi() {
+            do {
+                let box = ZaloJSONBox(RustCore.object(try await core.fetchConversationLabels()))
+                labelVersion = core.labelVersion()
+                return box
+            } catch { throw RustCore.mapError(error) }
+        }
         let resp = try await get(
             service: "label",
             path: "/api/convlabel/get",
@@ -567,6 +657,12 @@ extension ZaloSessionClient {
     }
 
     func setUnreadMarkAPI(convId: String, unread: Bool) async throws {
+        if let core = coreApi() {
+            do {
+                try await core.setUnreadMark(convId: convId, unread: unread)
+                return
+            } catch { throw RustCore.mapError(error) }
+        }
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
         let convsGroup: [String] = isGroup ? [cleanId] : []
@@ -644,6 +740,11 @@ extension ZaloSessionClient {
     }
 
     func fetchMuteList() async throws -> ZaloJSONArrayBox {
+        if let core = coreApi() {
+            do {
+                return ZaloJSONArrayBox(RustCore.objects(try await core.fetchMuteList()))
+            } catch { throw RustCore.mapError(error) }
+        }
         let resp = try await get(service: "profile", path: "/api/social/profile/getmute", encryptedPayload: ["imei": imei])
         let d = resp["data"] as? [String: Any] ?? [:]
         var normalized: [[String: Any]] = []
@@ -683,6 +784,11 @@ extension ZaloSessionClient {
     }
 
     func fetchPreloadConversations(threadIds: [String] = []) async throws -> ZaloJSONBox {
+        if let core = coreApi() {
+            do {
+                return ZaloJSONBox(RustCore.object(try await core.fetchPreloadConversations(threadIds: threadIds)))
+            } catch { throw RustCore.mapError(error) }
+        }
         var mapDict: [String: String] = [:]
         for rawId in threadIds.prefix(25) {
             if ZaloWireParser.isGroupId(rawId) {
@@ -723,7 +829,24 @@ extension ZaloSessionClient {
         return ZaloJSONBox(resp)
     }
 
+    /// History as a typed page: on the Rust path the answer stays in the core (no JSON in Swift, see `ZaloHistoryPage`);
+    /// on the Swift path it wraps the dictionary the Swift walk produces.
+    func fetchHistoryPage(convId: String, lastMsgId: String?, count: Int = 50, isOld: Bool? = nil) async throws -> ZaloHistoryPage {
+        if let core = coreApi() {
+            do {
+                let h = try await core.fetchHistory(convId: convId, lastMsgId: lastMsgId, count: Int64(count), isOld: isOld)
+                return ZaloHistoryPage(record: h)
+            } catch { throw RustCore.mapError(error) }
+        }
+        return ZaloHistoryPage(box: try await fetchHistorySwift(convId: convId, lastMsgId: lastMsgId, count: count, isOld: isOld))
+    }
+
+    /// History as a raw dictionary, for callers that read raw fields or feed `applyBatchResponse`.
     func fetchHistory(convId: String, lastMsgId: String?, count: Int = 50, isOld: Bool? = nil) async throws -> ZaloJSONBox {
+        try await fetchHistoryPage(convId: convId, lastMsgId: lastMsgId, count: count, isOld: isOld).box
+    }
+
+    private func fetchHistorySwift(convId: String, lastMsgId: String?, count: Int, isOld: Bool?) async throws -> ZaloJSONBox {
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
         let isSelfCloud = !isGroup && (
@@ -832,8 +955,21 @@ extension ZaloSessionClient {
         quoteOwnerId: String? = nil,
         quoteText: String? = nil,
         quoteTsMs: Int64? = nil,
-        mentions: [Mention] = []
+        mentions: [Mention] = [],
+        textProperties: String? = nil,
+        ttl: Int64 = 0,
+        urgency: Int = 0
     ) async throws -> SendMessageResult {
+        if let core = coreApi() {
+            do {
+                let r = try await core.sendText(args: SendTextRecord(
+                    convId: convId, text: text, cliMsgId: cliMsgId, quoteMsgId: quoteMsgId, quoteCliMsgId: quoteCliMsgId,
+                    quoteOwnerId: quoteOwnerId, quoteText: quoteText, quoteTsMs: quoteTsMs,
+                    mentions: mentions.map { MentionRecord(uid: $0.uid, pos: Int64($0.pos), len: Int64($0.len), isAll: $0.isAll) },
+                    textProperties: textProperties, ttl: ttl, urgency: Int64(urgency)))
+                return SendMessageResult(msgId: r.msgId, cliMsgId: r.cliMsgId, tsMs: r.tsMs)
+            } catch { throw RustCore.mapError(error) }
+        }
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
         let cliInt = Int64(cliMsgId) ?? nextClientId()
@@ -856,8 +992,10 @@ extension ZaloSessionClient {
                 "message": text,
                 "clientId": cliInt,
                 "imei": imei,
-                "ttl": 0
+                "ttl": ttl
             ]
+            if let textProperties { payload["textProperties"] = textProperties }
+            if urgency > 0 { payload["metaData"] = ["urgency": urgency] }
             if isGroup {
                 payload["grid"] = cleanId
                 payload["visibility"] = 0
@@ -880,10 +1018,12 @@ extension ZaloSessionClient {
                 "qmsgType": 1,
                 "qmsg": quoteText ?? "",
                 "qmsgTs": quoteTsMs ?? Int64(Date().timeIntervalSince1970 * 1000),
-                "ttl": 0,
+                "ttl": ttl,
                 "zsource": 101,
                 "imei": imei
             ]
+            if let textProperties { qPayload["textProperties"] = textProperties }
+            if urgency > 0 { qPayload["metaData"] = ["urgency": urgency] }
             if isGroup {
                 qPayload["grid"] = cleanId
                 qPayload["visibility"] = 0
@@ -912,18 +1052,27 @@ extension ZaloSessionClient {
         )
     }
 
+    /// Official `VERSION_MSG` (text, sticker, file, photo, link, gif: `{version:0, compat_version:0}`). A receiver drops
+    /// any message whose `compat_version` is above the one it knows before decrypting it: Zalo PC 26.10 shows a text sent
+    /// with 1 as failed while the phone still opens it.
+    static let e2eeMsgVersion = 0
+    static let e2eeMsgCompatVersion = 0
+
     static func buildE2EEExtJSON(
         registrationId: Int,
         senderRegistrationId: Int,
-        version: Int = 1,
-        compatVersion: Int = 1
+        version: Int = e2eeMsgVersion,
+        compatVersion: Int = e2eeMsgCompatVersion,
+        retry: Int = 0
     ) -> String {
-        let obj: [String: Any] = [
+        // Official `buildE2eeParams` / `_enrichAdditionalParams`: iid and sender_iid only when known.
+        var obj: [String: Any] = [
             "version": version,
             "compat_version": compatVersion,
-            "iid": registrationId,
-            "sender_iid": senderRegistrationId,
         ]
+        if registrationId > 0 { obj["iid"] = registrationId }
+        if senderRegistrationId > 0 { obj["sender_iid"] = senderRegistrationId }
+        if retry > 0 { obj["retry"] = retry }
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]),
               let str = String(data: data, encoding: .utf8) else {
             return "{}"
@@ -940,15 +1089,17 @@ extension ZaloSessionClient {
         senderIid: Int,
         ttl: Int = 0,
         useLegacyE2EEKey: Bool = false,
-        version: Int = 1,
-        compatVersion: Int = 1,
+        version: Int = e2eeMsgVersion,
+        compatVersion: Int = e2eeMsgCompatVersion,
+        retry: Int = 0,
         extraFields: [String: Any] = [:]
     ) -> [String: Any] {
         let extJSON = buildE2EEExtJSON(
             registrationId: registrationId,
             senderRegistrationId: senderIid,
             version: version,
-            compatVersion: compatVersion
+            compatVersion: compatVersion,
+            retry: retry
         )
         var entry: [String: Any] = [
             "toId": ZaloWireParser.stripUserPrefix(toId),
@@ -1135,6 +1286,16 @@ extension ZaloSessionClient {
             encryptedPayload: spec.payload
         )
         let extracted = Self.extractE2EESendResponse(resp)
+        do {
+            let path = spec.path
+            let code = JSONLossless.int64(resp["error_code"]).map(String.init) ?? "-"
+            let entries = listParams.array.count
+            let ext = (listParams.array.first?["e2eeExt"] as? String).flatMap { JSONLossless.parseObject(Data($0.utf8)) }
+            let versions = ext.map { "\(JSONLossless.int64($0["version"]) ?? -1)/\(JSONLossless.int64($0["compat_version"]) ?? -1)" } ?? "-"
+            Task { @MainActor in
+                EngineLog.shared.write("e2ee send: post path=\(path) entries=\(entries) version=\(versions) error_code=\(code) msgId=\(!extracted.msgId.isEmpty)")
+            }
+        }
         if extracted.msgId.isEmpty {
             // Shapes only (key names), never values: the message keeps its clientId until the WS echo.
             let dataKeys = (resp["data"] as? [String: Any]).map { $0.keys.sorted().joined(separator: ",") }
@@ -1153,18 +1314,29 @@ extension ZaloSessionClient {
         )
     }
 
+    /// Official `DEST_TYPING.USER` (`PAGE` = 5 is for official accounts). 0 is not a valid value: the peer shows nothing.
+    static let typingDestUser = 3
+
     func sendTypingAPI(convId: String) async {
+        if let core = coreApi() {
+            try? await core.sendTyping(convId: convId)
+            return
+        }
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
         let service = isGroup ? "group" : "chat"
         let path = isGroup ? "/api/group/typing" : "/api/message/typing"
         let payload: [String: Any] = isGroup
             ? ["grid": cleanId, "imei": imei]
-            : ["toid": cleanId, "destType": 0, "imei": imei]
+            : ["toid": cleanId, "destType": Self.typingDestUser, "imei": imei]
         _ = try? await post(service: service, path: path, encryptedPayload: payload)
     }
 
     func sendSeenAPI(convId: String, msgId: String, cliMsgId: String, senderId: String) async {
+        if let core = coreApi() {
+            try? await core.sendSeen(convId: convId, msgId: msgId, cliMsgId: cliMsgId, senderId: senderId)
+            return
+        }
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
         let trimmedMsg = msgId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1238,6 +1410,13 @@ extension ZaloSessionClient {
         msgType: Int = 1,
         clientId: Int64? = nil
     ) async throws -> Int64 {
+        if let core = coreApi() {
+            do {
+                return try await core.sendReaction(
+                    convId: convId, msgId: msgId, cliMsgId: cliMsgId, rIcon: rIcon, rType: Int64(rType),
+                    msgType: Int64(msgType), clientId: clientId)
+            } catch { throw RustCore.mapError(error) }
+        }
         let nowInt = clientId ?? nextClientId()
         let spec = Self.buildReactionRequest(
             convId: convId,
@@ -1304,6 +1483,12 @@ extension ZaloSessionClient {
     }
 
     func recallMessageAPI(convId: String, msgId: String, cliMsgId: String, isE2EE: Bool = false) async throws {
+        if let core = coreApi() {
+            do {
+                try await core.recallMessage(convId: convId, msgId: msgId, cliMsgId: cliMsgId, isE2ee: isE2EE)
+                return
+            } catch { throw RustCore.mapError(error) }
+        }
         let spec = Self.buildRecallMessageRequest(
             convId: convId,
             msgId: msgId,
@@ -1316,6 +1501,12 @@ extension ZaloSessionClient {
     }
 
     func deleteMessageForMeAPI(convId: String, msgId: String, cliMsgId: String, senderId: String) async throws {
+        if let core = coreApi() {
+            do {
+                try await core.deleteMessageForMe(convId: convId, msgId: msgId, cliMsgId: cliMsgId, senderId: senderId)
+                return
+            } catch { throw RustCore.mapError(error) }
+        }
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
         let msgDel: [String: Any] = [
@@ -1980,37 +2171,17 @@ extension ZaloSessionClient {
 
     // MARK: - Board Pins, Polls, Reminders
 
+    /// 1-1 pins live on `friend_board` (official `getListOneOnOnePinTopics`, cmd 12065); `group_board /api/board/oneone/*`
+    /// is the 1-1 *reminder* board, not the pinned bar.
     func fetchBoardPins(convId: String) async throws -> ZaloJSONBox {
         let isGroup = ZaloWireParser.isGroupId(convId)
         if !isGroup {
-            let toUid = ZaloWireParser.stripUserPrefix(convId)
-            let objDict: [String: Any] = [
-                "uid": toUid,
-                "board_type": 0,
-                "page": 1,
-                "count": 20,
-                "last_id": 0,
-                "last_type": 0
-            ]
-            let objStr = (try? JSONSerialization.data(withJSONObject: objDict)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-            let resp: [String: Any]
-            do {
-                resp = try await get(
-                    service: "group_board",
-                    path: "/api/board/oneone/list",
-                    encryptedPayload: ["objectData": objStr]
-                )
-            } catch let err as ZaloSessionError where err.code == -1 {
-                // Official `/api/board/oneone/list` returns `error_code: -1, data: "[]"` when empty.
-                return ZaloJSONBox(["items": [], "boardVersion": 0])
-            }
-            if let arr = resp["data"] as? [[String: Any]] {
-                return ZaloJSONBox(["items": arr, "boardVersion": 0])
-            }
-            let d = resp["data"] as? [String: Any] ?? [:]
-            let items = (d["topics"] as? [[String: Any]]) ?? (d["items"] as? [[String: Any]]) ?? []
-            let ver = JSONLossless.int64(d["version"] ?? d["boardVersion"]) ?? 0
-            return ZaloJSONBox(["items": items, "boardVersion": ver])
+            let resp = try await get(
+                service: "friend_board",
+                path: "/api/friendboard/list",
+                encryptedPayload: ["conversationId": ZaloWireParser.stripUserPrefix(convId), "version": 0]
+            )
+            return ZaloJSONBox(ZaloWireParser.friendBoardListBox(resp))
         }
         let grid = ZaloWireParser.cleanGroupId(convId)
         let resp = try await get(
@@ -2021,47 +2192,41 @@ extension ZaloSessionClient {
         let d = resp["data"] as? [String: Any] ?? [:]
         let items = (d["topics"] as? [[String: Any]]) ?? (d["items"] as? [[String: Any]]) ?? []
         let ver = JSONLossless.int64(d["boardVersion"] ?? d["version"]) ?? 0
-        return ZaloJSONBox(["items": items, "boardVersion": ver])
+        // Official topic controller keeps `pinLimit` of this response as the board's limit.
+        let limit = JSONLossless.int64(d["pinLimit"] ?? d["pin_limit"]) ?? 0
+        return ZaloJSONBox(["items": items, "boardVersion": ver, "pinLimit": limit])
     }
 
-    func pinBoardMessage(convId: String, msgId: String, cliMsgId: String, senderId: String, text: String) async throws -> ZaloJSONBox {
+    /// Pins a message topic. `params` = `ZaloWireParser.pinTopicParams` (official `getTopicDataFromMessage`).
+    /// Group: `group_board /api/board/topic/createv2`; 1-1: `friend_board /api/friendboard/create` (cmd 12067).
+    func pinBoardMessage(convId: String, params: [String: Any], boardVersion: Int64 = 0) async throws -> ZaloJSONBox {
+        let paramsStr = (try? JSONSerialization.data(withJSONObject: params)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
         let isGroup = ZaloWireParser.isGroupId(convId)
         if !isGroup {
-            let toUid = ZaloWireParser.stripUserPrefix(convId)
-            let objDict: [String: Any] = [
-                "toUid": toUid,
+            let topic: [String: Any] = [
                 "type": 2,
                 "color": -16_777_216,
                 "emoji": "",
                 "startTime": -1,
                 "duration": -1,
-                "params": [
-                    "senderUid": ZaloWireParser.stripUserPrefix(senderId),
-                    "msgType": 1,
-                    "client_msg_id": cliMsgId,
-                    "global_msg_id": msgId,
-                    "title": text
-                ],
-                "repeat": 0,
+                "params": paramsStr,
+                "pinAct": 1,
+                "isCreated": true,
                 "src": -1
             ]
-            let objStr = (try? JSONSerialization.data(withJSONObject: objDict)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-            let resp = try await post(
-                service: "group_board",
-                path: "/api/board/oneone/create",
-                encryptedPayload: ["objectData": objStr, "imei": imei]
+            let resp = try await get(
+                service: "friend_board",
+                path: "/api/friendboard/create",
+                encryptedPayload: [
+                    "conversationId": ZaloWireParser.stripUserPrefix(convId),
+                    "topic": topic,
+                    "version": boardVersion,
+                    "lang": "vi"
+                ]
             )
             return ZaloJSONBox(resp)
         }
         let grid = ZaloWireParser.cleanGroupId(convId)
-        let paramsDict: [String: Any] = [
-            "senderUid": ZaloWireParser.stripUserPrefix(senderId),
-            "msgType": 1,
-            "client_msg_id": cliMsgId,
-            "global_msg_id": msgId,
-            "title": text
-        ]
-        let paramsStr = (try? JSONSerialization.data(withJSONObject: paramsDict)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
         let resp = try await post(
             service: "group_board",
             path: "/api/board/topic/createv2",
@@ -2082,19 +2247,25 @@ extension ZaloSessionClient {
         return ZaloJSONBox(resp)
     }
 
+    /// Group: `group_board /api/board/unpinv2`; 1-1: `friend_board /api/friendboard/multi_unpin` (cmd 12069).
     func unpinBoardTopic(convId: String, topicId: String, rawTopic: ZaloJSONBox? = nil, boardVersion: Int64 = 0) async throws {
         let isGroup = ZaloWireParser.isGroupId(convId)
         if !isGroup {
-            let toUid = ZaloWireParser.stripUserPrefix(convId)
-            _ = try await post(
-                service: "group_board",
-                path: "/api/board/oneone/remove",
-                encryptedPayload: ["uid": toUid, "topicId": topicId, "imei": imei]
+            _ = try await get(
+                service: "friend_board",
+                path: "/api/friendboard/multi_unpin",
+                encryptedPayload: [
+                    "conversationId": ZaloWireParser.stripUserPrefix(convId),
+                    "topics": ZaloWireParser.friendBoardUnpinTopics(ref: topicId, rawTopic: rawTopic?.dict),
+                    "version": boardVersion,
+                    "lang": "vi"
+                ]
             )
             return
         }
         let grid = ZaloWireParser.cleanGroupId(convId)
-        let topicPayload: [String: Any] = rawTopic?.dict ?? ["id": topicId, "type": 2]
+        // Official `unpinBoardItem`: `topic` is {topicId, topicType} (the raw board row gets code 114).
+        let topicPayload: [String: Any] = ZaloWireParser.friendBoardUnpinTopics(ref: topicId, rawTopic: rawTopic?.dict)[0]
         _ = try await get(
             service: "group_board",
             path: "/api/board/unpinv2",
@@ -2824,5 +2995,45 @@ enum ZaloVoiceCallProtocol {
             return "{}"
         }
         return json
+    }
+}
+
+/// One history answer. Rust path: the core keeps the parsed body (`HistoryBatch`) and Swift reads the paging head and the
+/// typed events from it, never a JSON dictionary (`box` re-materialises one only for callers that need raw fields).
+/// Swift path: wraps the dictionary.
+struct ZaloHistoryPage: @unchecked Sendable {
+    let hasMore: Bool
+    let isOld: Bool
+    let lastMsgId: String
+    /// Sender / quote-owner uids a parse looks contact names up for (Rust path only).
+    let uids: [String]
+    let rustBatch: HistoryBatch?
+    private let swiftBox: ZaloJSONBox?
+
+    init(record: HistoryRecord) {
+        hasMore = record.hasMore
+        isOld = record.isOld
+        lastMsgId = record.lastMsgId
+        uids = record.uids
+        rustBatch = record.batch
+        swiftBox = nil
+    }
+
+    init(box: ZaloJSONBox) {
+        let data = box.dict["data"] as? [String: Any]
+        func flag(_ v: Any?) -> Bool { JSONLossless.int64(v) == 1 || (v as? Bool) == true }
+        hasMore = flag(data?["hasMore"])
+        isOld = flag(data?["isOld"])
+        lastMsgId = JSONLossless.string(data?["lastMsgId"])
+        uids = []
+        rustBatch = nil
+        swiftBox = box
+    }
+
+    /// The raw answer (`{error_code, data}`); on the Rust path this crosses the bridge as JSON, so use it sparingly.
+    var box: ZaloJSONBox {
+        if let swiftBox { return swiftBox }
+        guard let rustBatch else { return ZaloJSONBox() }
+        return ZaloJSONBox(RustCore.object(rustBatch.rawJson()))
     }
 }

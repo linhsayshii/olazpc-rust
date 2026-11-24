@@ -15,7 +15,7 @@ struct SettingsView: View {
                 SettingsPane(height: 440) { NotificationSettingsView() }
             }
             Tab("Quyền riêng tư", systemImage: "lock") {
-                SettingsPane(height: 300) { PrivacySettings() }
+                SettingsPane(height: 720) { PrivacySettings() }
             }
             Tab("Sticker", systemImage: "face.smiling") {
                 SettingsPane(height: 160) { StickerSettingsSection() }
@@ -87,6 +87,108 @@ private struct PrivacySettings: View {
                     .foregroundStyle(.secondary)
             }
         }
+        AccountPrivacySection()
+        QuickMessagesSection()
+        BlockedUsersSection()
+    }
+}
+
+/// "Quản lý tin nhắn nhanh": add, edit and delete; in a chat, "/" + keyword inserts one.
+private struct QuickMessagesSection: View {
+    @Environment(ZaloEngine.self) private var engine
+    @State private var keyword = ""
+    @State private var text = ""
+    @State private var editing: String?
+    @State private var busy = false
+
+    var body: some View {
+        Section("Tin nhắn nhanh") {
+            if let items = engine.quickMessages {
+                if items.isEmpty { Text("Chưa có tin nhắn nhanh nào.").foregroundStyle(.secondary) }
+                ForEach(items) { item in
+                    HStack {
+                        Text("/\(item.keyword)").fontWeight(.semibold)
+                        Text(item.text).lineLimit(1).foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Sửa") { editing = item.id; keyword = item.keyword; text = item.text }
+                        Button("Xóa", role: .destructive) { Task { await engine.deleteQuickMessage(item.id) } }
+                    }
+                }
+            } else {
+                ProgressView().controlSize(.small)
+            }
+            HStack {
+                TextField("Phím tắt", text: $keyword).frame(width: 110)
+                TextField("Nội dung tin nhắn", text: $text)
+                Button(editing == nil ? "Tạo mới" : "Lưu") {
+                    Task {
+                        busy = true
+                        if await engine.saveQuickMessage(id: editing, keyword: keyword, text: text) {
+                            keyword = ""; text = ""; editing = nil
+                        }
+                        busy = false
+                    }
+                }
+                .disabled(busy || keyword.trimmingCharacters(in: .whitespaces).isEmpty || text.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .task { if engine.quickMessages == nil { await engine.loadQuickMessages() } }
+    }
+}
+
+/// Official privacy toggles: online status and "Đã xem" on the server, the typing indicator here.
+private struct AccountPrivacySection: View {
+    @Environment(ZaloEngine.self) private var engine
+    @AppStorage(OlazPrefs.sendTyping) private var sendTyping = true
+
+    var body: some View {
+        Section("Quyền riêng tư") {
+            ForEach(PrivacyKey.allCases, id: \.self) { key in
+                Toggle(key.title, isOn: Binding(
+                    get: { engine.privacy?[key] ?? true },
+                    set: { value in Task { await engine.setPrivacy(key, on: value) } }))
+                .disabled(engine.privacy == nil)
+            }
+            Toggle("Hiển thị trạng thái đang soạn tin", isOn: $sendTyping)
+        }
+        .task { if engine.privacy == nil { await engine.loadPrivacy() } }
+    }
+}
+
+/// "Tài khoản đã chặn" (official Cài đặt ▸ Quyền riêng tư ▸ Danh sách chặn): who I blocked, with "Bỏ chặn".
+private struct BlockedUsersSection: View {
+    @Environment(ZaloEngine.self) private var engine
+    @State private var busy: String?
+
+    var body: some View {
+        Section("Tài khoản đã chặn") {
+            if let users = engine.blockedUsers {
+                if users.isEmpty {
+                    Text("Bạn chưa chặn tài khoản nào.").foregroundStyle(.secondary)
+                }
+                ForEach(users) { user in
+                    HStack(spacing: 10) {
+                        RemoteImage(url: user.avatar, contentMode: .fill, maxPixelSize: 64) {
+                            Image(systemName: "person.crop.circle.fill").resizable().foregroundStyle(.tertiary)
+                        }
+                        .frame(width: 28, height: 28)
+                        .clipShape(Circle())
+                        Text(user.name.isEmpty ? "Người dùng Zalo" : user.name)
+                        Spacer()
+                        if busy == user.id {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Button("Bỏ chặn") {
+                                Task { busy = user.id; await engine.setBlocked(user.id, blocked: false); busy = nil }
+                            }
+                        }
+                    }
+                }
+            } else {
+                Text("Đang tải…").foregroundStyle(.secondary)
+            }
+        }
+        .task { await engine.loadBlockedUsers() }
     }
 }
 

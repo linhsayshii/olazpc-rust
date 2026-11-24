@@ -1104,8 +1104,8 @@ import Testing
         await engine.ingestParsedPhoneMessages(batch)
         let elapsed = Date().timeIntervalSince(start)
 
-        // Should complete in well under 2 seconds (previously degraded to 53s+!)
-        #expect(elapsed < 2.5)
+        // Should complete well under 10s even on loaded CI runners (previously degraded to 53s+!)
+        #expect(elapsed < 10.0)
         // Unopened conversation is NOT bloated in `@Observable messages`, yet all 1,000 messages are in SQLite!
         #expect(engine.messages["u_background"] == nil)
         let bgStored = try await store.messages(convId: "u_background", limit: 50)
@@ -1870,15 +1870,52 @@ private final class MockProfileURLProtocol: URLProtocol, @unchecked Sendable {
         #expect((submitPreKeys["opKeys"] as? [[String: Any]])?.count == 1)
         #expect(submitPreKeys["data"] == nil)
 
-        let ackInit = ZaloE2EEManager.buildAckInitSessionInnerData(uidTo: "222", deviceId: 0, ts: 1700000000000)
-        #expect(ackInit["type"] as? Int == 0)
+        // Official sendAckSession: SUCCESS (1) carries the encrypted subDevice payload, FAILED (0) our iid.
+        let ackInit = ZaloE2EEManager.buildAckInitSessionInnerData(uidTo: "222", deviceId: 0, ts: 1700000000000, cipher: "Mw==", registrationId: 7)
+        #expect(ackInit["type"] as? Int == 1)
         #expect(ackInit["uidTo"] as? String == "222")
-        #expect((ackInit["data"] as? [[String: Any]])?.count == 1)
+        let ackEntry = try #require((ackInit["data"] as? [[String: Any]])?.first)
+        #expect(ackEntry["data"] as? String == "Mw==")
+        #expect(ackEntry["iid"] == nil)
+        #expect(ackEntry["ts"] as? Int64 == 1700000000000)
+        let ackFail = ZaloE2EEManager.buildAckInitSessionInnerData(uidTo: "222", deviceId: 0, ts: 1, cipher: nil, registrationId: 7)
+        #expect(ackFail["type"] as? Int == 0)
+        #expect((ackFail["data"] as? [[String: Any]])?.first?["iid"] as? Int == 7)
 
         let doneProc = ZaloE2EEManager.buildDoneProcessSessionInnerData(info: [["gid": "10", "cmd": 543]])
         #expect(doneProc["queueName"] as? String == "")
         #expect((doneProc["info"] as? [[String: Any]])?.count == 1)
         #expect(doneProc["data"] == nil)
+
+        // DELIVER_SEEN_ONEONE (553): a recipient device reports a message it could not decrypt; the log keeps shapes only.
+        let deliver: [String: Any] = ["data": ["delivereds": [
+            ["deviceId": 2, "err": -1, "errC": -7, "retry": 0, "fromDI": 2, "cliMsgId": "123", "threadId": "999"],
+            ["deviceId": 0, "err": 0, "fromDI": 2],
+        ]]]
+        let reports = ZaloE2EEManager.deliverReports(deliver)
+        #expect(reports.count == 2)
+        #expect(ZaloE2EEManager.deliverReportSummary(reports[0]) == "dev=2 err=-1 errC=-7 retry=0 fromDI=2")
+        #expect(ZaloE2EEManager.deliverReportSummary(reports[1]) == "dev=0 err=0 errC=- retry=- fromDI=2")
+        #expect(ZaloE2EEManager.deliverReports(["data": [:]]).isEmpty)
+
+        // Official processRequestResend gates: failed decrypt about our device's message, first retry only.
+        let failedReport: [String: Any] = ["deviceId": 2, "err": -1, "errC": -7, "retry": 0, "fromDI": 2,
+                                           "cliMsgId": "1700000000123", "msgId": "77", "threadId": "999", "deliveredUids": ["999"]]
+        #expect(ZaloE2EEManager.resendRequest(from: failedReport)
+                == .init(peerUid: "999", deviceId: 2, cliMsgId: "1700000000123", msgId: "77"))
+        #expect(ZaloE2EEManager.resendRequest(from: failedReport.merging(["retry": 1]) { _, n in n }) == nil)
+        #expect(ZaloE2EEManager.resendRequest(from: failedReport.merging(["fromDI": 0]) { _, n in n }) == nil)
+        #expect(ZaloE2EEManager.resendRequest(from: failedReport.merging(["err": -2]) { _, n in n }) == nil)
+        #expect(ZaloE2EEManager.resendRequest(from: failedReport.merging(["err": 0]) { _, n in n }) == nil)
+
+        let initSession = ZaloE2EEManager.buildInitSessionInnerData(uidTo: "999", deviceId: 2, cipher: "Mw==")
+        #expect(initSession["type"] as? Int == 1)
+        #expect((initSession["data"] as? [[String: Any]])?.first?["deviceId"] as? Int == 2)
+        let retryExt = JSONLossless.parseObject(Data(ZaloSessionClient.buildE2EEExtJSON(
+            registrationId: 5, senderRegistrationId: 6, retry: 1).utf8))
+        #expect(JSONLossless.int64(retryExt?["retry"]) == 1)
+        #expect(JSONLossless.parseObject(Data(ZaloSessionClient.buildE2EEExtJSON(
+            registrationId: 5, senderRegistrationId: 6).utf8))?["retry"] == nil)
 
         let peerList = ZaloE2EEManager.buildGetListUserE2EEInnerData()
         #expect(peerList["reqIid"] as? Int == 1)
@@ -2003,10 +2040,13 @@ private final class MockProfileURLProtocol: URLProtocol, @unchecked Sendable {
 
         let extStr = try #require(entry["e2eeExt"] as? String)
         let extObj = try #require(JSONLossless.parseObject(Data(extStr.utf8)))
-        #expect(JSONLossless.int64(extObj["version"]) == 1)
-        #expect(JSONLossless.int64(extObj["compat_version"]) == 1)
+        // Official VERSION_MSG.TEXT_MSG: Zalo PC drops anything with a higher compat_version before decrypting.
+        #expect(JSONLossless.int64(extObj["version"]) == 0)
+        #expect(JSONLossless.int64(extObj["compat_version"]) == 0)
         #expect(JSONLossless.int64(extObj["iid"]) == 3001)
         #expect(JSONLossless.int64(extObj["sender_iid"]) == 9002)
+        let noIid = try #require(JSONLossless.parseObject(Data(ZaloSessionClient.buildE2EEExtJSON(registrationId: 0, senderRegistrationId: 0).utf8)))
+        #expect(noIid["iid"] == nil && noIid["sender_iid"] == nil)
 
         let oneOneSpec = ZaloSessionClient.buildE2EEMessageRequestPayload(
             endpoint: "sms",

@@ -58,6 +58,13 @@ struct PollRequest: Identifiable, Equatable {
     var id: String { "\(conversationId)|\(pollId)" }
 }
 
+/// A tap on a reply's quote: scroll the open chat to the quoted message.
+struct QuoteJumpRequest: Identifiable, Equatable {
+    var message: ChatMessage
+    let id = UUID()
+    static func == (a: Self, b: Self) -> Bool { a.id == b.id }
+}
+
 /// Per-app state of card actions that must survive the message list recycling its rows.
 @MainActor @Observable
 final class CardActionCenter {
@@ -77,6 +84,7 @@ final class CardActionCenter {
     var groupInvite: GroupInviteRequest?
     var stickers: StickerCategoryRequest?
     var poll: PollRequest?
+    var quoteJump: QuoteJumpRequest?
     private(set) var notice: Notice?
 
     /// Drops every sheet and the toast. Called when another conversation opens and on logout, so nothing from one
@@ -88,6 +96,7 @@ final class CardActionCenter {
         groupInvite = nil
         stickers = nil
         poll = nil
+        quoteJump = nil
         notice = nil
     }
 

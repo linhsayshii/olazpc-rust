@@ -1,0 +1,23 @@
+[package]
+name = "olaz-api"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+olaz-crypto = { path = "../olaz-crypto" }
+olaz-json = { path = "../olaz-json" }
+olaz-net = { path = "../olaz-net" }
+olaz-wire = { path = "../olaz-wire" }
+base64 = "0.23.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
+thiserror = "2.0.21"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }

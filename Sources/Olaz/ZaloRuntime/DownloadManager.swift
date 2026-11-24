@@ -211,6 +211,7 @@ final class DownloadManager {
     /// The transfer: fetch → decrypt → quarantine → atomic move. Runs off the main actor; all file I/O and
     /// crypto happen here. Temporary files live in `job.tempDirectory`, never in the user's save folder.
     nonisolated static func execute(_ job: Job, loader: MediaLoader) async -> Outcome {
+        if let core = loader.rustMedia { return await rustExecute(job, core: core, allowPlainHTTP: loader.allowPlainHTTP) }
         var ownedRaw: URL?
         do {
             let fetched: Fetched
@@ -655,7 +656,8 @@ struct ZaloMediaURL: Sendable {
     /// When `originalURL` is a non-encrypted `/jxl/.../*.jxl` URL, the `/jpg/.../*.jpg` fallback URL.
     let jxlTranscodedURL: URL?
 
-    static func parse(_ url: URL) -> ZaloMediaURL? {
+    /// `allowPlainHTTP` keeps `http` (local test servers only); production always upgrades to https.
+    static func parse(_ url: URL, allowPlainHTTP: Bool = false) -> ZaloMediaURL? {
         let rawString = url.absoluteString
         guard !rawString.isEmpty else { return nil }
 
@@ -694,7 +696,7 @@ struct ZaloMediaURL: Sendable {
               components.host?.isEmpty == false else {
             return nil
         }
-        if scheme == "http" { components.scheme = "https" }
+        if scheme == "http", !allowPlainHTTP { components.scheme = "https" }
 
         let strippedKeys: Set<String> = ["jxlstatus", "e2esession", "version", "cloudkeyversion"]
         if let existingItems = components.percentEncodedQueryItems {

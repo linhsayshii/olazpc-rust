@@ -282,12 +282,14 @@ import Foundation
             myUid: "alice_uid",
             text: "Reply from Alice",
             quoteText: "Hello Alice!",
+            quoteExtras: ["{}", "", "Bob", "gid-bob"],
             store: storeAlice
         )
         #expect(textTargets.count == 1)
         #expect(textTargets[0].toId == "bob_uid")
         #expect(textTargets[0].platform == 2)
-        #expect(textTargets[0].ciphers.count == 2)
+        // Official quote layout: text, quote, attach, styles, owner name, owner global id.
+        #expect(textTargets[0].ciphers.count == 6)
 
         let decText = try await bobRT.callAsync("ZaloE2EE.pc.decryptCipher", [
             .string("bob_uid"), .string("alice_uid"), .number(2), .string(textTargets[0].ciphers[0]), .string("string"),
@@ -297,6 +299,23 @@ import Foundation
         ])
         #expect(decText["text"]?.stringValue == "Reply from Alice")
         #expect(decQuote["text"]?.stringValue == "Hello Alice!")
+        // The peer never decrypts the attach cipher (index 2) of a text quote: later ones must still open.
+        let decOwner = try await bobRT.callAsync("ZaloE2EE.pc.decryptCipher", [
+            .string("bob_uid"), .string("alice_uid"), .number(2), .string(textTargets[0].ciphers[5]), .string("string"),
+        ])
+        let decName = try await bobRT.callAsync("ZaloE2EE.pc.decryptCipher", [
+            .string("bob_uid"), .string("alice_uid"), .number(2), .string(textTargets[0].ciphers[4]), .string("string"),
+        ])
+        #expect(decOwner["text"]?.stringValue == "gid-bob")
+        #expect(decName["text"]?.stringValue == "Bob")
+        let fields = try #require(ZaloEngine.e2eeQuoteFields(ciphers: textTargets[0].ciphers, msgId: 9001, cliMsgId: 7001, ts: 5))
+        #expect(fields["qmsgOwner"] as? String == textTargets[0].ciphers[5])
+        #expect(fields["qmsgOwnerDName"] as? String == textTargets[0].ciphers[4])
+        #expect(fields["qmsg"] as? String == textTargets[0].ciphers[1])
+        #expect(fields["textProperties"] as? String == textTargets[0].ciphers[3])
+        #expect(fields["qmsgAttach"] == nil)
+        #expect(fields["qmsgCliId"] as? Int64 == 7001)
+        #expect(ZaloEngine.e2eeQuoteFields(ciphers: Array(textTargets[0].ciphers.prefix(2)), msgId: 1, cliMsgId: 1, ts: 1) == nil)
 
         let stickerTargets = await mgrAlice.encryptStickerMessage(
             peerUid: "bob_uid",
@@ -319,5 +338,37 @@ import Foundation
         #expect(decSid["number"]?.intValue == 55123)
         #expect(decCat["number"]?.intValue == 88)
         #expect(decType["number"]?.intValue == 7)
+
+        // Bob replies quoting Alice: text, quote text, owner name and owner global id all arrive encrypted.
+        func bobEncrypt(_ text: String) async throws -> String {
+            let r = try await bobRT.callAsync("ZaloE2EE.pc.encryptCipher", [
+                .string("bob_uid"), .string("alice_uid"), .number(2), .string(text), .string("string"),
+            ])
+            return try #require(r["cipher"]?.stringValue)
+        }
+        let cText = try await bobEncrypt("Đúng rồi")
+        let cQuote = try await bobEncrypt("Reply from Alice")
+        let cName = try await bobEncrypt("Alice")
+        let cOwner = try await bobEncrypt("gid-alice")
+        await mgrAlice.setGlobalIdResolver { gid, candidates in
+            gid == "gid-alice" && candidates.first == "alice_uid" ? ("alice_uid", "own") : nil
+        }
+        let quoted = await mgrAlice.decryptEnvelopeIfNeeded(ZaloJSONBox([
+            "data": ["msgs": [[
+                "msgId": "1002", "cliMsgId": "1002", "uidFrom": "bob_uid", "idTo": "alice_uid", "msgType": "chat.quote",
+                "ts": 1_795_000_001_000, "paramsExt": ["platformType": 2], "content": cText,
+                "quote": ["msg": cQuote, "fromD": cName, "gOwnerId": cOwner, "globalMsgId": 1001],
+            ]]]
+        ]), myUid: "alice_uid", store: storeAlice)
+        let q = try #require(((quoted.dict["data"] as? [String: Any])?["msgs"] as? [[String: Any]])?.first?["quote"] as? [String: Any])
+        #expect(q["msg"] as? String == "Reply from Alice")
+        #expect(q["fromD"] as? String == "Alice")
+        #expect(q["ownerId"] as? String == "alice_uid")
+        #expect(q["gOwnerId"] == nil)
+        // The parser then shows the local name ("Bạn" for our own message), not the sender's nickname for us.
+        guard case .message(let parsed, _)? = ZaloWireParser.extractBatchEvents(quoted.dict, myUid: "alice_uid").first else {
+            Issue.record("quote reply did not parse as a message"); return
+        }
+        #expect(parsed.quote?.senderName == "Bạn")
     }
 }

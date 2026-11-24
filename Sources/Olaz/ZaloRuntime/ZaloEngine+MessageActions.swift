@@ -47,6 +47,9 @@ enum MessageActionOutcome: Equatable, Sendable {
 struct MessageActionConfirm: Identifiable, Equatable {
     enum Action: Equatable {
         case deleteForMe(ChatMessage)
+        /// "Chọn nhiều tin nhắn": delete / recall the selected messages.
+        case deleteMany([ChatMessage])
+        case recallMany([ChatMessage])
         /// Replace the pin `ref` (the oldest) to pin this message.
         case pin(ChatMessage, replacing: String)
         case unpin(ref: String)
@@ -74,6 +77,9 @@ struct ForwardRequest: Identifiable, Equatable {
     let id = UUID()
     var conversationId: String
     var message: ChatMessage
+    /// "Chọn nhiều tin nhắn": the other selected messages, oldest first, forwarded after `message`.
+    var more: [ChatMessage] = []
+    var all: [ChatMessage] { [message] + more }
 }
 
 /// One pin of a conversation (official group board topic / 1:1 pin topic), newest first.
@@ -111,10 +117,13 @@ struct PinnedList: Equatable, Sendable {
     /// I may pin / unpin here (group allowance; friends always).
     var canPin = false
     var items: [PinnedItem] = []
+    /// Pins the board holds at most (official `pinLimit`).
+    var limit = ZaloWireParser.defaultPinLimit
 
     init(json: [String: Any]) {
         ready = json["ready"] as? Bool ?? false
         canPin = json["canPin"] as? Bool ?? false
+        if let l = json["limit"] as? Int, l > 0 { limit = l }
         items = (json["items"] as? [[String: Any]] ?? []).compactMap { row in
             guard let ref = row["ref"] as? String, !ref.isEmpty else { return nil }
             return PinnedItem(ref: ref, kind: PinnedItem.Kind(rawValue: row["kind"] as? String ?? "") ?? .note,
@@ -155,26 +164,81 @@ extension ZaloEngine {
         CardActionCenter.shared.show("Đã sao chép", in: conversationId)
     }
 
+    /// "Copy hình ảnh": the full-resolution picture (the message's hd URL, or the decrypted E2EE file), never the chat thumbnail.
     func copyPhoto(_ message: ChatMessage) {
         guard case .photo(let url, _, _) = message.kind else { return }
-        let conversation = message.conversationId
+        copyPhoto(conversationId: message.conversationId, messageId: message.id, url: message.isE2EE ? nil : url)
+    }
+
+    func copyPhoto(conversationId: String, messageId: String, url: URL?) {
         Task {
-            var data: Data?
-            if case .file(let file) = await resolveMedia(conversationId: conversation, messageId: message.id, kind: .photo),
-               MediaLoader.isAllowedLocalFile(file) {
-                data = try? Data(contentsOf: file)
-            }
-            if data == nil, !message.isE2EE, let url, url.scheme == "https" {
-                data = try? await MediaLoader.shared.data(for: url)
-            }
-            guard let data, let image = NSImage(data: data) else {
-                CardActionCenter.shared.show("Không sao chép được hình ảnh. Hãy thử lại.", in: conversation)
+            guard let original = await photoOriginal(conversationId: conversationId, messageId: messageId, url: url),
+                  let image = NSImage(data: original.data) else {
+                CardActionCenter.shared.show("Không sao chép được hình ảnh. Hãy thử lại.", in: conversationId)
                 return
             }
+            let item = NSPasteboardItem()
+            if let tiff = image.tiffRepresentation {
+                item.setData(tiff, forType: .tiff)
+                if let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
+                    item.setData(png, forType: .png)
+                }
+            }
+            if let file = original.file {
+                item.setString(file.absoluteString, forType: .fileURL)
+            }
             NSPasteboard.general.clearContents()
-            NSPasteboard.general.writeObjects([image])
-            CardActionCenter.shared.show("Đã sao chép", in: conversation)
+            NSPasteboard.general.writeObjects([item])
+            CardActionCenter.shared.show("Đã sao chép", in: conversationId)
         }
+    }
+
+    /// "Tải về": the original through a save panel (`askLocation`), or straight into Downloads when `false`.
+    func downloadPhoto(_ message: ChatMessage, askLocation: Bool = true) {
+        guard case .photo(let url, _, _) = message.kind else { return }
+        downloadPhoto(conversationId: message.conversationId, messageId: message.id, url: message.isE2EE ? nil : url,
+                      date: message.date, askLocation: askLocation)
+    }
+
+    func downloadPhoto(conversationId: String, messageId: String, url: URL?, date: Date, askLocation: Bool = true) {
+        Task {
+            guard let original = await photoOriginal(conversationId: conversationId, messageId: messageId, url: url) else {
+                CardActionCenter.shared.show("Không tải được hình ảnh. Hãy thử lại.", in: conversationId)
+                return
+            }
+            // Always a file on disk to copy from: the cached original when there is one, else the downloaded bytes.
+            var staged = original.file
+            if staged == nil {
+                let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-photo-\(UUID().uuidString)")
+                guard (try? original.data.write(to: tmp)) != nil else {
+                    CardActionCenter.shared.show("Không tải được hình ảnh. Hãy thử lại.", in: conversationId)
+                    return
+                }
+                staged = tmp
+            }
+            defer { if original.file == nil, let staged { try? FileManager.default.removeItem(at: staged) } }
+            guard let staged else { return }
+            let name = PhotoSaveName.make(date: date, data: original.data, sourceURL: url)
+            if askLocation {
+                _ = await ChatFileSavePanel.saveAs(staged: staged, displayName: name)
+            } else if (try? ChatFileResolver.saveToDownloads(staged: staged, displayName: name)) != nil {
+                CardActionCenter.shared.show("Đã tải ảnh về thư mục Downloads", in: conversationId)
+            } else {
+                CardActionCenter.shared.show("Không tải được hình ảnh. Hãy thử lại.", in: conversationId)
+            }
+        }
+    }
+
+    /// The photo's full-resolution bytes: the resolver's cached/decrypted local file first, then the CDN URL (never E2EE).
+    private func photoOriginal(conversationId: String, messageId: String, url: URL?) async -> (data: Data, file: URL?)? {
+        if case .file(let file) = await resolveMedia(conversationId: conversationId, messageId: messageId, kind: .photo),
+           MediaLoader.isAllowedLocalFile(file), let data = try? Data(contentsOf: file) {
+            return (data, MediaLoader.isOwnLocalFile(file) ? file : nil)
+        }
+        if let url, url.scheme == "https", let data = try? await MediaLoader.shared.data(for: url) {
+            return (data, nil)
+        }
+        return nil
     }
 
     // MARK: Chia sẻ
@@ -438,16 +502,23 @@ extension ZaloEngine {
             ))
             return
         }
+        deleteMessages([message])
+    }
+
+    /// Hides the messages at once and deletes them on the server when the undo bar times out (one bar for the batch).
+    func deleteMessages(_ list: [ChatMessage]) {
+        guard let conversation = list.first?.conversationId else { return }
         let undoId = UUID().uuidString
-        pendingDeletedMessages[undoId] = message
-        if var list = messages[conversation] {
-            list.removeAll { $0.id == message.id }
-            messages[conversation] = list
+        pendingDeletedMessages[undoId] = list
+        let ids = Set(list.map(\.id))
+        if var current = messages[conversation] {
+            current.removeAll { ids.contains($0.id) }
+            messages[conversation] = current
         }
         showDeleteUndo(DeleteUndo(
             id: undoId,
             conversationId: conversation,
-            count: 1,
+            count: list.count,
             deadline: Date().addingTimeInterval(5)
         ))
     }
@@ -469,7 +540,7 @@ extension ZaloEngine {
         guard let undo = deleteUndo else { return }
         deleteUndo = nil
         if let restored = pendingDeletedMessages.removeValue(forKey: undo.id) {
-            mergeMessageIntoMemory(restored)
+            for message in restored { mergeMessageIntoMemory(message) }
             CardActionCenter.shared.show("Khôi phục thành công", in: undo.conversationId)
         }
     }
@@ -481,16 +552,18 @@ extension ZaloEngine {
     }
 
     private func commitPendingDelete(id: String) {
-        guard let msg = pendingDeletedMessages.removeValue(forKey: id) else { return }
-        let resolvedCliId = msg.clientId.isEmpty ? msg.id : msg.clientId
+        guard let list = pendingDeletedMessages.removeValue(forKey: id) else { return }
         Task {
-            try? await sessionClient.deleteMessageForMeAPI(
-                convId: msg.conversationId,
-                msgId: msg.id,
-                cliMsgId: resolvedCliId,
-                senderId: msg.senderId
-            )
-            try? await sqliteStore?.deleteMessage(convId: msg.conversationId, id: msg.id)
+            for msg in list {
+                let resolvedCliId = msg.clientId.isEmpty ? msg.id : msg.clientId
+                try? await sessionClient.deleteMessageForMeAPI(
+                    convId: msg.conversationId,
+                    msgId: msg.id,
+                    cliMsgId: resolvedCliId,
+                    senderId: msg.senderId
+                )
+                try? await sqliteStore?.deleteMessage(convId: msg.conversationId, id: msg.id)
+            }
         }
     }
 
@@ -524,6 +597,7 @@ extension ZaloEngine {
         let conversation = message.conversationId
         let key = "\(conversation)|\(message.id)|pin"
         guard messageActionsBusy.insert(key).inserted else { return }
+        insertPinOptimistically(message, replacing: ref)
         Task {
             defer { messageActionsBusy.remove(key) }
             do {
@@ -535,16 +609,27 @@ extension ZaloEngine {
                         rawTopic: boardCache?.topics[ref].map { ZaloJSONBox($0) },
                         boardVersion: boardCache?.version ?? 0
                     )
+                    await refreshBoardPins(for: conversation)
                 }
+                // Official `getTopicDataFromMessage`: the real server/client id pair (own messages are not keyed by msgId).
+                let ids = await resolveServerAndClientIds(for: message)
+                let me = profile?.userId ?? ""
+                let senderUid = message.isMine || message.senderId.isEmpty || message.senderId == "0" ? me : message.senderId
+                let senderName = message.isMine
+                    ? (profile?.displayName ?? "")
+                    : (lookupPersonInfo(message.senderId)?.name ?? message.senderName)
+                let params = ZaloWireParser.pinTopicParams(
+                    msgId: ids.msgId, cliMsgId: ids.cliMsgId.isEmpty ? ids.msgId : ids.cliMsgId,
+                    senderUid: senderUid, senderName: senderName, kind: message.kind, title: message.text)
                 _ = try await sessionClient.pinBoardMessage(
                     convId: conversation,
-                    msgId: message.id,
-                    cliMsgId: message.id,
-                    senderId: message.senderId,
-                    text: message.text
+                    params: params,
+                    boardVersion: cachedBoardRawTopics[conversation]?.version ?? 0
                 )
                 await refreshBoardPins(for: conversation)
             } catch {
+                EngineLog.shared.write("pins: pin failed group=\(ZaloWireParser.isGroupId(conversation)) replacing=\(ref != nil) \(Self.pinErrorShape(error))")
+                await refreshBoardPins(for: conversation)
                 CardActionCenter.shared.show("Ghim tin nhắn không thành công.", in: conversation)
             }
         }
@@ -561,7 +646,7 @@ extension ZaloEngine {
         ))
     }
 
-    private func ask(_ confirm: MessageActionConfirm) {
+    func ask(_ confirm: MessageActionConfirm) {
         guard openConversationId == confirm.conversationId, messageConfirm == nil else {
             return
         }
@@ -576,6 +661,8 @@ extension ZaloEngine {
     private func unpin(_ ref: String, in conversationId: String) {
         let key = "\(conversationId)|\(ref)|unpin"
         guard messageActionsBusy.insert(key).inserted else { return }
+        let rawTopic = cachedBoardRawTopics[conversationId]?.topics[ref]
+        removePinOptimistically(ref, in: conversationId)
         Task {
             defer { messageActionsBusy.remove(key) }
             do {
@@ -583,11 +670,12 @@ extension ZaloEngine {
                 try await sessionClient.unpinBoardTopic(
                     convId: conversationId,
                     topicId: ref,
-                    rawTopic: boardCache?.topics[ref].map { ZaloJSONBox($0) },
+                    rawTopic: rawTopic.map { ZaloJSONBox($0) },
                     boardVersion: boardCache?.version ?? 0
                 )
                 await refreshBoardPins(for: conversationId)
             } catch {
+                await refreshBoardPins(for: conversationId)
                 CardActionCenter.shared.show("Yêu cầu thực hiện không thành công", in: conversationId)
             }
         }
@@ -599,6 +687,8 @@ extension ZaloEngine {
         guard ok else { return }
         switch confirm.action {
         case .deleteForMe(let message): deleteForMe(message, confirmed: true)
+        case .deleteMany(let list): endSelection(); deleteMessages(list)
+        case .recallMany(let list): recallMessages(list)
         case .pin(let message, let replacing): pin(message, replacing: replacing)
         case .unpin(let ref): unpin(ref, in: confirm.conversationId)
         }
@@ -607,48 +697,27 @@ extension ZaloEngine {
     // MARK: Pins of the open conversation
 
     internal func refreshBoardPins(for convId: String) async {
-        guard let box = try? await sessionClient.fetchBoardPins(convId: convId) else {
+        let group = ZaloWireParser.isGroupId(convId)
+        let box: ZaloJSONBox
+        do {
+            box = try await sessionClient.fetchBoardPins(convId: convId)
+        } catch {
+            EngineLog.shared.write("pins: list failed group=\(group) \(Self.pinErrorShape(error))")
             return
         }
-        let rawRows = (box.dict["items"] as? [[String: Any]]) ?? []
-        let boardVer = JSONLossless.int64(box.dict["boardVersion"]) ?? 0
-        var rawMap: [String: [String: Any]] = [:]
-        let items: [[String: Any]] = rawRows.compactMap { row in
-            let ref = JSONLossless.string(row["id"] ?? row["topicId"] ?? row["topic_id"])
-            guard !ref.isEmpty else { return nil }
-            rawMap[ref] = row
-            let params: [String: Any] = {
-                if let p = row["params"] as? [String: Any] { return p }
-                if let pStr = row["params"] as? String,
-                   let pData = pStr.data(using: .utf8),
-                   let parsed = JSONLossless.parseObject(pData) {
-                    return parsed
-                }
-                return [:]
-            }()
-            let topicType = JSONLossless.int64(row["type"]) ?? 2
-            let kindStr: String = {
-                if topicType == 3 { return "poll" }
-                if topicType == 0 || topicType == 1 { return "reminder" }
-                return "message"
-            }()
-            let senderUid = ZaloWireParser.stripUserPrefix(JSONLossless.string(params["senderUid"] ?? params["senderId"] ?? row["creatorId"]))
-            let resolvedSender = !senderUid.isEmpty ? (lookupPersonInfo(senderUid)?.name ?? "") : ""
-            return [
-                "ref": ref,
-                "kind": kindStr,
-                "title": JSONLossless.string(params["title"] ?? params["content"] ?? params["msg"] ?? params["message"] ?? params["description"] ?? row["title"] ?? row["content"]),
-                "sender": JSONLossless.string(params["senderName"] ?? params["sender_name"] ?? params["dName"] ?? params["fromName"] ?? row["creatorName"]).isEmpty
-                    ? resolvedSender
-                    : JSONLossless.string(params["senderName"] ?? params["sender_name"] ?? params["dName"] ?? params["fromName"] ?? row["creatorName"]),
-                "thumb": JSONLossless.string(params["thumb"]),
-                "msgId": JSONLossless.string(params["globalMsgId"] ?? params["global_msg_id"] ?? params["msgId"] ?? params["msg_id"]),
-                "cliMsgId": JSONLossless.string(params["cliMsgId"] ?? params["client_msg_id"])
-            ]
+        let parsed = ZaloWireParser.parseBoardTopics(box.dict, convId: convId) { [weak self] uid in
+            self?.lookupPersonInfo(uid)?.name
         }
-        cachedBoardRawTopics[convId] = (version: boardVer, topics: rawMap)
-        let list = PinnedList(json: ["convId": convId, "ready": true, "canPin": true, "items": items])
-        if pins[convId] != list { pins[convId] = list }
+        EngineLog.shared.write("pins: list ok group=\(group) rows=\((box.dict["items"] as? [Any])?.count ?? -1) items=\(parsed.list.items.count)")
+        cachedBoardRawTopics[convId] = (version: parsed.version, topics: parsed.raw)
+        if pins[convId] != parsed.list { pins[convId] = parsed.list }
+    }
+
+    /// Log shape of a board request error: the server code and the API path, never ids or text.
+    nonisolated static func pinErrorShape(_ error: Error) -> String {
+        guard let err = error as? ZaloSessionError else { return "error=\(type(of: error))" }
+        let path = URL(string: err.url)?.path ?? ""
+        return "code=\(err.code) path=\(path)"
     }
 
     func handlePins(state: [String: Any]) {
@@ -674,5 +743,27 @@ extension ZaloEngine {
         pins = [:]
         messageActionsBusy = []
         pendingDeletedMessages = [:]
+    }
+}
+
+
+/// File name for a saved chat photo: "Zalo_yyyyMMdd_HHmmss.ext", the extension from the bytes (the CDN URL often has none).
+enum PhotoSaveName {
+    nonisolated static func make(date: Date, data: Data, sourceURL: URL?) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyyMMdd_HHmmss"
+        return "Zalo_\(f.string(from: date)).\(fileExtension(data: data, sourceURL: sourceURL))"
+    }
+
+    nonisolated static func fileExtension(data: Data, sourceURL: URL?) -> String {
+        let b = [UInt8](data.prefix(12))
+        if b.starts(with: [0xFF, 0xD8, 0xFF]) { return "jpg" }
+        if b.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "png" }
+        if b.starts(with: [0x47, 0x49, 0x46]) { return "gif" }
+        if b.count >= 12, b[0..<4] == [0x52, 0x49, 0x46, 0x46], b[8..<12] == [0x57, 0x45, 0x42, 0x50] { return "webp" }
+        if b.count >= 12, b[4..<8] == [0x66, 0x74, 0x79, 0x70], b[8..<12] == [0x68, 0x65, 0x69, 0x63] { return "heic" }
+        if let ext = sourceURL?.pathExtension.lowercased(), ["jpg", "jpeg", "png", "gif", "webp", "heic"].contains(ext) { return ext }
+        return "jpg"
     }
 }

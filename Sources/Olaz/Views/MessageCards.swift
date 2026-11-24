@@ -502,7 +502,7 @@ struct ZInstantCard: View {
             }
             VStack(alignment: .leading, spacing: 4) {
                 if !title.isEmpty { Text(title).font(.system(size: 13.5, weight: .semibold)) }
-                if !text.isEmpty { Text(ChatFormat.linkified(text, mine: false)).font(.system(size: 13)) }
+                if !text.isEmpty { Text(Emoticon.replacing(in: ChatFormat.linkified(text, mine: false))).font(.system(size: 13)) }
                 CardLinkRow(buttons: buttons)
             }
             .multilineTextAlignment(.leading)

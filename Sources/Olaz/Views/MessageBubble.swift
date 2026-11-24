@@ -70,6 +70,33 @@ enum ChatFormat {
     /// URL scheme used for clickable @mentions (handled by `MessageRow`, never opened externally).
     static let mentionScheme = "zalomention"
 
+    /// Official MENTION_TOKEN rendering: a mention shows "@" + the member's current name (`getMemberFriendlyName`:
+    /// alias first), else the text as sent. Returns the text with each known mention replaced and the ranges moved.
+    static func renamingMentions(_ s: String, mentions: [Mention], name: (String) -> String?) -> (text: String, mentions: [Mention]) {
+        guard !mentions.isEmpty else { return (s, mentions) }
+        let ns = s as NSString
+        let valid = mentions.filter { $0.pos >= 0 && $0.len > 1 && $0.pos + $0.len <= ns.length && ns.character(at: $0.pos) == 0x40 }
+        // Overlapping ranges: keep the text as sent.
+        let sorted = valid.sorted { $0.pos < $1.pos }
+        guard valid.count == mentions.count,
+              zip(sorted, sorted.dropFirst()).allSatisfy({ $0.pos + $0.len <= $1.pos }) else { return (s, mentions) }
+        let out = NSMutableString(string: s)
+        var renamed: [Mention] = []
+        var shift = 0
+        for var m in sorted {
+            let replacement = m.isAll ? nil : name(m.uid).map { "@" + $0 }
+            m.pos += shift
+            if let replacement, replacement != ns.substring(with: NSRange(location: m.pos - shift, length: m.len)) {
+                out.replaceCharacters(in: NSRange(location: m.pos, length: m.len), with: replacement)
+                let newLen = (replacement as NSString).length
+                shift += newLen - m.len
+                m.len = newLen
+            }
+            renamed.append(m)
+        }
+        return (out as String, renamed)
+    }
+
     /// Link-detected text plus official @mention highlighting. Ranges are the message's
     /// `mentions` (UTF-16 offsets); a range that does not start with "@" is ignored.
     /// Mentions of me (or everyone) get a subtle background.
@@ -99,6 +126,51 @@ enum ChatFormat {
         }
         return out
     }
+
+    nonisolated(unsafe) private static let messageTextCache: NSCache<NSString, MessageText> = {
+        let c = NSCache<NSString, MessageText>(); c.countLimit = 2000; return c
+    }()
+
+    /// AppKit form of `mentioned(…)` for the selectable bubble text (`SelectableMessageText`): same links, mention
+    /// weight / color / background. Cached per text, side, size, accent and mentions, with its measured sizes.
+    @MainActor
+    static func messageText(_ s: String, mentions: [Mention], mine: Bool, myId: String?,
+                            size: CGFloat, accent: NSColor, rich: RichLayout? = nil, styleKey: String = "") -> MessageText {
+        let mentionKey = mentions.map { "\($0.uid),\($0.pos),\($0.len),\($0.isAll)" }.joined(separator: ";")
+        let key = "\(mine ? 1 : 0)|\(size)|\(accent.description)|\(myId ?? "")|\(mentionKey)|\(styleKey)|\(s)" as NSString
+        if let hit = messageTextCache.object(forKey: key) { return hit }
+        let text = mine ? NSColor.white : NSColor.labelColor
+        let out = NSMutableAttributedString(string: s, attributes: [.font: NSFont.systemFont(ofSize: size), .foregroundColor: text])
+        if let detector {
+            for match in detector.matches(in: s, range: NSRange(location: 0, length: out.length)) {
+                guard let url = match.url else { continue }
+                out.addAttributes([.link: url, .underlineStyle: NSUnderlineStyle.single.rawValue,
+                                   .foregroundColor: mine ? NSColor.white : accent], range: match.range)
+            }
+        }
+        for mention in mentions {
+            guard mention.pos >= 0, mention.len > 1, mention.pos + mention.len <= out.length,
+                  (s as NSString).character(at: mention.pos) == 0x40 else { continue }
+            let range = NSRange(location: mention.pos, length: mention.len)
+            let aimsAtMe = mention.isAll || (myId != nil && mention.uid == myId)
+            out.addAttributes([.font: NSFont.systemFont(ofSize: size, weight: .semibold),
+                               .foregroundColor: mine ? NSColor.white : accent], range: range)
+            out.removeAttribute(.underlineStyle, range: range)
+            out.removeAttribute(.link, range: range)
+            if aimsAtMe {
+                out.addAttribute(.backgroundColor, value: mine ? NSColor.white.withAlphaComponent(0.22) : accent.withAlphaComponent(0.16), range: range)
+            }
+            if !mention.isAll, mention.uid != myId, let url = URL(string: "\(mentionScheme):\(mention.uid)") {
+                out.addAttribute(.link, value: url, range: range)
+            }
+        }
+        if let rich { applyRich(rich, to: out, base: size) }
+        // Same emoji as the SwiftUI `Text` underneath, so the selectable layer lines up with it.
+        Emoticon.replace(in: out)
+        let result = MessageText(out)
+        messageTextCache.setObject(result, forKey: key)
+        return result
+    }
 }
 
 // MARK: - Row
@@ -125,6 +197,8 @@ struct MessageRow: View {
     let showStatus: Bool
     /// The chat's newest message: it carries the coach mark of the tour.
     var isNewest = false
+    /// Poll event rows: this is the newest event of its poll, so it shows the card.
+    var showsPollCard = true
     var onReply: (ChatMessage) -> Void
     var onReact: (String, ChatMessage) -> Void
 
@@ -149,6 +223,12 @@ struct MessageRow: View {
         case .notice(let symbol, let text):
             NoticeRow(symbol: symbol, text: text, buttons: message.cardButtons)
                 .cardActionHost(message)
+                .messageTourAnchor(isNewest)
+        case .poll(let poll):
+            // Official layout: poll events are centered info lines, the card under the newest one; no sender bubble.
+            PollMessageView(poll: poll, message: message, showsCard: showsPollCard)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 4)
                 .messageTourAnchor(isNewest)
         case .ecard(let card):
             ECardView(card: card, buttons: message.cardButtons, suggestsStickers: message.suggestsStickers)
@@ -182,7 +262,9 @@ struct MessageRow: View {
                         .legibleOnWallpaper(hasWallpaper)
                         .padding(.leading, hasWallpaper ? 4 : 12)
                 }
+                if message.urgency > 0 { urgencyTag }
                 bubbleStack
+                if let expires = message.expiresAt { ttlLine(expires) }
                 if mine && showStatus { statusLine }
             }
             .frame(maxWidth: 520, alignment: mine ? .trailing : .leading)
@@ -191,6 +273,8 @@ struct MessageRow: View {
         .padding(.top, (firstInGroup ? 8 : 2) + (message.reactions.isEmpty ? 0 : 10))
         .contentShape(Rectangle())
         .onHover { inside in
+            // A row passing under a resting pointer while the list scrolls is not hovered (see ChatScrollActivity).
+            if inside, ChatScrollActivity.isScrolling { return }
             withAnimation(.easeOut(duration: 0.12)) { hovering = inside }
         }
     }
@@ -254,7 +338,12 @@ struct MessageRow: View {
             if message.kind != .recalled {
                 barButton("Thả cảm xúc", symbol: "face.smiling") { showsReactionPicker.toggle() }
                     .popover(isPresented: $showsReactionPicker, arrowEdge: .top) {
-                        ReactionPicker(emojis: Self.reactionEmojis, mine: Set(message.reactions.filter(\.includesMe).map(\.emoji))) { emoji in
+                        ReactionPicker(emojis: Self.reactionEmojis, mine: Set(message.reactions.filter(\.includesMe).map(\.emoji)),
+                                       canRemove: message.reactions.contains(where: \.includesMe),
+                                       remove: {
+                            showsReactionPicker = false
+                            engine.removeMyReactions(from: message.id, in: message.conversationId)
+                        }) { emoji in
                             showsReactionPicker = false
                             onReact(emoji, message)
                         }
@@ -280,6 +369,26 @@ struct MessageRow: View {
         .buttonStyle(.plain)
         .help(title)
         .accessibilityLabel(title)
+    }
+
+    /// "Quan trọng" / "Khẩn cấp" over the bubble (official `message-urgency-indicator`).
+    private var urgencyTag: some View {
+        let urgent = message.urgency == 2
+        return Label(urgent ? "Khẩn cấp" : "Quan trọng", systemImage: urgent ? "bell.badge.fill" : "exclamationmark.circle.fill")
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(urgent ? Color.red : Color.orange)
+            .padding(.horizontal, 6)
+    }
+
+    /// "Tự xóa sau $0$" (official `ttl-timer-message`), refreshed each minute.
+    private func ttlLine(_ expires: Date) -> some View {
+        TimelineView(.periodic(from: .now, by: 60)) { context in
+            Label("Tự xóa sau \(AutoDelete.remaining(expires.timeIntervalSince(context.date)))", systemImage: "timer")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+                .legibleOnWallpaper(hasWallpaper)
+                .padding(.horizontal, 6)
+        }
     }
 
     private var statusLine: some View {
@@ -345,19 +454,6 @@ struct MessageRow: View {
                     Task {
                         let key = engine.fileDownloadKey(conversationId: message.conversationId, messageId: message.id, url: fileURL, name: fileName)
                         if case .ready(let staged) = await engine.resolveFile(conversationId: message.conversationId, messageId: message.id, name: fileName, url: fileURL),
-                           let saved = try? ChatFileResolver.saveToDownloads(staged: staged, displayName: fileName) {
-                            engine.downloadedFilePaths[key] = saved
-                            CardActionCenter.shared.show("Đã tải tệp về thư mục Downloads", in: message.conversationId)
-                        } else {
-                            CardActionCenter.shared.show("Không tải được tệp đính kèm", in: message.conversationId)
-                        }
-                    }
-                }
-                .disabled(fileURL == nil)
-                Button("Lưu về máy…", systemImage: "folder") {
-                    Task {
-                        let key = engine.fileDownloadKey(conversationId: message.conversationId, messageId: message.id, url: fileURL, name: fileName)
-                        if case .ready(let staged) = await engine.resolveFile(conversationId: message.conversationId, messageId: message.id, name: fileName, url: fileURL),
                            case .success(let chosen?) = await ChatFileSavePanel.saveAs(staged: staged, displayName: fileName) {
                             engine.downloadedFilePaths[key] = chosen
                         }
@@ -390,6 +486,9 @@ struct MessageRow: View {
                 if case .photo = message.kind {
                     Button("Copy hình ảnh", systemImage: "photo.on.rectangle") { engine.copyPhoto(message) }
                 }
+                if case .photo = message.kind {
+                    Button("Tải về", systemImage: "arrow.down.circle") { engine.downloadPhoto(message) }
+                }
                 if let caption = message.caption {
                     Button("Copy chú thích", systemImage: "text.quote") { engine.copyText(caption, in: message.conversationId) }
                 }
@@ -399,12 +498,16 @@ struct MessageRow: View {
                     Button(emoji) { onReact(emoji, message) }
                 }
             }
-            if actions.pin || actions.star != nil {
+            if message.isSelectable {
+                Button("Chọn nhiều tin nhắn", systemImage: "checklist") { engine.beginSelection(message) }
+            }
+            let canPin = actions.pin || engine.canPinMessage(message)
+            if canPin || actions.star != nil {
                 Divider()
-                if actions.pinned {
+                if actions.pinned || engine.isPinned(message) {
                     Button("Bỏ ghim tin nhắn", systemImage: "pin.slash") { engine.requestUnpin(message) }
-                } else if actions.pin {
-                    Button("Ghim tin nhắn", systemImage: "pin") { engine.pin(message) }
+                } else if canPin {
+                    Button("Ghim tin nhắn", systemImage: "pin") { engine.pinMessage(message) }
                 }
                 switch actions.star {
                 case .unstar: Button("Bỏ đánh dấu tin nhắn", systemImage: "star.slash") { engine.setStarred(message, false) }
@@ -475,7 +578,7 @@ struct MessageRow: View {
         case .file(let name, let size, let url):
             // Files are cards, not bubbles: neutral for both sides, no tail.
             VStack(alignment: .leading, spacing: 6) {
-                if let quote = message.quote { QuoteBlock(quote: quote, mine: false) }
+                if let quote = message.quote { QuoteBlock(quote: quote, mine: false) { CardActionCenter.shared.quoteJump = QuoteJumpRequest(message: message) } }
                 FileCard(
                     name: name,
                     size: size,
@@ -562,20 +665,47 @@ struct MessageRow: View {
         }
     }
 
-    private func textBody(_ text: String) -> some View {
-        Text(message.mentions.isEmpty
-             ? ChatFormat.linkified(text, mine: mine)
-             : ChatFormat.mentioned(text, mentions: message.mentions, mine: mine, myId: engine.profile?.userId,
-                                    size: scaled(14), accent: ChatPalette.accent(accentStored)))
-            .font(.system(size: scaled(14)))
+    private func textBody(_ sent: String) -> some View {
+        let size = scaled(14), mine = mine, myId = engine.profile?.userId
+        let accent = ChatPalette.accent(accentStored)
+        let styles = message.textStyles
+        // @mentions show the member's current name (alias first). Not with text styles: their offsets index the sent text.
+        let named = styles.isEmpty && sent == message.text
+            ? ChatFormat.renamingMentions(sent, mentions: message.mentions, name: { engine.mentionDisplayName($0) })
+            : (text: sent, mentions: message.mentions)
+        let original = named.text
+        // Rich text: list markers go into the drawn text, the message's offsets move with them.
+        let rich = styles.isEmpty ? nil : ChatFormat.richLayout(original, styles: styles)
+        let text = rich?.text ?? original
+        let mentions = rich.map { ChatFormat.mapped(named.mentions, $0) } ?? named.mentions
+        let styleKey = styles.map { "\($0.start),\($0.len),\($0.st)" }.joined(separator: ";")
+        var attributed = mentions.isEmpty
+            ? ChatFormat.linkified(text, mine: mine)
+            : ChatFormat.mentioned(text, mentions: mentions, mine: mine, myId: myId, size: size, accent: accent)
+        if let rich { ChatFormat.applyRich(rich, to: &attributed, mine: mine, base: size) }
+        return Text(Emoticon.replacing(in: attributed))
+            .font(.system(size: size))
             .fixedSize(horizontal: false, vertical: true)
             .environment(\.openURL, OpenURLAction { url in
-                // A clicked @mention opens that member's 1-1 chat.
+                // Links opened through the Text itself (accessibility): a @mention opens that member's 1-1 chat.
                 guard url.scheme == ChatFormat.mentionScheme else { return .systemAction }
                 let uid = String(url.absoluteString.dropFirst(ChatFormat.mentionScheme.count + 1))
                 if !uid.isEmpty { engine.navigationRequest = uid }
                 return .handled
             })
+            // Selectable (drag / double / triple click, ⌘C, "Copy" on the selection) and clickable links / @mentions;
+            // "Chặn chia sẻ" blocks selecting. Nothing but an empty view until clicked (see MessageTextSelection).
+            .overlay {
+                MessageTextSelection(
+                    text: { ChatFormat.messageText(text, mentions: mentions, mine: mine, myId: myId, size: size, accent: NSColor(accent),
+                                                   rich: rich, styleKey: styleKey) },
+                    selectionColor: mine ? NSColor.white.withAlphaComponent(0.35) : NSColor.selectedTextBackgroundColor.withAlphaComponent(0.45),
+                    allowsSelection: !message.menu.isProtected,
+                    mentionScheme: ChatFormat.mentionScheme,
+                    // A clicked @mention opens that member's 1-1 chat.
+                    onMention: { uid in engine.navigationRequest = uid },
+                    identity: message.id + "|" + text + "|" + styleKey)
+            }
     }
 
     private var stickerPlaceholder: some View {
@@ -608,7 +738,9 @@ struct MessageRow: View {
         let shape = bubbleShape(tail: wantsTail && !muted && lastInGroup)
         return VStack(alignment: .leading, spacing: 6) {
             if let quote = message.quote {
-                QuoteBlock(quote: quote, mine: mine && !muted)
+                QuoteBlock(quote: quote, mine: mine && !muted) {
+                    CardActionCenter.shared.quoteJump = QuoteJumpRequest(message: message)
+                }
             }
             inner()
         }
@@ -628,16 +760,37 @@ struct MessageRow: View {
     }
 }
 
+/// Rows are compared by their data only: the reply / react closures are rebuilt with every pass of the message list, and
+/// without this every visible row would re-run its body whenever any conversation's messages change. Engine state a row
+/// reads in its body (profile, call availability) still updates it through observation.
+extension MessageRow: Equatable {
+    nonisolated static func == (a: MessageRow, b: MessageRow) -> Bool {
+        a.message == b.message && a.isGroup == b.isGroup && a.firstInGroup == b.firstInGroup
+            && a.lastInGroup == b.lastInGroup && a.showStatus == b.showStatus && a.isNewest == b.isNewest
+            && a.showsPollCard == b.showsPollCard
+    }
+}
+
 /// The six Zalo reactions in a popover, Tapback style.
 private struct ReactionPicker: View {
     let emojis: [String]
     let mine: Set<String>
+    var canRemove = false
+    var remove: () -> Void = {}
     let pick: (String) -> Void
 
     var body: some View {
         HStack(spacing: 2) {
             ForEach(emojis, id: \.self) { emoji in
                 ReactionPickerButton(emoji: emoji, selected: mine.contains(emoji)) { pick(emoji) }
+            }
+            if canRemove {
+                Divider().frame(height: 22).padding(.horizontal, 4)
+                Button("Gỡ", action: remove)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
             }
         }
         .padding(6)
@@ -673,6 +826,8 @@ private struct ReactionPickerButton: View {
 private struct QuoteBlock: View {
     let quote: ChatMessage.Quote
     let mine: Bool
+    /// Scrolls to the quoted message.
+    var onTap: () -> Void = {}
     @Environment(\.olazTextScale) private var textScale
 
     var body: some View {
@@ -687,6 +842,10 @@ private struct QuoteBlock: View {
         .padding(.vertical, 4).padding(.horizontal, 6)
         .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
             .fill(mine ? Color.white.opacity(0.18) : Color.primary.opacity(0.06)))
+        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .onTapGesture(perform: onTap)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction(named: "Xem tin nhắn gốc", onTap)
     }
 }
 

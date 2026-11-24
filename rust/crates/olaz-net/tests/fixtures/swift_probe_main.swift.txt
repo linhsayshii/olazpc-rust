@@ -1,0 +1,159 @@
+import Foundation
+
+func sorted(_ obj: Any) -> String {
+    let d = try! JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys, .withoutEscapingSlashes, .fragmentsAllowed])
+    return String(decoding: d, as: UTF8.self)
+}
+func line(_ k: String, _ v: String) { print("\(k)\t\(v)") }
+
+let uuid = "123e4567-e89b-42d3-a456-426614174000"
+let imei = "\(uuid)-\(ZaloCrypto.md5Hex(ZaloDomains.userAgent))"
+line("imei", imei)
+
+// A. getServerInfo URL
+for name in ["Linh MacBook Pro", "Linh's Mac", "Máy của Linh’s Mac"] {
+    var params: [String: String] = [
+        "imei": imei, "type": ZaloDomains.zpwType, "client_version": ZaloDomains.zpwVer,
+        "computer_name": name, "sp_mtn": "-1", "bkt": "-1",
+    ]
+    params["signkey"] = ZaloCrypto.signKey(tag: "getserverinfo", params: params)
+    let url = URL(string: "https://wpa.zaloapp.com/api/login/getServerInfo?\(SC.sortedQueryString(params))")!
+    line("serverinfo[\(name)]", url.absoluteString)
+}
+
+// B. reqqr
+let nowMs: Int64 = 1_700_000_000_123
+let cipher = try! ZaloCrypto.ParamCipher(apiType: "23", imei: imei, firstLaunchTimeMs: nowMs)
+line("zcid", cipher.zcid)
+line("enckey", cipher.encryptKey)
+let payload: [String: Any] = [
+    "language": "vi", "client_time": nowMs / 1000, "imei": imei, "computer_name": "Linh MacBook Pro",
+    "logged_uids": "", "self_g": 0, "qr_form": 0,
+]
+let payloadJSON = sorted(payload)
+line("qrpayload", payloadJSON)
+let encrypted = try! cipher.encryptPayload(payloadJSON)
+var map: [String: String] = [
+    "zcid": cipher.zcid, "zcid_ext": cipher.zcidExt, "enc_ver": "v2", "params": encrypted,
+    "type": "23", "client_version": "694",
+]
+map["signkey"] = ZaloCrypto.signKey(tag: "reqqr", params: map)
+line("reqqr", "https://wpa.zaloapp.com/api/login/reqqr?\(SC.sortedQueryString(map))")
+let lp: [String: Any] = ["imei": imei, "computer_name": "Linh MacBook Pro", "language": "vi", "ts": nowMs]
+let lpEnc = try! cipher.encryptPayload(sorted(lp))
+var lmap: [String: String] = [
+    "zcid": cipher.zcid, "zcid_ext": cipher.zcidExt, "enc_ver": "v2", "params": lpEnc,
+    "type": "23", "client_version": "694",
+]
+lmap["signkey"] = ZaloCrypto.signKey(tag: "getlogininfo", params: lmap)
+line("logininfo", "https://wpa.zaloapp.com/api/login/getLoginInfo?\(SC.sortedQueryString(lmap))&nretry=0")
+
+// C/D/E. authenticated suffixes (zpw_enk 16 bytes)
+let key = Data("0123456789abcdef".utf8)
+func enc(_ s: String) -> String { SC.urlEncode(try! ZaloCrypto.encodeAES(key: key, plaintext: s)) }
+let common = "zpw_ver=694&zpw_type=23"
+let mePayload = sorted(["avatar_size": 160, "imei": imei] as [String: Any])
+line("meJSON", mePayload)
+line("get", "/api/social/profile/me-v2?\(common)&params=\(enc(mePayload))&os=8")
+line("getRaw", "/api/x?\(common)&params=\(enc("a=1&b=2"))&z=%/ ü+")
+var q = ""
+for (k, v) in ["b": "x y", "a": "1/2+3=4&5", "c": "ü"].sorted(by: { $0.key < $1.key }) { q += "&\(k)=\(SC.urlEncode(v))" }
+line("post", "/api/y?\(common)\(q) BODY params=\(enc(sorted(["k": 1, "s": "hé/llo"] as [String: Any])))")
+line("urlEncode", SC.urlEncode("AZaz09-._~ !\"#$%&'()*+,/:;<=>?@[\\]^`{|}é€"))
+let boundary = "----OlazBoundaryABCDEF"
+var body = Data()
+body.append(Data("--\(boundary)\r\n".utf8))
+body.append(Data("Content-Disposition: form-data; name=\"chunkContent\"; filename=\"a.bin\"\r\n".utf8))
+body.append(Data("Content-Type: application/octet-stream\r\n\r\n".utf8))
+body.append(Data([0x01, 0x02, 0x41]))
+body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+line("multipart", body.map { String(format: "%02x", $0) }.joined())
+
+// F. cookies
+let authURL = URL(string: "https://wpa.chat.zalo.me/api/login/getLoginInfo")!
+let cookieCases: [(String, String)] = [
+    ("expired", "zpw_sek=; Domain=.zalo.me; Path=/; Expires=Thu, 01-Jan-1970 00:00:01 GMT; Max-Age=0, zpw_sek=; Domain=.chat.zalo.me; Path=/; Expires=Thu, 01-Jan-1970 00:00:01 GMT; Max-Age=0"),
+    ("mixed", "zpw_sek=; Domain=.zalo.me; Path=/; Expires=Thu, 01-Jan-1970 00:00:01 GMT; Max-Age=0, zpw_sek=hdr.999999.a0.validToken; Domain=.zalo.me; Path=/; HttpOnly"),
+    ("future", "zpw_sek=fut.1.2.3; Domain=.zalo.me; Path=/; Expires=Wed, 21 Oct 2037 07:28:00 GMT; HttpOnly"),
+    ("futureDash", "zpw_sek=fut.dash.2; Domain=.zalo.me; Path=/; Expires=Wed, 21-Oct-2037 07:28:00 GMT"),
+    ("nodot", "zpw_sek=nodot; Domain=.zalo.me; Path=/"),
+    ("EXPIREDval", "zpw_sek=EXPIRED; Domain=.zalo.me; Path=/"),
+    ("other", "foo=bar.baz; Path=/"),
+    ("two", "zpw_sek=first.1.2; Path=/, zpw_sek=second.3.4; Path=/"),
+    ("pastDate", "zpw_sek=past.1.2; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/"),
+    ("maxage0", "zpw_sek=age.1.2; Max-Age=0; Path=/"),
+]
+for (name, h) in cookieCases {
+    let r = SC.extractZpwSekCookie(headers: ["Set-Cookie": h], url: authURL)
+    line("cookie[\(name)]", r ?? "nil")
+}
+for v in ["abc.def", "EXPIRED", "deleted", "null", "", " a.b ", "nodot"] {
+    line("valid[\(v)]", String(SC.isValidZpwSek(v)))
+}
+
+// G. domains
+var d = ZaloDomains()
+line("cand.chat", d.candidates(for: "chat").joined(separator: ","))
+line("cand.zcloud", d.candidates(for: "zcloud").joined(separator: ","))
+line("cand.friend", d.candidates(for: "friend").joined(separator: ","))
+line("cand.convers_api", d.candidates(for: "convers_api").joined(separator: ","))
+line("cand.auth", d.candidates(for: "auth").joined(separator: ","))
+line("cand.nope", d.candidates(for: "nope").joined(separator: ","))
+line("cand.group_poll", d.candidates(for: "group_poll").joined(separator: ","))
+let info: [String: Any] = [
+    "zpw_chts_new": ["https://p9-msg.example.com/"],
+    "zpw_ctrs_new": "ctl.example.com",
+    "zpw_ws": ["ws1.example.com", "wss://ws2.example.com/", "ftp://nope", 5],
+    "zpw_service_map_v3": [
+        "chat": ["chat.custom.com", "https://chat.custom.com/", " https://tt-chat1-wpa.api.zaloapp.com "],
+        "convers_api": "conv.custom.com",
+        "cloud_msg": ["cm.custom.com"],
+        "friend": [],
+        "label": "",
+        "sticker": ["https://tt-sticker-wpa.zaloapp.com"],
+    ],
+]
+d.applyServerInfo(info)
+line("after.lp", d.lpChat + " " + d.lpControl)
+line("after.ws", d.ws.joined(separator: ","))
+for s in ["chat", "conversation", "convers_api", "group_cloud_message", "friend", "label", "sticker"] {
+    line("after.cand.\(s)", d.candidates(for: s).joined(separator: ","))
+}
+d.rememberWinner(for: "chat", host: "https://tt-chat4-wpa.api.zaloapp.com/")
+d.rememberWinner(for: "cloud_msg", host: "cm.custom.com")
+d.preferredHosts["profile"] = "https://tt-profile-wpa.chat.zalo.me"
+d.ws.append("wss://ws9-msg.zaloapp.com")
+line("after.chat", d.candidates(for: "chat").joined(separator: ","))
+d.healFromVerified()
+let enc2 = JSONEncoder(); enc2.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+line("domainsJSON", String(decoding: try! enc2.encode(d), as: UTF8.self))
+// v2 map fallback
+var d2 = ZaloDomains()
+d2.applyServerInfo(["zpw_service_map_new": ["group": ["g.custom.com"]]])
+line("v2map", d2.candidates(for: "group").joined(separator: ","))
+
+// H. unwrap
+let k16 = Data("0123456789abcdef".utf8)
+func E(_ s: String) -> String { try! ZaloCrypto.encodeAES(key: k16, plaintext: s) }
+let inner = #"{"error_code":0,"data":"{\"groupMsgs\":[{\"msgId\":\"10\"}]}"}"#
+line("enc.inner", E(inner))
+let innerEnc = #"{"error_code":0,"data":""# + E(#"{"a":1}"#) + #""}"#
+line("enc.innerEnc", E(innerEnc))
+line("enc.obj", E(#"{"x":{"y":2},"list":[1,2]}"#))
+line("enc.arr", E(#"[1,2,3]"#))
+line("enc.plainNoErr", E(#"{"profile":{"userId":"1"}}"#))
+let cases: [(String, [String: Any])] = [
+    ("nested", ["error_code": 0, "data": E(inner)]),
+    ("nestedEnc", ["error_code": 0, "data": E(innerEnc)]),
+    ("obj", ["error_code": 0, "data": E(#"{"x":{"y":2},"list":[1,2]}"#)]),
+    ("arr", ["error_code": 0, "data": E("[1,2,3]")]),
+    ("jsonStr", ["error_code": 0, "data": #"  {"a":1}  "#]),
+    ("badStr", ["error_code": 0, "data": "not base64 !!"]),
+    ("withErr", ["error_code": 0, "data": E(#"{"error_code":114,"error_message":"x"}"#)]),
+    ("noData", ["error_code": 3, "error_message": "m"]),
+    ("numData", ["error_code": 0, "data": 5]),
+]
+for (n, c) in cases { line("unwrap[\(n)]", sorted(SC.unwrapDecryptedResponse(c, key: k16))) }
+line("unwrap[nokey]", sorted(SC.unwrapDecryptedResponse(["error_code": 0, "data": E("[1]")], key: nil)))
+line("extractSek[root]", SC.extractZpwSek(from: ["zpw_sek": " r.1 "]) ?? "nil")
+line("extractSek[acct]", SC.extractZpwSek(from: ["data": ["account": ["zpw_sek": "a.b.c"]]]) ?? "nil")

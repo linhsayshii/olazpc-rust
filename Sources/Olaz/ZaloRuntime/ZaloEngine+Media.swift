@@ -59,6 +59,9 @@ final class MediaResolver {
     /// The remembered verdict for `key`, if any.
     func known(_ key: String) -> MediaResolution? { settled[key]?.resolution }
 
+    /// Requests waiting for a slot (tests).
+    var queuedCount: Int { queue.count }
+
     /// `force` (the retry button) ignores any remembered verdict except a final "expired": a remembered
     /// "unavailable" is retried, and a remembered file that turned out not to be loadable is looked up again.
     func resolve(key: String, force: Bool = false, run: @escaping @MainActor () async -> MediaResolution) async -> MediaResolution {
@@ -270,9 +273,8 @@ extension ZaloEngine {
         }
         if !conversationId.isEmpty,
            let store = self.sqliteStore,
-           let stored = try? await store.message(convId: conversationId, idOrClientId: messageId),
-           let decoded = ZaloWireParser.decodeStoredMessage(stored) {
-            return decoded
+           let row = try? await store.decodedMessage(convId: conversationId, idOrClientId: messageId) {
+            return row.message
         }
         for list in self.messages.values {
             if let hit = list.first(where: { $0.id == messageId }) {

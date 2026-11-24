@@ -1,0 +1,46 @@
+# Vendored copy of signalapp/libsignal `rust/protocol` at tag v0.73.0 (AGPL-3.0-only),
+# patched for Zalo wire compatibility. See ZALO-PATCH.md and rust/DECISIONS.md ADR-015.
+# Workspace-inherited keys were inlined. The build script was replaced by pre-generated
+# prost output (src/proto/*.rs), so no protoc is needed to build.
+
+[package]
+name = "libsignal-protocol"
+version = "0.1.0"
+authors = ["Signal Messenger LLC"]
+license = "AGPL-3.0-only"
+edition = "2021"
+rust-version = "1.80.1"
+
+[dependencies]
+libsignal-core = { git = "https://github.com/signalapp/libsignal", tag = "v0.73.0" }
+signal-crypto = { git = "https://github.com/signalapp/libsignal", tag = "v0.73.0" }
+
+aes = { version = "0.8.3", features = ["zeroize"] }
+aes-gcm-siv = "0.11.1"
+arrayref = "0.3.6"
+assert_matches = "1.5"
+async-trait = "0.1.41"
+ctr = { version = "0.9.2", features = ["zeroize"] }
+derive-where = "1.2.5"
+derive_more = { version = "2.0.0", features = ["deref", "from", "into", "try_from"] }
+displaydoc = "0.2"
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12.0"
+indexmap = "2.1.0"
+itertools = "0.14.0"
+libcrux-ml-kem = { version = "0.0.2", features = ["kyber", "mlkem1024"] }
+log = "0.4"
+prost = "0.13.1"
+rand = "0.9"
+rayon = "1.8.0"
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
+subtle = "2.6"
+thiserror = "2.0.11"
+uuid = "1.1.2"
+zerocopy = { version = "0.8.24", features = ["derive"] }
+
+[features]
+kyber768 = ["libcrux-ml-kem/kyber", "libcrux-ml-kem/mlkem768"]
+mlkem1024 = []

@@ -178,7 +178,7 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
         /// Kinds the official client lays out centered, outside the message bubbles.
         var isStandalone: Bool {
             switch self {
-            case .system, .notice, .ecard: true
+            case .system, .notice, .ecard, .poll: true
             default: false
             }
         }
@@ -255,6 +255,10 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
     struct Quote: Equatable, Sendable {
         var senderName: String
         var text: String
+        /// The quoted message's server id (`globalMsgId`), empty when unknown.
+        var msgId: String = ""
+        /// The quoted message's `cliMsgId`, empty when unknown.
+        var cliMsgId: String = ""
     }
 
     struct Reaction: Equatable, Sendable, Identifiable {
@@ -311,6 +315,15 @@ struct ChatMessage: Identifiable, Equatable, Sendable {
     var fallbackURLs: [URL] = []
     /// Client-assigned ID (`cliMsgId` / `clientId`) required for recall (`undo`) and local correlation.
     var clientId: String = ""
+    /// Rich text (official `textProperties.styles`): styled UTF-16 ranges of `text`; empty for plain text.
+    var textStyles: [TextStyle] = []
+    /// "Tin nhắn tự xóa": lifetime in milliseconds from `date` (0 = kept).
+    var ttlMs: Int64 = 0
+    /// Official `URGENCY_MODE`: 1 "Quan trọng", 2 "Khẩn cấp", 0 normal.
+    var urgency: Int = 0
+
+    /// When a self-deleting message disappears.
+    var expiresAt: Date? { ttlMs > 0 ? date.addingTimeInterval(Double(ttlMs) / 1000) : nil }
 }
 
 /// The items of the official message context menu (message-actions-adapter.js `describe`, the builder's own conditions) with the
@@ -365,7 +378,8 @@ extension ChatMessage {
         func number(_ value: Any?) -> Double { (value as? NSNumber)?.doubleValue ?? 0 }
         var quote: Quote?
         if let q = json["quote"] as? [String: Any] {
-            quote = Quote(senderName: q["senderName"] as? String ?? "", text: q["text"] as? String ?? "")
+            quote = Quote(senderName: q["senderName"] as? String ?? "", text: q["text"] as? String ?? "",
+                          msgId: q["msgId"] as? String ?? "", cliMsgId: q["cliMsgId"] as? String ?? "")
         }
         let reactions = (json["reactions"] as? [[String: Any]] ?? []).compactMap { r -> Reaction? in
             guard let icon = ReactionIcon(json: r) else { return nil }
@@ -445,7 +459,10 @@ extension ChatMessage {
             suggestsStickers: json["stickers"] as? Bool ?? false,
             menu: MessageMenu(json: json["menu"]),
             fallbackURLs: fallbacks,
-            clientId: (json["clientId"] as? String) ?? (json["cliMsgId"] as? String) ?? ""
+            clientId: (json["clientId"] as? String) ?? (json["cliMsgId"] as? String) ?? "",
+            textStyles: TextStyle.list(json: json["styles"]),
+            ttlMs: max(0, (json["ttl"] as? NSNumber)?.int64Value ?? 0),
+            urgency: min(2, max(0, (json["urgency"] as? NSNumber)?.intValue ?? 0))
         )
     }
 }
@@ -911,4 +928,20 @@ struct MessageTransferState: Equatable, Sendable {
     var officialTitle: String? = nil
     var officialDescription: String? = nil
     var officialSuggestion: String? = nil
+}
+
+/// Someone typing in a conversation, from a `typing` / `gtyping` control action.
+struct TypingStatus: Equatable, Sendable {
+    /// The official client keeps the indicator 10 s after the last ping (`typing: 1e4`).
+    static let displaySeconds: Double = 10
+
+    var name: String
+    /// `isPC == 1`: they type on Zalo PC/Web ("… trên máy tính").
+    var onPC: Bool
+
+    /// The official strings: `STR_TYPING_CHAT_ONE_ONE(_ON_PC)` in a 1-1 chat, `<name> STR_TYPING(_ON_PC)` in a group.
+    func label(isGroup: Bool) -> String {
+        let suffix = onPC ? " trên máy tính" : ""
+        return isGroup ? "\(name) đang soạn tin\(suffix)" : "Đang soạn tin\(suffix)"
+    }
 }

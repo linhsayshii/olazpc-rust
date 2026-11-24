@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import OlazCore
 import Security
 
 enum ZaloSessionStatus: Equatable, Sendable {
@@ -84,6 +85,13 @@ actor ZaloSessionClient {
     let dataDirectory: URL
     private let session: URLSession
     private let useKeychain: Bool
+    /// Rust chat path (ADR-011). Swift stays the owner of Keychain persistence; the core session mirrors our state.
+    let useRustCore: Bool
+    private var coreSession: CoreSession?
+    private var coreApiHandle: CoreApi?
+    private var coreHttpHandle: CoreHttp?
+    private var coreRawHandle: CoreRawHttp?
+    private var corePushedSnapshot = ""
 
     var domains = ZaloDomains()
     var imei: String
@@ -112,10 +120,14 @@ actor ZaloSessionClient {
     init(
         dataDirectory: URL = ZaloPlatform.defaultUserData,
         useKeychain: Bool = true,
-        urlSession: URLSession? = nil
+        urlSession: URLSession? = nil,
+        useRustCore: Bool = RustCore.isEnabled
     ) {
         self.dataDirectory = dataDirectory
         self.useKeychain = useKeychain
+        // An injected URLSession means a test stubbing the network (URLProtocol): the Rust client has its own
+        // transport and would bypass the stub, so those sessions stay on the Swift path.
+        self.useRustCore = useRustCore && urlSession == nil
         self.computerName = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
 
         if let urlSession {
@@ -213,6 +225,55 @@ actor ZaloSessionClient {
             return nil
         }
         return try? AESCBC.crypt(ct, key: enc, iv: iv, encrypt: false)
+    }
+
+    /// The `CoreApi` over a `CoreSession` restored from our live state, or `nil` (Swift path, or no usable session).
+    /// The snapshot is rebuilt from the current fields and pushed only when it changed, so credential / domain updates
+    /// made anywhere in this class (login, `applyLoginConfig`, `updateCredentials`, `markExpired`) reach the core on
+    /// the next call. The account is carried in the clear inside the in-memory snapshot only; Rust never persists it.
+    func coreApi() -> CoreApi? {
+        syncCoreSession() ? coreApiHandle : nil
+    }
+
+    /// The generic signed-request seam (`get` / `post` / `postMultipart`) over the same core session as `coreApi()`.
+    func coreHttp() -> CoreHttp? {
+        syncCoreSession() ? coreHttpHandle : nil
+    }
+
+    /// The session-free raw HTTP seam (`rawRequest`, downloads), or `nil` on the Swift path. It needs no account: the QR
+    /// login flow uses it before one exists, and Swift passes its own `zpwSek` on every call so there is one owner.
+    private func coreRaw() -> CoreRawHttp? {
+        guard useRustCore else { return nil }
+        if coreRawHandle == nil { coreRawHandle = try? CoreRawHttp() }
+        return coreRawHandle
+    }
+
+    /// Creates the core session on first use and pushes our current state into it when it changed.
+    private func syncCoreSession() -> Bool {
+        guard useRustCore, let account else { return false }
+        let snapshot = StoredNativeSession(
+            zpwType: ZaloDomains.zpwType,
+            imei: imei,
+            computerName: computerName,
+            domains: domains,
+            sealedSecretsBase64: nil,
+            plainAccount: account,
+            expiredAt: expiredAt
+        )
+        guard let data = try? JSONEncoder().encode(snapshot), let json = String(data: data, encoding: .utf8) else { return false }
+        if coreSession == nil {
+            guard let created = try? CoreSession(computerName: computerName) else { return false }
+            coreSession = created
+            coreApiHandle = CoreApi(session: created)
+            coreHttpHandle = CoreHttp(session: created)
+            corePushedSnapshot = ""
+        }
+        guard let coreSession else { return false }
+        if json != corePushedSnapshot {
+            guard (try? coreSession.restore(snapshotJson: json)) == true else { return false }
+            corePushedSnapshot = json
+        }
+        return true
     }
 
     func commonParams() -> String {
@@ -355,6 +416,8 @@ actor ZaloSessionClient {
     }
 
     func clearSession() {
+        coreSession?.clearSession()
+        corePushedSnapshot = ""
         account = nil
         zpwSek = nil
         secretKey = nil
@@ -830,6 +893,11 @@ actor ZaloSessionClient {
         rawEncryptedString: String? = nil,
         decryptResponse: Bool = true
     ) async throws -> [String: Any] {
+        if let http = coreHttp() {
+            return try await coreRequest(
+                http, method: .get, service: service, path: path, queryParams: queryParams, headers: headers,
+                payload: encryptedPayload, rawEncrypted: rawEncryptedString, decryptResponse: decryptResponse)
+        }
         var suffix = "\(path)?\(commonParams())"
         if let encryptedPayload {
             let enc = try encodedParams(encryptedPayload)
@@ -851,6 +919,88 @@ actor ZaloSessionClient {
         )
     }
 
+    // MARK: Rust generic seam (get / post / postMultipart)
+
+    private func coreRecord(
+        method: HttpMethod,
+        service: String,
+        path: String,
+        queryParams: [String: String],
+        headers: [String: String],
+        payload: [String: Any]?,
+        rawEncrypted: String?,
+        decryptResponse: Bool
+    ) throws -> HttpRequestRecord {
+        // Same bytes `encodedParams` would encrypt; Rust parses them with exact 64-bit integers.
+        let payloadJSON = try payload.map { String(decoding: try JSONSerialization.data(withJSONObject: $0, options: []), as: UTF8.self) }
+        return HttpRequestRecord(
+            method: method, service: service, path: path, query: queryParams, headers: headers,
+            payloadJson: payloadJSON, rawEncrypted: rawEncrypted, decryptResponse: decryptResponse)
+    }
+
+    private func coreRequest(
+        _ http: CoreHttp,
+        method: HttpMethod,
+        service: String,
+        path: String,
+        queryParams: [String: String],
+        headers: [String: String],
+        payload: [String: Any]?,
+        rawEncrypted: String?,
+        decryptResponse: Bool
+    ) async throws -> [String: Any] {
+        let record = try coreRecord(
+            method: method, service: service, path: path, queryParams: queryParams, headers: headers,
+            payload: payload, rawEncrypted: rawEncrypted, decryptResponse: decryptResponse)
+        do {
+            return try Self.coreAnswer(try await http.request(request: record))
+        } catch { throw RustCore.mapError(error, path: path) }
+    }
+
+    /// The core returns the whole decoded answer (`error_code`, `data` already decrypted) as lossless JSON text.
+    private static func coreAnswer(_ json: String) throws -> [String: Any] {
+        guard let object = JSONLossless.parseObject(string: json) else { throw ZaloTransportError.invalidJSON }
+        return object
+    }
+
+    /// `postMultipart` with the file part read from disk (`length` bytes from `offset`, to EOF when `nil`). On the Rust
+    /// path the bytes never cross the FFI boundary; the Swift fallback reads the slice and uses the `Data` overload.
+    func postMultipart(
+        service: String,
+        path: String,
+        queryParams: [String: String] = [:],
+        encryptedPayload: [String: Any],
+        fieldName: String,
+        fileName: String,
+        mimeType: String,
+        filePath: String,
+        offset: UInt64 = 0,
+        length: UInt64? = nil
+    ) async throws -> [String: Any] {
+        if let http = coreHttp() {
+            let record = try coreRecord(
+                method: .post, service: service, path: path, queryParams: queryParams, headers: [:],
+                payload: encryptedPayload, rawEncrypted: nil, decryptResponse: true)
+            let part = UploadPartRecord(fieldName: fieldName, fileName: fileName, mimeType: mimeType)
+            do {
+                return try Self.coreAnswer(
+                    try await http.postMultipartFile(request: record, part: part, filePath: filePath, offset: offset, length: length))
+            } catch { throw RustCore.mapError(error, path: path) }
+        }
+        let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: filePath))
+        defer { try? handle.close() }
+        try handle.seek(toOffset: offset)
+        let slice: Data
+        if let length {
+            slice = try handle.read(upToCount: Int(length)) ?? Data()
+        } else {
+            slice = try handle.readToEnd() ?? Data()
+        }
+        return try await postMultipart(
+            service: service, path: path, queryParams: queryParams, encryptedPayload: encryptedPayload,
+            fieldName: fieldName, fileName: fileName, mimeType: mimeType, chunkData: slice)
+    }
+
     func rawGetJSON(url: URL, timeout: TimeInterval = 12, decryptResponse: Bool = true) async throws -> [String: Any] {
         let (status, data, _) = try await rawRequest(method: "GET", url: url, body: nil, contentType: nil, timeout: timeout)
         guard (200..<300).contains(status) else {
@@ -862,6 +1012,10 @@ actor ZaloSessionClient {
     }
 
     func rawDownloadData(url: URL, timeout: TimeInterval = 20) async throws -> Data {
+        if let raw = coreRaw() {
+            do { return try await raw.download(url: url.absoluteString, timeoutSecs: timeout) }
+            catch { throw RustCore.mapError(error, quietTimeout: true) }
+        }
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         req.timeoutInterval = timeout
@@ -875,6 +1029,20 @@ actor ZaloSessionClient {
     }
 
     func downloadSyncBatch(url: URL, timeout: TimeInterval = 45) async throws -> Data {
+        if let raw = coreRaw() {
+            do {
+                return try await raw.downloadSyncBatch(
+                    url: url.absoluteString, timeoutSecs: timeout, zpwSek: zpwSek, userId: account?.userId)
+            } catch {
+                if case CoreError.Http(let status) = error {
+                    let host = url.host ?? "-"
+                    Task { @MainActor in
+                        EngineLog.shared.write("sync-v2: batch download failed http=\(status) host=\(host)")
+                    }
+                }
+                throw RustCore.mapError(error, quietTimeout: true)
+            }
+        }
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         req.timeoutInterval = timeout
@@ -909,6 +1077,11 @@ actor ZaloSessionClient {
         encryptedPayload: [String: Any],
         decryptResponse: Bool = true
     ) async throws -> [String: Any] {
+        if let http = coreHttp() {
+            return try await coreRequest(
+                http, method: .post, service: service, path: path, queryParams: queryParams, headers: headers,
+                payload: encryptedPayload, rawEncrypted: nil, decryptResponse: decryptResponse)
+        }
         var suffix = "\(path)?\(commonParams())"
         for (k, v) in queryParams.sorted(by: { $0.key < $1.key }) {
             suffix += "&\(k)=\(Self.urlEncode(v))"
@@ -935,6 +1108,15 @@ actor ZaloSessionClient {
         mimeType: String,
         chunkData: Data
     ) async throws -> [String: Any] {
+        if let http = coreHttp() {
+            let record = try coreRecord(
+                method: .post, service: service, path: path, queryParams: queryParams, headers: [:],
+                payload: encryptedPayload, rawEncrypted: nil, decryptResponse: true)
+            let part = UploadPartRecord(fieldName: fieldName, fileName: fileName, mimeType: mimeType)
+            do {
+                return try Self.coreAnswer(try await http.postMultipart(request: record, part: part, data: chunkData))
+            } catch { throw RustCore.mapError(error, path: path) }
+        }
         let enc = try encodedParams(encryptedPayload)
         var suffix = "\(path)?\(commonParams())&params=\(enc)"
         for (k, v) in queryParams.sorted(by: { $0.key < $1.key }) {
@@ -1118,6 +1300,15 @@ actor ZaloSessionClient {
         timeout: TimeInterval? = nil,
         extraHeaders: [String: String] = [:]
     ) async throws -> (Int, Data, String?) {
+        if let raw = coreRaw() {
+            let record = RawRequestRecord(
+                method: method.uppercased() == "POST" ? .post : .get, url: url.absoluteString, body: body,
+                contentType: contentType, timeoutSecs: timeout, headers: extraHeaders, zpwSek: zpwSek)
+            do {
+                let out = try await raw.request(request: record)
+                return (Int(out.status), out.body, out.zpwSekCookie)
+            } catch { throw RustCore.mapError(error, quietTimeout: true) }
+        }
         var req = URLRequest(url: url)
         req.httpMethod = method
         if let timeout {

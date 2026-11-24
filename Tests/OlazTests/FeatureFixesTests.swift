@@ -230,6 +230,49 @@ import Testing
         #expect(decoded.menu.delete == .plain)
     }
 
+    /// Phone-synced info notices (pin / unpin …): `webchat` + object content with `action: msginfo.actionlist` is a
+    /// system line, not a text bubble (Rust `webchat_msginfo_actionlist_is_system`).
+    @Test func webchatMsgInfoActionListIsSystem() {
+        let evt = ZaloWireParser.parseWireMessage(
+            [
+                "msgId": "8522", "cliMsgId": "1795", "uidFrom": "0", "idTo": "peer", "msgType": "webchat", "ts": 1_795_463_690_898,
+                "content": ["action": "msginfo.actionlist", "title": "Hoàng Việt Linh đã ghim tin nhắn a đi dạy về ah.",
+                            "description": "", "href": "", "params": "{}", "thumb": "", "type": "", "childnumber": 0]
+            ],
+            myUid: "me"
+        )
+        guard case .message(let msg, _) = evt else { Issue.record("expected message"); return }
+        #expect(msg.kind == .system)
+        #expect(msg.text == "Hoàng Việt Linh đã ghim tin nhắn a đi dạy về ah.")
+        // A plain webchat (string or object content) stays text.
+        for content: Any in ["hi", ["title": "hi"]] {
+            let plain = ZaloWireParser.parseWireMessage(
+                ["msgId": "8523", "uidFrom": "peer", "idTo": "me", "msgType": "webchat", "ts": 1, "content": content], myUid: "me")
+            guard case .message(let m, _) = plain else { Issue.record("expected message"); return }
+            #expect(m.kind == .text)
+        }
+    }
+
+    /// `group.poll` events: actor + verb of `content.action` + question (Rust `group_poll_event_info_line`).
+    @Test func groupPollEventInfoLine() {
+        func header(_ action: String, from: String) -> String {
+            let evt = ZaloWireParser.parseWireMessage(
+                [
+                    "msgId": "9\(action)", "uidFrom": from, "idTo": "3993665107146848278", "msgType": "group.poll", "ts": 1,
+                    "content": ["action": action, "title": "", "description": "",
+                                "params": #"{"pollId":1192926841,"question":"Khỏe không","uid":"x","dName":"Việt Linh","pollVer":2}"#]
+                ],
+                myUid: "me", isGroupHint: true
+            )
+            guard case .message(let msg, _) = evt, case .poll(let info) = msg.kind else { return "" }
+            return info.header
+        }
+        #expect(header("create", from: "peer") == "Việt Linh tạo cuộc bình chọn mới: Khỏe không")
+        #expect(header("vote", from: "peer") == "Việt Linh tham gia cuộc bình chọn: Khỏe không")
+        #expect(header("update", from: "peer") == "Việt Linh đổi lựa chọn trong cuộc bình chọn: Khỏe không")
+        #expect(header("vote", from: "0") == "Bạn tham gia cuộc bình chọn: Khỏe không")
+    }
+
     @Test @MainActor func recallEnforces24hGuardAndApplyRemoteRecallUpdatesBubbleSQLiteAndPreview() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-recall-engine-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -1100,6 +1143,32 @@ private final class MockReactionURLProtocol: URLProtocol, @unchecked Sendable {
         #expect(capturedMsgTypes.withLock { $0 } == [32, 32, 46, 1])
     }
 
+    @Test @MainActor func removeAllMyReactionsKeepsOthers() {
+        var reactions = [
+            ChatMessage.Reaction(icon: ReactionIcon(type: "5", key: "/-heart", emoji: "❤️"), count: 2,
+                                 includesMe: true, names: ["Bạn", "Lan"], people: 2, userCounts: ["100": 1, "200": 1]),
+            ChatMessage.Reaction(icon: ReactionIcon(type: "3", key: "/-strong", emoji: "👍"), count: 1,
+                                 includesMe: true, names: ["Bạn"], people: 1, userCounts: ["100": 1]),
+        ]
+        ZaloEngine.mutateReactions(&reactions, actorUid: "100", myUid: "100", isMe: true, rType: "-1", rIcon: "",
+                                   allowDuplicateSameUser: true, nameLookup: { _ in "Lan" })
+        #expect(reactions.count == 1)
+        #expect(reactions[0].icon.type == "5")
+        #expect(reactions[0].includesMe == false)
+        #expect(reactions[0].userCounts == ["200": 1])
+    }
+
+    @Test func removeReactionWireFormat() throws {
+        let spec = ZaloSessionClient.buildReactionRequest(
+            convId: "200", msgId: "88001", cliMsgId: "17001", rIcon: "", rType: -1,
+            msgType: 1, clientId: 1, imei: "i")
+        let list = try #require(spec.payload["react_list"] as? [[String: Any]])
+        let msg = try #require(list.first?["message"] as? String)
+        let inner = try #require(JSONLossless.parseObject(Data(msg.utf8)))
+        #expect((inner["rType"] as? NSNumber)?.intValue == -1)
+        #expect(inner["rIcon"] as? String == "")
+    }
+
     @Test @MainActor func remoteUnreactAndCorruptedGhostReactionsAreEliminated() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-ghost-react-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -1659,5 +1728,34 @@ private final class MockReactionURLProtocol: URLProtocol, @unchecked Sendable {
         #expect(detailGroup.users.first?.name == "Hùng")
         #expect(detailGroup.users.first?.avatar?.absoluteString == "https://ava.example/555.jpg")
         #expect(engine.messages["g900"]?.first?.reactions.first?.names == ["Hùng"])
+    }
+}
+
+@Suite struct BatchMergeTests {
+    private func msg(_ id: String, _ ts: TimeInterval, clientId: String = "") -> ChatMessage {
+        ChatMessage(id: id, conversationId: "300", senderId: "300", senderName: "Lan", senderAvatar: nil, isMine: false,
+                    kind: .text, text: id, date: Date(timeIntervalSince1970: ts), status: .sent, quote: nil, reactions: [],
+                    isE2EE: false, clientId: clientId)
+    }
+
+    /// A jump to an old pin merges thousands of rows in one write: sorted, no duplicates, rows already shown kept.
+    @Test @MainActor func batchMergeSortsAndSkipsKnownRows() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-batch-merge-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let engine = ZaloEngine(dataDirectory: root, useKeychain: false)
+
+        engine.messages["300"] = [msg("9000", 9000, clientId: "c9000")]
+        var rows: [(message: ChatMessage, clientId: String?)] = (0..<3000).reversed().map { i in
+            (message: msg(String(1000 + i), TimeInterval(1000 + i)), clientId: nil)
+        }
+        rows.append((message: msg("9000", 9000, clientId: "c9000"), clientId: "c9000"))
+        engine.mergeMessagesIntoMemory(rows, in: "300")
+
+        let list = try #require(engine.messages["300"])
+        #expect(list.count == 3001)
+        #expect(list.first?.id == "1000")
+        #expect(list.last?.id == "9000")
+        #expect(zip(list, list.dropFirst()).allSatisfy { $0.date <= $1.date })
     }
 }

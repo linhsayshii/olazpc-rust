@@ -102,6 +102,10 @@ final class MediaViewerState {
     private(set) var item: MediaViewerItem?
     private(set) var zoom = ZoomController()
     private(set) var playback: VideoPlayback?
+    /// The conversation's photos for the arrow keys; nil while a video is shown.
+    private(set) var gallery: PhotoGallery?
+    private var galleryTask: Task<Void, Never>?
+    private var galleryLoading = false
     var isFullScreen = false
     var titlebar = ViewerTitlebar()
 
@@ -112,8 +116,62 @@ final class MediaViewerState {
         if case .video(let file, _) = item.media { playback = VideoPlayback(url: file) }
     }
 
+    /// Starts browsing the conversation's photos from `item` (already presented). Pages are read until the item shows up.
+    func beginGallery(for item: MediaViewerItem, source: any SharedMediaSource) {
+        galleryTask?.cancel()
+        galleryLoading = false
+        guard item.isPhoto else { gallery = nil; return }
+        gallery = PhotoGallery(current: item)
+        galleryLoading = true
+        galleryTask = Task { [weak self] in
+            // The clicked photo may be far back in a long chat: read pages until it is in (bounded).
+            for _ in 0..<40 {
+                guard let self, let gallery = self.gallery, gallery.items.first?.conversationId == item.conversationId else { return }
+                let page = await source.sharedMedia(in: item.conversationId, kind: .images, after: gallery.cursor, limit: 100)
+                guard !Task.isCancelled, let page, self.gallery?.items.first?.conversationId == item.conversationId else { break }
+                self.gallery?.merge(page: page)
+                if !page.more || page.items.contains(where: { $0.id == item.messageId }) { break }
+            }
+            if !Task.isCancelled { self?.galleryLoading = false }
+        }
+    }
+
+    /// Up / Left (`older`) or Down / Right. Swaps the shown photo; false when there is none that way.
+    @discardableResult func step(older: Bool, source: any SharedMediaSource) -> Bool {
+        guard var gallery, let next = older ? gallery.older() : gallery.newer() else { return false }
+        self.gallery = gallery
+        item = next
+        zoom = ZoomController()
+        preloadNeighbours()
+        if gallery.shouldLoadOlder { loadOlder(source: source) }
+        return true
+    }
+
+    private func loadOlder(source: any SharedMediaSource) {
+        guard !galleryLoading, let gallery, gallery.hasMoreOlder else { return }
+        galleryLoading = true
+        let conversationId = gallery.current.conversationId
+        galleryTask = Task { [weak self] in
+            let page = await source.sharedMedia(in: conversationId, kind: .images, after: gallery.cursor, limit: 100)
+            guard let self, !Task.isCancelled else { return }
+            self.galleryLoading = false
+            if let page, self.gallery?.current.conversationId == conversationId { self.gallery?.merge(page: page) }
+        }
+    }
+
+    private func preloadNeighbours() {
+        for neighbour in gallery?.neighbours ?? [] {
+            guard case .photo(let url?, _, _, let encrypted) = neighbour.media, !encrypted, url.scheme != "file" else { continue }
+            Task.detached(priority: .utility) { _ = try? await MediaLoader.shared.data(for: url) }
+        }
+    }
+
     /// Stops the player and lets go of the item (so the full-resolution image and the video are freed).
     func clear() {
+        galleryTask?.cancel()
+        galleryTask = nil
+        galleryLoading = false
+        gallery = nil
         playback?.stop()
         playback = nil
         item = nil
@@ -133,6 +191,7 @@ final class MediaViewer: NSObject, NSWindowDelegate {
     private var window: MediaViewerWindow?
     private var hosting: NSHostingView<AnyView>?
     private var keyMonitor: Any?
+    private weak var engine: ZaloEngine?
     /// A swap that happened in full screen: the frame to take when leaving it.
     private var pendingFrame: NSRect?
 
@@ -149,6 +208,8 @@ final class MediaViewer: NSObject, NSWindowDelegate {
         let window = self.window ?? makeWindow(size: content)
         hosting?.rootView = AnyView(MediaViewerRoot(state: state, engine: engine, shell: shell))
         state.present(item)
+        self.engine = engine
+        state.beginGallery(for: item, source: engine)
         window.title = item.windowTitle
 
         if window.styleMask.contains(.fullScreen) {
@@ -269,6 +330,12 @@ final class MediaViewer: NSObject, NSWindowDelegate {
                 if !event.isARepeat { toggleFullScreen() }
                 return true
             }
+            if item.isPhoto, let engine, [123, 124, 125, 126].contains(event.keyCode) {
+                // Up / Left: older photo, Down / Right: newer (the chat reads top to bottom, oldest first).
+                state.step(older: event.keyCode == 126 || event.keyCode == 123, source: engine)
+                if let current = state.item { window?.title = current.windowTitle }
+                return true
+            }
             guard let playback = state.playback else { return false }
             switch event.keyCode {
             case 49: if !event.isARepeat { playback.togglePlay() }
@@ -360,7 +427,7 @@ private struct MediaViewerContent: View {
                         .frame(width: 340, height: 220)
                         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                 }
-                .rendering { image in ZoomableImageView(image: image, zoom: state.zoom) }
+                .rendering { image in ZoomableImageView(image: image, zoom: state.zoom, menu: { photoMenu(url: url) }) }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 // The top bar gets its own band instead of covering the top of the photo.
                 .padding(.top, MediaViewerLayout.photoTopBar)
@@ -373,6 +440,24 @@ private struct MediaViewerContent: View {
         }
     }
 
+    // MARK: Photo menu
+
+    /// Right-click on the photo: the same copy / download items as the chat's message menu.
+    private func photoMenu(url: URL?) -> NSMenu {
+        let (conversationId, messageId, date) = (item.conversationId, item.messageId, item.date)
+        let engine = engine
+        let encrypted: Bool = { if case .photo(_, _, _, let e) = item.media { return e }; return false }()
+        let source = encrypted ? nil : url
+        let menu = NSMenu()
+        menu.addAction("Copy hình ảnh", symbol: "photo.on.rectangle") {
+            engine.copyPhoto(conversationId: conversationId, messageId: messageId, url: source)
+        }
+        menu.addAction("Tải về", symbol: "arrow.down.circle") {
+            engine.downloadPhoto(conversationId: conversationId, messageId: messageId, url: source, date: date)
+        }
+        return menu
+    }
+
     // MARK: Top bar
 
     private var topBar: some View {
@@ -380,6 +465,13 @@ private struct MediaViewerContent: View {
             info
                 .onHover { state.playback?.setPointerOver("top", $0) }
             Spacer(minLength: 12)
+            if let gallery = state.gallery, gallery.count > 1 {
+                Text("\(gallery.position)/\(gallery.count)")
+                    .font(.system(size: 12, weight: .medium).monospacedDigit())
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .glassEffect(.regular, in: Capsule())
+                    .accessibilityLabel("Ảnh \(gallery.position) trên \(gallery.count)")
+            }
             if item.isPhoto { ZoomControls(zoom: state.zoom) }
         }
         .padding(.leading, state.titlebar.leading)
@@ -427,4 +519,23 @@ private struct WindowDragArea: NSViewRepresentable {
 
     func makeNSView(context: Context) -> DragView { DragView() }
     func updateNSView(_ view: DragView, context: Context) {}
+}
+
+
+/// Closure-backed menu items (the menu keeps them alive through `representedObject`).
+private final class MenuAction: NSObject {
+    let run: () -> Void
+    init(_ run: @escaping () -> Void) { self.run = run }
+    @objc func fire() { run() }
+}
+
+private extension NSMenu {
+    func addAction(_ title: String, symbol: String, _ run: @escaping () -> Void) {
+        let action = MenuAction(run)
+        let entry = NSMenuItem(title: title, action: #selector(MenuAction.fire), keyEquivalent: "")
+        entry.target = action
+        entry.representedObject = action
+        entry.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        addItem(entry)
+    }
 }

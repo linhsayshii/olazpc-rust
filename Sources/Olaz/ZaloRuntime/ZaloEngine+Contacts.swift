@@ -112,7 +112,7 @@ extension ZaloEngine {
                 if !globalId.isEmpty {
                     friendGlobalMap[uid] = globalId
                 }
-                let display = JSONLossless.string(row["displayName"] ?? row["name"] ?? row["zaloName"])
+                let display = ZaloWireParser.preferredName(row)
                 let zaloName = JSONLossless.string(row["zaloName"])
                 let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
                 let lastAct = (JSONLossless.int64(row["lastActionTime"]).map(Double.init)) ?? 0
@@ -404,5 +404,17 @@ extension ZaloEngine {
             )
         }
         return search
+    }
+}
+
+extension ZaloEngine {
+    /// Name an @mention of `uid` shows (official `getMemberFriendlyName` -> `getDName`: alias, else the Zalo name);
+    /// nil keeps the text as sent (me, everyone, or nobody known).
+    func mentionDisplayName(_ uid: String) -> String? {
+        let clean = ZaloWireParser.stripUserPrefix(uid)
+        guard !clean.isEmpty, clean != "-1", clean != ZaloWireParser.stripUserPrefix(profile?.userId ?? ""),
+              let name = lookupPersonInfo(clean)?.name.trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.isEmpty, name != clean, name != "Bạn", name != ReactionDetail.unknownName else { return nil }
+        return name
     }
 }

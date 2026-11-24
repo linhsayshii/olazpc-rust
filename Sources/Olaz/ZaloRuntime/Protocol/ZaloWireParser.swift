@@ -63,6 +63,16 @@ enum ZaloWireParser {
         id.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// A person's name from a friend / profile row, as the official `getDName` falls back after the alias: `zaloName`
+    /// first. `displayName` on friend rows can carry the name from the phone's contacts, which the official PC does not show.
+    static func preferredName(_ row: [String: Any]) -> String {
+        for key in ["zaloName", "zalo_name", "displayName", "display_name", "dName", "name"] {
+            let value = JSONLossless.string(row[key]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !value.isEmpty { return value }
+        }
+        return ""
+    }
+
     static func sanitizeProfileUid(_ raw: String) -> String? {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !s.isEmpty else { return nil }
@@ -441,6 +451,15 @@ enum ZaloWireParser {
         var suggestsStickers = false
 
         switch msgType {
+        // `where` binds to every pattern only when each carries it (a single trailing `where` guards "chat.text" alone).
+        case "" where JSONLossless.string(contentDict?["action"]) == "msginfo.actionlist",
+             "webchat" where JSONLossless.string(contentDict?["action"]) == "msginfo.actionlist",
+             "chat.text" where JSONLossless.string(contentDict?["action"]) == "msginfo.actionlist":
+            // Info notices (pin / unpin … synced from the phone): a system line, like under `chat.recommended`.
+            kindDict = ["type": "system"]
+            kindTag = "system"
+            textBody = firstNonEmpty(JSONLossless.string(contentDict?["title"]), JSONLossless.string(contentDict?["description"]), "Thông báo hệ thống")
+
         case "", "webchat", "chat.text":
             if let str = rawContent as? String, contentDict == nil {
                 textBody = str
@@ -686,7 +705,16 @@ enum ZaloWireParser {
         case "group.poll", "chat.poll":
             let pollId = JSONLossless.string(contentParams?["poll_id"] ?? contentParams?["pollId"] ?? contentDict?["pollId"])
             let question = firstNonEmpty(JSONLossless.string(contentParams?["question"] ?? contentDict?["title"]), "Bình chọn")
-            let header = JSONLossless.string(contentDict?["description"])
+            // Official `_onMessageInfoEvent`: actor + verb of `content.action` + question (params).
+            let verb: String = [
+                "create": "tạo cuộc bình chọn mới", "share": "chia sẻ cuộc bình chọn", "vote": "tham gia cuộc bình chọn",
+                "update": "đổi lựa chọn trong cuộc bình chọn", "close": "khóa bình chọn"
+            ][JSONLossless.string(contentDict?["action"])] ?? ""
+            let actor = isMine ? "Bạn" : JSONLossless.string(contentParams?["dName"])
+            let header = firstNonEmpty(
+                JSONLossless.string(contentDict?["description"]),
+                (!verb.isEmpty && !actor.isEmpty) ? "\(actor) \(verb): \(question)" : ""
+            )
             kindDict = [
                 "type": "poll",
                 "question": question,
@@ -776,7 +804,13 @@ enum ZaloWireParser {
             let rawQText = firstNonEmpty(JSONLossless.string(q["msg"] ?? q["text"]), "[Tin nhắn]")
             let qText = Self.isSignalCiphertext(rawQText) ? "[Tin nhắn mã hóa đầu cuối]" : rawQText
             if !qName.isEmpty || !qText.isEmpty {
-                quoteDict = ["senderName": qName, "text": qText]
+                var d: [String: Any] = ["senderName": qName, "text": qText]
+                // The quoted message's ids, so tapping the quote can scroll to it ("0" means none).
+                let qMsgId = JSONLossless.string(q["globalMsgId"] ?? q["msgId"])
+                let qCliId = JSONLossless.string(q["cliMsgId"] ?? q["clientId"])
+                if !qMsgId.isEmpty, qMsgId != "0" { d["msgId"] = qMsgId }
+                if !qCliId.isEmpty, qCliId != "0" { d["cliMsgId"] = qCliId }
+                quoteDict = d
             }
         }
 
@@ -873,6 +907,19 @@ enum ZaloWireParser {
             canonical["undecryptedE2EE"] = true
         }
         if let quoteDict { canonical["quote"] = quoteDict }
+        // "Tin nhắn tự xóa": the message's lifetime (ms) from its timestamp.
+        if let ttl = JSONLossless.int64(raw["ttl"]), ttl > 0 { canonical["ttl"] = ttl }
+        // "Quan trọng" / "Khẩn cấp": `urgency` on the message or in its `metaData` (object or JSON string).
+        let meta: [String: Any]? = (raw["metaData"] as? [String: Any])
+            ?? (raw["metaData"] as? String).flatMap { $0.data(using: .utf8) }.flatMap { JSONLossless.parseObject($0) }
+        if let urgency = JSONLossless.int64(raw["urgency"]) ?? JSONLossless.int64(meta?["urgency"]), urgency == 1 || urgency == 2 {
+            canonical["urgency"] = urgency
+        }
+        // Rich text (`action: rtf`): the official `params.styles` ranges over the text.
+        if kindTag == "text" {
+            let styles = TextStyle.list(json: contentParams?["styles"])
+            if !styles.isEmpty { canonical["styles"] = styles.map(\.json) }
+        }
 
         guard let rawJSONData = try? JSONSerialization.data(withJSONObject: canonical, options: []),
               let chatMessage = ChatMessage(json: canonical, fallbackConversation: convId) else {
@@ -1026,8 +1073,14 @@ enum ZaloWireParser {
             "stickers": msg.suggestsStickers,
             "menu": menuDict
         ]
+        if !msg.textStyles.isEmpty { canonical["styles"] = msg.textStyles.map(\.json) }
+        if msg.ttlMs > 0 { canonical["ttl"] = msg.ttlMs }
+        if msg.urgency > 0 { canonical["urgency"] = msg.urgency }
         if let quote = msg.quote {
-            canonical["quote"] = ["senderName": quote.senderName, "text": quote.text]
+            var q: [String: Any] = ["senderName": quote.senderName, "text": quote.text]
+            if !quote.msgId.isEmpty { q["msgId"] = quote.msgId }
+            if !quote.cliMsgId.isEmpty { q["cliMsgId"] = quote.cliMsgId }
+            canonical["quote"] = q
         }
         guard let data = try? JSONSerialization.data(withJSONObject: canonical, options: []) else { return nil }
         return StoredMessage(
@@ -1249,8 +1302,16 @@ enum ZaloWireParser {
         defaultCmd: UInt16 = 0,
         fallbackConvId: String? = nil,
         isGroupHint: Bool? = nil,
-        nameLookup: ((String) -> (name: String, avatar: String)?)? = nil
+        nameLookup: ((String) -> (name: String, avatar: String)?)? = nil,
+        useRustCore: Bool = RustCore.isEnabled
     ) -> [ParsedWireEvent] {
+        if useRustCore,
+           let rust = rustExtractBatchEvents(
+               root, myUid: myUid, selfConvId: selfConvId, defaultCmd: defaultCmd,
+               fallbackConvId: fallbackConvId, isGroupHint: isGroupHint, nameLookup: nameLookup
+           ) {
+            return rust
+        }
         var events: [ParsedWireEvent] = []
 
         func unwrapValue(_ v: Any) -> Any {

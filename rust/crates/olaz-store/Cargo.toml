@@ -1,0 +1,19 @@
+[package]
+name = "olaz-store"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rusqlite = { version = "0.37", features = ["functions"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+olaz-json = { path = "../olaz-json" }
+olaz-wire = { path = "../olaz-wire" }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -19,8 +19,13 @@ BUNDLE_ID="app.olaz.mac"
 # Marketing version and build number; scripts/release.sh sets them for a tagged release.
 VERSION="${OLAZ_VERSION:-1.0}"
 BUILD_NUMBER="${OLAZ_BUILD:-$VERSION}"
-swift build -c "$CONFIG"
-BIN=".build/${CONFIG}/Olaz"
+./scripts/build-rust.sh
+# OLAZ_UNIVERSAL=1 builds arm64 + x86_64 (release workflow); default is the host architecture only.
+SWIFT_ARGS=(-c "$CONFIG")
+[[ "${OLAZ_UNIVERSAL:-0}" == 1 ]] && SWIFT_ARGS+=(--arch arm64 --arch x86_64)
+swift build $SWIFT_ARGS
+BIN_DIR="$(swift build $SWIFT_ARGS --show-bin-path)"
+BIN="$BIN_DIR/Olaz"
 
 APP="build/Olaz.app"
 rm -rf "$APP"
@@ -30,7 +35,7 @@ cp "$BIN" "$APP/Contents/MacOS/Olaz"
 cp Assets/olaz.icns "$APP/Contents/Resources/AppIcon.icns"
 
 # SwiftPM resource bundle (JSModules/, Resources/) — found via ResourceLocator.
-RES_BUNDLE=".build/${CONFIG}/Olaz_Olaz.bundle"
+RES_BUNDLE="$BIN_DIR/Olaz_Olaz.bundle"
 if [[ -d "$RES_BUNDLE" ]]; then
     cp -R "$RES_BUNDLE" "$APP/Contents/Resources/"
 else
@@ -71,7 +76,12 @@ PLIST
 # Sign with the JIT entitlement so JavaScriptCore can JIT the JS modules.
 # OLAZ_SIGN_IDENTITY="Developer ID Application: ..." (set by scripts/release.sh) signs for distribution:
 # hardened runtime + secure timestamp are what notarization requires. Unset = ad-hoc dev build.
-if [[ -n "${OLAZ_SIGN_IDENTITY:-}" ]]; then
+# OLAZ_SIGN_NOTARIZABLE=0 signs with a fixed identity (the self-signed "Olaz Release Signing" cert) without the
+# notarization extras: same runtime behavior as the ad-hoc build, but a stable designated requirement, so Keychain
+# items and privacy permissions survive updates.
+if [[ -n "${OLAZ_SIGN_IDENTITY:-}" && "${OLAZ_SIGN_NOTARIZABLE:-1}" == 0 ]]; then
+    codesign --force --sign "$OLAZ_SIGN_IDENTITY" --entitlements scripts/Olaz.entitlements "$APP"
+elif [[ -n "${OLAZ_SIGN_IDENTITY:-}" ]]; then
     codesign --force --timestamp --options runtime --sign "$OLAZ_SIGN_IDENTITY" \
         --entitlements scripts/Olaz.entitlements "$APP"
 else

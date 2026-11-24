@@ -13,6 +13,7 @@ final class OlazAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSWindow.allowsAutomaticWindowTabbing = false
         NSApp.setActivationPolicy(.regular)
+        MediaLoader.trackDisplayColorSpace()
         onLaunch?()
         DispatchQueue.main.async { [weak self] in
             if NSApp.windows.filter({ $0.canBecomeMain && $0.isVisible }).isEmpty {
@@ -21,6 +22,10 @@ final class OlazAppDelegate: NSObject, NSApplicationDelegate {
             NSApp.activate()
         }
     }
+
+    /// Soft close: Cmd+W (or the red button) only closes the window. The engine, WebSocket and notifications keep
+    /// running, like the official Zalo PC; Cmd+Q quits. The Dock icon or a notification brings the window back.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
@@ -42,16 +47,17 @@ struct OlazApp: App {
             let open = openWindow
             let eng = engine
             appDelegate.openMainWindow = { open(id: "main") }
+            NativeNotifier.shared.openMainWindow = { open(id: "main") }
             appDelegate.onLaunch = { eng.start() }
         }()
         Window(AppBrand.name, id: "main") {
             RootView()
                 .olazAppearance(engine: engine, shell: shell)
-                // While the inspector shows, the window may not get narrower than what keeps the chat usable beside it.
-                .frame(minWidth: shell.holdsInspectorRoom ? InspectorRoom.windowMinWidthWithInspector : InspectorRoom.windowMinWidth, minHeight: 620)
+                .modifier(ShellMinimumSize(shell: shell))
                 .task {
                     engine.start()
                     await EngineProbe.runUISmokeIfRequested(engine: engine, shell: shell)
+                    await PerfProbe.runIfRequested(engine: engine, shell: shell)
                 }
         }
         .defaultLaunchBehavior(.presented)
@@ -114,6 +120,17 @@ extension View {
     /// Root styling and environment shared by every window of the app (see `OlazAppearance`).
     func olazAppearance(engine: ZaloEngine, shell: ShellModel) -> some View {
         modifier(OlazAppearance(engine: engine, shell: shell))
+    }
+}
+
+/// While the inspector shows, the window may not get narrower than what keeps the chat usable beside it. Read in a modifier of
+/// its own, not in `OlazApp.body`: there every inspector toggle re-ran the scene and re-placed the whole window and its toolbar.
+private struct ShellMinimumSize: ViewModifier {
+    let shell: ShellModel
+
+    func body(content: Content) -> some View {
+        content.frame(minWidth: shell.holdsInspectorRoom ? InspectorRoom.windowMinWidthWithInspector : InspectorRoom.windowMinWidth,
+                      minHeight: 620)
     }
 }
 

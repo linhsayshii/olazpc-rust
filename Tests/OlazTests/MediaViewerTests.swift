@@ -123,7 +123,7 @@ import AppKit
 
     /// Animated zooms take their time under a loaded test run: wait for `condition` instead of for a fixed delay.
     @MainActor private func settle(_ condition: () -> Bool) async {
-        for _ in 0..<300 where !condition() { try? await Task.sleep(for: .milliseconds(10)) }
+        await pollUntil(condition)
     }
 
     @MainActor @Test func lockedChatNeverOrdersTheViewerFront() {
@@ -265,7 +265,7 @@ import AppKit
     }
 
     @MainActor private func waitUntilLoaded(_ playback: VideoPlayback) async {
-        for _ in 0..<100 where playback.status == .loading { try? await Task.sleep(for: .milliseconds(50)) }
+        await pollUntil { playback.status != .loading }
     }
 
     /// Runs `body` with the persisted volume / mute restored afterwards (the keys are shared by every test and player).
@@ -303,7 +303,7 @@ import AppKit
     }
 
     @MainActor private func waitUntilSeekLands(_ playback: VideoPlayback) async {
-        for _ in 0..<200 where playback.isSeeking { try? await Task.sleep(for: .milliseconds(10)) }
+        await pollUntil { !playback.isSeeking }
     }
 
     @Test @MainActor func scrubEndsAtOnceAndPlaybackResumesEvenIfALaterSeekSupersedesTheExactOne() async throws {
@@ -378,5 +378,68 @@ import AppKit
             playback.stop()
             next.stop()
         }
+    }
+}
+
+@Suite struct PhotoGalleryTests {
+    private func item(_ id: String, _ ts: TimeInterval) -> MediaViewerItem {
+        MediaViewerItem(media: .photo(url: URL(string: "https://x/\(id).jpg"), width: 1, height: 1, encrypted: false),
+                        conversationId: "c1", messageId: id, senderName: "An", date: Date(timeIntervalSince1970: ts))
+    }
+
+    private func page(_ ids: [(String, TimeInterval)], cursor: String?, more: Bool) -> SharedMediaPage {
+        let items = ids.map { id, ts in
+            ChatMessage(id: id, conversationId: "c1", senderId: "u1", senderName: "An", senderAvatar: nil, isMine: false,
+                        kind: .photo(url: URL(string: "https://x/\(id).jpg"), width: 1, height: 1), text: "",
+                        date: Date(timeIntervalSince1970: ts), status: .sent, quote: nil, reactions: [], isE2EE: false)
+        }
+        return SharedMediaPage(items: items, cursor: cursor, more: more)
+    }
+
+    @Test func startsAloneAndCannotStep() {
+        var g = PhotoGallery(current: item("b", 20))
+        #expect(g.position == 1 && g.count == 1)
+        #expect(g.older() == nil && g.newer() == nil)
+    }
+
+    @Test func mergeOrdersOldestFirstAndKeepsCurrent() {
+        var g = PhotoGallery(current: item("b", 20))
+        g.merge(page: page([("c", 30), ("b", 20), ("a", 10)], cursor: "10|a", more: true))
+        #expect(g.items.map(\.messageId) == ["a", "b", "c"])
+        #expect(g.current.messageId == "b")
+        #expect(g.position == 2 && g.count == 3)
+        #expect(g.hasMoreOlder && g.cursor == "10|a")
+    }
+
+    @Test func arrowsMoveOlderAndNewer() {
+        var g = PhotoGallery(current: item("b", 20))
+        g.merge(page: page([("c", 30), ("b", 20), ("a", 10)], cursor: nil, more: false))
+        #expect(g.older()?.messageId == "a")
+        #expect(g.older() == nil)
+        #expect(g.newer()?.messageId == "b")
+        #expect(g.newer()?.messageId == "c")
+        #expect(g.newer() == nil)
+        #expect(g.neighbours.map(\.messageId) == ["b"])
+    }
+
+    @Test func olderPageIsRequestedNearTheOldestEnd() {
+        var g = PhotoGallery(current: item("e", 50))
+        g.merge(page: page([("e", 50), ("d", 40), ("c", 30), ("b", 20)], cursor: "20|b", more: true))
+        #expect(!g.shouldLoadOlder)          // index 3, far from the end
+        g.older(); g.older()
+        #expect(g.shouldLoadOlder)           // index 1
+        g.merge(page: page([("a", 10), ("z", 5)], cursor: nil, more: false))
+        #expect(!g.shouldLoadOlder && !g.hasMoreOlder)
+        #expect(g.items.first?.messageId == "z")
+        #expect(g.current.messageId == "c")
+    }
+
+    @Test func videosAndDuplicatesAreSkipped() {
+        var g = PhotoGallery(current: item("a", 10))
+        var v = page([("v", 15)], cursor: nil, more: false)
+        v.items[0].kind = .video(thumbnail: nil, duration: 3)
+        g.merge(page: v)
+        g.merge(page: page([("a", 10), ("a", 10)], cursor: nil, more: false))
+        #expect(g.items.map(\.messageId) == ["a"])
     }
 }

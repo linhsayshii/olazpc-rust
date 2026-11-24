@@ -397,7 +397,8 @@ private final class MockStage4URLProtocol: URLProtocol, @unchecked Sendable {
                 return (200, ["error_code": 0, "data": ["ok": true]])
             case "/api/board/unpinv2":
                 if let topic = call.payload.dict["topic"] as? [String: Any] {
-                    let tid = JSONLossless.string(topic["id"])
+                    #expect(Set(topic.keys) == ["topicId", "topicType"])
+                    let tid = JSONLossless.string(topic["topicId"])
                     pinnedRefs.withLock { refs in refs.removeAll { $0 == tid } }
                 }
                 return (200, ["error_code": 0, "data": ["ok": true]])

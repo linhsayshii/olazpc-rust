@@ -9,15 +9,17 @@ extension ZaloEngine {
         let changed = openConversationId != id
         openConversationId = id
         if changed { dropMessagePrompts() }
-        typing[id] = nil
+        // Observable writes invalidate every reader even when the value is the same: write only real changes.
+        if typing[id] != nil { typing[id] = nil }
         if messages[id] == nil {
             messages[id] = []
         }
         // Synchronous WAL snapshot read (< 0.5ms) so synced local history appears on the very first frame.
-        if let syncCached = sqliteStore?.readMessagesNow(convId: id, limit: 50) {
-            let decoded = syncCached.compactMap { ZaloWireParser.decodeStoredMessage($0) }
-            for msg in decoded { mergeMessageIntoMemory(msg) }
-            if decoded.count >= 45 {
+        if let syncCached = sqliteStore?.readDecodedMessagesNow(convId: id, limit: 50) {
+            let decoded = syncCached.map(\.message)
+            // One write for the whole page (a merge per row copied, sorted and published the list 50 times).
+            mergeMessagesIntoMemory(decoded.map { (message: $0, clientId: nil) }, in: id)
+            if decoded.count >= 45, hasMoreHistory[id] != true {
                 hasMoreHistory[id] = true
             }
         }
@@ -29,16 +31,19 @@ extension ZaloEngine {
             guard let self else { return }
             // 1. Fallback async read for in-memory test DBs without a separate WAL handle.
             if (self.messages[id]?.isEmpty ?? true),
-               let cached = try? await self.sqliteStore?.messages(convId: id, limit: 50) {
-                let decoded = cached.compactMap { ZaloWireParser.decodeStoredMessage($0) }
+               let cached = try? await self.sqliteStore?.decodedMessages(convId: id, limit: 50) {
+                let decoded = cached.map(\.message)
                 for msg in decoded { self.mergeMessageIntoMemory(msg) }
                 if decoded.count >= 45 {
                     self.hasMoreHistory[id] = true
                 }
             }
 
-            // 2. Refresh recent history (and board pins) from server if authenticated.
-            let fetched = await self.fetchAndMergeHistory(convId: id, beforeMsgId: nil, isOld: false, count: 50)
+            // 2. Refresh recent history (and board pins) from server if authenticated. Skipped when this session already
+            // knows the store holds the newest message (launch preload probe, or an earlier open of this chat).
+            let fetched = self.isRecentHistoryUpToDate(id)
+                ? 0
+                : await self.fetchAndMergeHistory(convId: id, beforeMsgId: nil, isOld: false, count: 50)
             await self.resolveMissingSenderProfiles(in: id)
             if (fetched > 0 || self.conversations.first(where: { $0.id == id })?.preview == nil),
                let latest = self.messages[id]?.last {
@@ -46,6 +51,8 @@ extension ZaloEngine {
             }
             if isGrp || self.contacts.friends.contains(where: { $0.id == id }) {
                 await self.refreshBoardPins(for: id)
+            } else {
+                EngineLog.shared.write("pins: list skipped (1-1 not in friends)")
             }
 
             // 3. Mark read locally & remotely.
@@ -103,7 +110,7 @@ extension ZaloEngine {
             for (uid, row) in profilesMap {
                 let trimmed = ZaloWireParser.stripUserPrefix(uid)
                 let clean = ZaloWireParser.sanitizeProfileUid(trimmed) ?? trimmed
-                let fetchedName = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+                let fetchedName = ZaloWireParser.preferredName(row)
                 let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
                 if !clean.isEmpty, (!fetchedName.isEmpty || !avt.isEmpty) {
                     cachedProfiles[clean] = ZaloWebKitMigrator.CachedProfile(name: fetchedName, avatar: avt)
@@ -165,14 +172,14 @@ extension ZaloEngine {
 
             var addedCount = 0
             if let beforeTsMs {
-                let cachedOlder: [StoredMessage]?
-                if let syncOlder = self.sqliteStore?.readMessagesNow(convId: id, beforeTsMs: beforeTsMs, limit: 50) {
+                let cachedOlder: [DecodedMessageRow]?
+                if let syncOlder = self.sqliteStore?.readDecodedMessagesNow(convId: id, beforeTsMs: beforeTsMs, limit: 50) {
                     cachedOlder = syncOlder
                 } else {
-                    cachedOlder = try? await self.sqliteStore?.messages(convId: id, beforeTsMs: beforeTsMs, limit: 50)
+                    cachedOlder = try? await self.sqliteStore?.decodedMessages(convId: id, beforeTsMs: beforeTsMs, limit: 50)
                 }
                 if let cachedOlder, !cachedOlder.isEmpty {
-                    let decoded = cachedOlder.compactMap { ZaloWireParser.decodeStoredMessage($0) }
+                    let decoded = cachedOlder.map(\.message)
                     for msg in decoded {
                         if !(self.messages[id]?.contains(where: { $0.id == msg.id }) ?? false) {
                             addedCount += 1
@@ -201,7 +208,7 @@ extension ZaloEngine {
 
     @discardableResult
     internal func fetchAndMergeHistory(convId: String, beforeMsgId: String?, isOld: Bool? = nil, count: Int = 50) async -> Int {
-        guard let box = try? await sessionClient.fetchHistory(convId: convId, lastMsgId: beforeMsgId, count: count, isOld: isOld) else {
+        guard let page = try? await sessionClient.fetchHistoryPage(convId: convId, lastMsgId: beforeMsgId, count: count, isOld: isOld) else {
             if beforeMsgId == nil {
                 if messages[convId] == nil { messages[convId] = [] }
                 if messages[convId]?.isEmpty ?? true { hasMoreHistory[convId] = false }
@@ -209,11 +216,12 @@ extension ZaloEngine {
             return 0
         }
 
+        if beforeMsgId == nil { historyFreshness[convId] = .upToDate }
         let myUid = profile?.userId ?? ""
         let isGrp = ZaloWireParser.isGroupId(convId)
         let isSelf = (convId == selfConversationId)
-        let events = ZaloWireParser.extractBatchEvents(
-            box.dict,
+        let events = await ZaloWireParser.historyEventsAsync(
+            page,
             myUid: myUid,
             selfConvId: selfConversationId,
             fallbackConvId: (isGrp || isSelf) ? convId : nil,
@@ -283,7 +291,8 @@ extension ZaloEngine {
 
     // MARK: - Send Text / Mentions
 
-    func sendText(_ text: String, to id: String, quoting quoteId: String? = nil, mentions: [Mention] = []) async -> Bool {
+    func sendText(_ text: String, to id: String, quoting quoteId: String? = nil, mentions: [Mention] = [],
+                  styles: [TextStyle] = [], urgency: Int = 0) async -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !id.isEmpty else { return false }
         resetOutgoingTyping(in: id)
@@ -293,7 +302,10 @@ extension ZaloEngine {
         let cliId = "\(cliInt)"
         let myUid = profile?.userId ?? ""
         let myName = profile?.displayName ?? "Bạn"
-        let quoteBlock = quote.map { ChatMessage.Quote(senderName: $0.isMine ? "Bạn" : $0.senderName, text: $0.text.isEmpty ? "[Tin nhắn]" : $0.text) }
+        let quoteBlock = quote.map {
+            ChatMessage.Quote(senderName: $0.isMine ? "Bạn" : $0.senderName, text: $0.text.isEmpty ? "[Tin nhắn]" : $0.text,
+                              msgId: $0.id, cliMsgId: $0.clientId)
+        }
         var isE2EE = false
         if !ZaloWireParser.isGroupId(id) {
             isE2EE = await e2eeManager.isE2EEConversation(id)
@@ -325,6 +337,14 @@ extension ZaloEngine {
             ]),
             clientId: cliId
         )
+        // Rich text goes out on the plain path only (E2EE text is sent unstyled).
+        if !isE2EE { optimistic.textStyles = styles }
+        // "Tin nhắn tự xóa": the conversation's lifetime rides on the message.
+        let ttl = isE2EE ? 0 : autoDeleteTTL(id)
+        optimistic.ttlMs = ttl
+        // "Quan trọng" / "Khẩn cấp" (plain path only, like the styles).
+        let urgency = isE2EE ? 0 : urgency
+        optimistic.urgency = urgency
         mergeMessageIntoMemory(optimistic)
 
         func removeOptimistic() {
@@ -356,13 +376,27 @@ extension ZaloEngine {
                 }
 
                 let qMsgInt = quote.flatMap { Int64($0.id.trimmingCharacters(in: .whitespacesAndNewlines)) }
-                let hasValidQuote = (quote != nil && qMsgInt != nil && qMsgInt != 0)
+                // The peer decrypts the quoted message's owner as an encrypted global id; without one the whole message
+                // fails on their side ("tạm thời chưa hiển thị"), so a quote whose owner has none goes out as a plain text.
+                let quoteOwner = quote.map { ZaloWireParser.stripUserPrefix($0.senderId.isEmpty ? myUid : $0.senderId) } ?? ""
+                var ownerGlobalId = ""
+                if quote != nil, qMsgInt != nil, qMsgInt != 0, !quoteOwner.isEmpty {
+                    if let cached = cachedFriendGlobalIds[quoteOwner] {
+                        ownerGlobalId = cached
+                    } else {
+                        ownerGlobalId = await sessionClient.encryptGlobalIds([quoteOwner])[quoteOwner] ?? ""
+                    }
+                    if ownerGlobalId.isEmpty { EngineLog.shared.write("sendText e2ee: quote owner has no global id, sending without quote") }
+                }
+                let hasValidQuote = (quote != nil && qMsgInt != nil && qMsgInt != 0 && !ownerGlobalId.isEmpty)
                 let quotePlain = hasValidQuote ? (quote!.text.isEmpty ? "[Tin nhắn]" : quote!.text) : nil
+                let ownerName = quote.map { $0.isMine ? (profile?.displayName ?? $0.senderName) : $0.senderName } ?? ""
                 let encryptedDevices = await e2eeManager.encryptTextMessage(
                     peerUid: id,
                     myUid: myUid,
                     text: text,
                     quoteText: quotePlain,
+                    quoteExtras: hasValidQuote ? ["{}", "", ownerName, ownerGlobalId] : [],
                     store: sqliteStore
                 )
                 guard !encryptedDevices.isEmpty else {
@@ -377,14 +411,10 @@ extension ZaloEngine {
                     guard let msgCipher = dev.ciphers.first else { return nil }
                     var extra: [String: Any] = ["message": msgCipher]
                     if hasValidQuote, let qMsgInt, let quote {
-                        let rawOwner = quote.senderId.isEmpty ? myUid : quote.senderId
-                        extra["qmsgOwner"] = ZaloWireParser.stripUserPrefix(rawOwner)
-                        extra["qmsgId"] = qMsgInt
-                        extra["qmsgCliId"] = qMsgInt
-                        extra["qmsgType"] = 1
-                        extra["qmsg"] = dev.ciphers.count > 1 ? dev.ciphers[1] : ""
-                        extra["qmsgTs"] = quoteTsMs ?? Int64(Date().timeIntervalSince1970 * 1000)
-                        extra["zsource"] = 101
+                        guard let fields = Self.e2eeQuoteFields(
+                            ciphers: dev.ciphers, msgId: qMsgInt, cliMsgId: Int64(quote.clientId) ?? qMsgInt,
+                            ts: quoteTsMs ?? Int64(Date().timeIntervalSince1970 * 1000)) else { return nil }
+                        extra.merge(fields) { _, new in new }
                     }
                     return ZaloSessionClient.buildE2EEListParamEntry(
                         toId: dev.toId,
@@ -418,11 +448,25 @@ extension ZaloEngine {
                     quoteOwnerId: quote?.senderId,
                     quoteText: quote?.text,
                     quoteTsMs: quoteTsMs,
-                    mentions: mentions
+                    mentions: mentions,
+                    textProperties: TextStyle.textProperties(styles),
+                    ttl: ttl,
+                    urgency: urgency
                 )
             }
             // Replace temporary client id with server msgId while avoiding duplicates.
             let finalCliId = res.cliMsgId.isEmpty ? cliId : res.cliMsgId
+            // 1-1 E2EE replies carry no msgId (it falls back to the client id); the websocket echo may already have
+            // brought the server copy, which then stands for this message.
+            if res.msgId == cliId,
+               let echoed = messages[id]?.first(where: { $0.clientId == finalCliId && $0.id != cliId }) {
+                if var list = messages[id] {
+                    list.removeAll { $0.id == cliId }
+                    messages[id] = list
+                }
+                updateConversationOnMessage(echoed, incrementUnread: false)
+                return true
+            }
             if var list = messages[id] {
                 list.removeAll { $0.id == cliId || $0.id == res.msgId }
                 optimistic.id = res.msgId
@@ -470,7 +514,7 @@ extension ZaloEngine {
                     let profilesMap = ZaloWireParser.extractProfilesMap(profBox.dict)
                     for uid in cleanIds {
                         guard let row = profilesMap[uid] else { continue }
-                        let name = JSONLossless.string(row["dName"] ?? row["displayName"] ?? row["zaloName"] ?? row["name"])
+                        let name = ZaloWireParser.preferredName(row)
                         let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
                         if !name.isEmpty {
                             candidates.append(MentionCandidate(id: uid, name: name, avatar: avt.isEmpty ? nil : URL(string: avt), isAll: false))
@@ -587,7 +631,7 @@ extension ZaloEngine {
             var cacheChanged = false
             for (uid, row) in profilesMap {
                 let clean = ZaloWireParser.sanitizeProfileUid(uid) ?? ZaloWireParser.stripUserPrefix(uid)
-                let fetchedName = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+                let fetchedName = ZaloWireParser.preferredName(row)
                 let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
                 if !clean.isEmpty && (!fetchedName.isEmpty || !avt.isEmpty) {
                     cachedProfiles[clean] = ZaloWebKitMigrator.CachedProfile(name: fetchedName, avatar: avt)
@@ -709,7 +753,14 @@ extension ZaloEngine {
         }
     }
 
-    internal func performReact(_ emoji: String, to messageId: String, in conversationId: String) async {
+    /// Official "Gỡ": drops every reaction of mine on the message at once (wire: rType -1, rIcon "").
+    func removeMyReactions(from messageId: String, in conversationId: String) {
+        Task {
+            await performReact("", to: messageId, in: conversationId, removeAll: true)
+        }
+    }
+
+    internal func performReact(_ emoji: String, to messageId: String, in conversationId: String, removeAll: Bool = false) async {
         guard !conversationId.isEmpty, !messageId.isEmpty else { return }
         guard let initialMsg = messages[conversationId]?.first(where: { $0.id == messageId || $0.clientId == messageId }),
               initialMsg.kind != .recalled,
@@ -723,7 +774,8 @@ extension ZaloEngine {
         defer { reactionBusyKeys.remove(busyKey) }
 
         let spec = ZaloWireParser.reactionSpec(forEmoji: emoji)
-        let alreadyMine = initialMsg.reactions.contains(where: { $0.includesMe && $0.icon.type == "\(spec.rType)" })
+        if removeAll && !initialMsg.reactions.contains(where: \.includesMe) { return }
+        let alreadyMine = removeAll || initialMsg.reactions.contains(where: { $0.includesMe && $0.icon.type == "\(spec.rType)" })
         let effectiveType = alreadyMine ? -1 : spec.rType
         let effectiveIcon = alreadyMine ? "" : spec.rIcon
         let msgType = ZaloWireParser.reactionClientMsgType(for: initialMsg.kind)
@@ -841,7 +893,7 @@ extension ZaloEngine {
         if let info = state["typing"] as? [String: Any],
            let convId = info["convId"] as? String,
            let name = info["name"] as? String {
-            showTyping(convId: convId, name: name)
+            showTyping(convId: convId, name: name, onPC: info["isPC"] as? Bool ?? false)
         }
     }
 
@@ -849,6 +901,8 @@ extension ZaloEngine {
     func notifyTyping(in convId: String) {
         let target = convId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !target.isEmpty, phase == .ready else { return }
+        // Cài đặt ▸ Quyền riêng tư: "Hiển thị trạng thái đang soạn tin" off sends nothing.
+        guard UserDefaults.standard.object(forKey: OlazPrefs.sendTyping) as? Bool ?? true else { return }
         guard OutgoingTypingStore.throttle(for: self).shouldSend(in: target) else { return }
         let client = sessionClient
         Task {
@@ -865,10 +919,11 @@ extension ZaloEngine {
     }
 }
 
-/// Per-conversation outgoing typing throttle (~3.5s) stored outside `ZaloEngine` so engine state stays decoupled.
+/// Per-conversation outgoing typing throttle (10 s) stored outside `ZaloEngine` so engine state stays decoupled.
 @MainActor
 final class OutgoingTypingThrottle {
-    static let defaultInterval: TimeInterval = 3.5
+    /// The official client sends at most one typing ping per 10 s (`functionTyping`).
+    static let defaultInterval: TimeInterval = 10
 
     let interval: TimeInterval
     private var lastSentByConv: [String: Date] = [:]
@@ -915,5 +970,74 @@ private enum OutgoingTypingStore {
         let created = OutgoingTypingThrottle()
         byEngine.setObject(created, forKey: engine)
         return created
+    }
+}
+
+extension ZaloEngine {
+    /// Quote fields of one device's E2EE `/api/e2ee/pc/message/quote` entry, as the official `sendMsgQuote` builds them
+    /// from the ciphers of [text, quote text, attach JSON, text styles, owner name, owner global id]. The attach cipher
+    /// is not sent for a text quote (official `transformQuoteMessage`). Nil when a cipher is missing.
+    nonisolated static func e2eeQuoteFields(ciphers: [String], msgId: Int64, cliMsgId: Int64, ts: Int64) -> [String: Any]? {
+        guard ciphers.count >= 6 else { return nil }
+        return [
+            "qmsg": ciphers[1],
+            "textProperties": ciphers[3],
+            "qmsgOwnerDName": ciphers[4],
+            "qmsgOwner": ciphers[5],
+            "qmsgId": msgId,
+            "qmsgCliId": cliMsgId,
+            "qmsgType": 1,
+            "qmsgTs": ts,
+        ]
+    }
+}
+
+extension ZaloEngine {
+    /// Official `processRequestResend` -> `_doResend`: a device reported it could not decrypt one of our messages, so
+    /// rebuild the session to that device and send the same message (same cliMsgId) to it alone, with `e2ee.retry = 1`.
+    /// Text messages only for now; the log keeps shapes (device, kind, codes), never ids or text.
+    func resendE2EEMessage(_ request: ZaloE2EEManager.ResendRequest) async {
+        let myUid = profile?.userId ?? ""
+        let peer = request.peerUid
+        guard !myUid.isEmpty,
+              let message = (messages[peer] ?? []).first(where: { msg in
+                  msg.isMine && (msg.clientId == request.cliMsgId || (!request.msgId.isEmpty && msg.id == request.msgId))
+              }) else {
+            EngineLog.shared.write("e2ee resend: skip dev=\(request.deviceId) reason=message-not-loaded")
+            return
+        }
+        guard case .text = message.kind, message.quote == nil, !message.text.isEmpty else {
+            EngineLog.shared.write("e2ee resend: skip dev=\(request.deviceId) reason=unsupported-kind")
+            return
+        }
+        guard await e2eeManager.reinitSession(
+            peerUid: peer, deviceId: request.deviceId, myUid: myUid, webSocket: webSocket, store: sqliteStore) else {
+            EngineLog.shared.write("e2ee resend: skip dev=\(request.deviceId) reason=reinit-failed")
+            return
+        }
+        let encrypted = await e2eeManager.encryptTextMessage(
+            peerUid: peer, myUid: myUid, text: message.text, onlyDevice: request.deviceId, store: sqliteStore)
+        guard let device = encrypted.first, let cipher = device.ciphers.first,
+              let clientId = Int64(request.cliMsgId) else {
+            EngineLog.shared.write("e2ee resend: skip dev=\(request.deviceId) reason=encrypt-failed")
+            return
+        }
+        let entry = ZaloSessionClient.buildE2EEListParamEntry(
+            toId: device.toId,
+            platform: device.platform,
+            clientId: clientId,
+            imei: await sessionClient.imei,
+            registrationId: device.registrationId,
+            senderIid: await e2eeManager.localRegistrationId(),
+            retry: 1,
+            extraFields: ["message": cipher]
+        )
+        do {
+            _ = try await sessionClient.sendE2EEMessageAPI(
+                endpoint: "sms", threadId: peer, isGroup: false, clientId: clientId, listParams: ZaloJSONArrayBox([entry]))
+            EngineLog.shared.write("e2ee resend: sent dev=\(request.deviceId) cipher=\(E2EEShadow.cipherType(cipher))")
+        } catch {
+            EngineLog.shared.write("e2ee resend: post failed dev=\(request.deviceId) error=\(type(of: error))")
+        }
     }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import OlazCore
 import SQLite3
 
 private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
@@ -46,6 +47,13 @@ struct StoredMessage: Equatable, Sendable {
     var rawJSONData: Data
 }
 
+/// A stored message decoded to a `ChatMessage` plus the table columns callers match on (`id`, `client_id`).
+struct DecodedMessageRow: Sendable {
+    var message: ChatMessage
+    var rowId: String
+    var rowClientId: String
+}
+
 struct StoredCloudConversationSummary: Equatable, Sendable {
     var convId: String
     var convName: String
@@ -84,8 +92,11 @@ actor ZaloSQLiteStore {
     nonisolated(unsafe) private var db: OpaquePointer?
     nonisolated(unsafe) private var readDb: OpaquePointer?
     private let readLock = NSLock()
+    /// Rust store on the same file (ADR-010: same system SQLite, WAL). Non-nil only on the Rust path; the chat-path
+    /// methods below forward to it. In-memory stores always stay on Swift (a second connection would be a second DB).
+    private let core: CoreStore?
 
-    init(path: String) throws {
+    init(path: String, useRustCore: Bool = RustCore.isEnabled) throws {
         self.path = path
         if path != ":memory:" {
             let url = URL(fileURLWithPath: path)
@@ -100,6 +111,16 @@ actor ZaloSQLiteStore {
             throw ZaloSQLiteError.openFailed(msg)
         }
         self.db = handle
+        if useRustCore, path != ":memory:" {
+            do {
+                self.core = try CoreStore.open(path: path)
+            } catch {
+                sqlite3_close(handle)
+                throw RustCore.mapError(error)
+            }
+        } else {
+            self.core = nil
+        }
         Self.registerSearchFunctions(on: handle)
         try Self.exec(handle, """
         PRAGMA journal_mode=WAL;
@@ -173,8 +194,12 @@ actor ZaloSQLiteStore {
 
     // MARK: - Conversations
 
-    func saveConversations(_ items: [StoredConversation]) throws {
+    func saveConversations(_ items: [StoredConversation]) async throws {
         guard !items.isEmpty else { return }
+        if let core {
+            do { try await core.saveConversations(items: items.map(RustCore.row)) } catch { throw RustCore.mapError(error) }
+            return
+        }
         try inTransaction {
             let sql = """
             INSERT INTO conversations(id, is_group, name, avatar, pinned, members, unread, preview_text, preview_ts, preview_from_me, updated_at)
@@ -212,11 +237,16 @@ actor ZaloSQLiteStore {
         }
     }
 
-    func upsertConversation(_ item: StoredConversation) throws {
-        try saveConversations([item])
+    func upsertConversation(_ item: StoredConversation) async throws {
+        try await saveConversations([item])
     }
 
-    func loadConversations() throws -> [StoredConversation] {
+    func loadConversations() async throws -> [StoredConversation] {
+        if let core {
+            do {
+                return try await core.loadConversations().map(RustCore.stored)
+            } catch { throw RustCore.mapError(error) }
+        }
         let sql = """
         SELECT id, is_group, name, avatar, pinned, members, unread, preview_text, preview_ts, preview_from_me, updated_at
         FROM conversations
@@ -246,7 +276,13 @@ actor ZaloSQLiteStore {
         return out
     }
 
-    func setConversationUnread(id: String, unread: Int) throws {
+    func setConversationUnread(id: String, unread: Int) async throws {
+        if let core {
+            do {
+                try await core.setConversationUnread(id: id, unread: Int64(max(0, unread)))
+                return
+            } catch { throw RustCore.mapError(error) }
+        }
         let stmt = try prepare("UPDATE conversations SET unread = ?1 WHERE id = ?2;")
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_int(stmt, 1, Int32(max(0, unread)))
@@ -254,7 +290,13 @@ actor ZaloSQLiteStore {
         try stepDone(stmt)
     }
 
-    func setConversationPinned(id: String, pinned: Bool) throws {
+    func setConversationPinned(id: String, pinned: Bool) async throws {
+        if let core {
+            do {
+                try await core.setConversationPinned(id: id, pinned: pinned)
+                return
+            } catch { throw RustCore.mapError(error) }
+        }
         let stmt = try prepare("UPDATE conversations SET pinned = ?1 WHERE id = ?2;")
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_int(stmt, 1, pinned ? 1 : 0)
@@ -262,7 +304,13 @@ actor ZaloSQLiteStore {
         try stepDone(stmt)
     }
 
-    func deleteConversation(id: String) throws {
+    func deleteConversation(id: String) async throws {
+        if let core {
+            do {
+                try await core.deleteConversation(id: id)
+                return
+            } catch { throw RustCore.mapError(error) }
+        }
         try inTransaction {
             let s1 = try prepare("DELETE FROM messages WHERE conv_id = ?1;")
             defer { sqlite3_finalize(s1) }
@@ -298,7 +346,16 @@ actor ZaloSQLiteStore {
         return out
     }
 
-    func saveMessages(_ items: [StoredMessage], skipTwinChecks: Bool = false, preserveExistingReactions: Bool = false) throws {
+    func saveMessages(_ items: [StoredMessage], skipTwinChecks: Bool = false, preserveExistingReactions: Bool = false) async throws {
+        if let core {
+            do {
+                try await core.saveMessagesWith(
+                    items: items.map(RustCore.row),
+                    skipTwinChecks: skipTwinChecks,
+                    preserveExistingReactions: preserveExistingReactions)
+                return
+            } catch { throw RustCore.mapError(error) }
+        }
         guard !items.isEmpty else { return }
         try inTransaction {
             let rawJSONUpdateExpr: String = preserveExistingReactions
@@ -353,11 +410,21 @@ actor ZaloSQLiteStore {
             defer { if let delIdStmt { sqlite3_finalize(delIdStmt) } }
             let delClientStmt = skipTwinChecks ? nil : try prepare(deleteStaleClientTwinSQL)
             defer { if let delClientStmt { sqlite3_finalize(delClientStmt) } }
+            let serverTwinStmt = skipTwinChecks ? nil : try prepare(
+                "SELECT 1 FROM messages WHERE conv_id = ?1 AND client_id = ?2 AND id != ?2 AND status != 'e2ee_locked' LIMIT 1;")
+            defer { if let serverTwinStmt { sqlite3_finalize(serverTwinStmt) } }
 
             for m in items {
                 let isLocked = (m.status == "e2ee_locked")
                 if !skipTwinChecks, !m.clientId.isEmpty {
-                    if isLocked, let checkStmt {
+                    if !isLocked, m.isMine, m.clientId == m.id, let serverTwinStmt {
+                        // A provisional row (the send reply had no server id): the server copy already saved wins.
+                        sqlite3_reset(serverTwinStmt)
+                        sqlite3_clear_bindings(serverTwinStmt)
+                        bindText(serverTwinStmt, 1, m.convId)
+                        bindText(serverTwinStmt, 2, m.clientId)
+                        if sqlite3_step(serverTwinStmt) == SQLITE_ROW { continue }
+                    } else if isLocked, let checkStmt {
                         sqlite3_reset(checkStmt)
                         sqlite3_clear_bindings(checkStmt)
                         bindText(checkStmt, 1, m.convId)
@@ -414,8 +481,8 @@ actor ZaloSQLiteStore {
     /// One-time migration scrubbing pre-fix corrupted/ghost reactions (entries missing `userCounts`
     /// or containing sentinel keys like `"__legacy__"` / `"unknown"` / placeholder `"Người dùng Zalo"`).
     @discardableResult
-    func repairLegacyReactions(myUid: String) throws -> Int {
-        if (try? getPreferenceString(key: "reactionRepairVersion")) == "2" {
+    func repairLegacyReactions(myUid: String) async throws -> Int {
+        if (try? await getPreferenceString(key: "reactionRepairVersion")) == "2" {
             return 0
         }
 
@@ -522,7 +589,7 @@ actor ZaloSQLiteStore {
             }
         }
 
-        try setPreferenceString(key: "reactionRepairVersion", value: "2")
+        try await setPreferenceString(key: "reactionRepairVersion", value: "2")
         return repaired
     }
 
@@ -695,7 +762,12 @@ actor ZaloSQLiteStore {
 
     /// Loads messages for `convId` in chronological ascending order (oldest -> newest).
     /// When `beforeTsMs` is provided, fetches messages strictly older than `beforeTsMs`.
-    func messages(convId: String, beforeTsMs: Int64? = nil, limit: Int = 50) throws -> [StoredMessage] {
+    func messages(convId: String, beforeTsMs: Int64? = nil, limit: Int = 50) async throws -> [StoredMessage] {
+        if let core {
+            do {
+                return try await core.messages(convId: convId, beforeTsMs: beforeTsMs, limit: Int64(limit)).map(RustCore.stored)
+            } catch { throw RustCore.mapError(error) }
+        }
         let clampedLimit = max(1, min(limit, 500))
         let sql: String
         if beforeTsMs != nil {
@@ -749,7 +821,12 @@ actor ZaloSQLiteStore {
 
     /// Searches stored messages in `conversationId` case-insensitively using `LIKE ? ESCAPE '\'`,
     /// returning newest-first (`ts_ms DESC`).
-    func searchMessages(conversationId: String, query: String, limit: Int = 50) throws -> [StoredMessage] {
+    func searchMessages(conversationId: String, query: String, limit: Int = 50) async throws -> [StoredMessage] {
+        if let core {
+            do {
+                return try await core.searchMessages(convId: conversationId, query: query, limit: Int64(limit)).map(RustCore.stored)
+            } catch { throw RustCore.mapError(error) }
+        }
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !conversationId.isEmpty, !trimmed.isEmpty, limit > 0 else { return [] }
         let clampedLimit = max(1, min(limit, 500))
@@ -814,7 +891,15 @@ actor ZaloSQLiteStore {
         beforeOldestTsMs: Int64?,
         contextBefore: Int = 25,
         maxWindow: Int = 3000
-    ) throws -> (messages: [StoredMessage], hasMoreOlder: Bool) {
+    ) async throws -> (messages: [StoredMessage], hasMoreOlder: Bool) {
+        if let core {
+            do {
+                let r = try await core.messagesAround(
+                    convId: convId, targetTsMs: targetTsMs, beforeOldestTsMs: beforeOldestTsMs,
+                    contextBefore: Int64(contextBefore), maxWindow: Int64(maxWindow))
+                return (r.messages.map(RustCore.stored), r.hasMoreOlder)
+            } catch { throw RustCore.mapError(error) }
+        }
         let clampedBefore = max(0, min(contextBefore, 200))
         let clampedWindow = max(1, min(maxWindow, 5000))
 
@@ -899,7 +984,12 @@ actor ZaloSQLiteStore {
         )
     }
 
-    func message(convId: String, idOrClientId: String) throws -> StoredMessage? {
+    func message(convId: String, idOrClientId: String) async throws -> StoredMessage? {
+        if let core {
+            do {
+                return try await core.message(convId: convId, idOrClientId: idOrClientId).map(RustCore.stored)
+            } catch { throw RustCore.mapError(error) }
+        }
         let sql = """
         SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
         FROM messages
@@ -934,7 +1024,12 @@ actor ZaloSQLiteStore {
     }
 
     @discardableResult
-    func upgradeMessageId(convId: String, oldId: String, newId: String, clientId: String) throws -> Bool {
+    func upgradeMessageId(convId: String, oldId: String, newId: String, clientId: String) async throws -> Bool {
+        if let core {
+            do {
+                return try await core.upgradeMessageId(convId: convId, oldId: oldId, newId: newId, clientId: clientId)
+            } catch { throw RustCore.mapError(error) }
+        }
         var upgraded = false
         try inTransaction {
             upgraded = try performUpgradeMessageIdInTransaction(
@@ -1009,7 +1104,13 @@ actor ZaloSQLiteStore {
         return sqlite3_changes(db) > 0
     }
 
-    func deleteMessage(convId: String, id: String) throws {
+    func deleteMessage(convId: String, id: String) async throws {
+        if let core {
+            do {
+                try await core.deleteMessage(convId: convId, id: id)
+                return
+            } catch { throw RustCore.mapError(error) }
+        }
         try inTransaction {
             let s1 = try prepare("DELETE FROM messages WHERE conv_id = ?1 AND id = ?2;")
             defer { sqlite3_finalize(s1) }
@@ -1025,9 +1126,17 @@ actor ZaloSQLiteStore {
         }
     }
 
-    func markRecalled(convId: String, id: String, cliMsgId: String = "") throws {
-        let lookup = try message(convId: convId, idOrClientId: id)
-            ?? (!cliMsgId.isEmpty ? try message(convId: convId, idOrClientId: cliMsgId) : nil)
+    func markRecalled(convId: String, id: String, cliMsgId: String = "") async throws {
+        if let core {
+            do {
+                try await core.markRecalled(convId: convId, id: id, cliMsgId: cliMsgId)
+                return
+            } catch { throw RustCore.mapError(error) }
+        }
+        var lookup = try await message(convId: convId, idOrClientId: id)
+        if lookup == nil, !cliMsgId.isEmpty {
+            lookup = try await message(convId: convId, idOrClientId: cliMsgId)
+        }
         guard let existing = lookup,
               var dict = (try? JSONSerialization.jsonObject(with: existing.rawJSONData)) as? [String: Any] else {
             return
@@ -1053,11 +1162,17 @@ actor ZaloSQLiteStore {
             isMine: existing.isMine, text: "", kindTag: "recalled", tsMs: existing.tsMs,
             status: existing.status, rawJSONData: updatedData
         )
-        try saveMessages([updated])
+        try await saveMessages([updated])
     }
 
-    func updateMessageReactionsJSON(convId: String, id: String, reactionsJSONData: Data) throws {
-        guard let existing = try message(convId: convId, idOrClientId: id),
+    func updateMessageReactionsJSON(convId: String, id: String, reactionsJSONData: Data) async throws {
+        if let core {
+            do {
+                try await core.updateMessageReactionsJson(convId: convId, id: id, reactionsJson: reactionsJSONData)
+                return
+            } catch { throw RustCore.mapError(error) }
+        }
+        guard let existing = try await message(convId: convId, idOrClientId: id),
               var dict = (try? JSONSerialization.jsonObject(with: existing.rawJSONData)) as? [String: Any],
               let reactionsObj = try? JSONSerialization.jsonObject(with: reactionsJSONData) else {
             return
@@ -1070,7 +1185,7 @@ actor ZaloSQLiteStore {
             isMine: existing.isMine, text: existing.text, kindTag: existing.kindTag, tsMs: existing.tsMs,
             status: existing.status, rawJSONData: updatedData
         )
-        try saveMessages([updated])
+        try await saveMessages([updated])
     }
 
     /// Queries locally indexed shared-media JSON blobs for `convId` filtered by `kindTags`.
@@ -1298,7 +1413,12 @@ actor ZaloSQLiteStore {
     }
 
     /// Returns the subset of `ids` (matching either `id` or `client_id`) already persisted in `convId`.
-    func existingMessageIds(convId: String, ids: [String]) throws -> Set<String> {
+    func existingMessageIds(convId: String, ids: [String]) async throws -> Set<String> {
+        if let core {
+            do {
+                return Set(try await core.existingMessageIds(convId: convId, ids: ids))
+            } catch { throw RustCore.mapError(error) }
+        }
         let unique = Array(Set(ids.filter { !$0.isEmpty }))
         guard !convId.isEmpty, !unique.isEmpty else { return [] }
         var found = Set<String>()
@@ -1331,7 +1451,12 @@ actor ZaloSQLiteStore {
 
     // MARK: - Preferences
 
-    func getPreferenceData(key: String) throws -> Data? {
+    func getPreferenceData(key: String) async throws -> Data? {
+        if let core {
+            do {
+                return try await core.preferenceData(key: key)
+            } catch { throw RustCore.mapError(error) }
+        }
         let stmt = try prepare("SELECT value_json FROM preferences WHERE key = ?1 LIMIT 1;")
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, key)
@@ -1341,7 +1466,13 @@ actor ZaloSQLiteStore {
         return Data(columnText(stmt, 0).utf8)
     }
 
-    func setPreferenceData(key: String, data: Data) throws {
+    func setPreferenceData(key: String, data: Data) async throws {
+        if let core {
+            do {
+                try await core.setPreferenceData(key: key, data: data)
+                return
+            } catch { throw RustCore.mapError(error) }
+        }
         let stmt = try prepare("""
         INSERT INTO preferences(key, value_json) VALUES (?1, ?2)
         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json;
@@ -1352,41 +1483,139 @@ actor ZaloSQLiteStore {
         try stepDone(stmt)
     }
 
-    func getPreferenceString(key: String) throws -> String? {
-        guard let data = try getPreferenceData(key: key) else { return nil }
+    func getPreferenceString(key: String) async throws -> String? {
+        guard let data = try await getPreferenceData(key: key) else { return nil }
         return try? JSONDecoder().decode(String.self, from: data)
     }
 
-    func setPreferenceString(key: String, value: String) throws {
+    func setPreferenceString(key: String, value: String) async throws {
         let data = try JSONEncoder().encode(value)
-        try setPreferenceData(key: key, data: data)
+        try await setPreferenceData(key: key, data: data)
     }
 
-    func getPreferenceBool(key: String, default fallback: Bool = false) throws -> Bool {
-        guard let data = try getPreferenceData(key: key) else { return fallback }
+    func getPreferenceBool(key: String, default fallback: Bool = false) async throws -> Bool {
+        guard let data = try await getPreferenceData(key: key) else { return fallback }
         return (try? JSONDecoder().decode(Bool.self, from: data)) ?? fallback
     }
 
-    func setPreferenceBool(key: String, value: Bool) throws {
+    func setPreferenceBool(key: String, value: Bool) async throws {
         let data = try JSONEncoder().encode(value)
-        try setPreferenceData(key: key, data: data)
+        try await setPreferenceData(key: key, data: data)
     }
 
-    func getPreferenceStrings(key: String) throws -> [String] {
-        guard let data = try getPreferenceData(key: key) else { return [] }
+    func getPreferenceStrings(key: String) async throws -> [String] {
+        guard let data = try await getPreferenceData(key: key) else { return [] }
         return (try? JSONDecoder().decode([String].self, from: data)) ?? []
     }
 
-    func setPreferenceStrings(key: String, value: [String]) throws {
+    func setPreferenceStrings(key: String, value: [String]) async throws {
         let data = try JSONEncoder().encode(value)
-        try setPreferenceData(key: key, data: data)
+        try await setPreferenceData(key: key, data: data)
     }
 
-    func deletePreference(key: String) throws {
+    func deletePreference(key: String) async throws {
+        if let core {
+            do {
+                try await core.deletePreference(key: key)
+                return
+            } catch { throw RustCore.mapError(error) }
+        }
         let stmt = try prepare("DELETE FROM preferences WHERE key = ?1;")
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, 1, key)
         try stepDone(stmt)
+    }
+
+    // MARK: - Typed reads / writes (no JSON in Swift on the Rust path)
+
+    private static func decoded(_ stored: [StoredMessage]) -> [DecodedMessageRow] {
+        stored.compactMap { s in
+            ZaloWireParser.decodeStoredMessage(s).map { DecodedMessageRow(message: $0, rowId: s.id, rowClientId: s.clientId) }
+        }
+    }
+
+    private static func decoded(_ rows: [StoredChat]) -> [DecodedMessageRow] {
+        rows.map { DecodedMessageRow(message: ChatMessage(record: $0.message), rowId: $0.rowId, rowClientId: $0.rowClientId) }
+    }
+
+    /// `messages(...)` decoded to `ChatMessage`s (Rust path: decoded in the core, no JSON re-parse in Swift).
+    func decodedMessages(convId: String, beforeTsMs: Int64? = nil, limit: Int = 50) async throws -> [DecodedMessageRow] {
+        if let core {
+            do { return Self.decoded(try await core.messagesChat(convId: convId, beforeTsMs: beforeTsMs, limit: Int64(limit))) }
+            catch { throw RustCore.mapError(error) }
+        }
+        return Self.decoded(try await messages(convId: convId, beforeTsMs: beforeTsMs, limit: limit))
+    }
+
+    /// `message(convId:idOrClientId:)` decoded to a `ChatMessage` (nil when missing or undecodable). Rust path: decoded in
+    /// the core, no JSON re-parse in Swift. The row's `id` / `clientId` columns come back with it.
+    func decodedMessage(convId: String, idOrClientId: String) async throws -> DecodedMessageRow? {
+        if let core {
+            do {
+                return try await core.messageChat(convId: convId, idOrClientId: idOrClientId).map {
+                    DecodedMessageRow(message: ChatMessage(record: $0.message), rowId: $0.rowId, rowClientId: $0.rowClientId)
+                }
+            } catch { throw RustCore.mapError(error) }
+        }
+        guard let stored = try await message(convId: convId, idOrClientId: idOrClientId),
+              let decoded = ZaloWireParser.decodeStoredMessage(stored) else { return nil }
+        return DecodedMessageRow(message: decoded, rowId: stored.id, rowClientId: stored.clientId)
+    }
+
+    /// `searchMessages(...)` decoded to `ChatMessage`s.
+    func decodedSearch(conversationId: String, query: String, limit: Int = 50) async throws -> [DecodedMessageRow] {
+        if let core {
+            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !conversationId.isEmpty, !trimmed.isEmpty, limit > 0 else { return [] }
+            do { return Self.decoded(try await core.searchMessagesChat(convId: conversationId, query: query, limit: Int64(limit))) }
+            catch { throw RustCore.mapError(error) }
+        }
+        return Self.decoded(try await searchMessages(conversationId: conversationId, query: query, limit: limit))
+    }
+
+    /// `messagesAround(...)` decoded to `ChatMessage`s.
+    func decodedMessagesAround(
+        convId: String,
+        targetTsMs: Int64,
+        beforeOldestTsMs: Int64?,
+        contextBefore: Int = 25,
+        maxWindow: Int = 3000
+    ) async throws -> (rows: [DecodedMessageRow], hasMoreOlder: Bool) {
+        if let core {
+            do {
+                let r = try await core.messagesAroundChat(
+                    convId: convId, targetTsMs: targetTsMs, beforeOldestTsMs: beforeOldestTsMs,
+                    contextBefore: Int64(contextBefore), maxWindow: Int64(maxWindow))
+                return (Self.decoded(r.messages), r.hasMoreOlder)
+            } catch { throw RustCore.mapError(error) }
+        }
+        let r = try await messagesAround(
+            convId: convId, targetTsMs: targetTsMs, beforeOldestTsMs: beforeOldestTsMs, contextBefore: contextBefore, maxWindow: maxWindow)
+        return (Self.decoded(r.messages), r.hasMoreOlder)
+    }
+
+    /// `readMessagesNow(...)` decoded to `ChatMessage`s: the synchronous first-frame read. Rust path: the core's
+    /// separate read-only connection, decoded in Rust.
+    nonisolated func readDecodedMessagesNow(convId: String, beforeTsMs: Int64? = nil, limit: Int = 50) -> [DecodedMessageRow]? {
+        if let core {
+            return core.readChatMessagesNow(convId: convId, beforeTsMs: beforeTsMs, limit: Int64(limit)).map(Self.decoded)
+        }
+        return readMessagesNow(convId: convId, beforeTsMs: beforeTsMs, limit: limit).map(Self.decoded)
+    }
+
+    /// Saves typed messages. Rust path: encoded to the canonical row in the core (no `StoredMessage` / JSON in Swift).
+    func saveChatMessages(_ items: [ChatMessage], skipTwinChecks: Bool = false, preserveExistingReactions: Bool = false) async throws {
+        if let core {
+            do {
+                try await core.saveChatMessages(
+                    items: items.map { ChatMessageRecord(message: $0) },
+                    skipTwinChecks: skipTwinChecks, preserveExistingReactions: preserveExistingReactions)
+                return
+            } catch { throw RustCore.mapError(error) }
+        }
+        try await saveMessages(
+            items.compactMap { ZaloWireParser.encodeChatMessage($0) },
+            skipTwinChecks: skipTwinChecks, preserveExistingReactions: preserveExistingReactions)
     }
 
     nonisolated func readMessagesNow(convId: String, beforeTsMs: Int64? = nil, limit: Int = 50) -> [StoredMessage]? {

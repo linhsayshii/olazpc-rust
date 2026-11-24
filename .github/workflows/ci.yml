@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**", "fix/**"]
+    tags-ignore: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Rust + Swift build and test
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        run: |
+          xcodebuild -version
+          swift --version
+          rustup --version
+          cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Rust tests
+        working-directory: rust
+        run: cargo test --workspace --locked
+
+      - name: Build Rust core (xcframework + UniFFI bindings)
+        run: ./scripts/build-rust.sh
+
+      - name: UniFFI bindings are committed
+        run: git diff --exit-code -- Sources/OlazCore/OlazCore.swift
+
+      - name: Swift build
+        run: swift build
+
+      - name: Swift tests
+        run: swift test

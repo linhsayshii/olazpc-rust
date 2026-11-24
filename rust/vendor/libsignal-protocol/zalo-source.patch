@@ -1,0 +1,68 @@
+diff -ru -x proto src/lib.rs src/lib.rs
+--- src/lib.rs	2026-11-23 15:17:01
++++ src/lib.rs	2026-11-23 15:31:22
+@@ -14,6 +14,8 @@
+ //! [X3DH]: https://signal.org/docs/specifications/x3dh/
+ //! [Double Ratchet]: https://signal.org/docs/specifications/doubleratchet/
+ 
++// ZALO-PATCH: silence a toolchain lint that did not exist when this tag was cut.
++#![allow(mismatched_lifetime_syntaxes)]
+ #![warn(clippy::unwrap_used)]
+ #![deny(unsafe_code)]
+ 
+diff -ru -x proto src/protocol.rs src/protocol.rs
+--- src/protocol.rs	2026-11-23 15:17:01
++++ src/protocol.rs	2026-11-23 15:28:19
+@@ -89,7 +89,8 @@
+             ciphertext: Some(Vec::<u8>::from(ciphertext)),
+         };
+         let mut serialized = Vec::with_capacity(1 + message.encoded_len() + Self::MAC_LENGTH);
+-        serialized.push(((message_version & 0xF) << 4) | CIPHERTEXT_MESSAGE_CURRENT_VERSION);
++        // ZALO-PATCH: low nibble = message version (0x33 for v3); was CURRENT_VERSION (0x34).
++        serialized.push(((message_version & 0xF) << 4) | (message_version & 0xF));
+         message
+             .encode(&mut serialized)
+             .expect("can always append to a buffer");
+@@ -288,7 +289,8 @@
+             message: Some(Vec::from(message.as_ref())),
+         };
+         let mut serialized = Vec::with_capacity(1 + proto_message.encoded_len());
+-        serialized.push(((message_version & 0xF) << 4) | CIPHERTEXT_MESSAGE_CURRENT_VERSION);
++        // ZALO-PATCH: low nibble = message version (0x33 for v3); was CURRENT_VERSION (0x34).
++        serialized.push(((message_version & 0xF) << 4) | (message_version & 0xF));
+         proto_message
+             .encode(&mut serialized)
+             .expect("can always append to a Vec");
+diff -ru -x proto src/ratchet/keys.rs src/ratchet/keys.rs
+--- src/ratchet/keys.rs	2026-11-23 15:17:01
++++ src/ratchet/keys.rs	2026-11-23 15:21:50
+@@ -83,7 +83,7 @@
+     pub(crate) fn derive_keys(input_key_material: &[u8], counter: u32) -> Self {
+         let mut okm = [0; 80];
+         hkdf::Hkdf::<sha2::Sha256>::new(None, input_key_material)
+-            .expand(b"WhisperMessageKeys", &mut okm)
++            .expand(b"ZaloMessageKeys" /* ZALO-PATCH: was "WhisperMessageKeys" */,&mut okm)
+             .expect("valid output length");
+ 
+         MessageKeys {
+@@ -180,7 +180,7 @@
+         let shared_secret = our_ratchet_key.calculate_agreement(their_ratchet_key)?;
+         let mut derived_secret_bytes = [0; 64];
+         hkdf::Hkdf::<sha2::Sha256>::new(Some(&self.key), &shared_secret)
+-            .expand(b"WhisperRatchet", &mut derived_secret_bytes)
++            .expand(b"ZaloRatchet" /* ZALO-PATCH: was "WhisperRatchet" */,&mut derived_secret_bytes)
+             .expect("valid output length");
+ 
+         Ok((
+diff -ru -x proto src/ratchet.rs src/ratchet.rs
+--- src/ratchet.rs	2026-11-23 15:17:01
++++ src/ratchet.rs	2026-11-23 15:28:26
+@@ -18,7 +18,7 @@
+     let label = if has_kyber {
+         b"WhisperText_X25519_SHA-256_CRYSTALS-KYBER-1024".as_slice()
+     } else {
+-        b"WhisperText".as_slice()
++        b"ZaloText".as_slice() // ZALO-PATCH: was "WhisperText"
+     };
+     derive_keys_with_label(label, secret_input)
+ }

@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# Vendored, patched third-party crates: built as path dependencies only (never linted).
+exclude = ["vendor"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "UNLICENSED"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# libsignal-protocol is patched for Zalo (different KDF labels, version byte); see
+# vendor/libsignal-protocol/ZALO-PATCH.md and ADR-015. Depending on the upstream tag keeps the
+# provenance explicit, the patch swaps in the vendored copy.
+[patch."https://github.com/signalapp/libsignal"]
+libsignal-protocol = { path = "vendor/libsignal-protocol" }

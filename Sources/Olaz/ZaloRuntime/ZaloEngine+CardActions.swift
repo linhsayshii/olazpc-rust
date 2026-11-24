@@ -69,7 +69,7 @@ extension ZaloEngine {
         }
         if let box = try? await sessionClient.fetchProfiles(uids: [clean]),
            let row = ZaloWireParser.extractProfilesMap(box.dict)[clean] {
-            let name = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+            let name = ZaloWireParser.preferredName(row)
             let zalo = JSONLossless.string(row["zaloName"])
             let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
             return ContactProfile(uid: clean, name: name, zaloName: zalo, avatar: avt.isEmpty ? nil : URL(string: avt))
@@ -434,7 +434,7 @@ extension ZaloEngine {
                     dict["uid"] ?? dict["userId"] ?? dict["user_id"] ?? dict["id"]
                 ))
                 guard !uid.isEmpty, uid != "0" else { return nil }
-                let name = JSONLossless.string(dict["displayName"] ?? dict["dName"] ?? dict["zaloName"] ?? dict["name"])
+                let name = ZaloWireParser.preferredName(dict)
                 let avatar = JSONLossless.string(dict["avatar"] ?? dict["avt"])
                 let rType = JSONLossless.int64(dict["type"] ?? dict["responseType"] ?? dict["status"]).map(Int.init)
                 return (uid, name, avatar, rType)
@@ -529,7 +529,7 @@ extension ZaloEngine {
                let profBox = try? await sessionClient.fetchProfiles(uids: Array(missingUids)) {
                 for (uid, row) in ZaloWireParser.extractProfilesMap(profBox.dict) {
                     let clean = ZaloWireParser.stripUserPrefix(uid)
-                    let name = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+                    let name = ZaloWireParser.preferredName(row)
                     let avatar = JSONLossless.string(row["avatar"] ?? row["avt"])
                     if !clean.isEmpty, (!name.isEmpty || !avatar.isEmpty) {
                         cachedProfiles[clean] = ZaloWebKitMigrator.CachedProfile(name: name, avatar: avatar)

@@ -28,17 +28,23 @@ struct MainShellView: View {
         // On the split view, not inside the chat: inside a column it takes over that column's toolbar section.
         .inspector(isPresented: $shell.showInspector) {
             InspectorColumn()
-                .inspectorColumnWidth(min: 260, ideal: 300, max: 440)
+                .inspectorColumnWidth(min: 260, ideal: InspectorRoom.inspectorWidth, max: 440)
         }
-        .onChange(of: shell.selection) { _, new in
-            EngineLog.shared.write("shell selection \(new.map { String($0.prefix(4)) + "…" } ?? "-")")
-            openSelection(new)
+        // Selection and call state are watched by a child view: read here, every chat switch (and the call gate it updates)
+        // would re-run this whole body, split view and toolbar included.
+        .background {
+            ShellSelectionWatcher(
+                onSelection: { new in
+                    EngineLog.shared.write("shell selection \(new.map { String($0.prefix(4)) + "…" } ?? "-")")
+                    openSelection(new)
+                },
+                onCallEnded: { closeIfLocked() })
         }
         .onChange(of: shell.destination) { _, destination in
             EngineLog.shared.write("shell destination \(destination.logName)")
             applyOfficialFilter(destination)
             // Leaving the conversation lists hides the inspector without triggering a simultaneous live-resize teardown on `NSOutlineView`.
-            if !destination.isConversationList { shell.hideInspector(animated: false) }
+            if !destination.isConversationList { shell.hideInspector() }
         }
         .onChange(of: engine.conversationExtras.loaded) { _, _ in applyOfficialFilter(shell.destination) }
         // A label deleted here or on another device takes its list with it.
@@ -78,8 +84,6 @@ struct MainShellView: View {
                 shell.selection = nil
             }
         }
-        // A conversation that stayed open during a call is closed once the call is over.
-        .onChange(of: engine.isInCall) { _, inCall in if !inCall { closeIfLocked() } }
         // Other views (contacts, notifications…) ask to show a conversation.
         .onChange(of: engine.navigationRequest) { _, id in consumeNavigationRequest(id) }
         // Side-bar actions of message cards (`action.open.tab.chat` / `.tab.contact` / `.grouplist`).
@@ -140,6 +144,22 @@ struct MainShellView: View {
         guard extras.loaded, let filter = destination.officialFilter(defaultTab: extras.defaultTab) else { return }
         guard extras.typeFilter != filter.tab.rawValue || extras.labelFilterIds != filter.labelIds else { return }
         engine.setConversationFilter(filter.tab, labelIds: filter.labelIds)
+    }
+}
+
+/// Invisible: reports selection changes and the end of a call to `MainShellView` without making it observe either.
+private struct ShellSelectionWatcher: View {
+    let onSelection: (String?) -> Void
+    /// A conversation that stayed open during a call is closed once the call is over.
+    let onCallEnded: () -> Void
+    @Environment(ZaloEngine.self) private var engine
+    @Environment(ShellModel.self) private var shell
+
+    var body: some View {
+        Color.clear
+            .accessibilityHidden(true)
+            .onChange(of: shell.selection) { _, new in onSelection(new) }
+            .onChange(of: engine.isInCall) { _, inCall in if !inCall { onCallEnded() } }
     }
 }
 
@@ -264,9 +284,6 @@ private struct DetailColumn: View {
                 ContactsDetailColumn(destination: destination)
             }
         }
-        // Room kept free at the trailing edge during the inspector's reveal (see `ShellModel.toggleInspector`); measured outside it.
-        .safeAreaInset(edge: .trailing, spacing: 0) { Color.clear.frame(width: shell.inspectorRoomReserve) }
-        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { shell.detailWidthChanged($0) }
     }
 }
 
@@ -326,8 +343,9 @@ struct ConversationDetail: View {
                     .buttonStyle(.glassProminent)
             }
         } else if let conversation {
+            // No `.id(conversation.id)`: the chat view and its toolbar are reused from chat to chat (see `ChatView`).
             ChatView(conversation: conversation)
-                .id(conversation.id)
+                .chatToolbar(conversation: conversation)
         } else {
             ContentUnavailableView("Chọn một cuộc trò chuyện", systemImage: "bubble.left.and.bubble.right",
                                    description: Text("Chọn ở danh sách bên cạnh, hoặc nhấn ⌘K để đi tới một cuộc trò chuyện."))

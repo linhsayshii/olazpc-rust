@@ -4,13 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Olaz is an unofficial, reverse-engineered native macOS Zalo client (SwiftUI + a pure Swift protocol engine). The ongoing goal is feature parity with the official **Zalo PC for macOS** (client `zpw_ver=694`, Zalo PC 26.10.x): when implementing or fixing a feature, the official client's behavior, wording (Vietnamese UI strings) and server calls are the reference. See `README.md` and `REVERSE-ENGINEERING-NOTES.md` for the wire protocol (signing, ParamCipher, QR login, `zpw_ws` framing and cmd numbers, service-map failover).
+Olaz is an unofficial, reverse-engineered native macOS Zalo client (SwiftUI + a Swift protocol engine with a Rust core exported via UniFFI). This repo is standalone (https://github.com/linhsayshii/olazpc-rust, no longer a fork) and continues the GPL-3.0 project by Quan Nguyen (qnguyen3/zalo-swift-re), whose app and reverse-engineering work it builds on; see `NOTICE.md`. The ongoing goal is feature parity with the official **Zalo PC for macOS** (client `zpw_ver=694`, Zalo PC 26.10.x): when implementing or fixing a feature, the official client's behavior, wording (Vietnamese UI strings) and server calls are the reference. See `README.md` and `REVERSE-ENGINEERING-NOTES.md` for the wire protocol (signing, ParamCipher, QR login, `zpw_ws` framing and cmd numbers, service-map failover).
 
-Requirements: macOS 26+, Swift 6 toolchain (Xcode, not just CommandLineTools: SwiftUI macros need Xcode's plugins; the scripts auto-pick `/Applications/Xcode*.app` via `DEVELOPER_DIR`). No third-party SwiftPM dependencies.
+Requirements: macOS 26+, Swift 6 toolchain (Xcode, not just CommandLineTools: SwiftUI macros need Xcode's plugins; the scripts auto-pick `/Applications/Xcode*.app` via `DEVELOPER_DIR`). No third-party SwiftPM dependencies. Rust via rustup (1.88+; `build-rust.sh` adds the arm64/x86_64 darwin targets); on a fresh checkout run `./scripts/build-rust.sh` before `swift build` (it produces the git-ignored `rust/build/OlazCoreFFI.xcframework`).
 
 ## Commands
 
 ```bash
+./scripts/build-rust.sh                      # fresh checkout / after Rust changes: xcframework + Swift bindings
 swift build                                  # debug build → .build/debug/Olaz
 swift test                                   # all tests (Swift Testing: @Suite / @Test / #expect)
 swift test --filter PollTests                # one suite
@@ -19,6 +20,8 @@ swift test --filter PollTests/detailParsing  # one test
 open build/Olaz.app
 ./scripts/release.sh                         # Developer ID sign + notarize → dist/ (needs keychain profile)
 ```
+
+CI/release workflows live in `.github/workflows/` (`ci.yml`, `release.yml`; see `docs/RELEASING.md`).
 
 Run the bundled app (not the bare binary) for real use: the JIT entitlement in `scripts/Olaz.entitlements` is required for JavaScriptCore, and the SwiftPM resource bundle `Olaz_Olaz.bundle` (JSModules/, Resources/) is copied into the .app and located by `JSBridge/ResourceLocator.swift`.
 

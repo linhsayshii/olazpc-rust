@@ -18,8 +18,18 @@ struct ChatInspector: View {
     @State private var showRenameGroup = false
     @State private var showAddMembers = false
     @State private var memberToKick: MentionCandidate?
+    /// Owner / deputies of the group (from its detail), read with the members.
+    @State private var roles = GroupRoles()
+    @State private var newOwner: MentionCandidate?
+    @State private var memberToBlock: MentionCandidate?
+    @State private var showGroupLink = false
+    @State private var showApproval = false
+    @State private var showReport = false
+    @State private var showNote = false
     @State private var confirmLeaveGroup = false
     @State private var leavingGroup = false
+    @State private var confirmBlock = false
+    @State private var blockBusy = false
     /// Width of the overview's scroll view itself (not of its content, see `SharedMediaGrid`).
     @State private var outerWidth: CGFloat = 300
     /// Photos / files / links ever shared, read from the official media service (the overview shows the newest of each).
@@ -48,7 +58,7 @@ struct ChatInspector: View {
         }
         // On the container, not the overview: leaving for the storage page must not restart these.
         .task(id: id) { await loadMembers() }
-        .task(id: engine.messages[id]?.last?.id) { await refreshPreview() }
+        .task(id: engine.messages(in: id)?.last?.id) { await refreshPreview() }
         .sheet(item: $pollSheet) { poll in
             PollDetailSheet(pollId: poll.pollId, conversationId: id, question: poll.question)
         }
@@ -65,6 +75,38 @@ struct ChatInspector: View {
             ) {
                 Task { await loadMembers() }
             }
+        }
+        .sheet(isPresented: $showNote) { GroupNoteSheet(groupId: id) }
+        .sheet(isPresented: $showReport) { ReportSheet(conversationId: id, name: conversation.displayName) }
+        .sheet(isPresented: $showGroupLink) { GroupLinkSheet(groupId: id, canManage: myRoleCanManage) }
+        .sheet(isPresented: $showApproval) {
+            GroupApprovalSheet(groupId: id, approvalOn: roles.joinApproval) { Task { await loadMembers() } }
+        }
+        .alert(
+            "Xác nhận chọn trưởng nhóm mới",
+            isPresented: Binding(get: { newOwner != nil }, set: { if !$0 { newOwner = nil } }),
+            presenting: newOwner
+        ) { member in
+            Button("Chuyển quyền") {
+                newOwner = nil
+                Task { if await engine.changeGroupOwner(id, uid: member.id) { await loadMembers() } }
+            }
+            Button("Hủy", role: .cancel) { newOwner = nil }
+        } message: { member in
+            Text("\(member.name) sẽ trở thành trưởng nhóm. Bạn sẽ trở thành thành viên bình thường.")
+        }
+        .alert(
+            "Chặn khỏi nhóm",
+            isPresented: Binding(get: { memberToBlock != nil }, set: { if !$0 { memberToBlock = nil } }),
+            presenting: memberToBlock
+        ) { member in
+            Button("Chặn", role: .destructive) {
+                memberToBlock = nil
+                Task { if await engine.blockGroupMember(id, uid: member.id) { await loadMembers() } }
+            }
+            Button("Hủy", role: .cancel) { memberToBlock = nil }
+        } message: { member in
+            Text("\(member.name) sẽ bị xóa và không thể tham gia lại nhóm này.")
         }
         .alert(
             "Xóa thành viên?",
@@ -83,6 +125,21 @@ struct ChatInspector: View {
         } message: { member in
             Text("Bạn có chắc muốn xóa \(member.name) khỏi nhóm này?")
         }
+        .alert("Chặn tin nhắn và cuộc gọi?", isPresented: $confirmBlock) {
+            Button("Chặn", role: .destructive) {
+                Task {
+                    blockBusy = true
+                    await engine.setBlocked(id, blocked: true, name: conversation.displayName)
+                    blockBusy = false
+                }
+            }
+            Button("Hủy", role: .cancel) {}
+        } message: {
+            Text("\(conversation.displayName) sẽ không thể nhắn tin hay gọi điện cho bạn.")
+        }
+        .task(id: id) {
+            if !conversation.isGroup, engine.blockedUsers == nil { await engine.loadBlockedUsers() }
+        }
         .alert("Rời khỏi nhóm?", isPresented: $confirmLeaveGroup) {
             Button("Rời nhóm", role: .destructive) {
                 Task {
@@ -90,7 +147,7 @@ struct ChatInspector: View {
                     let ok = await engine.leaveGroup(id)
                     leavingGroup = false
                     if ok {
-                        shell.hideInspector(animated: false)
+                        shell.hideInspector()
                     }
                 }
             }
@@ -101,7 +158,7 @@ struct ChatInspector: View {
     }
 
     private var overview: some View {
-        let loaded = engine.messages[id] ?? []
+        let loaded = engine.messages(in: id) ?? []
         return ScrollView {
             VStack(spacing: 20) {
                 header
@@ -115,7 +172,10 @@ struct ChatInspector: View {
                 filesSection(preview(.files, loaded))
                 linksSection(preview(.links, loaded))
                 if conversation.isGroup {
+                    autoDeleteSection
                     leaveGroupSection
+                } else if id != engine.selfConversationId {
+                    securitySection
                 }
             }
             .padding(.horizontal, 16)
@@ -219,6 +279,8 @@ struct ChatInspector: View {
     private func groupBoard(_ polls: [LoadedPolls.Poll]) -> some View {
         section("Bảng tin nhóm") {
             list {
+                row(symbol: "note.text.badge.plus", title: "Tạo ghi chú") { showNote = true }
+                Divider().padding(.leading, 40)
                 row(symbol: "plus.circle", title: "Tạo bình chọn") { showPollCreate = true }
                 ForEach(polls.prefix(listLimit)) { poll in
                     Divider().padding(.leading, 40)
@@ -240,6 +302,99 @@ struct ChatInspector: View {
                 row(symbol: "pencil", title: "Đổi tên nhóm") { showRenameGroup = true }
                 Divider().padding(.leading, 40)
                 row(symbol: "person.badge.plus", title: "Thêm thành viên") { showAddMembers = true }
+                Divider().padding(.leading, 40)
+                row(symbol: "link", title: "Link tham gia nhóm") { showGroupLink = true }
+                if myRoleCanManage {
+                    Divider().padding(.leading, 40)
+                    row(symbol: "person.crop.circle.badge.checkmark", title: "Phê duyệt thành viên mới",
+                        subtitle: roles.joinApproval ? "Đang bật" : "Đang tắt") { showApproval = true }
+                }
+            }
+        }
+    }
+
+    /// 1-1 "Thiết lập bảo mật": block / unblock messages and calls (official `setBlockFriend`).
+    /// "Tin nhắn tự xóa" (official `STR_VANISH_MSGS`): the lifetime of new messages in this conversation.
+    private var autoDeleteRow: some View {
+        let ttl = engine.autoDeleteTTL(id)
+        return Menu {
+            ForEach(AutoDelete.options, id: \.ttl) { option in
+                Button {
+                    Task { await engine.setAutoDelete(id, ttl: option.ttl) }
+                } label: {
+                    if option.ttl == ttl { Label(option.label, systemImage: "checkmark") } else { Text(option.label) }
+                }
+            }
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "timer").font(.system(size: 14)).frame(width: 18)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Tin nhắn tự xóa").font(.system(size: 13, weight: .medium))
+                    Text(ttl > 0 ? AutoDelete.label(ttl) : "Không bao giờ").font(.system(size: 11.5)).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .frame(minHeight: 38)
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.button)
+        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
+        .disabled(engine.autoDelete == nil)
+        .help("Tin nhắn sẽ tự xóa sau khoảng thời gian bạn cài đặt")
+        .task(id: id) { if engine.autoDelete == nil { await engine.loadAutoDelete() } }
+    }
+
+    private var autoDeleteSection: some View {
+        section("Thiết lập bảo mật") {
+            list {
+                autoDeleteRow
+                Divider().padding(.leading, 40)
+                reportRow
+            }
+        }
+    }
+
+    private var reportRow: some View {
+        row(symbol: "exclamationmark.triangle", title: "Báo xấu") { showReport = true }
+    }
+
+    private var securitySection: some View {
+        let blocked = engine.isBlocked(id)
+        return section("Thiết lập bảo mật") {
+            list {
+                autoDeleteRow
+                Divider().padding(.leading, 40)
+                reportRow
+                Divider().padding(.leading, 40)
+                Button {
+                    if blocked {
+                        Task { blockBusy = true; await engine.setBlocked(id, blocked: false); blockBusy = false }
+                    } else {
+                        confirmBlock = true
+                    }
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: blocked ? "hand.raised.slash" : "hand.raised")
+                            .font(.system(size: 14))
+                            .frame(width: 18)
+                        if blockBusy {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text(blocked ? "Bỏ chặn" : "Chặn tin nhắn").font(.system(size: 13, weight: .medium))
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .foregroundStyle(blocked ? Color.primary : Color.red)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .frame(minHeight: 38)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(blockBusy || engine.blockedUsers == nil)
             }
         }
     }
@@ -273,7 +428,6 @@ struct ChatInspector: View {
 
     @ViewBuilder
     private var membersSection: some View {
-        let myUid = ZaloWireParser.stripUserPrefix(engine.profile?.userId ?? "")
         if let members, !members.isEmpty {
             let shown = showAllMembers ? members : Array(members.prefix(memberLimit))
             let toggleAction: (() -> Void)? = members.count > memberLimit ? { showAllMembers.toggle() } : nil
@@ -291,7 +445,12 @@ struct ChatInspector: View {
                             Button { engine.openContactConversation(member.id) } label: {
                                 HStack(spacing: 10) {
                                     RemoteAvatar(url: member.avatar, name: member.name, size: 26)
-                                    Text(member.name).font(.system(size: 13)).lineLimit(1)
+                                    VStack(alignment: .leading, spacing: 0) {
+                                        Text(member.name).font(.system(size: 13)).lineLimit(1)
+                                        if let role = roleLabel(member.id) {
+                                            Text(role).font(.system(size: 11)).foregroundStyle(.secondary)
+                                        }
+                                    }
                                     Spacer(minLength: 0)
                                 }
                                 .contentShape(Rectangle())
@@ -305,6 +464,7 @@ struct ChatInspector: View {
                                         engine.openContactConversation(member.id)
                                     }
                                     Divider()
+                                    adminItems(member)
                                     Button("Xóa khỏi nhóm", systemImage: "person.badge.minus", role: .destructive) {
                                         memberToKick = member
                                     }
@@ -330,6 +490,7 @@ struct ChatInspector: View {
                             }
                             if canKick {
                                 Divider()
+                                adminItems(member)
                                 Button("Xóa khỏi nhóm", systemImage: "person.badge.minus", role: .destructive) {
                                     memberToKick = member
                                 }
@@ -355,6 +516,35 @@ struct ChatInspector: View {
         let found = await engine.loadGroupMembers(in: id)
         guard !Task.isCancelled else { return }
         members = found.filter { !$0.isAll && $0.id != "-1" }
+        roles = engine.groupRoles(id)
+    }
+
+    private var myUid: String { ZaloWireParser.stripUserPrefix(engine.profile?.userId ?? "") }
+    private var myRoleCanManage: Bool { roles.canManage(myUid) }
+
+    private func roleLabel(_ uid: String) -> String? {
+        roles.isOwner(uid) ? "Trưởng nhóm" : roles.isAdmin(uid) ? "Phó nhóm" : nil
+    }
+
+    /// Official member menu: the owner adjusts deputies and hands the group over; owner / deputies block members.
+    @ViewBuilder
+    private func adminItems(_ member: MentionCandidate) -> some View {
+        let iAmOwner = roles.isOwner(myUid)
+        if iAmOwner {
+            if roles.isAdmin(member.id) {
+                Button("Xóa phó nhóm", systemImage: "person.badge.minus") {
+                    Task { if await engine.setGroupAdmin(id, uid: member.id, admin: false) { await loadMembers() } }
+                }
+            } else {
+                Button("Thêm phó nhóm", systemImage: "person.badge.shield.checkmark") {
+                    Task { if await engine.setGroupAdmin(id, uid: member.id, admin: true) { await loadMembers() } }
+                }
+            }
+            Button("Chuyển quyền trưởng nhóm", systemImage: "crown") { newOwner = member }
+        }
+        if myRoleCanManage, !roles.isOwner(member.id), iAmOwner || !roles.isAdmin(member.id) {
+            Button("Chặn khỏi nhóm", systemImage: "hand.raised", role: .destructive) { memberToBlock = member }
+        }
     }
 
     // MARK: Shared content

@@ -1116,7 +1116,7 @@ extension ZaloEngine {
                 if let profBox = try? await sessionClient.fetchProfiles(uids: slice) {
                     for (uid, row) in ZaloWireParser.extractProfilesMap(profBox.dict) {
                         let clean = ZaloWireParser.stripUserPrefix(uid)
-                        let n = JSONLossless.string(row["displayName"] ?? row["dName"] ?? row["zaloName"] ?? row["name"])
+                        let n = ZaloWireParser.preferredName(row)
                         let a = JSONLossless.string(row["avatar"] ?? row["avt"])
                         if !clean.isEmpty, (!n.isEmpty || !a.isEmpty) {
                             extraProfiles[clean] = (n, a)

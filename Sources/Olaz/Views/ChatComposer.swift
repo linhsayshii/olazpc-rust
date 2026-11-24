@@ -10,8 +10,11 @@ struct ChatComposer: View {
     var isGroup: Bool = false
     @Binding var draft: String
     @Binding var mentions: [Mention]
+    /// Rich-text runs of the draft (sent as `textProperties`).
+    var styles: Binding<[TextStyle]>? = nil
+    /// "Quan trọng" (1) / "Khẩn cấp" (2) for the next message.
+    var urgency: Binding<Int>? = nil
     @Binding var replyTo: ChatMessage?
-    let typingName: String?
     let focusTick: Int
     let send: () -> Void
     let sendLike: () -> Void
@@ -19,6 +22,10 @@ struct ChatComposer: View {
     @Environment(ZaloEngine.self) private var engine
     @AppStorage(OlazPrefs.accent) private var accentStored = OlazAccent.blue.rawValue
     @Namespace private var glassNamespace
+    /// Read here, not passed in by the chat: `typing` changes for any conversation, and only the composer shows it.
+    private var typingLabel: String? {
+        engine.typingStatus(in: conversationId)?.label(isGroup: ZaloWireParser.isGroupId(conversationId))
+    }
     @State private var textHeight: CGFloat = ComposerTextView.lineHeight
     @State private var handle = ComposerHandle()
     @State private var query: MentionQuery?
@@ -26,6 +33,8 @@ struct ChatComposer: View {
     @State private var selected = 0
     @State private var showPollCreate = false
     @State private var showStickers = false
+    @State private var showFormat = false
+    @State private var showGif = false
     /// "Ảnh hoặc Video" / "Tệp": the open panel and what its pick is sent as.
     @State private var importing = false
     @State private var importKind = AttachmentKind.files
@@ -45,12 +54,17 @@ struct ChatComposer: View {
 
     private var isEmpty: Bool { draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
+    /// "Tin nhắn nhanh": "/" then a keyword lists the saved texts that start with it.
+    private var quickMatches: [QuickMessage] {
+        Array(QuickMessage.matches(draft, in: engine.quickMessages ?? []).prefix(6))
+    }
+
     var body: some View {
         VStack(spacing: 8) {
-            if let typingName {
+            if let typingLabel {
                 HStack(spacing: 6) {
                     Image(systemName: "ellipsis.bubble").symbolEffect(.pulse)
-                    Text("\(typingName) đang soạn tin…")
+                    Text(typingLabel + "…")
                 }
                 .font(.system(size: 11.5))
                 .foregroundStyle(.secondary)
@@ -81,6 +95,14 @@ struct ChatComposer: View {
                 MentionSuggestions(candidates: candidates, selected: $selected, pick: pick)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
+            if !quickMatches.isEmpty {
+                QuickMessageStrip(items: quickMatches) { item in
+                    draft = item.text
+                    mentions = []
+                    styles?.wrappedValue = []
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
             if stickerStripOpen {
                 TypingStickerStrip(stickers: typingStickers.stickers, sending: sendingSuggestion, pick: sendSuggestion,
                                    dismiss: { typingStickers.dismissed = true })
@@ -104,7 +126,7 @@ struct ChatComposer: View {
         .animation(.snappy(duration: 0.18), value: suggestionsOpen)
         .animation(.snappy(duration: 0.18), value: stickerStripOpen)
         .animation(.snappy(duration: 0.18), value: replyTo?.id)
-        .animation(.snappy(duration: 0.18), value: typingName)
+        .animation(.snappy(duration: 0.18), value: typingLabel)
         .onAppear { ComposerTextView.accent = NSColor(ChatPalette.accent(accentStored)) }
         .onChange(of: accentStored) { _, now in ComposerTextView.accent = NSColor(ChatPalette.accent(now)) }
         .task(id: query) { await loadCandidates() }
@@ -184,7 +206,7 @@ struct ChatComposer: View {
     private var field: some View {
         HStack(alignment: .bottom, spacing: 4) {
             ComposerTextView(
-                text: $draft, mentions: $mentions, height: $textHeight, focusTick: focusTick,
+                text: $draft, mentions: $mentions, styles: styles, height: $textHeight, focusTick: focusTick,
                 handle: handle, mentionsEnabled: isGroup,
                 onMentionQuery: { query = $0 },
                 onSuggestionKey: suggestionKey,
@@ -204,7 +226,7 @@ struct ChatComposer: View {
                 .frame(height: textHeight)
                 .overlay(alignment: .topLeading) {
                     if draft.isEmpty {
-                        Text("Tin nhắn tới \(name)")
+                        Text(engine.autoDeleteTTL(conversationId) > 0 ? "Nhập tin nhắn tự xóa gửi đến \(name)" : "Tin nhắn tới \(name)")
                             .font(.system(size: 14))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -212,6 +234,63 @@ struct ChatComposer: View {
                     }
                 }
                 .padding(.vertical, 10)
+            if let urgency {
+                Menu {
+                    Button("Bình thường") { urgency.wrappedValue = 0 }
+                    Button("Quan trọng", systemImage: "exclamationmark.circle") { urgency.wrappedValue = 1 }
+                    Button("Khẩn cấp", systemImage: "bell.badge") { urgency.wrappedValue = 2 }
+                } label: {
+                    Image(systemName: urgency.wrappedValue == 2 ? "bell.badge.fill" : "exclamationmark.circle\(urgency.wrappedValue == 1 ? ".fill" : "")")
+                        .font(.system(size: 15))
+                        .foregroundStyle(urgency.wrappedValue == 2 ? AnyShapeStyle(Color.red)
+                                         : urgency.wrappedValue == 1 ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.secondary))
+                        .frame(width: 28, height: 28)
+                        .contentShape(Circle())
+                }
+                .menuStyle(.button)
+                .menuIndicator(.hidden)
+                .buttonStyle(.plain)
+                .fixedSize()
+                .padding(.bottom, 4)
+                .help(urgency.wrappedValue == 2 ? "Tin khẩn cấp" : urgency.wrappedValue == 1 ? "Tin quan trọng" : "Đánh dấu tin quan trọng hoặc khẩn cấp")
+                .accessibilityLabel("Mức độ tin nhắn")
+            }
+            if styles != nil {
+                Button {
+                    showFormat.toggle()
+                } label: {
+                    Image(systemName: "textformat").font(.system(size: 15))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, height: 28)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .padding(.bottom, 4)
+                .help("Định dạng tin nhắn")
+                .accessibilityLabel("Định dạng tin nhắn")
+                .popover(isPresented: $showFormat, arrowEdge: .top) {
+                    ComposerFormatBar(handle: handle)
+                }
+            }
+            if !conversationId.isEmpty {
+                Button {
+                    showGif.toggle()
+                } label: {
+                    Text("GIF").font(.system(size: 10.5, weight: .bold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 3).padding(.vertical, 1)
+                        .overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(.secondary, lineWidth: 1))
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.bottom, 4)
+                .help("Gửi GIF")
+                .accessibilityLabel("Gửi GIF")
+                .popover(isPresented: $showGif, arrowEdge: .top) {
+                    GifPicker(conversationId: conversationId) { showGif = false }
+                }
+            }
             if !conversationId.isEmpty {
                 Button {
                     showStickers.toggle()
@@ -499,6 +578,8 @@ private struct MentionSuggestions: View {
 @MainActor
 final class ComposerHandle {
     weak var textView: NSTextView?
+    /// The format of the field changed without a text change (bar / shortcut on a selection).
+    var onFormatChange: (() -> Void)?
 
     func insertMention(_ candidate: MentionCandidate, replacing range: NSRange) {
         guard let tv = textView, let storage = tv.textStorage,
@@ -536,6 +617,8 @@ extension NSAttributedString.Key {
 struct ComposerTextView: NSViewRepresentable {
     @Binding var text: String
     @Binding var mentions: [Mention]
+    /// Rich-text runs of the field (official `textProperties.styles`), published on every edit.
+    var styles: Binding<[TextStyle]>? = nil
     @Binding var height: CGFloat
     var focusTick: Int
     var handle: ComposerHandle? = nil
@@ -560,6 +643,8 @@ struct ComposerTextView: NSViewRepresentable {
     /// Sets text set from outside (restored draft) together with its mentions, rebuilding their token styling
     /// so `syncMentions` publishes them back instead of wiping them. Offsets that no longer read "@…" are skipped.
     static func setContent(_ tv: NSTextView, text: String, mentions: [Mention]) {
+        // Typing attributes first: the new string takes them (a styled caret must not paint a restored draft).
+        tv.typingAttributes = baseAttributes
         tv.string = text
         tv.typingAttributes = baseAttributes
         guard let storage = tv.textStorage, !mentions.isEmpty else { return }
@@ -597,6 +682,13 @@ struct ComposerTextView: NSViewRepresentable {
         tv.setAccessibilityLabel("Nhập tin nhắn")
         Self.setContent(tv, text: text, mentions: mentions)
         context.coordinator.parent.handle?.textView = tv
+        context.coordinator.parent.handle?.onFormatChange = { [weak coordinator = context.coordinator, weak tv] in
+            guard let tv else { return }
+            coordinator?.syncStyles(tv)
+        }
+        tv.onFormatKey = { [weak coordinator = context.coordinator] command in
+            coordinator?.parent.handle?.format(command)
+        }
         tv.onWidthChange = { [weak coordinator = context.coordinator, weak tv] in
             guard let tv else { return }
             coordinator?.remeasure(tv)
@@ -605,7 +697,7 @@ struct ComposerTextView: NSViewRepresentable {
         let scroll = NSScrollView()
         scroll.drawsBackground = false
         scroll.borderType = .noBorder
-        scroll.hasVerticalScroller = true
+        scroll.hasVerticalScroller = false
         scroll.autohidesScrollers = true
         scroll.hasHorizontalScroller = false
         scroll.documentView = tv
@@ -682,15 +774,22 @@ struct ComposerTextView: NSViewRepresentable {
                 }
             }
             syncMentions(tv)
+            syncStyles(tv)
             refreshQuery(tv)
             remeasure(tv)
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
             guard let tv = notification.object as? NSTextView else { return }
-            // Typing next to a mention must never extend it.
-            tv.typingAttributes = ComposerTextView.baseAttributes
+            // Typing next to a mention must never extend it; a format goes on from the character before the caret.
+            tv.typingAttributes = ComposerTextView.typingAttributes(tv)
             refreshQuery(tv)
+        }
+
+        func syncStyles(_ tv: NSTextView) {
+            guard let binding = parent.styles, let storage = tv.textStorage else { return }
+            let found = ComposerTextView.styles(of: storage)
+            if binding.wrappedValue != found { binding.wrappedValue = found }
         }
 
         /// A mention is atomic: any edit touching it replaces/deletes the whole token.
@@ -811,6 +910,12 @@ struct ComposerTextView: NSViewRepresentable {
             let line = ComposerTextView.lineHeight
             let used = lm.usedRect(for: container).height
             let h = min(max(line, ceil(used)), line * ComposerTextView.maxLines)
+            // Scroller only once the text outgrows the max height: a short line must never show a knob
+            // (the text view's inset makes it a hair taller than the field, which would trigger autohide).
+            let overflow = ceil(used) > line * ComposerTextView.maxLines + 0.5
+            if let scroll = tv.enclosingScrollView, scroll.hasVerticalScroller != overflow {
+                scroll.hasVerticalScroller = overflow
+            }
             if abs(parent.height - h) > 0.5 {
                 DispatchQueue.main.async { [weak self] in self?.parent.height = h }
             }
@@ -820,6 +925,24 @@ struct ComposerTextView: NSViewRepresentable {
     final class FieldTextView: NSTextView {
         var onWidthChange: (() -> Void)?
         var onPasteAttachment: ((PastedContent) -> Void)?
+        var onFormatKey: ((ComposerFormatCommand) -> Void)?
+
+        /// ⌘B ⌘I ⌘U, ⌘⇧X: the official format shortcuts.
+        override func performKeyEquivalent(with event: NSEvent) -> Bool {
+            guard window?.firstResponder === self, !hasMarkedText(), let onFormatKey else { return super.performKeyEquivalent(with: event) }
+            let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let key = event.charactersIgnoringModifiers?.lowercased() ?? ""
+            let command: ComposerFormatCommand? = switch (mods, key) {
+            case (.command, "b"): .bold
+            case (.command, "i"): .italic
+            case (.command, "u"): .underline
+            case ([.command, .shift], "x"): .strike
+            default: nil
+            }
+            guard let command else { return super.performKeyEquivalent(with: event) }
+            onFormatKey(command)
+            return true
+        }
         override func paste(_ sender: Any?) {
             if let content = PastedContent.read(from: .general) {
                 onPasteAttachment?(content)
@@ -874,3 +997,32 @@ private struct PastedAttachment: Identifiable {
         return ""
     }
 }
+
+/// The quick messages matching "/keyword": a click puts the text in the box.
+private struct QuickMessageStrip: View {
+    let items: [QuickMessage]
+    let pick: (QuickMessage) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Tin nhắn nhanh").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                .padding(.horizontal, 12).padding(.top, 8).padding(.bottom, 4)
+            ForEach(items) { item in
+                Button { pick(item) } label: {
+                    HStack(spacing: 8) {
+                        Text("/\(item.keyword)").font(.system(size: 12, weight: .semibold)).foregroundStyle(.tint)
+                        Text(item.text).font(.system(size: 12)).lineLimit(1).foregroundStyle(.primary)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.bottom, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+}
+

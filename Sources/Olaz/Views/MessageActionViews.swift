@@ -34,6 +34,9 @@ struct ForwardSheet: View {
             Divider()
             VStack(alignment: .leading, spacing: 10) {
                 ForwardPreview(message: request.message)
+                if !request.more.isEmpty {
+                    Text("và \(request.more.count) tin nhắn khác").font(.system(size: 12)).foregroundStyle(.secondary)
+                }
                 TextField("Tìm kiếm hội thoại cần chia sẻ", text: $search).textFieldStyle(.roundedBorder)
             }
             .padding(16)
@@ -77,8 +80,15 @@ struct ForwardSheet: View {
     private func send() async {
         guard !selected.isEmpty, !busy else { return }
         busy = true; failure = nil
-        let outcome = await engine.forward(request.message, to: selected)
+        // Several selected messages: forwarded oldest first; any success counts as shared.
+        var outcome = MessageActionOutcome.failed("Có lỗi khi chia sẻ tin nhắn")
+        for message in request.all {
+            let one = await engine.forward(message, to: selected)
+            if case .done = outcome { continue }
+            outcome = one
+        }
         busy = false
+        if case .done = outcome, !request.more.isEmpty { engine.endSelection() }
         switch outcome {
         case .done(let text):
             CardActionCenter.shared.show(text ?? "Đã chia sẻ tin nhắn", in: request.conversationId)
@@ -129,78 +139,254 @@ private struct ForwardPreview: View {
 
 // MARK: - Pinned bar
 
-/// The conversation's pins above its messages (official topic banner): the newest pin, the others in a menu.
+/// The conversation's pins above its messages, Telegram style: one pin at a time with a segmented indicator; clicking jumps to
+/// it and steps to the next (older) pin, sliding the text; the list button opens every pin ("Danh sách ghim") with unpin.
 struct PinnedBar: View {
     let conversationId: String
     var open: (PinnedItem) -> Void
 
     @Environment(ZaloEngine.self) private var engine
+    /// Index into the newest-first items of the pin shown.
+    @State private var index = 0
+    /// The text slides up when stepping to an older pin, down when going back.
+    @State private var towardOlder = true
+    @State private var listShown = false
+    @State private var hovered = false
+
+    private static let motion = Animation.snappy(duration: 0.3, extraBounce: 0.04)
 
     var body: some View {
-        if let list = engine.pins[conversationId], list.ready, let first = list.items.first {
-            HStack(spacing: 10) {
-                Image(systemName: "pin.fill")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.tint)
-                    .rotationEffect(.degrees(35))
-                Button { open(first) } label: {
-                    HStack(spacing: 8) {
-                        if let thumbnail = first.thumbnail {
-                            RemoteImage(url: thumbnail, contentMode: .fill, maxPixelSize: 80) { Rectangle().fill(.quaternary) }
-                                .frame(width: 28, height: 28)
-                                .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
-                        }
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(caption(first)).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
-                            Text(first.title.isEmpty ? first.label : first.title).font(.system(size: 12.5)).lineLimit(1)
-                        }
-                        Spacer(minLength: 0)
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help(first.title)
-                if list.items.count > 1 {
-                    Menu {
-                        ForEach(list.items) { item in
-                            Menu(menuTitle(item)) {
-                                Button(item.kind == .message ? "Xem tin nhắn" : "Xem", systemImage: "arrow.right.circle") { open(item) }
-                                if list.canPin {
-                                    Button("Bỏ ghim", systemImage: "pin.slash", role: .destructive) { engine.requestUnpin(item, in: conversationId) }
-                                }
-                            }
-                        }
-                    } label: {
-                        Text("+\(list.items.count - 1) ghim").font(.system(size: 11.5, weight: .medium))
-                    }
-                    .menuStyle(.button)
-                    .buttonStyle(.glass)
-                    .controlSize(.small)
-                    .fixedSize()
-                    .help("Danh sách ghim (\(list.items.count))")
-                } else if list.canPin {
-                    Button("Bỏ ghim", systemImage: "pin.slash") { engine.requestUnpin(first, in: conversationId) }
-                        .labelStyle(.iconOnly)
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
-                        .help("Bỏ ghim")
-                }
+        let list = engine.pins[conversationId]
+        let items = list?.ready == true ? list?.items ?? [] : []
+        ZStack {
+            if !items.isEmpty, let list {
+                bar(items: items, list: list)
+                    .transition(.move(edge: .top).combined(with: .opacity))
             }
-            .padding(.horizontal, 12).padding(.vertical, 7)
-            .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .padding(.horizontal, 16).padding(.top, 6).padding(.bottom, 2)
-            .accessibilityElement(children: .contain)
-            .accessibilityLabel("Tin nhắn đã ghim")
+        }
+        .animation(Self.motion, value: items.isEmpty)
+        .animation(Self.motion, value: items.map(\.ref))
+        .onChange(of: items.map(\.ref)) { old, new in
+            // A new pin shows itself (newest first); otherwise keep the shown pin where it still is.
+            if let first = new.first, !old.contains(first) {
+                towardOlder = false
+                index = 0
+            } else if let shown = old.indices.contains(index) ? old[index] : nil, let at = new.firstIndex(of: shown) {
+                index = at
+            } else {
+                index = min(index, max(0, new.count - 1))
+            }
+        }
+        .onChange(of: conversationId) { _, _ in
+            index = 0
+            listShown = false
         }
     }
 
-    private func caption(_ item: PinnedItem) -> String {
-        item.sender.isEmpty ? item.label : "\(item.label) của \(item.sender)"
+    @ViewBuilder
+    private func bar(items: [PinnedItem], list: PinnedList) -> some View {
+        let current = items[min(index, items.count - 1)]
+        HStack(spacing: 10) {
+            PinSegmentIndicator(count: items.count, position: items.count - 1 - min(index, items.count - 1))
+            Button { activate(current, items: items) } label: {
+                HStack(spacing: 8) {
+                    ZStack(alignment: .leading) {
+                        PinBarContent(item: current, number: items.count > 1 ? items.count - min(index, items.count - 1) : nil)
+                            .id(current.ref)
+                            .transition(.asymmetric(
+                                insertion: .move(edge: towardOlder ? .bottom : .top).combined(with: .opacity),
+                                removal: .move(edge: towardOlder ? .top : .bottom).combined(with: .opacity)
+                            ))
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
+                    .clipped()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(items.count > 1 ? "Xem tin nhắn · bấm tiếp để xem ghim khác" : (current.title.isEmpty ? current.label : current.title))
+            .contextMenu {
+                Button(current.kind == .message ? "Xem tin nhắn" : "Xem", systemImage: "arrow.right.circle") { open(current) }
+                if items.count > 1 {
+                    Button("Danh sách ghim (\(items.count))", systemImage: "list.bullet") { listShown = true }
+                }
+                if list.canPin {
+                    Divider()
+                    Button("Bỏ ghim", systemImage: "pin.slash", role: .destructive) { engine.requestUnpin(current, in: conversationId) }
+                }
+            }
+            if items.count > 1 {
+                Button { listShown.toggle() } label: {
+                    Image(systemName: "list.bullet").font(.system(size: 13, weight: .medium)).frame(width: 26, height: 26).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Danh sách ghim (\(items.count))")
+                .popover(isPresented: $listShown, arrowEdge: .bottom) {
+                    PinListPopover(conversationId: conversationId, canPin: list.canPin) { item in
+                        listShown = false
+                        if let at = items.firstIndex(of: item) { step(to: at) }
+                        open(item)
+                    }
+                }
+            } else if list.canPin {
+                Button { engine.requestUnpin(current, in: conversationId) } label: {
+                    Image(systemName: "xmark").font(.system(size: 11, weight: .semibold)).frame(width: 26, height: 26).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Bỏ ghim")
+            }
+        }
+        .padding(.leading, 12).padding(.trailing, 6).padding(.vertical, 6)
+        .background(hovered ? AnyShapeStyle(.primary.opacity(0.04)) : AnyShapeStyle(.clear), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .onHover { hovered = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovered)
+        .padding(.horizontal, 16).padding(.top, 6).padding(.bottom, 2)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Tin nhắn đã ghim")
     }
 
-    private func menuTitle(_ item: PinnedItem) -> String {
+    /// Jump to the shown pin, then show the next older one (wrapping to the newest), as Telegram does.
+    private func activate(_ item: PinnedItem, items: [PinnedItem]) {
+        open(item)
+        guard items.count > 1 else { return }
+        step(to: (min(index, items.count - 1) + 1) % items.count)
+    }
+
+    private func step(to target: Int) {
+        guard target != index else { return }
+        towardOlder = target > index
+        withAnimation(Self.motion) { index = target }
+    }
+}
+
+/// The shown pin: "Tin nhắn đã ghim #n" over its text, with a thumbnail for media.
+private struct PinBarContent: View {
+    let item: PinnedItem
+    let number: Int?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if let thumbnail = item.thumbnail {
+                RemoteImage(url: thumbnail, contentMode: .fill, maxPixelSize: 80) { Rectangle().fill(.quaternary) }
+                    .frame(width: 30, height: 30)
+                    .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(heading).font(.system(size: 11.5, weight: .semibold)).foregroundStyle(.tint).lineLimit(1)
+                Text(line).font(.system(size: 12.5)).lineLimit(1)
+            }
+        }
+    }
+
+    private var heading: String {
+        let base = item.kind == .message ? "Tin nhắn đã ghim" : item.label
+        return number.map { "\(base) #\($0)" } ?? base
+    }
+
+    private var line: String {
         let text = item.title.isEmpty ? item.label : item.title
-        return String(text.prefix(60))
+        return item.sender.isEmpty ? text : "\(item.sender): \(text)"
+    }
+}
+
+/// Telegram's pinned indicator: one segment per pin, the shown one lit; the lit segment glides between positions.
+struct PinSegmentIndicator: View {
+    let count: Int
+    /// 0 = top segment.
+    let position: Int
+
+    var body: some View {
+        let n = max(1, count)
+        GeometryReader { geo in
+            let gap: CGFloat = n > 1 ? 2 : 0
+            let segment = max(2, (geo.size.height - gap * CGFloat(n - 1)) / CGFloat(n))
+            ZStack(alignment: .top) {
+                VStack(spacing: gap) {
+                    ForEach(0..<n, id: \.self) { _ in Capsule().fill(.tint.opacity(0.28)) }
+                }
+                Capsule().fill(.tint)
+                    .frame(height: segment)
+                    .offset(y: CGFloat(min(max(0, position), n - 1)) * (segment + gap))
+            }
+        }
+        .frame(width: 2.5, height: 30)
+        .animation(.snappy(duration: 0.3), value: position)
+        .animation(.snappy(duration: 0.3), value: count)
+        .accessibilityHidden(true)
+    }
+}
+
+/// "Danh sách ghim (N)": every pin, newest first; a row opens its pin, "Bỏ ghim" asks to unpin it.
+private struct PinListPopover: View {
+    let conversationId: String
+    let canPin: Bool
+    var open: (PinnedItem) -> Void
+    @Environment(ZaloEngine.self) private var engine
+
+    var body: some View {
+        let items = engine.pins[conversationId]?.items ?? []
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Danh sách ghim (\(items.count))")
+                .font(.system(size: 13, weight: .semibold))
+                .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 6)
+            ForEach(items) { item in
+                PinListRow(item: item, canPin: canPin, open: { open(item) }) {
+                    engine.requestUnpin(item, in: conversationId)
+                }
+                .transition(.opacity.combined(with: .move(edge: .trailing)))
+            }
+        }
+        .padding(.bottom, 8)
+        .frame(width: 340)
+        .animation(.snappy(duration: 0.25), value: items.map(\.ref))
+    }
+}
+
+private struct PinListRow: View {
+    let item: PinnedItem
+    let canPin: Bool
+    var open: () -> Void
+    var unpin: () -> Void
+    @State private var hovered = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 13))
+                .foregroundStyle(.tint)
+                .frame(width: 28, height: 28)
+                .background(.tint.opacity(0.12), in: Circle())
+            VStack(alignment: .leading, spacing: 1) {
+                Text(item.title.isEmpty ? item.label : item.title).font(.system(size: 12.5)).lineLimit(2)
+                Text(item.sender.isEmpty ? item.label : "\(item.label) của \(item.sender)")
+                    .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            if canPin {
+                Button("Bỏ ghim", action: unpin)
+                    .buttonStyle(.glass)
+                    .controlSize(.small)
+                    .opacity(hovered ? 1 : 0.6)
+            }
+        }
+        .padding(.horizontal, 14).padding(.vertical, 6)
+        .background(hovered ? AnyShapeStyle(.primary.opacity(0.06)) : AnyShapeStyle(.clear))
+        .contentShape(Rectangle())
+        .onTapGesture(perform: open)
+        .onHover { hovered = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovered)
+    }
+
+    private var icon: String {
+        switch item.kind {
+        case .message: "text.bubble"
+        case .note, .link: "note.text"
+        case .poll: "chart.bar"
+        case .reminder: "alarm"
+        }
     }
 }
 
