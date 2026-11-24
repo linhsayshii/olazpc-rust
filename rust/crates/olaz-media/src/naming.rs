@@ -168,6 +168,14 @@ mod tests {
         assert_eq!(stable_hash(""), "cbf29ce484222325");
         // Non-ASCII goes through UTF-8 bytes like `text.utf8`.
         assert_ne!(stable_hash("é"), stable_hash("e"));
+        assert_eq!(
+            stable_hash("https://res-zalo.zadn.vn/upload/x.json"),
+            "c063989352bd3693"
+        );
+        assert_eq!(
+            stable_hash("dec1:https://a.zdn.vn/é?x=1"),
+            "cd3fcbd3a9e2f16"
+        );
     }
 
     #[test]
@@ -179,6 +187,27 @@ mod tests {
             "af63dc4c8601ec8c.abcdefgh"
         );
         assert_eq!(cached_file_name("a", "a-b"), "af63dc4c8601ec8c.ab");
+        // Exact URLs from Swift `RustMediaTests.stableHashAndFileNamesMatchSwift`.
+        assert_eq!(
+            cached_file_name("https://res-zalo.zadn.vn/upload/x.json", "json"),
+            format!("{}.json", stable_hash("https://res-zalo.zadn.vn/upload/x.json"))
+        );
+        assert_eq!(
+            cached_file_name("https://a.zdn.vn/p/pic.jpeg?x=1", "jpeg"),
+            format!("{}.jpeg", stable_hash("https://a.zdn.vn/p/pic.jpeg?x=1"))
+        );
+        assert_eq!(
+            cached_file_name("https://a.zdn.vn/noext", ""),
+            stable_hash("https://a.zdn.vn/noext")
+        );
+        assert_eq!(
+            cached_file_name("https://a.zdn.vn/a.verylongextension99", "verylongextension99"),
+            format!("{}.verylong", stable_hash("https://a.zdn.vn/a.verylongextension99"))
+        );
+        assert_eq!(
+            cached_file_name("https://a.zdn.vn/x.jxl?jxlstatus=1", "jxl"),
+            format!("{}.jxl", stable_hash("https://a.zdn.vn/x.jxl?jxlstatus=1"))
+        );
     }
 
     #[test]

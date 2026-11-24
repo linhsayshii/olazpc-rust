@@ -758,3 +758,306 @@ fn history_batch_head_defaults_when_data_is_missing() {
             .is_empty()
     );
 }
+
+// ---- Golden fixtures ported from Swift RustCoreCutoverTests ----
+
+#[test]
+fn typed_wire_kinds_golden_fixtures() {
+    use std::collections::HashSet;
+
+    let cipher = "AzMIARIgmPWlMdiC4wZ0hVUkXfJNMGeaKzuZQHfDCq7xsZVv2DMYASAAKhBRjyzr+XbYlKSf6RJpDsNYYEQQBKQD3BpgD3Z3lXe7e0yLmZm/Bpf2gTLm1y6lcAsaZnlYFuE=";
+    let root = serde_json::json!({
+        "data": {
+            "msgs": [
+                {"msgId": "1001", "cliMsgId": "c1001", "uidFrom": "u1", "idTo": "me", "msgType": "webchat", "content": "Chào @An và mọi người", "ts": 1_000,
+                 "mentions": [{"uid": "u1", "pos": 5, "len": 3, "type": 0}, {"uid": "-1", "pos": 12, "len": 9, "type": 1}],
+                 "quote": {"ownerId": "u1", "msg": "Tin cũ", "fromD": "An cũ"}},
+                {"msgId": "1002", "cliMsgId": "c1002", "uidFrom": "me", "idTo": "u1", "msgType": "chat.photo",
+                 "content": {"hd": "https://cdn.example/p.jpg", "normalUrl": "https://cdn.example/n.jpg", "title": "Ảnh đẹp", "params": {"width": 640, "height": 480}}, "ts": 2_000},
+                {"msgId": "1003", "cliMsgId": "c1003", "uidFrom": "u1", "idTo": "me", "msgType": "chat.sticker", "content": {"id": 3, "catId": 0, "type": 7}, "ts": 3_000},
+                {"msgId": "1004", "cliMsgId": "c1004", "uidFrom": "u1", "idTo": "me", "msgType": "chat.gif", "content": {"href": "https://cdn.example/a.gif"}, "ts": 4_000},
+                {"msgId": "1005", "cliMsgId": "c1005", "uidFrom": "u1", "idTo": "me", "msgType": "chat.video.msg",
+                 "content": {"href": "https://cdn.example/v.mp4", "thumb": "https://cdn.example/v.jpg", "title": "Clip", "params": {"duration": 12_000}}, "ts": 5_000},
+                {"msgId": "1006", "cliMsgId": "c1006", "uidFrom": "u1", "idTo": "me", "msgType": "chat.voice",
+                 "content": {"href": "https://cdn.example/v.m4a", "params": {"duration": 3_000}}, "ts": 6_000},
+                {"msgId": "1007", "cliMsgId": "c1007", "uidFrom": "u1", "idTo": "me", "msgType": "share.file",
+                 "content": {"title": "báo cáo", "href": "https://cdn.example/f.pdf", "params": {"fileExt": "pdf", "fileSize": "123456"}}, "ts": 7_000},
+                {"msgId": "1008", "cliMsgId": "c1008", "uidFrom": "u1", "idTo": "me", "msgType": "chat.recommended",
+                 "content": {"action": "recommened.link", "href": "https://example.com/x", "title": "Ví dụ", "description": "Mô tả", "thumb": "https://cdn.example/t.jpg"}, "ts": 8_000},
+                {"msgId": "1009", "cliMsgId": "c1009", "uidFrom": "u1", "idTo": "me", "msgType": "chat.recommended",
+                 "content": {"action": "recommened.link", "href": "file:///etc/passwd", "title": "bad"}, "ts": 9_000},
+                {"msgId": "1010", "cliMsgId": "c1010", "uidFrom": "u1", "idTo": "me", "msgType": "chat.recommended",
+                 "content": {"action": "recommened.user", "title": "Nguyễn Văn B", "params": "777888", "thumb": "https://cdn.example/a.jpg"}, "ts": 10_000},
+                {"msgId": "1011", "cliMsgId": "c1011", "uidFrom": "u1", "idTo": "me", "msgType": "chat.location.new",
+                 "content": {"title": "Quán", "description": "Hà Nội", "params": {"lat": 21.0285, "lon": 105.8542, "locationName": "Quán cà phê"}}, "ts": 11_000},
+                {"msgId": "1012", "cliMsgId": "c1012", "uidFrom": "u1", "idTo": "me", "msgType": "chat.recommended",
+                 "content": {"action": "recommened.misscall", "params": {"duration": 0}}, "ts": 12_000},
+                {"msgId": "1013", "cliMsgId": "c1013", "uidFrom": "u1", "idTo": "me", "msgType": "chat.ecard",
+                 "content": {"action": "ecard.reminder", "title": "Họp", "description": "10h", "href": "https://cdn.example/e.png", "params": {"startTime": 1_795_000_000_000_i64, "topicTitle": "Họp nhóm", "repeatLabel": "Hằng ngày"}}, "ts": 13_000},
+                {"msgId": "1014", "cliMsgId": "c1014", "uidFrom": "u1", "idTo": "me", "msgType": "chat.poll",
+                 "content": {"question": "Ăn gì?", "description": "An đã bình chọn", "params": {"poll_id": "77", "is_anonymous": false}}, "ts": 14_000},
+                {"msgId": "1015", "cliMsgId": "c1015", "uidFrom": "u1", "idTo": "me", "msgType": "chat.sys", "content": {"title": "Nhóm đổi tên"}, "ts": 15_000},
+                {"msgId": "1016", "cliMsgId": "c1016", "uidFrom": "u1", "idTo": "me", "msgType": "chat.webcontent", "content": {"title": "Zinstant", "description": "d", "thumb": "https://cdn.example/z.png"}, "ts": 16_000},
+                {"msgId": "1017", "cliMsgId": "c1017", "uidFrom": "u1", "idTo": "me", "msgType": "webchat", "content": cipher, "ts": 17_000},
+                {"msgId": "1018", "cliMsgId": "c1018", "uidFrom": "u1", "idTo": "me", "msgType": "chat.mystery", "content": {"title": "lạ"}, "ts": 18_000},
+                {"msgId": "1019", "cliMsgId": "c1019", "uidFrom": "u1", "idTo": "me", "msgType": "chat.sticker", "content": {"id": cipher, "catId": cipher, "type": cipher}, "ts": 19_000},
+                {"msgType": "chat.undo", "uidFrom": "u1", "idTo": "me", "content": {"globalMsgId": "1001", "cliMsgId": "c1001"}}
+            ]
+        }
+    });
+    let options = WireOptions {
+        self_conv_id: Some("cloud999".into()),
+        names: vec![NameEntry {
+            uid: "u1".into(),
+            name: "An".into(),
+            avatar: "https://ava.example/an.jpg".into(),
+        }],
+        ..WireOptions::default()
+    };
+    let events = parse_wire_batch(root.to_string(), "me".into(), options).unwrap();
+    assert!(events.len() >= 19);
+
+    let mut tags = HashSet::new();
+    for ev in &events {
+        if let WireEvent::Message { message, stored } = ev {
+            tags.insert(stored.kind_tag.as_str());
+            if message.id == "1001" {
+                assert_eq!(message.sender_name, "An");
+                assert_eq!(message.mentions.len(), 2);
+                assert_eq!(message.quote.as_ref().unwrap().sender_name, "An");
+            }
+            if message.id == "1009" {
+                assert!(matches!(
+                    message.kind,
+                    KindRecord::Link { url: None, .. }
+                ));
+            }
+            if message.id == "1017" || message.id == "1019" {
+                assert!(stored.locked);
+                assert!(matches!(message.kind, KindRecord::Placeholder { .. }));
+            }
+        }
+    }
+    for tag in [
+        "text", "photo", "sticker", "gif", "video", "voice", "file", "link", "contactCard",
+        "location", "call", "ecard", "poll", "system", "placeholder", "unsupported",
+    ] {
+        assert!(tags.contains(tag), "kind {tag} missing (got {tags:?})");
+    }
+    assert!(matches!(
+        events.last().unwrap(),
+        WireEvent::Undo {
+            msg_id,
+            cli_msg_id,
+            ..
+        } if msg_id == "1001" && cli_msg_id == "c1001"
+    ));
+}
+
+#[tokio::test]
+async fn typed_store_reads_and_single_lookup_golden_fixtures() {
+    fn stored_row(id: &str, ts: i64, kind: &str, mut dict: serde_json::Map<String, serde_json::Value>) -> MessageRow {
+        dict.insert("id".into(), serde_json::json!(id));
+        if !dict.contains_key("clientId") {
+            dict.insert("clientId".into(), serde_json::json!(format!("cli{id}")));
+        }
+        dict.insert("conversationId".into(), serde_json::json!("u1"));
+        dict.insert("date".into(), serde_json::json!(ts));
+        if !dict.contains_key("kind") {
+            dict.insert("kind".into(), serde_json::json!({"type": kind}));
+        }
+        let client_id = dict
+            .get("clientId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let text = dict
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let kind_tag = dict
+            .get("kind")
+            .and_then(|v| v.as_object())
+            .and_then(|k| k.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("text")
+            .to_owned();
+        let raw_json = serde_json::to_vec(&serde_json::Value::Object(dict)).unwrap();
+        MessageRow {
+            id: id.into(),
+            conv_id: "u1".into(),
+            client_id,
+            sender_id: "u1".into(),
+            sender_name: "An".into(),
+            sender_avatar: String::new(),
+            is_mine: false,
+            text,
+            kind_tag,
+            ts_ms: ts,
+            status: "sent".into(),
+            raw_json,
+        }
+    }
+
+    let obj_from = |v: serde_json::Value| v.as_object().unwrap().clone();
+    let heart = serde_json::json!({"type": "5", "key": "/-heart", "emoji": "❤️", "image": "", "count": 3, "includesMe": true, "names": ["Bạn", "An"], "people": 2, "userCounts": {"me": 1, "u1": 2}});
+    let ghost = serde_json::json!({"type": "3", "key": "/-strong", "emoji": "👍", "image": "", "count": 1, "includesMe": false, "names": ["Người dùng Zalo"], "people": 1});
+    let sentinel = serde_json::json!({"type": "0", "key": ":>", "emoji": "😆", "count": 2, "includesMe": false, "names": ["Lan"], "people": 1, "userCounts": {"__legacy__": 2}});
+    let menu = serde_json::json!({"forward": "ok", "recall": true, "delete": "forMe", "pin": true, "star": "unstar", "starred": true, "pinned": true, "protected": true});
+
+    let rows = vec![
+        stored_row("2001", 1_000, "text", obj_from(serde_json::json!({"text": "xin chào", "senderAvatar": "https://ava.example/a.jpg", "isMine": true, "status": "delivered", "reactions": [heart, ghost, sentinel], "mentions": [{"uid": "u2", "pos": 1, "len": 3, "isAll": false}, {"uid": "", "pos": 0, "len": 1}], "menu": menu, "quote": {"senderName": "An", "text": "tin cũ"}, "isE2EE": true, "buttons": [{"ref": "b1", "label": "  Mở  ", "enabled": true, "help": "h"}, {"ref": "", "label": "x"}], "stickers": true}))),
+        stored_row("2002", 2_000, "photo", obj_from(serde_json::json!({"kind": {"type": "photo", "url": "https://cdn.example/p.jpg", "width": 640.0, "height": 480, "fallbacks": ["https://cdn.example/n.jpg", "", "ht tp://bad url"]}, "text": "Ảnh"}))),
+        stored_row("2003", 3_000, "sticker", obj_from(serde_json::json!({"kind": {"type": "sticker", "url": "  https://cdn.example/s.png "}, "text": "[Sticker]"}))),
+        stored_row("2004", 4_000, "link", obj_from(serde_json::json!({"kind": {"type": "link", "title": "T", "url": "javascript:alert(1)", "thumbnail": "https://cdn.example/t.jpg", "description": "d", "source": "s"}}))),
+        stored_row("2005", 5_000, "link", obj_from(serde_json::json!({"kind": {"type": "link", "title": "T", "url": "https://example.com/ok", "thumbnail": "", "description": "d", "source": "example.com"}}))),
+        stored_row("2006", 6_000, "file", obj_from(serde_json::json!({"kind": {"type": "file", "name": "a.pdf", "size": 1.5e9, "url": "https://cdn.example/a.pdf"}, "text": "a.pdf"}))),
+        stored_row("2007", 7_000, "location", obj_from(serde_json::json!({"kind": {"type": "location", "title": "Quán", "address": "Hà Nội", "hasCoordinates": true, "latitude": 21.03, "longitude": 105.85, "thumbnail": "https://cdn.example/m.png"}}))),
+        stored_row("2008", 8_000, "location", obj_from(serde_json::json!({"kind": {"type": "location", "title": "Sai", "address": "", "hasCoordinates": true, "latitude": 999.0, "longitude": 105.85, "thumbnail": ""}}))),
+        stored_row("2009", 9_000, "ecard", obj_from(serde_json::json!({"kind": {"type": "ecard", "style": "birthday", "image": "https://cdn.example/e.png", "thumb": "", "title": "SN", "description": "d", "actions": ["a", "", "b"], "avatars": ["https://cdn.example/1.png", "bad url"], "reminderTitle": "r", "reminderStart": 5.0e12, "reminderRepeat": ""}}))),
+        stored_row("2010", 10_000, "ecard", obj_from(serde_json::json!({"kind": {"type": "ecard", "style": "weird", "title": "x", "reminderStart": 1_795_000_000_000.0}}))),
+        stored_row("2011", 11_000, "oaMessage", obj_from(serde_json::json!({"kind": {"type": "oaMessage", "parts": [{"header": true, "title": "Tiêu đề", "description": "d", "thumb": "https://cdn.example/h.png", "url": "https://oa.example/1", "help": ""}, {"title": "", "thumb": ""}, {"header": false, "title": "Dòng", "url": "file:///x"}]}}))),
+        stored_row("2012", 12_000, "poll", obj_from(serde_json::json!({"kind": {"type": "poll", "question": "Q", "header": "H", "anonymous": true, "pollId": "9", "conversationId": "u1"}}))),
+        stored_row("2013", 13_000, "call", obj_from(serde_json::json!({"kind": {"type": "call", "video": true, "missed": true, "duration": 65, "title": "Bạn bị nhỡ", "detail": "1 phút"}}))),
+        stored_row("2014", 14_000, "contactCard", obj_from(serde_json::json!({"kind": {"type": "contactCard", "name": "B", "uid": "77", "avatar": "https://cdn.example/b.png", "phone": "0900", "qr": "", "oaLink": "", "isOA": true}}))),
+        stored_row("2015", 15_000, "placeholder", obj_from(serde_json::json!({"kind": {"type": "placeholder", "symbol": "", "text": "🔒 Tin nhắn mã hóa"}, "isE2EE": true}))),
+        stored_row("2016", 16_000, "notice", obj_from(serde_json::json!({"kind": {"type": "notice", "symbol": "", "text": "Thông báo"}}))),
+        stored_row("2017", 17_000, "recalled", obj_from(serde_json::json!({"text": "", "reactions": []}))),
+        stored_row("2018", 18_000, "unsupported", obj_from(serde_json::json!({"kind": {"type": "unsupported", "rawType": "chat.x"}}))),
+        stored_row("2019", 19_000, "video", obj_from(serde_json::json!({"kind": {"type": "video", "thumbnail": "https://cdn.example/v.jpg", "duration": 12, "url": "https://cdn.example/v.mp4"}}))),
+        stored_row("2020", 20_000, "voice", obj_from(serde_json::json!({"kind": {"type": "voice", "url": "https://cdn.example/v.m4a", "duration": 3}}))),
+        stored_row("2021", 21_000, "zinstant", obj_from(serde_json::json!({"kind": {"type": "zinstant", "title": "Z", "text": "t", "thumb": "https://cdn.example/z.png"}}))),
+        stored_row("2022", 22_000, "stickerSet", obj_from(serde_json::json!({"kind": {"type": "stickerSet", "title": "Bộ", "thumb": ""}}))),
+        stored_row("2023", 23_000, "gif", obj_from(serde_json::json!({"kind": {"type": "gif", "url": "https://cdn.example/a.gif"}}))),
+        stored_row("2024", 24_000, "system", obj_from(serde_json::json!({"text": "Nhóm đổi tên"}))),
+        MessageRow {
+            id: "2025".into(),
+            conv_id: "u1".into(),
+            client_id: "cli2025".into(),
+            sender_id: "u1".into(),
+            sender_name: "An".into(),
+            sender_avatar: String::new(),
+            is_mine: false,
+            text: "hỏng".into(),
+            kind_tag: "text".into(),
+            ts_ms: 25_000,
+            status: "sent".into(),
+            raw_json: b"not json".to_vec(),
+        },
+        MessageRow {
+            id: "2026".into(),
+            conv_id: "u1".into(),
+            client_id: "colcli".into(),
+            sender_id: "u1".into(),
+            sender_name: "An".into(),
+            sender_avatar: String::new(),
+            is_mine: false,
+            text: "t".into(),
+            kind_tag: "text".into(),
+            ts_ms: 26_000,
+            status: "sent".into(),
+            raw_json: br#"{"id":"2026","conversationId":"u1","kind":{"type":"text"},"text":"t","date":26000}"#.to_vec(),
+        },
+    ];
+
+    let total_rows = rows.len();
+    let dir = tempfile::tempdir().unwrap();
+    let store = CoreStore::open(dir.path().join("t.db").to_string_lossy().into_owned()).unwrap();
+    store.save_messages(rows.clone()).await.unwrap();
+
+    let all = store.messages_chat("u1".into(), None, 100).await.unwrap();
+    assert_eq!(all.len(), total_rows - 1); // 2025 corrupt row drops
+
+    // Sync reader agrees with async reader
+    assert_eq!(
+        store.read_chat_messages_now("u1".into(), Some(20_500), 100).unwrap(),
+        store.messages_chat("u1".into(), Some(20_500), 100).await.unwrap()
+    );
+    assert_eq!(
+        store.read_chat_messages_now("u1".into(), None, 5).unwrap(),
+        store.messages_chat("u1".into(), None, 5).await.unwrap()
+    );
+    assert_eq!(
+        store.search_messages_chat("u1".into(), "xin".into(), 10).await.unwrap().len(),
+        1
+    );
+    let around = store
+        .messages_around_chat("u1".into(), 5_000, None, 2, 6)
+        .await
+        .unwrap();
+    assert!(!around.messages.is_empty());
+
+    // Canonical re-encode round-trip produces identical decoded messages
+    let dir2 = tempfile::tempdir().unwrap();
+    let store2 = CoreStore::open(dir2.path().join("t2.db").to_string_lossy().into_owned()).unwrap();
+    store2
+        .save_chat_messages(all.iter().map(|r| r.message.clone()).collect(), false, false)
+        .await
+        .unwrap();
+    assert_eq!(store2.messages_chat("u1".into(), None, 100).await.unwrap(), all);
+
+    // Every non-corrupt row resolves by server id and client id; 2025 corrupt and misses return None
+    let mut found = 0usize;
+    for r in &rows {
+        for key in [r.id.as_str(), r.client_id.as_str()] {
+            let got = store.message_chat("u1".into(), key.into()).await.unwrap();
+            if r.id == "2025" {
+                assert!(got.is_none());
+            } else {
+                let got = got.expect("valid row");
+                found += 1;
+                assert_eq!(got.row_id, r.id);
+                assert_eq!(got.row_client_id, r.client_id);
+            }
+        }
+    }
+    assert!(found > 40);
+    assert!(store.message_chat("u1".into(), "missing".into()).await.unwrap().is_none());
+    assert!(store.message_chat("other".into(), "2001".into()).await.unwrap().is_none());
+    let fallback = store
+        .message_chat("u1".into(), "colcli".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((fallback.row_id.as_str(), fallback.row_client_id.as_str()), ("2026", "colcli"));
+}
+
+#[test]
+fn history_batch_with_quote_photo_and_undo_matches_parse_wire_batch() {
+    let body = serde_json::json!({
+        "error_code": 0,
+        "data": {
+            "hasMore": 1,
+            "isOld": 0,
+            "lastMsgId": "7412345678901234500",
+            "groupMsgs": [
+                {"msgId": "7412345678901234567", "cliMsgId": "c1", "uidFrom": "u1", "idTo": "g1", "msgType": "webchat", "content": "Chào nhóm", "ts": 1_795_000_000_000_i64,
+                 "quote": {"ownerId": "u1", "msg": "Tin cũ", "fromD": "x"}},
+                {"msgId": "7412345678901234568", "cliMsgId": "c2", "uidFrom": "me", "idTo": "g1", "msgType": "chat.photo", "content": {"hd": "https://cdn.example/p.jpg", "title": "Anh"}, "ts": 1_795_000_001_000_i64},
+                {"msgType": "chat.undo", "uidFrom": "u1", "idTo": "g1", "content": {"globalMsgId": "7412345678901234567", "cliMsgId": "c1"}}
+            ]
+        }
+    });
+    let h = history_record_from_json(body.to_string()).unwrap();
+    assert!(h.has_more && !h.is_old);
+    assert_eq!(h.last_msg_id, "7412345678901234500");
+    assert_eq!(h.uids, vec!["me".to_owned(), "u1".to_owned()]);
+    for fallback in ["g1", "g:g1"] {
+        let o = WireOptions {
+            fallback_conv_id: Some(fallback.into()),
+            is_group_hint: Some(true),
+            self_conv_id: Some("cloud999".into()),
+            names: vec![NameEntry {
+                uid: "u1".into(),
+                name: "An".into(),
+                avatar: "https://ava.example/an.jpg".into(),
+            }],
+            ..WireOptions::default()
+        };
+        let typed = h.batch.events("me".into(), o.clone());
+        let via_json = parse_wire_batch(h.batch.raw_json(), "me".into(), o).unwrap();
+        assert!(typed.len() >= 3);
+        assert_eq!(typed, via_json);
+    }
+}
