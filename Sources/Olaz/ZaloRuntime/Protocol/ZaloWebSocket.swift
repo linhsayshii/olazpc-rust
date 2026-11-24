@@ -26,6 +26,8 @@ struct ZaloWSEvent: @unchecked Sendable {
     let payload: [String: Any]
     /// Set (and `payload` empty) when the Rust core delivered the envelope pre-parsed.
     var typed: ZaloWSTypedChat? = nil
+    /// Set when a frame updated queue cursors, serialized on the WS stream after the frame itself.
+    var cursorsChanged: [String: ZaloWSQueueCursorSnapshot]? = nil
 
     var isChatPushOrPull: Bool {
         switch cmd {
@@ -104,15 +106,20 @@ final class RustWSCursorBox: @unchecked Sendable {
         lock.lock(); cursors.removeAll(); lock.unlock()
     }
 
-    /// Replaces the mirror with the core's latest snapshot and notifies the observer when it changed.
-    func update(_ entries: [CursorEntry]) {
+    /// Replaces the mirror with the core's latest snapshot, notifies any observer, and returns the snapshot if changed.
+    @discardableResult
+    func update(_ entries: [CursorEntry]) -> [String: ZaloWSQueueCursorSnapshot]? {
         let next = Self.snapshots(entries)
         lock.lock()
         let changed = next != cursors
         cursors = next
         let obs = observer
         lock.unlock()
-        if changed { obs?(next) }
+        if changed {
+            obs?(next)
+            return next
+        }
+        return nil
     }
 }
 
@@ -145,7 +152,9 @@ private final class RustWSListener: WsListener, @unchecked Sendable {
     }
 
     func onCursorsChanged(cursors entries: [CursorEntry]) {
-        cursors.update(entries)
+        if let updated = cursors.update(entries) {
+            continuation.yield(ZaloWSEvent(cmd: 0, subCmd: 0, version: 0, payload: [:], cursorsChanged: updated))
+        }
     }
 
     func onStopped() {
