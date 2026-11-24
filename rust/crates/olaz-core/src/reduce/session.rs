@@ -37,13 +37,7 @@ pub fn reduce_session(state: &mut CoreState, input: Input, out: &mut ReduceOutpu
             }
             match account {
                 Some(acc) if !acc.user_id.is_empty() => {
-                    begin_store_prepare_for_boot(
-                        state,
-                        boot_gen,
-                        acc,
-                        ws_endpoints,
-                        out,
-                    );
+                    begin_store_prepare_for_boot(state, boot_gen, acc, ws_endpoints, out);
                 }
                 _ => {
                     tracing::debug!("session: saved session has empty user id, starting qr login");
@@ -69,13 +63,7 @@ pub fn reduce_session(state: &mut CoreState, input: Input, out: &mut ReduceOutpu
                         out.effects.push(Effect::Host(HostCall::PersistSession));
                     }
                     out.effects.push(Effect::Host(HostCall::PersistSession));
-                    begin_store_prepare_for_boot(
-                        state,
-                        boot_gen,
-                        acc,
-                        ws_endpoints,
-                        out,
-                    );
+                    begin_store_prepare_for_boot(state, boot_gen, acc, ws_endpoints, out);
                 }
                 _ => {
                     tracing::debug!(

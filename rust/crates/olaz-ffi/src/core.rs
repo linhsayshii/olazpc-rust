@@ -2,18 +2,22 @@
 //!
 //! Credentials and user-facing personal data never reach `Debug` output or error messages (ADR-008).
 
+use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use olaz_api::PollState;
+use olaz_core::changes::DirtyKey;
+use olaz_core::conversations::{BatchApplyDelta, ConversationSummary, sort_conversations};
 use olaz_core::reduce::classify::{MobileSyncEvent, Route, classify};
-use olaz_core::runner::WsDriver;
+use olaz_core::reduce::reduce;
+use olaz_core::runner::{SharedStoreSlot, WsDriver};
 use olaz_core::state::PersistedTransportState;
 use olaz_core::typed_chat::{TypedChatEnvelope, WirePayloadHandle};
 use olaz_core::{
-    Command, CoreChanges, CoreFailKind, CoreHandle, FailReason, Host, LegacyCookie, LoginState,
-    LoginStep, Phase, Profile, SessionEffectRunner, SessionSnapshot,
+    Command, CoreChanges, CoreFailKind, CoreHandle, CoreState, FailReason, Host, Input,
+    LegacyCookie, LoginState, LoginStep, Phase, Profile, SessionEffectRunner, SessionSnapshot,
 };
 use olaz_json::to_swift_json_string;
 use olaz_net::{LoginAccount, NetworkErrorKind};
@@ -22,9 +26,16 @@ use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
 use crate::api::PollStateRecord;
+use crate::conversations::{
+    BatchApplyDeltaRecord, ConversationActionResultRecord, ConversationActionUiRecord,
+    ConversationActionsRecord, ConversationExtrasRecord, ConversationPromptRecord,
+    ConversationSummaryRecord, IdentityTableRecord, MessagePreviewInputRecord, PinBoardRecord,
+    PromptUpdateRecord, RankEntry, SeenTargetRecord,
+};
 use crate::error::{CoreError, NetworkKind};
 use crate::runtime::{run, runtime};
 use crate::session::CoreSession;
+use crate::store::CoreStore;
 use crate::wire::{NameEntry, WireEvent, convert as convert_wire_event};
 use crate::ws::{CursorEntry, to_entries as cursors_to_entries, to_map as cursors_to_map};
 
@@ -363,6 +374,11 @@ impl From<SessionSnapshot> for SessionStateRecord {
 pub struct CoreChangesRecord {
     pub version: u64,
     pub session: Option<SessionStateRecord>,
+    pub conversations: Option<Vec<ConversationSummaryRecord>>,
+    pub conversation_flags: Option<ConversationActionsRecord>,
+    pub conversation_extras: Option<ConversationExtrasRecord>,
+    pub conversation_ui: Option<ConversationActionUiRecord>,
+    pub conversation_prompt: Option<PromptUpdateRecord>,
 }
 
 impl fmt::Debug for CoreChangesRecord {
@@ -370,6 +386,14 @@ impl fmt::Debug for CoreChangesRecord {
         f.debug_struct("CoreChangesRecord")
             .field("version", &self.version)
             .field("session", &self.session)
+            .field(
+                "conversations_count",
+                &self.conversations.as_ref().map(Vec::len),
+            )
+            .field("conversation_flags", &self.conversation_flags)
+            .field("conversation_extras", &self.conversation_extras)
+            .field("conversation_ui", &self.conversation_ui)
+            .field("conversation_prompt", &self.conversation_prompt)
             .finish()
     }
 }
@@ -379,6 +403,15 @@ impl From<CoreChanges> for CoreChangesRecord {
         Self {
             version: c.version,
             session: c.session.map(Into::into),
+            conversations: c
+                .conversations
+                .map(|list| list.into_iter().map(Into::into).collect()),
+            conversation_flags: c.conversation_flags.map(Into::into),
+            conversation_extras: c.conversation_extras.map(Into::into),
+            conversation_ui: c.conversation_ui.map(Into::into),
+            conversation_prompt: c.conversation_prompt.map(|p| PromptUpdateRecord {
+                prompt: p.map(Into::into),
+            }),
         }
     }
 }
@@ -688,6 +721,183 @@ pub fn classify_control_envelope(
         .collect()
 }
 
+/// Pure conversation list ordering backed by `olaz_core::conversations::sort_conversations`.
+#[uniffi::export]
+pub fn sort_conversations_order(
+    items: Vec<ConversationSummaryRecord>,
+    activity_ranks: Vec<RankEntry>,
+) -> Vec<ConversationSummaryRecord> {
+    let mut list: Vec<ConversationSummary> = items.into_iter().map(Into::into).collect();
+    let mut ranks = BTreeMap::new();
+    for entry in activity_ranks {
+        ranks.insert(entry.conv_id, entry.rank);
+    }
+    sort_conversations(&mut list, &ranks);
+    list.into_iter().map(Into::into).collect()
+}
+
+/// Pure synchronous wrapper around `olaz_core::reduce::reduce` for offline unit tests where
+/// `ZaloEngine` is constructed without calling `start()` (never allocated when `CoreEngine` runs).
+#[derive(uniffi::Object)]
+pub struct CoreOfflineConversations {
+    inner: Mutex<(CoreState, u64)>,
+}
+
+impl CoreOfflineConversations {
+    fn apply_cmd(&self, cmd: Command) -> CoreChangesRecord {
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let (state, version) = &mut *guard;
+        let out = reduce(state, Input::Command(cmd));
+        if !out.dirty.is_empty() {
+            *version = version.saturating_add(1);
+        }
+        let mut rec = CoreChangesRecord {
+            version: *version,
+            session: None,
+            conversations: None,
+            conversation_flags: None,
+            conversation_extras: None,
+            conversation_ui: None,
+            conversation_prompt: None,
+        };
+        for key in out.dirty {
+            match key {
+                DirtyKey::Session => rec.session = Some(state.session.snapshot().into()),
+                DirtyKey::Conversations => {
+                    rec.conversations = Some(
+                        state
+                            .conversations
+                            .conversations
+                            .iter()
+                            .cloned()
+                            .map(Into::into)
+                            .collect(),
+                    );
+                }
+                DirtyKey::ConversationFlags => {
+                    rec.conversation_flags = Some(state.conversations.actions.clone().into());
+                }
+                DirtyKey::ConversationExtras => {
+                    rec.conversation_extras = Some(state.conversations.extras.clone().into());
+                }
+                DirtyKey::ConversationUi => {
+                    rec.conversation_ui = Some(state.conversations.ui.clone().into());
+                }
+                DirtyKey::ConversationPrompt => {
+                    rec.conversation_prompt = Some(PromptUpdateRecord {
+                        prompt: state.conversations.prompt.clone().map(Into::into),
+                    });
+                }
+            }
+        }
+        rec
+    }
+}
+
+#[uniffi::export]
+impl CoreOfflineConversations {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new((CoreState::default(), 0)),
+        })
+    }
+
+    pub fn sync_context(
+        &self,
+        identities: IdentityTableRecord,
+        my_uid: String,
+        my_avatar: Option<String>,
+        self_conv_id: Option<String>,
+        open_conv_id: Option<String>,
+    ) {
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let (state, _) = &mut *guard;
+        state.conversations.identities = identities.into();
+        state.conversations.open_conversation_id = open_conv_id;
+        state.session.self_conversation_id = self_conv_id;
+        if !my_uid.is_empty() {
+            state.session.profile = Some(Profile {
+                user_id: my_uid,
+                display_name: String::new(),
+                avatar: my_avatar,
+                phone: None,
+            });
+        }
+    }
+
+    pub fn sync_conversations(&self, list: Vec<ConversationSummaryRecord>) {
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.0.conversations.conversations = list.into_iter().map(Into::into).collect();
+    }
+
+    pub fn update_conversation_on_message(
+        &self,
+        msg: MessagePreviewInputRecord,
+        increment_unread: bool,
+    ) -> CoreChangesRecord {
+        self.apply_cmd(Command::UpdateConversationOnMessage {
+            msg: msg.into(),
+            increment_unread,
+        })
+    }
+
+    pub fn apply_batch_delta(&self, delta: BatchApplyDeltaRecord) -> CoreChangesRecord {
+        self.apply_cmd(Command::ApplyBatchDelta(delta.into()))
+    }
+
+    pub fn ensure_known_contacts(&self) -> CoreChangesRecord {
+        self.apply_cmd(Command::EnsureKnownContacts)
+    }
+
+    pub fn rebuild_conversation_extras(&self) -> CoreChangesRecord {
+        self.apply_cmd(Command::RebuildConversationExtras)
+    }
+
+    pub fn republish_conversation_actions(&self) -> CoreChangesRecord {
+        self.apply_cmd(Command::RepublishConversationActions)
+    }
+
+    pub fn handle_conversation_actions(&self, state_json: String) -> CoreChangesRecord {
+        let map = olaz_json::parse_object_str(&state_json).unwrap_or_default();
+        self.apply_cmd(Command::HandleConversationActions { state: map })
+    }
+
+    pub fn handle_conversation_extras(&self, state_json: String) -> CoreChangesRecord {
+        let map = olaz_json::parse_object_str(&state_json).unwrap_or_default();
+        self.apply_cmd(Command::HandleConversationExtras { state: map })
+    }
+
+    pub fn set_conversation_filter(
+        &self,
+        filter_type: i32,
+        label_ids: Vec<String>,
+    ) -> CoreChangesRecord {
+        self.apply_cmd(Command::SetConversationFilter {
+            filter_type,
+            label_ids,
+        })
+    }
+
+    pub fn report_conversation_action_result(
+        &self,
+        result: ConversationActionResultRecord,
+    ) -> CoreChangesRecord {
+        self.apply_cmd(Command::ReportConversationActionResult(result.into()))
+    }
+
+    pub fn reset_conversation_actions(&self) -> CoreChangesRecord {
+        self.apply_cmd(Command::ResetConversationActions)
+    }
+
+    pub fn set_conversation_prompt(
+        &self,
+        prompt: Option<ConversationPromptRecord>,
+    ) -> CoreChangesRecord {
+        self.apply_cmd(Command::SetConversationPrompt(prompt.map(Into::into)))
+    }
+}
+
 /// Platform host callbacks implemented by Swift (`ZaloEngineCoreHost`).
 ///
 /// Called serially in emitted order on the core's host worker; never invoked concurrently.
@@ -712,7 +922,7 @@ pub trait CoreHost: Send + Sync {
     async fn clear_session(&self);
     async fn mark_expired(&self, snapshot_json: String);
 
-    // --- Transport domain callbacks (U2) ---
+    // --- Transport domain callbacks (U2 / U3) ---
     async fn persist_poll_state(&self, state: PollStateRecord);
     async fn persist_ws_cursors(&self, cursors: Vec<CursorEntry>);
     async fn apply_batch(
@@ -721,7 +931,7 @@ pub trait CoreHost: Send + Sync {
         increment_unread: bool,
         notify_incoming: bool,
         payload_json: String,
-    ) -> u32;
+    ) -> BatchApplyDeltaRecord;
     async fn apply_parsed_events(
         &self,
         cmd: u16,
@@ -730,7 +940,7 @@ pub trait CoreHost: Send + Sync {
         events: Vec<WireEvent>,
         uids: Vec<String>,
         payload: Arc<CoreWirePayload>,
-    );
+    ) -> BatchApplyDeltaRecord;
     async fn mobile_sync(&self, events: Vec<MobileSyncEventRecord>);
     async fn e2ee_signal(&self, cmd: u16, payload_json: String);
     async fn e2ee_deliver_reports(&self, cmd: u16, payload_json: String);
@@ -824,11 +1034,12 @@ impl Host for FfiHostBridge {
         increment_unread: bool,
         notify_incoming: bool,
         payload: Map<String, Value>,
-    ) -> u32 {
+    ) -> BatchApplyDelta {
         let payload_json = to_swift_json_string(&Value::Object(payload));
         self.0
             .apply_batch(cmd, increment_unread, notify_incoming, payload_json)
             .await
+            .into()
     }
 
     async fn apply_parsed_events(
@@ -837,7 +1048,7 @@ impl Host for FfiHostBridge {
         increment_unread: bool,
         notify_incoming: bool,
         envelope: TypedChatEnvelope,
-    ) {
+    ) -> BatchApplyDelta {
         let events = envelope
             .events
             .into_iter()
@@ -855,7 +1066,8 @@ impl Host for FfiHostBridge {
                 envelope.uids,
                 payload,
             )
-            .await;
+            .await
+            .into()
     }
 
     async fn mobile_sync(&self, events: Vec<MobileSyncEvent>) {
@@ -926,13 +1138,16 @@ fn parse_inner_json(json: &str) -> Result<Map<String, Value>, CoreError> {
 
 /// The `olaz-core` actor handle exported to Swift.
 ///
-/// Owns session & transport state (boot, QR login, expiry, logout, WebSocket lifecycle,
-/// long-poll loop, and event routing) over the shared [`CoreSession`].
+/// Owns session, transport, and conversations/conversation-actions state (boot, QR login, expiry,
+/// logout, WebSocket lifecycle, long-poll loop, event routing, conversation list/filters/labels,
+/// pin/archive/delete/unread/hidden actions) over the shared [`CoreSession`] and [`CoreStore`].
 /// Swift pushes commands via sync/async methods and pulls coalesced updates via [`Self::next_changes`].
 #[derive(uniffi::Object)]
 pub struct CoreEngine {
     handle: Arc<CoreHandle>,
+    runner: Arc<SessionEffectRunner<olaz_net::ReqwestTransport>>,
     ws_driver: Arc<dyn WsDriver>,
+    shared_store: SharedStoreSlot,
 }
 
 #[uniffi::export]
@@ -948,11 +1163,33 @@ impl CoreEngine {
             session.default_domains.clone(),
         ));
         let ws_driver = Arc::clone(runner.ws_driver());
-        let handle = CoreHandle::start(runner, rt_handle);
+        let shared_store = runner.shared_store_slot();
+        let runner_dyn: Arc<dyn olaz_core::EffectRunner> =
+            Arc::clone(&runner) as Arc<dyn olaz_core::EffectRunner>;
+        let handle = CoreHandle::start(runner_dyn, rt_handle);
         Ok(Arc::new(Self {
             handle: Arc::new(handle),
+            runner,
             ws_driver,
+            shared_store,
         }))
+    }
+
+    /// Attaches the account's opened [`CoreStore`] so `olaz-core` can hydrate local conversation
+    /// state and run serial SQLite persistence directly without Swift hops.
+    pub fn attach_store(&self, store: Arc<CoreStore>) {
+        *self
+            .shared_store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(store.shared_store());
+    }
+
+    /// Detaches any attached [`CoreStore`] handle.
+    pub fn detach_store(&self) {
+        *self
+            .shared_store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     /// Starts the engine (idempotent; subsequent calls are no-ops).
@@ -1008,6 +1245,417 @@ impl CoreEngine {
         })
         .await?;
         Ok(count)
+    }
+
+    // --- Conversations & conversation actions domain (U3) ---
+
+    /// Synchronously enqueues an updated identity table (FIFO-ordered before any later command).
+    pub fn update_identities(&self, table: IdentityTableRecord) {
+        self.handle.send(Command::UpdateIdentities(table.into()));
+    }
+
+    /// Synchronously seeds the conversation list in core (used when tests assign `conversations`).
+    pub fn sync_conversations_snapshot(&self, list: Vec<ConversationSummaryRecord>) {
+        self.handle.send(Command::SyncConversationsSnapshot(
+            list.into_iter().map(Into::into).collect(),
+        ));
+    }
+
+    /// Applies a Swift-computed [`BatchApplyDeltaRecord`] and awaits store persistence if requested.
+    pub async fn apply_batch_delta(&self, delta: BatchApplyDeltaRecord) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle
+                .request_unit(Command::ApplyBatchDelta(delta.into()))
+                .await;
+            handle.current_version()
+        })
+        .await
+    }
+
+    /// Synchronously enqueues a single-message conversation preview/unread update.
+    pub fn update_conversation_on_message(
+        &self,
+        msg: MessagePreviewInputRecord,
+        increment_unread: bool,
+    ) {
+        self.handle.send(Command::UpdateConversationOnMessage {
+            msg: msg.into(),
+            increment_unread,
+        });
+    }
+
+    /// Synchronously enqueues `EnsureKnownContacts`.
+    pub fn ensure_known_contacts(&self) {
+        self.handle.send(Command::EnsureKnownContacts);
+    }
+
+    /// Resolves missing conversation display names in 50-UID chunks via `get_profiles`.
+    pub async fn resolve_missing_names(&self) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle.request_unit(Command::ResolveMissingNames).await;
+            handle.current_version()
+        })
+        .await
+    }
+
+    /// Refreshes group `@mention` previews from the attached SQLite store.
+    pub async fn refresh_mention_previews(&self) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle.request_unit(Command::RefreshMentionPreviews).await;
+            handle.current_version()
+        })
+        .await
+    }
+
+    /// Synchronously enqueues the currently open conversation ID (or `None`).
+    pub fn set_open_conversation(&self, id: Option<String>) {
+        self.handle.send(Command::SetOpenConversation { id });
+    }
+
+    /// Persists the current conversation list to SQLite and awaits completion.
+    pub async fn persist_conversations(&self) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle.request_unit(Command::PersistConversations).await;
+            handle.current_version()
+        })
+        .await
+    }
+
+    /// Pins a conversation (or opens the `PinBoard` prompt when at the 10-pin limit).
+    pub fn pin_conversation(&self, id: String) {
+        self.handle.send(Command::PinConversation { id });
+    }
+
+    /// Unpins a conversation.
+    pub fn unpin_conversation(&self, id: String) {
+        self.handle.send(Command::UnpinConversation { id });
+    }
+
+    /// Computes the current [`PinBoardRecord`] for replacing pins.
+    pub async fn request_pin_board(&self, id: String) -> Result<Option<PinBoardRecord>, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let board = run(async move { handle.request_pin_board(id).await }).await?;
+        Ok(board.map(Into::into))
+    }
+
+    /// Unpins `unpin_ids` in order, then pins `pin_id`.
+    pub async fn pin_replacing(
+        &self,
+        unpin_ids: Vec<String>,
+        pin_id: String,
+    ) -> Result<ConversationActionResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let res = run(async move {
+            handle
+                .request_action(Command::PinReplacing { unpin_ids, pin_id })
+                .await
+        })
+        .await?;
+        Ok(res.into())
+    }
+
+    /// Moves a conversation between Focus (`to_other = false`) and Other (`to_other = true`).
+    pub fn move_conversation(&self, id: String, to_other: bool) {
+        self.handle.send(Command::MoveConversation { id, to_other });
+    }
+
+    /// Opens the delete confirmation prompt for `id`.
+    pub fn request_delete_conversation(&self, id: String) {
+        self.handle.send(Command::RequestDeleteConversation { id });
+    }
+
+    /// Deletes a conversation on the server, in SQLite, and in memory.
+    pub fn confirm_delete_conversation(&self, id: String, last_cli_msg_id: String) {
+        self.handle.send(Command::ConfirmDeleteConversation {
+            id,
+            last_cli_msg_id,
+        });
+    }
+
+    /// Clears the active conversation prompt.
+    pub fn dismiss_conversation_prompt(&self) {
+        self.handle.send(Command::DismissConversationPrompt);
+    }
+
+    /// Sets or clears the active conversation prompt.
+    pub fn set_conversation_prompt(&self, prompt: Option<ConversationPromptRecord>) {
+        self.handle
+            .send(Command::SetConversationPrompt(prompt.map(Into::into)));
+    }
+
+    /// Marks a conversation read (clears unread count & manual unread mark, optional read receipt).
+    pub fn mark_conversation_read(&self, id: String, seen_target: Option<SeenTargetRecord>) {
+        self.handle.send(Command::MarkConversationRead {
+            id,
+            seen_target: seen_target.map(Into::into),
+        });
+    }
+
+    /// Adds a manual unread mark to `id`.
+    pub fn mark_conversation_unread(&self, id: String) {
+        self.handle.send(Command::MarkConversationUnread { id });
+    }
+
+    /// Checks whether `pin` matches the stored hidden-chat PIN digest (MD5 or offline SHA-256).
+    pub async fn check_hidden_pin(&self, pin: String) -> Result<bool, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move { handle.request_bool(Command::CheckHiddenPin { pin }).await }).await
+    }
+
+    /// Hides a conversation after verifying the existing PIN.
+    pub async fn hide_conversation(
+        &self,
+        id: String,
+        pin: String,
+    ) -> Result<ConversationActionResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let res = run(async move {
+            handle
+                .request_action(Command::HideConversation { id, pin })
+                .await
+        })
+        .await?;
+        Ok(res.into())
+    }
+
+    /// Sets a new hidden-chat PIN and hides `id`.
+    pub async fn hide_conversation_new_pin(
+        &self,
+        id: String,
+        pin: String,
+    ) -> Result<ConversationActionResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let res = run(async move {
+            handle
+                .request_action(Command::HideConversationNewPin { id, pin })
+                .await
+        })
+        .await?;
+        Ok(res.into())
+    }
+
+    /// Unhides `id`, verifying `pin` when provided.
+    pub async fn unhide_conversation(
+        &self,
+        id: String,
+        pin: Option<String>,
+    ) -> Result<ConversationActionResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let res = run(async move {
+            handle
+                .request_action(Command::UnhideConversation { id, pin })
+                .await
+        })
+        .await?;
+        Ok(res.into())
+    }
+
+    /// Sets or changes the hidden-chat PIN.
+    pub async fn set_hidden_pin(
+        &self,
+        pin: String,
+        changed: bool,
+    ) -> Result<ConversationActionResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let res = run(async move {
+            handle
+                .request_action(Command::SetHiddenPin { pin, changed })
+                .await
+        })
+        .await?;
+        Ok(res.into())
+    }
+
+    /// Resets the hidden-chat PIN and unhides all hidden conversations.
+    pub async fn reset_hidden_pin(&self) -> Result<ConversationActionResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let res = run(async move { handle.request_action(Command::ResetHiddenPin).await }).await?;
+        Ok(res.into())
+    }
+
+    /// Syncs hidden conversations and PIN digest from the server.
+    pub async fn sync_hidden_conversations(&self) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle.request_unit(Command::SyncHiddenConversations).await;
+            handle.current_version()
+        })
+        .await
+    }
+
+    /// Applies an already-fetched server hidden-conversations snapshot.
+    pub async fn apply_server_hidden_conversations(
+        &self,
+        pin: String,
+        thread_ids: Vec<String>,
+    ) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle
+                .request_unit(Command::ApplyServerHiddenConversations { pin, thread_ids })
+                .await;
+            handle.current_version()
+        })
+        .await
+    }
+
+    /// Matches a 4-digit search query against the hidden PIN and populates `pin_search_ids`.
+    pub async fn hidden_search(&self, query: String) -> Result<Option<Vec<String>>, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move { handle.request_hidden_search(query).await }).await
+    }
+
+    /// Unlocks `id` if it is in the current PIN search results.
+    pub fn unlock_from_pin_search(&self, id: String) {
+        self.handle.send(Command::UnlockFromPinSearch { id });
+    }
+
+    /// Unlocks a hidden conversation directly (after PIN verification).
+    pub fn unlock_hidden_conversation(&self, id: String) {
+        self.handle.send(Command::UnlockHiddenConversation { id });
+    }
+
+    /// Drops the active single-conversation hidden unlock.
+    pub fn drop_hidden_unlock(&self) {
+        self.handle.send(Command::DropHiddenUnlock);
+    }
+
+    /// Relocks all hidden conversations and clears PIN search results.
+    pub fn relock_hidden(&self) {
+        self.handle.send(Command::RelockHidden);
+    }
+
+    /// Applies a `convActions` JSON state payload.
+    pub fn handle_conversation_actions(&self, state_json: String) {
+        let state = olaz_json::parse_object_str(&state_json).unwrap_or_default();
+        self.handle
+            .send(Command::HandleConversationActions { state });
+    }
+
+    /// Applies a `conversationExtras` JSON state payload.
+    pub fn handle_conversation_extras(&self, state_json: String) {
+        let state = olaz_json::parse_object_str(&state_json).unwrap_or_default();
+        self.handle
+            .send(Command::HandleConversationExtras { state });
+    }
+
+    /// Updates the sidebar type/label filter and recomputes `list_ids`.
+    pub fn set_conversation_filter(&self, filter_type: i32, label_ids: Vec<String>) {
+        self.handle.send(Command::SetConversationFilter {
+            filter_type,
+            label_ids,
+        });
+    }
+
+    /// Assigns (or removes when `label_id` is `None`) a label on `conversation_id`.
+    pub fn set_conversation_label(&self, conversation_id: String, label_id: Option<String>) {
+        self.handle.send(Command::SetConversationLabel {
+            conversation_id,
+            label_id,
+        });
+    }
+
+    /// Creates a new conversation label using caller-supplied `now_ms` and `rand4` for deterministic IDs.
+    pub fn create_conversation_label(
+        &self,
+        name: String,
+        color_hex: String,
+        conversation_ids: Vec<String>,
+        now_ms: i64,
+        rand4: String,
+    ) {
+        self.handle.send(Command::CreateConversationLabel {
+            name,
+            color_hex,
+            conversation_ids,
+            now_ms,
+            rand4,
+        });
+    }
+
+    /// Renames or recolors an existing conversation label.
+    pub fn update_conversation_label(&self, id: String, name: String, color_hex: String) {
+        self.handle.send(Command::UpdateConversationLabel {
+            id,
+            name,
+            color_hex,
+        });
+    }
+
+    /// Deletes a conversation label.
+    pub fn delete_conversation_label(&self, id: String) {
+        self.handle.send(Command::DeleteConversationLabel { id });
+    }
+
+    /// Reorders conversation labels to match `ids` (preserving any omitted labels after).
+    pub fn reorder_conversation_labels(&self, ids: Vec<String>) {
+        self.handle.send(Command::ReorderConversationLabels { ids });
+    }
+
+    /// Fetches and applies conversation labels from the server.
+    pub async fn sync_conversation_labels(&self) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle.request_unit(Command::SyncConversationLabels).await;
+            handle.current_version()
+        })
+        .await
+    }
+
+    /// Shows a toast for a conversation action result.
+    pub fn report_conversation_action_result(&self, result: ConversationActionResultRecord) {
+        self.handle
+            .send(Command::ReportConversationActionResult(result.into()));
+    }
+
+    /// Rebuilds conversation extras (`stranger_box`, `list_ids`, etc.) using latest identities.
+    pub fn rebuild_conversation_extras(&self) {
+        self.handle.send(Command::RebuildConversationExtras);
+    }
+
+    /// Rebuilds and republishes conversation action flags.
+    pub fn republish_conversation_actions(&self) {
+        self.handle.send(Command::RepublishConversationActions);
+    }
+
+    /// Resets conversation actions, prompt, hidden PIN caches, and UI state.
+    pub fn reset_conversation_actions(&self) {
+        self.handle.send(Command::ResetConversationActions);
+    }
+
+    /// Applies server-fetched pinned and archived conversation ID sets during bootstrap sync.
+    pub async fn apply_bootstrap_pin_archive(
+        &self,
+        pinned_ids: Option<Vec<String>>,
+        archived_ids: Option<Vec<String>>,
+    ) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle
+                .request_unit(Command::ApplyBootstrapPinArchive {
+                    pinned_ids,
+                    archived_ids,
+                })
+                .await;
+            handle.current_version()
+        })
+        .await
+    }
+
+    /// Removes a conversation locally (e.g. after leaving a group) and persists the removal.
+    pub async fn remove_local_conversation(&self, id: String) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle
+                .request_unit(Command::RemoveLocalConversation { id })
+                .await;
+            handle.current_version()
+        })
+        .await
     }
 
     // --- Core-owned WebSocket pass-throughs for Swift feature domains ---
@@ -1097,12 +1745,30 @@ impl CoreEngine {
         self.handle.current_version()
     }
 
-    /// Enqueues a barrier on the actor mailbox and returns the change revision once every input
-    /// enqueued before this call has been reduced and published (`0` if already stopped).
+    /// Enqueues a barrier on the actor mailbox, flushes any queued serial SQLite writes, and
+    /// returns the change revision once every input enqueued before this call has been reduced
+    /// and published (`0` if already stopped).
     pub async fn settle(&self) -> Result<u64, CoreError> {
         let handle = Arc::clone(&self.handle);
-        let version = run(async move { handle.settle().await.unwrap_or(0) }).await?;
+        let runner = Arc::clone(&self.runner);
+        let version = run(async move {
+            let _ = handle.settle().await;
+            runner.flush_store().await;
+            handle.settle().await.unwrap_or(0)
+        })
+        .await?;
         Ok(version)
+    }
+
+    /// Waits until no actor inputs or tracked effects (including serial SQLite writes and API
+    /// requests) remain in flight, then returns the latest change revision.
+    pub async fn wait_idle(&self) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle.wait_idle().await;
+            handle.current_version()
+        })
+        .await
     }
 
     /// Stops the actor, aborts in-flight session & transport tasks, and closes `next_changes()`.
@@ -1114,6 +1780,7 @@ impl CoreEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversations::ConversationPreviewRecord;
 
     struct NoopCoreHost;
 
@@ -1150,8 +1817,8 @@ mod tests {
             _increment_unread: bool,
             _notify_incoming: bool,
             _payload_json: String,
-        ) -> u32 {
-            0
+        ) -> BatchApplyDeltaRecord {
+            BatchApplyDeltaRecord::default()
         }
         async fn apply_parsed_events(
             &self,
@@ -1161,7 +1828,8 @@ mod tests {
             _events: Vec<WireEvent>,
             _uids: Vec<String>,
             _payload: Arc<CoreWirePayload>,
-        ) {
+        ) -> BatchApplyDeltaRecord {
+            BatchApplyDeltaRecord::default()
         }
         async fn mobile_sync(&self, _events: Vec<MobileSyncEventRecord>) {}
         async fn e2ee_signal(&self, _cmd: u16, _payload_json: String) {}
@@ -1216,6 +1884,30 @@ mod tests {
         let cookie_dbg = format!("{cookie:?}");
         assert!(!cookie_dbg.contains("SECRET_COOKIE"));
         assert!(!cookie_dbg.contains("SECRET_IMEI"));
+
+        let conv = ConversationSummaryRecord {
+            id: "CONV_SECRET_ID".to_owned(),
+            is_group: false,
+            name: "SECRET_CONV_NAME".to_owned(),
+            avatar: Some("https://secret.example/c.jpg".to_owned()),
+            pinned: false,
+            members: 0,
+            unread: 2,
+            preview: Some(ConversationPreviewRecord {
+                text: "SECRET_PREVIEW_TEXT".to_owned(),
+                date_ms: Some(1_700_000_000_000),
+                from_me: false,
+            }),
+        };
+        let conv_dbg = format!("{conv:?}");
+        for secret in [
+            "CONV_SECRET_ID",
+            "SECRET_CONV_NAME",
+            "secret.example",
+            "SECRET_PREVIEW_TEXT",
+        ] {
+            assert!(!conv_dbg.contains(secret), "leaked {secret}: {conv_dbg}");
+        }
     }
 
     #[tokio::test]
@@ -1254,6 +1946,50 @@ mod tests {
 
         engine.stop();
         assert_eq!(engine.next_changes().await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn core_engine_u3_message_and_hidden_pin_flow() -> Result<(), CoreError> {
+        let session = CoreSession::with_config("imei-2".to_owned(), "Mac".to_owned(), None)?;
+        let engine = CoreEngine::new(session, Arc::new(NoopCoreHost))?;
+
+        engine.update_conversation_on_message(
+            MessagePreviewInputRecord {
+                conv_id: "u10".to_owned(),
+                text: "Hello U3".to_owned(),
+                mentions: Vec::new(),
+                preview_label: "Hello U3".to_owned(),
+                date_ms: 1_700_000_000_000,
+                is_mine: false,
+                sender_name: "An".to_owned(),
+                sender_avatar: None,
+            },
+            true,
+        );
+        let ver = engine.wait_idle().await?;
+        assert!(ver >= 1);
+
+        let Some(batch) = engine.next_changes().await? else {
+            return Err(CoreError::Parse {
+                message: "expected batch".to_owned(),
+            });
+        };
+        let Some(convs) = batch.conversations else {
+            return Err(CoreError::Parse {
+                message: "expected conversations".to_owned(),
+            });
+        };
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].id, "u10");
+        assert_eq!(convs[0].unread, 1);
+
+        let pin_res = engine.set_hidden_pin("1234".to_owned(), false).await?;
+        assert!(pin_res.ok);
+        assert!(engine.check_hidden_pin("1234".to_owned()).await?);
+        assert!(!engine.check_hidden_pin("9999".to_owned()).await?);
+
+        engine.stop();
         Ok(())
     }
 

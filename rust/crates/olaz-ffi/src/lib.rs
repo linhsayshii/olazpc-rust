@@ -6,6 +6,7 @@
 //! |---|---|
 //! | misc | [`core_version`] |
 //! | core | [`CoreEngine`], [`CoreHost`], [`CoreChangesRecord`], [`SessionStateRecord`] (ADR-016) |
+//! | conversations | U3 conversation summary, flags, extras, UI, prompt, action result, pin board records |
 //! | store | [`CoreStore`] (+ [`ConversationRow`], [`MessageRow`], [`MessagesAroundRow`]) |
 //! | session | [`CoreSession`] (restore/snapshot, QR login, status), [`QrListener`] |
 //! | api | [`CoreApi`] over a shared [`CoreSession`], [`poll_state_initial`] |
@@ -38,6 +39,7 @@
 
 mod api;
 mod chat;
+mod conversations;
 mod core;
 mod crypto;
 mod error;
@@ -57,6 +59,7 @@ pub use api::{
     poll_state_initial,
 };
 pub use chat::*;
+pub use conversations::*;
 pub use core::{
     ControlRouteRecord, CoreChangesRecord, CoreEngine, CoreFailKindRecord, CoreHost,
     CoreWirePayload, FailReasonRecord, LegacyCookieRecord, LoginAccountRecord, LoginStateRecord,

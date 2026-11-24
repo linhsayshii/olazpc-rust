@@ -81,9 +81,10 @@ impl fmt::Debug for StoreOp {
                 .field("key", key)
                 .field("bytes", &data.len())
                 .finish(),
-            Self::DeletePreference { key } => {
-                f.debug_struct("DeletePreference").field("key", key).finish()
-            }
+            Self::DeletePreference { key } => f
+                .debug_struct("DeletePreference")
+                .field("key", key)
+                .finish(),
             Self::LoadMentionPreviewMessages { group_ids, .. } => f
                 .debug_struct("LoadMentionPreviewMessages")
                 .field("group_count", &group_ids.len())
@@ -393,10 +394,7 @@ pub enum Effect {
         op_id: Option<u64>,
     },
     /// Calls `ZaloApi::set_unread_mark` (best-effort fire-and-forget).
-    SetUnreadMarkApi {
-        conv_id: String,
-        unread: bool,
-    },
+    SetUnreadMarkApi { conv_id: String, unread: bool },
     /// Calls `ZaloApi::send_seen` (best-effort fire-and-forget).
     SendSeenApi(SeenTarget),
     /// Calls `ZaloApi::set_hidden_conversation` (best-effort, optional op completion).
@@ -413,13 +411,9 @@ pub enum Effect {
         op_id: Option<u64>,
     },
     /// Calls `ZaloApi::reset_hidden_pin` if authenticated.
-    ResetHiddenPinApi {
-        op_id: Option<u64>,
-    },
+    ResetHiddenPinApi { op_id: Option<u64> },
     /// Calls `ZaloApi::fetch_hidden_conversations` if authenticated.
-    FetchHiddenConversationsApi {
-        op_id: Option<u64>,
-    },
+    FetchHiddenConversationsApi { op_id: Option<u64> },
     /// Calls `ZaloApi::fetch_profiles` for one chunk of up to 50 missing-name UIDs.
     FetchProfilesChunkApi {
         op_id: Option<u64>,
@@ -433,9 +427,7 @@ pub enum Effect {
         op_id: Option<u64>,
     },
     /// Calls `ZaloApi::fetch_conversation_labels`.
-    FetchConversationLabelsApi {
-        op_id: Option<u64>,
-    },
+    FetchConversationLabelsApi { op_id: Option<u64> },
 
     /// Domain activity delegated to Swift via `CoreHost`.
     Host(HostCall),

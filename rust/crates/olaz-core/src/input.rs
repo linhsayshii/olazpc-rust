@@ -8,11 +8,11 @@ use olaz_net::{LoginAccount, NetError, QrScanResult, QrTicket, SessionStatus};
 use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
-use crate::effect::OpResult;
 use crate::conversations::{
-    BatchApplyDelta, ConversationActionResult, IdentityTable, LocalAccountHydration,
-    MessagePreviewInput,
+    BatchApplyDelta, ConversationActionResult, ConversationSummary, IdentityTable,
+    LocalAccountHydration, MessagePreviewInput,
 };
+use crate::effect::OpResult;
 use crate::state::{CoreFailKind, FailReason, PersistedTransportState};
 use crate::typed_chat::TypedChatEnvelope;
 
@@ -169,9 +169,21 @@ pub enum Command {
     },
     SyncConversationLabels,
     ReportConversationActionResult(ConversationActionResult),
+    CheckHiddenPin {
+        pin: String,
+    },
+    SyncConversationsSnapshot(Vec<ConversationSummary>),
+    RebuildConversationExtras,
     RepublishConversationActions,
     ResetConversationActions,
     PersistConversations,
+    ApplyBootstrapPinArchive {
+        pinned_ids: Option<Vec<String>>,
+        archived_ids: Option<Vec<String>>,
+    },
+    RemoveLocalConversation {
+        id: String,
+    },
 }
 
 impl fmt::Debug for Command {
@@ -297,9 +309,24 @@ impl fmt::Debug for Command {
                 .debug_tuple("ReportConversationActionResult")
                 .field(r)
                 .finish(),
+            Self::CheckHiddenPin { .. } => f.write_str("CheckHiddenPin"),
+            Self::SyncConversationsSnapshot(list) => f
+                .debug_struct("SyncConversationsSnapshot")
+                .field("count", &list.len())
+                .finish(),
+            Self::RebuildConversationExtras => f.write_str("RebuildConversationExtras"),
             Self::RepublishConversationActions => f.write_str("RepublishConversationActions"),
             Self::ResetConversationActions => f.write_str("ResetConversationActions"),
             Self::PersistConversations => f.write_str("PersistConversations"),
+            Self::ApplyBootstrapPinArchive {
+                pinned_ids,
+                archived_ids,
+            } => f
+                .debug_struct("ApplyBootstrapPinArchive")
+                .field("pinned_count", &pinned_ids.as_ref().map(Vec::len))
+                .field("archived_count", &archived_ids.as_ref().map(Vec::len))
+                .finish(),
+            Self::RemoveLocalConversation { .. } => f.write_str("RemoveLocalConversation"),
         }
     }
 }
@@ -757,9 +784,7 @@ impl fmt::Debug for Input {
                 .field("ok", ok)
                 .finish(),
             Self::DeleteApiDone { .. } => f.write_str("DeleteApiDone"),
-            Self::HiddenPinSyncDone {
-                kind, ok, md5, ..
-            } => f
+            Self::HiddenPinSyncDone { kind, ok, md5, .. } => f
                 .debug_struct("HiddenPinSyncDone")
                 .field("kind", kind)
                 .field("ok", ok)

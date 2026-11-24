@@ -269,7 +269,10 @@ mod tests {
             panic!("expected batch");
         };
         assert_eq!(batch.version, 2);
-        assert_eq!(batch.session.as_ref().map(|s| &s.phase), Some(&Phase::Ready));
+        assert_eq!(
+            batch.session.as_ref().map(|s| &s.phase),
+            Some(&Phase::Ready)
+        );
         assert!(batch.conversations.is_some());
         assert_eq!(
             batch.conversation_flags.as_ref().map(|f| f.hidden_enabled),

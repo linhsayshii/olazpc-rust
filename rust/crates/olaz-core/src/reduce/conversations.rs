@@ -200,8 +200,9 @@ pub(crate) fn reduce_conversations(state: &mut CoreState, input: Input, out: &mu
         }
 
         Input::DeleteApiDone { id, op_id } => {
-            out.effects
-                .push(Effect::Store(StoreOp::DeleteConversation { id: id.clone() }));
+            out.effects.push(Effect::Store(StoreOp::DeleteConversation {
+                id: id.clone(),
+            }));
             let prev_len = state.conversations.conversations.len();
             state.conversations.conversations.retain(|c| c.id != id);
             if state.conversations.conversations.len() != prev_len {
@@ -427,12 +428,7 @@ pub(crate) fn reduce_conversations(state: &mut CoreState, input: Input, out: &mu
     }
 }
 
-fn reduce_command(
-    state: &mut CoreState,
-    cmd: Command,
-    op_id: Option<u64>,
-    out: &mut ReduceOutput,
-) {
+fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: &mut ReduceOutput) {
     match cmd {
         Command::UpdateIdentities(table) => {
             state.conversations.identities = table;
@@ -514,9 +510,7 @@ fn reduce_command(
                 .conversations
                 .conversations
                 .iter()
-                .filter(|c| {
-                    c.is_group && c.preview.as_ref().is_some_and(|p| p.text.contains('@'))
-                })
+                .filter(|c| c.is_group && c.preview.as_ref().is_some_and(|p| p.text.contains('@')))
                 .map(|c| c.id.clone())
                 .collect();
             if group_ids.is_empty() {
@@ -1024,11 +1018,7 @@ fn reduce_command(
         }
 
         Command::DeleteConversationLabel { id } => {
-            state
-                .conversations
-                .extras
-                .labels
-                .retain(|l| l.id != id);
+            state.conversations.extras.labels.retain(|l| l.id != id);
             let mut map = BTreeMap::new();
             for label in &state.conversations.extras.labels {
                 for conv in &label.conv_ids {
@@ -1085,6 +1075,27 @@ fn reduce_command(
             complete_op(op_id, OpResult::Unit, false, out);
         }
 
+        Command::CheckHiddenPin { pin } => {
+            let ok = state.conversations.check_hidden_pin(&pin);
+            complete_op(op_id, OpResult::Bool(ok), false, out);
+        }
+
+        Command::SyncConversationsSnapshot(list) => {
+            state.conversations.conversations = list;
+            complete_op(op_id, OpResult::Unit, false, out);
+        }
+
+        Command::RebuildConversationExtras => {
+            let self_conv_id = state.session.self_conversation_id.clone();
+            if state
+                .conversations
+                .rebuild_conversation_extras(self_conv_id.as_deref())
+            {
+                out.dirty.insert(DirtyKey::ConversationExtras);
+            }
+            complete_op(op_id, OpResult::Unit, false, out);
+        }
+
         Command::RepublishConversationActions => {
             let self_conv_id = state.session.self_conversation_id.clone();
             if state
@@ -1110,6 +1121,68 @@ fn reduce_command(
 
         Command::PersistConversations => {
             emit_save_conversations(state, out);
+            complete_op(op_id, OpResult::Unit, true, out);
+        }
+
+        Command::ApplyBootstrapPinArchive {
+            pinned_ids,
+            archived_ids,
+        } => {
+            let mut wrote_store = false;
+            if let Some(pins) = pinned_ids {
+                state.conversations.pinned_ids = pins.into_iter().collect();
+                out.effects
+                    .push(Effect::Store(StoreOp::SetPreferenceStrings {
+                        key: "pinnedIds".to_owned(),
+                        values: sorted_set_vec(&state.conversations.pinned_ids),
+                    }));
+                wrote_store = true;
+            }
+            if let Some(archived) = archived_ids {
+                state.conversations.archived_ids = archived.into_iter().collect();
+                out.effects
+                    .push(Effect::Store(StoreOp::SetPreferenceStrings {
+                        key: "archivedIds".to_owned(),
+                        values: sorted_set_vec(&state.conversations.archived_ids),
+                    }));
+                wrote_store = true;
+            }
+            rebuild_flags_and_extras(state, out);
+            complete_op(op_id, OpResult::Unit, wrote_store, out);
+        }
+
+        Command::RemoveLocalConversation { id } => {
+            let prev_len = state.conversations.conversations.len();
+            state.conversations.conversations.retain(|c| c.id != id);
+            if state.conversations.conversations.len() != prev_len {
+                out.dirty.insert(DirtyKey::Conversations);
+            }
+            state.conversations.pinned_ids.remove(&id);
+            state.conversations.archived_ids.remove(&id);
+            state.conversations.unread_marks.remove(&id);
+            if state.conversations.open_conversation_id.as_deref() == Some(id.as_str()) {
+                state.conversations.open_conversation_id = None;
+            }
+            state.conversations.ui.remove(BTreeSet::from([id.clone()]));
+            out.dirty.insert(DirtyKey::ConversationUi);
+            rebuild_flags_and_extras(state, out);
+            out.effects
+                .push(Effect::Store(StoreOp::DeleteConversation { id }));
+            out.effects
+                .push(Effect::Store(StoreOp::SetPreferenceStrings {
+                    key: "pinnedIds".to_owned(),
+                    values: sorted_set_vec(&state.conversations.pinned_ids),
+                }));
+            out.effects
+                .push(Effect::Store(StoreOp::SetPreferenceStrings {
+                    key: "archivedIds".to_owned(),
+                    values: sorted_set_vec(&state.conversations.archived_ids),
+                }));
+            out.effects
+                .push(Effect::Store(StoreOp::SetPreferenceStrings {
+                    key: "unreadMarks".to_owned(),
+                    values: sorted_set_vec(&state.conversations.unread_marks),
+                }));
             complete_op(op_id, OpResult::Unit, true, out);
         }
 
@@ -1246,12 +1319,7 @@ fn report_result(state: &mut CoreState, result: ConversationActionResult, out: &
     }
 }
 
-fn complete_op(
-    op_id: Option<u64>,
-    result: OpResult,
-    after_store: bool,
-    out: &mut ReduceOutput,
-) {
+fn complete_op(op_id: Option<u64>, result: OpResult, after_store: bool, out: &mut ReduceOutput) {
     if let Some(id) = op_id {
         out.effects.push(Effect::CompleteOp {
             op_id: id,

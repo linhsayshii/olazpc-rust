@@ -21,8 +21,7 @@ use tokio::task::AbortHandle;
 
 use crate::actor::{ActorSink, InFlightGuard};
 use crate::conversations::{
-    IdentityTable,
-    BatchApplyDelta, MessagePreviewInput, hidden_pin_md5, hidden_pin_sha256,
+    BatchApplyDelta, IdentityTable, MessagePreviewInput, hidden_pin_md5, hidden_pin_sha256,
     load_local_account_from_store, to_wire_stored,
 };
 use crate::effect::{Effect, HostCall, OpResult, StoreOp};
@@ -648,6 +647,14 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
             .shared_store
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(store);
+    }
+
+    /// Waits until all previously queued serial SQLite store jobs have completed.
+    pub async fn flush_store(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.store_tx.send(StoreJob::Drain(tx)).is_ok() {
+            let _ = rx.await;
+        }
     }
 
     /// Detaches any attached SQLite [`Store`] handle.
@@ -1462,18 +1469,19 @@ async fn run_store_worker(
                         let messages = if let Some(store_arc) = store_opt {
                             runtime
                                 .spawn_blocking(move || {
-                                    let store = store_arc
-                                        .lock()
-                                        .unwrap_or_else(PoisonError::into_inner);
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
                                     let mut map = BTreeMap::new();
                                     for gid in group_ids {
                                         if let Ok(rows) = store.messages(&gid, None, 1)
                                             && let Some(latest) = rows.last()
-                                            && let Some(msg) = decode_stored_message(
-                                                &to_wire_stored(latest),
-                                            )
+                                            && let Some(msg) =
+                                                decode_stored_message(&to_wire_stored(latest))
                                         {
-                                            map.insert(gid, MessagePreviewInput::from_chat_message(&msg));
+                                            map.insert(
+                                                gid,
+                                                MessagePreviewInput::from_chat_message(&msg),
+                                            );
                                         }
                                     }
                                     map
@@ -1489,9 +1497,8 @@ async fn run_store_worker(
                         if let Some(store_arc) = store_opt {
                             let _ = runtime
                                 .spawn_blocking(move || {
-                                    let mut store = store_arc
-                                        .lock()
-                                        .unwrap_or_else(PoisonError::into_inner);
+                                    let mut store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
                                     match other {
                                         StoreOp::SaveConversations(mut rows) => {
                                             let now = unix_now_ms();
@@ -1687,9 +1694,8 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 let local_hydration = if let Some(store_arc) = store_opt {
                     runtime
                         .spawn_blocking(move || {
-                            let mut store = store_arc
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner);
+                            let mut store =
+                                store_arc.lock().unwrap_or_else(PoisonError::into_inner);
                             load_local_account_from_store(
                                 &mut store,
                                 &my_uid,
@@ -1763,9 +1769,7 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 if store_tx.send(StoreJob::Drain(tx)).is_ok() {
                     let _ = rx.await;
                 }
-                *shared_store
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = None;
+                *shared_store.lock().unwrap_or_else(PoisonError::into_inner) = None;
             }
             HostJob::ResetDomains { _guard } => {
                 host.reset_domains().await;

@@ -2191,9 +2191,7 @@ fn apply_contacts_json(contacts: &Value, table: &mut IdentityTable) {
                 && !gid.is_empty()
                 && !uid.is_empty()
             {
-                table
-                    .friend_global_ids
-                    .insert(uid.to_owned(), gid.clone());
+                table.friend_global_ids.insert(uid.to_owned(), gid.clone());
             }
         }
     }
@@ -2309,7 +2307,10 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned(),
-                    preview_ts_ms: row.get("preview_ts_ms").and_then(Value::as_i64).unwrap_or(0),
+                    preview_ts_ms: row
+                        .get("preview_ts_ms")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
                     preview_from_me: row
                         .get("preview_from_me")
                         .and_then(Value::as_bool)
@@ -2353,10 +2354,7 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
-                let is_mine = row
-                    .get("is_mine")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                let is_mine = row.get("is_mine").and_then(Value::as_bool).unwrap_or(false);
                 let text = row
                     .get("text")
                     .and_then(Value::as_str)
@@ -2556,22 +2554,23 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 now_ms,
                 rand4,
             } => match cmd.as_str() {
-                "start" | "refresh_qr" | "log_out" | "session_expired"
-                | "apply_account_profile" | "drain_chat_polling" => {
+                "start"
+                | "refresh_qr"
+                | "log_out"
+                | "session_expired"
+                | "apply_account_profile"
+                | "drain_chat_polling" => {
                     let parsed = parse_command(cmd, args)?;
                     match parsed {
                         Command::LogOut | Command::SessionExpired { .. } => {
-                            let _ =
-                                tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
-                                    .await;
+                            let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
+                                .await;
                             core.send(parsed);
                         }
                         Command::RefreshQr => {
-                            let _ = tokio::time::timeout(
-                                Duration::from_millis(500),
-                                core.wait_idle(),
-                            )
-                            .await;
+                            let _ =
+                                tokio::time::timeout(Duration::from_millis(500), core.wait_idle())
+                                    .await;
                             core.send(parsed);
                         }
                         Command::ApplyAccountProfile(_) => {
@@ -2640,9 +2639,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                     host.set_open_conversation(id_opt.clone());
                     core.request_unit(Command::SetOpenConversation { id: id_opt.clone() })
                         .await;
-                    if load
-                        && let Some(conv_id) = id_opt
-                    {
+                    if load && let Some(conv_id) = id_opt {
                         let local_latest = host.load_local_messages_for_open(&conv_id);
                         let api = ZaloApi::from_shared(Arc::clone(&client));
                         let mut fetched = 0usize;
@@ -2752,10 +2749,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 }
                 "unhide" => {
                     let id = str_arg(args, "id");
-                    let pin = args
-                        .get("pin")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
+                    let pin = args.get("pin").and_then(Value::as_str).map(str::to_owned);
                     let _ = core
                         .request_action(Command::UnhideConversation { id, pin })
                         .await;
@@ -2788,9 +2782,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 }
                 "unlock_from_pin_search" => {
                     let id = str_arg(args, "id");
-                    let _ = core
-                        .request_bool(Command::UnlockFromPinSearch { id })
-                        .await;
+                    let _ = core.request_bool(Command::UnlockFromPinSearch { id }).await;
                 }
                 "relock_hidden" => {
                     core.request_unit(Command::RelockHidden).await;
@@ -2909,9 +2901,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 tokio::time::timeout(dur, host.await_call(await_host, &mut host_cursor))
                     .await
                     .map_err(|_| format!("timed out awaiting host call `{await_host}`"))?;
-                if is_u3
-                    && (await_host == "apply_parsed_events" || await_host == "apply_batch")
-                {
+                if is_u3 && (await_host == "apply_parsed_events" || await_host == "apply_batch") {
                     let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
                 }
             }

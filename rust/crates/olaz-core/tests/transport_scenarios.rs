@@ -1329,7 +1329,11 @@ async fn adr018_concurrent_drains_are_serialized() {
         Input::PollBatchApplied {
             lp_gen: 1,
             drain_id: d1,
-            delta: olaz_core::BatchApplyDelta { applied_count: 3, updates: Vec::new(), persist_conversations: false },
+            delta: olaz_core::BatchApplyDelta {
+                applied_count: 3,
+                updates: Vec::new(),
+                persist_conversations: false,
+            },
         },
     );
     assert!(matches!(
@@ -1359,7 +1363,11 @@ async fn adr018_concurrent_drains_are_serialized() {
         Input::PollBatchApplied {
             lp_gen: 1,
             drain_id: d2,
-            delta: olaz_core::BatchApplyDelta { applied_count: 5, updates: Vec::new(), persist_conversations: false },
+            delta: olaz_core::BatchApplyDelta {
+                applied_count: 5,
+                updates: Vec::new(),
+                persist_conversations: false,
+            },
         },
     );
     let periodic_id = match out_done2.effects.as_slice() {
@@ -1395,7 +1403,11 @@ async fn adr018_concurrent_drains_are_serialized() {
         Input::PollBatchApplied {
             lp_gen: 1,
             drain_id: periodic_id,
-            delta: olaz_core::BatchApplyDelta { applied_count: 1, updates: Vec::new(), persist_conversations: false },
+            delta: olaz_core::BatchApplyDelta {
+                applied_count: 1,
+                updates: Vec::new(),
+                persist_conversations: false,
+            },
         },
     );
     assert!(matches!(
