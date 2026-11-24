@@ -20,8 +20,12 @@ BUNDLE_ID="app.olaz.mac"
 VERSION="${OLAZ_VERSION:-1.0}"
 BUILD_NUMBER="${OLAZ_BUILD:-$VERSION}"
 ./scripts/build-rust.sh
-swift build -c "$CONFIG"
-BIN=".build/${CONFIG}/Olaz"
+# OLAZ_UNIVERSAL=1 builds arm64 + x86_64 (release workflow); default is the host architecture only.
+SWIFT_ARGS=(-c "$CONFIG")
+[[ "${OLAZ_UNIVERSAL:-0}" == 1 ]] && SWIFT_ARGS+=(--arch arm64 --arch x86_64)
+swift build $SWIFT_ARGS
+BIN_DIR="$(swift build $SWIFT_ARGS --show-bin-path)"
+BIN="$BIN_DIR/Olaz"
 
 APP="build/Olaz.app"
 rm -rf "$APP"
@@ -31,7 +35,7 @@ cp "$BIN" "$APP/Contents/MacOS/Olaz"
 cp Assets/olaz.icns "$APP/Contents/Resources/AppIcon.icns"
 
 # SwiftPM resource bundle (JSModules/, Resources/) — found via ResourceLocator.
-RES_BUNDLE=".build/${CONFIG}/Olaz_Olaz.bundle"
+RES_BUNDLE="$BIN_DIR/Olaz_Olaz.bundle"
 if [[ -d "$RES_BUNDLE" ]]; then
     cp -R "$RES_BUNDLE" "$APP/Contents/Resources/"
 else

@@ -4,6 +4,7 @@
 #
 #   ./scripts/release.sh                 # version 1.0, profile "olaz-notary"
 #   OLAZ_VERSION=1.1 ./scripts/release.sh
+#   OLAZ_UNIVERSAL=1 ./scripts/release.sh   # arm64 + x86_64 (what the GitHub release workflow builds)
 #
 # One-time setup (interactive, asks for an app-specific password from appleid.apple.com):
 #   xcrun notarytool store-credentials "olaz-notary" --apple-id <apple-id> --team-id <team-id>
@@ -22,6 +23,9 @@ fi
 VERSION="${OLAZ_VERSION:-1.0}"
 IDENTITY="${OLAZ_SIGN_IDENTITY:-Developer ID Application}"   # codesign matches the identity by substring
 PROFILE="${OLAZ_NOTARY_PROFILE:-olaz-notary}"
+# CI stores the notary profile in a temporary keychain instead of the login keychain.
+NOTARY_AUTH=(--keychain-profile "$PROFILE")
+[[ -n "${OLAZ_NOTARY_KEYCHAIN:-}" ]] && NOTARY_AUTH+=(--keychain "$OLAZ_NOTARY_KEYCHAIN")
 APP="build/Olaz.app"
 DIST="dist"
 ZIP="$DIST/Olaz-$VERSION.zip"
@@ -40,7 +44,7 @@ codesign -d --entitlements - "$APP" 2>/dev/null | grep -q allow-jit || { echo "e
 mkdir -p "$DIST"
 rm -f "$ZIP" "$DMG"
 
-if ! xcrun notarytool history --keychain-profile "$PROFILE" >/dev/null 2>&1; then
+if ! xcrun notarytool history $NOTARY_AUTH >/dev/null 2>&1; then
     echo "" >&2
     echo "Signed app is at $APP, but notarization needs a keychain profile named '$PROFILE'. Store one with:" >&2
     echo "  xcrun notarytool store-credentials \"$PROFILE\" --apple-id <apple-id> --team-id <team-id>" >&2
@@ -52,11 +56,11 @@ fi
 notarize() {
     local file="$1" out id
     echo "==> Notarizing $file"
-    out="$(xcrun notarytool submit "$file" --keychain-profile "$PROFILE" --wait 2>&1)" || true
+    out="$(xcrun notarytool submit "$file" $NOTARY_AUTH --wait 2>&1)" || true
     echo "$out"
     if ! grep -q 'status: Accepted' <<< "$out"; then
         id="$(grep -m1 -E '^\s*id:' <<< "$out" | awk '{print $2}')"
-        [[ -n "$id" ]] && xcrun notarytool log "$id" --keychain-profile "$PROFILE" >&2 || true
+        [[ -n "$id" ]] && xcrun notarytool log "$id" $NOTARY_AUTH >&2 || true
         echo "error: notarization of $file was not accepted" >&2
         exit 1
     fi

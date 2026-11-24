@@ -1,80 +1,133 @@
-# zalo-swift-re — Olaz
+# Olaz
 
-**A reverse-engineered, ultra-lightweight pure Swift native macOS client for [Zalo](https://zalo.me).**
+**An unofficial, reverse-engineered native macOS client for [Zalo](https://zalo.me).**
 
-Olaz pairs a native SwiftUI interface (`App/`, `Shell/`, `Views/`) with a **100% Pure Swift Native Protocol Engine** (`ZaloRuntime/Protocol/`): direct `URLSession` HTTP + `URLSessionWebSocketTask` binary realtime WebSocket (`zpw_ws`), `CryptoKit`/`CommonCrypto`, `KeychainCipher`, `SQLite3` WAL persistence, and in-process `JavaScriptCore` (`SignalE2EE`).
+Olaz is a SwiftUI app on top of a protocol engine that is being moved into a Rust core. There is no `WKWebView`, no Electron bundle (`app.asar`), no Node.js sidecar and no idle helper process.
 
-There is **zero `WKWebView`**, **zero `app.asar` (~340 MB Electron bundle)**, **zero Node.js sidecar**, and **zero idle helper processes**.
+- **UI and app logic**: Swift 6 / SwiftUI (`Sources/Olaz/App`, `Shell`, `Views`, `ZaloRuntime`).
+- **Protocol core**: a Rust workspace (`rust/`, crates `olaz-api`, `olaz-crypto`, `olaz-ffi`, `olaz-json`, `olaz-media`, `olaz-net`, `olaz-signal`, `olaz-store`, `olaz-wire`, `olaz-ws`) exported to Swift through UniFFI (`Sources/OlazCore`, `rust/build/OlazCoreFFI.xcframework`). It covers signing and `ParamCipher`, the `zpw_ws` WebSocket, HTTP with service-map failover, the SQLite store, media download and cache, and Signal E2EE. The Swift engine still exists and is used as a fallback and for features not yet ported (see `rust/MAP.md`).
+- **JavaScriptCore**: still used in-process for two Zalo JS modules in `Sources/Olaz/JSModules/`: the Signal E2EE library (`zalo-e2ee.js`, being replaced by the Rust `olaz-signal`) and the phone-to-Mac history sync (`zalo-zproto-sync.js`, which runs Zalo's `libzproto` WASM).
 
 > [!IMPORTANT]
 > **Unofficial project, not affiliated with or endorsed by VNG Corporation.** "Zalo" is a trademark of VNG.
 > This is an interoperability and reverse-engineering research project. Using an unofficial client may
 > conflict with Zalo's terms of service, so use it at your own risk with your own account.
 
-## Architecture Comparison (`WKWebView` Host → Pure Swift Native)
+## Tiếng Việt
 
-Inspired by lightweight native client designs (such as `lebad280324/zalolite`), Olaz replaces the legacy Chromium/WKWebView + `app.asar` renderer host with direct wire-protocol communication:
+Olaz là ứng dụng Zalo không chính thức, viết native cho macOS (giao diện SwiftUI, lõi giao thức bằng Rust qua UniFFI, một số module JS chạy trong JavaScriptCore). Dự án nghiên cứu khả năng tương tác, không liên kết với VNG; dùng với tài khoản của bạn và tự chịu rủi ro.
 
-| Component | Legacy (`app.asar` + `WKWebView`) | Pure Swift Native (Current) |
-|---|---|---|
-| **Protocol & Auth** | Headless `WKWebView` + 17 MB webpack bundle | `ZaloSessionClient` + `ZaloCrypto` (`zpw_ver=694`, `ParamCipher`, `signkey`) |
-| **Realtime Transport** | Browser WebSocket shimmed via JS | `ZaloWebSocket` (`URLSessionWebSocketTask`, binary `zpw_ws`, AES-GCM-16 + gzip/zlib) |
-| **Storage** | IndexedDB in WebKit data store | `ZaloSQLiteStore` (`SQLite3` WAL at `~/Library/Application Support/Olaz/ZaloData/`) |
-| **Media & Screenshots** | CDN + `ZaloCap` helper binary | `MediaLoader` (DoH/SNI) + `AVFoundation` + native macOS `⌘V` clipboard paste |
-| **Voice / Video Calls** | Background helper + JS IPC router | VNG `ZaloCall` (`CallBridge`) launched strictly **on-demand** during active calls |
-| **E2EE** | `app.asar` libsignal | In-process `JavaScriptCore` `SignalE2EE` (`Sources/Olaz/JSModules/`) |
+- Yêu cầu macOS 26 (Tahoe) trở lên. Bản phát hành là universal (Apple Silicon và Intel).
+- Cài đặt: tải file DMG mới nhất ở [Releases](https://github.com/linhsayshii/olazpc-rust/releases/latest), kéo Olaz vào Applications. Với bản "unsigned", lần mở đầu hãy bấm chuột phải rồi chọn Open, hoặc chạy `xattr -dr com.apple.quarantine /Applications/Olaz.app`.
+- Zalo chỉ cho một phiên PC trên mỗi tài khoản: hãy tắt Zalo PC chính thức khi dùng Olaz.
+- Giấy phép GPL-3.0. Mã gốc và phần nghiên cứu giao thức do Quan Nguyen ([zalo-swift-re](https://github.com/qnguyen3/zalo-swift-re)); xem mục Credits.
+
+## Supported platforms
+
+| Item | Support |
+|---|---|
+| Operating system | macOS 26 Tahoe or later only (`LSMinimumSystemVersion` 26.0, `Package.swift` `.macOS("26.0")`). Older macOS is not supported. |
+| Architectures | Release builds are universal: Apple Silicon (arm64) and Intel (x86_64). |
+| Apple Silicon Macs | M1 or later: MacBook Air, MacBook Pro, Mac mini, iMac, Mac Studio, Mac Pro (2023). |
+| Intel Macs | Only those that can run macOS 26: MacBook Pro 16-inch (2019), MacBook Pro 13-inch (2020, four Thunderbolt 3 ports), iMac (2020), Mac Pro (2019). Best-effort, less tested than Apple Silicon. |
+| Not supported | iOS, iPadOS, Windows, Linux. |
+| Zalo protocol reference | Official Zalo PC for macOS 26.10.x (`zpw_ver=694`). |
+| Sessions | Zalo allows one PC session per account. Quit the official Zalo PC while using Olaz. |
+| Calls | Need VNG's official Zalo runtime (downloaded automatically on first launch) and microphone/camera permissions. |
+| Account | A Zalo account and the Zalo mobile app for QR login. |
+
+## Install
+
+1. Download the latest DMG from [GitHub Releases](https://github.com/linhsayshii/olazpc-rust/releases/latest).
+2. Open it and drag **Olaz** to **Applications**.
+3. If the release is marked "unsigned" (built without a Developer ID), macOS blocks the first launch. Right-click Olaz, choose **Open**, then confirm; or run:
+
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/Olaz.app
+   ```
+
+Releases list SHA-256 sums for every artifact.
 
 ## Features
 
-- **Real QR login** (`reqqr` → long-poll scan & confirm → `getLoginInfo` → Keychain-sealed `native-session.json` + legacy cookie migration)
-- **Chat**: SQLite-backed offline history & load older, send text / quotes / `@mentions`, reactions, typing, read receipts (`seenv2`), real-time `zpw_ws` sync
-- **Composer & Clipboard**: native macOS `⌘V` image/file paste (`PastedContentTests`), photo/file chunked upload, my contact card, reminders
-- **Message actions**: copy, forward, recall (`undo`), delete with 5s undo, pin board, star
-- **Voice / video calls**: on-demand `ZaloCall` (`ZaloHelper.app`) resolved from Olaz's runtime or `/Applications/Zalo.app`, automatically terminated when idle
-- **Contacts, Groups, Polls, Stickers, Labels, Hidden Chats (SHA-256 PIN), Shared Media, Cloud summary, Native macOS Notifications**
+- **Real QR login** (`reqqr`, long-poll scan and confirm, `getLoginInfo`, Keychain-sealed session)
+- **Chat**: SQLite-backed offline history and load older, text / quotes / `@mentions`, reactions, typing, read receipts, real-time `zpw_ws` sync
+- **1-1 E2EE** (Signal, Zalo's variant)
+- **Composer**: `⌘V` image/file paste, photo/file chunked upload, contact card, reminders
+- **Message actions**: copy, forward, recall, delete with undo, pin board, star
+- **Voice / video calls**: on-demand VNG `ZaloCall`, terminated when idle
+- **Contacts, groups, polls, stickers, labels, hidden chats (PIN), shared media, Cloud, native notifications**
+- **Phone to Mac history sync**
 
-## Requirements
+## Build from source
 
-- macOS 26 or later, Xcode toolchain (Swift 6+)
-- A Zalo account and Zalo mobile app for QR login
-- Optional for voice/video calls: `/Applications/Zalo.app` installed (or placed in Olaz's runtime directory for `ZaloHelper.app`)
-
-Zalo allows **one desktop (PC) session per account**. If the official Zalo PC is also running, quit it while using Olaz.
-
-## Build & Run
+Requirements: Xcode 26 (the full app, not only CommandLineTools: SwiftUI macros need Xcode's plugins), and Rust via [rustup](https://rustup.rs) (`rust-version` 1.88 or newer). `scripts/build-rust.sh` adds the `aarch64-apple-darwin` and `x86_64-apple-darwin` targets itself.
 
 ```bash
-swift test                     # pure Swift protocol, crypto, SQLite WAL, wire parser & UI model tests
-./scripts/make-app.sh debug    # builds build/Olaz.app (zero WebKit.framework, zero app.asar)
-open build/Olaz.app            # real QR login — scan with Zalo on your phone
+./scripts/build-rust.sh        # fresh checkout: builds rust/build/OlazCoreFFI.xcframework + regenerates Sources/OlazCore
+swift build                    # debug build
+swift test                     # Swift tests (Swift Testing)
+( cd rust && cargo test )      # Rust tests
+./scripts/make-app.sh debug    # bundles build/Olaz.app
+open build/Olaz.app            # QR login, scan with Zalo on your phone
 ```
 
-### Developer Harness
+Run the bundled app, not the bare binary: the JIT entitlement is required for JavaScriptCore and the resource bundle is copied into the `.app`. Re-run `build-rust.sh` after pulling Rust changes. `./scripts/release.sh` produces a Developer ID signed and notarized build (needs a keychain profile).
+
+Developer harness:
 
 ```bash
-.build/debug/Olaz --engine-probe login 5    # tests live VNG QR ticket + PNG generation
-.build/debug/Olaz --engine-probe status 5   # validates saved Keychain session status
+.build/debug/Olaz --engine-probe login 5    # live QR ticket + PNG
+.build/debug/Olaz --engine-probe status 5   # validate saved Keychain session
 ```
 
-* Engine diagnostics: `~/Library/Application Support/Olaz/logs/engine.log` (event shapes only, never tokens or message bodies).
+Engine diagnostics: `~/Library/Application Support/Olaz/logs/engine.log` (event shapes only, never tokens or message bodies).
 
-## Architecture Overview
+## CI/CD
+
+- `.github/workflows/ci.yml` runs on every push and pull request on a `macos-26` runner: Rust build and `cargo test`, `swift build`, `swift test`.
+- `.github/workflows/release.yml` runs when a tag `v*` is pushed, or manually. It builds a universal `Olaz.app`, makes a DMG and a ZIP, and publishes a GitHub Release with SHA-256 sums.
+
+  ```bash
+  git tag v1.2.0 && git push origin v1.2.0
+  ```
+
+  If the signing secrets are configured it signs with Developer ID and notarizes; otherwise it publishes an ad-hoc signed "unsigned" build.
+
+Secrets, setup and troubleshooting: [docs/RELEASING.md](docs/RELEASING.md).
+
+## Architecture overview
 
 ```
-SwiftUI (Liquid Glass)                      Sources/Olaz/App/, Shell/, Views/
-        │  @Observable ZaloEngine           Sources/Olaz/ZaloRuntime/ZaloEngine*.swift
-        ▼
-Pure Swift Protocol Layer                   Sources/Olaz/ZaloRuntime/Protocol/
-  ├─ ZaloCrypto.swift        ── ParamCipher, signkey, AES-CBC/GCM-16, zlib/gzip, JSONLossless, CoreImage QR
-  ├─ ZaloDomains.swift       ── SERVICE_MAP_V3 multi-host failover & server info updates
-  ├─ ZaloSessionClient.swift ── QR flow, getLoginInfo, Keychain session, encrypted GET/POST/Multipart
-  ├─ ZaloWebSocket.swift     ── URLSessionWebSocketTask binary framing (cmd=1/2/501/510/521/533/570/603/604)
-  ├─ ZaloWireParser.swift    ── Zalo REST/WS JSON ↔ ChatMessage & StoredMessage mapper
-  ├─ ZaloAPIService.swift    ── Chat, group, friend, sticker, poll, pin, mute, upload endpoints
-  └─ ZaloSQLiteStore.swift   ── Actor-isolated SQLite3 WAL store + shared-media cursor index
+SwiftUI (Liquid Glass)                  Sources/Olaz/App, Shell, Views
+        |  @Observable ZaloEngine       Sources/Olaz/ZaloRuntime/ZaloEngine*.swift
+        v
+Protocol layer (Swift)                  Sources/Olaz/ZaloRuntime/Protocol/
+        |  UniFFI                       Sources/OlazCore (generated) + rust/build/OlazCoreFFI.xcframework
+        v
+Rust core                               rust/crates/olaz-*  (crypto, wire, ws, net, store, api, media, signal)
+JavaScriptCore                          Sources/Olaz/JSBridge + JSModules (E2EE fallback, phone sync WASM)
 ```
+
+Rust port status and units: [rust/MAP.md](rust/MAP.md); decisions: [rust/DECISIONS.md](rust/DECISIONS.md); wire protocol: [REVERSE-ENGINEERING-NOTES.md](REVERSE-ENGINEERING-NOTES.md).
+
+## Credits / Origin
+
+This repository is an independent continuation, no longer a GitHub fork, at <https://github.com/linhsayshii/olazpc-rust>.
+
+- **Original project**: the Olaz app (name and original Swift codebase) and the original Zalo reverse-engineering work (wire protocol, QR login, `zpw_ws` framing, `ParamCipher`, signing, service-map failover; see [REVERSE-ENGINEERING-NOTES.md](REVERSE-ENGINEERING-NOTES.md)) come from [zalo-swift-re](https://github.com/qnguyen3/zalo-swift-re) by **Quan Nguyen** (GPL-3.0). The first commit of this history is his (`76eb26d`, 2026-11-07).
+- **This repository**: the Rust core and later features are by linhsayshii and contributors.
+- **Design inspiration**: [lebad280324/zalolite](https://github.com/lebad280324/zalolite), a lightweight native client design.
+- **Signal protocol**: `rust/vendor/libsignal-protocol` is a vendored, patched copy of Signal's `libsignal` (tag v0.73.0, AGPL-3.0-only; the patch is described in its `ZALO-PATCH.md`).
+- **VNG / Zalo**: no VNG files are redistributed. The official runtime (`app.asar`, `ZaloHelper.app`) is downloaded from VNG at first launch and its signature is verified. "Zalo" is a VNG trademark; Olaz is not affiliated with VNG.
+
+See [NOTICE.md](NOTICE.md) for details.
 
 ## License
 
-Olaz is free software, licensed under the [GNU General Public License v3.0](LICENSE).
+Olaz is free software under the [GNU General Public License v3.0](LICENSE).
+
 Copyright © 2026 Quan Nguyen.
+Copyright © 2026 linhsayshii and contributors.
+
+The vendored `rust/vendor/libsignal-protocol` stays under AGPL-3.0-only. GPL-3.0 section 13 permits combining GPL-3.0 and AGPL-3.0 works.
