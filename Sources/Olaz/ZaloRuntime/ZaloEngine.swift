@@ -61,10 +61,16 @@ final class ZaloEngine {
         var displayName: String { name.isEmpty ? (isGroup ? "Nhóm" : "Người dùng Zalo") : name }
     }
 
-    private(set) var phase: Phase = .starting
+    private(set) var phase: Phase = .starting {
+        didSet { stateTrace?() }
+    }
     var conversations: [ConversationSummary] = []
-    private(set) var profile: Profile?
-    private(set) var signOutNotice: String?
+    private(set) var profile: Profile? {
+        didSet { stateTrace?() }
+    }
+    private(set) var signOutNotice: String? {
+        didSet { stateTrace?() }
+    }
     private(set) var clientVersion: String? = "694 (Native)"
     private(set) var recentLog: [String] = []
 
@@ -97,7 +103,9 @@ final class ZaloEngine {
     var canStartTransfer = false
     var transferStartBlockedReason: String?
 
-    var selfConversationId: String?
+    var selfConversationId: String? {
+        didSet { stateTrace?() }
+    }
     var navigationRequest: String?
     var conversationExtras = ConversationExtras()
     var conversationActions = ConversationActionsState()
@@ -128,10 +136,16 @@ final class ZaloEngine {
 
     @ObservationIgnored private var started = false
     internal var isEngineStarted: Bool { started }
-    @ObservationIgnored private var qrTask: Task<Void, Never>?
-    @ObservationIgnored private var wsTask: Task<Void, Never>?
-    @ObservationIgnored private var lpPollTask: Task<Void, Never>?
-    @ObservationIgnored private var bootstrapTask: Task<Void, Never>?
+    @ObservationIgnored internal var hostTrace: ((String, [String: Any]) -> Bool)?
+    @ObservationIgnored internal var stateTrace: (() -> Void)?
+    @ObservationIgnored internal var recordedQRPayload: String?
+    @ObservationIgnored internal var recordedSessionPrefs: [String: String] = [:]
+    @ObservationIgnored internal var pendingCleanupTask: Task<Void, Never>?
+    @ObservationIgnored internal var bootTask: Task<Void, Never>?
+    @ObservationIgnored internal var qrTask: Task<Void, Never>?
+    @ObservationIgnored internal var wsTask: Task<Void, Never>?
+    @ObservationIgnored internal var lpPollTask: Task<Void, Never>?
+    @ObservationIgnored internal var bootstrapTask: Task<Void, Never>?
     @ObservationIgnored internal var transferTask: Task<Void, Never>?
     @ObservationIgnored internal var batchImportTask: Task<Void, Never>?
     @ObservationIgnored internal var activeSyncBatchTasks: [UUID: Task<Void, Never>] = [:]
@@ -195,10 +209,11 @@ final class ZaloEngine {
     init(
         dataDirectory: URL = ZaloPlatform.defaultUserData,
         useKeychain: Bool = true,
-        urlSession: URLSession? = nil
+        urlSession: URLSession? = nil,
+        domains: ZaloDomains = ZaloDomains()
     ) {
         self.dataDirectory = dataDirectory
-        self.sessionClient = ZaloSessionClient(dataDirectory: dataDirectory, useKeychain: useKeychain, urlSession: urlSession)
+        self.sessionClient = ZaloSessionClient(dataDirectory: dataDirectory, useKeychain: useKeychain, urlSession: urlSession, domains: domains)
     }
 
     // MARK: - Lifecycle
@@ -220,7 +235,7 @@ final class ZaloEngine {
         call.supported = call.helperInstalled
         call.videoSupported = call.helperInstalled
 
-        Task { [weak self] in
+        bootTask = Task { [weak self] in
             await self?.bootSession()
         }
     }
@@ -252,11 +267,13 @@ final class ZaloEngine {
 
         callBridge?.shutdown()
         callBridge = nil
-        Task {
+        let allowClear = traceHost("clear_session")
+        let allowResetDomains = traceHost("reset_domains")
+        pendingCleanupTask = Task {
             await phoneSync.resetAll()
             await e2eeManager.reset()
             await webSocket.stop()
-            await sessionClient.clearSession()
+            await sessionClient.clearSession(clearDisk: allowClear, resetDomains: allowResetDomains)
             await sqliteStore?.close()
         }
         sqliteStore = nil
@@ -276,11 +293,12 @@ final class ZaloEngine {
         activeSyncBatchTasks.values.forEach { $0.cancel() }
         activeSyncBatchTasks = [:]
         webkitMigrateTask?.cancel(); webkitMigrateTask = nil
-        Task {
+        let allowMarkExpired = traceHost("mark_expired")
+        pendingCleanupTask = Task {
             await phoneSync.resetAll()
             await e2eeManager.reset()
             await webSocket.stop()
-            await sessionClient.markExpired()
+            await sessionClient.markExpired(persist: allowMarkExpired)
             await sqliteStore?.close()
         }
         sqliteStore = nil
@@ -349,6 +367,7 @@ final class ZaloEngine {
     // MARK: - Boot & QR Flow
 
     private func bootSession() async {
+        await syncSessionClientTrace()
         let restoredSaved = await sessionClient.loadSavedSession()
         let restoredCookie = restoredSaved ? false : await sessionClient.tryRestoreLegacyCookieSession()
 
@@ -394,22 +413,27 @@ final class ZaloEngine {
 
     private func startQRLoginFlow() {
         qrTask?.cancel()
+        recordedQRPayload = nil
         phase = .login(LoginState(step: .generating, qrPNG: nil))
 
         qrTask = Task { [weak self] in
             guard let self else { return }
+            await self.syncSessionClientTrace()
             do {
                 let ticket = try await self.sessionClient.requestQR()
                 guard !Task.isCancelled else { return }
+                self.recordedQRPayload = ticket.qrPayload
                 self.phase = .login(LoginState(step: .waitingScan, qrPNG: ticket.pngData))
 
                 let scanned = try await self.sessionClient.waitForQRScan(ticket) { [weak self] rotated in
                     await MainActor.run {
                         guard let self else { return }
+                        self.recordedQRPayload = rotated.qrPayload
                         self.phase = .login(LoginState(step: .waitingScan, qrPNG: rotated.pngData))
                     }
                 }
                 guard !Task.isCancelled else { return }
+                self.recordedQRPayload = scanned.activeTicket.qrPayload
                 self.phase = .login(LoginState(
                     step: .waitingConfirm(name: scanned.displayName, avatar: scanned.avatar),
                     qrPNG: scanned.activeTicket.pngData
@@ -417,6 +441,7 @@ final class ZaloEngine {
 
                 _ = try await self.sessionClient.waitForQRConfirm(scanned.activeTicket)
                 guard !Task.isCancelled else { return }
+                self.recordedQRPayload = nil
                 self.phase = .signingIn
 
                 let account = try await self.sessionClient.completeLogin()
@@ -424,7 +449,7 @@ final class ZaloEngine {
 
                 self.signOutNotice = nil
                 await self.prepareStoreAndLocalCache(for: account)
-                try? await self.sqliteStore?.setPreferenceString(key: "didOfferInitialSync", value: "0")
+                await self.setSessionPreference(key: "didOfferInitialSync", value: "0")
                 self.phase = .ready
 
                 let snap = await self.sessionClient.currentSnapshot()
@@ -435,12 +460,14 @@ final class ZaloEngine {
             } catch is CancellationError {
                 return
             } catch let err as ZaloTransportError {
+                self.recordedQRPayload = nil
                 if case .qrTimeout = err {
                     self.phase = .login(LoginState(step: .expired, qrPNG: nil))
                 } else {
                     self.phase = .login(LoginState(step: .failed(err.errorDescription ?? "Đăng nhập thất bại."), qrPNG: nil))
                 }
             } catch {
+                self.recordedQRPayload = nil
                 self.phase = .login(LoginState(step: .failed(error.localizedDescription), qrPNG: nil))
             }
         }
@@ -461,6 +488,9 @@ final class ZaloEngine {
         applyAccountProfile(account)
         canStartTransfer = true
         transferStartBlockedReason = nil
+        if !traceHost("prepare_store", args: ["user_id": account.userId]) {
+            return
+        }
         let dbURL = dataDirectory
             .appendingPathComponent("accounts", isDirectory: true)
             .appendingPathComponent(account.userId, isDirectory: true)
@@ -705,6 +735,9 @@ final class ZaloEngine {
     // MARK: - Online Bootstrap & WebSocket Loop
 
     func startBootstrapRefresh() {
+        if !traceHost("start_bootstrap") {
+            return
+        }
         bootstrapTask?.cancel()
         bootstrapTask = Task { [weak self] in
             await self?.performBootstrapSync()
@@ -910,6 +943,9 @@ final class ZaloEngine {
     }
 
     private func startLongPollLoop() {
+        if !traceHost("start_long_poll") {
+            return
+        }
         lpPollTask?.cancel()
         lpPollTask = Task { [weak self] in
             guard let self else { return }
@@ -1283,6 +1319,9 @@ final class ZaloEngine {
     private func startWebSocketLoop(endpoints: [String], zpwSek: String) {
         wsTask?.cancel()
         guard !zpwSek.isEmpty else { return }
+        if !traceHost("start_ws", args: ["endpoints": endpoints]) {
+            return
+        }
         wsTask = Task { [weak self] in
             guard let self else { return }
             let stream = await self.webSocket.start(

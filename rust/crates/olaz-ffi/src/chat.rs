@@ -727,7 +727,11 @@ impl From<ChatMessage> for ChatMessageRecord {
             text_styles: m
                 .text_styles
                 .into_iter()
-                .map(|s| TextStyleRecord { start: s.start, len: s.len, st: s.st })
+                .map(|s| TextStyleRecord {
+                    start: s.start,
+                    len: s.len,
+                    st: s.st,
+                })
                 .collect(),
             ttl_ms: m.ttl_ms,
             urgency: m.urgency,
@@ -803,7 +807,11 @@ impl From<&ChatMessageRecord> for ChatMessage {
             text_styles: r
                 .text_styles
                 .iter()
-                .map(|s| TextStyle { start: s.start, len: s.len, st: s.st.clone() })
+                .map(|s| TextStyle {
+                    start: s.start,
+                    len: s.len,
+                    st: s.st.clone(),
+                })
                 .collect(),
             ttl_ms: r.ttl_ms,
             urgency: r.urgency,

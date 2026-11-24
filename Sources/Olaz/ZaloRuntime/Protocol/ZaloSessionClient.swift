@@ -113,6 +113,7 @@ actor ZaloSessionClient {
     private var serverQrForm: Int = 0
     private var needsPCTypeUpgrade: Bool = false
     private var lastClientIdMs: Int64 = 0
+    private var sessionTrace: (@MainActor @Sendable (String) -> Bool)?
 
     private static let keychainIdentifier = "olaz.native.session"
     private static let imeiDefaultsKey = "olaz.native.pc.imei"
@@ -121,10 +122,12 @@ actor ZaloSessionClient {
         dataDirectory: URL = ZaloPlatform.defaultUserData,
         useKeychain: Bool = true,
         urlSession: URLSession? = nil,
-        useRustCore: Bool = RustCore.isEnabled
+        useRustCore: Bool = RustCore.isEnabled,
+        domains: ZaloDomains = ZaloDomains()
     ) {
         self.dataDirectory = dataDirectory
         self.useKeychain = useKeychain
+        self.domains = domains
         // An injected URLSession means a test stubbing the network (URLProtocol): the Rust client has its own
         // transport and would bypass the stub, so those sessions stay on the Swift path.
         self.useRustCore = useRustCore && urlSession == nil
@@ -310,6 +313,17 @@ actor ZaloSessionClient {
 
     // MARK: Persistence
 
+    func setSessionTrace(_ trace: (@MainActor @Sendable (String) -> Bool)?) {
+        self.sessionTrace = trace
+    }
+
+    private func persistSessionIfAllowed() async {
+        if let sessionTrace, !(await sessionTrace("persist_session")) {
+            return
+        }
+        try? saveSession()
+    }
+
     func saveSession() throws {
         try FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
         var sealedB64: String?
@@ -410,12 +424,14 @@ actor ZaloSessionClient {
         }
     }
 
-    func markExpired() {
+    func markExpired(persist: Bool = true) {
         self.expiredAt = Date().timeIntervalSince1970
-        try? saveSession()
+        if persist {
+            try? saveSession()
+        }
     }
 
-    func clearSession() {
+    func clearSession(clearDisk: Bool = true, resetDomains: Bool = true) {
         coreSession?.clearSession()
         corePushedSnapshot = ""
         account = nil
@@ -426,10 +442,14 @@ actor ZaloSessionClient {
         cloudEnk = nil
         globalIdToUidCache.removeAll()
         uidToGlobalIdCache.removeAll()
-        domains = ZaloDomains()
-        try? FileManager.default.removeItem(at: sessionFileURL)
-        for cookie in HTTPCookieStorage.shared.cookies ?? [] where cookie.name == "zpw_sek" {
-            HTTPCookieStorage.shared.deleteCookie(cookie)
+        if resetDomains {
+            domains = ZaloDomains()
+        }
+        if clearDisk {
+            try? FileManager.default.removeItem(at: sessionFileURL)
+            for cookie in HTTPCookieStorage.shared.cookies ?? [] where cookie.name == "zpw_sek" {
+                HTTPCookieStorage.shared.deleteCookie(cookie)
+            }
         }
     }
 
@@ -740,7 +760,7 @@ actor ZaloSessionClient {
             throw ZaloTransportError.notAuthenticated
         }
         self.expiredAt = nil
-        try? saveSession()
+        await persistSessionIfAllowed()
         return account
     }
 
@@ -801,7 +821,7 @@ actor ZaloSessionClient {
             if let cfg = info["data"] as? [String: Any] {
                 applyLoginConfig(cfg)
                 needsPCTypeUpgrade = false
-                try? saveSession()
+                await persistSessionIfAllowed()
                 return .valid
             }
         } catch let err as ZaloSessionError {
@@ -860,7 +880,7 @@ actor ZaloSessionClient {
         if !phone.isEmpty { updated.phone = phone }
         if let sek = self.zpwSek, !sek.isEmpty { updated.zpwSek = sek }
         self.account = updated
-        try? saveSession()
+        await persistSessionIfAllowed()
         return updated
     }
 

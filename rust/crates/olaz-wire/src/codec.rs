@@ -2,7 +2,9 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::model::{Availability, ChatMessage, DeleteMode, Kind, StarMode, StoredMessage, TextStyle};
+use crate::model::{
+    Availability, ChatMessage, DeleteMode, Kind, StarMode, StoredMessage, TextStyle,
+};
 
 fn opt(url: &Option<String>) -> &str {
     url.as_deref().unwrap_or("")

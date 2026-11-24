@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::util::{
     as_bool_cast, as_dict, as_dict_array, as_str, clamped_int, ns_bool, ns_double, ns_int,
@@ -49,7 +49,11 @@ impl TextStyle {
     }
 
     pub fn to_json(list: &[TextStyle]) -> Value {
-        Value::Array(list.iter().map(|s| json!({"start": s.start, "len": s.len, "st": s.st})).collect())
+        Value::Array(
+            list.iter()
+                .map(|s| json!({"start": s.start, "len": s.len, "st": s.st}))
+                .collect(),
+        )
     }
 }
 
