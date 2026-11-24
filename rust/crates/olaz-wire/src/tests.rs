@@ -1135,16 +1135,30 @@ fn group_poll_event_info_line() {
             r#"{{"msgId":"9{action}","msgType":"group.poll","uidFrom":"{from}","idTo":"3993665107146848278","ts":"1",
                 "content":{{"action":"{action}","title":"","description":"","params":"{{\"pollId\":1192926841,\"question\":\"Khỏe không\",\"uid\":\"{from}\",\"dName\":\"Việt Linh\",\"pollVer\":2}}"}}}}"#
         );
-        let mut o = WireParseOptions::default();
-        o.is_group_hint = Some(true);
+        let o = WireParseOptions {
+            is_group_hint: Some(true),
+            ..Default::default()
+        };
         let (_, s) = msg_of(parse_wire_message(&obj(&raw), "me", &o));
         let kind: serde_json::Value = serde_json::from_slice(&s.raw_json_data).unwrap();
         kind["kind"]["header"].as_str().unwrap().to_string()
     };
-    assert_eq!(ev("create", "peer"), "Việt Linh tạo cuộc bình chọn mới: Khỏe không");
-    assert_eq!(ev("vote", "peer"), "Việt Linh tham gia cuộc bình chọn: Khỏe không");
-    assert_eq!(ev("update", "peer"), "Việt Linh đổi lựa chọn trong cuộc bình chọn: Khỏe không");
-    assert_eq!(ev("share", "peer"), "Việt Linh chia sẻ cuộc bình chọn: Khỏe không");
+    assert_eq!(
+        ev("create", "peer"),
+        "Việt Linh tạo cuộc bình chọn mới: Khỏe không"
+    );
+    assert_eq!(
+        ev("vote", "peer"),
+        "Việt Linh tham gia cuộc bình chọn: Khỏe không"
+    );
+    assert_eq!(
+        ev("update", "peer"),
+        "Việt Linh đổi lựa chọn trong cuộc bình chọn: Khỏe không"
+    );
+    assert_eq!(
+        ev("share", "peer"),
+        "Việt Linh chia sẻ cuộc bình chọn: Khỏe không"
+    );
     assert_eq!(ev("close", "peer"), "Việt Linh khóa bình chọn: Khỏe không");
     assert_eq!(ev("vote", "0"), "Bạn tham gia cuộc bình chọn: Khỏe không");
 }
@@ -1164,8 +1178,16 @@ fn rtf_styles_parse_and_round_trip() {
     assert_eq!(
         m.text_styles,
         vec![
-            TextStyle { start: 0, len: 3, st: "b".into() },
-            TextStyle { start: 4, len: 7, st: "i,c_db342e".into() },
+            TextStyle {
+                start: 0,
+                len: 3,
+                st: "b".into()
+            },
+            TextStyle {
+                start: 4,
+                len: 7,
+                st: "i,c_db342e".into()
+            },
         ]
     );
     let stored = encode_chat_message(&m, "").unwrap();
@@ -1198,7 +1220,12 @@ fn urgency_parse_and_round_trip() {
         "me",
     ));
     assert_eq!(m.urgency, 2);
-    assert_eq!(decode_stored_message(&encode_chat_message(&m, "").unwrap()).unwrap().urgency, 2);
+    assert_eq!(
+        decode_stored_message(&encode_chat_message(&m, "").unwrap())
+            .unwrap()
+            .urgency,
+        2
+    );
     let (n, _) = msg_of(parse(
         r#"{"msgId":"8802","msgType":"webchat","uidFrom":"peer","idTo":"me","ts":"1","urgency":1,"content":"x"}"#,
         "me",
@@ -1214,9 +1241,15 @@ fn quote_keeps_the_quoted_message_ids() {
         "100",
     ));
     let q = m.quote.unwrap();
-    assert_eq!((q.msg_id.as_str(), q.cli_msg_id.as_str()), ("8521991431452", "1795441030216"));
+    assert_eq!(
+        (q.msg_id.as_str(), q.cli_msg_id.as_str()),
+        ("8521991431452", "1795441030216")
+    );
     let back = crate::model::ChatMessage::from_json(
-        serde_json::from_slice::<serde_json::Value>(&stored.raw_json_data).unwrap().as_object().unwrap(),
+        serde_json::from_slice::<serde_json::Value>(&stored.raw_json_data)
+            .unwrap()
+            .as_object()
+            .unwrap(),
         "",
     )
     .unwrap();

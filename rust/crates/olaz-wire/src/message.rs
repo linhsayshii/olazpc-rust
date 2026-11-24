@@ -8,7 +8,9 @@ use serde_json::{Map, Value, json};
 
 use crate::ids::{clean_group_id, group_conv_id, is_group_id, strip_user_prefix};
 use crate::lossless::{self, int64, string};
-use crate::model::{ChatMessage, Kind, ParsedWireEvent, ReactionIcon, StoredMessage, TextStyle, UNKNOWN_NAME};
+use crate::model::{
+    ChatMessage, Kind, ParsedWireEvent, ReactionIcon, StoredMessage, TextStyle, UNKNOWN_NAME,
+};
 use crate::signal::{is_signal_ciphertext, url_has_undecrypted_signal_cipher};
 use crate::util::{
     as_bool_cast, as_dict, as_dict_array, first_non_empty, ns_bool, ns_double, pick, pick_opt,
@@ -625,7 +627,8 @@ pub fn parse_wire_message(
         "" | "webchat" | "chat.text" if dd.ds("action") == "msginfo.actionlist" => {
             kind_dict = obj(json!({"type": "system"}));
             kind_tag = "system".into();
-            text_body = first_non_empty(&[&dd.ds("title"), &dd.ds("description"), "Thông báo hệ thống"]);
+            text_body =
+                first_non_empty(&[&dd.ds("title"), &dd.ds("description"), "Thông báo hệ thống"]);
         }
         "" | "webchat" | "chat.text" => {
             if let (Some(s), None) = (raw_content_str, &content_dict) {
@@ -931,7 +934,11 @@ pub fn parse_wire_message(
                 "close" => "khóa bình chọn",
                 _ => "",
             };
-            let actor = if is_mine { "Bạn".to_string() } else { dd.ps("dName") };
+            let actor = if is_mine {
+                "Bạn".to_string()
+            } else {
+                dd.ps("dName")
+            };
             let header = first_non_empty(&[
                 &dd.ds("description"),
                 &if !verb.is_empty() && !actor.is_empty() {
@@ -1067,7 +1074,10 @@ pub fn parse_wire_message(
             qd.insert("senderName".into(), json!(q_name));
             qd.insert("text".into(), json!(q_text));
             // The quoted message's ids, so tapping the quote can scroll to it ("0" means none).
-            for (key, names) in [("msgId", ["globalMsgId", "msgId"]), ("cliMsgId", ["cliMsgId", "clientId"])] {
+            for (key, names) in [
+                ("msgId", ["globalMsgId", "msgId"]),
+                ("cliMsgId", ["cliMsgId", "clientId"]),
+            ] {
                 let v = string(pick(q, &names));
                 if !v.is_empty() && v != "0" {
                     qd.insert(key.into(), json!(v));

@@ -1151,7 +1151,10 @@ fn open_drops_stored_provisional_twins() {
                     mine(msg("srv1", "c", "cli1", "hi", 10, "text", "sent")),
                     mine(msg("cli2", "c", "cli2", "alone", 12, "text", "sent")),
                 ],
-                crate::model::SaveOptions { skip_twin_checks: true, ..Default::default() },
+                crate::model::SaveOptions {
+                    skip_twin_checks: true,
+                    ..Default::default()
+                },
             )
             .unwrap();
     }
