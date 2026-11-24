@@ -286,6 +286,9 @@ async fn pump(
 ) {
     loop {
         tokio::select! {
+            biased;
+            // Deliver each frame before its cursor update, so the persisted cursor
+            // never runs ahead of the applied batch.
             ev = events.recv() => {
                 let Some(ev) = ev else { break };
                 let l = Arc::clone(&listener);

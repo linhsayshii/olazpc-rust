@@ -572,11 +572,6 @@ final class ZaloEngine {
            let savedCursors = try? JSONDecoder().decode([String: ZaloWSQueueCursorSnapshot].self, from: wsData) {
             await webSocket.seedQueueCursors(savedCursors)
         }
-        await webSocket.setQueueCursorObserver { [weak self] updated in
-            Task { @MainActor [weak self] in
-                await self?.persistWSQueueCursors(updated)
-            }
-        }
         await e2eeManager.loadPersistedThreads(store: store)
         let client = sessionClient
         // The owner of an E2EE quote is nearly always one of the two people in the chat: their global ids come from
@@ -1334,11 +1329,6 @@ final class ZaloEngine {
         }
         wsTask = Task { [weak self] in
             guard let self else { return }
-            await self.webSocket.setQueueCursorObserver { [weak self] updated in
-                Task { @MainActor [weak self] in
-                    await self?.persistWSQueueCursors(updated)
-                }
-            }
             let stream = await self.webSocket.start(
                 endpoints: endpoints, zpwSek: zpwSek, myUid: self.profile?.userId, selfConvId: self.selfConversationId)
             let authWatchTask = Task { [weak self] in
@@ -1374,6 +1364,11 @@ final class ZaloEngine {
             defer { authWatchTask.cancel() }
             for await event in stream {
                 if Task.isCancelled { break }
+                if let updated = event.cursorsChanged {
+                    await self.persistWSQueueCursors(updated)
+                    self.transportSettleTrace?()
+                    continue
+                }
                 await self.handleWSEvent(event)
             }
         }
