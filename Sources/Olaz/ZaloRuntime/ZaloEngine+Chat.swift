@@ -322,7 +322,7 @@ extension ZaloEngine {
             isMine: true,
             kind: .text,
             text: text,
-            date: Date(),
+            date: Date(timeIntervalSince1970: Double(nowMs()) / 1000.0),
             status: .sending,
             quote: quoteBlock,
             reactions: [],
@@ -360,6 +360,26 @@ extension ZaloEngine {
             let quoteTsMs = quote.map { Int64(($0.date.timeIntervalSince1970 * 1000).rounded()) }
             let res: SendMessageResult
             if isE2EE {
+                if let sendE2EETextHostHandler {
+                    let quoteArgs: Any = quote.map { q -> [String: Any] in
+                        [
+                            "msg_id": q.id,
+                            "cli_msg_id": q.clientId,
+                            "sender_id": q.senderId,
+                            "sender_name": q.senderName,
+                            "text": q.text,
+                            "ts_ms": quoteTsMs ?? Int64(0),
+                        ]
+                    } ?? NSNull()
+                    let args: [String: Any] = [
+                        "conv_id": id,
+                        "text": text,
+                        "client_id": cliId,
+                        "quote": quoteArgs,
+                    ]
+                    _ = traceHost("send_e2ee_text", args: args)
+                    res = try await sendE2EETextHostHandler(args)
+                } else {
                 guard !myUid.isEmpty else {
                     EngineLog.shared.write("sendText e2ee failed: missing local uid")
                     removeOptimistic()
@@ -440,6 +460,7 @@ extension ZaloEngine {
                     clientId: cliInt,
                     listParams: ZaloJSONArrayBox(listParams)
                 )
+                }
             } else {
                 res = try await sessionClient.sendTextAPI(
                     convId: id,
@@ -733,20 +754,28 @@ extension ZaloEngine {
         if hadUnreadMark {
             rebuildConversationFlags()
             extrasChanged = true
-            Task {
-                try? await sqliteStore?.setPreferenceStrings(key: "unreadMarks", value: Array(cachedUnreadMarks))
-                try? await sessionClient.setUnreadMarkAPI(convId: id, unread: false)
+            let key = UUID()
+            let t = Task { @MainActor [weak self] in
+                defer { self?.markReadTasks.removeValue(forKey: key) }
+                guard let self else { return }
+                try? await self.sqliteStore?.setPreferenceStrings(key: "unreadMarks", value: Array(self.cachedUnreadMarks))
+                try? await self.sessionClient.setUnreadMarkAPI(convId: id, unread: false)
             }
+            markReadTasks[key] = t
         }
         if extrasChanged {
             rebuildConversationExtras()
         }
-        Task {
-            try? await sqliteStore?.setConversationUnread(id: id, unread: 0)
-            if let last = messages[id]?.last, !last.isMine {
-                await sessionClient.sendSeenAPI(convId: id, msgId: last.id, cliMsgId: last.id, senderId: last.senderId)
+        let key = UUID()
+        let t = Task { @MainActor [weak self] in
+            defer { self?.markReadTasks.removeValue(forKey: key) }
+            guard let self else { return }
+            try? await self.sqliteStore?.setConversationUnread(id: id, unread: 0)
+            if let last = self.messages[id]?.last, !last.isMine {
+                await self.sessionClient.sendSeenAPI(convId: id, msgId: last.id, cliMsgId: last.id, senderId: last.senderId)
             }
         }
+        markReadTasks[key] = t
     }
 
     func react(_ emoji: String, to messageId: String, in conversationId: String) {
@@ -904,10 +933,11 @@ extension ZaloEngine {
         let target = convId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !target.isEmpty, phase == .ready else { return }
         // Cài đặt ▸ Quyền riêng tư: "Hiển thị trạng thái đang soạn tin" off sends nothing.
-        guard UserDefaults.standard.object(forKey: OlazPrefs.sendTyping) as? Bool ?? true else { return }
-        guard OutgoingTypingStore.throttle(for: self).shouldSend(in: target) else { return }
+        guard userDefaults.object(forKey: OlazPrefs.sendTyping) as? Bool ?? true else { return }
+        let now = Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
+        guard OutgoingTypingStore.throttle(for: self).shouldSend(in: target, now: now) else { return }
         let client = sessionClient
-        Task {
+        notifyTypingTask = Task {
             guard await client.isAuthenticated else { return }
             await client.sendTypingAPI(convId: target)
         }
