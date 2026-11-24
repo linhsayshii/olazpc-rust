@@ -1,47 +1,364 @@
-//! Effect runner and `Host` trait (ADR-016).
-//!
-//! Host calls execute serially on a dedicated FIFO worker so their observed order always matches
-//! the order `reduce` emitted them. Network calls run as cancellable tokio tasks.
+//! Effect execution: [`EffectRunner`] trait, [`Host`] callback trait, [`WsDriver`] abstraction,
+//! and the concrete [`SessionEffectRunner`] backed by `olaz_net::SessionClient`, `olaz_api::ZaloApi`,
+//! and `olaz_ws::WsClient`.
 
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use olaz_net::http::Transport;
-use olaz_net::{LoginAccount, SessionClient, SessionSnapshot as NetSessionSnapshot, ZaloDomains};
+use olaz_api::{PollState, ZaloApi};
+use olaz_net::{
+    LoginAccount, SessionClient, SessionSnapshot as NetSessionSnapshot, Transport, ZaloDomains,
+};
+use olaz_ws::{CryptoDecryptor, CursorMap, WsClient, WsConfig, WsHandle};
+use serde_json::{Map, Value};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
 use crate::actor::{ActorSink, InFlightGuard};
 use crate::effect::{Effect, HostCall};
-use crate::input::{CompletedLogin, Input, LegacyCookie, SessionFailure, StoreToken};
+use crate::input::{
+    CompletedLogin, Input, LegacyCookie, PollBatchError, PollBatchOutcome, SessionFailure,
+    StoreToken,
+};
+use crate::reduce::classify::MobileSyncEvent;
+use crate::state::PersistedTransportState;
+use crate::typed_chat::{
+    PlainChatParse, TypedChatEnvelope, new_shared_parse, try_parse_plain_chat,
+};
 
-/// Platform callbacks for activities owned by Swift (or recorded by the test host in `cases.rs`).
+/// Executes effects produced by `reduce` and feeds completion [`Input`]s back via [`ActorSink`].
+pub trait EffectRunner: Send + Sync {
+    fn dispatch(&self, effects: Vec<Effect>, sink: ActorSink);
+    fn shutdown(&self);
+}
+
+/// Parameters passed to [`WsDriver::start`] when the core brings up the WebSocket transport.
+#[derive(Debug, Clone)]
+pub struct WsStartParams {
+    pub ws_gen: u64,
+    pub endpoints: Vec<String>,
+    pub zpw_sek: String,
+    pub seed_cursors: CursorMap,
+    pub my_uid: String,
+    pub self_conv_id: Option<String>,
+}
+
+/// Abstraction over the WebSocket transport owned by [`SessionEffectRunner`].
+///
+/// Production uses [`LiveWsDriver`] (backed by `olaz_ws::WsClient`); tests plug in a scripted
+/// driver backed by `olaz_ws::WsCore`.
+#[async_trait]
+pub trait WsDriver: Send + Sync {
+    fn start(&self, params: WsStartParams, sink: ActorSink, runtime: &Handle);
+    fn stop(&self, reset_cursors: bool);
+    fn record_file_done(&self, file_id: String, url: String);
+    async fn send_frame(&self, cmd: u16, sub_cmd: u8, payload_json: Option<Vec<u8>>) -> bool;
+    async fn send_frame_versioned(
+        &self,
+        cmd: u16,
+        sub_cmd: u8,
+        version: u8,
+        payload_json: Option<Vec<u8>>,
+    ) -> bool;
+    async fn send_request(
+        &self,
+        cmd: u16,
+        sub_cmd: u8,
+        version: u8,
+        req_id: Option<String>,
+        inner_data: Map<String, Value>,
+        timeout: Duration,
+    ) -> Option<Map<String, Value>>;
+    async fn wait_for_file_done(&self, file_id: String, timeout: Duration) -> Option<String>;
+    async fn is_authed(&self) -> bool;
+    async fn current_cursors(&self) -> CursorMap;
+    async fn seed_cursors(&self, cursors: CursorMap);
+}
+
+struct LiveWsSession {
+    handle: WsHandle,
+    pump_abort: AbortHandle,
+    runtime: Handle,
+}
+
+/// Production [`WsDriver`] driving `olaz_ws::WsClient` directly.
+///
+/// Uses a single `biased;` pump per generation that delivers `WsEvent` / `WsTypedChat` strictly
+/// before any `WsCursorsChanged` caused by the same frame.
+#[derive(Default)]
+pub struct LiveWsDriver {
+    active: Mutex<Option<LiveWsSession>>,
+}
+
+impl LiveWsDriver {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn current_handle(&self) -> Option<WsHandle> {
+        self.active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|s| s.handle.clone())
+    }
+}
+
+#[async_trait]
+impl WsDriver for LiveWsDriver {
+    fn start(&self, params: WsStartParams, sink: ActorSink, runtime: &Handle) {
+        let prev = self
+            .active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(old) = prev {
+            old.pump_abort.abort();
+            old.runtime.spawn(async move {
+                let _ = old.handle.stop(false).await;
+            });
+        }
+
+        let mut config = WsConfig::new(params.endpoints, params.zpw_sek);
+        config.seed_cursors = params.seed_cursors;
+
+        // `WsClient::start` spawns its transport task on the current tokio runtime.
+        let _entered = runtime.enter();
+        let (handle, mut events) = WsClient::start(config, Arc::new(CryptoDecryptor));
+        drop(_entered);
+
+        let mut authed = handle.watch_authed();
+        let mut cursors = handle.watch_cursors();
+        let parse_state = new_shared_parse(params.my_uid, params.self_conv_id);
+        let ws_gen = params.ws_gen;
+
+        let pump_abort = runtime
+            .spawn(async move {
+                let mut authed_open = true;
+                let mut cursors_open = true;
+                loop {
+                    tokio::select! {
+                        biased;
+                        res = authed.changed(), if authed_open => {
+                            if res.is_ok() {
+                                let now_authed = *authed.borrow_and_update();
+                                sink.send(Input::WsAuthChanged {
+                                    ws_gen,
+                                    authed: now_authed,
+                                });
+                            } else {
+                                authed_open = false;
+                            }
+                        }
+                        ev = events.recv() => {
+                            let Some(ev) = ev else {
+                                break;
+                            };
+                            match try_parse_plain_chat(ev.cmd, &ev.payload, &parse_state) {
+                                PlainChatParse::Empty => {}
+                                PlainChatParse::Typed(envelope) => {
+                                    sink.send(Input::WsTypedChat {
+                                        ws_gen,
+                                        cmd: ev.cmd,
+                                        envelope,
+                                    });
+                                }
+                                PlainChatParse::NotPlain => {
+                                    sink.send(Input::WsEvent {
+                                        ws_gen,
+                                        cmd: ev.cmd,
+                                        payload: ev.payload,
+                                        now_unix_secs: unix_now_secs(),
+                                    });
+                                }
+                            }
+                        }
+                        res = cursors.changed(), if cursors_open => {
+                            if res.is_ok() {
+                                let snap = cursors.borrow_and_update().clone();
+                                sink.send(Input::WsCursorsChanged {
+                                    ws_gen,
+                                    cursors: snap,
+                                });
+                            } else {
+                                cursors_open = false;
+                            }
+                        }
+                    }
+                }
+            })
+            .abort_handle();
+
+        *self.active.lock().unwrap_or_else(PoisonError::into_inner) = Some(LiveWsSession {
+            handle,
+            pump_abort,
+            runtime: runtime.clone(),
+        });
+    }
+
+    fn stop(&self, reset_cursors: bool) {
+        let prev = self
+            .active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(old) = prev {
+            old.pump_abort.abort();
+            old.runtime.spawn(async move {
+                let _ = old.handle.stop(reset_cursors).await;
+            });
+        }
+    }
+
+    fn record_file_done(&self, file_id: String, url: String) {
+        let info = self
+            .active
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|s| (s.handle.clone(), s.runtime.clone()));
+        if let Some((handle, runtime)) = info {
+            runtime.spawn(async move {
+                handle.record_file_done(file_id, url).await;
+            });
+        }
+    }
+
+    async fn send_frame(&self, cmd: u16, sub_cmd: u8, payload_json: Option<Vec<u8>>) -> bool {
+        let Some(handle) = self.current_handle() else {
+            return false;
+        };
+        handle.send_frame(cmd, sub_cmd, payload_json).await
+    }
+
+    async fn send_frame_versioned(
+        &self,
+        cmd: u16,
+        sub_cmd: u8,
+        version: u8,
+        payload_json: Option<Vec<u8>>,
+    ) -> bool {
+        let Some(handle) = self.current_handle() else {
+            return false;
+        };
+        handle
+            .send_frame_versioned(cmd, sub_cmd, version, payload_json)
+            .await
+    }
+
+    async fn send_request(
+        &self,
+        cmd: u16,
+        sub_cmd: u8,
+        version: u8,
+        req_id: Option<String>,
+        inner_data: Map<String, Value>,
+        timeout: Duration,
+    ) -> Option<Map<String, Value>> {
+        let handle = self.current_handle()?;
+        handle
+            .send_request_versioned_with_timeout(cmd, sub_cmd, version, req_id, inner_data, timeout)
+            .await
+    }
+
+    async fn wait_for_file_done(&self, file_id: String, timeout: Duration) -> Option<String> {
+        let handle = self.current_handle()?;
+        handle
+            .wait_for_file_done_with_timeout(&file_id, timeout)
+            .await
+    }
+
+    async fn is_authed(&self) -> bool {
+        let Some(handle) = self.current_handle() else {
+            return false;
+        };
+        handle.is_authed().await
+    }
+
+    async fn current_cursors(&self) -> CursorMap {
+        let Some(handle) = self.current_handle() else {
+            return CursorMap::new();
+        };
+        handle.current_cursors().await
+    }
+
+    async fn seed_cursors(&self, cursors: CursorMap) {
+        if let Some(handle) = self.current_handle() {
+            handle.seed_cursors(cursors).await;
+        }
+    }
+}
+
+/// Platform / Swift host boundary called serially by [`SessionEffectRunner`].
+///
+/// Storage primitives (`load_saved_session`, `load_legacy_cookie`, `load_transport_state`,
+/// `set_pref`) live here alongside domain calls that still belong to Swift until later units
+/// (`prepare_store`, `start_bootstrap`, `apply_batch`, etc.).
 #[async_trait]
 pub trait Host: Send + Sync {
-    /// Reads and unseals the saved `StoredNativeSession` JSON, or `None` if absent/unreadable.
     async fn load_saved_session(&self) -> Option<String>;
-    /// Reads legacy WKWebView/HTTPCookieStorage credentials if present.
     async fn load_legacy_cookie(&self) -> Option<LegacyCookie>;
-    /// Persists a session-domain preference into the open SQLite store (not traced in `host`).
+    async fn load_transport_state(&self) -> PersistedTransportState {
+        PersistedTransportState::default()
+    }
     async fn set_pref(&self, key: String, value: String);
-
-    // Traced domain activities (Case format v1 `host` list):
     async fn prepare_store(&self, user_id: String, account: LoginAccount);
-    async fn start_ws(&self, endpoints: Vec<String>, zpw_sek: String);
-    async fn start_long_poll(&self);
     async fn start_bootstrap(&self);
     async fn offer_first_login_transfer(&self, force: bool);
     async fn reset_domains(&self);
     async fn persist_session(&self, snapshot_json: String);
     async fn clear_session(&self);
     async fn mark_expired(&self, snapshot_json: String);
-}
 
-/// Executes effects emitted by `reduce` and posts resulting [`Input`]s back to the actor.
-pub trait EffectRunner: Send + Sync {
-    fn dispatch(&self, effects: Vec<Effect>, sink: ActorSink);
-    fn shutdown(&self);
+    /// Host hook emitted when the core starts WebSocket. Return `false` to suppress connecting
+    /// (used by session/transport recorders when `"ws"` is suppressed). Production returns `true`.
+    async fn on_ws_started(&self, _endpoints: Vec<String>) -> bool {
+        true
+    }
+    /// Host hook emitted when the core starts the long-poll loop. Return `false` to suppress
+    /// periodic ticks (used by session/transport recorders when `"long_poll"` is suppressed).
+    /// Production returns `true`.
+    async fn on_long_poll_started(&self) -> bool {
+        true
+    }
+
+    // --- Transport domain callbacks (U2) ---
+    async fn persist_poll_state(&self, state: PollState);
+    async fn persist_ws_cursors(&self, cursors: CursorMap);
+    async fn apply_batch(
+        &self,
+        cmd: Option<u16>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        payload: Map<String, Value>,
+    ) -> u32;
+    async fn apply_parsed_events(
+        &self,
+        cmd: u16,
+        increment_unread: bool,
+        notify_incoming: bool,
+        envelope: TypedChatEnvelope,
+    );
+    async fn mobile_sync(&self, events: Vec<MobileSyncEvent>);
+    async fn e2ee_signal(&self, cmd: u16, payload: Map<String, Value>);
+    async fn e2ee_deliver_reports(&self, cmd: u16, payload: Map<String, Value>);
+    async fn e2ee_connected(&self, uid: String);
+    async fn e2ee_disconnected(&self);
+    async fn voip_control(&self, act: String, raw_data: Value, data: Map<String, Value>);
+    async fn show_typing(&self, conv_id: String, uid: String, on_pc: bool);
+    async fn pin_topic(&self, conv_id: String);
+    async fn group_notice(&self, act: String, data: Map<String, Value>, ts: i64);
+    async fn mute(
+        &self,
+        conv_id: String,
+        set: bool,
+        start: i64,
+        start_explicit: bool,
+        duration: i64,
+    );
 }
 
 enum HostJob {
@@ -68,11 +385,14 @@ enum HostJob {
         _guard: InFlightGuard,
     },
     StartWs {
-        endpoints: Vec<String>,
-        zpw_sek: String,
+        params: WsStartParams,
+        sink: ActorSink,
         _guard: InFlightGuard,
     },
-    StartLongPoll {
+    StartLpInitial {
+        lp_gen: u64,
+        delay: Duration,
+        sink: ActorSink,
         _guard: InFlightGuard,
     },
     StartBootstrap {
@@ -96,26 +416,114 @@ enum HostJob {
         snapshot_json: String,
         _guard: InFlightGuard,
     },
+    PersistPollState {
+        state: PollState,
+        _guard: InFlightGuard,
+    },
+    PersistWsCursors {
+        cursors: CursorMap,
+        _guard: InFlightGuard,
+    },
+    ApplyBatch {
+        cmd: Option<u16>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        payload: Map<String, Value>,
+        poll_batch_done: Option<(u64, u64)>,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    ApplyParsedEvents {
+        cmd: u16,
+        increment_unread: bool,
+        notify_incoming: bool,
+        envelope: TypedChatEnvelope,
+        _guard: InFlightGuard,
+    },
+    MobileSync {
+        events: Vec<MobileSyncEvent>,
+        _guard: InFlightGuard,
+    },
+    E2eeSignal {
+        cmd: u16,
+        payload: Map<String, Value>,
+        _guard: InFlightGuard,
+    },
+    E2eeDeliverReports {
+        cmd: u16,
+        payload: Map<String, Value>,
+        _guard: InFlightGuard,
+    },
+    E2eeConnected {
+        uid: String,
+        _guard: InFlightGuard,
+    },
+    E2eeDisconnected {
+        _guard: InFlightGuard,
+    },
+    VoipControl {
+        act: String,
+        raw_data: Value,
+        data: Map<String, Value>,
+        _guard: InFlightGuard,
+    },
+    ShowTyping {
+        conv_id: String,
+        uid: String,
+        on_pc: bool,
+        _guard: InFlightGuard,
+    },
+    PinTopic {
+        conv_id: String,
+        _guard: InFlightGuard,
+    },
+    GroupNotice {
+        act: String,
+        data: Map<String, Value>,
+        ts: i64,
+        _guard: InFlightGuard,
+    },
+    Mute {
+        conv_id: String,
+        set: bool,
+        start: i64,
+        start_explicit: bool,
+        duration: i64,
+        _guard: InFlightGuard,
+    },
 }
 
-/// Real effect runner backed by a shared `SessionClient<T>` and a [`Host`] implementation.
+/// Real effect runner backed by a shared `SessionClient<T>`, a [`WsDriver`], and a [`Host`].
 ///
 /// Generic over `T: Transport` so production uses `ReqwestTransport` and `tests/cases.rs` plugs
 /// in a scripted `Transport` over the exact same request-building code.
 pub struct SessionEffectRunner<T: Transport + 'static> {
     client: Arc<SessionClient<T>>,
+    ws_driver: Arc<dyn WsDriver>,
     default_domains: Option<ZaloDomains>,
+    suppress_long_poll: bool,
+    ws_active_gen: Arc<Mutex<Option<u64>>>,
+    lp_active_gen: Arc<Mutex<Option<u64>>>,
     host_tx: mpsc::UnboundedSender<HostJob>,
     active_tasks: Arc<Mutex<Vec<AbortHandle>>>,
+    lp_timer_abort: Arc<Mutex<Option<AbortHandle>>>,
+    lp_fetch_abort: Mutex<Option<AbortHandle>>,
     host_worker_abort: AbortHandle,
     runtime: Handle,
 }
 
 impl<T: Transport + 'static> SessionEffectRunner<T> {
-    /// Starts the runner's serial host worker on `runtime`.
+    /// Starts the runner's serial host worker on `runtime` with [`LiveWsDriver`].
     #[must_use]
     pub fn new(client: Arc<SessionClient<T>>, host: Arc<dyn Host>, runtime: Handle) -> Self {
-        Self::with_default_domains(client, host, runtime, None)
+        Self::with_options(
+            client,
+            host,
+            Arc::new(LiveWsDriver::new()),
+            runtime,
+            None,
+            false,
+        )
     }
 
     /// Starts the runner with an optional domains override restored after `ClearCoreSession`
@@ -127,23 +535,64 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         runtime: Handle,
         default_domains: Option<ZaloDomains>,
     ) -> Self {
+        Self::with_options(
+            client,
+            host,
+            Arc::new(LiveWsDriver::new()),
+            runtime,
+            default_domains,
+            false,
+        )
+    }
+
+    /// Full constructor allowing tests to inject a custom [`WsDriver`] and suppress periodic
+    /// long-poll timer ticks (still emitting the `start_long_poll` trace marker).
+    #[must_use]
+    pub fn with_options(
+        client: Arc<SessionClient<T>>,
+        host: Arc<dyn Host>,
+        ws_driver: Arc<dyn WsDriver>,
+        runtime: Handle,
+        default_domains: Option<ZaloDomains>,
+        suppress_long_poll: bool,
+    ) -> Self {
         let (host_tx, host_rx) = mpsc::unbounded_channel();
         let active_tasks: Arc<Mutex<Vec<AbortHandle>>> = Arc::new(Mutex::new(Vec::new()));
-        let worker_handle = runtime.spawn(run_host_worker(
-            host_rx,
-            Arc::clone(&client),
+        let ws_active_gen: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let lp_active_gen: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let lp_timer_abort: Arc<Mutex<Option<AbortHandle>>> = Arc::new(Mutex::new(None));
+        let worker_handle = runtime.spawn(run_host_worker(HostWorkerDeps {
+            rx: host_rx,
+            client: Arc::clone(&client),
             host,
-            Arc::clone(&active_tasks),
-            runtime.clone(),
-        ));
+            ws_driver: Arc::clone(&ws_driver),
+            ws_active_gen: Arc::clone(&ws_active_gen),
+            lp_active_gen: Arc::clone(&lp_active_gen),
+            lp_timer_abort: Arc::clone(&lp_timer_abort),
+            suppress_long_poll,
+            active_tasks: Arc::clone(&active_tasks),
+            runtime: runtime.clone(),
+        }));
         Self {
             client,
+            ws_driver,
             default_domains,
+            suppress_long_poll,
+            ws_active_gen,
+            lp_active_gen,
             host_tx,
             active_tasks,
+            lp_timer_abort,
+            lp_fetch_abort: Mutex::new(None),
             host_worker_abort: worker_handle.abort_handle(),
             runtime,
         }
+    }
+
+    /// Returns a reference to the runner's [`WsDriver`] (for FFI WS pass-throughs and tests).
+    #[must_use]
+    pub fn ws_driver(&self) -> &Arc<dyn WsDriver> {
+        &self.ws_driver
     }
 
     fn cancel_active_tasks(&self) {
@@ -156,6 +605,25 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         };
         for handle in handles {
             handle.abort();
+        }
+    }
+
+    fn cancel_long_poll(&self) {
+        if let Some(h) = self
+            .lp_timer_abort
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            h.abort();
+        }
+        if let Some(h) = self
+            .lp_fetch_abort
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            h.abort();
         }
     }
 
@@ -326,6 +794,144 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         _guard: guard,
                     });
                 }
+                Effect::StartWs {
+                    ws_gen,
+                    endpoints,
+                    seed_cursors,
+                    my_uid,
+                    self_conv_id,
+                } => {
+                    *self
+                        .ws_active_gen
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = Some(ws_gen);
+                    let zpw_sek = self.client.zpw_sek().unwrap_or_default();
+                    let guard = sink.track();
+                    let _ = self.host_tx.send(HostJob::StartWs {
+                        params: WsStartParams {
+                            ws_gen,
+                            endpoints,
+                            zpw_sek,
+                            seed_cursors,
+                            my_uid,
+                            self_conv_id,
+                        },
+                        sink: sink.clone(),
+                        _guard: guard,
+                    });
+                }
+                Effect::StopWs { reset_cursors } => {
+                    *self
+                        .ws_active_gen
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = None;
+                    self.ws_driver.stop(reset_cursors);
+                }
+                Effect::RecordFileDone { file_id, url } => {
+                    self.ws_driver.record_file_done(file_id, url);
+                }
+                Effect::StartLpTimer {
+                    lp_gen,
+                    initial,
+                    delay,
+                } => {
+                    if let Some(prev) = self
+                        .lp_timer_abort
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take()
+                    {
+                        prev.abort();
+                    }
+                    if initial {
+                        *self
+                            .lp_active_gen
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) = Some(lp_gen);
+                        let guard = sink.track();
+                        let _ = self.host_tx.send(HostJob::StartLpInitial {
+                            lp_gen,
+                            delay,
+                            sink: sink.clone(),
+                            _guard: guard,
+                        });
+                    } else if !self.suppress_long_poll
+                        && *self
+                            .lp_active_gen
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            == Some(lp_gen)
+                    {
+                        let timer_sink = sink.clone();
+                        let handle = self
+                            .runtime
+                            .spawn(async move {
+                                tokio::time::sleep(delay).await;
+                                timer_sink.send(Input::LpTick { lp_gen });
+                            })
+                            .abort_handle();
+                        *self
+                            .lp_timer_abort
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) = Some(handle);
+                    }
+                }
+                Effect::StopLongPoll => {
+                    *self
+                        .lp_active_gen
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = None;
+                    self.cancel_long_poll();
+                }
+                Effect::FetchPollBatch {
+                    lp_gen,
+                    drain_id,
+                    poll_state,
+                } => {
+                    if let Some(prev) = self
+                        .lp_fetch_abort
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take()
+                    {
+                        prev.abort();
+                    }
+                    let client = Arc::clone(&self.client);
+                    let fetch_sink = sink.clone();
+                    let guard = sink.track();
+                    let handle = self
+                        .runtime
+                        .spawn(async move {
+                            let api = ZaloApi::from_shared(client);
+                            let result = match api.fetch_chat_from_polling(&poll_state).await {
+                                Ok(outcome) => Ok(PollBatchOutcome {
+                                    payload: outcome.response,
+                                    next_state: outcome.next_state,
+                                    more: outcome.more,
+                                }),
+                                Err(err) if err.is_auth_error() => Err(PollBatchError::Auth),
+                                Err(_) => Err(PollBatchError::Other),
+                            };
+                            fetch_sink.send(Input::PollBatchFetched {
+                                lp_gen,
+                                drain_id,
+                                result,
+                                now_unix_secs: unix_now_secs(),
+                            });
+                            drop(guard);
+                        })
+                        .abort_handle();
+                    *self
+                        .lp_fetch_abort
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = Some(handle);
+                }
+                Effect::CompleteDrain { .. } => {
+                    // Handled directly by the actor before reaching EffectRunner.
+                }
+                Effect::EngineLog(msg) => {
+                    tracing::info!(target: "olaz_core::engine_log", "{msg}");
+                }
                 Effect::Host(call) => {
                     let guard = sink.track();
                     let job = match call {
@@ -340,12 +946,6 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             sink: sink.clone(),
                             _guard: guard,
                         },
-                        HostCall::StartWs { endpoints } => HostJob::StartWs {
-                            endpoints,
-                            zpw_sek: self.client.zpw_sek().unwrap_or_default(),
-                            _guard: guard,
-                        },
-                        HostCall::StartLongPoll => HostJob::StartLongPoll { _guard: guard },
                         HostCall::StartBootstrap => HostJob::StartBootstrap { _guard: guard },
                         HostCall::OfferFirstLoginTransfer { force } => {
                             HostJob::OfferFirstLoginTransfer {
@@ -363,6 +963,105 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             snapshot_json: self.snapshot_json(),
                             _guard: guard,
                         },
+                        HostCall::PersistPollState { state } => HostJob::PersistPollState {
+                            state,
+                            _guard: guard,
+                        },
+                        HostCall::PersistWsCursors { cursors } => HostJob::PersistWsCursors {
+                            cursors,
+                            _guard: guard,
+                        },
+                        HostCall::ApplyBatch {
+                            cmd,
+                            increment_unread,
+                            notify_incoming,
+                            payload,
+                            poll_batch_done,
+                        } => HostJob::ApplyBatch {
+                            cmd,
+                            increment_unread,
+                            notify_incoming,
+                            payload,
+                            poll_batch_done,
+                            sink: sink.clone(),
+                            _guard: guard,
+                        },
+                        HostCall::ApplyParsedEvents {
+                            cmd,
+                            increment_unread,
+                            notify_incoming,
+                            envelope,
+                        } => HostJob::ApplyParsedEvents {
+                            cmd,
+                            increment_unread,
+                            notify_incoming,
+                            envelope,
+                            _guard: guard,
+                        },
+                        HostCall::MobileSync { events } => HostJob::MobileSync {
+                            events,
+                            _guard: guard,
+                        },
+                        HostCall::E2eeSignal { cmd, payload } => HostJob::E2eeSignal {
+                            cmd,
+                            payload,
+                            _guard: guard,
+                        },
+                        HostCall::E2eeDeliverReports { cmd, payload } => {
+                            HostJob::E2eeDeliverReports {
+                                cmd,
+                                payload,
+                                _guard: guard,
+                            }
+                        }
+                        HostCall::E2eeConnected { uid } => {
+                            HostJob::E2eeConnected { uid, _guard: guard }
+                        }
+                        HostCall::E2eeDisconnected => HostJob::E2eeDisconnected { _guard: guard },
+                        HostCall::VoipControl {
+                            act,
+                            raw_data,
+                            data,
+                        } => HostJob::VoipControl {
+                            act,
+                            raw_data,
+                            data,
+                            _guard: guard,
+                        },
+                        HostCall::ShowTyping {
+                            conv_id,
+                            uid,
+                            on_pc,
+                        } => HostJob::ShowTyping {
+                            conv_id,
+                            uid,
+                            on_pc,
+                            _guard: guard,
+                        },
+                        HostCall::PinTopic { conv_id } => HostJob::PinTopic {
+                            conv_id,
+                            _guard: guard,
+                        },
+                        HostCall::GroupNotice { act, data, ts } => HostJob::GroupNotice {
+                            act,
+                            data,
+                            ts,
+                            _guard: guard,
+                        },
+                        HostCall::Mute {
+                            conv_id,
+                            set,
+                            start,
+                            start_explicit,
+                            duration,
+                        } => HostJob::Mute {
+                            conv_id,
+                            set,
+                            start,
+                            start_explicit,
+                            duration,
+                            _guard: guard,
+                        },
                     };
                     let _ = self.host_tx.send(job);
                 }
@@ -371,18 +1070,53 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
     }
 
     fn shutdown(&self) {
+        *self
+            .ws_active_gen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        *self
+            .lp_active_gen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
         self.cancel_active_tasks();
+        self.cancel_long_poll();
+        self.ws_driver.stop(false);
         self.host_worker_abort.abort();
     }
 }
 
-async fn run_host_worker<T: Transport + 'static>(
-    mut rx: mpsc::UnboundedReceiver<HostJob>,
+fn unix_now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+struct HostWorkerDeps<T: Transport + 'static> {
+    rx: mpsc::UnboundedReceiver<HostJob>,
     client: Arc<SessionClient<T>>,
     host: Arc<dyn Host>,
+    ws_driver: Arc<dyn WsDriver>,
+    ws_active_gen: Arc<Mutex<Option<u64>>>,
+    lp_active_gen: Arc<Mutex<Option<u64>>>,
+    lp_timer_abort: Arc<Mutex<Option<AbortHandle>>>,
+    suppress_long_poll: bool,
     active_tasks: Arc<Mutex<Vec<AbortHandle>>>,
     runtime: Handle,
-) {
+}
+
+async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
+    let HostWorkerDeps {
+        mut rx,
+        client,
+        host,
+        ws_driver,
+        ws_active_gen,
+        lp_active_gen,
+        lp_timer_abort,
+        suppress_long_poll,
+        active_tasks,
+        runtime,
+    } = deps;
     while let Some(job) = rx.recv().await {
         match job {
             HostJob::LoadSavedSession {
@@ -480,17 +1214,54 @@ async fn run_host_worker<T: Transport + 'static>(
                 _guard,
             } => {
                 host.prepare_store(user_id, *account).await;
-                sink.send(Input::PrepareStoreDone { token });
+                let transport_state = host.load_transport_state().await;
+                sink.send(Input::PrepareStoreDone {
+                    token,
+                    transport_state,
+                });
             }
             HostJob::StartWs {
-                endpoints,
-                zpw_sek,
+                params,
+                sink,
                 _guard,
             } => {
-                host.start_ws(endpoints, zpw_sek).await;
+                let run_ws = host.on_ws_started(params.endpoints.clone()).await;
+                if run_ws
+                    && *ws_active_gen.lock().unwrap_or_else(PoisonError::into_inner)
+                        == Some(params.ws_gen)
+                {
+                    ws_driver.start(params, sink, &runtime);
+                }
             }
-            HostJob::StartLongPoll { _guard } => {
-                host.start_long_poll().await;
+            HostJob::StartLpInitial {
+                lp_gen,
+                delay,
+                sink,
+                _guard,
+            } => {
+                let run_lp = host.on_long_poll_started().await;
+                if !run_lp {
+                    let mut active = lp_active_gen.lock().unwrap_or_else(PoisonError::into_inner);
+                    if *active == Some(lp_gen) {
+                        *active = None;
+                    }
+                } else if !suppress_long_poll
+                    && *lp_active_gen.lock().unwrap_or_else(PoisonError::into_inner) == Some(lp_gen)
+                {
+                    let handle = runtime
+                        .spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            sink.send(Input::LpTick { lp_gen });
+                        })
+                        .abort_handle();
+                    let prev = lp_timer_abort
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .replace(handle);
+                    if let Some(old) = prev {
+                        old.abort();
+                    }
+                }
             }
             HostJob::StartBootstrap { _guard } => {
                 host.start_bootstrap().await;
@@ -515,6 +1286,103 @@ async fn run_host_worker<T: Transport + 'static>(
                 _guard,
             } => {
                 host.mark_expired(snapshot_json).await;
+            }
+            HostJob::PersistPollState { state, _guard } => {
+                host.persist_poll_state(state).await;
+            }
+            HostJob::PersistWsCursors { cursors, _guard } => {
+                host.persist_ws_cursors(cursors).await;
+            }
+            HostJob::ApplyBatch {
+                cmd,
+                increment_unread,
+                notify_incoming,
+                payload,
+                poll_batch_done,
+                sink,
+                _guard,
+            } => {
+                let applied_count = host
+                    .apply_batch(cmd, increment_unread, notify_incoming, payload)
+                    .await;
+                if let Some((lp_gen, drain_id)) = poll_batch_done {
+                    sink.send(Input::PollBatchApplied {
+                        lp_gen,
+                        drain_id,
+                        applied_count,
+                    });
+                }
+            }
+            HostJob::ApplyParsedEvents {
+                cmd,
+                increment_unread,
+                notify_incoming,
+                envelope,
+                _guard,
+            } => {
+                host.apply_parsed_events(cmd, increment_unread, notify_incoming, envelope)
+                    .await;
+            }
+            HostJob::MobileSync { events, _guard } => {
+                host.mobile_sync(events).await;
+            }
+            HostJob::E2eeSignal {
+                cmd,
+                payload,
+                _guard,
+            } => {
+                host.e2ee_signal(cmd, payload).await;
+            }
+            HostJob::E2eeDeliverReports {
+                cmd,
+                payload,
+                _guard,
+            } => {
+                host.e2ee_deliver_reports(cmd, payload).await;
+            }
+            HostJob::E2eeConnected { uid, _guard } => {
+                host.e2ee_connected(uid).await;
+            }
+            HostJob::E2eeDisconnected { _guard } => {
+                host.e2ee_disconnected().await;
+            }
+            HostJob::VoipControl {
+                act,
+                raw_data,
+                data,
+                _guard,
+            } => {
+                host.voip_control(act, raw_data, data).await;
+            }
+            HostJob::ShowTyping {
+                conv_id,
+                uid,
+                on_pc,
+                _guard,
+            } => {
+                host.show_typing(conv_id, uid, on_pc).await;
+            }
+            HostJob::PinTopic { conv_id, _guard } => {
+                host.pin_topic(conv_id).await;
+            }
+            HostJob::GroupNotice {
+                act,
+                data,
+                ts,
+                _guard,
+            } => {
+                host.group_notice(act, data, ts).await;
+            }
+            HostJob::Mute {
+                conv_id,
+                set,
+                start,
+                start_explicit,
+                duration,
+                _guard,
+            } => {
+                host.mute(conv_id, set, start, start_explicit, duration)
+                    .await;
             }
         }
     }
@@ -568,8 +1436,6 @@ mod tests {
         }
         async fn set_pref(&self, _key: String, _value: String) {}
         async fn prepare_store(&self, _user_id: String, _account: LoginAccount) {}
-        async fn start_ws(&self, _endpoints: Vec<String>, _zpw_sek: String) {}
-        async fn start_long_poll(&self) {}
         async fn start_bootstrap(&self) {}
         async fn offer_first_login_transfer(&self, _force: bool) {}
         async fn reset_domains(&self) {
@@ -581,6 +1447,43 @@ mod tests {
             self.record("clear_session", 30).await;
         }
         async fn mark_expired(&self, _snapshot_json: String) {}
+        async fn persist_poll_state(&self, _state: PollState) {}
+        async fn persist_ws_cursors(&self, _cursors: CursorMap) {}
+        async fn apply_batch(
+            &self,
+            _cmd: Option<u16>,
+            _increment_unread: bool,
+            _notify_incoming: bool,
+            _payload: Map<String, Value>,
+        ) -> u32 {
+            0
+        }
+        async fn apply_parsed_events(
+            &self,
+            _cmd: u16,
+            _increment_unread: bool,
+            _notify_incoming: bool,
+            _envelope: TypedChatEnvelope,
+        ) {
+        }
+        async fn mobile_sync(&self, _events: Vec<MobileSyncEvent>) {}
+        async fn e2ee_signal(&self, _cmd: u16, _payload: Map<String, Value>) {}
+        async fn e2ee_deliver_reports(&self, _cmd: u16, _payload: Map<String, Value>) {}
+        async fn e2ee_connected(&self, _uid: String) {}
+        async fn e2ee_disconnected(&self) {}
+        async fn voip_control(&self, _act: String, _raw_data: Value, _data: Map<String, Value>) {}
+        async fn show_typing(&self, _conv_id: String, _uid: String, _on_pc: bool) {}
+        async fn pin_topic(&self, _conv_id: String) {}
+        async fn group_notice(&self, _act: String, _data: Map<String, Value>, _ts: i64) {}
+        async fn mute(
+            &self,
+            _conv_id: String,
+            _set: bool,
+            _start: i64,
+            _start_explicit: bool,
+            _duration: i64,
+        ) {
+        }
     }
 
     #[tokio::test]
@@ -601,96 +1504,10 @@ mod tests {
         core.wait_idle().await;
 
         assert_eq!(host.max_concurrent.load(Ordering::SeqCst), 1);
-        let calls = host
-            .log
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        assert_eq!(calls, vec!["clear_session", "reset_domains"]);
+        assert_eq!(
+            *host.log.lock().unwrap_or_else(PoisonError::into_inner),
+            vec!["clear_session", "reset_domains"]
+        );
         core.stop();
-    }
-
-    fn custom_domains(auth: &str, isolated: bool) -> ZaloDomains {
-        ZaloDomains {
-            auth: auth.to_owned(),
-            wpa_chat: auth.to_owned(),
-            ws: vec!["ws://127.0.0.1:9999".to_owned()],
-            isolated,
-            ..ZaloDomains::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn clear_core_session_resets_non_isolated_domains_to_default() {
-        let host = Arc::new(SlowOrderedHost::new());
-        let non_isolated = custom_domains("https://assigned.zalo.example", false);
-        let client = Arc::new(SessionClient::new(
-            MockTransport::scripted(vec![]),
-            "imei-1".to_owned(),
-            "Mac".to_owned(),
-        ));
-        client.with_session(|s| s.domains = non_isolated.clone());
-
-        let runner = Arc::new(SessionEffectRunner::with_default_domains(
-            Arc::clone(&client),
-            Arc::clone(&host) as Arc<dyn Host>,
-            Handle::current(),
-            Some(non_isolated),
-        ));
-        let core = CoreHandle::start(runner, Handle::current());
-        core.send(Command::LogOut);
-        core.wait_idle().await;
-
-        assert_eq!(client.domains(), ZaloDomains::default());
-        core.stop();
-    }
-
-    #[tokio::test]
-    async fn clear_core_session_preserves_isolated_domains() {
-        // Branch A: pre-clear domains are isolated (default_domains is None).
-        let host = Arc::new(SlowOrderedHost::new());
-        let isolated = custom_domains("http://127.0.0.1:18080", true);
-        let client = Arc::new(SessionClient::new(
-            MockTransport::scripted(vec![]),
-            "imei-1".to_owned(),
-            "Mac".to_owned(),
-        ));
-        client.with_session(|s| s.domains = isolated.clone());
-
-        let runner = Arc::new(SessionEffectRunner::new(
-            Arc::clone(&client),
-            Arc::clone(&host) as Arc<dyn Host>,
-            Handle::current(),
-        ));
-        let core = CoreHandle::start(runner, Handle::current());
-        core.send(Command::LogOut);
-        core.wait_idle().await;
-
-        assert_eq!(client.domains(), isolated);
-        core.stop();
-
-        // Branch B: pre-clear domains are non-isolated, default_domains is Some and isolated.
-        let host2 = Arc::new(SlowOrderedHost::new());
-        let isolated_default = custom_domains("http://127.0.0.1:18081", true);
-        let client2 = Arc::new(SessionClient::new(
-            MockTransport::scripted(vec![]),
-            "imei-2".to_owned(),
-            "Mac".to_owned(),
-        ));
-        client2
-            .with_session(|s| s.domains = custom_domains("https://assigned.zalo.example", false));
-
-        let runner2 = Arc::new(SessionEffectRunner::with_default_domains(
-            Arc::clone(&client2),
-            Arc::clone(&host2) as Arc<dyn Host>,
-            Handle::current(),
-            Some(isolated_default.clone()),
-        ));
-        let core2 = CoreHandle::start(runner2, Handle::current());
-        core2.send(Command::LogOut);
-        core2.wait_idle().await;
-
-        assert_eq!(client2.domains(), isolated_default);
-        core2.stop();
     }
 }

@@ -26,7 +26,7 @@ pub struct CursorEntry {
     pub pre_ids: Vec<String>,
 }
 
-fn to_entries(map: &CursorMap) -> Vec<CursorEntry> {
+pub(crate) fn to_entries(map: &CursorMap) -> Vec<CursorEntry> {
     map.iter()
         .map(|(k, v)| CursorEntry {
             queue_key: k.clone(),
@@ -36,7 +36,7 @@ fn to_entries(map: &CursorMap) -> Vec<CursorEntry> {
         .collect()
 }
 
-fn to_map(entries: Vec<CursorEntry>) -> CursorMap {
+pub(crate) fn to_map(entries: Vec<CursorEntry>) -> CursorMap {
     entries
         .into_iter()
         .map(|e| {

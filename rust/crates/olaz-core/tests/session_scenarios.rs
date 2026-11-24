@@ -59,7 +59,7 @@ fn http_ok(path: &str, json_body: Value) -> ServerEntry {
             error: None,
             headers: BTreeMap::new(),
         }),
-        accept: None,
+        ..ServerEntry::default()
     }
 }
 
@@ -82,7 +82,7 @@ fn http_error(path: &str, err: &str) -> ServerEntry {
             error: Some(err.to_owned()),
             headers: BTreeMap::new(),
         }),
-        accept: None,
+        ..ServerEntry::default()
     }
 }
 

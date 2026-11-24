@@ -30,8 +30,6 @@ extension ZaloEngine {
         stopCoreEngine()
         bootTask?.cancel()
         qrTask?.cancel()
-        wsTask?.cancel()
-        lpPollTask?.cancel()
         bootstrapTask?.cancel()
         transferTask?.cancel()
     }

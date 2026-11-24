@@ -234,18 +234,25 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         await engine.prepareStoreAndLocalCache(for: swiftAccount)
     }
 
-    func startWs(endpoints: [String], zpwSek: String) async {
-        guard let engine else { return }
+    func loadTransportState() async -> PersistedTransportStateRecord {
+        guard let engine else {
+            return PersistedTransportStateRecord(pollState: nil, wsCursors: [])
+        }
+        return await engine.hostLoadTransportState()
+    }
+
+    func onWsStarted(endpoints: [String]) async -> Bool {
+        guard let engine else { return false }
         await engine.sessionClient.syncMirrorFromCoreSession()
-        await MainActor.run {
-            engine.startWebSocketLoop(endpoints: endpoints, zpwSek: zpwSek)
+        return await MainActor.run {
+            engine.traceHost("start_ws", args: ["endpoints": endpoints])
         }
     }
 
-    func startLongPoll() async {
-        guard let engine else { return }
-        await MainActor.run {
-            engine.startLongPollLoop()
+    func onLongPollStarted() async -> Bool {
+        guard let engine else { return false }
+        return await MainActor.run {
+            engine.traceHost("start_long_poll")
         }
     }
 
@@ -310,6 +317,193 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         await engine.waitForCoreMirrorDrain()
         await MainActor.run {
             engine.noteCoreCleanupCompleted()
+        }
+    }
+
+    // MARK: - Transport Host Effects (U2)
+
+    func persistPollState(state: PollStateRecord) async {
+        guard let engine else { return }
+        let swiftState = ZaloPollState(coreRecord: state)
+        await engine.hostPersistPollState(swiftState)
+    }
+
+    func persistWsCursors(cursors: [CursorEntry]) async {
+        guard let engine else { return }
+        await engine.webSocket.syncPersistedCursors(cursors)
+        await engine.persistWSQueueCursors(ZaloWebSocket.cursorSnapshots(from: cursors))
+    }
+
+    func applyBatch(
+        cmd: UInt16?,
+        incrementUnread: Bool,
+        notifyIncoming: Bool,
+        payloadJson: String
+    ) async -> UInt32 {
+        guard let engine else { return 0 }
+        let box = ZaloJSONBox(JSONLossless.parseObject(string: payloadJson) ?? [:])
+        let count = await engine.hostApplyBatch(
+            box: box,
+            cmd: cmd,
+            incrementUnread: incrementUnread,
+            notifyIncoming: notifyIncoming
+        )
+        return UInt32(max(0, count))
+    }
+
+    func applyParsedEvents(
+        cmd: UInt16,
+        incrementUnread: Bool,
+        notifyIncoming: Bool,
+        events: [WireEvent],
+        uids: [String],
+        payload: CoreWirePayload
+    ) async {
+        guard let engine else { return }
+        let context = await engine.hostLookupNameContext(uids: uids)
+        let resolvedWire = payload.resolve(
+            myUid: context.myUid,
+            selfConvId: context.selfConvId,
+            names: context.names
+        ) ?? events
+        let parsed = ZaloWireParser.parsedEvents(from: resolvedWire)
+        let allowApply = await MainActor.run {
+            engine.traceHost("apply_parsed_events", args: [
+                "cmd": Int(cmd),
+                "increment_unread": incrementUnread,
+                "notify_incoming": notifyIncoming,
+                "events": ZaloEngine.serializeParsedWireEvents(parsed),
+            ])
+        }
+        if allowApply {
+            _ = await engine.applyParsedEvents(
+                parsed,
+                incrementUnread: incrementUnread,
+                notifyIncoming: notifyIncoming
+            )
+        }
+    }
+
+    func mobileSync(events: [MobileSyncEventRecord]) async {
+        guard let engine, !events.isEmpty else { return }
+        let mapped = events.map(ZaloMobileSyncEvent.init(coreRecord:))
+        let allowSync = await MainActor.run {
+            engine.traceHost("mobile_sync", args: [
+                "events": ZaloEngine.serializeMobileSyncEvents(mapped),
+            ])
+        }
+        if allowSync {
+            await engine.processMobileSyncEvents(mapped)
+        }
+    }
+
+    func e2eeSignal(cmd: UInt16, payloadJson: String) async {
+        guard let engine else { return }
+        let box = ZaloJSONBox(JSONLossless.parseObject(string: payloadJson) ?? [:])
+        await engine.hostHandleE2EESignal(cmd: cmd, payload: box)
+    }
+
+    func e2eeDeliverReports(cmd: UInt16, payloadJson: String) async {
+        guard let engine else { return }
+        let box = ZaloJSONBox(JSONLossless.parseObject(string: payloadJson) ?? [:])
+        await engine.hostHandleE2EEDeliverReports(cmd: cmd, payload: box)
+    }
+
+    func e2eeConnected(uid: String) async {
+        guard let engine else { return }
+        await engine.hostHandleE2EEConnected(uid: uid)
+    }
+
+    func e2eeDisconnected() async {
+        guard let engine else { return }
+        let allowDisconnect = await MainActor.run {
+            engine.traceHost("e2ee_disconnected")
+        }
+        if allowDisconnect {
+            await engine.e2eeManager.markDisconnected()
+        }
+    }
+
+    func voipControl(act: String, rawDataJson: String, dataJson: String) async {
+        guard let engine else { return }
+        let dataBox = ZaloJSONBox(JSONLossless.parseObject(string: dataJson) ?? [:])
+        await engine.hostHandleVoipControl(act: act, rawDataJson: rawDataJson, dataBox: dataBox)
+    }
+
+    func showTyping(convId: String, uid: String, onPc: Bool) async {
+        guard let engine else { return }
+        await MainActor.run {
+            if engine.traceHost("show_typing", args: ["conv_id": convId, "uid": uid, "on_pc": onPc]) {
+                let name = engine.lookupPersonInfo(uid)?.name ?? "Ai đó"
+                engine.showTyping(convId: convId, name: name, onPC: onPc)
+            }
+        }
+    }
+
+    func pinTopic(convId: String) async {
+        guard let engine else { return }
+        await MainActor.run {
+            if engine.traceHost("pin_topic", args: ["conv_id": convId]) {
+                engine.handlePinTopicEvent(conversationId: convId)
+            }
+        }
+    }
+
+    func groupNotice(act: String, dataJson: String, ts: Int64) async {
+        guard let engine else { return }
+        let dataBox = ZaloJSONBox(JSONLossless.parseObject(string: dataJson) ?? [:])
+        await engine.hostHandleGroupNotice(act: act, dataBox: dataBox, ts: ts)
+    }
+
+    func mute(convId: String, set: Bool, start: Int64, startExplicit: Bool, duration: Int64) async {
+        guard let engine else { return }
+        await engine.hostApplyMute(
+            convId: convId,
+            set: set,
+            start: start,
+            startExplicit: startExplicit,
+            duration: duration
+        )
+    }
+}
+
+extension ZaloPollState {
+    init(coreRecord record: PollStateRecord) {
+        self.init(
+            lastActionId: record.lastActionId,
+            lastActionIdOther: record.lastActionIdOther,
+            queues: Dictionary(uniqueKeysWithValues: record.queues.map {
+                ($0.key, ZaloPollQueueCursor(lastId: $0.lastId, ids: $0.ids))
+            })
+        )
+    }
+
+    var coreRecord: PollStateRecord {
+        PollStateRecord(
+            lastActionId: lastActionId,
+            lastActionIdOther: lastActionIdOther,
+            queues: queues.keys.sorted().map { key in
+                PollQueueRecord(key: key, lastId: queues[key]?.lastId ?? "1", ids: queues[key]?.ids ?? [])
+            }
+        )
+    }
+}
+
+extension ZaloMobileSyncEvent {
+    init(coreRecord record: MobileSyncEventRecord) {
+        switch record {
+        case .transferAfterLogin(let tempKey):
+            self = .transferAfterLogin(tempKey: tempKey)
+        case .waitingConfirmOnPhone(let syncId):
+            self = .waitingConfirmOnPhone(syncId: syncId)
+        case .userConfirmed:
+            self = .userConfirmed
+        case .userRejected:
+            self = .userRejected
+        case .mobileBusy:
+            self = .mobileBusy
+        case .uploadBatch(let syncId, let url, let batchType, let idx, let isLast):
+            self = .uploadBatch(syncId: syncId, url: url, batchType: Int(batchType), idx: Int(idx), isLast: isLast)
         }
     }
 }
@@ -401,7 +595,9 @@ extension ZaloEngine {
                 }
             }
 
+            await self.webSocket.attachCore(core)
             guard self.coreLifecycle.install(core: core, changeTask: changeTask) else {
+                await self.webSocket.detachCore()
                 changeTask.cancel()
                 core.stop()
                 self.pendingCoreCommands.removeAll()
@@ -498,11 +694,155 @@ extension ZaloEngine {
     internal func stopCoreEngine() {
         pendingCoreCommands.removeAll()
         coreLifecycle.shutdown()
+        let ws = webSocket
+        Task { await ws.detachCore() }
         failAllMirrorWaiters()
     }
 
     internal func hostNotePrepareStoreStarted() {
         // Shape-only hook; keeps MainActor visibility clean if future domains log transitions.
+    }
+
+    internal struct CoreNameContext: Sendable {
+        let myUid: String
+        let selfConvId: String?
+        let names: [NameEntry]
+    }
+
+    internal func hostLoadTransportState() async -> PersistedTransportStateRecord {
+        let cursors = await webSocket.currentQueueCursors()
+        return PersistedTransportStateRecord(
+            pollState: pollState.coreRecord,
+            wsCursors: ZaloWebSocket.cursorEntries(from: cursors)
+        )
+    }
+
+    internal func hostPersistPollState(_ state: ZaloPollState) async {
+        pollState = state
+        await persistPollState()
+    }
+
+    internal func hostApplyBatch(
+        box: ZaloJSONBox,
+        cmd: UInt16?,
+        incrementUnread: Bool,
+        notifyIncoming: Bool
+    ) async -> Int {
+        let cmdArg: Any = cmd.map { Int($0) } ?? NSNull()
+        guard traceHost("apply_batch", args: [
+            "cmd": cmdArg,
+            "increment_unread": incrementUnread,
+            "notify_incoming": notifyIncoming,
+            "payload": box.dict,
+        ]) else {
+            return 0
+        }
+        return await applyBatchResponse(
+            box.dict,
+            defaultCmd: cmd ?? 0,
+            incrementUnread: incrementUnread,
+            notifyIncoming: notifyIncoming
+        )
+    }
+
+    internal func hostLookupNameContext(uids: [String]) -> CoreNameContext {
+        var names: [NameEntry] = []
+        names.reserveCapacity(uids.count)
+        for uid in uids {
+            if let hit = lookupPersonInfo(uid) {
+                names.append(NameEntry(uid: uid, name: hit.name, avatar: hit.avatar))
+            }
+        }
+        return CoreNameContext(
+            myUid: profile?.userId ?? "",
+            selfConvId: selfConversationId,
+            names: names
+        )
+    }
+
+    internal func hostHandleE2EESignal(cmd: UInt16, payload: ZaloJSONBox) async {
+        guard traceHost("e2ee_signal", args: ["cmd": Int(cmd), "payload": payload.dict]) else { return }
+        guard let uid = profile?.userId, !uid.isEmpty else { return }
+        await e2eeManager.handleSignalSocketEvent(
+            cmd: cmd,
+            payload: payload,
+            uid: uid,
+            webSocket: webSocket,
+            store: sqliteStore
+        )
+    }
+
+    internal func hostHandleE2EEDeliverReports(cmd: UInt16, payload: ZaloJSONBox) async {
+        guard traceHost("e2ee_deliver_reports", args: ["cmd": Int(cmd), "payload": payload.dict]) else { return }
+        let resends = await e2eeManager.handleDeliverReports(
+            cmd: cmd,
+            payload: payload,
+            webSocket: webSocket
+        )
+        for request in resends {
+            await resendE2EEMessage(request)
+        }
+    }
+
+    internal func hostHandleE2EEConnected(uid: String) async {
+        let effectiveUid = uid.isEmpty ? (profile?.userId ?? "") : uid
+        guard !effectiveUid.isEmpty else { return }
+        guard traceHost("e2ee_connected", args: ["uid": effectiveUid]) else { return }
+        await e2eeManager.syncBundleWithServerIfNeeded(
+            uid: effectiveUid,
+            webSocket: webSocket,
+            store: sqliteStore
+        )
+        await e2eeManager.fetchE2EEPeerList(
+            webSocket: webSocket,
+            store: sqliteStore,
+            myUid: effectiveUid
+        )
+    }
+
+    internal func hostHandleVoipControl(act: String, rawDataJson: String, dataBox: ZaloJSONBox) async {
+        let rawValue: Any = {
+            if let obj = JSONLossless.parseObject(string: rawDataJson) {
+                return obj
+            }
+            if let data = rawDataJson.data(using: .utf8),
+               let parsed = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) {
+                return parsed
+            }
+            return dataBox.dict
+        }()
+        guard traceHost("voip_control", args: ["act": act, "raw_data": rawValue, "data": dataBox.dict]) else { return }
+        await handleVoipControlEvent(act: act, rawDataValue: rawValue, parsedData: dataBox.dict)
+    }
+
+    internal func hostHandleGroupNotice(act: String, dataBox: ZaloJSONBox, ts: Int64) async {
+        guard traceHost("group_notice", args: ["act": act, "data": dataBox.dict, "ts": ts]) else { return }
+        await handleGroupEventNotice(act: act, data: dataBox.dict, ts: ts)
+    }
+
+    internal func hostApplyMute(
+        convId: String,
+        set: Bool,
+        start: Int64,
+        startExplicit: Bool,
+        duration: Int64
+    ) async {
+        guard !convId.isEmpty else { return }
+        let startArg: Any = (!startExplicit && hostTrace != nil) ? "<volatile>" : start
+        guard traceHost("mute", args: [
+            "conv_id": convId,
+            "set": set,
+            "start": startArg,
+            "duration": duration,
+        ]) else {
+            return
+        }
+        if set {
+            notificationSettings.mutes[convId] = MuteInfo(startTime: Double(start), duration: Double(duration))
+        } else {
+            notificationSettings.mutes.removeValue(forKey: convId)
+        }
+        await saveNotificationPreferences()
     }
 
     private static func sendCommand(_ command: PendingCoreCommand, to core: CoreEngine) {

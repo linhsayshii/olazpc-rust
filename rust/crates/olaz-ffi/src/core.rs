@@ -4,16 +4,29 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
+use olaz_api::PollState;
+use olaz_core::reduce::classify::{MobileSyncEvent, Route, classify};
+use olaz_core::runner::WsDriver;
+use olaz_core::state::PersistedTransportState;
+use olaz_core::typed_chat::{TypedChatEnvelope, WirePayloadHandle};
 use olaz_core::{
     Command, CoreChanges, CoreFailKind, CoreHandle, FailReason, Host, LegacyCookie, LoginState,
     LoginStep, Phase, Profile, SessionEffectRunner, SessionSnapshot,
 };
+use olaz_json::to_swift_json_string;
 use olaz_net::{LoginAccount, NetworkErrorKind};
+use olaz_wire::NameLookup;
+use olaz_ws::CursorMap;
+use serde_json::{Map, Value};
 
+use crate::api::PollStateRecord;
 use crate::error::{CoreError, NetworkKind};
 use crate::runtime::{run, runtime};
 use crate::session::CoreSession;
+use crate::wire::{NameEntry, WireEvent, convert as convert_wire_event};
+use crate::ws::{CursorEntry, to_entries as cursors_to_entries, to_map as cursors_to_map};
 
 /// Core/transport error kind rendered by Swift via `RustCore.mapError(...).localizedDescription`.
 #[derive(Clone, PartialEq, Eq, uniffi::Enum)]
@@ -370,6 +383,311 @@ impl From<CoreChanges> for CoreChangesRecord {
     }
 }
 
+/// Persisted transport cursors loaded by Swift right after `prepare_store`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, uniffi::Record)]
+pub struct PersistedTransportStateRecord {
+    pub poll_state: Option<PollStateRecord>,
+    pub ws_cursors: Vec<CursorEntry>,
+}
+
+impl From<PersistedTransportStateRecord> for PersistedTransportState {
+    fn from(r: PersistedTransportStateRecord) -> Self {
+        Self {
+            poll_state: r.poll_state.map(Into::into).unwrap_or_default(),
+            ws_cursors: cursors_to_map(r.ws_cursors),
+        }
+    }
+}
+
+/// Parsed mobile-sync control event delivered to Swift (`ZaloMobileSyncEvent`).
+/// Contains sync tokens/URLs; `Debug` is redacted.
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum MobileSyncEventRecord {
+    TransferAfterLogin {
+        temp_key: String,
+    },
+    WaitingConfirmOnPhone {
+        sync_id: String,
+    },
+    UserConfirmed,
+    UserRejected,
+    MobileBusy,
+    UploadBatch {
+        sync_id: String,
+        url: String,
+        batch_type: i64,
+        idx: i64,
+        is_last: bool,
+    },
+}
+
+impl fmt::Debug for MobileSyncEventRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TransferAfterLogin { temp_key } => f
+                .debug_struct("TransferAfterLogin")
+                .field("temp_key_len", &temp_key.len())
+                .finish(),
+            Self::WaitingConfirmOnPhone { sync_id } => f
+                .debug_struct("WaitingConfirmOnPhone")
+                .field("has_sync_id", &!sync_id.is_empty())
+                .finish(),
+            Self::UserConfirmed => f.write_str("UserConfirmed"),
+            Self::UserRejected => f.write_str("UserRejected"),
+            Self::MobileBusy => f.write_str("MobileBusy"),
+            Self::UploadBatch {
+                batch_type,
+                idx,
+                is_last,
+                ..
+            } => f
+                .debug_struct("UploadBatch")
+                .field("batch_type", batch_type)
+                .field("idx", idx)
+                .field("is_last", is_last)
+                .finish(),
+        }
+    }
+}
+
+impl From<MobileSyncEvent> for MobileSyncEventRecord {
+    fn from(e: MobileSyncEvent) -> Self {
+        match e {
+            MobileSyncEvent::TransferAfterLogin { temp_key } => {
+                Self::TransferAfterLogin { temp_key }
+            }
+            MobileSyncEvent::WaitingConfirmOnPhone { sync_id } => {
+                Self::WaitingConfirmOnPhone { sync_id }
+            }
+            MobileSyncEvent::UserConfirmed => Self::UserConfirmed,
+            MobileSyncEvent::UserRejected => Self::UserRejected,
+            MobileSyncEvent::MobileBusy => Self::MobileBusy,
+            MobileSyncEvent::UploadBatch {
+                sync_id,
+                url,
+                batch_type,
+                idx,
+                is_last,
+            } => Self::UploadBatch {
+                sync_id,
+                url,
+                batch_type,
+                idx,
+                is_last,
+            },
+        }
+    }
+}
+
+/// Decrypted plain-chat envelope held Rust-side for zero-JSON-reencode typed delivery.
+///
+/// Mirrors `crate::ws::WirePayload`: Swift resolves contact names for `uids`, calls [`Self::resolve`],
+/// and gets `None` (zero re-parse) when the core's name cache already matched.
+#[derive(uniffi::Object)]
+pub struct CoreWirePayload {
+    inner: Arc<WirePayloadHandle>,
+}
+
+#[uniffi::export]
+impl CoreWirePayload {
+    /// Returns `None` when the delivered events already used this `my_uid`, `self_conv_id`, and
+    /// `names`; otherwise re-parses and updates the core's per-session name cache.
+    pub fn resolve(
+        &self,
+        my_uid: String,
+        self_conv_id: Option<String>,
+        names: Vec<NameEntry>,
+    ) -> Option<Vec<WireEvent>> {
+        let pairs: Vec<(String, NameLookup)> = names
+            .into_iter()
+            .map(|n| {
+                (
+                    n.uid,
+                    NameLookup {
+                        name: n.name,
+                        avatar: n.avatar,
+                    },
+                )
+            })
+            .collect();
+        self.inner
+            .resolve(&my_uid, self_conv_id.as_deref(), &pairs)
+            .map(|evts| evts.into_iter().map(convert_wire_event).collect())
+    }
+
+    /// Lossless JSON string of the decrypted payload (diagnostic / fallback).
+    pub fn json_string(&self) -> String {
+        self.inner.json_string()
+    }
+}
+
+/// Control routing decision returned by [`classify_control_envelope`] (pure FFI helper for
+/// direct Swift unit tests of `ZaloEngine.processControlEnvelope`).
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum ControlRouteRecord {
+    RecordFileDone {
+        file_id: String,
+        url: String,
+    },
+    LogUndecodedControl {
+        cmd: u16,
+        encrypt: i64,
+        data_is_string: bool,
+    },
+    VoipControl {
+        act: String,
+        raw_data_json: String,
+        data_json: String,
+    },
+    LogTypingShape {
+        shape: String,
+    },
+    ShowTyping {
+        conv_id: String,
+        uid: String,
+        on_pc: bool,
+    },
+    PinTopic {
+        conv_id: String,
+    },
+    GroupNotice {
+        act: String,
+        data_json: String,
+        ts: i64,
+    },
+    Mute {
+        conv_id: String,
+        set: bool,
+        start: i64,
+        start_explicit: bool,
+        duration: i64,
+    },
+}
+
+impl fmt::Debug for ControlRouteRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RecordFileDone { file_id, url } => f
+                .debug_struct("RecordFileDone")
+                .field("has_file_id", &!file_id.is_empty())
+                .field("has_url", &!url.is_empty())
+                .finish(),
+            Self::LogUndecodedControl {
+                cmd,
+                encrypt,
+                data_is_string,
+            } => f
+                .debug_struct("LogUndecodedControl")
+                .field("cmd", cmd)
+                .field("encrypt", encrypt)
+                .field("data_is_string", data_is_string)
+                .finish(),
+            Self::VoipControl { act, .. } => {
+                f.debug_struct("VoipControl").field("act", act).finish()
+            }
+            Self::LogTypingShape { shape } => f
+                .debug_struct("LogTypingShape")
+                .field("shape", shape)
+                .finish(),
+            Self::ShowTyping { on_pc, .. } => {
+                f.debug_struct("ShowTyping").field("on_pc", on_pc).finish()
+            }
+            Self::PinTopic { .. } => f.write_str("PinTopic"),
+            Self::GroupNotice { act, ts, .. } => f
+                .debug_struct("GroupNotice")
+                .field("act", act)
+                .field("ts", ts)
+                .finish(),
+            Self::Mute {
+                set,
+                start,
+                duration,
+                ..
+            } => f
+                .debug_struct("Mute")
+                .field("set", set)
+                .field("start", start)
+                .field("duration", duration)
+                .finish(),
+        }
+    }
+}
+
+/// Pure control-envelope classifier backed by `olaz_core::reduce::classify::classify`.
+/// Used by `ZaloEngine.processControlEnvelope` so Swift holds zero duplicate control parsing logic.
+#[uniffi::export]
+pub fn classify_control_envelope(
+    cmd: u16,
+    payload_json: String,
+    my_uid: String,
+    now_unix_secs: i64,
+) -> Vec<ControlRouteRecord> {
+    let Some(payload) = olaz_json::parse_object_str(&payload_json) else {
+        return Vec::new();
+    };
+    classify(cmd, payload, &my_uid, now_unix_secs)
+        .into_iter()
+        .filter_map(|route| match route {
+            Route::RecordFileDone { file_id, url } => {
+                Some(ControlRouteRecord::RecordFileDone { file_id, url })
+            }
+            Route::LogUndecodedControl {
+                cmd,
+                encrypt,
+                data_is_string,
+            } => Some(ControlRouteRecord::LogUndecodedControl {
+                cmd,
+                encrypt,
+                data_is_string,
+            }),
+            Route::VoipControl {
+                act,
+                raw_data,
+                data,
+            } => Some(ControlRouteRecord::VoipControl {
+                act,
+                raw_data_json: to_swift_json_string(&raw_data),
+                data_json: to_swift_json_string(&Value::Object(data)),
+            }),
+            Route::LogTypingShape { shape } => Some(ControlRouteRecord::LogTypingShape { shape }),
+            Route::ShowTyping {
+                conv_id,
+                uid,
+                on_pc,
+            } => Some(ControlRouteRecord::ShowTyping {
+                conv_id,
+                uid,
+                on_pc,
+            }),
+            Route::PinTopic { conv_id } => Some(ControlRouteRecord::PinTopic { conv_id }),
+            Route::GroupNotice { act, data, ts } => Some(ControlRouteRecord::GroupNotice {
+                act,
+                data_json: to_swift_json_string(&Value::Object(data)),
+                ts,
+            }),
+            Route::Mute {
+                conv_id,
+                set,
+                start,
+                start_explicit,
+                duration,
+            } => Some(ControlRouteRecord::Mute {
+                conv_id,
+                set,
+                start,
+                start_explicit,
+                duration,
+            }),
+            Route::SessionExpired { .. }
+            | Route::E2eeSignal { .. }
+            | Route::E2eeDeliverReports { .. }
+            | Route::LogSyncAck { .. }
+            | Route::MobileSync(_)
+            | Route::ApplyBatch { .. } => None,
+        })
+        .collect()
+}
+
 /// Platform host callbacks implemented by Swift (`ZaloEngineCoreHost`).
 ///
 /// Called serially in emitted order on the core's host worker; never invoked concurrently.
@@ -380,16 +698,56 @@ impl From<CoreChanges> for CoreChangesRecord {
 pub trait CoreHost: Send + Sync {
     async fn load_saved_session(&self) -> Option<String>;
     async fn load_legacy_cookie(&self) -> Option<LegacyCookieRecord>;
+    async fn load_transport_state(&self) -> PersistedTransportStateRecord;
     async fn set_pref(&self, key: String, value: String);
     async fn prepare_store(&self, user_id: String, account: LoginAccountRecord);
-    async fn start_ws(&self, endpoints: Vec<String>, zpw_sek: String);
-    async fn start_long_poll(&self);
+    /// Return `true` to connect WebSocket, `false` to suppress (used by session/transport recorders).
+    async fn on_ws_started(&self, endpoints: Vec<String>) -> bool;
+    /// Return `true` to start periodic long-poll ticks, `false` to suppress.
+    async fn on_long_poll_started(&self) -> bool;
     async fn start_bootstrap(&self);
     async fn offer_first_login_transfer(&self, force: bool);
     async fn reset_domains(&self);
     async fn persist_session(&self, snapshot_json: String);
     async fn clear_session(&self);
     async fn mark_expired(&self, snapshot_json: String);
+
+    // --- Transport domain callbacks (U2) ---
+    async fn persist_poll_state(&self, state: PollStateRecord);
+    async fn persist_ws_cursors(&self, cursors: Vec<CursorEntry>);
+    async fn apply_batch(
+        &self,
+        cmd: Option<u16>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        payload_json: String,
+    ) -> u32;
+    async fn apply_parsed_events(
+        &self,
+        cmd: u16,
+        increment_unread: bool,
+        notify_incoming: bool,
+        events: Vec<WireEvent>,
+        uids: Vec<String>,
+        payload: Arc<CoreWirePayload>,
+    );
+    async fn mobile_sync(&self, events: Vec<MobileSyncEventRecord>);
+    async fn e2ee_signal(&self, cmd: u16, payload_json: String);
+    async fn e2ee_deliver_reports(&self, cmd: u16, payload_json: String);
+    async fn e2ee_connected(&self, uid: String);
+    async fn e2ee_disconnected(&self);
+    async fn voip_control(&self, act: String, raw_data_json: String, data_json: String);
+    async fn show_typing(&self, conv_id: String, uid: String, on_pc: bool);
+    async fn pin_topic(&self, conv_id: String);
+    async fn group_notice(&self, act: String, data_json: String, ts: i64);
+    async fn mute(
+        &self,
+        conv_id: String,
+        set: bool,
+        start: i64,
+        start_explicit: bool,
+        duration: i64,
+    );
 }
 
 struct FfiHostBridge(Arc<dyn CoreHost>);
@@ -404,6 +762,10 @@ impl Host for FfiHostBridge {
         self.0.load_legacy_cookie().await.map(Into::into)
     }
 
+    async fn load_transport_state(&self) -> PersistedTransportState {
+        self.0.load_transport_state().await.into()
+    }
+
     async fn set_pref(&self, key: String, value: String) {
         self.0.set_pref(key, value).await;
     }
@@ -412,12 +774,12 @@ impl Host for FfiHostBridge {
         self.0.prepare_store(user_id, account.into()).await;
     }
 
-    async fn start_ws(&self, endpoints: Vec<String>, zpw_sek: String) {
-        self.0.start_ws(endpoints, zpw_sek).await;
+    async fn on_ws_started(&self, endpoints: Vec<String>) -> bool {
+        self.0.on_ws_started(endpoints).await
     }
 
-    async fn start_long_poll(&self) {
-        self.0.start_long_poll().await;
+    async fn on_long_poll_started(&self) -> bool {
+        self.0.on_long_poll_started().await
     }
 
     async fn start_bootstrap(&self) {
@@ -443,15 +805,134 @@ impl Host for FfiHostBridge {
     async fn mark_expired(&self, snapshot_json: String) {
         self.0.mark_expired(snapshot_json).await;
     }
+
+    async fn persist_poll_state(&self, state: PollState) {
+        self.0
+            .persist_poll_state(PollStateRecord::from(&state))
+            .await;
+    }
+
+    async fn persist_ws_cursors(&self, cursors: CursorMap) {
+        self.0
+            .persist_ws_cursors(cursors_to_entries(&cursors))
+            .await;
+    }
+
+    async fn apply_batch(
+        &self,
+        cmd: Option<u16>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        payload: Map<String, Value>,
+    ) -> u32 {
+        let payload_json = to_swift_json_string(&Value::Object(payload));
+        self.0
+            .apply_batch(cmd, increment_unread, notify_incoming, payload_json)
+            .await
+    }
+
+    async fn apply_parsed_events(
+        &self,
+        cmd: u16,
+        increment_unread: bool,
+        notify_incoming: bool,
+        envelope: TypedChatEnvelope,
+    ) {
+        let events = envelope
+            .events
+            .into_iter()
+            .map(convert_wire_event)
+            .collect();
+        let payload = Arc::new(CoreWirePayload {
+            inner: envelope.payload,
+        });
+        self.0
+            .apply_parsed_events(
+                cmd,
+                increment_unread,
+                notify_incoming,
+                events,
+                envelope.uids,
+                payload,
+            )
+            .await;
+    }
+
+    async fn mobile_sync(&self, events: Vec<MobileSyncEvent>) {
+        self.0
+            .mobile_sync(events.into_iter().map(Into::into).collect())
+            .await;
+    }
+
+    async fn e2ee_signal(&self, cmd: u16, payload: Map<String, Value>) {
+        let payload_json = to_swift_json_string(&Value::Object(payload));
+        self.0.e2ee_signal(cmd, payload_json).await;
+    }
+
+    async fn e2ee_deliver_reports(&self, cmd: u16, payload: Map<String, Value>) {
+        let payload_json = to_swift_json_string(&Value::Object(payload));
+        self.0.e2ee_deliver_reports(cmd, payload_json).await;
+    }
+
+    async fn e2ee_connected(&self, uid: String) {
+        self.0.e2ee_connected(uid).await;
+    }
+
+    async fn e2ee_disconnected(&self) {
+        self.0.e2ee_disconnected().await;
+    }
+
+    async fn voip_control(&self, act: String, raw_data: Value, data: Map<String, Value>) {
+        let raw_data_json = to_swift_json_string(&raw_data);
+        let data_json = to_swift_json_string(&Value::Object(data));
+        self.0.voip_control(act, raw_data_json, data_json).await;
+    }
+
+    async fn show_typing(&self, conv_id: String, uid: String, on_pc: bool) {
+        self.0.show_typing(conv_id, uid, on_pc).await;
+    }
+
+    async fn pin_topic(&self, conv_id: String) {
+        self.0.pin_topic(conv_id).await;
+    }
+
+    async fn group_notice(&self, act: String, data: Map<String, Value>, ts: i64) {
+        let data_json = to_swift_json_string(&Value::Object(data));
+        self.0.group_notice(act, data_json, ts).await;
+    }
+
+    async fn mute(
+        &self,
+        conv_id: String,
+        set: bool,
+        start: i64,
+        start_explicit: bool,
+        duration: i64,
+    ) {
+        self.0
+            .mute(conv_id, set, start, start_explicit, duration)
+            .await;
+    }
+}
+
+fn parse_inner_json(json: &str) -> Result<Map<String, Value>, CoreError> {
+    if json.trim().is_empty() {
+        return Ok(Map::new());
+    }
+    olaz_json::parse_object_str(json).ok_or_else(|| CoreError::Parse {
+        message: "request data is not a JSON object".to_owned(),
+    })
 }
 
 /// The `olaz-core` actor handle exported to Swift.
 ///
-/// Owns session state and drives boot, QR login, expiry, and logout over the shared [`CoreSession`].
+/// Owns session & transport state (boot, QR login, expiry, logout, WebSocket lifecycle,
+/// long-poll loop, and event routing) over the shared [`CoreSession`].
 /// Swift pushes commands via sync/async methods and pulls coalesced updates via [`Self::next_changes`].
 #[derive(uniffi::Object)]
 pub struct CoreEngine {
     handle: Arc<CoreHandle>,
+    ws_driver: Arc<dyn WsDriver>,
 }
 
 #[uniffi::export]
@@ -460,15 +941,17 @@ impl CoreEngine {
     #[uniffi::constructor]
     pub fn new(session: Arc<CoreSession>, host: Arc<dyn CoreHost>) -> Result<Arc<Self>, CoreError> {
         let rt_handle = runtime()?.handle().clone();
-        let runner = SessionEffectRunner::with_default_domains(
+        let runner = Arc::new(SessionEffectRunner::with_default_domains(
             Arc::clone(&session.client),
             Arc::new(FfiHostBridge(host)),
             rt_handle.clone(),
             session.default_domains.clone(),
-        );
-        let handle = CoreHandle::start(Arc::new(runner), rt_handle);
+        ));
+        let ws_driver = Arc::clone(runner.ws_driver());
+        let handle = CoreHandle::start(runner, rt_handle);
         Ok(Arc::new(Self {
             handle: Arc::new(handle),
+            ws_driver,
         }))
     }
 
@@ -510,6 +993,98 @@ impl CoreEngine {
         Ok(rev)
     }
 
+    /// Runs up to `max_batches` HTTP long-poll fetches serially (ADR-018) and returns the total
+    /// number of events applied across those batches.
+    pub async fn drain_chat_polling(
+        &self,
+        max_batches: u32,
+        notify_incoming: bool,
+    ) -> Result<u32, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let count = run(async move {
+            handle
+                .drain_chat_polling(max_batches, notify_incoming)
+                .await
+        })
+        .await?;
+        Ok(count)
+    }
+
+    // --- Core-owned WebSocket pass-throughs for Swift feature domains ---
+
+    /// Sends a raw WebSocket frame. `false` unless authenticated and the write succeeded.
+    pub async fn ws_send_frame(
+        &self,
+        cmd: u16,
+        sub_cmd: u8,
+        version: u8,
+        payload_json: Option<String>,
+    ) -> Result<bool, CoreError> {
+        let ws = Arc::clone(&self.ws_driver);
+        run(async move {
+            ws.send_frame_versioned(cmd, sub_cmd, version, payload_json.map(String::into_bytes))
+                .await
+        })
+        .await
+    }
+
+    /// Sends a `requestAsyncV2` request frame on the core's WebSocket and awaits its reply.
+    pub async fn ws_send_request(
+        &self,
+        cmd: u16,
+        sub_cmd: u8,
+        version: u8,
+        req_id: Option<String>,
+        inner_data_json: String,
+        timeout_secs: f64,
+    ) -> Result<Option<String>, CoreError> {
+        let inner = parse_inner_json(&inner_data_json)?;
+        let timeout = Duration::try_from_secs_f64(timeout_secs).unwrap_or(Duration::from_secs(10));
+        let ws = Arc::clone(&self.ws_driver);
+        let out = run(async move {
+            ws.send_request(cmd, sub_cmd, version, req_id, inner, timeout)
+                .await
+        })
+        .await?;
+        Ok(out.map(|m| to_swift_json_string(&Value::Object(m))))
+    }
+
+    /// Waits up to `timeout_secs` for upload `file_id` to complete on the core's WebSocket.
+    pub async fn ws_wait_for_file_done(
+        &self,
+        file_id: String,
+        timeout_secs: f64,
+    ) -> Result<Option<String>, CoreError> {
+        let timeout = Duration::try_from_secs_f64(timeout_secs).unwrap_or(Duration::from_secs(12));
+        let ws = Arc::clone(&self.ws_driver);
+        run(async move { ws.wait_for_file_done(file_id, timeout).await }).await
+    }
+
+    /// Records a `file_done` completion discovered outside the core's WS frame loop.
+    pub fn ws_record_file_done(&self, file_id: String, url: String) {
+        self.ws_driver.record_file_done(file_id, url);
+    }
+
+    /// Returns whether the core's WebSocket is currently authenticated.
+    pub async fn ws_is_authed(&self) -> Result<bool, CoreError> {
+        let ws = Arc::clone(&self.ws_driver);
+        run(async move { ws.is_authed().await }).await
+    }
+
+    /// Returns the core's current WebSocket queue cursors.
+    pub async fn ws_current_cursors(&self) -> Result<Vec<CursorEntry>, CoreError> {
+        let ws = Arc::clone(&self.ws_driver);
+        let map = run(async move { ws.current_cursors().await }).await?;
+        Ok(cursors_to_entries(&map))
+    }
+
+    /// Seeds the core's WebSocket queue cursors.
+    pub async fn ws_seed_cursors(&self, cursors: Vec<CursorEntry>) -> Result<(), CoreError> {
+        let ws = Arc::clone(&self.ws_driver);
+        let map = cursors_to_map(cursors);
+        run(async move { ws.seed_cursors(map).await }).await
+    }
+
     /// Pulls the next coalesced batch of dirty domain snapshots, or `None` after [`Self::stop`].
     pub async fn next_changes(&self) -> Result<Option<CoreChangesRecord>, CoreError> {
         let handle = Arc::clone(&self.handle);
@@ -530,7 +1105,7 @@ impl CoreEngine {
         Ok(version)
     }
 
-    /// Stops the actor, aborts in-flight session tasks, and closes `next_changes()`.
+    /// Stops the actor, aborts in-flight session & transport tasks, and closes `next_changes()`.
     pub fn stop(&self) {
         self.handle.stop();
     }
@@ -550,16 +1125,62 @@ mod tests {
         async fn load_legacy_cookie(&self) -> Option<LegacyCookieRecord> {
             None
         }
+        async fn load_transport_state(&self) -> PersistedTransportStateRecord {
+            PersistedTransportStateRecord::default()
+        }
         async fn set_pref(&self, _key: String, _value: String) {}
         async fn prepare_store(&self, _user_id: String, _account: LoginAccountRecord) {}
-        async fn start_ws(&self, _endpoints: Vec<String>, _zpw_sek: String) {}
-        async fn start_long_poll(&self) {}
+        async fn on_ws_started(&self, _endpoints: Vec<String>) -> bool {
+            false
+        }
+        async fn on_long_poll_started(&self) -> bool {
+            false
+        }
         async fn start_bootstrap(&self) {}
         async fn offer_first_login_transfer(&self, _force: bool) {}
         async fn reset_domains(&self) {}
         async fn persist_session(&self, _snapshot_json: String) {}
         async fn clear_session(&self) {}
         async fn mark_expired(&self, _snapshot_json: String) {}
+        async fn persist_poll_state(&self, _state: PollStateRecord) {}
+        async fn persist_ws_cursors(&self, _cursors: Vec<CursorEntry>) {}
+        async fn apply_batch(
+            &self,
+            _cmd: Option<u16>,
+            _increment_unread: bool,
+            _notify_incoming: bool,
+            _payload_json: String,
+        ) -> u32 {
+            0
+        }
+        async fn apply_parsed_events(
+            &self,
+            _cmd: u16,
+            _increment_unread: bool,
+            _notify_incoming: bool,
+            _events: Vec<WireEvent>,
+            _uids: Vec<String>,
+            _payload: Arc<CoreWirePayload>,
+        ) {
+        }
+        async fn mobile_sync(&self, _events: Vec<MobileSyncEventRecord>) {}
+        async fn e2ee_signal(&self, _cmd: u16, _payload_json: String) {}
+        async fn e2ee_deliver_reports(&self, _cmd: u16, _payload_json: String) {}
+        async fn e2ee_connected(&self, _uid: String) {}
+        async fn e2ee_disconnected(&self) {}
+        async fn voip_control(&self, _act: String, _raw_data_json: String, _data_json: String) {}
+        async fn show_typing(&self, _conv_id: String, _uid: String, _on_pc: bool) {}
+        async fn pin_topic(&self, _conv_id: String) {}
+        async fn group_notice(&self, _act: String, _data_json: String, _ts: i64) {}
+        async fn mute(
+            &self,
+            _conv_id: String,
+            _set: bool,
+            _start: i64,
+            _start_explicit: bool,
+            _duration: i64,
+        ) {
+        }
     }
 
     #[test]

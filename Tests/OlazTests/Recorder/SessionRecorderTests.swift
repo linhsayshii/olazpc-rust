@@ -68,43 +68,42 @@ struct SessionRecorderTests {
     }
 
     enum RecorderError: Error, CustomStringConvertible {
-        case timeout(String)
-        case unscriptedRequest(String)
-        case invalidStep(String)
-        case hostNotIsolated(String)
+        case timeout(scenario: String, detail: String)
+        case unscriptedRequest(scenario: String)
+        case invalidStep(scenario: String, detail: String)
+        case hostNotIsolated(scenario: String, detail: String)
 
         var description: String {
             switch self {
-            case .timeout(let msg): return "RecorderError.timeout: \(msg)"
-            case .unscriptedRequest(let name): return "RecorderError.unscriptedRequest: \(name)"
-            case .invalidStep(let msg): return "RecorderError.invalidStep: \(msg)"
-            case .hostNotIsolated(let msg): return "RecorderError.hostNotIsolated: \(msg)"
+            case .timeout(let scenario, let detail):
+                return "\(scenario): RecorderError.timeout: \(detail)"
+            case .unscriptedRequest(let scenario):
+                return "\(scenario): RecorderError.unscriptedRequest"
+            case .invalidStep(let scenario, let detail):
+                return "\(scenario): RecorderError.invalidStep: \(detail)"
+            case .hostNotIsolated(let scenario, let detail):
+                return "\(scenario): RecorderError.hostNotIsolated: \(detail)"
             }
         }
     }
 
     @MainActor
     static func recordScenario(_ scenario: ScenarioDef) async throws -> CaseJSON {
+        try await RecorderSuiteLock.shared.withLock {
+            try await recordScenarioLocked(scenario)
+        }
+    }
+
+    @MainActor
+    private static func recordScenarioLocked(_ scenario: ScenarioDef) async throws -> CaseJSON {
         let dataDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("olaz-recorder-\(scenario.name)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
 
-        let savedLegacyIMEI = UserDefaults.standard.object(forKey: "olaz.imei")
-        let savedNativeIMEI = UserDefaults.standard.object(forKey: "olaz.native.pc.imei")
-        deleteZpwSekCookies()
+        let storage = RecorderStorageIsolation(prefix: "olaz.session-recorder")
 
         defer {
-            deleteZpwSekCookies()
-            if let savedLegacyIMEI {
-                UserDefaults.standard.set(savedLegacyIMEI, forKey: "olaz.imei")
-            } else {
-                UserDefaults.standard.removeObject(forKey: "olaz.imei")
-            }
-            if let savedNativeIMEI {
-                UserDefaults.standard.set(savedNativeIMEI, forKey: "olaz.native.pc.imei")
-            } else {
-                UserDefaults.standard.removeObject(forKey: "olaz.native.pc.imei")
-            }
+            storage.cleanup()
             try? FileManager.default.removeItem(at: dataDir)
         }
 
@@ -145,10 +144,10 @@ struct SessionRecorderTests {
                    .value: sek,
                    .originURL: cookieURL,
                ]) {
-                HTTPCookieStorage.shared.setCookie(cookie)
+                storage.cookieStorage.setCookie(cookie)
             }
             if let imei = cookieSeed["imei"]?.stringValue {
-                UserDefaults.standard.set(imei, forKey: "olaz.imei")
+                storage.userDefaults.set(imei, forKey: "olaz.imei")
             }
         }
 
@@ -156,9 +155,15 @@ struct SessionRecorderTests {
         let domainsJSON = substituteRuntimeURLs(scenario.seed["domains"] ?? defaultFakeDomainsJSON())
         let domainsData = Data(domainsJSON.canonicalString().utf8)
         let domains = try JSONDecoder().decode(ZaloDomains.self, from: domainsData)
-        try assertOnlyLocalFakeHosts(domains, context: "\(scenario.name) initial seed")
+        try assertOnlyLocalFakeHosts(domains, scenario: scenario.name, stage: "initial seed")
 
-        let engine = ZaloEngine(dataDirectory: dataDir, useKeychain: false, domains: domains)
+        let engine = ZaloEngine(
+            dataDirectory: dataDir,
+            useKeychain: false,
+            domains: domains,
+            userDefaultsSuiteName: storage.userDefaultsSuiteName,
+            cookieStorage: storage.cookieStorage
+        )
         if let prefsObj = scenario.seed["prefs"]?.objectValue {
             for (k, v) in prefsObj {
                 if let s = v.stringValue {
@@ -177,7 +182,7 @@ struct SessionRecorderTests {
             return false
         }
 
-        let transitionRecorder = TransitionRecorder {
+        let transitionRecorder = TransitionRecorder(scenarioName: scenario.name) {
             normalizeRecordedURLs(SessionSnapshot.capture(from: engine))
         }
         engine.stateTrace = { [weak transitionRecorder] in
@@ -213,7 +218,7 @@ struct SessionRecorderTests {
                         engine.handleSessionExpiredNotice(reason)
                         transitionRecorder.advanceSearchToLatestSyncState()
                     default:
-                        throw RecorderError.invalidStep("Unknown cmd: \(cmd)")
+                        throw RecorderError.invalidStep(scenario: scenario.name, detail: "Unknown cmd: \(cmd)")
                     }
                 } else if let pred = step["await"] {
                     let timeoutMs = Int(step["timeout_ms"]?.int64Value ?? 5000)
@@ -221,7 +226,7 @@ struct SessionRecorderTests {
                 } else if let label = step["snapshot"]?.stringValue {
                     snapshots[label] = transitionRecorder.currentCursorSnapshot()
                 } else {
-                    throw RecorderError.invalidStep("Unknown step: \(step.canonicalString())")
+                    throw RecorderError.invalidStep(scenario: scenario.name, detail: "Unknown step: \(step.canonicalString())")
                 }
             }
 
@@ -241,7 +246,7 @@ struct SessionRecorderTests {
             await engine.settleForRecording()
             await Task.yield()
 
-            try assertOnlyLocalFakeHosts(await engine.sessionClient.domains, context: "\(scenario.name) final")
+            try assertOnlyLocalFakeHosts(await engine.sessionClient.domains, scenario: scenario.name, stage: "final")
 
             let finalState = normalizeRecordedURLs(SessionSnapshot.capture(from: engine))
             let requests = server.canonicalRequests().map { normalizeRecordedURLs($0) }
@@ -251,7 +256,7 @@ struct SessionRecorderTests {
             await engine.finishTearDownForRecording()
 
             if server.hadUnscriptedRequest {
-                throw RecorderError.unscriptedRequest(scenario.name)
+                throw RecorderError.unscriptedRequest(scenario: scenario.name)
             }
 
             var caseDict: [String: CaseJSON] = [
@@ -281,9 +286,9 @@ struct SessionRecorderTests {
         }
     }
 
-    private static func assertOnlyLocalFakeHosts(_ domains: ZaloDomains, context: String) throws {
+    private static func assertOnlyLocalFakeHosts(_ domains: ZaloDomains, scenario: String, stage: String) throws {
         guard domains.isolated else {
-            throw RecorderError.hostNotIsolated("\(context): ZaloDomains.isolated must be true")
+            throw RecorderError.hostNotIsolated(scenario: scenario, detail: "\(stage): ZaloDomains.isolated must be true")
         }
         var allHosts: [String] = [domains.auth, domains.wpaChat, domains.lpChat, domains.lpControl]
         allHosts.append(contentsOf: domains.ws)
@@ -294,7 +299,7 @@ struct SessionRecorderTests {
         for raw in allHosts where !raw.isEmpty {
             let norm = ZaloDomains.normalizeHost(raw)
             guard let host = URL(string: norm)?.host?.lowercased(), allowedHosts.contains(host) else {
-                throw RecorderError.hostNotIsolated("\(context): non-fake host detected '\(raw)'")
+                throw RecorderError.hostNotIsolated(scenario: scenario, detail: "\(stage): non-fake host detected '\(raw)'")
             }
         }
     }
@@ -305,12 +310,6 @@ struct SessionRecorderTests {
         }
         let parsed = ZaloCrypto.parseSecretKey(enk)
         return (parsed.count == 16 || parsed.count == 32) ? parsed : nil
-    }
-
-    private static func deleteZpwSekCookies() {
-        for cookie in HTTPCookieStorage.shared.cookies ?? [] where cookie.name == "zpw_sek" {
-            HTTPCookieStorage.shared.deleteCookie(cookie)
-        }
     }
 
 
@@ -1069,9 +1068,11 @@ private final class TransitionRecorder {
     private(set) var cursor: Int = 0
     private var searchStart: Int = 0
     private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private let scenarioName: String
     private let capture: () -> CaseJSON
 
-    init(capture: @escaping () -> CaseJSON) {
+    init(scenarioName: String, capture: @escaping () -> CaseJSON) {
+        self.scenarioName = scenarioName
         self.capture = capture
         self.history.append(capture())
     }
@@ -1123,7 +1124,8 @@ private final class TransitionRecorder {
             if remaining <= .zero {
                 let lastDesc = (history.last ?? capture()).canonicalString()
                 throw SessionRecorderTests.RecorderError.timeout(
-                    "Timed out waiting for \(predicate.canonicalString()), current: \(lastDesc)"
+                    scenario: scenarioName,
+                    detail: "Timed out waiting for \(predicate.canonicalString()), current: \(lastDesc)"
                 )
             }
 
