@@ -1491,9 +1491,12 @@ name = "olaz-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "olaz-api",
  "olaz-crypto",
  "olaz-json",
  "olaz-net",
+ "olaz-wire",
+ "olaz-ws",
  "serde",
  "serde_json",
  "thiserror",

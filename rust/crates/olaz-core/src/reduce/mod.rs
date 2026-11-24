@@ -2,6 +2,7 @@
 //!
 //! No I/O, no clock, and no randomness may live inside `reduce`.
 
+pub mod classify;
 pub mod session;
 
 use crate::changes::DirtySet;

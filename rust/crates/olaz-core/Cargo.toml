@@ -14,9 +14,12 @@ harness = false
 
 [dependencies]
 async-trait = "0.1"
+olaz-api = { path = "../olaz-api" }
 olaz-crypto = { path = "../olaz-crypto" }
 olaz-json = { path = "../olaz-json" }
 olaz-net = { path = "../olaz-net" }
+olaz-wire = { path = "../olaz-wire" }
+olaz-ws = { path = "../olaz-ws" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["arbitrary_precision"] }
 thiserror = "2.0.21"
