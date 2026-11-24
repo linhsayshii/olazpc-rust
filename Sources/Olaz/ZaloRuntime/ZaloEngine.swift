@@ -171,7 +171,16 @@ final class ZaloEngine {
     @ObservationIgnored internal var cachedQRPNG: Data?
     @ObservationIgnored internal var hostTrace: ((String, [String: Any]) -> Bool)?
     @ObservationIgnored internal var stateTrace: (() -> Void)?
-    @ObservationIgnored internal var transportSettleTrace: (() -> Void)?
+    @ObservationIgnored private let transportSettleTraceActive = OSAllocatedUnfairLock<Bool>(initialState: false)
+    nonisolated internal var hasTransportSettleTrace: Bool {
+        transportSettleTraceActive.withLock { $0 }
+    }
+    @ObservationIgnored internal var transportSettleTrace: (() -> Void)? {
+        didSet {
+            let active = transportSettleTrace != nil
+            transportSettleTraceActive.withLock { $0 = active }
+        }
+    }
     @ObservationIgnored internal var nowMs: () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }
     @ObservationIgnored internal var randomTag4: () -> String = { String(UUID().uuidString.prefix(4)) }
     @ObservationIgnored internal var recordedQRPayload: String?

@@ -350,8 +350,10 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
             incrementUnread: incrementUnread,
             notifyIncoming: notifyIncoming
         )
-        await MainActor.run {
-            engine.transportSettleTrace?()
+        if engine.hasTransportSettleTrace {
+            await MainActor.run {
+                engine.transportSettleTrace?()
+            }
         }
         return delta
     }
@@ -380,8 +382,10 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
             notifyIncoming: notifyIncoming,
             events: parsed
         )
-        await MainActor.run {
-            engine.transportSettleTrace?()
+        if engine.hasTransportSettleTrace {
+            await MainActor.run {
+                engine.transportSettleTrace?()
+            }
         }
         return delta
     }
@@ -414,8 +418,10 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
     func e2eeConnected(uid: String) async {
         guard let engine else { return }
         await engine.hostHandleE2EEConnected(uid: uid)
-        await MainActor.run {
-            engine.transportSettleTrace?()
+        if engine.hasTransportSettleTrace {
+            await MainActor.run {
+                engine.transportSettleTrace?()
+            }
         }
     }
 
@@ -427,8 +433,10 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         if allowDisconnect {
             await engine.e2eeManager.markDisconnected()
         }
-        await MainActor.run {
-            engine.transportSettleTrace?()
+        if engine.hasTransportSettleTrace {
+            await MainActor.run {
+                engine.transportSettleTrace?()
+            }
         }
     }
 
