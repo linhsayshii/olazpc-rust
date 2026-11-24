@@ -223,7 +223,10 @@ import Foundation
     }
 
     @Test func e2eeManagerOutgoingTextAndStickerRoundTripWithSQLite() async throws {
-        let storeAlice = try ZaloSQLiteStore(path: ":memory:")
+        let dbDir = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-e2ee-alice-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dbDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dbDir) }
+        let storeAlice = try ZaloSQLiteStore(path: dbDir.appendingPathComponent("history.sqlite3").path)
         let mgrAlice = ZaloE2EEManager()
         await mgrAlice.prepare(uid: "alice_uid", store: storeAlice)
 

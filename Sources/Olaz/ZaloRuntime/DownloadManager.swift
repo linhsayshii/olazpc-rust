@@ -201,84 +201,10 @@ final class DownloadManager {
         return values.isRegularFile == true && (values.fileSize ?? 0) > 0
     }
 
-    /// What a fetch produced, before decryption and publication.
-    enum Fetched: Sendable {
-        case bytes(Data)
-        /// `ours`: a temporary file this download owns (deleted afterwards); otherwise a shared cache file.
-        case file(URL, ours: Bool)
-    }
-
     /// The transfer: fetch → decrypt → quarantine → atomic move. Runs off the main actor; all file I/O and
     /// crypto happen here. Temporary files live in `job.tempDirectory`, never in the user's save folder.
     nonisolated static func execute(_ job: Job, loader: MediaLoader) async -> Outcome {
-        if let core = loader.rustMedia { return await rustExecute(job, core: core, allowPlainHTTP: loader.allowPlainHTTP) }
-        var ownedRaw: URL?
-        do {
-            let fetched: Fetched
-            if job.headers.isEmpty && job.isPhoto {
-                let bytes = try await loader.data(for: job.url, deadline: max(MediaLoader.imageDeadline, job.ttfb))
-                fetched = .bytes(bytes)
-            } else if job.headers.isEmpty {
-                fetched = .file(try await loader.localFile(for: job.url), ours: false)       // shared cache: never deleted here
-            } else {
-                let raw = try await loader.downloadWithHeaders(job.url, headers: job.headers,
-                                                               maxBytes: job.isPhoto ? photoByteCap : MediaLoader.maxFileBytes,
-                                                               ttfb: job.ttfb > 0 ? job.ttfb : nil)
-                ownedRaw = raw
-                fetched = .file(raw, ours: true)
-            }
-            try Task.checkCancellation()
-            return try finalize(job, fetched)
-        } catch {
-            if let ownedRaw { try? FileManager.default.removeItem(at: ownedRaw) }
-            if Task.isCancelled || error is CancellationError { return Outcome(failure: .aborted) }
-            MediaDiagnostics.report(url: job.url, error: error, kind: "download-" + job.type.lowercased())
-            return Outcome(failure: Failure.from(error))
-        }
-    }
-
-    /// Decrypts (when `secure` asks), quarantines and publishes the bytes at `job.destination` atomically.
-    /// Nothing is visible at the destination until everything succeeded; temporaries are always removed.
-    nonisolated static func finalize(_ job: Job, _ fetched: Fetched) throws -> Outcome {
-        let fm = FileManager.default
-        var cleanup: [URL] = []
-        defer { for url in cleanup { try? fm.removeItem(at: url) } }
-        try fm.createDirectory(at: job.destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try fm.createDirectory(at: job.tempDirectory, withIntermediateDirectories: true)
-        let staged = job.tempDirectory.appendingPathComponent(UUID().uuidString + ".part")
-        cleanup.append(staged)
-        var stream: SecureStream?
-        switch job.secure {
-        case .stream(let value): stream = value
-        case .invalid: if case .file(let url, true) = fetched { cleanup.append(url) }; return Outcome(failure: .decryptFailed)
-        case .none: break
-        }
-
-        switch fetched {
-        case .bytes(let bytes):
-            guard !bytes.isEmpty else { return Outcome(failure: .emptyBody) }
-            guard bytes.count <= photoByteCap else { return Outcome(failure: .tooLarge) }
-            if let stream {
-                guard let plain = try? stream.decrypt(bytes) else { return Outcome(failure: .decryptFailed) }
-                try plain.write(to: staged)
-            } else {
-                try bytes.write(to: staged)
-            }
-        case .file(let raw, let ours):
-            if ours { cleanup.append(raw) }
-            if let stream {
-                do { try stream.decryptFile(at: raw, to: staged) } catch { return Outcome(failure: .decryptFailed) }
-            } else if ours {
-                try fm.moveItem(at: raw, to: staged)
-            } else {
-                try fm.copyItem(at: raw, to: staged)                       // APFS clone of the cache file
-            }
-        }
-        try Task.checkCancellation()
-        guard ((try? staged.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) > 0 else { return Outcome(failure: .emptyBody) }
-        MediaLoader.applyQuarantine(to: staged, origin: job.url)           // before the final name appears
-        try commit(staged, to: job.destination)
-        return Outcome(savePath: job.destination.path)
+        await rustExecute(job, core: loader.rustMedia, allowPlainHTTP: loader.allowPlainHTTP)
     }
 
     /// Moves `staged` over `destination` (replacing an existing file atomically when there is one).

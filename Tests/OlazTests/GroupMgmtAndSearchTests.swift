@@ -3,47 +3,6 @@ import os
 import Testing
 @testable import Olaz
 
-private final class MockGroupMgmtURLProtocol: URLProtocol, @unchecked Sendable {
-    typealias Handler = @Sendable (URLRequest, Data) -> (Int, [String: Any])
-    static let handlers = OSAllocatedUnfairLock<[String: Handler]>(initialState: [:])
-
-    override class func canInit(with request: URLRequest) -> Bool {
-        guard let host = request.url?.host else { return false }
-        return handlers.withLock { $0[host] != nil }
-    }
-
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
-        request
-    }
-
-    override func startLoading() {
-        guard let url = request.url,
-              let host = url.host,
-              let handler = Self.handlers.withLock({ $0[host] }) else {
-            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
-            return
-        }
-        var bodyData = request.httpBody ?? Data()
-        if bodyData.isEmpty, let stream = request.httpBodyStream {
-            stream.open()
-            defer { stream.close() }
-            var buf = [UInt8](repeating: 0, count: 4096)
-            while stream.hasBytesAvailable {
-                let n = stream.read(&buf, maxLength: buf.count)
-                if n > 0 { bodyData.append(contentsOf: buf.prefix(n)) } else { break }
-            }
-        }
-        let (status, jsonObj) = handler(request, bodyData)
-        let respData = (try? JSONSerialization.data(withJSONObject: jsonObj)) ?? Data("{}".utf8)
-        let http = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
-        client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: respData)
-        client?.urlProtocolDidFinishLoading(self)
-    }
-
-    override func stopLoading() {}
-}
-
 @Suite struct GroupMgmtPayloadAndAPITests {
     @Test func payloadBuildersMatchWireSpecsAndSanitizeInputs() throws {
         let imei = "test-imei-123"
@@ -128,7 +87,6 @@ private final class MockGroupMgmtURLProtocol: URLProtocol, @unchecked Sendable {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let host = "mock-grpmgmt-\(UUID().uuidString.lowercased()).invalid"
         let key = Data("0123456789abcdef".utf8)
         struct RecordedCall: Sendable {
             let path: String
@@ -138,45 +96,19 @@ private final class MockGroupMgmtURLProtocol: URLProtocol, @unchecked Sendable {
         }
         let recorded = OSAllocatedUnfairLock<[RecordedCall]>(initialState: [])
 
-        @Sendable func decodeEncryptedParams(_ rawEncoded: String) -> [String: Any] {
-            let decodedB64 = rawEncoded.removingPercentEncoding ?? rawEncoded
-            guard let plain = try? ZaloCrypto.decodeAES(key: key, base64: decodedB64),
-                  let obj = JSONLossless.parseObject(Data(plain.utf8)) else {
-                return [:]
+        let server = try FakeZaloServer { req in
+            let box = ZaloJSONBox(req.decodeEncryptedParams(key: key) ?? [:])
+            let contentType = req.header("content-type") ?? ""
+            recorded.withLock {
+                $0.append(RecordedCall(path: req.path, payload: box, contentType: contentType, body: req.body))
             }
-            return obj
+            return .json(200, ["error_code": 0, "data": ["ok": true]])
         }
+        try await server.start()
+        defer { server.stop() }
 
-        MockGroupMgmtURLProtocol.handlers.withLock { handlers in
-            handlers[host] = { req, bodyData in
-                let path = req.url?.path ?? ""
-                let contentType = req.value(forHTTPHeaderField: "Content-Type") ?? ""
-                var payload: [String: Any] = [:]
-                if let query = req.url?.query,
-                   let paramsPart = query.split(separator: "&").first(where: { $0.hasPrefix("params=") }) {
-                    payload = decodeEncryptedParams(String(paramsPart.dropFirst("params=".count)))
-                }
-                if payload.isEmpty {
-                    let bodyStr = String(decoding: bodyData, as: UTF8.self)
-                    if let paramsPart = bodyStr.split(separator: "&").first(where: { $0.hasPrefix("params=") }) {
-                        payload = decodeEncryptedParams(String(paramsPart.dropFirst("params=".count)))
-                    }
-                }
-                let box = ZaloJSONBox(payload)
-                recorded.withLock {
-                    $0.append(RecordedCall(path: path, payload: box, contentType: contentType, body: bodyData))
-                }
-                return (200, ["error_code": 0, "data": ["ok": true]])
-            }
-        }
-        defer { _ = MockGroupMgmtURLProtocol.handlers.withLock { $0.removeValue(forKey: host) } }
-
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [MockGroupMgmtURLProtocol.self]
-        let client = ZaloSessionClient(dataDirectory: root, useKeychain: false, urlSession: URLSession(configuration: config))
-        var domains = ZaloDomains()
-        domains.serviceCandidates["file"] = ["https://\(host)"]
-        domains.serviceCandidates["group"] = ["https://\(host)"]
+        let client = ZaloSessionClient(dataDirectory: root, useKeychain: false)
+        let domains = server.domains(for: ["file", "group"])
         var account = ZaloLoginAccount()
         account.userId = "100"
         await client.updateCredentials(account: account, secretKey: key, zpwSek: "sek.1.2", domains: domains)
@@ -276,7 +208,10 @@ private final class MockGroupMgmtURLProtocol: URLProtocol, @unchecked Sendable {
     }
 
     @Test func sqliteSearchEscapesWildcardsIsCaseInsensitiveScopedAndOrdered() async throws {
-        let store = try ZaloSQLiteStore(path: ":memory:")
+        let dbDir = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-sqlite-search-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dbDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dbDir) }
+        let store = try ZaloSQLiteStore(path: dbDir.appendingPathComponent("history.sqlite3").path)
         try await store.saveMessages([
             try storedText(id: "m1", convId: "c1", text: "Hello World", tsMs: 1000),
             try storedText(id: "m2", convId: "c1", text: "Đà Nẵng cuối tuần", tsMs: 2000),

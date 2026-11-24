@@ -1231,6 +1231,11 @@ fn urgency_parse_and_round_trip() {
         "me",
     ));
     assert_eq!(n.urgency, 1);
+    let (obj_meta, _) = msg_of(parse(
+        r#"{"msgId":"8803","msgType":"webchat","uidFrom":"peer","idTo":"me","ts":"1","metaData":{"urgency":1},"content":"x"}"#,
+        "me",
+    ));
+    assert_eq!(obj_meta.urgency, 1);
 }
 
 #[test]

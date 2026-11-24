@@ -113,7 +113,6 @@ private final class LocalServer: @unchecked Sendable {
     // MARK: Network through MediaLoader on the Rust path (local server)
 
     @Test func loaderFetchesCachesAndReportsHttpErrors() async throws {
-        guard RustCore.isEnabled else { return }
         let server = try LocalServer(body: Data("payload".utf8))
         try await server.start()
         defer { server.stop() }
@@ -139,7 +138,6 @@ private final class LocalServer: @unchecked Sendable {
 
     /// UniFFI does not cancel a Rust future when the Swift task is cancelled; the `MediaCancel` bridge must.
     @Test func cancellingTheSwiftTaskAbortsTheTransfer() async throws {
-        guard RustCore.isEnabled else { return }
         let server = try LocalServer(hang: true)
         try await server.start()
         defer { server.stop() }
@@ -159,7 +157,6 @@ private final class LocalServer: @unchecked Sendable {
     }
 
     @Test func downloadManagerStagesThroughRust() async throws {
-        guard RustCore.isEnabled else { return }
         let server = try LocalServer(body: Data("file-bytes".utf8))
         try await server.start()
         defer { server.stop() }
@@ -203,9 +200,8 @@ private final class LocalServer: @unchecked Sendable {
             return await group.reduce(0, +)
         }
         let elapsed = ContinuousClock.now - started
-        print("PERF media burst 200 fetches rust=\(RustCore.isEnabled) \(elapsed)")
-        // The Swift path upgrades http to https (ATS), so only the Rust path can reach the plain local server.
-        if RustCore.isEnabled { #expect(total == 200 * 4096) }
+        print("PERF media burst 200 fetches \(elapsed)")
+        #expect(total == 200 * 4096)
     }
 }
 

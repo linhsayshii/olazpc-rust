@@ -116,7 +116,7 @@ enum ScrollBench {
         let refresh = clock.refresh
         log(String(format: "label=%@ msgs=%d speed=%.0fpt/s screen=%@ maxFPS=%d refresh=%.2fms core=%@ window=%.0fx%.0f",
                    label, messages.count, speed, screen.localizedName, screen.maximumFramesPerSecond, refresh * 1000,
-                   RustCore.isEnabled ? "rust" : "swift", frame.width, frame.height))
+                   "rust", frame.width, frame.height))
 
         log(String(format: "memory start rss=%.0fMB footprint=%.0fMB", residentMB(), footprintMB()))
         guard let scroll = largestScrollView(in: host) else { log("no scroll view"); return }
