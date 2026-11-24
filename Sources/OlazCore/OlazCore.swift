@@ -1229,6 +1229,1196 @@ public func FfiConverterTypeCoreApi_lower(_ value: CoreApi) -> UInt64 {
 
 
 /**
+ * The `olaz-core` actor handle exported to Swift.
+ *
+ * Owns session state and drives boot, QR login, expiry, and logout over the shared [`CoreSession`].
+ * Swift pushes commands via sync/async methods and pulls coalesced updates via [`Self::next_changes`].
+ */
+public protocol CoreEngineProtocol: AnyObject, Sendable {
+    
+    /**
+     * Applies an account profile update and returns the monotonic change revision once reduced.
+     * Swift awaits this revision in its `next_changes()` mirror before returning from
+     * `async func applyAccountProfile(_:)`.
+     */
+    func applyAccountProfile(account: LoginAccountRecord) async throws  -> UInt64
+    
+    /**
+     * Returns the latest monotonic revision published to the change stream.
+     */
+    func currentVersion()  -> UInt64
+    
+    /**
+     * Handles a server-reported session expiry (`600` / `-102`) from any domain.
+     */
+    func handleSessionExpiredNotice(reason: String) 
+    
+    /**
+     * Clears session credentials, resets Swift domains, and starts fresh QR login.
+     */
+    func logOut() 
+    
+    /**
+     * Pulls the next coalesced batch of dirty domain snapshots, or `None` after [`Self::stop`].
+     */
+    func nextChanges() async throws  -> CoreChangesRecord?
+    
+    /**
+     * Cancels any active QR attempt and requests a fresh QR code.
+     */
+    func refreshQr() 
+    
+    /**
+     * Enqueues a barrier on the actor mailbox and returns the change revision once every input
+     * enqueued before this call has been reduced and published (`0` if already stopped).
+     */
+    func settle() async throws  -> UInt64
+    
+    /**
+     * Starts the engine (idempotent; subsequent calls are no-ops).
+     */
+    func start() 
+    
+    /**
+     * Stops the actor, aborts in-flight session tasks, and closes `next_changes()`.
+     */
+    func stop() 
+    
+}
+/**
+ * The `olaz-core` actor handle exported to Swift.
+ *
+ * Owns session state and drives boot, QR login, expiry, and logout over the shared [`CoreSession`].
+ * Swift pushes commands via sync/async methods and pulls coalesced updates via [`Self::next_changes`].
+ */
+open class CoreEngine: CoreEngineProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_olaz_ffi_fn_clone_coreengine(self.handle, $0) }
+    }
+    /**
+     * Starts the `olaz-core` actor on the shared tokio runtime.
+     */
+public convenience init(session: CoreSession, host: CoreHost)throws  {
+    let handle =
+        try rustCallWithError(FfiConverterTypeCoreError_lift) {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_constructor_coreengine_new(
+        FfiConverterTypeCoreSession_lower(session),
+        FfiConverterTypeCoreHost_lower(host),uniffiCallStatus
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_olaz_ffi_fn_free_coreengine(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Applies an account profile update and returns the monotonic change revision once reduced.
+     * Swift awaits this revision in its `next_changes()` mirror before returning from
+     * `async func applyAccountProfile(_:)`.
+     */
+open func applyAccountProfile(account: LoginAccountRecord)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_apply_account_profile(
+                        self.uniffiCloneHandle(),FfiConverterTypeLoginAccountRecord_lower(account)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Returns the latest monotonic revision published to the change stream.
+     */
+open func currentVersion() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_current_version(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Handles a server-reported session expiry (`600` / `-102`) from any domain.
+     */
+open func handleSessionExpiredNotice(reason: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_handle_session_expired_notice(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(reason),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Clears session credentials, resets Swift domains, and starts fresh QR login.
+     */
+open func logOut()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_log_out(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Pulls the next coalesced batch of dirty domain snapshots, or `None` after [`Self::stop`].
+     */
+open func nextChanges()async throws  -> CoreChangesRecord?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_next_changes(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeCoreChangesRecord.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Cancels any active QR attempt and requests a fresh QR code.
+     */
+open func refreshQr()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_refresh_qr(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Enqueues a barrier on the actor mailbox and returns the change revision once every input
+     * enqueued before this call has been reduced and published (`0` if already stopped).
+     */
+open func settle()async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_settle(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Starts the engine (idempotent; subsequent calls are no-ops).
+     */
+open func start()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_start(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Stops the actor, aborts in-flight session tasks, and closes `next_changes()`.
+     */
+open func stop()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_stop(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreEngine: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = CoreEngine
+
+    public static func lift(_ handle: UInt64) throws -> CoreEngine {
+        return CoreEngine(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: CoreEngine) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreEngine {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: CoreEngine, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreEngine_lift(_ handle: UInt64) throws -> CoreEngine {
+    return try FfiConverterTypeCoreEngine.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreEngine_lower(_ value: CoreEngine) -> UInt64 {
+    return FfiConverterTypeCoreEngine.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Platform host callbacks implemented by Swift (`ZaloEngineCoreHost`).
+ *
+ * Called serially in emitted order on the core's host worker; never invoked concurrently.
+ * `snapshot_json` in `persist_session` / `mark_expired` contains credentials and must never be
+ * logged.
+ */
+public protocol CoreHost: AnyObject, Sendable {
+    
+    func loadSavedSession() async  -> String?
+    
+    func loadLegacyCookie() async  -> LegacyCookieRecord?
+    
+    func setPref(key: String, value: String) async 
+    
+    func prepareStore(userId: String, account: LoginAccountRecord) async 
+    
+    func startWs(endpoints: [String], zpwSek: String) async 
+    
+    func startLongPoll() async 
+    
+    func startBootstrap() async 
+    
+    func offerFirstLoginTransfer(force: Bool) async 
+    
+    func resetDomains() async 
+    
+    func persistSession(snapshotJson: String) async 
+    
+    func clearSession() async 
+    
+    func markExpired(snapshotJson: String) async 
+    
+}
+/**
+ * Platform host callbacks implemented by Swift (`ZaloEngineCoreHost`).
+ *
+ * Called serially in emitted order on the core's host worker; never invoked concurrently.
+ * `snapshot_json` in `persist_session` / `mark_expired` contains credentials and must never be
+ * logged.
+ */
+open class CoreHostImpl: CoreHost, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_olaz_ffi_fn_clone_corehost(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_olaz_ffi_fn_free_corehost(handle, $0) }
+    }
+
+    
+
+    
+open func loadSavedSession()async  -> String?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_load_saved_session(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionString.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func loadLegacyCookie()async  -> LegacyCookieRecord?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_load_legacy_cookie(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeLegacyCookieRecord.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func setPref(key: String, value: String)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_set_pref(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(key),FfiConverterString.lower(value)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
+            freeFunc: ffi_olaz_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+open func prepareStore(userId: String, account: LoginAccountRecord)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_prepare_store(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(userId),FfiConverterTypeLoginAccountRecord_lower(account)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
+            freeFunc: ffi_olaz_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+open func startWs(endpoints: [String], zpwSek: String)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_start_ws(
+                        self.uniffiCloneHandle(),FfiConverterSequenceString.lower(endpoints),FfiConverterString.lower(zpwSek)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
+            freeFunc: ffi_olaz_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+open func startLongPoll()async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_start_long_poll(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
+            freeFunc: ffi_olaz_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+open func startBootstrap()async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_start_bootstrap(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
+            freeFunc: ffi_olaz_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+open func offerFirstLoginTransfer(force: Bool)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_offer_first_login_transfer(
+                        self.uniffiCloneHandle(),FfiConverterBool.lower(force)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
+            freeFunc: ffi_olaz_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+open func resetDomains()async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_reset_domains(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
+            freeFunc: ffi_olaz_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+open func persistSession(snapshotJson: String)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_persist_session(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(snapshotJson)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
+            freeFunc: ffi_olaz_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+open func clearSession()async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_clear_session(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
+            freeFunc: ffi_olaz_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+open func markExpired(snapshotJson: String)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_mark_expired(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(snapshotJson)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
+            freeFunc: ffi_olaz_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+
+    
+}
+
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceCoreHost {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceCoreHost = UniffiVTableCallbackInterfaceCoreHost(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterTypeCoreHost.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface CoreHost: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterTypeCoreHost.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface CoreHost: handle missing in uniffiClone")
+            }
+        },
+        loadSavedSession: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> String? in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.loadSavedSession(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: String?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterOptionString.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        loadLegacyCookie: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> LegacyCookieRecord? in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.loadLegacyCookie(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: LegacyCookieRecord?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterOptionTypeLegacyCookieRecord.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        setPref: { (
+            uniffiHandle: UInt64,
+            key: RustBuffer,
+            value: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.setPref(
+                     key: try FfiConverterString.lift(key),
+                     value: try FfiConverterString.lift(value)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        prepareStore: { (
+            uniffiHandle: UInt64,
+            userId: RustBuffer,
+            account: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.prepareStore(
+                     userId: try FfiConverterString.lift(userId),
+                     account: try FfiConverterTypeLoginAccountRecord_lift(account)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        startWs: { (
+            uniffiHandle: UInt64,
+            endpoints: RustBuffer,
+            zpwSek: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.startWs(
+                     endpoints: try FfiConverterSequenceString.lift(endpoints),
+                     zpwSek: try FfiConverterString.lift(zpwSek)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        startLongPoll: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.startLongPoll(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        startBootstrap: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.startBootstrap(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        offerFirstLoginTransfer: { (
+            uniffiHandle: UInt64,
+            force: Int8,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.offerFirstLoginTransfer(
+                     force: try FfiConverterBool.lift(force)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        resetDomains: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.resetDomains(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        persistSession: { (
+            uniffiHandle: UInt64,
+            snapshotJson: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.persistSession(
+                     snapshotJson: try FfiConverterString.lift(snapshotJson)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        clearSession: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.clearSession(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        markExpired: { (
+            uniffiHandle: UInt64,
+            snapshotJson: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.markExpired(
+                     snapshotJson: try FfiConverterString.lift(snapshotJson)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceCoreHost> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceCoreHost>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitCoreHost() {
+    uniffi_olaz_ffi_fn_init_callback_vtable_corehost(UniffiCallbackInterfaceCoreHost.vtablePtr)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreHost: FfiConverter {
+    fileprivate static let handleMap = UniffiHandleMap<CoreHost>()
+
+    typealias FfiType = UInt64
+    typealias SwiftType = CoreHost
+
+    public static func lift(_ handle: UInt64) throws -> CoreHost {
+        if ((handle & 1) == 0) {
+            // Rust-generated handle, construct a new class that uses the handle to implement the
+            // interface
+            return CoreHostImpl(unsafeFromHandle: handle)
+        } else {
+            // Swift-generated handle, get the object from the handle map
+            return try handleMap.remove(handle: handle)
+        }
+    }
+
+    public static func lower(_ value: CoreHost) -> UInt64 {
+         if let rustImpl = value as? CoreHostImpl {
+             // Rust-implemented object.  Clone the handle and return it
+            return rustImpl.uniffiCloneHandle()
+         } else {
+            // Swift object, generate a new vtable handle and return that.
+            return handleMap.insert(obj: value)
+         }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreHost {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: CoreHost, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreHost_lift(_ handle: UInt64) throws -> CoreHost {
+    return try FfiConverterTypeCoreHost.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreHost_lower(_ value: CoreHost) -> UInt64 {
+    return FfiConverterTypeCoreHost.lower(value)
+}
+
+
+
+
+
+
+/**
  * Generic authenticated requests over a shared [`CoreSession`]. Every method is async, runs on the
  * shared runtime and throws `CoreError` (`.session(isAuth: true)` means re-login).
  */
@@ -1884,7 +3074,8 @@ public func FfiConverterTypeCoreRawHttp_lower(_ value: CoreRawHttp) -> UInt64 {
 
 
 /**
- * The logged-in (or logging-in) session. Share it with [`crate::CoreApi`] (`CoreApi(session:)`).
+ * The logged-in (or logging-in) session. Share it with [`crate::CoreApi`] (`CoreApi(session:)`),
+ * [`crate::CoreHttp`] (`CoreHttp(session:)`), and [`crate::CoreEngine`] (`CoreEngine(session:host:)`).
  */
 public protocol CoreSessionProtocol: AnyObject, Sendable {
     
@@ -1951,7 +3142,8 @@ public protocol CoreSessionProtocol: AnyObject, Sendable {
     
 }
 /**
- * The logged-in (or logging-in) session. Share it with [`crate::CoreApi`] (`CoreApi(session:)`).
+ * The logged-in (or logging-in) session. Share it with [`crate::CoreApi`] (`CoreApi(session:)`),
+ * [`crate::CoreHttp`] (`CoreHttp(session:)`), and [`crate::CoreEngine`] (`CoreEngine(session:host:)`).
  */
 open class CoreSession: CoreSessionProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
@@ -2015,6 +3207,21 @@ public convenience init(computerName: String)throws  {
         try! rustCall { uniffi_olaz_ffi_fn_free_coresession(handle, $0) }
     }
 
+    
+    /**
+     * A fresh session configured with an explicit IMEI and optional `ZaloDomains` JSON override.
+     * Used so `CoreEngine`, `CoreApi`, and `CoreHttp` share one `SessionClient` from startup.
+     */
+public static func withConfig(imei: String, computerName: String, domainsJson: String?)throws  -> CoreSession  {
+    return try  FfiConverterTypeCoreSession_lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_constructor_coresession_with_config(
+        FfiConverterString.lower(imei),
+        FfiConverterString.lower(computerName),
+        FfiConverterOptionString.lower(domainsJson),uniffiCallStatus
+    )
+})
+}
     
 
     
@@ -5722,6 +6929,63 @@ public func FfiConverterTypeCoordinateRecord_lower(_ value: CoordinateRecord) ->
 
 
 /**
+ * Coalesced dirty-key change batch returned by [`CoreEngine::next_changes`].
+ */
+public struct CoreChangesRecord: Equatable, Hashable {
+    public var version: UInt64
+    public var session: SessionStateRecord?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(version: UInt64, session: SessionStateRecord?) {
+        self.version = version
+        self.session = session
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CoreChangesRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreChangesRecord {
+        return
+            try CoreChangesRecord(
+                version: FfiConverterUInt64.read(from: &buf), 
+                session: FfiConverterOptionTypeSessionStateRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreChangesRecord, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.version, into: &buf)
+        FfiConverterOptionTypeSessionStateRecord.write(value.session, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreChangesRecord_lift(_ buf: RustBuffer) throws -> CoreChangesRecord {
+    return try FfiConverterTypeCoreChangesRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreChangesRecord_lower(_ value: CoreChangesRecord) -> RustBuffer {
+    return FfiConverterTypeCoreChangesRecord.lower(value)
+}
+
+
+/**
  * Queue cursor of one `<cmd>_<sub>` queue (`wsQueueCursors` preference entry).
  */
 public struct CursorEntry: Equatable, Hashable {
@@ -6068,6 +7332,64 @@ public func FfiConverterTypeHttpRequestRecord_lower(_ value: HttpRequestRecord) 
 }
 
 
+/**
+ * Legacy WKWebView/HTTPCookieStorage credentials loaded by Swift on cold boot.
+ * Contains `zpw_sek`; `Debug` is redacted.
+ */
+public struct LegacyCookieRecord: Equatable, Hashable {
+    public var zpwSek: String
+    public var imei: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(zpwSek: String, imei: String?) {
+        self.zpwSek = zpwSek
+        self.imei = imei
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension LegacyCookieRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLegacyCookieRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LegacyCookieRecord {
+        return
+            try LegacyCookieRecord(
+                zpwSek: FfiConverterString.read(from: &buf), 
+                imei: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LegacyCookieRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.zpwSek, into: &buf)
+        FfiConverterOptionString.write(value.imei, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLegacyCookieRecord_lift(_ buf: RustBuffer) throws -> LegacyCookieRecord {
+    return try FfiConverterTypeLegacyCookieRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLegacyCookieRecord_lower(_ value: LegacyCookieRecord) -> RustBuffer {
+    return FfiConverterTypeLegacyCookieRecord.lower(value)
+}
+
+
 public struct LocationRecord: Equatable, Hashable {
     public var title: String
     public var address: String
@@ -6127,6 +7449,153 @@ public func FfiConverterTypeLocationRecord_lift(_ buf: RustBuffer) throws -> Loc
 #endif
 public func FfiConverterTypeLocationRecord_lower(_ value: LocationRecord) -> RustBuffer {
     return FfiConverterTypeLocationRecord.lower(value)
+}
+
+
+/**
+ * Account record crossing FFI for `prepare_store` and `apply_account_profile`.
+ * Contains credentials (`zpw_enk`, `zpw_sek`); `Debug` is redacted.
+ */
+public struct LoginAccountRecord: Equatable, Hashable {
+    public var userId: String
+    public var displayName: String
+    public var avatar: String
+    public var phone: String
+    public var send2meId: String
+    public var dkey: String
+    public var zpwEnk: String
+    public var zpwSek: String
+    public var needSyncMsg: Bool?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(userId: String, displayName: String, avatar: String, phone: String, send2meId: String, dkey: String, zpwEnk: String, zpwSek: String, needSyncMsg: Bool?) {
+        self.userId = userId
+        self.displayName = displayName
+        self.avatar = avatar
+        self.phone = phone
+        self.send2meId = send2meId
+        self.dkey = dkey
+        self.zpwEnk = zpwEnk
+        self.zpwSek = zpwSek
+        self.needSyncMsg = needSyncMsg
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension LoginAccountRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLoginAccountRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LoginAccountRecord {
+        return
+            try LoginAccountRecord(
+                userId: FfiConverterString.read(from: &buf), 
+                displayName: FfiConverterString.read(from: &buf), 
+                avatar: FfiConverterString.read(from: &buf), 
+                phone: FfiConverterString.read(from: &buf), 
+                send2meId: FfiConverterString.read(from: &buf), 
+                dkey: FfiConverterString.read(from: &buf), 
+                zpwEnk: FfiConverterString.read(from: &buf), 
+                zpwSek: FfiConverterString.read(from: &buf), 
+                needSyncMsg: FfiConverterOptionBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LoginAccountRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.userId, into: &buf)
+        FfiConverterString.write(value.displayName, into: &buf)
+        FfiConverterString.write(value.avatar, into: &buf)
+        FfiConverterString.write(value.phone, into: &buf)
+        FfiConverterString.write(value.send2meId, into: &buf)
+        FfiConverterString.write(value.dkey, into: &buf)
+        FfiConverterString.write(value.zpwEnk, into: &buf)
+        FfiConverterString.write(value.zpwSek, into: &buf)
+        FfiConverterOptionBool.write(value.needSyncMsg, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoginAccountRecord_lift(_ buf: RustBuffer) throws -> LoginAccountRecord {
+    return try FfiConverterTypeLoginAccountRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoginAccountRecord_lower(_ value: LoginAccountRecord) -> RustBuffer {
+    return FfiConverterTypeLoginAccountRecord.lower(value)
+}
+
+
+/**
+ * QR login state delivered to Swift (`ZaloEngine.LoginState`).
+ */
+public struct LoginStateRecord: Equatable, Hashable {
+    public var step: LoginStepRecord
+    public var qrPayload: String?
+    public var qrPng: Data?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(step: LoginStepRecord, qrPayload: String?, qrPng: Data?) {
+        self.step = step
+        self.qrPayload = qrPayload
+        self.qrPng = qrPng
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension LoginStateRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLoginStateRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LoginStateRecord {
+        return
+            try LoginStateRecord(
+                step: FfiConverterTypeLoginStepRecord.read(from: &buf), 
+                qrPayload: FfiConverterOptionString.read(from: &buf), 
+                qrPng: FfiConverterOptionData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LoginStateRecord, into buf: inout [UInt8]) {
+        FfiConverterTypeLoginStepRecord.write(value.step, into: &buf)
+        FfiConverterOptionString.write(value.qrPayload, into: &buf)
+        FfiConverterOptionData.write(value.qrPng, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoginStateRecord_lift(_ buf: RustBuffer) throws -> LoginStateRecord {
+    return try FfiConverterTypeLoginStateRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoginStateRecord_lower(_ value: LoginStateRecord) -> RustBuffer {
+    return FfiConverterTypeLoginStateRecord.lower(value)
 }
 
 
@@ -7513,6 +8982,71 @@ public func FfiConverterTypePollStateRecord_lower(_ value: PollStateRecord) -> R
 
 
 /**
+ * Signed-in account profile (`ZaloEngine.Profile`).
+ */
+public struct ProfileRecord: Equatable, Hashable {
+    public var userId: String
+    public var displayName: String
+    public var avatar: String?
+    public var phone: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(userId: String, displayName: String, avatar: String?, phone: String?) {
+        self.userId = userId
+        self.displayName = displayName
+        self.avatar = avatar
+        self.phone = phone
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ProfileRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeProfileRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ProfileRecord {
+        return
+            try ProfileRecord(
+                userId: FfiConverterString.read(from: &buf), 
+                displayName: FfiConverterString.read(from: &buf), 
+                avatar: FfiConverterOptionString.read(from: &buf), 
+                phone: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ProfileRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.userId, into: &buf)
+        FfiConverterString.write(value.displayName, into: &buf)
+        FfiConverterOptionString.write(value.avatar, into: &buf)
+        FfiConverterOptionString.write(value.phone, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeProfileRecord_lift(_ buf: RustBuffer) throws -> ProfileRecord {
+    return try FfiConverterTypeProfileRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeProfileRecord_lower(_ value: ProfileRecord) -> RustBuffer {
+    return FfiConverterTypeProfileRecord.lower(value)
+}
+
+
+/**
  * Outcome of `wait_for_qr_scan`: who scanned and the ticket to confirm with (it differs from
  * the original after a rotation).
  */
@@ -8169,6 +9703,71 @@ public func FfiConverterTypeSendTextRecord_lift(_ buf: RustBuffer) throws -> Sen
 #endif
 public func FfiConverterTypeSendTextRecord_lower(_ value: SendTextRecord) -> RustBuffer {
     return FfiConverterTypeSendTextRecord.lower(value)
+}
+
+
+/**
+ * Session-domain state mirror snapshot delivered inside [`CoreChangesRecord`].
+ */
+public struct SessionStateRecord: Equatable, Hashable {
+    public var phase: PhaseRecord
+    public var profile: ProfileRecord?
+    public var signOutNotice: String?
+    public var selfConversationId: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(phase: PhaseRecord, profile: ProfileRecord?, signOutNotice: String?, selfConversationId: String?) {
+        self.phase = phase
+        self.profile = profile
+        self.signOutNotice = signOutNotice
+        self.selfConversationId = selfConversationId
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SessionStateRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionStateRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionStateRecord {
+        return
+            try SessionStateRecord(
+                phase: FfiConverterTypePhaseRecord.read(from: &buf), 
+                profile: FfiConverterOptionTypeProfileRecord.read(from: &buf), 
+                signOutNotice: FfiConverterOptionString.read(from: &buf), 
+                selfConversationId: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SessionStateRecord, into buf: inout [UInt8]) {
+        FfiConverterTypePhaseRecord.write(value.phase, into: &buf)
+        FfiConverterOptionTypeProfileRecord.write(value.profile, into: &buf)
+        FfiConverterOptionString.write(value.signOutNotice, into: &buf)
+        FfiConverterOptionString.write(value.selfConversationId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionStateRecord_lift(_ buf: RustBuffer) throws -> SessionStateRecord {
+    return try FfiConverterTypeSessionStateRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionStateRecord_lower(_ value: SessionStateRecord) -> RustBuffer {
+    return FfiConverterTypeSessionStateRecord.lower(value)
 }
 
 
@@ -9335,6 +10934,117 @@ public func FfiConverterTypeCoreError_lower(_ value: CoreError) -> RustBuffer {
 
 
 /**
+ * Core/transport error kind rendered by Swift via `RustCore.mapError(...).localizedDescription`.
+ */
+
+public enum CoreFailKindRecord: Equatable, Hashable {
+    
+    case network(kind: NetworkKind
+    )
+    case session(code: Int64, message: String, url: String
+    )
+    case http(status: UInt16
+    )
+    case invalidJson
+    case notAuthenticated
+    case crypto(message: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension CoreFailKindRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreFailKindRecord: FfiConverterRustBuffer {
+    typealias SwiftType = CoreFailKindRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreFailKindRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .network(kind: try FfiConverterTypeNetworkKind.read(from: &buf)
+        )
+        
+        case 2: return .session(code: try FfiConverterInt64.read(from: &buf), message: try FfiConverterString.read(from: &buf), url: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .http(status: try FfiConverterUInt16.read(from: &buf)
+        )
+        
+        case 4: return .invalidJson
+        
+        case 5: return .notAuthenticated
+        
+        case 6: return .crypto(message: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreFailKindRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .network(kind):
+            writeInt(&buf, Int32(1))
+            FfiConverterTypeNetworkKind.write(kind, into: &buf)
+            
+        
+        case let .session(code,message,url):
+            writeInt(&buf, Int32(2))
+            FfiConverterInt64.write(code, into: &buf)
+            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(url, into: &buf)
+            
+        
+        case let .http(status):
+            writeInt(&buf, Int32(3))
+            FfiConverterUInt16.write(status, into: &buf)
+            
+        
+        case .invalidJson:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .notAuthenticated:
+            writeInt(&buf, Int32(5))
+        
+        
+        case let .crypto(message):
+            writeInt(&buf, Int32(6))
+            FfiConverterString.write(message, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreFailKindRecord_lift(_ buf: RustBuffer) throws -> CoreFailKindRecord {
+    return try FfiConverterTypeCoreFailKindRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreFailKindRecord_lower(_ value: CoreFailKindRecord) -> RustBuffer {
+    return FfiConverterTypeCoreFailKindRecord.lower(value)
+}
+
+
+
+/**
  * Result of `session_status` (Swift `ZaloSessionStatus`).
  */
 
@@ -9552,6 +11262,81 @@ public func FfiConverterTypeECardStyleRecord_lift(_ buf: RustBuffer) throws -> E
 #endif
 public func FfiConverterTypeECardStyleRecord_lower(_ value: ECardStyleRecord) -> RustBuffer {
     return FfiConverterTypeECardStyleRecord.lower(value)
+}
+
+
+
+/**
+ * Typed failure reason for `LoginStepRecord::Failed`.
+ */
+
+public enum FailReasonRecord: Equatable, Hashable {
+    
+    case text(message: String
+    )
+    case core(kind: CoreFailKindRecord
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FailReasonRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFailReasonRecord: FfiConverterRustBuffer {
+    typealias SwiftType = FailReasonRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FailReasonRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .text(message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .core(kind: try FfiConverterTypeCoreFailKindRecord.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FailReasonRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .text(message):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(message, into: &buf)
+            
+        
+        case let .core(kind):
+            writeInt(&buf, Int32(2))
+            FfiConverterTypeCoreFailKindRecord.write(kind, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFailReasonRecord_lift(_ buf: RustBuffer) throws -> FailReasonRecord {
+    return try FfiConverterTypeFailReasonRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFailReasonRecord_lower(_ value: FailReasonRecord) -> RustBuffer {
+    return FfiConverterTypeFailReasonRecord.lower(value)
 }
 
 
@@ -9897,6 +11682,103 @@ public func FfiConverterTypeKindRecord_lift(_ buf: RustBuffer) throws -> KindRec
 #endif
 public func FfiConverterTypeKindRecord_lower(_ value: KindRecord) -> RustBuffer {
     return FfiConverterTypeKindRecord.lower(value)
+}
+
+
+
+/**
+ * Sub-state of `PhaseRecord::Login`.
+ */
+
+public enum LoginStepRecord: Equatable, Hashable {
+    
+    case generating
+    case waitingScan
+    case waitingConfirm(name: String, avatar: String?
+    )
+    case expired
+    case failed(reason: FailReasonRecord
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension LoginStepRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLoginStepRecord: FfiConverterRustBuffer {
+    typealias SwiftType = LoginStepRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LoginStepRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .generating
+        
+        case 2: return .waitingScan
+        
+        case 3: return .waitingConfirm(name: try FfiConverterString.read(from: &buf), avatar: try FfiConverterOptionString.read(from: &buf)
+        )
+        
+        case 4: return .expired
+        
+        case 5: return .failed(reason: try FfiConverterTypeFailReasonRecord.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: LoginStepRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .generating:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .waitingScan:
+            writeInt(&buf, Int32(2))
+        
+        
+        case let .waitingConfirm(name,avatar):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(name, into: &buf)
+            FfiConverterOptionString.write(avatar, into: &buf)
+            
+        
+        case .expired:
+            writeInt(&buf, Int32(4))
+        
+        
+        case let .failed(reason):
+            writeInt(&buf, Int32(5))
+            FfiConverterTypeFailReasonRecord.write(reason, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoginStepRecord_lift(_ buf: RustBuffer) throws -> LoginStepRecord {
+    return try FfiConverterTypeLoginStepRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoginStepRecord_lower(_ value: LoginStepRecord) -> RustBuffer {
+    return FfiConverterTypeLoginStepRecord.lower(value)
 }
 
 
@@ -10472,6 +12354,92 @@ public func FfiConverterTypeNetworkKind_lower(_ value: NetworkKind) -> RustBuffe
 
 
 
+/**
+ * Top-level engine phase (`ZaloEngine.Phase`).
+ */
+
+public enum PhaseRecord: Equatable, Hashable {
+    
+    case starting
+    case login(state: LoginStateRecord
+    )
+    case signingIn
+    case ready
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PhaseRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePhaseRecord: FfiConverterRustBuffer {
+    typealias SwiftType = PhaseRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PhaseRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .starting
+        
+        case 2: return .login(state: try FfiConverterTypeLoginStateRecord.read(from: &buf)
+        )
+        
+        case 3: return .signingIn
+        
+        case 4: return .ready
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PhaseRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .starting:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .login(state):
+            writeInt(&buf, Int32(2))
+            FfiConverterTypeLoginStateRecord.write(state, into: &buf)
+            
+        
+        case .signingIn:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .ready:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePhaseRecord_lift(_ buf: RustBuffer) throws -> PhaseRecord {
+    return try FfiConverterTypePhaseRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePhaseRecord_lower(_ value: PhaseRecord) -> RustBuffer {
+    return FfiConverterTypePhaseRecord.lower(value)
+}
+
+
+
 
 public enum StarModeRecord: Equatable, Hashable {
     
@@ -11030,6 +12998,54 @@ fileprivate struct FfiConverterOptionTypeCoordinateRecord: FfiConverterRustBuffe
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeCoreChangesRecord: FfiConverterRustBuffer {
+    typealias SwiftType = CoreChangesRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreChangesRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreChangesRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeLegacyCookieRecord: FfiConverterRustBuffer {
+    typealias SwiftType = LegacyCookieRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeLegacyCookieRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeLegacyCookieRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeMediaFailureRecord: FfiConverterRustBuffer {
     typealias SwiftType = MediaFailureRecord?
 
@@ -11102,6 +13118,30 @@ fileprivate struct FfiConverterOptionTypeMessageRow: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeProfileRecord: FfiConverterRustBuffer {
+    typealias SwiftType = ProfileRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeProfileRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeProfileRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeQuoteRecord: FfiConverterRustBuffer {
     typealias SwiftType = QuoteRecord?
 
@@ -11118,6 +13158,30 @@ fileprivate struct FfiConverterOptionTypeQuoteRecord: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeQuoteRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSessionStateRecord: FfiConverterRustBuffer {
+    typealias SwiftType = SessionStateRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSessionStateRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSessionStateRecord.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -11814,6 +13878,96 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
         print("uniffiFutureContinuationCallback invalid handle")
     }
 }
+private func uniffiTraitInterfaceCallAsync<T>(
+    makeCall: @escaping () async throws -> T,
+    handleSuccess: @escaping (T) -> (),
+    handleError: @escaping (Int8, RustBuffer) -> (),
+    droppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+) {
+    let task = Task {
+        // Note: it's important we call either `handleSuccess` or `handleError` exactly once.  Each
+        // call consumes an Arc reference, which means there should be no possibility of a double
+        // call.  The following code is structured so that will will never call both `handleSuccess`
+        // and `handleError`, even in the face of weird errors.
+        //
+        // On platforms that need extra machinery to make C-ABI calls, like JNA or ctypes, it's
+        // possible that we fail to make either call.  However, it doesn't seem like this is
+        // possible on Swift since swift can just make the C call directly.
+        var callResult: T
+        do {
+            callResult = try await makeCall()
+        } catch {
+            handleError(CALL_UNEXPECTED_ERROR, FfiConverterString.lower(String(describing: error)))
+            return
+        }
+        handleSuccess(callResult)
+    }
+    let handle = UNIFFI_FOREIGN_FUTURE_HANDLE_MAP.insert(obj: task)
+    droppedCallback.pointee = UniffiForeignFutureDroppedCallbackStruct(
+        handle: handle,
+        free: uniffiForeignFutureDroppedCallback
+    )
+}
+
+private func uniffiTraitInterfaceCallAsyncWithError<T, E>(
+    makeCall: @escaping () async throws -> T,
+    handleSuccess: @escaping (T) -> (),
+    handleError: @escaping (Int8, RustBuffer) -> (),
+    lowerError: @escaping (E) -> RustBuffer,
+    droppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+) {
+    let task = Task {
+        // See the note in uniffiTraitInterfaceCallAsync for details on `handleSuccess` and
+        // `handleError`.
+        var callResult: T
+        do {
+            callResult = try await makeCall()
+        } catch let error as E {
+            handleError(CALL_ERROR, lowerError(error))
+            return
+        } catch {
+            handleError(CALL_UNEXPECTED_ERROR, FfiConverterString.lower(String(describing: error)))
+            return
+        }
+        handleSuccess(callResult)
+    }
+    let handle = UNIFFI_FOREIGN_FUTURE_HANDLE_MAP.insert(obj: task)
+    droppedCallback.pointee = UniffiForeignFutureDroppedCallbackStruct(
+        handle: handle,
+        free: uniffiForeignFutureDroppedCallback
+    )
+}
+
+// Borrow the callback handle map implementation to store foreign future handles
+// TODO: consolidate the handle-map code (https://github.com/mozilla/uniffi-rs/pull/1823)
+fileprivate let UNIFFI_FOREIGN_FUTURE_HANDLE_MAP = UniffiHandleMap<UniffiForeignFutureTask>()
+
+// Protocol for tasks that handle foreign futures.
+//
+// Defining a protocol allows all tasks to be stored in the same handle map.  This can't be done
+// with the task object itself, since has generic parameters.
+fileprivate protocol UniffiForeignFutureTask {
+    func cancel()
+}
+
+extension Task: UniffiForeignFutureTask {}
+
+private func uniffiForeignFutureDroppedCallback(handle: UInt64) {
+    do {
+        let task = try UNIFFI_FOREIGN_FUTURE_HANDLE_MAP.remove(handle: handle)
+        // Set the cancellation flag on the task.  If it's still running, the code can check the
+        // cancellation flag or call `Task.checkCancellation()`.  If the task has completed, this is
+        // a no-op.
+        task.cancel()
+    } catch {
+        print("uniffiForeignFutureDroppedCallback: handle missing from handlemap")
+    }
+}
+
+// For testing
+public func uniffiForeignFutureHandleCountOlazFfi() -> Int {
+    UNIFFI_FOREIGN_FUTURE_HANDLE_MAP.count
+}
 /**
  * Version of the Rust core (the `olaz-ffi` crate version).
  */
@@ -12163,6 +14317,69 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_historybatch_raw_json() != 50277) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_apply_account_profile() != 24350) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_current_version() != 33807) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_handle_session_expired_notice() != 44648) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_log_out() != 29389) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_next_changes() != 57544) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_refresh_qr() != 24041) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_settle() != 21321) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_start() != 22299) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_stop() != 21596) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_load_saved_session() != 53717) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_load_legacy_cookie() != 9800) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_set_pref() != 43534) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_prepare_store() != 30692) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_start_ws() != 61487) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_start_long_poll() != 802) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_start_bootstrap() != 58803) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_offer_first_login_transfer() != 26293) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_reset_domains() != 37044) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_persist_session() != 57600) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_clear_session() != 64706) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_mark_expired() != 40291) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_corehttp_post_multipart() != 4369) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -12427,6 +14644,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_constructor_coreapi_new() != 49715) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_constructor_coreengine_new() != 28052) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_constructor_corehttp_new() != 27227) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -12442,6 +14662,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_constructor_coresession_new() != 51392) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_constructor_coresession_with_config() != 16329) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_constructor_corestore_open() != 64564) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -12449,6 +14672,7 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
 
+    uniffiCallbackInitCoreHost()
     uniffiCallbackInitMediaProgress()
     uniffiCallbackInitMediaPublishHook()
     uniffiCallbackInitQrListener()

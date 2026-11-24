@@ -1,0 +1,28 @@
+[package]
+name = "olaz-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "cases"
+harness = false
+
+[dependencies]
+async-trait = "0.1"
+olaz-crypto = { path = "../olaz-crypto" }
+olaz-json = { path = "../olaz-json" }
+olaz-net = { path = "../olaz-net" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["arbitrary_precision"] }
+thiserror = "2.0.21"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "test-util"] }
+url = "2"

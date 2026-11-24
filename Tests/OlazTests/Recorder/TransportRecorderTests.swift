@@ -294,6 +294,7 @@ struct TransportRecorderTests {
             if !suppressedTransports.contains("ws") {
                 try? await Task.sleep(for: .milliseconds(50))
             }
+            await engine.settleForRecording()
             await Task.yield()
 
             try assertOnlyLocalFakeHosts(await engine.sessionClient.domains, context: "\(scenario.name) final")

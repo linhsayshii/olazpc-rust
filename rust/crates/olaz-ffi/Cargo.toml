@@ -12,7 +12,9 @@ workspace = true
 crate-type = ["staticlib", "lib"]
 
 [dependencies]
+async-trait = "0.1"
 olaz-api = { path = "../olaz-api" }
+olaz-core = { path = "../olaz-core" }
 olaz-crypto = { path = "../olaz-crypto" }
 olaz-json = { path = "../olaz-json" }
 olaz-media = { path = "../olaz-media" }
