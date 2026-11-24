@@ -147,6 +147,9 @@ final class ZaloEngine {
     @ObservationIgnored internal var qrTask: Task<Void, Never>?
     @ObservationIgnored internal var bootstrapTask: Task<Void, Never>?
     @ObservationIgnored internal var transferTask: Task<Void, Never>?
+    @ObservationIgnored internal var openConversationTask: Task<Void, Never>?
+    @ObservationIgnored internal var loadOlderTask: Task<Void, Never>?
+    @ObservationIgnored internal var persistConversationsTask: Task<Void, Never>?
     @ObservationIgnored internal var batchImportTask: Task<Void, Never>?
     @ObservationIgnored internal var activeSyncBatchTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var lastSyncConvFlushAt: Date = .distantPast
@@ -679,18 +682,31 @@ final class ZaloEngine {
             try? await sqliteStore?.setPreferenceStrings(key: "archivedIds", value: Array(cachedArchivedIds))
         }
         if let mutesBox = mutesResult {
-            var map = notificationSettings.mutes
+            var parsedMutes: [(convId: String, start: Double, duration: Double)] = []
             for entry in mutesBox.array {
                 let idRaw = JSONLossless.string(entry["id"])
                 guard !idRaw.isEmpty else { continue }
                 let typeVal = JSONLossless.int64(entry["type"]) ?? 1
                 let normId = typeVal == 2 ? ZaloWireParser.groupConvId(idRaw) : ZaloWireParser.stripUserPrefix(idRaw)
                 let dur = (JSONLossless.int64(entry["duration"]).map(Double.init)) ?? -1
-                let start = (JSONLossless.int64(entry["startTime"]).map(Double.init)) ?? Date().timeIntervalSince1970
-                map[normId] = MuteInfo(startTime: start, duration: dur)
+                let start = (JSONLossless.int64(entry["startTime"]).map(Double.init)) ?? (Double(nowMs()) / 1000.0)
+                parsedMutes.append((convId: normId, start: start, duration: dur))
             }
-            notificationSettings.mutes = map
-            await saveNotificationPreferences()
+            let serializedMutes: [[String: Any]] = parsedMutes.map {
+                [
+                    "conv_id": $0.convId,
+                    "start": Int64($0.start),
+                    "duration": Int64($0.duration),
+                ]
+            }
+            if traceHost("apply_mutes", args: ["mutes": serializedMutes]) {
+                var map = notificationSettings.mutes
+                for m in parsedMutes {
+                    map[m.convId] = MuteInfo(startTime: m.start, duration: m.duration)
+                }
+                notificationSettings.mutes = map
+                await saveNotificationPreferences()
+            }
         }
 
         await syncConversationLabelsFromServer()
@@ -1530,7 +1546,7 @@ final class ZaloEngine {
         conversations = list
         rebuildConversationFlags()
         rebuildConversationExtras()
-        Task { await persistConversationsToSQLite() }
+        persistConversationsTask = Task { await persistConversationsToSQLite() }
     }
 
     internal func sortConversations(_ list: inout [ConversationSummary]) {
@@ -1804,6 +1820,19 @@ final class ZaloEngine {
         reactClientId: String = "",
         senderName: String = ""
     ) async {
+        guard traceHost("apply_remote_reaction", args: [
+            "conv_id": convId,
+            "msg_id": msgId,
+            "cli_msg_id": cliMsgId,
+            "sender_id": senderId,
+            "r_type": rType,
+            "r_icon": rIcon,
+            "event_id": eventId,
+            "react_client_id": reactClientId,
+            "sender_name": senderName,
+        ]) else {
+            return
+        }
         let trimmedConv = convId.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedMsg = msgId.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedCli = cliMsgId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1953,6 +1982,13 @@ final class ZaloEngine {
     }
 
     internal func applyRemoteRecall(convId: String, msgId: String, cliMsgId: String) async {
+        guard traceHost("apply_remote_recall", args: [
+            "conv_id": convId,
+            "msg_id": msgId,
+            "cli_msg_id": cliMsgId,
+        ]) else {
+            return
+        }
         let targetId = !msgId.isEmpty ? msgId : cliMsgId
         guard !targetId.isEmpty else { return }
 
@@ -2023,6 +2059,13 @@ final class ZaloEngine {
     }
 
     internal func applyRemoteDelete(convId: String, msgId: String, cliMsgId: String) async {
+        guard traceHost("apply_remote_delete", args: [
+            "conv_id": convId,
+            "msg_id": msgId,
+            "cli_msg_id": cliMsgId,
+        ]) else {
+            return
+        }
         let targetId = !msgId.isEmpty ? msgId : cliMsgId
         guard !targetId.isEmpty else { return }
         if var list = messages[convId] {

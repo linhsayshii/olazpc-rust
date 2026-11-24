@@ -51,7 +51,7 @@ extension ZaloEngine {
     /// Starts a bootstrap: returns true when the daily full refresh is due (then nothing is skipped this launch).
     internal func beginHistoryFreshnessPass() async -> Bool {
         historyFreshness = [:]
-        let now = Date().timeIntervalSince1970
+        let now = Double(nowMs()) / 1000.0
         let last = (try? await sqliteStore?.getPreferenceString(key: Self.fullHistoryRefreshKey)).flatMap { $0 }.flatMap(Double.init) ?? 0
         let due = now - last >= Self.fullHistoryRefreshInterval || last > now
         historyFullRefreshDue = due
@@ -63,6 +63,6 @@ extension ZaloEngine {
         guard historyFullRefreshDue else { return }
         historyFullRefreshDue = false
         try? await sqliteStore?.setPreferenceString(
-            key: Self.fullHistoryRefreshKey, value: String(Date().timeIntervalSince1970))
+            key: Self.fullHistoryRefreshKey, value: String(Double(nowMs()) / 1000.0))
     }
 }

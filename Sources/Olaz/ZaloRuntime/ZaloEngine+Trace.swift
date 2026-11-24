@@ -32,6 +32,9 @@ extension ZaloEngine {
         qrTask?.cancel()
         bootstrapTask?.cancel()
         transferTask?.cancel()
+        openConversationTask?.cancel()
+        loadOlderTask?.cancel()
+        persistConversationsTask?.cancel()
     }
 
     internal func settleForRecording() async {
@@ -52,6 +55,9 @@ extension ZaloEngine {
         await sessionClient.setSessionTrace(nil)
         _ = await bootTask?.value
         _ = await qrTask?.value
+        _ = await openConversationTask?.value
+        _ = await loadOlderTask?.value
+        _ = await persistConversationsTask?.value
         _ = await pendingCleanupTask?.value
     }
 
