@@ -460,7 +460,7 @@ import Testing
         var account = ZaloLoginAccount()
         account.userId = "100"
         account.displayName = "Minh"
-        engine.applyAccountProfile(account)
+        await engine.applyAccountProfile(account)
 
         let cliId = "1795343225629"
         let srvId = "8517564748888"
@@ -682,7 +682,7 @@ import Testing
         var acc = ZaloLoginAccount()
         acc.userId = "100"
         acc.send2MeId = "999"
-        engine.applyAccountProfile(acc)
+        await engine.applyAccountProfile(acc)
 
         let mOther = ChatMessage(
             id: "m_other",
@@ -1054,7 +1054,7 @@ private final class MockReactionURLProtocol: URLProtocol, @unchecked Sendable {
         var account = ZaloLoginAccount()
         account.userId = "100"
         account.displayName = "Minh"
-        engine.applyAccountProfile(account)
+        await engine.applyAccountProfile(account)
         await engine.sessionClient.updateCredentials(account: account, secretKey: key, zpwSek: "sek.1.2", domains: domains)
 
         let photoMsg = ChatMessage(
@@ -1180,7 +1180,7 @@ private final class MockReactionURLProtocol: URLProtocol, @unchecked Sendable {
         var account = ZaloLoginAccount()
         account.userId = "100"
         account.displayName = "Minh"
-        engine.applyAccountProfile(account)
+        await engine.applyAccountProfile(account)
         engine.contacts.friends = [
             ContactsState.Friend(
                 id: "201",
@@ -1334,7 +1334,7 @@ private final class MockReactionURLProtocol: URLProtocol, @unchecked Sendable {
         var account = ZaloLoginAccount()
         account.userId = "100"
         account.displayName = "Minh"
-        engine.applyAccountProfile(account)
+        await engine.applyAccountProfile(account)
 
         let msg = ChatMessage(
             id: "6001",
@@ -1408,7 +1408,7 @@ private final class MockReactionURLProtocol: URLProtocol, @unchecked Sendable {
             var account = ZaloLoginAccount()
             account.userId = "100"
             account.displayName = "Minh"
-            engine1.applyAccountProfile(account)
+            await engine1.applyAccountProfile(account)
             await engine1.loadLocalAccountState(from: store1)
 
             let msg = ChatMessage(
@@ -1459,7 +1459,7 @@ private final class MockReactionURLProtocol: URLProtocol, @unchecked Sendable {
         var account2 = ZaloLoginAccount()
         account2.userId = "100"
         account2.displayName = "Minh"
-        engine2.applyAccountProfile(account2)
+        await engine2.applyAccountProfile(account2)
         await engine2.loadLocalAccountState(from: store2)
 
         #expect(engine2.pollState.lastActionId == "456789")
@@ -1646,7 +1646,7 @@ private final class MockReactionURLProtocol: URLProtocol, @unchecked Sendable {
         var account = ZaloLoginAccount()
         account.userId = "100"
         account.displayName = "Minh"
-        engine.applyAccountProfile(account)
+        await engine.applyAccountProfile(account)
         await engine.sessionClient.updateCredentials(account: account, secretKey: key, zpwSek: "sek.1.2", domains: domains)
 
         engine.contacts.friends = [

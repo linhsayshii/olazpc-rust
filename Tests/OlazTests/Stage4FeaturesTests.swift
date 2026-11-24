@@ -182,7 +182,7 @@ private final class MockStage4URLProtocol: URLProtocol, @unchecked Sendable {
         account.displayName = "Minh"
         account.avatar = "https://cdn.example/me.jpg"
         account.send2MeId = "999"
-        engine.applyAccountProfile(account)
+        await engine.applyAccountProfile(account)
         await engine.sessionClient.updateCredentials(account: account, secretKey: key, zpwSek: "sek.1.2", domains: domains)
         return (engine, store, host, recorded)
     }
@@ -318,11 +318,11 @@ private final class MockStage4URLProtocol: URLProtocol, @unchecked Sendable {
     // MARK: 2. Poll Pin, Post-Create Pin & Admin canClose
 
     @MainActor
-    @Test func pollCanCloseAllowsPollCreatorAndGroupCreatorOrAdmin() throws {
+    @Test func pollCanCloseAllowsPollCreatorAndGroupCreatorOrAdmin() async throws {
         let engine = ZaloEngine()
         var acc = ZaloLoginAccount()
         acc.userId = "100"
-        engine.applyAccountProfile(acc)
+        await engine.applyAccountProfile(acc)
 
         // 1. Poll creator can close even without group admin info
         let ownPoll = try #require(PollDetail(json: engine.normalizePollDetail([
@@ -665,7 +665,7 @@ private final class MockStage4URLProtocol: URLProtocol, @unchecked Sendable {
         var acc = ZaloLoginAccount()
         acc.userId = "100"
         acc.send2MeId = "999"
-        engine.applyAccountProfile(acc)
+        await engine.applyAccountProfile(acc)
 
         try await store.saveConversations([
             StoredConversation(id: "101", isGroup: false, name: "An", avatar: "", pinned: false, members: 0, unread: 0, previewText: "", previewTsMs: 4000, previewFromMe: false, updatedAtMs: 4000),

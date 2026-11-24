@@ -1,6 +1,6 @@
 # Olaz Rust port map
 
-Goal: move Olaz's protocol engine to a Rust core called from the existing SwiftUI app (macOS only), for speed and a smoother main thread. Decisions: [DECISIONS.md](DECISIONS.md) (ADR-001..015). Terms: [GLOSSARY.md](GLOSSARY.md).
+Goal: move Olaz's protocol engine to a Rust core called from the existing SwiftUI app (macOS only), for speed and a smoother main thread. Decisions: [DECISIONS.md](DECISIONS.md) (ADR-001..016). Terms: [GLOSSARY.md](GLOSSARY.md).
 
 Workflow per unit: claim here, port into its own crate, port Swift fixtures as Rust tests, `cargo fmt --check && cargo clippy -p <crate> -- -D warnings && cargo test -p <crate>` green, mark done with test counts.
 
@@ -45,6 +45,12 @@ Live check 2026-11-23 (release build 9c47e82, merged 5a+5b): clean engine.log, n
 |---|---|---|
 | 6b | E2EE compatibility spike: `olaz-signal` = libsignal-protocol v0.73.0 (vendored + 5-line Zalo patch) over the JS-persisted `zaloE2EEPCStoreV1` records; fixtures from the real bundled JS library; NOT wired, no FFI | done 2026-11-23 (verdict: compatible both ways, see ADR-015; olaz-signal 20 tests: 3 unit, 3 JS->Rust, 3 round-trip, 3 Rust->JS via node, 8 store; workspace 291) |
 | 6c | `CoreSignal` FFI (`olaz-ffi/src/signal.rs`) wired into `ZaloE2EEManager`: shadow decrypt by default (JS authoritative, Rust compares a copy, counters + `e2ee-shadow:` log lines), `OLAZ_E2EE_RUST=1` / `olaz.e2eeRust` makes Rust authoritative for decrypt+encrypt and persist, JS restore from the Rust-written JSON tested; JS runtime kept | done 2026-11-23 (not yet live-checked; ffi 3 new tests, Swift 6 new in `RustE2EEModeTests`; workspace 354; see ADR-015) |
+
+## Core engine migration (U1+)
+
+| Unit | Scope | State |
+|---|---|---|
+| U1b | `olaz-core` skeleton (single tokio actor, pure `reduce(&mut CoreState, Input) -> (Vec<Effect>, DirtyKeys)`, coalescing `ChangeStream`, serial `CoreHost` runner, Case format v1 replay runner `tests/cases.rs`) + session domain (`boot`, QR login, logout, expiry, profile) cutover in `ZaloEngine` + `ZaloEngine+Core.swift` | done 2026-11-24 (olaz-core: 13 unit + 20 scenario tests, cases 0/0 awaiting U1a merge; olaz-ffi: 45 passed; swift: 580 tests in 98 suites green; release `next_changes()` delivery p50=65.6 us / p95=125.0 us; see ADR-016) |
 
 ## Later waves (out of milestone 1)
 
