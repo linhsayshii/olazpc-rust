@@ -91,7 +91,9 @@ struct ZaloDomains: Codable, Sendable {
         case auth, wpaChat, lpChat, lpControl, ws, serviceCandidates, preferredHosts, isolated
     }
 
-    init() {}
+    init(isolated: Bool = false) {
+        self.isolated = isolated
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)

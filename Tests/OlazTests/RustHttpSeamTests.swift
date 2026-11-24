@@ -1,37 +1,8 @@
 import Foundation
 import OlazCore
+import os
 import Testing
 @testable import Olaz
-
-/// Captures the multipart request of the Swift fallback (no network).
-private final class CaptureURLProtocol: URLProtocol, @unchecked Sendable {
-    nonisolated(unsafe) static var captured: (url: URL, contentType: String, body: Data)?
-    static let host = "rust-seam.test.zaloapp.com"
-
-    override class func canInit(with request: URLRequest) -> Bool { request.url?.host == host }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-
-    override func startLoading() {
-        var body = request.httpBody ?? Data()
-        if body.isEmpty, let stream = request.httpBodyStream {
-            stream.open()
-            defer { stream.close() }
-            var buf = [UInt8](repeating: 0, count: 4096)
-            while stream.hasBytesAvailable {
-                let n = stream.read(&buf, maxLength: buf.count)
-                if n > 0 { body.append(contentsOf: buf.prefix(n)) } else { break }
-            }
-        }
-        Self.captured = (request.url!, request.value(forHTTPHeaderField: "Content-Type") ?? "", body)
-        let reply = Data(#"{"error_code":0,"data":{"ok":1}}"#.utf8)
-        let http = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-        client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: reply)
-        client?.urlProtocolDidFinishLoading(self)
-    }
-
-    override func stopLoading() {}
-}
 
 private extension ZaloSessionClient {
     /// The raw `[String: Any]` answers are not Sendable; tests read them through the engine's `ZaloJSONBox`.
@@ -67,12 +38,6 @@ private extension ZaloSessionClient {
         #expect(await client.coreHttp() == nil)   // no account yet
         await Self.login(client)
         #expect(await client.coreHttp() != nil)
-        #expect(await ZaloSessionClient(dataDirectory: dir, useKeychain: false, useRustCore: false).coreHttp() == nil)
-        // A stubbed URLSession (tests) must keep the Swift transport so the stub still sees the requests.
-        let stubbed = ZaloSessionClient(dataDirectory: dir, useKeychain: false, urlSession: URLSession(configuration: .ephemeral), useRustCore: true)
-        await Self.login(stubbed)
-        #expect(await stubbed.coreHttp() == nil)
-        #expect(await stubbed.coreApi() == nil)
     }
 
     @Test func swiftPathStillThrowsNotAuthenticatedWithoutASession() async {
@@ -120,22 +85,27 @@ private extension ZaloSessionClient {
         #expect((board as? ZaloSessionError)?.code == 112)
     }
 
-    @Test func swiftFallbackReadsTheFileSliceForMultipart() async throws {
+    @Test func coreHttpReadsTheFileSliceForMultipart() async throws {
         let dir = Self.tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
         let file = dir.appendingPathComponent("up.bin")
         try Data("0123456789".utf8).write(to: file)
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [CaptureURLProtocol.self]
-        let client = ZaloSessionClient(dataDirectory: dir, useKeychain: false, urlSession: URLSession(configuration: config))
-        var domains = ZaloDomains()
-        domains.serviceCandidates["file"] = ["https://\(CaptureURLProtocol.host)"]
-        await Self.login(client, domains: domains)
+
+        let captured = OSAllocatedUnfairLock<FakeZaloServer.HTTPRequest?>(initialState: nil)
+        let server = try FakeZaloServer { req in
+            captured.withLock { $0 = req }
+            return .json(200, ["error_code": 0, "data": ["ok": 1]])
+        }
+        try await server.start()
+        defer { server.stop() }
+
+        let client = ZaloSessionClient(dataDirectory: dir, useKeychain: false)
+        await Self.login(client, domains: server.domains(for: ["file"]))
         let resp = try await client.multipartBox(file: file.path, offset: 2, length: 5)
         #expect(JSONLossless.int64((resp.dict["data"] as? [String: Any])?["ok"]) == 1)
-        let captured = try #require(CaptureURLProtocol.captured)
-        #expect(captured.contentType.hasPrefix("multipart/form-data; boundary=----OlazBoundary"))
-        #expect(captured.body.range(of: Data("23456".utf8)) != nil)
-        #expect(captured.body.range(of: Data("0123456".utf8)) == nil)
+        let req = try #require(captured.withLock { $0 })
+        #expect((req.header("content-type") ?? "").hasPrefix("multipart/form-data; boundary=----OlazBoundary"))
+        #expect(req.body.range(of: Data("23456".utf8)) != nil)
+        #expect(req.body.range(of: Data("0123456".utf8)) == nil)
     }
 }

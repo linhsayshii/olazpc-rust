@@ -100,8 +100,16 @@ private func converse(_ mgr: ZaloE2EEManager, store: ZaloSQLiteStore, idBase: In
 }
 
 @Suite(.serialized) struct RustE2EEModeTests {
+    private static func makeTempStore() throws -> (dir: URL, store: ZaloSQLiteStore) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-e2ee-mode-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let store = try ZaloSQLiteStore(path: dir.appendingPathComponent("history.sqlite3").path)
+        return (dir, store)
+    }
+
     @Test func shadowModeCountsMatchesAndNeverWrites() async throws {
-        let store = try ZaloSQLiteStore(path: ":memory:")
+        let (dir, store) = try Self.makeTempStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
         let log = LogBox()
         let mgr = ZaloE2EEManager(mode: .shadow, logSink: { log.append($0) })
         _ = try await converse(mgr, store: store, idBase: 100)
@@ -130,7 +138,8 @@ private func converse(_ mgr: ZaloE2EEManager, store: ZaloSQLiteStore, idBase: In
     }
 
     @Test func switchModeIsAuthoritativeAndJSCanReadItsStore() async throws {
-        let store = try ZaloSQLiteStore(path: ":memory:")
+        let (dir, store) = try Self.makeTempStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
         let log = LogBox()
         let mgr = ZaloE2EEManager(mode: .authoritative, logSink: { log.append($0) })
         let bob = try await converse(mgr, store: store, idBase: 200)
@@ -163,7 +172,8 @@ private func converse(_ mgr: ZaloE2EEManager, store: ZaloSQLiteStore, idBase: In
     }
 
     @Test func switchingOffLetsJSContinueFromTheRustWrittenStore() async throws {
-        let store = try ZaloSQLiteStore(path: ":memory:")
+        let (dir, store) = try Self.makeTempStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
         let rustMgr = ZaloE2EEManager(mode: .authoritative, logSink: { _ in })
         let bob = try await converse(rustMgr, store: store, idBase: 300)
 
@@ -189,7 +199,8 @@ private func converse(_ mgr: ZaloE2EEManager, store: ZaloSQLiteStore, idBase: In
     }
 
     @Test func corruptSavedStoreFallsBackToJSWithoutOverwriting() async throws {
-        let store = try ZaloSQLiteStore(path: ":memory:")
+        let (dir, store) = try Self.makeTempStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
         try await store.setPreferenceString(key: ZaloE2EEManager.storePrefKey, value: "{not json at all")
         let log = LogBox()
         let mgr = ZaloE2EEManager(mode: .authoritative, logSink: { log.append($0) })

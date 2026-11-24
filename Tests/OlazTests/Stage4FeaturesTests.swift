@@ -3,52 +3,6 @@ import os
 import Testing
 @testable import Olaz
 
-private final class MockStage4URLProtocol: URLProtocol, @unchecked Sendable {
-    typealias Handler = @Sendable (URLRequest, Data) -> (Int, [String: Any])
-    static let handlers = OSAllocatedUnfairLock<[String: Handler]>(initialState: [:])
-
-    override class func canInit(with request: URLRequest) -> Bool {
-        guard let host = request.url?.host else { return false }
-        return handlers.withLock { $0[host] != nil }
-    }
-
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
-        request
-    }
-
-    override func startLoading() {
-        guard let url = request.url,
-              let host = url.host,
-              let handler = Self.handlers.withLock({ $0[host] }) else {
-            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
-            return
-        }
-        var bodyData = request.httpBody ?? Data()
-        if bodyData.isEmpty, let stream = request.httpBodyStream {
-            stream.open()
-            defer { stream.close() }
-            var buf = [UInt8](repeating: 0, count: 4096)
-            while stream.hasBytesAvailable {
-                let n = stream.read(&buf, maxLength: buf.count)
-                if n > 0 { bodyData.append(contentsOf: buf.prefix(n)) } else { break }
-            }
-        }
-        let (status, jsonObj) = handler(request, bodyData)
-        let respData = (try? JSONSerialization.data(withJSONObject: jsonObj)) ?? Data("{}".utf8)
-        let http = HTTPURLResponse(
-            url: url,
-            statusCode: status,
-            httpVersion: "HTTP/1.1",
-            headerFields: ["Content-Type": "application/json"]
-        )!
-        client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: respData)
-        client?.urlProtocolDidFinishLoading(self)
-    }
-
-    override func stopLoading() {}
-}
-
 @Suite struct Stage4FeaturesTests {
     private struct RecordedHTTP: Sendable {
         let method: String
@@ -63,61 +17,33 @@ private final class MockStage4URLProtocol: URLProtocol, @unchecked Sendable {
         root: URL,
         key: Data,
         routes: @escaping @Sendable (RecordedHTTP) -> (Int, [String: Any])
-    ) async -> (client: ZaloSessionClient, host: String, recorded: OSAllocatedUnfairLock<[RecordedHTTP]>) {
-        let host = "mock-stage4-\(UUID().uuidString.lowercased()).invalid"
+    ) async throws -> (client: ZaloSessionClient, server: FakeZaloServer, recorded: OSAllocatedUnfairLock<[RecordedHTTP]>) {
         let recorded = OSAllocatedUnfairLock<[RecordedHTTP]>(initialState: [])
-
-        @Sendable func decodeParams(_ encoded: String) -> [String: Any] {
-            let unescaped = encoded.removingPercentEncoding ?? encoded
-            guard let plain = try? ZaloCrypto.decodeAES(key: key, base64: unescaped),
-                  let obj = JSONLossless.parseObject(Data(plain.utf8)) else {
-                return [:]
-            }
-            return obj
+        let server = try FakeZaloServer { req in
+            let hasParams = req.query.split(separator: "&").contains { $0.hasPrefix("params=") }
+            let payload = req.decodeEncryptedParams(key: key) ?? [:]
+            let call = RecordedHTTP(
+                method: req.method,
+                host: req.header("host") ?? "",
+                path: req.path,
+                query: req.query,
+                hasParamsQuery: hasParams,
+                payload: ZaloJSONBox(payload)
+            )
+            recorded.withLock { $0.append(call) }
+            let (status, jsonObj) = routes(call)
+            return .json(status, jsonObj)
         }
+        try await server.start()
 
-        MockStage4URLProtocol.handlers.withLock { map in
-            map[host] = { req, bodyData in
-                let path = req.url?.path ?? ""
-                let query = req.url?.query ?? ""
-                var hasParams = false
-                var payload: [String: Any] = [:]
-                if let paramsPart = query.split(separator: "&").first(where: { $0.hasPrefix("params=") }) {
-                    hasParams = true
-                    payload = decodeParams(String(paramsPart.dropFirst("params=".count)))
-                }
-                if payload.isEmpty {
-                    let bodyStr = String(decoding: bodyData, as: UTF8.self)
-                    if let paramsPart = bodyStr.split(separator: "&").first(where: { $0.hasPrefix("params=") }) {
-                        payload = decodeParams(String(paramsPart.dropFirst("params=".count)))
-                    }
-                }
-                let call = RecordedHTTP(
-                    method: req.httpMethod ?? "GET",
-                    host: req.url?.host ?? "",
-                    path: path,
-                    query: query,
-                    hasParamsQuery: hasParams,
-                    payload: ZaloJSONBox(payload)
-                )
-                recorded.withLock { $0.append(call) }
-                return routes(call)
-            }
-        }
-
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [MockStage4URLProtocol.self]
-        let client = ZaloSessionClient(dataDirectory: root, useKeychain: false, urlSession: URLSession(configuration: config))
-        var domains = ZaloDomains()
-        for svc in ["group_board", "conversation", "group_poll", "profile", "group", "label", "chat"] {
-            domains.serviceCandidates[svc] = ["https://\(host)"]
-        }
+        let client = ZaloSessionClient(dataDirectory: root, useKeychain: false)
+        let domains = server.domains(for: ["group_board", "conversation", "group_poll", "profile", "group", "label", "chat"])
         var account = ZaloLoginAccount()
         account.userId = "100"
         account.displayName = "Minh"
         account.send2MeId = "999"
         await client.updateCredentials(account: account, secretKey: key, zpwSek: "sek.1.2", domains: domains)
-        return (client, host, recorded)
+        return (client, server, recorded)
     }
 
     @MainActor
@@ -125,58 +51,30 @@ private final class MockStage4URLProtocol: URLProtocol, @unchecked Sendable {
         root: URL,
         key: Data,
         routes: @escaping @Sendable (RecordedHTTP) -> (Int, [String: Any])
-    ) async throws -> (engine: ZaloEngine, store: ZaloSQLiteStore, host: String, recorded: OSAllocatedUnfairLock<[RecordedHTTP]>) {
-        let host = "mock-stage4-eng-\(UUID().uuidString.lowercased()).invalid"
+    ) async throws -> (engine: ZaloEngine, store: ZaloSQLiteStore, server: FakeZaloServer, recorded: OSAllocatedUnfairLock<[RecordedHTTP]>) {
         let recorded = OSAllocatedUnfairLock<[RecordedHTTP]>(initialState: [])
-
-        @Sendable func decodeParams(_ encoded: String) -> [String: Any] {
-            let unescaped = encoded.removingPercentEncoding ?? encoded
-            guard let plain = try? ZaloCrypto.decodeAES(key: key, base64: unescaped),
-                  let obj = JSONLossless.parseObject(Data(plain.utf8)) else {
-                return [:]
-            }
-            return obj
+        let server = try FakeZaloServer { req in
+            let hasParams = req.query.split(separator: "&").contains { $0.hasPrefix("params=") }
+            let payload = req.decodeEncryptedParams(key: key) ?? [:]
+            let call = RecordedHTTP(
+                method: req.method,
+                host: req.header("host") ?? "",
+                path: req.path,
+                query: req.query,
+                hasParamsQuery: hasParams,
+                payload: ZaloJSONBox(payload)
+            )
+            recorded.withLock { $0.append(call) }
+            let (status, jsonObj) = routes(call)
+            return .json(status, jsonObj)
         }
+        try await server.start()
 
-        MockStage4URLProtocol.handlers.withLock { map in
-            map[host] = { req, bodyData in
-                let path = req.url?.path ?? ""
-                let query = req.url?.query ?? ""
-                var hasParams = false
-                var payload: [String: Any] = [:]
-                if let paramsPart = query.split(separator: "&").first(where: { $0.hasPrefix("params=") }) {
-                    hasParams = true
-                    payload = decodeParams(String(paramsPart.dropFirst("params=".count)))
-                }
-                if payload.isEmpty {
-                    let bodyStr = String(decoding: bodyData, as: UTF8.self)
-                    if let paramsPart = bodyStr.split(separator: "&").first(where: { $0.hasPrefix("params=") }) {
-                        payload = decodeParams(String(paramsPart.dropFirst("params=".count)))
-                    }
-                }
-                let call = RecordedHTTP(
-                    method: req.httpMethod ?? "GET",
-                    host: req.url?.host ?? "",
-                    path: path,
-                    query: query,
-                    hasParamsQuery: hasParams,
-                    payload: ZaloJSONBox(payload)
-                )
-                recorded.withLock { $0.append(call) }
-                return routes(call)
-            }
-        }
-
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [MockStage4URLProtocol.self]
-        let engine = ZaloEngine(dataDirectory: root, useKeychain: false, urlSession: URLSession(configuration: config))
+        let engine = ZaloEngine(dataDirectory: root, useKeychain: false)
         let store = try ZaloSQLiteStore(path: root.appendingPathComponent("history.sqlite3").path)
         engine.sqliteStore = store
 
-        var domains = ZaloDomains()
-        for svc in ["group_board", "conversation", "group_poll", "profile", "group", "label", "chat"] {
-            domains.serviceCandidates[svc] = ["https://\(host)"]
-        }
+        let domains = server.domains(for: ["group_board", "conversation", "group_poll", "profile", "group", "label", "chat"])
         var account = ZaloLoginAccount()
         account.userId = "100"
         account.displayName = "Minh"
@@ -184,7 +82,7 @@ private final class MockStage4URLProtocol: URLProtocol, @unchecked Sendable {
         account.send2MeId = "999"
         engine.applyAccountProfile(account)
         await engine.sessionClient.updateCredentials(account: account, secretKey: key, zpwSek: "sek.1.2", domains: domains)
-        return (engine, store, host, recorded)
+        return (engine, store, server, recorded)
     }
 
     // MARK: 1. Feature Request Builders & Network Payloads
@@ -204,10 +102,10 @@ private final class MockStage4URLProtocol: URLProtocol, @unchecked Sendable {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let key = Data("0123456789abcdef".utf8)
-        let (client, host, recorded) = await makeMockClient(root: root, key: key) { _ in
+        let (client, server, recorded) = try await makeMockClient(root: root, key: key) { _ in
             (200, ["error_code": 0, "data": ["ok": true]])
         }
-        defer { _ = MockStage4URLProtocol.handlers.withLock { $0.removeValue(forKey: host) } }
+        defer { server.stop() }
 
         _ = try await client.pinBoardItemAPI(groupId: "g998877", topicId: "poll_42", topicType: 3)
         let calls = recorded.withLock { $0 }
@@ -259,7 +157,7 @@ private final class MockStage4URLProtocol: URLProtocol, @unchecked Sendable {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let key = Data("0123456789abcdef".utf8)
-        let (client, host, recorded) = await makeMockClient(root: root, key: key) { call in
+        let (client, server, recorded) = try await makeMockClient(root: root, key: key) { call in
             if call.path == "/api/hiddenconvers/get-all" {
                 return (200, [
                     "error_code": 0,
@@ -274,7 +172,7 @@ private final class MockStage4URLProtocol: URLProtocol, @unchecked Sendable {
             }
             return (200, ["error_code": 0, "data": [:]])
         }
-        defer { _ = MockStage4URLProtocol.handlers.withLock { $0.removeValue(forKey: host) } }
+        defer { server.stop() }
 
         let snap = try await client.fetchHiddenConversationsAPI()
         #expect(snap.pin == "81dc9bdb52d04dc20036dbd8313ed055")
@@ -302,10 +200,10 @@ private final class MockStage4URLProtocol: URLProtocol, @unchecked Sendable {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let key = Data("0123456789abcdef".utf8)
-        let (client, host, recorded) = await makeMockClient(root: root, key: key) { _ in
+        let (client, server, recorded) = try await makeMockClient(root: root, key: key) { _ in
             (200, ["error_code": 0, "data": ["accept": ["100", "201"], "reject": ["202"]]])
         }
-        defer { _ = MockStage4URLProtocol.handlers.withLock { $0.removeValue(forKey: host) } }
+        defer { server.stop() }
 
         _ = try await client.fetchReminderRespondersAPI(reminderId: "evt_99")
         let calls = recorded.withLock { $0 }
@@ -384,7 +282,7 @@ private final class MockStage4URLProtocol: URLProtocol, @unchecked Sendable {
         let pinBoardFull = OSAllocatedUnfairLock<Bool>(initialState: false)
         let pinnedRefs = OSAllocatedUnfairLock<[String]>(initialState: ["old_1", "old_2", "old_3", "old_4", "old_5"])
 
-        let (engine, _, host, recorded) = try await makeMockEngine(root: root, key: key) { call in
+        let (engine, _, server, recorded) = try await makeMockEngine(root: root, key: key) { call in
             switch call.path {
             case "/api/board/pinv2":
                 let tid = JSONLossless.string(call.payload.dict["topicId"])
@@ -414,7 +312,7 @@ private final class MockStage4URLProtocol: URLProtocol, @unchecked Sendable {
                 return (200, ["error_code": 0, "data": [:]])
             }
         }
-        defer { _ = MockStage4URLProtocol.handlers.withLock { $0.removeValue(forKey: host) } }
+        defer { server.stop() }
 
         // Direct pin success
         let okOutcome = await engine.pinPoll("poll_1", in: "g555")
@@ -480,7 +378,7 @@ private final class MockStage4URLProtocol: URLProtocol, @unchecked Sendable {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let key = Data("0123456789abcdef".utf8)
-        let (engine, store, host, recorded) = try await makeMockEngine(root: root, key: key) { call in
+        let (engine, store, server, recorded) = try await makeMockEngine(root: root, key: key) { call in
             switch call.path {
             case "/api/hiddenconvers/get-all":
                 return (200, [
@@ -499,7 +397,7 @@ private final class MockStage4URLProtocol: URLProtocol, @unchecked Sendable {
                 return (200, ["error_code": 0, "data": [:]])
             }
         }
-        defer { _ = MockStage4URLProtocol.handlers.withLock { $0.removeValue(forKey: host) } }
+        defer { server.stop() }
 
         engine.conversations = [
             ZaloEngine.ConversationSummary(id: "201", isGroup: false, name: "An", avatar: nil, pinned: false, members: 0, unread: 0, preview: nil),
@@ -545,7 +443,7 @@ private final class MockStage4URLProtocol: URLProtocol, @unchecked Sendable {
 
         let key = Data("0123456789abcdef".utf8)
         let accepted = OSAllocatedUnfairLock<Bool>(initialState: false)
-        let (engine, _, host, _) = try await makeMockEngine(root: root, key: key) { call in
+        let (engine, _, server, _) = try await makeMockEngine(root: root, key: key) { call in
             switch call.path {
             case "/api/board/topic/getReminder":
                 let isAcc = accepted.withLock { $0 }
@@ -577,7 +475,7 @@ private final class MockStage4URLProtocol: URLProtocol, @unchecked Sendable {
                 return (200, ["error_code": 0, "data": [:]])
             }
         }
-        defer { _ = MockStage4URLProtocol.handlers.withLock { $0.removeValue(forKey: host) } }
+        defer { server.stop() }
 
         engine.contacts.friends = [
             ContactsState.Friend(

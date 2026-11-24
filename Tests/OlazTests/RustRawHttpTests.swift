@@ -169,26 +169,4 @@ private func response(_ status: String, headers: [String] = [], body: String = "
             #expect(status == 401)
         }
     }
-
-    @Test func swiftFallbackStillOwnsRawRequestWhenCoreIsOff() async throws {
-        let dir = Self.tempDir()
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [StubCookieProtocol.self]
-        let client = ZaloSessionClient(dataDirectory: dir, useKeychain: false, urlSession: URLSession(configuration: config), useRustCore: true)
-        let (status, _, cookie) = try await client.rawRequest(method: "GET", url: URL(string: "https://raw-stub.test.zaloapp.com/x")!)
-        #expect(status == 200)
-        #expect(cookie == "stub.1.2")
-    }
-}
-
-private final class StubCookieProtocol: URLProtocol, @unchecked Sendable {
-    override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "raw-stub.test.zaloapp.com" }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-    override func startLoading() {
-        let http = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: ["Set-Cookie": "zpw_sek=stub.1.2; Path=/"])!
-        client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocolDidFinishLoading(self)
-    }
-    override func stopLoading() {}
 }
