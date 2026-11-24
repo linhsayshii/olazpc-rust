@@ -3,22 +3,108 @@
 //! `Debug` implementations on types that carry credentials, display names, phone numbers, or QR
 //! payloads emit shape-only summaries (ADR-008).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
+use olaz_api::PollState;
 use olaz_net::NetworkErrorKind;
+use olaz_ws::CursorMap;
 use serde_json::{Map, Value, json};
 
 /// Top-level state owned by the single `olaz-core` actor. Future domains (U2+) add fields here.
 #[derive(Clone, Default)]
 pub struct CoreState {
     pub session: SessionState,
+    pub transport: TransportState,
 }
 
 impl fmt::Debug for CoreState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CoreState")
             .field("session", &self.session)
+            .field("transport", &self.transport)
+            .finish()
+    }
+}
+
+/// Persisted transport cursors loaded from the store after `prepare_store` (U2).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct PersistedTransportState {
+    pub poll_state: PollState,
+    pub ws_cursors: CursorMap,
+}
+
+impl fmt::Debug for PersistedTransportState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PersistedTransportState")
+            .field("ws_cursors_count", &self.ws_cursors.len())
+            .finish()
+    }
+}
+
+/// Lifecycle phase of the core-owned WebSocket connection (U2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WsPhase {
+    #[default]
+    Stopped,
+    Running,
+}
+
+/// Active long-poll drain currently executing batch-by-batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveDrain {
+    pub drain_id: u64,
+    pub lp_gen: u64,
+    pub remaining_batches: u32,
+    pub notify_incoming: bool,
+    pub is_periodic: bool,
+    pub total_events: u32,
+    pub more_after_current: bool,
+}
+
+/// Queued long-poll drain waiting for the active drain to finish (ADR-018).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingDrain {
+    pub drain_id: u64,
+    pub max_batches: u32,
+    pub notify_incoming: bool,
+    pub is_periodic: bool,
+}
+
+/// Full transport-domain state inside [`CoreState`] (U2).
+#[derive(Clone, Default)]
+pub struct TransportState {
+    pub ws_phase: WsPhase,
+    pub ws_authed: bool,
+    pub ws_gen: u64,
+    pub lp_running: bool,
+    pub lp_gen: u64,
+    pub ws_cursors: CursorMap,
+    pub poll_state: PollState,
+    pub(crate) seen_typing_shapes: BTreeSet<String>,
+    pub(crate) active_drain: Option<ActiveDrain>,
+    pub(crate) pending_drains: VecDeque<PendingDrain>,
+    pub(crate) next_drain_id: u64,
+}
+
+impl TransportState {
+    pub(crate) fn alloc_drain_id(&mut self) -> u64 {
+        self.next_drain_id = self.next_drain_id.saturating_add(1);
+        self.next_drain_id
+    }
+}
+
+impl fmt::Debug for TransportState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TransportState")
+            .field("ws_phase", &self.ws_phase)
+            .field("ws_authed", &self.ws_authed)
+            .field("ws_gen", &self.ws_gen)
+            .field("lp_running", &self.lp_running)
+            .field("lp_gen", &self.lp_gen)
+            .field("ws_cursors_count", &self.ws_cursors.len())
+            .field("has_active_drain", &self.active_drain.is_some())
+            .field("pending_drains", &self.pending_drains.len())
             .finish()
     }
 }

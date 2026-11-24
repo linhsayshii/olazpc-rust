@@ -51,6 +51,10 @@ pub(crate) enum Cmd {
         timeout: Option<Duration>,
         reply: oneshot::Sender<Option<String>>,
     },
+    RecordFileDone {
+        file_id: String,
+        url: String,
+    },
     SeedCursors(CursorMap),
     Cursors(oneshot::Sender<CursorMap>),
     IsAuthed(oneshot::Sender<bool>),
@@ -81,6 +85,7 @@ pub(crate) struct ActorParts {
     pub cmds: mpsc::Receiver<Cmd>,
     pub events: mpsc::Sender<WsEvent>,
     pub cursors_tx: watch::Sender<CursorMap>,
+    pub authed_tx: watch::Sender<bool>,
     pub on_cursors: Option<CursorObserver>,
 }
 
@@ -164,6 +169,7 @@ impl Actor {
     /// `runSingleSession` including the connect phase.
     async fn run_session(&mut self, endpoint: &str) -> Flow {
         self.p.core.on_connect();
+        self.publish_authed();
         let label = host_label(endpoint).to_owned();
         tracing::info!(host = %label, "ws: connecting");
 
@@ -259,6 +265,7 @@ impl Actor {
         for (_, token) in self.p.core.on_disconnect() {
             self.resolve_request(token, None);
         }
+        self.publish_authed();
     }
 
     /// Builds the handshake request (URL + headers) and, for `wss`, the TLS connector.
@@ -302,6 +309,7 @@ impl Actor {
             .p
             .core
             .handle_binary_frame(data, self.p.decryptor.as_ref());
+        self.publish_authed();
         self.apply_outcome(out, data.len(), ws).await
     }
 
@@ -356,6 +364,18 @@ impl Actor {
             obs(&cursors);
         }
         self.p.cursors_tx.send_replace(cursors);
+    }
+
+    fn publish_authed(&self) {
+        let authed = self.p.core.is_authed();
+        self.p.authed_tx.send_if_modified(|cur| {
+            if *cur == authed {
+                false
+            } else {
+                *cur = authed;
+                true
+            }
+        });
     }
 
     fn resolve_request(&mut self, token: WaiterToken, value: Option<Map<String, Value>>) {
@@ -482,6 +502,11 @@ impl Actor {
                     self.add_timer(after, Timer::File { file_id, token });
                 }
             },
+            Cmd::RecordFileDone { file_id, url } => {
+                for token in self.p.core.files.record(&file_id, &url) {
+                    self.resolve_file(token, Some(url.clone()));
+                }
+            }
             Cmd::SeedCursors(snaps) => {
                 self.p.core.cursors.seed(&snaps);
                 let cur = self.p.core.cursors.current();
@@ -504,6 +529,7 @@ impl Actor {
                 for t in files {
                     self.resolve_file(t, None);
                 }
+                self.publish_authed();
                 let cur = self.p.core.cursors.current();
                 self.publish_cursors(cur.clone(), false);
                 let _ = reply.send(cur);

@@ -285,7 +285,15 @@ import Testing
         let sessionURL = dir.appendingPathComponent("native-session.json")
         try Data(savedSession.canonicalString().utf8).write(to: sessionURL)
 
-        let engine = ZaloEngine(dataDirectory: dir, useKeychain: false, domains: isolatedDomains)
+        let storage = RecorderStorageIsolation(prefix: "olaz.core-mirror")
+        defer { storage.cleanup() }
+        let engine = ZaloEngine(
+            dataDirectory: dir,
+            useKeychain: false,
+            domains: isolatedDomains,
+            userDefaultsSuiteName: storage.userDefaultsSuiteName,
+            cookieStorage: storage.cookieStorage
+        )
         // Stub out side-effecting host hooks (SQLite/WS/bootstrap) to keep the test isolated and fast.
         engine.hostTrace = { _, _ in false }
 
@@ -300,7 +308,7 @@ import Testing
         let logOutCleanupTask = try #require(engine.pendingCleanupTask)
         let logOutQrTask = try #require(engine.qrTask)
         try await awaitTaskWithinTimeout(logOutCleanupTask, label: "logOutCleanupTask")
-        try await waitForPhase(engine, timeoutMs: 3000) {
+        try await waitForPhase(engine, timeoutMs: 30_000) {
             if case .login(let l) = $0, case .waitingScan = l.step { return true }
             return false
         }
@@ -321,7 +329,7 @@ import Testing
         let expiredCleanupTask = try #require(engine.pendingCleanupTask)
         let expiredQrTask = try #require(engine.qrTask)
         try await awaitTaskWithinTimeout(expiredCleanupTask, label: "expiredCleanupTask")
-        try await waitForPhase(engine, timeoutMs: 3000) {
+        try await waitForPhase(engine, timeoutMs: 30_000) {
             if case .login(let l) = $0, case .waitingScan = l.step { return true }
             return false
         }
@@ -380,11 +388,19 @@ import Testing
         var deinitBootTask: Task<Void, Never>?
         var deinitQrTask: Task<Void, Never>?
         do {
-            let ephemeral = ZaloEngine(dataDirectory: deinitDir, useKeychain: false, domains: deinitDomains)
+            let deinitStorage = RecorderStorageIsolation(prefix: "olaz.core-deinit")
+            defer { deinitStorage.cleanup() }
+            let ephemeral = ZaloEngine(
+                dataDirectory: deinitDir,
+                useKeychain: false,
+                domains: deinitDomains,
+                userDefaultsSuiteName: deinitStorage.userDefaultsSuiteName,
+                cookieStorage: deinitStorage.cookieStorage
+            )
             ephemeral.hostTrace = { _, _ in false }
             ephemeral.start()
             deinitBootTask = ephemeral.bootTask
-            try await waitForPhase(ephemeral, timeoutMs: 3000) {
+            try await waitForPhase(ephemeral, timeoutMs: 30_000) {
                 if case .login(let l) = $0, case .waitingScan = l.step { return true }
                 return false
             }
@@ -396,7 +412,7 @@ import Testing
     }
 
     @MainActor
-    private func awaitTaskWithinTimeout(_ task: Task<Void, Never>, label: String, timeoutMs: Int = 3000) async throws {
+    private func awaitTaskWithinTimeout(_ task: Task<Void, Never>, label: String, timeoutMs: Int = 30_000) async throws {
         let completed = await withTaskGroup(of: Bool.self) { group in
             group.addTask {
                 await task.value

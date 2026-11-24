@@ -2,9 +2,13 @@
 
 use std::fmt;
 
+use olaz_api::PollState;
 use olaz_net::{LoginAccount, NetError, QrScanResult, QrTicket, SessionStatus};
+use olaz_ws::CursorMap;
+use serde_json::{Map, Value};
 
-use crate::state::{CoreFailKind, FailReason};
+use crate::state::{CoreFailKind, FailReason, PersistedTransportState};
+use crate::typed_chat::TypedChatEnvelope;
 
 /// Commands sent from Swift (or test scripts) into the actor.
 #[derive(Clone)]
@@ -12,8 +16,14 @@ pub enum Command {
     Start,
     RefreshQr,
     LogOut,
-    SessionExpired { reason: String },
+    SessionExpired {
+        reason: String,
+    },
     ApplyAccountProfile(LoginAccount),
+    DrainChatPolling {
+        max_batches: u32,
+        notify_incoming: bool,
+    },
 }
 
 impl fmt::Debug for Command {
@@ -29,6 +39,14 @@ impl fmt::Debug for Command {
             Self::ApplyAccountProfile(acc) => f
                 .debug_struct("ApplyAccountProfile")
                 .field("has_uid", &!acc.user_id.is_empty())
+                .finish(),
+            Self::DrainChatPolling {
+                max_batches,
+                notify_incoming,
+            } => f
+                .debug_struct("DrainChatPolling")
+                .field("max_batches", max_batches)
+                .field("notify_incoming", notify_incoming)
                 .finish(),
         }
     }
@@ -73,6 +91,32 @@ impl fmt::Debug for CompletedLogin {
             .field("profile_synced", &self.profile_synced)
             .finish()
     }
+}
+
+/// Result of one `fetch_chat_from_polling` HTTP call.
+#[derive(Clone)]
+pub struct PollBatchOutcome {
+    pub payload: Map<String, Value>,
+    pub next_state: PollState,
+    pub more: bool,
+}
+
+impl fmt::Debug for PollBatchOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PollBatchOutcome")
+            .field("payload_keys", &self.payload.len())
+            .field("more", &self.more)
+            .finish()
+    }
+}
+
+/// Failure category of one `fetch_chat_from_polling` HTTP call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollBatchError {
+    /// Auth error (code 600 or -102): expires the session.
+    Auth,
+    /// Transient network / server / parse error: ends this tick and retries on the next tick.
+    Other,
 }
 
 /// Typed failure produced by QR login effects.
@@ -132,6 +176,7 @@ pub enum Input {
     },
     PrepareStoreDone {
         token: StoreToken,
+        transport_state: PersistedTransportState,
     },
     SessionStatusResult {
         boot_gen: u64,
@@ -165,6 +210,46 @@ pub enum Input {
         qr_gen: u64,
         result: Result<CompletedLogin, SessionFailure>,
     },
+
+    // --- Transport domain (U2) ---
+    WsEvent {
+        ws_gen: u64,
+        cmd: u16,
+        payload: Map<String, Value>,
+        now_unix_secs: i64,
+    },
+    WsTypedChat {
+        ws_gen: u64,
+        cmd: u16,
+        envelope: TypedChatEnvelope,
+    },
+    WsAuthChanged {
+        ws_gen: u64,
+        authed: bool,
+    },
+    WsCursorsChanged {
+        ws_gen: u64,
+        cursors: CursorMap,
+    },
+    LpTick {
+        lp_gen: u64,
+    },
+    DrainRequested {
+        drain_id: u64,
+        max_batches: u32,
+        notify_incoming: bool,
+    },
+    PollBatchFetched {
+        lp_gen: u64,
+        drain_id: u64,
+        result: Result<PollBatchOutcome, PollBatchError>,
+        now_unix_secs: i64,
+    },
+    PollBatchApplied {
+        lp_gen: u64,
+        drain_id: u64,
+        applied_count: u32,
+    },
 }
 
 impl fmt::Debug for Input {
@@ -195,9 +280,13 @@ impl fmt::Debug for Input {
                 .field("ws_count", &ws_endpoints.len())
                 .field("profile_synced", profile_synced)
                 .finish(),
-            Self::PrepareStoreDone { token } => f
+            Self::PrepareStoreDone {
+                token,
+                transport_state,
+            } => f
                 .debug_struct("PrepareStoreDone")
                 .field("token", token)
+                .field("transport_state", transport_state)
                 .finish(),
             Self::SessionStatusResult {
                 boot_gen,
@@ -245,6 +334,69 @@ impl fmt::Debug for Input {
                 .debug_struct("LoginCompleted")
                 .field("qr_gen", qr_gen)
                 .field("ok", &result.is_ok())
+                .finish(),
+            Self::WsEvent {
+                ws_gen,
+                cmd,
+                payload,
+                ..
+            } => f
+                .debug_struct("WsEvent")
+                .field("ws_gen", ws_gen)
+                .field("cmd", cmd)
+                .field("payload_keys", &payload.len())
+                .finish(),
+            Self::WsTypedChat {
+                ws_gen,
+                cmd,
+                envelope,
+            } => f
+                .debug_struct("WsTypedChat")
+                .field("ws_gen", ws_gen)
+                .field("cmd", cmd)
+                .field("envelope", envelope)
+                .finish(),
+            Self::WsAuthChanged { ws_gen, authed } => f
+                .debug_struct("WsAuthChanged")
+                .field("ws_gen", ws_gen)
+                .field("authed", authed)
+                .finish(),
+            Self::WsCursorsChanged { ws_gen, cursors } => f
+                .debug_struct("WsCursorsChanged")
+                .field("ws_gen", ws_gen)
+                .field("cursors_count", &cursors.len())
+                .finish(),
+            Self::LpTick { lp_gen } => f.debug_struct("LpTick").field("lp_gen", lp_gen).finish(),
+            Self::DrainRequested {
+                drain_id,
+                max_batches,
+                notify_incoming,
+            } => f
+                .debug_struct("DrainRequested")
+                .field("drain_id", drain_id)
+                .field("max_batches", max_batches)
+                .field("notify_incoming", notify_incoming)
+                .finish(),
+            Self::PollBatchFetched {
+                lp_gen,
+                drain_id,
+                result,
+                ..
+            } => f
+                .debug_struct("PollBatchFetched")
+                .field("lp_gen", lp_gen)
+                .field("drain_id", drain_id)
+                .field("result", result)
+                .finish(),
+            Self::PollBatchApplied {
+                lp_gen,
+                drain_id,
+                applied_count,
+            } => f
+                .debug_struct("PollBatchApplied")
+                .field("lp_gen", lp_gen)
+                .field("drain_id", drain_id)
+                .field("applied_count", applied_count)
                 .finish(),
         }
     }

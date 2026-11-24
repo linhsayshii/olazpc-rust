@@ -5,8 +5,8 @@ use olaz_net::{LoginAccount, QrTicket, SessionStatus};
 use crate::changes::DirtyKey;
 use crate::effect::{Effect, HostCall};
 use crate::input::{Command, Input, SessionFailure, StoreToken};
-use crate::reduce::ReduceOutput;
-use crate::state::{LoginState, LoginStep, PendingStore, Phase, Profile, SessionState};
+use crate::reduce::{ReduceOutput, transport};
+use crate::state::{CoreState, LoginState, LoginStep, PendingStore, Phase, Profile, SessionState};
 
 /// Default Vietnamese display name when the server returns an empty string (Swift `applyAccountProfile`).
 pub const DEFAULT_DISPLAY_NAME: &str = "Người dùng Zalo";
@@ -18,7 +18,7 @@ pub const BOOT_EXPIRED_NOTICE: &str =
 const DEFAULT_QR_LANGUAGE: &str = "vi";
 const PREF_DID_OFFER_INITIAL_SYNC: &str = "didOfferInitialSync";
 
-pub fn reduce_session(state: &mut SessionState, input: Input, out: &mut ReduceOutput) {
+pub fn reduce_session(state: &mut CoreState, input: Input, out: &mut ReduceOutput) {
     match input {
         Input::Command(cmd) => reduce_command(state, cmd, out),
 
@@ -28,7 +28,7 @@ pub fn reduce_session(state: &mut SessionState, input: Input, out: &mut ReduceOu
             account,
             ws_endpoints,
         } => {
-            if boot_gen != state.boot_gen {
+            if boot_gen != state.session.boot_gen {
                 return;
             }
             if !restored {
@@ -37,11 +37,17 @@ pub fn reduce_session(state: &mut SessionState, input: Input, out: &mut ReduceOu
             }
             match account {
                 Some(acc) if !acc.user_id.is_empty() => {
-                    begin_store_prepare_for_boot(state, boot_gen, acc, ws_endpoints, out);
+                    begin_store_prepare_for_boot(
+                        &mut state.session,
+                        boot_gen,
+                        acc,
+                        ws_endpoints,
+                        out,
+                    );
                 }
                 _ => {
                     tracing::debug!("session: saved session has empty user id, starting qr login");
-                    start_qr_login(state, out);
+                    start_qr_login(&mut state.session, out);
                 }
             }
         }
@@ -52,7 +58,7 @@ pub fn reduce_session(state: &mut SessionState, input: Input, out: &mut ReduceOu
             ws_endpoints,
             profile_synced,
         } => {
-            if boot_gen != state.boot_gen {
+            if boot_gen != state.session.boot_gen {
                 return;
             }
             match account {
@@ -63,40 +69,51 @@ pub fn reduce_session(state: &mut SessionState, input: Input, out: &mut ReduceOu
                         out.effects.push(Effect::Host(HostCall::PersistSession));
                     }
                     out.effects.push(Effect::Host(HostCall::PersistSession));
-                    begin_store_prepare_for_boot(state, boot_gen, acc, ws_endpoints, out);
+                    begin_store_prepare_for_boot(
+                        &mut state.session,
+                        boot_gen,
+                        acc,
+                        ws_endpoints,
+                        out,
+                    );
                 }
                 _ => {
                     tracing::debug!(
                         "session: no saved session or legacy cookie, starting qr login"
                     );
-                    start_qr_login(state, out);
+                    start_qr_login(&mut state.session, out);
                 }
             }
         }
 
-        Input::PrepareStoreDone { token } => {
-            let matches = match (&state.pending_store, token) {
+        Input::PrepareStoreDone {
+            token,
+            transport_state,
+        } => {
+            let matches = match (&state.session.pending_store, token) {
                 (Some(PendingStore::Boot { boot_gen, .. }), StoreToken::Boot(t)) => {
-                    *boot_gen == t && *boot_gen == state.boot_gen
+                    *boot_gen == t && *boot_gen == state.session.boot_gen
                 }
                 (Some(PendingStore::QrComplete { qr_gen, .. }), StoreToken::Qr(t)) => {
-                    *qr_gen == t && *qr_gen == state.qr_gen
+                    *qr_gen == t && *qr_gen == state.session.qr_gen
                 }
                 _ => false,
             };
             if !matches {
                 return;
             }
-            let Some(pending) = state.pending_store.take() else {
+            let Some(pending) = state.session.pending_store.take() else {
                 return;
             };
+            state.transport.poll_state = transport_state.poll_state;
+            state.transport.ws_cursors = transport_state.ws_cursors;
             match pending {
                 PendingStore::Boot {
                     boot_gen,
                     ws_endpoints,
                 } => {
-                    state.boot_ws_endpoints = ws_endpoints;
-                    state.phase = Phase::Ready;
+                    state.session.boot_ws_endpoints = ws_endpoints;
+                    state.session.phase = Phase::Ready;
                     out.dirty.insert(DirtyKey::Session);
                     out.effects.push(Effect::CheckSessionStatus { boot_gen });
                 }
@@ -106,18 +123,16 @@ pub fn reduce_session(state: &mut SessionState, input: Input, out: &mut ReduceOu
                     ..
                 } => {
                     state
+                        .session
                         .prefs
                         .insert(PREF_DID_OFFER_INITIAL_SYNC.to_owned(), "0".to_owned());
-                    state.phase = Phase::Ready;
+                    state.session.phase = Phase::Ready;
                     out.dirty.insert(DirtyKey::Session);
                     out.effects.push(Effect::SetPref {
                         key: PREF_DID_OFFER_INITIAL_SYNC.to_owned(),
                         value: "0".to_owned(),
                     });
-                    out.effects.push(Effect::Host(HostCall::StartWs {
-                        endpoints: ws_endpoints,
-                    }));
-                    out.effects.push(Effect::Host(HostCall::StartLongPoll));
+                    transport::start_transport(state, ws_endpoints, out);
                     out.effects.push(Effect::Host(HostCall::StartBootstrap));
                     out.effects
                         .push(Effect::Host(HostCall::OfferFirstLoginTransfer {
@@ -133,13 +148,13 @@ pub fn reduce_session(state: &mut SessionState, input: Input, out: &mut ReduceOu
             updated_from_login_info,
             ws_endpoints,
         } => {
-            if boot_gen != state.boot_gen {
+            if boot_gen != state.session.boot_gen {
                 return;
             }
             match status {
                 SessionStatus::Valid => {
                     tracing::debug!("session: status valid, syncing profile");
-                    state.boot_ws_endpoints = ws_endpoints;
+                    state.session.boot_ws_endpoints = ws_endpoints;
                     if updated_from_login_info {
                         out.effects.push(Effect::Host(HostCall::PersistSession));
                     }
@@ -151,10 +166,8 @@ pub fn reduce_session(state: &mut SessionState, input: Input, out: &mut ReduceOu
                 }
                 SessionStatus::Unreachable => {
                     tracing::debug!("session: status unreachable, starting from cache");
-                    let endpoints = state.boot_ws_endpoints.clone();
-                    out.effects
-                        .push(Effect::Host(HostCall::StartWs { endpoints }));
-                    out.effects.push(Effect::Host(HostCall::StartLongPoll));
+                    let endpoints = state.session.boot_ws_endpoints.clone();
+                    transport::start_transport(state, endpoints, out);
                     out.effects.push(Effect::Host(HostCall::StartBootstrap));
                 }
             }
@@ -166,52 +179,49 @@ pub fn reduce_session(state: &mut SessionState, input: Input, out: &mut ReduceOu
             account,
             ws_endpoints,
         } => {
-            if boot_gen != state.boot_gen {
+            if boot_gen != state.session.boot_gen {
                 return;
             }
             if profile_synced {
                 out.effects.push(Effect::Host(HostCall::PersistSession));
             }
             if let Some(acc) = account {
-                apply_account_profile(state, &acc);
+                apply_account_profile(&mut state.session, &acc);
                 out.dirty.insert(DirtyKey::Session);
             }
-            out.effects.push(Effect::Host(HostCall::StartWs {
-                endpoints: ws_endpoints,
-            }));
-            out.effects.push(Effect::Host(HostCall::StartLongPoll));
+            transport::start_transport(state, ws_endpoints, out);
             out.effects.push(Effect::Host(HostCall::StartBootstrap));
         }
 
         Input::QrRequested { qr_gen, result } => {
-            if qr_gen != state.qr_gen {
+            if qr_gen != state.session.qr_gen {
                 return;
             }
             match result {
                 Ok(ticket) => {
-                    state.phase = Phase::Login(waiting_scan_state(&ticket));
+                    state.session.phase = Phase::Login(waiting_scan_state(&ticket));
                     out.dirty.insert(DirtyKey::Session);
                     out.effects.push(Effect::WaitQrScan { qr_gen, ticket });
                 }
-                Err(failure) => apply_qr_failure(state, failure, out),
+                Err(failure) => apply_qr_failure(&mut state.session, failure, out),
             }
         }
 
         Input::QrRotated { qr_gen, ticket } => {
-            if qr_gen != state.qr_gen {
+            if qr_gen != state.session.qr_gen {
                 return;
             }
-            state.phase = Phase::Login(waiting_scan_state(&ticket));
+            state.session.phase = Phase::Login(waiting_scan_state(&ticket));
             out.dirty.insert(DirtyKey::Session);
         }
 
         Input::QrScanned { qr_gen, result } => {
-            if qr_gen != state.qr_gen {
+            if qr_gen != state.session.qr_gen {
                 return;
             }
             match result {
                 Ok(scan) => {
-                    state.phase = Phase::Login(LoginState {
+                    state.session.phase = Phase::Login(LoginState {
                         step: LoginStep::WaitingConfirm {
                             name: scan.display_name,
                             avatar: scan.avatar,
@@ -225,34 +235,34 @@ pub fn reduce_session(state: &mut SessionState, input: Input, out: &mut ReduceOu
                         ticket: scan.active_ticket,
                     });
                 }
-                Err(failure) => apply_qr_failure(state, failure, out),
+                Err(failure) => apply_qr_failure(&mut state.session, failure, out),
             }
         }
 
         Input::QrConfirmed { qr_gen, result } => {
-            if qr_gen != state.qr_gen {
+            if qr_gen != state.session.qr_gen {
                 return;
             }
             match result {
                 Ok(()) => {
-                    state.phase = Phase::SigningIn;
+                    state.session.phase = Phase::SigningIn;
                     out.dirty.insert(DirtyKey::Session);
                     out.effects.push(Effect::CompleteLogin { qr_gen });
                 }
-                Err(failure) => apply_qr_failure(state, failure, out),
+                Err(failure) => apply_qr_failure(&mut state.session, failure, out),
             }
         }
 
         Input::LoginCompleted { qr_gen, result } => {
-            if qr_gen != state.qr_gen {
+            if qr_gen != state.session.qr_gen {
                 return;
             }
             match result {
                 Ok(done) => {
-                    state.sign_out_notice = None;
-                    apply_account_profile(state, &done.account);
+                    state.session.sign_out_notice = None;
+                    apply_account_profile(&mut state.session, &done.account);
                     out.dirty.insert(DirtyKey::Session);
-                    state.pending_store = Some(PendingStore::QrComplete {
+                    state.session.pending_store = Some(PendingStore::QrComplete {
                         qr_gen,
                         ws_endpoints: done.ws_endpoints,
                         need_sync_msg: done.account.need_sync_msg == Some(true),
@@ -267,43 +277,47 @@ pub fn reduce_session(state: &mut SessionState, input: Input, out: &mut ReduceOu
                         account: Box::new(done.account),
                     }));
                 }
-                Err(failure) => apply_qr_failure(state, failure, out),
+                Err(failure) => apply_qr_failure(&mut state.session, failure, out),
             }
         }
+
+        _ => {}
     }
 }
 
-fn reduce_command(state: &mut SessionState, cmd: Command, out: &mut ReduceOutput) {
+fn reduce_command(state: &mut CoreState, cmd: Command, out: &mut ReduceOutput) {
     match cmd {
         Command::Start => {
-            if state.started {
+            if state.session.started {
                 return;
             }
-            state.started = true;
-            state.boot_gen = state.boot_gen.saturating_add(1);
+            state.session.started = true;
+            state.session.boot_gen = state.session.boot_gen.saturating_add(1);
             out.effects.push(Effect::LoadSavedSession {
-                boot_gen: state.boot_gen,
+                boot_gen: state.session.boot_gen,
             });
         }
         Command::RefreshQr => {
-            state.sign_out_notice = None;
-            start_qr_login(state, out);
+            state.session.sign_out_notice = None;
+            start_qr_login(&mut state.session, out);
         }
         Command::LogOut => {
             tracing::debug!("session: log out");
-            reset_session_fields(state);
-            state.sign_out_notice = None;
-            state.qr_gen = state.qr_gen.saturating_add(1);
-            state.phase = Phase::Login(LoginState::generating());
+            reset_session_fields(&mut state.session);
+            state.session.sign_out_notice = None;
+            state.session.qr_gen = state.session.qr_gen.saturating_add(1);
+            state.session.phase = Phase::Login(LoginState::generating());
             out.dirty.insert(DirtyKey::Session);
 
-            // Order matches Swift `logOut`: cancel tasks, clear session, reset domains, start QR.
+            // Order matches Swift `logOut`: cancel tasks, stop transport, clear session,
+            // reset domains, start QR.
             out.effects.push(Effect::CancelSessionTasks);
+            transport::stop_transport(state, true, out);
             out.effects.push(Effect::ClearCoreSession);
             out.effects.push(Effect::Host(HostCall::ClearSession));
             out.effects.push(Effect::Host(HostCall::ResetDomains));
             out.effects.push(Effect::RequestQr {
-                qr_gen: state.qr_gen,
+                qr_gen: state.session.qr_gen,
                 language: DEFAULT_QR_LANGUAGE.to_owned(),
             });
         }
@@ -311,9 +325,10 @@ fn reduce_command(state: &mut SessionState, cmd: Command, out: &mut ReduceOutput
             enter_session_expired(state, reason, out);
         }
         Command::ApplyAccountProfile(account) => {
-            apply_account_profile(state, &account);
+            apply_account_profile(&mut state.session, &account);
             out.dirty.insert(DirtyKey::Session);
         }
+        Command::DrainChatPolling { .. } => {}
     }
 }
 
@@ -348,21 +363,22 @@ fn start_qr_login(state: &mut SessionState, out: &mut ReduceOutput) {
     });
 }
 
-fn enter_session_expired(state: &mut SessionState, reason: String, out: &mut ReduceOutput) {
+pub(crate) fn enter_session_expired(state: &mut CoreState, reason: String, out: &mut ReduceOutput) {
     tracing::debug!("session: expired");
-    reset_session_fields(state);
-    state.sign_out_notice = Some(reason);
-    state.qr_gen = state.qr_gen.saturating_add(1);
-    state.phase = Phase::Login(LoginState::generating());
+    reset_session_fields(&mut state.session);
+    state.session.sign_out_notice = Some(reason);
+    state.session.qr_gen = state.session.qr_gen.saturating_add(1);
+    state.session.phase = Phase::Login(LoginState::generating());
     out.dirty.insert(DirtyKey::Session);
 
-    // Order matches Swift `handleSessionExpiredNotice`: cancel, mark_expired, QR.
+    // Order matches Swift `handleSessionExpiredNotice`: cancel, stop transport, mark_expired, QR.
     // Unlike `logOut`, session expiry does not reset `ZaloDomains`.
     out.effects.push(Effect::CancelSessionTasks);
+    transport::stop_transport(state, true, out);
     out.effects.push(Effect::MarkCoreSessionExpired);
     out.effects.push(Effect::Host(HostCall::MarkExpired));
     out.effects.push(Effect::RequestQr {
-        qr_gen: state.qr_gen,
+        qr_gen: state.session.qr_gen,
         language: DEFAULT_QR_LANGUAGE.to_owned(),
     });
 }
@@ -432,7 +448,7 @@ mod tests {
     use super::*;
     use crate::input::CompletedLogin;
     use crate::reduce::reduce;
-    use crate::state::{CoreFailKind, CoreState, FailReason};
+    use crate::state::{CoreFailKind, CoreState, FailReason, PersistedTransportState};
 
     fn sample_account(uid: &str) -> LoginAccount {
         LoginAccount {
@@ -527,6 +543,7 @@ mod tests {
             &mut state,
             Input::PrepareStoreDone {
                 token: StoreToken::Boot(1),
+                transport_state: PersistedTransportState::default(),
             },
         );
         assert_eq!(state.session.phase, Phase::Ready);
@@ -654,6 +671,7 @@ mod tests {
             &mut state,
             Input::PrepareStoreDone {
                 token: StoreToken::Qr(1),
+                transport_state: PersistedTransportState::default(),
             },
         );
         assert_eq!(state.session.phase, Phase::Ready);
@@ -669,8 +687,12 @@ mod tests {
             out.effects.as_slice(),
             [
                 Effect::SetPref { .. },
-                Effect::Host(HostCall::StartWs { .. }),
-                Effect::Host(HostCall::StartLongPoll),
+                Effect::StartWs { ws_gen: 1, .. },
+                Effect::StartLpTimer {
+                    lp_gen: 1,
+                    initial: true,
+                    ..
+                },
                 Effect::Host(HostCall::StartBootstrap),
                 Effect::Host(HostCall::OfferFirstLoginTransfer { force: true }),
             ]
@@ -686,6 +708,10 @@ mod tests {
             out.effects.as_slice(),
             [
                 Effect::CancelSessionTasks,
+                Effect::StopWs {
+                    reset_cursors: true
+                },
+                Effect::StopLongPoll,
                 Effect::ClearCoreSession,
                 Effect::Host(HostCall::ClearSession),
                 Effect::Host(HostCall::ResetDomains),
@@ -704,6 +730,10 @@ mod tests {
             out.effects.as_slice(),
             [
                 Effect::CancelSessionTasks,
+                Effect::StopWs {
+                    reset_cursors: true
+                },
+                Effect::StopLongPoll,
                 Effect::MarkCoreSessionExpired,
                 Effect::Host(HostCall::MarkExpired),
                 Effect::RequestQr { qr_gen: 2, .. }

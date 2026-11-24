@@ -1,6 +1,6 @@
 # Olaz Rust port map
 
-Goal: move Olaz's protocol engine to a Rust core called from the existing SwiftUI app (macOS only), for speed and a smoother main thread. Decisions: [DECISIONS.md](DECISIONS.md) (ADR-001..017). Terms: [GLOSSARY.md](GLOSSARY.md).
+Goal: move Olaz's protocol engine to a Rust core called from the existing SwiftUI app (macOS only), for speed and a smoother main thread. Decisions: [DECISIONS.md](DECISIONS.md) (ADR-001..018). Terms: [GLOSSARY.md](GLOSSARY.md).
 
 Workflow per unit: claim here, port into its own crate, port Swift fixtures as Rust tests, `cargo fmt --check && cargo clippy -p <crate> -- -D warnings && cargo test -p <crate>` green, mark done with test counts.
 
@@ -52,6 +52,7 @@ Live check 2026-11-23 (release build 9c47e82, merged 5a+5b): clean engine.log, n
 | Unit | Scope | State |
 |---|---|---|
 | U1b | `olaz-core` skeleton (single tokio actor, pure `reduce(&mut CoreState, Input) -> (Vec<Effect>, DirtyKeys)`, `ChangeStream`, serial `CoreHost` runner, Case format v1 replay runner `tests/cases.rs`) + session domain (`boot`, QR login, logout, expiry, profile) cutover in `ZaloEngine` + `ZaloEngine+Core.swift` | done 2026-11-24 (olaz-core: 13 unit + 20 scenario + 20/20 recorded `cases/session.jsonl`; olaz-ffi: 45 passed; `gate-core.sh session` 6/6 pass incl. `OLAZ_SLOW_CASES=1 SessionRecorderTests`; release `next_changes()` delivery min=33.4 us, p50=41.9 us, p95=78.5 us, max=730.8 us; see ADR-016) |
+| U2 | Transport domain in `olaz-core`: WS lifecycle (`WsDriver` + `watch_authed`), serialized HTTP long-poll (`4 s` ticks + `drain_chat_polling`), WS frame & control classification (`classify`), cursors & `poll_state` ownership, `CoreHost` transport callbacks, `ZaloEngine` / `ZaloWebSocket` cutover | done 2026-11-25 (olaz-core: 29 unit + 20 session + 29 transport scenario + 20/20 `cases/session.jsonl` + 26/26 `cases/transport.jsonl`; olaz-ffi: 50 passed; `gate-core.sh transport` & `session` 6/6 pass; release MainActor WS frame CPU `typed_chat_501` 81.12→72.43 µs (−10.7%), `control_mix_601` 83.03→46.06 µs (−44.5%), `protocol_noop_cmd1` 53.37→0.20 µs (−99.6%); see ADR-018) |
 
 ## Later waves (out of milestone 1)
 
