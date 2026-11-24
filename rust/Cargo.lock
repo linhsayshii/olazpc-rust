@@ -1487,6 +1487,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "olaz-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "olaz-crypto",
+ "olaz-json",
+ "olaz-net",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "olaz-crypto"
 version = "0.1.0"
 dependencies = [
@@ -1508,7 +1524,9 @@ dependencies = [
 name = "olaz-ffi"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "olaz-api",
+ "olaz-core",
  "olaz-crypto",
  "olaz-json",
  "olaz-media",

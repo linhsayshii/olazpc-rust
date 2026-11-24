@@ -496,6 +496,12 @@ impl<T: Transport> SessionClient<T> {
 
     /// Swift `completeLogin` minus `saveSession` (caller persists [`Self::snapshot`]).
     pub async fn complete_login(&self) -> Result<LoginAccount, NetError> {
+        self.complete_login_detailed().await.map(|(a, _)| a)
+    }
+
+    /// Like [`Self::complete_login`], also reporting whether the internal `sync_profile_me` call
+    /// succeeded and updated the account.
+    pub async fn complete_login_detailed(&self) -> Result<(LoginAccount, bool), NetError> {
         let info = self.get_login_info(ZPW_TYPE).await?;
         if let Some(cfg) = info.get("data").and_then(Value::as_object) {
             self.lock().apply_login_config(cfg);
@@ -514,13 +520,13 @@ impl<T: Transport> SessionClient<T> {
                 "login: complete"
             );
         }
-        let _ = self.sync_profile_me().await;
+        let profile_synced = self.sync_profile_me().await.is_some();
         let mut s = self.lock();
         let account = s.account.clone();
         match account {
             Some(a) if !a.user_id.is_empty() && is_valid_zpw_sek(s.zpw_sek.as_deref()) => {
                 s.expired_at = None;
-                Ok(a)
+                Ok((a, profile_synced))
             }
             _ => Err(NetError::NotAuthenticated),
         }
@@ -570,10 +576,16 @@ impl<T: Transport> SessionClient<T> {
 
     /// Swift `sessionStatus`: `getLoginInfo` first, then a `me-v2` probe.
     pub async fn session_status(&self) -> SessionStatus {
+        self.session_status_detailed().await.0
+    }
+
+    /// Like [`Self::session_status`], also reporting whether `getLoginInfo` returned a `data`
+    /// object and updated the session (the case in which Swift persists the snapshot).
+    pub async fn session_status_detailed(&self) -> (SessionStatus, bool) {
         {
             let s = self.lock();
             if s.account.is_none() || s.zpw_sek.is_none() || s.secret_key.is_none() {
-                return SessionStatus::Expired;
+                return (SessionStatus::Expired, false);
             }
         }
         match self.get_login_info(ZPW_TYPE).await {
@@ -582,7 +594,7 @@ impl<T: Transport> SessionClient<T> {
                     let mut s = self.lock();
                     s.apply_login_config(cfg);
                     s.needs_pc_type_upgrade = false;
-                    return SessionStatus::Valid;
+                    return (SessionStatus::Valid, true);
                 }
             }
             Err(NetError::Session(err)) => {
@@ -591,16 +603,16 @@ impl<T: Transport> SessionClient<T> {
                         code = err.code,
                         "session: getLoginInfo rejected, need QR login"
                     );
-                    return SessionStatus::Expired;
+                    return (SessionStatus::Expired, false);
                 }
             }
             Err(_) => {
                 if self.lock().needs_pc_type_upgrade {
-                    return SessionStatus::Unreachable;
+                    return (SessionStatus::Unreachable, false);
                 }
             }
         }
-        match self.get(&self.me_request()).await {
+        let status = match self.get(&self.me_request()).await {
             Ok(resp) => match int64(resp.get("error_code")) {
                 None => SessionStatus::Unreachable,
                 Some(0) => SessionStatus::Valid,
@@ -611,6 +623,7 @@ impl<T: Transport> SessionClient<T> {
             },
             Err(NetError::Session(err)) if err.is_auth_error() => SessionStatus::Expired,
             Err(_) => SessionStatus::Unreachable,
-        }
+        };
+        (status, false)
     }
 }
