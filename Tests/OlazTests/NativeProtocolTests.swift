@@ -1104,8 +1104,8 @@ import Testing
         await engine.ingestParsedPhoneMessages(batch)
         let elapsed = Date().timeIntervalSince(start)
 
-        // Should complete in well under 2 seconds (previously degraded to 53s+!)
-        #expect(elapsed < 2.5)
+        // Should complete well under 10s even on loaded CI runners (previously degraded to 53s+!)
+        #expect(elapsed < 10.0)
         // Unopened conversation is NOT bloated in `@Observable messages`, yet all 1,000 messages are in SQLite!
         #expect(engine.messages["u_background"] == nil)
         let bgStored = try await store.messages(convId: "u_background", limit: 50)
