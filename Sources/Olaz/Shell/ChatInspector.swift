@@ -18,6 +18,12 @@ struct ChatInspector: View {
     @State private var showRenameGroup = false
     @State private var showAddMembers = false
     @State private var memberToKick: MentionCandidate?
+    /// Owner / deputies of the group (from its detail), read with the members.
+    @State private var roles = GroupRoles()
+    @State private var newOwner: MentionCandidate?
+    @State private var memberToBlock: MentionCandidate?
+    @State private var showGroupLink = false
+    @State private var showApproval = false
     @State private var confirmLeaveGroup = false
     @State private var leavingGroup = false
     @State private var confirmBlock = false
@@ -67,6 +73,36 @@ struct ChatInspector: View {
             ) {
                 Task { await loadMembers() }
             }
+        }
+        .sheet(isPresented: $showGroupLink) { GroupLinkSheet(groupId: id, canManage: myRoleCanManage) }
+        .sheet(isPresented: $showApproval) {
+            GroupApprovalSheet(groupId: id, approvalOn: roles.joinApproval) { Task { await loadMembers() } }
+        }
+        .alert(
+            "Xác nhận chọn trưởng nhóm mới",
+            isPresented: Binding(get: { newOwner != nil }, set: { if !$0 { newOwner = nil } }),
+            presenting: newOwner
+        ) { member in
+            Button("Chuyển quyền") {
+                newOwner = nil
+                Task { if await engine.changeGroupOwner(id, uid: member.id) { await loadMembers() } }
+            }
+            Button("Hủy", role: .cancel) { newOwner = nil }
+        } message: { member in
+            Text("\(member.name) sẽ trở thành trưởng nhóm. Bạn sẽ trở thành thành viên bình thường.")
+        }
+        .alert(
+            "Chặn khỏi nhóm",
+            isPresented: Binding(get: { memberToBlock != nil }, set: { if !$0 { memberToBlock = nil } }),
+            presenting: memberToBlock
+        ) { member in
+            Button("Chặn", role: .destructive) {
+                memberToBlock = nil
+                Task { if await engine.blockGroupMember(id, uid: member.id) { await loadMembers() } }
+            }
+            Button("Hủy", role: .cancel) { memberToBlock = nil }
+        } message: { member in
+            Text("\(member.name) sẽ bị xóa và không thể tham gia lại nhóm này.")
         }
         .alert(
             "Xóa thành viên?",
@@ -260,6 +296,13 @@ struct ChatInspector: View {
                 row(symbol: "pencil", title: "Đổi tên nhóm") { showRenameGroup = true }
                 Divider().padding(.leading, 40)
                 row(symbol: "person.badge.plus", title: "Thêm thành viên") { showAddMembers = true }
+                Divider().padding(.leading, 40)
+                row(symbol: "link", title: "Link tham gia nhóm") { showGroupLink = true }
+                if myRoleCanManage {
+                    Divider().padding(.leading, 40)
+                    row(symbol: "person.crop.circle.badge.checkmark", title: "Phê duyệt thành viên mới",
+                        subtitle: roles.joinApproval ? "Đang bật" : "Đang tắt") { showApproval = true }
+                }
             }
         }
     }
@@ -367,7 +410,6 @@ struct ChatInspector: View {
 
     @ViewBuilder
     private var membersSection: some View {
-        let myUid = ZaloWireParser.stripUserPrefix(engine.profile?.userId ?? "")
         if let members, !members.isEmpty {
             let shown = showAllMembers ? members : Array(members.prefix(memberLimit))
             let toggleAction: (() -> Void)? = members.count > memberLimit ? { showAllMembers.toggle() } : nil
@@ -385,7 +427,12 @@ struct ChatInspector: View {
                             Button { engine.openContactConversation(member.id) } label: {
                                 HStack(spacing: 10) {
                                     RemoteAvatar(url: member.avatar, name: member.name, size: 26)
-                                    Text(member.name).font(.system(size: 13)).lineLimit(1)
+                                    VStack(alignment: .leading, spacing: 0) {
+                                        Text(member.name).font(.system(size: 13)).lineLimit(1)
+                                        if let role = roleLabel(member.id) {
+                                            Text(role).font(.system(size: 11)).foregroundStyle(.secondary)
+                                        }
+                                    }
                                     Spacer(minLength: 0)
                                 }
                                 .contentShape(Rectangle())
@@ -399,6 +446,7 @@ struct ChatInspector: View {
                                         engine.openContactConversation(member.id)
                                     }
                                     Divider()
+                                    adminItems(member)
                                     Button("Xóa khỏi nhóm", systemImage: "person.badge.minus", role: .destructive) {
                                         memberToKick = member
                                     }
@@ -424,6 +472,7 @@ struct ChatInspector: View {
                             }
                             if canKick {
                                 Divider()
+                                adminItems(member)
                                 Button("Xóa khỏi nhóm", systemImage: "person.badge.minus", role: .destructive) {
                                     memberToKick = member
                                 }
@@ -449,6 +498,35 @@ struct ChatInspector: View {
         let found = await engine.loadGroupMembers(in: id)
         guard !Task.isCancelled else { return }
         members = found.filter { !$0.isAll && $0.id != "-1" }
+        roles = engine.groupRoles(id)
+    }
+
+    private var myUid: String { ZaloWireParser.stripUserPrefix(engine.profile?.userId ?? "") }
+    private var myRoleCanManage: Bool { roles.canManage(myUid) }
+
+    private func roleLabel(_ uid: String) -> String? {
+        roles.isOwner(uid) ? "Trưởng nhóm" : roles.isAdmin(uid) ? "Phó nhóm" : nil
+    }
+
+    /// Official member menu: the owner adjusts deputies and hands the group over; owner / deputies block members.
+    @ViewBuilder
+    private func adminItems(_ member: MentionCandidate) -> some View {
+        let iAmOwner = roles.isOwner(myUid)
+        if iAmOwner {
+            if roles.isAdmin(member.id) {
+                Button("Xóa phó nhóm", systemImage: "person.badge.minus") {
+                    Task { if await engine.setGroupAdmin(id, uid: member.id, admin: false) { await loadMembers() } }
+                }
+            } else {
+                Button("Thêm phó nhóm", systemImage: "person.badge.shield.checkmark") {
+                    Task { if await engine.setGroupAdmin(id, uid: member.id, admin: true) { await loadMembers() } }
+                }
+            }
+            Button("Chuyển quyền trưởng nhóm", systemImage: "crown") { newOwner = member }
+        }
+        if myRoleCanManage, !roles.isOwner(member.id), iAmOwner || !roles.isAdmin(member.id) {
+            Button("Chặn khỏi nhóm", systemImage: "hand.raised", role: .destructive) { memberToBlock = member }
+        }
     }
 
     // MARK: Shared content
