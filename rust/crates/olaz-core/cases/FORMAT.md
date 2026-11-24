@@ -67,7 +67,7 @@ Run in order:
   - `resolve_missing_names`: `{}` — awaits `resolveMissingConversationNames()`.
   - `refresh_mention_previews`: `{}` — awaits `refreshMentionPreviews()`.
   - `update_contacts`: same fields as `seed.contacts` — updates in-memory `contacts` / `cachedAliases` mid-scenario before `ensure_known_contacts`.
-  - `open_conversation`: `{"id": <str|null>}` — sets `openConversationId`.
+  - `open_conversation`: `{"id": <str|null>, "load": <bool, optional>}` — sets `openConversationId`; when `"load": true`, calls `openConversation(id)` and awaits its history/preview update.
 - Conversation action `cmd` steps (`conversation_actions` domain):
   - Optional step-level deterministic inputs on `cmd` steps: `"now_ms": <int64>` and `"rand4": "<string>"` seed wall-clock milliseconds (`nowMs`) and 4-char random tags (`randomTag4`) for the duration of that single step.
   - `pin`: `{"id": "<convId>"}` — calls `pinConversation(id)` and awaits its completion (`toast` seq advance or `prompt == .pinBoard`).

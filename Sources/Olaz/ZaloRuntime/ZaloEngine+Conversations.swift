@@ -217,7 +217,7 @@ extension ZaloEngine {
             ["id": l.id, "name": l.name, "color": l.colorHex, "convIds": l.convIds]
         }
         if let store = sqliteStore,
-           let data = try? JSONSerialization.data(withJSONObject: serializedLocal) {
+           let data = try? JSONSerialization.data(withJSONObject: serializedLocal, options: [.sortedKeys]) {
             try? await store.setPreferenceData(key: "labels", data: data)
         }
         // Sync to Zalo server (`/api/convlabel/update`) so labels stay consistent across devices.
@@ -230,7 +230,7 @@ extension ZaloEngine {
                 "offset": idx
             ]
         }
-        if let serverBytes = try? JSONSerialization.data(withJSONObject: serverArray),
+        if let serverBytes = try? JSONSerialization.data(withJSONObject: serverArray, options: [.sortedKeys]),
            let serverJSON = String(data: serverBytes, encoding: .utf8) {
             try? await sessionClient.updateConversationLabels(labelDataJSON: serverJSON)
         }
@@ -286,7 +286,7 @@ extension ZaloEngine {
             let serialized: [[String: Any]] = parsedLabels.map { l in
                 ["id": l.id, "name": l.name, "color": l.colorHex, "convIds": l.convIds]
             }
-            if let data = try? JSONSerialization.data(withJSONObject: serialized) {
+            if let data = try? JSONSerialization.data(withJSONObject: serialized, options: [.sortedKeys]) {
                 try? await store.setPreferenceData(key: "labels", data: data)
             }
         }

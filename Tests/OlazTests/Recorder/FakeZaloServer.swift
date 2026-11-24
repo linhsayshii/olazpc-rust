@@ -232,6 +232,22 @@ final class FakeZaloServer: @unchecked Sendable {
         }
     }
 
+    func httpRequestCount(path: String) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedRequests.filter {
+            $0["kind"]?.stringValue == "http" && $0["path"]?.stringValue == path
+        }.count
+    }
+
+    func waitForHTTPRequests(path: String, atLeast: Int, timeoutMs: Int = 2000) async {
+        _ = await waitUntil(timeoutMs: timeoutMs) {
+            recordedRequests.filter {
+                $0["kind"]?.stringValue == "http" && $0["path"]?.stringValue == path
+            }.count >= atLeast
+        }
+    }
+
     private enum WSPushTarget {
         case ready(index: Int, entry: ScriptEntry, connection: NWConnection)
         case droppedAfterLogout(index: Int)
@@ -1088,7 +1104,10 @@ final class FakeZaloServer: @unchecked Sendable {
         lock.lock()
         recordedRequests.append(req)
         if unscripted { hasUnscripted = true }
+        let pendingWaiters = waiters
+        waiters.removeAll()
         lock.unlock()
+        for w in pendingWaiters { w() }
     }
 
     private func sendHTTP(connection: NWConnection, status: Int, headers: [String: String], body: Data) {
