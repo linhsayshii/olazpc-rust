@@ -25,6 +25,7 @@ extension ZaloEngine {
         hostTrace = nil
         stateTrace = nil
         EngineLog.shared.onAppend = nil
+        stopCoreEngine()
         bootTask?.cancel()
         qrTask?.cancel()
         wsTask?.cancel()

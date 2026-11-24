@@ -425,12 +425,13 @@ actor ZaloSessionClient {
 
     /// Persists a `CoreSession` snapshot to `native-session.json` (sealing credentials with the
     /// local vault key when `useKeychain` is true) and refreshes transitional Swift mirror fields.
-    func saveSessionFromCore(snapshotJSON: String) {
+    func saveSessionFromCore(snapshotJSON: String, writeDisk: Bool = true) {
         guard let raw = snapshotJSON.data(using: .utf8),
               let decoded = try? JSONDecoder().decode(StoredNativeSession.self, from: raw) else {
             return
         }
         applyMirror(from: decoded)
+        guard writeDisk else { return }
         do {
             try FileManager.default.createDirectory(at: dataDirectory, withIntermediateDirectories: true)
             var sealedB64: String?
@@ -459,13 +460,13 @@ actor ZaloSessionClient {
     }
 
     /// Persists an expired `CoreSession` snapshot (with `expiredAt` already set by Rust).
-    func markExpiredFromCore(snapshotJSON: String) {
-        saveSessionFromCore(snapshotJSON: snapshotJSON)
+    func markExpiredFromCore(snapshotJSON: String, persist: Bool = true) {
+        saveSessionFromCore(snapshotJSON: snapshotJSON, writeDisk: persist)
     }
 
     /// Removes persisted session files and cookies and clears transitional Swift mirror fields.
     /// Does not touch `coreSession` (already cleared by `olaz-core`).
-    func clearSessionStorage() {
+    func clearSessionStorage(clearDisk: Bool = true, resetDomains: Bool = true) {
         corePushedSnapshot = ""
         // U17: remove when ZaloAPIService is gone
         account = nil
@@ -476,11 +477,20 @@ actor ZaloSessionClient {
         cloudEnk = nil
         globalIdToUidCache.removeAll()
         uidToGlobalIdCache.removeAll()
-        domains = ZaloDomains()
-        try? FileManager.default.removeItem(at: sessionFileURL)
-        for cookie in HTTPCookieStorage.shared.cookies ?? [] where cookie.name == "zpw_sek" {
-            HTTPCookieStorage.shared.deleteCookie(cookie)
+        if resetDomains {
+            domains = ZaloDomains()
         }
+        if clearDisk {
+            try? FileManager.default.removeItem(at: sessionFileURL)
+            for cookie in HTTPCookieStorage.shared.cookies ?? [] where cookie.name == "zpw_sek" {
+                HTTPCookieStorage.shared.deleteCookie(cookie)
+            }
+        }
+    }
+
+    /// Resets the transitional Swift `domains` mirror to default live endpoints.
+    func resetDomainsToDefault() {
+        domains = ZaloDomains()
     }
 
     /// Refreshes transitional Swift mirror fields from the shared `CoreSession` snapshot so

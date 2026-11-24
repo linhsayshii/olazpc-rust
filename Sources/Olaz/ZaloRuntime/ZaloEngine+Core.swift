@@ -51,6 +51,35 @@ enum PendingCoreCommand {
     case sessionExpired(String)
 }
 
+/// One-shot `@MainActor` gate backing `bootTask` / `qrTask` / `pendingCleanupTask` so recorder
+/// tests awaiting lifecycle completion synchronize with the Rust actor cleanly.
+@MainActor
+internal final class CorePhaseGate {
+    private var completed = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func finish() {
+        guard !completed else { return }
+        completed = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending {
+            waiter.resume()
+        }
+    }
+
+    func wait() async {
+        guard !completed else { return }
+        await withCheckedContinuation { continuation in
+            if completed {
+                continuation.resume()
+                return
+            }
+            waiters.append(continuation)
+        }
+    }
+}
+
 /// Bridges `olaz-core` host effects onto `ZaloEngine` and `ZaloSessionClient` (ADR-016).
 ///
 /// Every method is called serially in emitted order by `olaz-core`'s host worker; never invoked
@@ -74,8 +103,7 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
 
     func setPref(key: String, value: String) async {
         guard let engine else { return }
-        let store = await MainActor.run { engine.sqliteStore }
-        try? await store?.setPreferenceString(key: key, value: value)
+        await engine.setSessionPreference(key: key, value: value)
     }
 
     func prepareStore(userId: String, account: LoginAccountRecord) async {
@@ -108,31 +136,63 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         await MainActor.run {
             engine.startBootstrapRefresh()
         }
+        await engine.waitForCoreMirrorDrain()
+        await MainActor.run {
+            engine.noteCoreBootCompleted()
+        }
     }
 
     func offerFirstLoginTransfer(force: Bool) async {
         guard let engine else { return }
         await engine.offerFirstLoginTransferIfNeeded(forceOffer: force)
+        await engine.waitForCoreMirrorDrain()
+        await MainActor.run {
+            engine.noteCoreQRCompleted()
+        }
     }
 
     func resetDomains() async {
         guard let engine else { return }
-        await engine.hostResetDomains()
+        let allowReset = await MainActor.run {
+            engine.traceHost("reset_domains")
+        }
+        if allowReset {
+            await engine.sessionClient.resetDomainsToDefault()
+        }
+        await engine.waitForCoreMirrorDrain()
+        await MainActor.run {
+            engine.noteCoreCleanupCompleted()
+        }
     }
 
     func persistSession(snapshotJson: String) async {
         guard let engine else { return }
-        await engine.sessionClient.saveSessionFromCore(snapshotJSON: snapshotJson)
+        let allowPersist = await MainActor.run {
+            engine.traceHost("persist_session")
+        }
+        await engine.sessionClient.saveSessionFromCore(snapshotJSON: snapshotJson, writeDisk: allowPersist)
     }
 
     func clearSession() async {
         guard let engine else { return }
-        await engine.sessionClient.clearSessionStorage()
+        let allowClear = await MainActor.run {
+            engine.traceHost("clear_session")
+        }
+        await engine.hostResetDomains()
+        await engine.sessionClient.clearSessionStorage(clearDisk: allowClear, resetDomains: false)
     }
 
     func markExpired(snapshotJson: String) async {
         guard let engine else { return }
-        await engine.sessionClient.markExpiredFromCore(snapshotJSON: snapshotJson)
+        let allowMarkExpired = await MainActor.run {
+            engine.traceHost("mark_expired")
+        }
+        await engine.hostResetDomains()
+        await engine.sessionClient.markExpiredFromCore(snapshotJSON: snapshotJson, persist: allowMarkExpired)
+        await engine.waitForCoreMirrorDrain()
+        await MainActor.run {
+            engine.noteCoreCleanupCompleted()
+        }
     }
 }
 
@@ -199,6 +259,7 @@ extension ZaloEngine {
                     }
                 }
                 self?.failAllMirrorWaiters()
+                self?.finishAllCorePhaseGates()
             }
 
             guard self.coreLifecycle.install(core: core, changeTask: changeTask) else {
@@ -223,6 +284,7 @@ extension ZaloEngine {
 
     /// Sends a command to `CoreEngine`, preserving FIFO order if `CoreEngine` is still initializing.
     internal func dispatchCoreCommand(_ command: PendingCoreCommand) {
+        armCorePhaseGates(for: command)
         if let core = coreLifecycle.core, pendingCoreCommands.isEmpty {
             Self.sendCommand(command, to: core)
             return
@@ -231,6 +293,63 @@ extension ZaloEngine {
         Task { @MainActor [weak self] in
             _ = await self?.ensureCoreEngine()
         }
+    }
+
+    private func armCorePhaseGates(for command: PendingCoreCommand) {
+        switch command {
+        case .start:
+            let gate = CorePhaseGate()
+            bootPhaseGate = gate
+            bootTask = Task { @MainActor in
+                await gate.wait()
+            }
+        case .refreshQr:
+            qrPhaseGate?.finish()
+            let gate = CorePhaseGate()
+            qrPhaseGate = gate
+            qrTask = Task { @MainActor in
+                await gate.wait()
+            }
+        case .logOut, .sessionExpired:
+            bootPhaseGate?.finish()
+            bootPhaseGate = nil
+            cleanupPhaseGate?.finish()
+            let cleanupGate = CorePhaseGate()
+            cleanupPhaseGate = cleanupGate
+            pendingCleanupTask = Task { @MainActor in
+                await cleanupGate.wait()
+            }
+            qrPhaseGate?.finish()
+            let qrGate = CorePhaseGate()
+            qrPhaseGate = qrGate
+            qrTask = Task { @MainActor in
+                await qrGate.wait()
+            }
+        }
+    }
+
+    internal func noteCoreBootCompleted() {
+        bootPhaseGate?.finish()
+        bootPhaseGate = nil
+    }
+
+    internal func noteCoreQRCompleted() {
+        qrPhaseGate?.finish()
+        qrPhaseGate = nil
+    }
+
+    internal func noteCoreCleanupCompleted() {
+        cleanupPhaseGate?.finish()
+        cleanupPhaseGate = nil
+    }
+
+    internal func finishAllCorePhaseGates() {
+        bootPhaseGate?.finish()
+        bootPhaseGate = nil
+        qrPhaseGate?.finish()
+        qrPhaseGate = nil
+        cleanupPhaseGate?.finish()
+        cleanupPhaseGate = nil
     }
 
     /// Applies an account profile update through `olaz-core` and suspends until the resulting
@@ -247,6 +366,7 @@ extension ZaloEngine {
     internal func stopCoreEngine() {
         coreLifecycle.shutdown()
         failAllMirrorWaiters()
+        finishAllCorePhaseGates()
     }
 
     internal func hostNotePrepareStoreStarted() {
@@ -268,6 +388,12 @@ extension ZaloEngine {
 
     internal func applyCoreChanges(_ batch: CoreChangesRecord) {
         if let session = batch.session {
+            let qrPayload: String?
+            if case .login(let login) = session.phase {
+                qrPayload = login.qrPayload
+            } else {
+                qrPayload = nil
+            }
             let mappedPhase = mapPhase(session.phase)
             let mappedProfile = session.profile.map { rec in
                 Profile(
@@ -282,8 +408,29 @@ extension ZaloEngine {
                 profile: mappedProfile,
                 signOutNotice: session.signOutNotice,
                 selfConversationId: session.selfConversationId,
-                clientVersion: "694 (Native)"
+                clientVersion: "694 (Native)",
+                qrPayload: qrPayload
             )
+
+            // Update lifecycle gates when boot hands off to QR or QR reaches a terminal failure/expiry.
+            if case .login(let login) = mappedPhase {
+                if bootPhaseGate != nil {
+                    noteCoreBootCompleted()
+                    if qrPhaseGate == nil {
+                        let qrGate = CorePhaseGate()
+                        qrPhaseGate = qrGate
+                        qrTask = Task { @MainActor in
+                            await qrGate.wait()
+                        }
+                    }
+                }
+                switch login.step {
+                case .expired, .failed:
+                    noteCoreQRCompleted()
+                case .generating, .waitingScan, .waitingConfirm:
+                    break
+                }
+            }
         }
 
         if batch.version > appliedMirrorVersion {
@@ -363,6 +510,11 @@ extension ZaloEngine {
                 return RustCore.mapError(CoreError.Crypto(message: message)).localizedDescription
             }
         }
+    }
+
+    internal func waitForCoreMirrorDrain() async {
+        guard let target = coreLifecycle.core?.currentVersion() else { return }
+        await waitForMirrorVersion(target)
     }
 
     private func waitForMirrorVersion(_ target: UInt64) async {
