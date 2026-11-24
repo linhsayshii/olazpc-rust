@@ -220,6 +220,7 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
 
     func setPref(key: String, value: String) async {
         guard let engine else { return }
+        await engine.waitForCoreMirrorDrain()
         await engine.setSessionPreference(key: key, value: value)
     }
 
