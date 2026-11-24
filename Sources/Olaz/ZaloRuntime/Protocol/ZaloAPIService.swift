@@ -2260,7 +2260,8 @@ extension ZaloSessionClient {
             return
         }
         let grid = ZaloWireParser.cleanGroupId(convId)
-        let topicPayload: [String: Any] = rawTopic?.dict ?? ["id": topicId, "type": 2]
+        // Official `unpinBoardItem`: `topic` is {topicId, topicType} (the raw board row gets code 114).
+        let topicPayload: [String: Any] = ZaloWireParser.friendBoardUnpinTopics(ref: topicId, rawTopic: rawTopic?.dict)[0]
         _ = try await get(
             service: "group_board",
             path: "/api/board/unpinv2",

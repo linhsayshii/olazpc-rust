@@ -102,7 +102,7 @@ extension ZaloWireParser {
     }
 
     /// The board list (`fetchBoardPins` box: {items, boardVersion, pinLimit}) as the pinned bar's list, newest first,
-    /// plus the raw topics by id (sent back verbatim by `unpinv2`).
+    /// plus the raw topics by id (their type goes into `unpinv2` / `multi_unpin`).
     static func parseBoardTopics(
         _ box: [String: Any],
         convId: String,
