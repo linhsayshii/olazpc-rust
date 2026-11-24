@@ -18,7 +18,7 @@ Olaz is a SwiftUI app on top of a protocol engine that is being moved into a Rus
 Olaz là ứng dụng Zalo không chính thức, viết native cho macOS (giao diện SwiftUI, lõi giao thức bằng Rust qua UniFFI, một số module JS chạy trong JavaScriptCore). Dự án nghiên cứu khả năng tương tác, không liên kết với VNG; dùng với tài khoản của bạn và tự chịu rủi ro.
 
 - Yêu cầu macOS 26 (Tahoe) trở lên. Bản phát hành là universal (Apple Silicon và Intel).
-- Cài đặt: tải file DMG mới nhất ở [Releases](https://github.com/linhsayshii/olazpc-rust/releases/latest), kéo Olaz vào Applications. Với bản "unsigned", lần mở đầu hãy bấm chuột phải rồi chọn Open, hoặc chạy `xattr -dr com.apple.quarantine /Applications/Olaz.app`.
+- Cài đặt: tải file DMG mới nhất ở [Releases](https://github.com/linhsayshii/olazpc-rust/releases/latest), kéo Olaz vào Applications. Bản phát hành được ký bằng chứng chỉ cố định của Olaz (giữ quyền Keychain, micro, camera qua các lần cập nhật) nhưng chưa notarize, nên lần mở đầu hãy bấm chuột phải rồi chọn Open, hoặc chạy `xattr -dr com.apple.quarantine /Applications/Olaz.app`.
 - Zalo chỉ cho một phiên PC trên mỗi tài khoản: hãy tắt Zalo PC chính thức khi dùng Olaz.
 - Giấy phép GPL-3.0. Mã gốc và phần nghiên cứu giao thức do Quan Nguyen ([zalo-swift-re](https://github.com/qnguyen3/zalo-swift-re)); xem mục Credits.
 
@@ -40,7 +40,7 @@ Olaz là ứng dụng Zalo không chính thức, viết native cho macOS (giao d
 
 1. Download the latest DMG from [GitHub Releases](https://github.com/linhsayshii/olazpc-rust/releases/latest).
 2. Open it and drag **Olaz** to **Applications**.
-3. If the release is marked "unsigned" (built without a Developer ID), macOS blocks the first launch. Right-click Olaz, choose **Open**, then confirm; or run:
+3. Releases are signed with Olaz's own fixed certificate ("Olaz Release Signing"), so Keychain access and permissions carry over between updates, but they are not notarized by Apple. macOS blocks the first launch: right-click Olaz, choose **Open**, then confirm; or run once:
 
    ```bash
    xattr -dr com.apple.quarantine /Applications/Olaz.app
@@ -92,7 +92,7 @@ Engine diagnostics: `~/Library/Application Support/Olaz/logs/engine.log` (event 
   git tag v1.2.0 && git push origin v1.2.0
   ```
 
-  If the signing secrets are configured it signs with Developer ID and notarizes; otherwise it publishes an ad-hoc signed "unsigned" build.
+  Signing depends on the secrets: Developer ID + notarization, the fixed self-signed "Olaz Release Signing" certificate (current), or ad-hoc.
 
 Secrets, setup and troubleshooting: [docs/RELEASING.md](docs/RELEASING.md).
 

@@ -76,7 +76,12 @@ PLIST
 # Sign with the JIT entitlement so JavaScriptCore can JIT the JS modules.
 # OLAZ_SIGN_IDENTITY="Developer ID Application: ..." (set by scripts/release.sh) signs for distribution:
 # hardened runtime + secure timestamp are what notarization requires. Unset = ad-hoc dev build.
-if [[ -n "${OLAZ_SIGN_IDENTITY:-}" ]]; then
+# OLAZ_SIGN_NOTARIZABLE=0 signs with a fixed identity (the self-signed "Olaz Release Signing" cert) without the
+# notarization extras: same runtime behavior as the ad-hoc build, but a stable designated requirement, so Keychain
+# items and privacy permissions survive updates.
+if [[ -n "${OLAZ_SIGN_IDENTITY:-}" && "${OLAZ_SIGN_NOTARIZABLE:-1}" == 0 ]]; then
+    codesign --force --sign "$OLAZ_SIGN_IDENTITY" --entitlements scripts/Olaz.entitlements "$APP"
+elif [[ -n "${OLAZ_SIGN_IDENTITY:-}" ]]; then
     codesign --force --timestamp --options runtime --sign "$OLAZ_SIGN_IDENTITY" \
         --entitlements scripts/Olaz.entitlements "$APP"
 else

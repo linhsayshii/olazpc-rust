@@ -47,10 +47,14 @@ jobs:
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
           echo "OLAZ_VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "OLAZ_BUILD=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
+          # notarized: Developer ID cert + App Store Connect API key. fixed: a cert only (the self-signed
+          # "Olaz Release Signing" one), stable signature but not notarized. adhoc: no secrets.
           if [[ -n "$MACOS_CERT_P12_BASE64" && -n "$APPLE_API_KEY_P8_BASE64" ]]; then
-            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "mode=notarized" >> "$GITHUB_OUTPUT"
+          elif [[ -n "$MACOS_CERT_P12_BASE64" ]]; then
+            echo "mode=fixed" >> "$GITHUB_OUTPUT"
           else
-            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "mode=adhoc" >> "$GITHUB_OUTPUT"
             echo "::warning::Signing secrets not set: publishing an ad-hoc signed, non-notarized build."
           fi
 
@@ -64,8 +68,8 @@ jobs:
           key: cargo-release-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
           restore-keys: cargo-release-${{ runner.os }}-
 
-      - name: Import Developer ID certificate and notary key
-        if: steps.version.outputs.signed == 'true'
+      - name: Import signing certificate
+        if: steps.version.outputs.mode != 'adhoc'
         run: |
           KC="$RUNNER_TEMP/olaz-signing.keychain-db"
           KC_PASS="$(uuidgen)"
@@ -78,7 +82,16 @@ jobs:
           mapfile -t EXISTING < <(security list-keychains -d user | sed -e 's/^[[:space:]]*"//' -e 's/"$//')
           security list-keychains -d user -s "$KC" "${EXISTING[@]}"
           rm -f "$RUNNER_TEMP/cert.p12"
+          # Sign by SHA-1 so the name cannot be ambiguous; a self-signed cert is listed as untrusted, which codesign accepts.
+          IDENTITY="$(security find-identity -p codesigning "$KC" | awk '/^ *1\)/ {print $2; exit}')"
+          [[ -n "$IDENTITY" ]] || { echo "no code-signing identity in the imported certificate" >&2; exit 1; }
+          echo "OLAZ_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "OLAZ_SIGN_KEYCHAIN=$KC" >> "$GITHUB_ENV"
 
+      - name: Import notary key
+        if: steps.version.outputs.mode == 'notarized'
+        run: |
+          KC="$OLAZ_SIGN_KEYCHAIN"
           echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
           xcrun notarytool store-credentials olaz-notary \
             --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" \
@@ -87,12 +100,12 @@ jobs:
           echo "OLAZ_NOTARY_KEYCHAIN=$KC" >> "$GITHUB_ENV"
 
       - name: Build, sign, notarize (Developer ID)
-        if: steps.version.outputs.signed == 'true'
+        if: steps.version.outputs.mode == 'notarized'
         run: ./scripts/release.sh
 
-      - name: Build and package (ad-hoc signed)
-        if: steps.version.outputs.signed != 'true'
-        run: ./scripts/package-unsigned.sh
+      - name: Build and package (fixed or ad-hoc signature, not notarized)
+        if: steps.version.outputs.mode != 'notarized'
+        run: ./scripts/package.sh
 
       - name: Checksums
         run: |
@@ -104,17 +117,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
           VERSION: ${{ steps.version.outputs.version }}
-          SIGNED: ${{ steps.version.outputs.signed }}
+          MODE: ${{ steps.version.outputs.mode }}
         run: |
           NOTES="$RUNNER_TEMP/notes.md"
           {
             echo "Olaz $VERSION for macOS 26 Tahoe or later (universal: Apple Silicon + Intel)."
             echo
-            if [[ "$SIGNED" == "true" ]]; then
+            if [[ "$MODE" == "notarized" ]]; then
               echo "Signed with Developer ID and notarized by Apple."
             else
               echo "> [!WARNING]"
-              echo "> This build is **not notarized** (ad-hoc signed). After copying Olaz.app to /Applications, run:"
+              if [[ "$MODE" == "fixed" ]]; then
+                echo "> Signed with Olaz's own fixed certificate (Keychain and permissions are kept across updates) but **not notarized** by Apple."
+              else
+                echo "> This build is **not notarized** (ad-hoc signed)."
+              fi
+              echo "> After copying Olaz.app to /Applications, run once:"
               echo '> `xattr -dr com.apple.quarantine /Applications/Olaz.app`'
               echo "> or right-click Olaz.app and choose Open the first time."
             fi
@@ -128,5 +146,5 @@ jobs:
             --target "$GITHUB_SHA" "${PRERELEASE[@]}"
 
       - name: Remove signing keychain
-        if: always() && steps.version.outputs.signed == 'true'
+        if: always() && steps.version.outputs.mode != 'adhoc'
         run: security delete-keychain "$RUNNER_TEMP/olaz-signing.keychain-db" || true
