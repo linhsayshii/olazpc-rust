@@ -53,6 +53,11 @@ struct ChatComposer: View {
 
     private var isEmpty: Bool { draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
+    /// "Tin nhắn nhanh": "/" then a keyword lists the saved texts that start with it.
+    private var quickMatches: [QuickMessage] {
+        Array(QuickMessage.matches(draft, in: engine.quickMessages ?? []).prefix(6))
+    }
+
     var body: some View {
         VStack(spacing: 8) {
             if let typingLabel {
@@ -88,6 +93,14 @@ struct ChatComposer: View {
             if suggestionsOpen {
                 MentionSuggestions(candidates: candidates, selected: $selected, pick: pick)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+            if !quickMatches.isEmpty {
+                QuickMessageStrip(items: quickMatches) { item in
+                    draft = item.text
+                    mentions = []
+                    styles?.wrappedValue = []
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
             if stickerStripOpen {
                 TypingStickerStrip(stickers: typingStickers.stickers, sending: sendingSuggestion, pick: sendSuggestion,
@@ -958,3 +971,32 @@ private struct PastedAttachment: Identifiable {
         return ""
     }
 }
+
+/// The quick messages matching "/keyword": a click puts the text in the box.
+private struct QuickMessageStrip: View {
+    let items: [QuickMessage]
+    let pick: (QuickMessage) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Tin nhắn nhanh").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                .padding(.horizontal, 12).padding(.top, 8).padding(.bottom, 4)
+            ForEach(items) { item in
+                Button { pick(item) } label: {
+                    HStack(spacing: 8) {
+                        Text("/\(item.keyword)").font(.system(size: 12, weight: .semibold)).foregroundStyle(.tint)
+                        Text(item.text).font(.system(size: 12)).lineLimit(1).foregroundStyle(.primary)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.bottom, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+}
+

@@ -15,7 +15,7 @@ struct SettingsView: View {
                 SettingsPane(height: 440) { NotificationSettingsView() }
             }
             Tab("Quyền riêng tư", systemImage: "lock") {
-                SettingsPane(height: 600) { PrivacySettings() }
+                SettingsPane(height: 720) { PrivacySettings() }
             }
             Tab("Sticker", systemImage: "face.smiling") {
                 SettingsPane(height: 160) { StickerSettingsSection() }
@@ -88,7 +88,51 @@ private struct PrivacySettings: View {
             }
         }
         AccountPrivacySection()
+        QuickMessagesSection()
         BlockedUsersSection()
+    }
+}
+
+/// "Quản lý tin nhắn nhanh": add, edit and delete; in a chat, "/" + keyword inserts one.
+private struct QuickMessagesSection: View {
+    @Environment(ZaloEngine.self) private var engine
+    @State private var keyword = ""
+    @State private var text = ""
+    @State private var editing: String?
+    @State private var busy = false
+
+    var body: some View {
+        Section("Tin nhắn nhanh") {
+            if let items = engine.quickMessages {
+                if items.isEmpty { Text("Chưa có tin nhắn nhanh nào.").foregroundStyle(.secondary) }
+                ForEach(items) { item in
+                    HStack {
+                        Text("/\(item.keyword)").fontWeight(.semibold)
+                        Text(item.text).lineLimit(1).foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Sửa") { editing = item.id; keyword = item.keyword; text = item.text }
+                        Button("Xóa", role: .destructive) { Task { await engine.deleteQuickMessage(item.id) } }
+                    }
+                }
+            } else {
+                ProgressView().controlSize(.small)
+            }
+            HStack {
+                TextField("Phím tắt", text: $keyword).frame(width: 110)
+                TextField("Nội dung tin nhắn", text: $text)
+                Button(editing == nil ? "Tạo mới" : "Lưu") {
+                    Task {
+                        busy = true
+                        if await engine.saveQuickMessage(id: editing, keyword: keyword, text: text) {
+                            keyword = ""; text = ""; editing = nil
+                        }
+                        busy = false
+                    }
+                }
+                .disabled(busy || keyword.trimmingCharacters(in: .whitespaces).isEmpty || text.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .task { if engine.quickMessages == nil { await engine.loadQuickMessages() } }
     }
 }
 

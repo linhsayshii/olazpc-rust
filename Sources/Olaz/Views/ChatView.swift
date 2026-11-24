@@ -120,6 +120,7 @@ struct ChatView: View {
         .task(id: id) {
             // "Tin nhắn tự xóa": the setting for the composer, then messages leave the chat when their time is over.
             if engine.autoDelete == nil { await engine.loadAutoDelete() }
+            if engine.quickMessages == nil { await engine.loadQuickMessages() }
             while !Task.isCancelled {
                 let next = engine.pruneExpiredMessages(in: id)
                 let wait = min(60, max(1, next.map { $0.timeIntervalSinceNow + 0.5 } ?? 60))
