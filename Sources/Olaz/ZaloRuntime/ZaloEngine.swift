@@ -928,7 +928,7 @@ final class ZaloEngine {
                 }
                 await processControlEnvelope(box.dict)
                 if traceHost("apply_batch", args: [
-                    "cmd": 0,
+                    "cmd": NSNull(),
                     "increment_unread": notifyIncoming,
                     "notify_incoming": notifyIncoming,
                     "payload": box.dict,

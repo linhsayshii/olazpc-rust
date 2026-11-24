@@ -91,6 +91,18 @@ final class FakeZaloServer: @unchecked Sendable {
         }
     }
 
+    enum ServerError: Error, CustomStringConvertible {
+        case wsPushTimeout(String)
+        case noScriptedWSAction(String)
+
+        var description: String {
+            switch self {
+            case .wsPushTimeout(let msg): return "FakeZaloServer.wsPushTimeout: \(msg)"
+            case .noScriptedWSAction(let msg): return "FakeZaloServer.noScriptedWSAction: \(msg)"
+            }
+        }
+    }
+
     private let listener: NWListener
     private let queue = DispatchQueue(label: "olaz.test.fake-zalo-server")
     private let lock = NSLock()
@@ -100,6 +112,9 @@ final class FakeZaloServer: @unchecked Sendable {
     private var hasUnscripted = false
     private var sessionSecretKey: Data?
     private var openConnections: [NWConnection] = []
+    private var activeWSConnection: NWConnection?
+    private var activeWSCipherKey: Data?
+    private var hadWSUpgrade = false
     private var waiters: [() -> Void] = []
     private var refuseNewConnections = false
     private(set) var port: UInt16 = 0
@@ -195,6 +210,8 @@ final class FakeZaloServer: @unchecked Sendable {
         stopped = true
         let conns = openConnections
         openConnections.removeAll()
+        activeWSConnection = nil
+        activeWSCipherKey = nil
         let pendingWaiters = waiters
         waiters.removeAll()
         lock.unlock()
@@ -204,27 +221,159 @@ final class FakeZaloServer: @unchecked Sendable {
     }
 
     func waitForScriptedRequests(timeoutMs: Int = 2000) async {
-        await waitUntil(timeoutMs: timeoutMs) {
+        _ = await waitUntil(timeoutMs: timeoutMs) {
             allNonRefusedConsumedLocked()
         }
     }
 
     func waitForConsumed(path: String, timeoutMs: Int = 2000) async {
-        await waitUntil(timeoutMs: timeoutMs) {
+        _ = await waitUntil(timeoutMs: timeoutMs) {
             entries.allSatisfy { ($0.kind != "http" && $0.kind != "ws") || $0.path != path || $0.repeat || $0.isRefused || $0.consumed }
         }
     }
 
-    private func waitUntil(timeoutMs: Int, conditionLocked: () -> Bool) async {
+    private enum WSPushTarget {
+        case ready(index: Int, entry: ScriptEntry, connection: NWConnection)
+        case droppedAfterLogout(index: Int)
+        case missingAction
+    }
+
+    private func resolveWSPushTargetLocked() -> WSPushTarget? {
+        guard let actionIdx = entries.firstIndex(where: {
+            ($0.kind == "ws_frame" || $0.kind == "ws_close") && !$0.consumed && !$0.claimed
+        }) else {
+            return .missingAction
+        }
+        let hasPrecedingWS = entries[..<actionIdx].contains {
+            $0.kind == "ws" && !$0.consumed && !$0.repeat
+        }
+        if hasPrecedingWS {
+            return nil
+        }
+        if let conn = activeWSConnection {
+            return .ready(index: actionIdx, entry: entries[actionIdx], connection: conn)
+        }
+        let hasRemainingWS = entries.contains {
+            $0.kind == "ws" && !$0.consumed && !$0.repeat
+        }
+        if hadWSUpgrade && !hasRemainingWS {
+            return .droppedAfterLogout(index: actionIdx)
+        }
+        return nil
+    }
+
+    private func claimNextWSPushTarget() -> WSPushTarget? {
+        lock.lock()
+        let target = resolveWSPushTargetLocked()
+        var pendingWaiters: [() -> Void] = []
+        switch target {
+        case .ready(let idx, _, _):
+            entries[idx].claimed = true
+        case .droppedAfterLogout(let idx):
+            entries[idx].consumed = true
+            pendingWaiters = waiters
+            waiters.removeAll()
+        case .missingAction, nil:
+            break
+        }
+        lock.unlock()
+        for w in pendingWaiters { w() }
+        return target
+    }
+
+    private func prepareWSFrameBytesIfRunning(entry: ScriptEntry) -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped else { return nil }
+        var nextCipherKey = activeWSCipherKey
+        let frameBytes = encodeZaloWSFrame(entry: entry, cipherKey: &nextCipherKey)
+        activeWSCipherKey = nextCipherKey
+        return frameBytes
+    }
+
+    private func isStoppedSync() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopped
+    }
+
+    /// Sends the next `count` scripted `ws_frame` / `ws_close` entries (only the initial `cmd == 1` auth reply
+    /// right after `"ws"` is auto-sent on connect).
+    func pushWebSocketActions(count: Int, timeoutMs: Int = 5000) async throws {
+        guard count > 0 else { return }
+        for stepOffset in 0..<count {
+            let reached = await waitUntil(timeoutMs: timeoutMs) {
+                resolveWSPushTargetLocked() != nil
+            }
+            guard reached else {
+                throw ServerError.wsPushTimeout("Timed out waiting for active WS connection on ws_push item \(stepOffset + 1)/\(count)")
+            }
+
+            switch claimNextWSPushTarget() {
+            case .ready(let idx, let entry, let conn):
+                try await performScheduledWSAction(index: idx, entry: entry, on: conn)
+            case .droppedAfterLogout:
+                break
+            case .missingAction:
+                throw ServerError.noScriptedWSAction("No remaining ws_frame/ws_close entry for ws_push item \(stepOffset + 1)/\(count)")
+            case nil:
+                throw ServerError.wsPushTimeout("WS connection unavailable on ws_push item \(stepOffset + 1)/\(count)")
+            }
+        }
+    }
+
+    private func performScheduledWSAction(index: Int, entry: ScriptEntry, on connection: NWConnection) async throws {
+        if let delayMs = entry.delayMs, delayMs > 0 {
+            try await Task.sleep(for: .milliseconds(delayMs))
+        }
+        guard !isStoppedSync() else { return }
+
+        if entry.kind == "ws_close" {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                self.sendWebSocketFrame(on: connection, opcode: 0x8, payload: Data([0x03, 0xE8])) {
+                    connection.cancel()
+                    self.clearActiveWSConnectionIfMatching(connection)
+                    self.markWebSocketActionConsumed(index)
+                    cont.resume()
+                }
+            }
+            return
+        }
+
+        guard let frameBytes = prepareWSFrameBytesIfRunning(entry: entry) else { return }
+
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            self.sendWebSocketFrame(on: connection, opcode: 0x2, payload: frameBytes) {
+                self.markWebSocketActionConsumed(index)
+                cont.resume()
+            }
+        }
+    }
+
+    private func clearActiveWSConnectionIfMatching(_ connection: NWConnection) {
+        lock.lock()
+        if activeWSConnection === connection {
+            activeWSConnection = nil
+            activeWSCipherKey = nil
+        }
+        let pendingWaiters = waiters
+        waiters.removeAll()
+        lock.unlock()
+        for w in pendingWaiters { w() }
+    }
+
+    @discardableResult
+    private func waitUntil(timeoutMs: Int, conditionLocked: () -> Bool) async -> Bool {
         func check() -> Bool {
             lock.lock()
             defer { lock.unlock() }
             return conditionLocked()
         }
-        if check() { return }
+        if check() { return true }
         let deadline = ContinuousClock.now + .milliseconds(timeoutMs)
         while !check() {
-            if ContinuousClock.now >= deadline { break }
+            let remaining = deadline - ContinuousClock.now
+            if remaining <= .zero { return false }
             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                 let once = OnceFlag()
                 let finish: @Sendable () -> Void = {
@@ -240,11 +389,12 @@ final class FakeZaloServer: @unchecked Sendable {
                 lock.unlock()
 
                 Task {
-                    try? await Task.sleep(for: .milliseconds(50))
+                    try? await Task.sleep(for: min(remaining, .milliseconds(50)))
                     finish()
                 }
             }
         }
+        return true
     }
 
     private func allNonRefusedConsumedLocked() -> Bool {
@@ -526,7 +676,7 @@ final class FakeZaloServer: @unchecked Sendable {
         headers: [String: String]
     ) {
         let canonicalQuery = canonicalizeQuery(rawQuery)
-        let (matched, scheduledActions) = consumeWebSocketEntry(path: path)
+        let (matched, autoAuthFrame) = consumeWebSocketEntry(path: path)
         var reqDict: [String: CaseJSON] = [
             "kind": .string("ws_connect"),
             "path": .string(path),
@@ -550,12 +700,44 @@ final class FakeZaloServer: @unchecked Sendable {
                 connection.cancel()
                 return
             }
+            self.lock.lock()
+            self.activeWSConnection = connection
+            self.activeWSCipherKey = nil
+            self.hadWSUpgrade = true
+            let pendingWaiters = self.waiters
+            self.waiters.removeAll()
+            self.lock.unlock()
+            for w in pendingWaiters { w() }
+
             self.readWebSocketFrames(on: connection, buffer: Data())
-            self.runWebSocketActions(scheduledActions, index: 0, on: connection, cipherKey: nil)
+
+            if let (authIndex, authEntry) = autoAuthFrame {
+                let sendAuth: @Sendable () -> Void = { [weak self] in
+                    guard let self else { return }
+                    self.lock.lock()
+                    let isStoppedNow = self.stopped || self.activeWSConnection !== connection
+                    if isStoppedNow {
+                        self.lock.unlock()
+                        return
+                    }
+                    var nextKey = self.activeWSCipherKey
+                    let frameBytes = self.encodeZaloWSFrame(entry: authEntry, cipherKey: &nextKey)
+                    self.activeWSCipherKey = nextKey
+                    self.lock.unlock()
+                    self.sendWebSocketFrame(on: connection, opcode: 0x2, payload: frameBytes) {
+                        self.markWebSocketActionConsumed(authIndex)
+                    }
+                }
+                if let delayMs = authEntry.delayMs, delayMs > 0 {
+                    self.queue.asyncAfter(deadline: .now() + .milliseconds(delayMs), execute: sendAuth)
+                } else {
+                    sendAuth()
+                }
+            }
         })
     }
 
-    private func consumeWebSocketEntry(path: String) -> (ScriptEntry?, [(Int, ScriptEntry)]) {
+    private func consumeWebSocketEntry(path: String) -> (ScriptEntry?, (Int, ScriptEntry)?) {
         lock.lock()
         var foundIndex: Int?
         for i in entries.indices {
@@ -568,17 +750,16 @@ final class FakeZaloServer: @unchecked Sendable {
             foundIndex = i
             break
         }
-        var actions: [(Int, ScriptEntry)] = []
+        var autoAuthFrame: (Int, ScriptEntry)?
         if let wsIdx = foundIndex, entries[wsIdx].accept {
-            var j = wsIdx + 1
-            while j < entries.count {
-                let kind = entries[j].kind
-                if kind == "ws" { break }
-                if (kind == "ws_frame" || kind == "ws_close"), !entries[j].consumed, !entries[j].claimed {
-                    entries[j].claimed = true
-                    actions.append((j, entries[j]))
-                }
-                j += 1
+            let nextIdx = wsIdx + 1
+            if entries.indices.contains(nextIdx),
+               !entries[nextIdx].consumed,
+               !entries[nextIdx].claimed,
+               entries[nextIdx].kind == "ws_frame",
+               entries[nextIdx].cmd == 1 {
+                entries[nextIdx].claimed = true
+                autoAuthFrame = (nextIdx, entries[nextIdx])
             }
         }
         let matched = foundIndex.map { entries[$0] }
@@ -586,7 +767,7 @@ final class FakeZaloServer: @unchecked Sendable {
         waiters.removeAll()
         lock.unlock()
         for w in pendingWaiters { w() }
-        return (matched, actions)
+        return (matched, autoAuthFrame)
     }
 
     private func markWebSocketActionConsumed(_ index: Int) {
@@ -598,50 +779,6 @@ final class FakeZaloServer: @unchecked Sendable {
         waiters.removeAll()
         lock.unlock()
         for w in pendingWaiters { w() }
-    }
-
-    private func runWebSocketActions(
-        _ actions: [(Int, ScriptEntry)],
-        index: Int,
-        on connection: NWConnection,
-        cipherKey: Data?
-    ) {
-        guard index < actions.count else { return }
-        lock.lock()
-        let isStopped = stopped
-        lock.unlock()
-        guard !isStopped else { return }
-
-        let (entryIndex, entry) = actions[index]
-        let execute: @Sendable () -> Void = { [weak self] in
-            guard let self else { return }
-            self.lock.lock()
-            let isStoppedNow = self.stopped
-            self.lock.unlock()
-            guard !isStoppedNow else { return }
-
-            if entry.kind == "ws_close" {
-                self.sendWebSocketFrame(on: connection, opcode: 0x8, payload: Data([0x03, 0xE8])) {
-                    connection.cancel()
-                    self.markWebSocketActionConsumed(entryIndex)
-                }
-                return
-            }
-
-            var nextCipherKey = cipherKey
-            let frameBytes = self.encodeZaloWSFrame(entry: entry, cipherKey: &nextCipherKey)
-            let updatedKey = nextCipherKey
-            self.sendWebSocketFrame(on: connection, opcode: 0x2, payload: frameBytes) {
-                self.markWebSocketActionConsumed(entryIndex)
-                self.runWebSocketActions(actions, index: index + 1, on: connection, cipherKey: updatedKey)
-            }
-        }
-
-        if let delayMs = entry.delayMs, delayMs > 0 {
-            queue.asyncAfter(deadline: .now() + .milliseconds(delayMs), execute: execute)
-        } else {
-            execute()
-        }
     }
 
     private func encodeZaloWSFrame(entry: ScriptEntry, cipherKey: inout Data?) -> Data {
@@ -816,6 +953,7 @@ final class FakeZaloServer: @unchecked Sendable {
                         len64 = (len64 << 8) | UInt64(acc[acc.startIndex + headerLen + i])
                     }
                     guard len64 <= UInt64(Int.max) else {
+                        self.clearActiveWSConnectionIfMatching(connection)
                         connection.cancel()
                         return
                     }
@@ -841,9 +979,12 @@ final class FakeZaloServer: @unchecked Sendable {
                 }
 
                 switch opcode {
+                case 0x1, 0x2:
+                    self.recordInboundWSFrame(payload)
                 case 0x8:
                     let closePayload = payload.count >= 2 ? Data(payload.prefix(2)) : Data([0x03, 0xE8])
                     self.sendWebSocketFrame(on: connection, opcode: 0x8, payload: closePayload) {
+                        self.clearActiveWSConnectionIfMatching(connection)
                         connection.cancel()
                     }
                     return
@@ -855,11 +996,38 @@ final class FakeZaloServer: @unchecked Sendable {
             }
 
             if isComplete || error != nil {
+                self.clearActiveWSConnectionIfMatching(connection)
                 connection.cancel()
                 return
             }
             self.readWebSocketFrames(on: connection, buffer: acc)
         }
+    }
+
+    private func recordInboundWSFrame(_ payload: Data) {
+        guard payload.count >= 4 else { return }
+        let base = payload.startIndex
+        let cmd = UInt16(payload[base + 1]) | (UInt16(payload[base + 2]) << 8)
+        let subCmd = payload[base + 3]
+        // Keepalive pings (cmd 2 and cmd 4) depend on wall time; exclude them.
+        if cmd == 2 || cmd == 4 { return }
+
+        let bodyData = Data(payload[(base + 4)...])
+        let decodedPayload: CaseJSON
+        if bodyData.isEmpty {
+            decodedPayload = .object([:])
+        } else if let parsed = try? CaseJSON.parse(bodyData) {
+            decodedPayload = canonicalizeWSSendPayload(parsed)
+        } else {
+            decodedPayload = .string("<binary>")
+        }
+
+        recordRequest(.object([
+            "kind": .string("ws_send"),
+            "cmd": .int(Int64(cmd)),
+            "sub_cmd": .int(Int64(subCmd)),
+            "payload": decodedPayload,
+        ]), unscripted: false)
     }
 
     private static func compressZlib(_ input: Data) throws -> Data {
@@ -1052,6 +1220,10 @@ final class FakeZaloServer: @unchecked Sendable {
         "imei", "computer_name", "client_time", "ts"
     ]
 
+    private static let volatileWSSendKeys: Set<String> = [
+        "ts", "client_time", "timestamp"
+    ]
+
     private func canonicalizeQuery(_ rawQuery: [String: String], keepPlainParams: Bool = false) -> [String: CaseJSON] {
         var out: [String: CaseJSON] = [:]
         for (k, v) in rawQuery {
@@ -1077,6 +1249,25 @@ final class FakeZaloServer: @unchecked Sendable {
             }
         }
         return .object(out)
+    }
+
+    private func canonicalizeWSSendPayload(_ val: CaseJSON) -> CaseJSON {
+        switch val {
+        case .object(let obj):
+            var out: [String: CaseJSON] = [:]
+            for (k, v) in obj {
+                if Self.volatileWSSendKeys.contains(k) {
+                    out[k] = .string("<volatile>")
+                } else {
+                    out[k] = canonicalizeWSSendPayload(v)
+                }
+            }
+            return .object(out)
+        case .array(let arr):
+            return .array(arr.map { canonicalizeWSSendPayload($0) })
+        default:
+            return val
+        }
     }
 }
 

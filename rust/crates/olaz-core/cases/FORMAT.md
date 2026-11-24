@@ -34,6 +34,7 @@ The oracle is what can be observed from outside the engine: the domain state the
 - `prefs`: store preference strings present before the run.
 - `poll_state` *(optional, `transport` domain)*: `null`, or `ZaloPollState` / `PollState` camelCase JSON (`{"lastActionId": "...", "lastActionIdOther": "...", "queues": {"1": {"lastId": "...", "ids": []}, ...}}`) seeded before long-polling starts.
 - `ws_cursors` *(optional, `transport` domain)*: `null`, or a map of `"<cmd>_<subCmd>"` to `{"lastId": "...", "preIds": [...]}` (`ZaloWSQueueCursorSnapshot` / `WsQueueCursorSnapshot`) seeded before WebSocket connects.
+- `suppress` *(optional, runner metadata, `transport` domain)*: array of transport names (`"ws"`, `"long_poll"`, or both) to suppress during the run. Both the recorder's `hostTrace` and the Rust replay obey it: `start_ws` / `start_long_poll` are still traced, `hostTrace` returns `false` for listed transports, a suppressed WS never connects, and a suppressed long-poll never ticks.
 
 ### server
 
@@ -41,16 +42,20 @@ Scripted answers, in the order they are consumed. Each request takes the first u
 
 - HTTP: `{"kind": "http", "path": "/api/...", "method": "GET|POST", "response": {"status": 200, "json": {...}}}`. `json` is the plain body; the fake server encrypts it the way Zalo does for that endpoint (including ParamCipher endpoints and AES-CBC `data` encryption with `zpw_enk` for `/api/social/profile/me-v2` and long-poll `/`). Instead of `json`: `"raw": "<text>"`, or `"error": "timeout" | "refused" | "reset"`.
 - WebSocket: `{"kind": "ws", "path": "...", "accept": true}`.
-- WebSocket server frames (`ws_frame`): `{"kind": "ws_frame", "cmd": <int>, "sub_cmd": <int>, "payload": {...}}` (optional `"encrypt": <0|1|2|3>`, optional `"key": "<base64>"`, optional `"delay_ms": <int>`). Sent in script order after the matching `"ws"` entry upgrades (all `ws_frame` and `ws_close` entries following a `"ws"` entry up to the next `"ws"` entry belong to that connection). `payload` is the plain JSON body; the fake server encodes it as Zalo and `olaz-ws` expect for that `cmd` inside an RFC 6455 binary frame (`u8 version(1) | u16 LE cmd | u8 sub_cmd | UTF-8 JSON envelope`): `cmd == 1` defaults to `encrypt: 0` with a base64 `"key"` and JSON-stringified `"data"`, `cmd == 602` defaults to `encrypt: 0` with JSON-stringified `"data"`, and other `cmd`s default to `encrypt: 2` (AES-GCM 16-byte nonce + zlib when the connection established a cipher key on `cmd == 1`) or `encrypt: 1` (zlib) unless `"encrypt"` is explicitly given.
-- WebSocket server drop (`ws_close`): `{"kind": "ws_close"}` (optional `"delay_ms": <int>`). Sends an RFC 6455 Close frame (`1000`) and closes the socket at that point in the connection's script sequence (used to trigger disconnect/reconnect such as `ws_auth_watch`).
+- WebSocket server frames (`ws_frame`): `{"kind": "ws_frame", "cmd": <int>, "sub_cmd": <int>, "payload": {...}}` (optional `"encrypt": <0|1|2|3>`, optional `"key": "<base64>"`, optional `"delay_ms": <int>`). Only the initial auth reply (`cmd == 1` immediately following a `"ws"` entry) is sent automatically when that WebSocket connects; every subsequent `ws_frame` waits for a `ws_push` step and is sent in script order on the active connection. `payload` is the plain JSON body; the fake server encodes it as Zalo and `olaz-ws` expect for that `cmd` inside an RFC 6455 binary frame (`u8 version(1) | u16 LE cmd | u8 sub_cmd | UTF-8 JSON envelope`): `cmd == 1` defaults to `encrypt: 0` with a base64 `"key"` and JSON-stringified `"data"`, `cmd == 602` defaults to `encrypt: 0` with JSON-stringified `"data"`, and other `cmd`s default to `encrypt: 2` (AES-GCM 16-byte nonce + zlib when the connection established a cipher key on `cmd == 1`) or `encrypt: 1` (zlib) unless `"encrypt"` is explicitly given.
+- WebSocket server drop (`ws_close`): `{"kind": "ws_close"}` (optional `"delay_ms": <int>`). Sends an RFC 6455 Close frame (`1000`) and closes the socket when triggered by a `ws_push` step (used to trigger disconnect/reconnect such as `ws_auth_watch`).
 - A request with no matching entry is answered `{"error_code": 0, "data": {}}` and recorded with `"unscripted": true`. A case with an unscripted request is a recorder bug.
 
 ### steps
 
 Run in order:
 
-- `{"cmd": "start" | "refresh_qr" | "log_out" | "session_expired", "args": {...}}`. `session_expired` takes `{"reason": "<text>"}`.
+- `{"cmd": "start" | "refresh_qr" | "log_out" | "session_expired" | "drain_chat_polling", "args": {...}}`.
+  - `session_expired` takes `{"reason": "<text>"}`.
+  - `drain_chat_polling` (`transport` domain) calls `drainChatPolling(maxBatches, notifyIncoming)` with `{"max_batches": <int>, "notify_incoming": <bool>}`.
 - `{"await": {"phase": "<kind>", "step": "<login step, optional>"}, "timeout_ms": 5000}`: wait until the state matches. The Rust runner instead runs the core until no input or effect is pending, then checks the same predicate.
+- `{"await_host": "<call>", "timeout_ms": N}`: wait until the recorded `host` list contains `"<call>"` searching from the current host cursor, then advance the host cursor past that entry (`index + 1`). Used for deterministic ordering (for example awaiting `e2ee_connected` before `ws_push`).
+- `{"ws_push": k}` (optional `"timeout_ms": N`): instruct the fake server to send the next `k` scripted `ws_frame` or `ws_close` entries in script order.
 - `{"snapshot": "<label>"}`: record the state under `expect.snapshots[label]`.
 
 ### expect
@@ -59,11 +64,12 @@ Run in order:
 - `final`: state after the last step, once nothing is pending.
 - `requests`: every request that reached the fake server, canonical form, as a **sorted multiset** (sort by `kind`, then `path`, then the canonical JSON text). Concurrent requests have no stable order, so order is not compared.
   - HTTP: `{"kind": "http", "path", "method", "params": {...} | null, "query": {...}}`. `params` is the decrypted ParamCipher payload, keys sorted (`null` when absent or for unencrypted endpoints such as long-poll `GET /`). `query` is the plain query string, keys sorted. Signatures, encrypted blobs and the keys listed under Volatile become `"<volatile>"`.
-  - WebSocket: `{"kind": "ws_connect", "path", "query": {...}}`.
+  - WebSocket connect: `{"kind": "ws_connect", "path", "query": {...}}`.
+  - WebSocket client→server frames (`ws_send`): `{"kind": "ws_send", "cmd": <int>, "sub_cmd": <int>, "payload": {...} | "<binary>"}`. `payload` is the decoded JSON body after the 4-byte binary header (`u8 version | u16 LE cmd | u8 sub_cmd`, `{}` when empty, `"<binary>"` when undecodable as UTF-8 JSON). Keepalive pings (`cmd == 2` and `cmd == 4`) are excluded because their count depends on wall time.
 - `host`: ordered list of activities handed to Swift-owned code, `{"call": "<name>", "args": {...}}`. While recording, the engine's trace hook records these and skips the real activity (except where a lifecycle hook in `transport` cases must permit WS/long-poll startup so the transport runs under test).
   - Session domain names: `prepare_store {user_id}`, `start_ws {endpoints}`, `start_long_poll {}`, `start_bootstrap {}`, `offer_first_login_transfer {force}`, `reset_domains {}`, `persist_session {}`, `clear_session {}`, `mark_expired {}`.
   - Transport domain names:
-    - `apply_batch {cmd, increment_unread, notify_incoming, payload}`
+    - `apply_batch {cmd, increment_unread, notify_incoming, payload}` *(`cmd` is an integer on the WS path and `null` on the long-poll path)*
     - `apply_parsed_events {cmd, increment_unread, notify_incoming, events}`
     - `mobile_sync {events}`
     - `e2ee_signal {cmd, payload}`
@@ -117,6 +123,7 @@ Keys marked `"<volatile>"` by the recorder:
 | `query` | `zcid_ext` | Random 10-hex-character nonce per `ParamCipher` |
 | `query` | `signkey` | MD5 signature computed over volatile `imei`, `zcid`, `zcid_ext`, `params`, etc. |
 | `query` | `params` | Encrypted `ParamCipher` / AES-CBC payload blob (depends on volatile keys/IV/timestamps; decrypted payload is compared separately in `request.params`). Plain cursor `params` on long-poll `GET /` (`<lastActionId>,<lastActionIdOther>,<b64>,1`) is deterministic and kept verbatim. |
+| `ws_send` (`payload`) | `ts`, `client_time`, `timestamp` | Any wall-clock timestamp fields carried inside client→server `ws_send` JSON payloads |
 | `host` (`mute`) | `start` | Only when `startTime` and `systemTime` are both absent from a `mute` control payload and `start` falls back to `Date().timeIntervalSince1970`. |
 
 ## Comparing
