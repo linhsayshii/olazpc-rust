@@ -50,7 +50,7 @@ Live check 2026-11-23 (release build 9c47e82, merged 5a+5b): clean engine.log, n
 
 | Unit | Scope | State |
 |---|---|---|
-| U1b | `olaz-core` skeleton (single tokio actor, pure `reduce(&mut CoreState, Input) -> (Vec<Effect>, DirtyKeys)`, coalescing `ChangeStream`, serial `CoreHost` runner, Case format v1 replay runner `tests/cases.rs`) + session domain (`boot`, QR login, logout, expiry, profile) cutover in `ZaloEngine` + `ZaloEngine+Core.swift` | done 2026-11-24 (olaz-core: 13 unit + 20 scenario tests, cases 0/0 awaiting U1a merge; olaz-ffi: 45 passed; swift: 580 tests in 98 suites green; release `next_changes()` delivery p50=65.6 us / p95=125.0 us; see ADR-016) |
+| U1b | `olaz-core` skeleton (single tokio actor, pure `reduce(&mut CoreState, Input) -> (Vec<Effect>, DirtyKeys)`, `ChangeStream`, serial `CoreHost` runner, Case format v1 replay runner `tests/cases.rs`) + session domain (`boot`, QR login, logout, expiry, profile) cutover in `ZaloEngine` + `ZaloEngine+Core.swift` | done 2026-11-24 (olaz-core: 13 unit + 20 scenario + 20/20 recorded `cases/session.jsonl`; olaz-ffi: 45 passed; `gate-core.sh session` 6/6 pass incl. `OLAZ_SLOW_CASES=1 SessionRecorderTests`; release `next_changes()` delivery min=33.4 us, p50=41.9 us, p95=78.5 us, max=730.8 us; see ADR-016) |
 
 ## Later waves (out of milestone 1)
 
