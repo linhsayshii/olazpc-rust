@@ -1,15 +1,19 @@
 //! Dirty-key change stream pulled by Swift (`next_changes()`, D2/D3).
 //!
-//! High-frequency domain keys (conversations, messages, typing added in later units) coalesce in
-//! place in `O(dirty keys)` memory. Low-frequency `Session` lifecycle transitions are buffered in
-//! a small bounded queue (`MAX_SESSION_QUEUE`) with consecutive-duplicate coalescing so fast local
-//! or loopback servers never skip intermediate login/ready transitions before Swift pulls.
+//! High-frequency domain keys (conversations, flags, extras, UI, prompt) coalesce in place in
+//! `O(dirty keys)` memory. Low-frequency `Session` lifecycle transitions are buffered in a small
+//! bounded queue (`MAX_SESSION_QUEUE`) with consecutive-duplicate coalescing so fast local or
+//! loopback servers never skip intermediate login/ready transitions before Swift pulls.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Mutex, PoisonError};
 
 use tokio::sync::Notify;
 
+use crate::conversations::{
+    ConversationActionUI, ConversationActionsState, ConversationExtras, ConversationPrompt,
+    ConversationSummary,
+};
 use crate::state::{CoreState, SessionSnapshot};
 
 /// Upper bound on queued distinct session transitions; keeps hub memory strictly `O(1)`.
@@ -19,6 +23,11 @@ const MAX_SESSION_QUEUE: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DirtyKey {
     Session,
+    Conversations,
+    ConversationFlags,
+    ConversationExtras,
+    ConversationUi,
+    ConversationPrompt,
 }
 
 /// Set of keys dirtied by one `reduce` step.
@@ -30,6 +39,12 @@ pub struct CoreChanges {
     /// Monotonic revision of the latest change included in this batch.
     pub version: u64,
     pub session: Option<SessionSnapshot>,
+    pub conversations: Option<Vec<ConversationSummary>>,
+    pub conversation_flags: Option<ConversationActionsState>,
+    pub conversation_extras: Option<ConversationExtras>,
+    pub conversation_ui: Option<ConversationActionUI>,
+    /// Outer `Some(...)` means the prompt changed; inner `Option` is the new prompt (`None` = cleared).
+    pub conversation_prompt: Option<Option<ConversationPrompt>>,
 }
 
 #[derive(Default)]
@@ -37,7 +52,22 @@ struct DirtyBuffer {
     version: u64,
     dirty: DirtySet,
     session_queue: VecDeque<(u64, SessionSnapshot)>,
+    conversations: Option<Vec<ConversationSummary>>,
+    conversation_flags: Option<ConversationActionsState>,
+    conversation_extras: Option<ConversationExtras>,
+    conversation_ui: Option<ConversationActionUI>,
+    conversation_prompt: Option<Option<ConversationPrompt>>,
     closed: bool,
+}
+
+impl DirtyBuffer {
+    fn has_domain_changes(&self) -> bool {
+        self.conversations.is_some()
+            || self.conversation_flags.is_some()
+            || self.conversation_extras.is_some()
+            || self.conversation_ui.is_some()
+            || self.conversation_prompt.is_some()
+    }
 }
 
 /// Change hub between the actor and the Swift `next_changes()` consumer.
@@ -84,6 +114,21 @@ impl ChangeHub {
                         buf.session_queue.push_back((version, snap));
                     }
                 }
+                DirtyKey::Conversations => {
+                    buf.conversations = Some(state.conversations.conversations.clone());
+                }
+                DirtyKey::ConversationFlags => {
+                    buf.conversation_flags = Some(state.conversations.actions.clone());
+                }
+                DirtyKey::ConversationExtras => {
+                    buf.conversation_extras = Some(state.conversations.extras.clone());
+                }
+                DirtyKey::ConversationUi => {
+                    buf.conversation_ui = Some(state.conversations.ui.clone());
+                }
+                DirtyKey::ConversationPrompt => {
+                    buf.conversation_prompt = Some(state.conversations.prompt.clone());
+                }
             }
             buf.dirty.insert(key);
         }
@@ -120,20 +165,38 @@ impl ChangeHub {
 
             {
                 let mut buf = self.buf.lock().unwrap_or_else(PoisonError::into_inner);
-                if let Some((version, session)) = buf.session_queue.pop_front() {
-                    if buf.session_queue.is_empty() {
-                        buf.dirty.remove(&DirtyKey::Session);
+                if buf.session_queue.len() > 1 {
+                    // Drain earlier session lifecycle transitions one-by-one before attaching
+                    // coalesced domain state to the latest transition.
+                    if let Some((version, session)) = buf.session_queue.pop_front() {
+                        return Some(CoreChanges {
+                            version,
+                            session: Some(session),
+                            conversations: None,
+                            conversation_flags: None,
+                            conversation_extras: None,
+                            conversation_ui: None,
+                            conversation_prompt: None,
+                        });
                     }
-                    return Some(CoreChanges {
-                        version,
-                        session: Some(session),
-                    });
                 }
-                if !buf.dirty.is_empty() {
+                if buf.session_queue.len() == 1 || buf.has_domain_changes() || !buf.dirty.is_empty()
+                {
+                    let popped_session = buf.session_queue.pop_front();
+                    let has_domains = buf.has_domain_changes();
+                    let version = match (&popped_session, has_domains) {
+                        (Some((sv, _)), false) => *sv,
+                        _ => buf.version,
+                    };
                     buf.dirty.clear();
                     return Some(CoreChanges {
-                        version: buf.version,
-                        session: None,
+                        version,
+                        session: popped_session.map(|(_, s)| s),
+                        conversations: buf.conversations.take(),
+                        conversation_flags: buf.conversation_flags.take(),
+                        conversation_extras: buf.conversation_extras.take(),
+                        conversation_ui: buf.conversation_ui.take(),
+                        conversation_prompt: buf.conversation_prompt.take(),
                     });
                 }
                 if buf.closed {
@@ -182,6 +245,39 @@ mod tests {
             second.and_then(|c| c.session).map(|s| s.phase),
             Some(Phase::Ready)
         );
+    }
+
+    #[tokio::test]
+    async fn coalesces_conversation_bursts_in_place_and_bundles_with_ready() {
+        let hub = ChangeHub::new();
+        let mut state = CoreState::default();
+        state.session.phase = Phase::Ready;
+        state.conversations.actions.loaded = true;
+        hub.publish(
+            &DirtySet::from([
+                DirtyKey::Session,
+                DirtyKey::Conversations,
+                DirtyKey::ConversationFlags,
+            ]),
+            &state,
+        );
+        state.conversations.actions.hidden_enabled = true;
+        hub.publish(&DirtySet::from([DirtyKey::ConversationFlags]), &state);
+
+        let batch = hub.next_changes().await;
+        let Some(batch) = batch else {
+            panic!("expected batch");
+        };
+        assert_eq!(batch.version, 2);
+        assert_eq!(batch.session.as_ref().map(|s| &s.phase), Some(&Phase::Ready));
+        assert!(batch.conversations.is_some());
+        assert_eq!(
+            batch.conversation_flags.as_ref().map(|f| f.hidden_enabled),
+            Some(true)
+        );
+        assert!(batch.conversation_extras.is_none());
+        assert!(batch.conversation_ui.is_none());
+        assert!(batch.conversation_prompt.is_none());
     }
 
     #[tokio::test]

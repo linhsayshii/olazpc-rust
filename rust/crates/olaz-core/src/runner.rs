@@ -2,6 +2,7 @@
 //! and the concrete [`SessionEffectRunner`] backed by `olaz_net::SessionClient`, `olaz_api::ZaloApi`,
 //! and `olaz_ws::WsClient`.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -10,14 +11,21 @@ use olaz_api::{PollState, ZaloApi};
 use olaz_net::{
     LoginAccount, SessionClient, SessionSnapshot as NetSessionSnapshot, Transport, ZaloDomains,
 };
+use olaz_store::Store;
+use olaz_wire::{decode_stored_message, extract_profiles_map};
 use olaz_ws::{CryptoDecryptor, CursorMap, WsClient, WsConfig, WsHandle};
 use serde_json::{Map, Value};
 use tokio::runtime::Handle;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
 use crate::actor::{ActorSink, InFlightGuard};
-use crate::effect::{Effect, HostCall};
+use crate::conversations::{
+    IdentityTable,
+    BatchApplyDelta, MessagePreviewInput, hidden_pin_md5, hidden_pin_sha256,
+    load_local_account_from_store, to_wire_stored,
+};
+use crate::effect::{Effect, HostCall, OpResult, StoreOp};
 use crate::input::{
     CompletedLogin, Input, LegacyCookie, PollBatchError, PollBatchOutcome, SessionFailure,
     StoreToken,
@@ -334,14 +342,14 @@ pub trait Host: Send + Sync {
         increment_unread: bool,
         notify_incoming: bool,
         payload: Map<String, Value>,
-    ) -> u32;
+    ) -> BatchApplyDelta;
     async fn apply_parsed_events(
         &self,
         cmd: u16,
         increment_unread: bool,
         notify_incoming: bool,
         envelope: TypedChatEnvelope,
-    );
+    ) -> BatchApplyDelta;
     async fn mobile_sync(&self, events: Vec<MobileSyncEvent>);
     async fn e2ee_signal(&self, cmd: u16, payload: Map<String, Value>);
     async fn e2ee_deliver_reports(&self, cmd: u16, payload: Map<String, Value>);
@@ -381,6 +389,7 @@ enum HostJob {
         token: StoreToken,
         user_id: String,
         account: Box<LoginAccount>,
+        identities: Box<IdentityTable>,
         sink: ActorSink,
         _guard: InFlightGuard,
     },
@@ -400,6 +409,9 @@ enum HostJob {
     },
     OfferFirstLoginTransfer {
         force: bool,
+        _guard: InFlightGuard,
+    },
+    DetachStore {
         _guard: InFlightGuard,
     },
     ResetDomains {
@@ -438,6 +450,7 @@ enum HostJob {
         increment_unread: bool,
         notify_incoming: bool,
         envelope: TypedChatEnvelope,
+        sink: ActorSink,
         _guard: InFlightGuard,
     },
     MobileSync {
@@ -493,6 +506,24 @@ enum HostJob {
     },
 }
 
+/// Shared SQLite store slot attached during `prepare_store` and detached before `reset_domains`.
+pub type SharedStoreSlot = Arc<Mutex<Option<Arc<Mutex<Store>>>>>;
+
+enum StoreJob {
+    Op {
+        op: StoreOp,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    FlushOp {
+        op_id: u64,
+        result: OpResult,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    Drain(oneshot::Sender<()>),
+}
+
 /// Real effect runner backed by a shared `SessionClient<T>`, a [`WsDriver`], and a [`Host`].
 ///
 /// Generic over `T: Transport` so production uses `ReqwestTransport` and `tests/cases.rs` plugs
@@ -504,11 +535,14 @@ pub struct SessionEffectRunner<T: Transport + 'static> {
     suppress_long_poll: bool,
     ws_active_gen: Arc<Mutex<Option<u64>>>,
     lp_active_gen: Arc<Mutex<Option<u64>>>,
+    shared_store: SharedStoreSlot,
     host_tx: mpsc::UnboundedSender<HostJob>,
+    store_tx: mpsc::UnboundedSender<StoreJob>,
     active_tasks: Arc<Mutex<Vec<AbortHandle>>>,
     lp_timer_abort: Arc<Mutex<Option<AbortHandle>>>,
     lp_fetch_abort: Mutex<Option<AbortHandle>>,
     host_worker_abort: AbortHandle,
+    store_worker_abort: AbortHandle,
     runtime: Handle,
 }
 
@@ -557,14 +591,23 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         suppress_long_poll: bool,
     ) -> Self {
         let (host_tx, host_rx) = mpsc::unbounded_channel();
+        let (store_tx, store_rx) = mpsc::unbounded_channel();
+        let shared_store: SharedStoreSlot = Arc::new(Mutex::new(None));
         let active_tasks: Arc<Mutex<Vec<AbortHandle>>> = Arc::new(Mutex::new(Vec::new()));
         let ws_active_gen: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let lp_active_gen: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let lp_timer_abort: Arc<Mutex<Option<AbortHandle>>> = Arc::new(Mutex::new(None));
+        let store_handle = runtime.spawn(run_store_worker(
+            store_rx,
+            Arc::clone(&shared_store),
+            runtime.clone(),
+        ));
         let worker_handle = runtime.spawn(run_host_worker(HostWorkerDeps {
             rx: host_rx,
             client: Arc::clone(&client),
             host,
+            shared_store: Arc::clone(&shared_store),
+            store_tx: store_tx.clone(),
             ws_driver: Arc::clone(&ws_driver),
             ws_active_gen: Arc::clone(&ws_active_gen),
             lp_active_gen: Arc::clone(&lp_active_gen),
@@ -580,11 +623,14 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
             suppress_long_poll,
             ws_active_gen,
             lp_active_gen,
+            shared_store,
             host_tx,
+            store_tx,
             active_tasks,
             lp_timer_abort,
             lp_fetch_abort: Mutex::new(None),
             host_worker_abort: worker_handle.abort_handle(),
+            store_worker_abort: store_handle.abort_handle(),
             runtime,
         }
     }
@@ -593,6 +639,29 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
     #[must_use]
     pub fn ws_driver(&self) -> &Arc<dyn WsDriver> {
         &self.ws_driver
+    }
+
+    /// Attaches the account's opened SQLite [`Store`] so the core runner can hydrate local state
+    /// and execute serial persistence operations directly without Swift hops.
+    pub fn attach_store(&self, store: Arc<Mutex<Store>>) {
+        *self
+            .shared_store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(store);
+    }
+
+    /// Detaches any attached SQLite [`Store`] handle.
+    pub fn detach_store(&self) {
+        *self
+            .shared_store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// Returns a handle to the shared SQLite store slot (used by test hosts).
+    #[must_use]
+    pub fn shared_store_slot(&self) -> SharedStoreSlot {
+        Arc::clone(&self.shared_store)
     }
 
     fn cancel_active_tasks(&self) {
@@ -932,6 +1001,277 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 Effect::EngineLog(msg) => {
                     tracing::info!(target: "olaz_core::engine_log", "{msg}");
                 }
+                Effect::Store(op) => {
+                    let guard = sink.track();
+                    let _ = self.store_tx.send(StoreJob::Op {
+                        op,
+                        sink: sink.clone(),
+                        _guard: guard,
+                    });
+                }
+                Effect::DetachStore => {
+                    let guard = sink.track();
+                    let _ = self.host_tx.send(HostJob::DetachStore { _guard: guard });
+                }
+                Effect::CompleteOp {
+                    op_id,
+                    result,
+                    after_store: true,
+                } => {
+                    let guard = sink.track();
+                    let _ = self.store_tx.send(StoreJob::FlushOp {
+                        op_id,
+                        result,
+                        sink: sink.clone(),
+                        _guard: guard,
+                    });
+                }
+                Effect::CompleteOp {
+                    after_store: false, ..
+                } => {
+                    // Handled directly by the actor before reaching EffectRunner.
+                }
+                Effect::UpdatePinnedConversationApi { id, pinned, op_id } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let ok = api.update_pinned_conversation(&id, pinned).await.is_ok();
+                        sink.send(Input::PinApiDone {
+                            id,
+                            pinned,
+                            ok,
+                            op_id,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::PinReplacingApi {
+                    op_id,
+                    target_id,
+                    pinned,
+                    unpin_remaining,
+                    pin_id,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let ok = api
+                            .update_pinned_conversation(&target_id, pinned)
+                            .await
+                            .is_ok();
+                        sink.send(Input::PinReplacingStepDone {
+                            op_id,
+                            target_id,
+                            pinned,
+                            unpin_remaining,
+                            pin_id,
+                            ok,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::UpdateArchivedChatApi {
+                    id,
+                    archived,
+                    op_id,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let ok = api.update_archived_chat(&id, archived).await.is_ok();
+                        sink.send(Input::MoveApiDone {
+                            id,
+                            to_other: archived,
+                            ok,
+                            op_id,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::DeleteConversationApi {
+                    id,
+                    last_cli_msg_id,
+                    op_id,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let _ = api.delete_conversation(&id, &last_cli_msg_id).await;
+                        sink.send(Input::DeleteApiDone { id, op_id });
+                        drop(guard);
+                    });
+                }
+                Effect::SetUnreadMarkApi { conv_id, unread } => {
+                    let client = Arc::clone(&self.client);
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let _ = api.set_unread_mark(&conv_id, unread).await;
+                        drop(guard);
+                    });
+                }
+                Effect::SendSeenApi(target) => {
+                    let client = Arc::clone(&self.client);
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let _ = api
+                            .send_seen(
+                                &target.conv_id,
+                                &target.msg_id,
+                                &target.cli_msg_id,
+                                &target.sender_id,
+                            )
+                            .await;
+                        drop(guard);
+                    });
+                }
+                Effect::SetHiddenConversationApi {
+                    conv_id,
+                    hidden,
+                    op_id,
+                    result,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let _ = api.set_hidden_conversation(&conv_id, hidden).await;
+                        if let (Some(id), Some(res)) = (op_id, result) {
+                            sink.send(Input::OpApiDone {
+                                op_id: id,
+                                result: OpResult::ActionResult(res),
+                            });
+                        }
+                        drop(guard);
+                    });
+                }
+                Effect::UpdateHiddenPinApi { pin, kind, op_id } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let md5 = if client.is_authenticated() {
+                            let api = ZaloApi::from_shared(Arc::clone(&client));
+                            if api.update_hidden_pin(&pin).await.is_err() {
+                                sink.send(Input::HiddenPinSyncDone {
+                                    op_id,
+                                    kind,
+                                    ok: false,
+                                    md5: None,
+                                    sha256: String::new(),
+                                });
+                                drop(guard);
+                                return;
+                            }
+                            Some(hidden_pin_md5(&pin))
+                        } else {
+                            None
+                        };
+                        let sha256 = hidden_pin_sha256(&pin);
+                        sink.send(Input::HiddenPinSyncDone {
+                            op_id,
+                            kind,
+                            ok: true,
+                            md5,
+                            sha256,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::ResetHiddenPinApi { op_id } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let ok = if client.is_authenticated() {
+                            let api = ZaloApi::from_shared(client);
+                            api.reset_hidden_pin().await.is_ok()
+                        } else {
+                            true
+                        };
+                        sink.send(Input::ResetHiddenPinApiDone { op_id, ok });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchHiddenConversationsApi { op_id } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let snapshot = if client.is_authenticated() {
+                            let api = ZaloApi::from_shared(client);
+                            api.fetch_hidden_conversations().await.ok()
+                        } else {
+                            None
+                        };
+                        sink.send(Input::SyncHiddenFetched { op_id, snapshot });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchProfilesChunkApi {
+                    op_id,
+                    chunk,
+                    remaining_chunks,
+                    profiles_cache_changed,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let profiles_map = match api.fetch_profiles(&chunk).await {
+                            Ok(raw) => extract_profiles_map(&raw),
+                            Err(_) => Map::new(),
+                        };
+                        sink.send(Input::ResolveNamesChunkDone {
+                            op_id,
+                            remaining_chunks,
+                            profiles_map,
+                            profiles_cache_changed,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::UpdateConversationLabelsApi {
+                    label_data_json,
+                    op_id,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let _ = api.update_conversation_labels(&label_data_json).await;
+                        if let Some(id) = op_id {
+                            sink.send(Input::OpApiDone {
+                                op_id: id,
+                                result: OpResult::Unit,
+                            });
+                        }
+                        drop(guard);
+                    });
+                }
+                Effect::FetchConversationLabelsApi { op_id } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let payload = api.fetch_conversation_labels().await.ok();
+                        sink.send(Input::SyncLabelsFetched { op_id, payload });
+                        drop(guard);
+                    });
+                }
                 Effect::Host(call) => {
                     let guard = sink.track();
                     let job = match call {
@@ -939,10 +1279,12 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             token,
                             user_id,
                             account,
+                            identities,
                         } => HostJob::PrepareStore {
                             token,
                             user_id,
                             account,
+                            identities,
                             sink: sink.clone(),
                             _guard: guard,
                         },
@@ -996,6 +1338,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             increment_unread,
                             notify_incoming,
                             envelope,
+                            sink: sink.clone(),
                             _guard: guard,
                         },
                         HostCall::MobileSync { events } => HostJob::MobileSync {
@@ -1082,6 +1425,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
         self.cancel_long_poll();
         self.ws_driver.stop(false);
         self.host_worker_abort.abort();
+        self.store_worker_abort.abort();
     }
 }
 
@@ -1091,10 +1435,121 @@ fn unix_now_secs() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+async fn run_store_worker(
+    mut rx: mpsc::UnboundedReceiver<StoreJob>,
+    shared_store: SharedStoreSlot,
+    runtime: Handle,
+) {
+    while let Some(job) = rx.recv().await {
+        match job {
+            StoreJob::Op { op, sink, _guard } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                match op {
+                    StoreOp::LoadMentionPreviewMessages {
+                        op_id,
+                        group_ids,
+                        my_uid: _,
+                    } => {
+                        let messages = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store = store_arc
+                                        .lock()
+                                        .unwrap_or_else(PoisonError::into_inner);
+                                    let mut map = BTreeMap::new();
+                                    for gid in group_ids {
+                                        if let Ok(rows) = store.messages(&gid, None, 1)
+                                            && let Some(latest) = rows.last()
+                                            && let Some(msg) = decode_stored_message(
+                                                &to_wire_stored(latest),
+                                            )
+                                        {
+                                            map.insert(gid, MessagePreviewInput::from_chat_message(&msg));
+                                        }
+                                    }
+                                    map
+                                })
+                                .await
+                                .unwrap_or_default()
+                        } else {
+                            BTreeMap::new()
+                        };
+                        sink.send(Input::MentionPreviewsLoaded { op_id, messages });
+                    }
+                    other => {
+                        if let Some(store_arc) = store_opt {
+                            let _ = runtime
+                                .spawn_blocking(move || {
+                                    let mut store = store_arc
+                                        .lock()
+                                        .unwrap_or_else(PoisonError::into_inner);
+                                    match other {
+                                        StoreOp::SaveConversations(mut rows) => {
+                                            let now = unix_now_ms();
+                                            for row in &mut rows {
+                                                row.updated_at_ms = now;
+                                            }
+                                            let _ = store.save_conversations(&rows);
+                                        }
+                                        StoreOp::SetConversationPinned { id, pinned } => {
+                                            let _ = store.set_conversation_pinned(&id, pinned);
+                                        }
+                                        StoreOp::SetConversationUnread { id, unread } => {
+                                            let _ = store.set_conversation_unread(&id, unread);
+                                        }
+                                        StoreOp::DeleteConversation { id } => {
+                                            let _ = store.delete_conversation(&id);
+                                        }
+                                        StoreOp::SetPreferenceString { key, value } => {
+                                            let _ = store.set_preference_string(&key, &value);
+                                        }
+                                        StoreOp::SetPreferenceStrings { key, values } => {
+                                            let _ = store.set_preference_strings(&key, &values);
+                                        }
+                                        StoreOp::SetPreferenceData { key, data } => {
+                                            let _ = store.set_preference_data(&key, &data);
+                                        }
+                                        StoreOp::DeletePreference { key } => {
+                                            let _ = store.delete_preference(&key);
+                                        }
+                                        StoreOp::LoadMentionPreviewMessages { .. } => {}
+                                    }
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
+            StoreJob::FlushOp {
+                op_id,
+                result,
+                sink,
+                _guard,
+            } => {
+                sink.send(Input::OpStoreFlushed { op_id, result });
+            }
+            StoreJob::Drain(tx) => {
+                let _ = tx.send(());
+            }
+        }
+    }
+}
+
 struct HostWorkerDeps<T: Transport + 'static> {
     rx: mpsc::UnboundedReceiver<HostJob>,
     client: Arc<SessionClient<T>>,
     host: Arc<dyn Host>,
+    shared_store: SharedStoreSlot,
+    store_tx: mpsc::UnboundedSender<StoreJob>,
     ws_driver: Arc<dyn WsDriver>,
     ws_active_gen: Arc<Mutex<Option<u64>>>,
     lp_active_gen: Arc<Mutex<Option<u64>>>,
@@ -1109,6 +1564,8 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
         mut rx,
         client,
         host,
+        shared_store,
+        store_tx,
         ws_driver,
         ws_active_gen,
         lp_active_gen,
@@ -1210,14 +1667,46 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 token,
                 user_id,
                 account,
+                identities,
                 sink,
                 _guard,
             } => {
+                let my_uid = user_id.clone();
+                let my_avatar = (!account.avatar.is_empty()).then(|| account.avatar.clone());
+                let self_conv_id = if account.send2me_id.is_empty() {
+                    Some(account.user_id.clone())
+                } else {
+                    Some(account.send2me_id.clone())
+                };
                 host.prepare_store(user_id, *account).await;
                 let transport_state = host.load_transport_state().await;
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let local_hydration = if let Some(store_arc) = store_opt {
+                    runtime
+                        .spawn_blocking(move || {
+                            let mut store = store_arc
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner);
+                            load_local_account_from_store(
+                                &mut store,
+                                &my_uid,
+                                my_avatar.as_deref(),
+                                self_conv_id.as_deref(),
+                                &identities,
+                            )
+                        })
+                        .await
+                        .ok()
+                } else {
+                    None
+                };
                 sink.send(Input::PrepareStoreDone {
                     token,
                     transport_state,
+                    local_hydration: local_hydration.map(Box::new),
                 });
             }
             HostJob::StartWs {
@@ -1269,6 +1758,15 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
             HostJob::OfferFirstLoginTransfer { force, _guard } => {
                 host.offer_first_login_transfer(force).await;
             }
+            HostJob::DetachStore { _guard } => {
+                let (tx, rx) = oneshot::channel();
+                if store_tx.send(StoreJob::Drain(tx)).is_ok() {
+                    let _ = rx.await;
+                }
+                *shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = None;
+            }
             HostJob::ResetDomains { _guard } => {
                 host.reset_domains().await;
             }
@@ -1302,15 +1800,17 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 sink,
                 _guard,
             } => {
-                let applied_count = host
+                let delta = host
                     .apply_batch(cmd, increment_unread, notify_incoming, payload)
                     .await;
                 if let Some((lp_gen, drain_id)) = poll_batch_done {
                     sink.send(Input::PollBatchApplied {
                         lp_gen,
                         drain_id,
-                        applied_count,
+                        delta,
                     });
+                } else if delta.applied_count > 0 || !delta.updates.is_empty() {
+                    sink.send(Input::BatchDeltaApplied { delta });
                 }
             }
             HostJob::ApplyParsedEvents {
@@ -1318,10 +1818,15 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 increment_unread,
                 notify_incoming,
                 envelope,
+                sink,
                 _guard,
             } => {
-                host.apply_parsed_events(cmd, increment_unread, notify_incoming, envelope)
+                let delta = host
+                    .apply_parsed_events(cmd, increment_unread, notify_incoming, envelope)
                     .await;
+                if delta.applied_count > 0 || !delta.updates.is_empty() {
+                    sink.send(Input::BatchDeltaApplied { delta });
+                }
             }
             HostJob::MobileSync { events, _guard } => {
                 host.mobile_sync(events).await;
@@ -1455,8 +1960,8 @@ mod tests {
             _increment_unread: bool,
             _notify_incoming: bool,
             _payload: Map<String, Value>,
-        ) -> u32 {
-            0
+        ) -> BatchApplyDelta {
+            BatchApplyDelta::default()
         }
         async fn apply_parsed_events(
             &self,
@@ -1464,7 +1969,8 @@ mod tests {
             _increment_unread: bool,
             _notify_incoming: bool,
             _envelope: TypedChatEnvelope,
-        ) {
+        ) -> BatchApplyDelta {
+            BatchApplyDelta::default()
         }
         async fn mobile_sync(&self, _events: Vec<MobileSyncEvent>) {}
         async fn e2ee_signal(&self, _cmd: u16, _payload: Map<String, Value>) {}

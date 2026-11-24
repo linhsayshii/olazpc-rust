@@ -38,7 +38,7 @@ pub fn reduce_session(state: &mut CoreState, input: Input, out: &mut ReduceOutpu
             match account {
                 Some(acc) if !acc.user_id.is_empty() => {
                     begin_store_prepare_for_boot(
-                        &mut state.session,
+                        state,
                         boot_gen,
                         acc,
                         ws_endpoints,
@@ -70,7 +70,7 @@ pub fn reduce_session(state: &mut CoreState, input: Input, out: &mut ReduceOutpu
                     }
                     out.effects.push(Effect::Host(HostCall::PersistSession));
                     begin_store_prepare_for_boot(
-                        &mut state.session,
+                        state,
                         boot_gen,
                         acc,
                         ws_endpoints,
@@ -89,6 +89,7 @@ pub fn reduce_session(state: &mut CoreState, input: Input, out: &mut ReduceOutpu
         Input::PrepareStoreDone {
             token,
             transport_state,
+            local_hydration,
         } => {
             let matches = match (&state.session.pending_store, token) {
                 (Some(PendingStore::Boot { boot_gen, .. }), StoreToken::Boot(t)) => {
@@ -107,6 +108,29 @@ pub fn reduce_session(state: &mut CoreState, input: Input, out: &mut ReduceOutpu
             };
             state.transport.poll_state = transport_state.poll_state;
             state.transport.ws_cursors = transport_state.ws_cursors;
+            if let Some(hydration) = local_hydration {
+                let my_uid = state
+                    .session
+                    .profile
+                    .as_ref()
+                    .map(|p| p.user_id.clone())
+                    .unwrap_or_default();
+                let my_avatar = state
+                    .session
+                    .profile
+                    .as_ref()
+                    .and_then(|p| p.avatar.clone());
+                let self_conv_id = state.session.self_conversation_id.clone();
+                state.conversations.hydrate_from_local(
+                    *hydration,
+                    &my_uid,
+                    my_avatar.as_deref(),
+                    self_conv_id.as_deref(),
+                );
+                out.dirty.insert(DirtyKey::Conversations);
+                out.dirty.insert(DirtyKey::ConversationFlags);
+                out.dirty.insert(DirtyKey::ConversationExtras);
+            }
             match pending {
                 PendingStore::Boot {
                     boot_gen,
@@ -275,6 +299,7 @@ pub fn reduce_session(state: &mut CoreState, input: Input, out: &mut ReduceOutpu
                         token: StoreToken::Qr(qr_gen),
                         user_id: done.account.user_id.clone(),
                         account: Box::new(done.account),
+                        identities: Box::new(state.conversations.identities.clone()),
                     }));
                 }
                 Err(failure) => apply_qr_failure(&mut state.session, failure, out),
@@ -304,17 +329,24 @@ fn reduce_command(state: &mut CoreState, cmd: Command, out: &mut ReduceOutput) {
         Command::LogOut => {
             tracing::debug!("session: log out");
             reset_session_fields(&mut state.session);
+            state.conversations.reset();
             state.session.sign_out_notice = None;
             state.session.qr_gen = state.session.qr_gen.saturating_add(1);
             state.session.phase = Phase::Login(LoginState::generating());
             out.dirty.insert(DirtyKey::Session);
+            out.dirty.insert(DirtyKey::Conversations);
+            out.dirty.insert(DirtyKey::ConversationFlags);
+            out.dirty.insert(DirtyKey::ConversationExtras);
+            out.dirty.insert(DirtyKey::ConversationUi);
+            out.dirty.insert(DirtyKey::ConversationPrompt);
 
             // Order matches Swift `logOut`: cancel tasks, stop transport, clear session,
-            // reset domains, start QR.
+            // detach SQLite store, reset domains, start QR.
             out.effects.push(Effect::CancelSessionTasks);
             transport::stop_transport(state, true, out);
             out.effects.push(Effect::ClearCoreSession);
             out.effects.push(Effect::Host(HostCall::ClearSession));
+            out.effects.push(Effect::DetachStore);
             out.effects.push(Effect::Host(HostCall::ResetDomains));
             out.effects.push(Effect::RequestQr {
                 qr_gen: state.session.qr_gen,
@@ -328,20 +360,20 @@ fn reduce_command(state: &mut CoreState, cmd: Command, out: &mut ReduceOutput) {
             apply_account_profile(&mut state.session, &account);
             out.dirty.insert(DirtyKey::Session);
         }
-        Command::DrainChatPolling { .. } => {}
+        _ => {}
     }
 }
 
 fn begin_store_prepare_for_boot(
-    state: &mut SessionState,
+    state: &mut CoreState,
     boot_gen: u64,
     account: LoginAccount,
     ws_endpoints: Vec<String>,
     out: &mut ReduceOutput,
 ) {
-    apply_account_profile(state, &account);
+    apply_account_profile(&mut state.session, &account);
     out.dirty.insert(DirtyKey::Session);
-    state.pending_store = Some(PendingStore::Boot {
+    state.session.pending_store = Some(PendingStore::Boot {
         boot_gen,
         ws_endpoints,
     });
@@ -349,6 +381,7 @@ fn begin_store_prepare_for_boot(
         token: StoreToken::Boot(boot_gen),
         user_id: account.user_id.clone(),
         account: Box::new(account),
+        identities: Box::new(state.conversations.identities.clone()),
     }));
 }
 
@@ -544,6 +577,7 @@ mod tests {
             Input::PrepareStoreDone {
                 token: StoreToken::Boot(1),
                 transport_state: PersistedTransportState::default(),
+                local_hydration: None,
             },
         );
         assert_eq!(state.session.phase, Phase::Ready);
@@ -672,6 +706,7 @@ mod tests {
             Input::PrepareStoreDone {
                 token: StoreToken::Qr(1),
                 transport_state: PersistedTransportState::default(),
+                local_hydration: None,
             },
         );
         assert_eq!(state.session.phase, Phase::Ready);
@@ -714,6 +749,7 @@ mod tests {
                 Effect::StopLongPoll,
                 Effect::ClearCoreSession,
                 Effect::Host(HostCall::ClearSession),
+                Effect::DetachStore,
                 Effect::Host(HostCall::ResetDomains),
                 Effect::RequestQr { qr_gen: 1, .. }
             ]

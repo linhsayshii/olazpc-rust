@@ -25,18 +25,22 @@ pub use conversations::{
     ConversationLeaveType, ConversationPreview, ConversationPrompt, ConversationRemoval,
     ConversationSummary, ConversationToast, ConversationsState, FriendIdentity, GroupIdentity,
     IdentityTable, LocalAccountHydration, MessagePreviewInput, PinBoard, StrangerBox, ToastKind,
+    message_preview_label, to_wire_stored,
 };
-pub use effect::{Effect, HostCall};
+pub use effect::{Effect, HostCall, OpResult, StoreOp};
 pub use input::{
-    Command, CompletedLogin, Input, LegacyCookie, PollBatchError, PollBatchOutcome, SessionFailure,
-    StoreToken,
+    Command, CompletedLogin, HiddenPinSyncKind, Input, LegacyCookie, PollBatchError,
+    PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
 };
 pub use reduce::classify::{MobileSyncEvent, Route, classify, classify_poll};
 pub use reduce::{ReduceOutput, reduce};
-pub use runner::{EffectRunner, Host, LiveWsDriver, SessionEffectRunner, WsDriver, WsStartParams};
+pub use runner::{
+    EffectRunner, Host, LiveWsDriver, SessionEffectRunner, SharedStoreSlot, WsDriver, WsStartParams,
+};
 pub use state::{
-    CoreFailKind, CoreState, FailReason, LoginState, LoginStep, PersistedTransportState, Phase,
-    Profile, SessionSnapshot, SessionState, TransportState, WsPhase,
+    CoreFailKind, CoreSnapshot, CoreState, FailReason, LoginState, LoginStep,
+    PersistedTransportState, Phase, Profile, SessionSnapshot, SessionState, TransportState,
+    WsPhase,
 };
 pub use typed_chat::{
     ParseState, PlainChatParse, SharedParse, TypedChatEnvelope, WirePayloadHandle,
