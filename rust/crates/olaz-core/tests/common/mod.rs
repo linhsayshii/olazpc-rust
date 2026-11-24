@@ -1,37 +1,55 @@
-//! Case format v1 replay engine shared by `tests/cases.rs` and `tests/session_scenarios.rs`.
+//! Case format v1 replay engine shared by `tests/cases.rs`, `tests/session_scenarios.rs`, and
+//! `tests/transport_scenarios.rs`.
 //!
 //! Runs the real `olaz_core::CoreHandle` + `SessionEffectRunner<ScriptedTransport>` over the real
-//! `olaz_net::SessionClient` request builders and `olaz_crypto` AES/ParamCipher crypto.
+//! `olaz_net::SessionClient`, `olaz_api::ZaloApi`, `olaz_ws::WsCore`, and `olaz_crypto`.
 
 #![expect(
     dead_code,
     reason = "shared test helper used selectively by each test binary"
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use olaz_core::actor::CoreHandle;
-use olaz_core::input::{Command, LegacyCookie};
-use olaz_core::runner::{Host, SessionEffectRunner};
-use olaz_core::state::{CoreFailKind, CoreState, LoginStep, Phase, SessionSnapshot};
+use olaz_api::PollState;
+use olaz_core::actor::{ActorSink, CoreHandle};
+use olaz_core::input::{Command, Input, LegacyCookie};
+use olaz_core::reduce::classify::MobileSyncEvent;
+use olaz_core::runner::{Host, SessionEffectRunner, WsDriver, WsStartParams};
+use olaz_core::state::{
+    CoreFailKind, CoreState, LoginStep, PersistedTransportState, Phase, SessionSnapshot,
+};
+use olaz_core::typed_chat::{
+    PlainChatParse, TypedChatEnvelope, new_shared_parse, try_parse_plain_chat,
+};
 use olaz_crypto::{decode_aes, encode_aes, md5_hex, parse_any, parse_secret_key};
 use olaz_net::http::{DEFAULT_REQUEST_TIMEOUT, RawResponse, RequestSpec, Transport};
 use olaz_net::{
     LoginAccount, NetError, NetworkErrorKind, SessionClient, ZaloDomains, ZaloSessionError,
 };
+use olaz_wire::{WireParseOptions, extract_batch_events};
+use olaz_ws::consts::{CMD_AUTHEN, CMD_PING, CMD_PING_ACTIVE, DEFAULT_WS_ENDPOINTS, FRAME_VERSION};
+use olaz_ws::frame::encode_frame_json;
+use olaz_ws::{
+    CloseRequest, CryptoDecryptor, CursorMap, ReconnectPolicy, WsCore, build_socket_url,
+    decode_frame,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::runtime::Handle;
+use tokio::sync::{Notify, mpsc};
+use tokio::task::AbortHandle;
 
 /// Keys replaced with `"<volatile>"` before canonical request comparison (Case format v1).
 pub const VOLATILE_KEYS: &[&str] = &[
     "imei",
     "client_time",
     "ts",
+    "t",
     "signkey",
     "zcid",
     "zcid_ext",
@@ -44,10 +62,6 @@ pub const VOLATILE_KEYS: &[&str] = &[
 /// Test-only canonicalization for `FailReason::Core` so `tests/cases.rs` can compare against
 /// recordings captured on an English macOS locale without hard-coding Foundation text in
 /// production Rust code (see Q1 in approved design).
-///
-/// Reproduces `RustCore.mapError(...).localizedDescription` on an `en` macOS locale
-/// (including Foundation's `NSError` description without `userInfo`, e.g.
-/// `URLError(.cannotConnectToHost).localizedDescription`).
 pub fn render_core_fail_en(kind: &CoreFailKind) -> String {
     match kind {
         CoreFailKind::Network(NetworkErrorKind::Timeout) => {
@@ -98,11 +112,18 @@ pub struct Seed {
     pub legacy_cookie: Option<Value>,
     #[serde(default)]
     pub prefs: BTreeMap<String, String>,
+    #[serde(default)]
+    pub poll_state: Option<Value>,
+    #[serde(default)]
+    pub ws_cursors: Option<Value>,
+    #[serde(default)]
+    pub suppress: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ServerEntry {
     pub kind: String,
+    #[serde(default)]
     pub path: String,
     #[serde(default)]
     pub method: Option<String>,
@@ -112,6 +133,20 @@ pub struct ServerEntry {
     pub response: Option<HttpResponseSpec>,
     #[serde(default)]
     pub accept: Option<bool>,
+    #[serde(default)]
+    pub cmd: Option<u16>,
+    #[serde(default)]
+    pub sub_cmd: Option<u8>,
+    #[serde(default)]
+    pub version: Option<u8>,
+    #[serde(default)]
+    pub encrypt: Option<u8>,
+    #[serde(default)]
+    pub payload: Option<Value>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub code: Option<u16>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -145,6 +180,14 @@ pub enum Step {
         predicate: AwaitPredicate,
         #[serde(default)]
         timeout_ms: Option<u64>,
+    },
+    AwaitHost {
+        await_host: String,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
+    WsPush {
+        ws_push: usize,
     },
     Snapshot {
         snapshot: String,
@@ -246,13 +289,25 @@ enum ScriptDispatch {
 /// scripted JSON responses the way Zalo does.
 pub struct ScriptedTransport {
     state: Mutex<ScriptState>,
-    recorded: Mutex<Vec<Value>>,
+    recorded: Arc<Mutex<Vec<Value>>>,
     /// Session AES secret key (kept in sync from seed + `getLoginInfo` responses).
     secret_key: Mutex<Option<Vec<u8>>>,
 }
 
 impl ScriptedTransport {
     pub fn new(entries: Vec<ServerEntry>, initial_secret_key: Option<Vec<u8>>) -> Self {
+        Self::with_recorded(
+            entries,
+            initial_secret_key,
+            Arc::new(Mutex::new(Vec::new())),
+        )
+    }
+
+    pub fn with_recorded(
+        entries: Vec<ServerEntry>,
+        initial_secret_key: Option<Vec<u8>>,
+        recorded: Arc<Mutex<Vec<Value>>>,
+    ) -> Self {
         let states: Vec<ScriptedEntryState> = entries
             .into_iter()
             .map(|spec| ScriptedEntryState {
@@ -266,7 +321,7 @@ impl ScriptedTransport {
                 entries: states,
                 server_down,
             }),
-            recorded: Mutex::new(Vec::new()),
+            recorded,
             secret_key: Mutex::new(initial_secret_key),
         }
     }
@@ -304,19 +359,19 @@ impl ScriptedTransport {
         reqs
     }
 
-    fn update_secret_key_from_response(&self, json_val: &Value) {
-        let enk = json_val
+    fn update_secret_key_from_response(&self, json: &Value) {
+        if let Some(enk) = json
             .get("data")
-            .and_then(Value::as_object)
             .and_then(|d| d.get("zpw_enk"))
-            .and_then(Value::as_str);
-        if let Some(enk) = enk {
-            let parsed = parse_secret_key(enk);
-            if parsed.len() == 16 || parsed.len() == 32 {
+            .and_then(Value::as_str)
+            && !enk.is_empty()
+        {
+            let key = parse_secret_key(enk);
+            if key.len() == 16 || key.len() == 32 {
                 *self
                     .secret_key
                     .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Some(parsed);
+                    .unwrap_or_else(PoisonError::into_inner) = Some(key);
             }
         }
     }
@@ -326,12 +381,15 @@ impl ScriptedTransport {
         if state.server_down {
             return ScriptDispatch::Refused;
         }
-        let mut matched = None;
-        for entry in state.entries.iter_mut() {
-            if entry.consumed || entry.spec.kind != "http" || entry.spec.path != path {
+        let mut matched_spec: Option<ServerEntry> = None;
+        for entry in &mut state.entries {
+            if entry.spec.kind != "http" || entry.consumed {
                 continue;
             }
-            if let Some(expected_method) = &entry.spec.method
+            if entry.spec.path != path {
+                continue;
+            }
+            if let Some(expected_method) = entry.spec.method.as_deref()
                 && !expected_method.eq_ignore_ascii_case(method)
             {
                 continue;
@@ -339,13 +397,13 @@ impl ScriptedTransport {
             if !entry.spec.repeat {
                 entry.consumed = true;
             }
-            matched = Some(entry.spec.clone());
+            matched_spec = Some(entry.spec.clone());
             break;
         }
         if should_stop_server(&state.entries) {
             state.server_down = true;
         }
-        match matched {
+        match matched_spec {
             Some(spec)
                 if spec.response.as_ref().and_then(|r| r.error.as_deref()) == Some("refused") =>
             {
@@ -464,8 +522,6 @@ fn encrypt_response_if_needed(plain: &Value, encrypt_key: Option<&[u8]>) -> Vec<
     let Some(obj) = plain.as_object() else {
         return serde_json::to_vec(plain).unwrap_or_default();
     };
-    // Match Zalo wire format: if `data` is a JSON object/array, AES-encrypt it under the request
-    // key (`ParamCipher` key for `reqqr`/`getLoginInfo`, session `zpw_enk` for authenticated calls).
     if let Some(data_val) = obj.get("data")
         && (data_val.is_object() || data_val.is_array())
         && let Ok(data_json) = serde_json::to_string(data_val)
@@ -490,19 +546,12 @@ impl Transport for ScriptedTransport {
             .clone();
         let dispatch = self.dispatch_entry(&request.path(), request.method.as_str());
 
-        // Under `tokio::time::pause()`, a small virtual RTT (10ms) guarantees the actor + any
-        // `await`/`snapshot` observer finishes draining synchronously before the next HTTP reply
-        // arrives, while advancing instantaneously in real time. A scripted `"timeout"` sleeps the
-        // request's real idle timeout so `wait_for_qr_scan` hits its 60s deadline floor in one call.
         let mut virtual_rtt = Duration::from_millis(10);
         let result = match dispatch {
-            ScriptDispatch::Refused => {
-                // Refused requests never reach the server listener, so they are not recorded.
-                Err(NetError::network(
-                    NetworkErrorKind::Other,
-                    "scripted refused",
-                ))
-            }
+            ScriptDispatch::Refused => Err(NetError::network(
+                NetworkErrorKind::Other,
+                "scripted refused",
+            )),
             ScriptDispatch::Unscripted => {
                 let (canonical, _) = canonical_http_request(&request, session_key.as_deref(), true);
                 self.recorded
@@ -552,8 +601,6 @@ impl Transport for ScriptedTransport {
                                 raw.into_bytes()
                             } else if let Some(json_val) = resp.json {
                                 self.update_secret_key_from_response(&json_val);
-                                // Encrypt response `data` using ParamCipher key (for reqqr/getLoginInfo)
-                                // or session key (for authenticated API calls with `params`).
                                 let resp_key = if param_cipher_key.is_some() {
                                     param_cipher_key.as_deref()
                                 } else if has_params {
@@ -583,12 +630,481 @@ impl Transport for ScriptedTransport {
     }
 }
 
-/// Fake [`Host`] that answers `load_saved_session` / `load_legacy_cookie` from the case `seed`
-/// and records every traced domain activity in Case format v1 `host` order.
+/// Scripted [`WsDriver`] built directly on `olaz_ws::WsCore`.
+///
+/// Supports:
+/// - `suppress`: if true, `start` is a no-op (no `ws_connect`, no auth, no `e2ee_connected`);
+/// - auto-delivery of `cmd == 1` auth reply on connect;
+/// - gated delivery of subsequent `ws_frame` / `ws_close` entries via [`Self::push`];
+/// - recording of `ws_connect` and outgoing `ws_send` frames (excluding pings cmd 2/4);
+/// - strict event-before-cursors ordering per frame.
+pub struct ScriptedWsDriver {
+    suppress: bool,
+    recorded: Arc<Mutex<Vec<Value>>>,
+    ws_connects: Arc<Mutex<VecDeque<ServerEntry>>>,
+    ws_events: Arc<Mutex<VecDeque<ServerEntry>>>,
+    state: Arc<Mutex<ScriptedWsState>>,
+}
+
+struct ScriptedWsState {
+    push_tx: Option<mpsc::UnboundedSender<usize>>,
+    task_abort: Option<AbortHandle>,
+    core: Arc<Mutex<WsCore>>,
+    fixed_now_secs: i64,
+}
+
+impl ScriptedWsDriver {
+    pub fn new(entries: &[ServerEntry], recorded: Arc<Mutex<Vec<Value>>>, suppress: bool) -> Self {
+        let mut ws_connects = VecDeque::new();
+        let mut ws_events = VecDeque::new();
+        for e in entries {
+            match e.kind.as_str() {
+                "ws" => ws_connects.push_back(e.clone()),
+                "ws_frame" | "ws_close" => ws_events.push_back(e.clone()),
+                _ => {}
+            }
+        }
+        Self {
+            suppress,
+            recorded,
+            ws_connects: Arc::new(Mutex::new(ws_connects)),
+            ws_events: Arc::new(Mutex::new(ws_events)),
+            state: Arc::new(Mutex::new(ScriptedWsState {
+                push_tx: None,
+                task_abort: None,
+                core: Arc::new(Mutex::new(WsCore::new())),
+                fixed_now_secs: 1_700_000_000,
+            })),
+        }
+    }
+
+    /// Releases the next `count` scripted `ws_frame` / `ws_close` entries to the active session.
+    pub fn push(&self, count: usize) {
+        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(tx) = &st.push_tx {
+            let _ = tx.send(count);
+        }
+    }
+
+    /// Injects an ad-hoc `ws_frame` / `ws_close` directly into the queue and pushes it.
+    pub fn enqueue_and_push(&self, entry: ServerEntry) {
+        self.ws_events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(entry);
+        self.push(1);
+    }
+}
+
+fn encode_scripted_ws_frame(entry: &ServerEntry) -> Vec<u8> {
+    let cmd = entry.cmd.unwrap_or(0);
+    let sub_cmd = entry.sub_cmd.unwrap_or(1);
+    let version = entry.version.unwrap_or(FRAME_VERSION);
+    let encrypt = entry.encrypt.unwrap_or(0);
+    let payload_val = entry.payload.clone().unwrap_or_else(|| json!({}));
+
+    if encrypt > 0 {
+        let mut map = payload_val.as_object().cloned().unwrap_or_default();
+        map.entry("encrypt".to_owned())
+            .or_insert_with(|| Value::from(encrypt));
+        if let Some(key) = &entry.key {
+            map.insert("key".to_owned(), Value::String(key.clone()));
+        }
+        return encode_frame_json(cmd, sub_cmd, version, Some(&map));
+    }
+
+    // Wrap plain payload in `{"encrypt": 0, "data": "<json>"}` so `WsCore::handle_binary_frame`
+    // and `WsCore::handle_auth` both recover the exact payload map losslessly.
+    let mut envelope = Map::new();
+    envelope.insert("encrypt".to_owned(), Value::from(0u8));
+    if let Some(key) = &entry.key {
+        envelope.insert("key".to_owned(), Value::String(key.clone()));
+    }
+    let data_str = serde_json::to_string(&payload_val).unwrap_or_else(|_| "{}".to_owned());
+    envelope.insert("data".to_owned(), Value::String(data_str));
+    encode_frame_json(cmd, sub_cmd, version, Some(&envelope))
+}
+
+fn record_ws_connect(recorded: &Arc<Mutex<Vec<Value>>>, endpoint: &str) {
+    let full = build_socket_url(endpoint, 0);
+    let parsed = url::Url::parse(&full).ok();
+    let path = parsed
+        .as_ref()
+        .map_or_else(|| "/".to_owned(), |u| u.path().to_owned());
+    let mut query_map = BTreeMap::new();
+    if let Some(u) = &parsed {
+        for (k, v) in u.query_pairs() {
+            let scrubbed = if is_volatile_key(&k) {
+                "<volatile>".to_owned()
+            } else {
+                v.into_owned()
+            };
+            query_map.insert(k.into_owned(), Value::String(scrubbed));
+        }
+    }
+    let query_obj: Map<String, Value> = query_map.into_iter().collect();
+    recorded
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(json!({
+            "kind": "ws_connect",
+            "path": path,
+            "query": Value::Object(query_obj),
+        }));
+}
+
+fn record_ws_send_bytes(recorded: &Arc<Mutex<Vec<Value>>>, raw: &[u8]) {
+    let Ok(frame) = decode_frame(raw) else {
+        return;
+    };
+    if frame.cmd == CMD_PING || frame.cmd == CMD_PING_ACTIVE {
+        return;
+    }
+    let payload = scrub_volatile_value(Value::Object(frame.envelope));
+    recorded
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(json!({
+            "kind": "ws_send",
+            "cmd": frame.cmd,
+            "sub_cmd": frame.sub_cmd,
+            "payload": payload,
+        }));
+}
+
+fn deliver_frame_to_core(
+    core: &Arc<Mutex<WsCore>>,
+    recorded: &Arc<Mutex<Vec<Value>>>,
+    parse_state: &olaz_core::typed_chat::SharedParse,
+    sink: &ActorSink,
+    ws_gen: u64,
+    now_unix_secs: i64,
+    entry: &ServerEntry,
+) -> Option<CloseRequest> {
+    let bytes = encode_scripted_ws_frame(entry);
+    let (prev_authed, now_authed, out) = {
+        let mut guard = core.lock().unwrap_or_else(PoisonError::into_inner);
+        let prev = guard.is_authed();
+        let outcome = guard.handle_binary_frame(&bytes, &CryptoDecryptor);
+        let now = guard.is_authed();
+        (prev, now, outcome)
+    };
+    for send in &out.sends {
+        record_ws_send_bytes(recorded, send);
+    }
+    if prev_authed != now_authed {
+        sink.send(Input::WsAuthChanged {
+            ws_gen,
+            authed: now_authed,
+        });
+    }
+    // Deliver event strictly before cursors_changed (Claude's U2 ordering rule).
+    if let Some(ev) = out.event {
+        match try_parse_plain_chat(ev.cmd, &ev.payload, parse_state) {
+            PlainChatParse::Empty => {}
+            PlainChatParse::Typed(envelope) => {
+                sink.send(Input::WsTypedChat {
+                    ws_gen,
+                    cmd: ev.cmd,
+                    envelope,
+                });
+            }
+            PlainChatParse::NotPlain => {
+                sink.send(Input::WsEvent {
+                    ws_gen,
+                    cmd: ev.cmd,
+                    payload: ev.payload,
+                    now_unix_secs,
+                });
+            }
+        }
+    }
+    if let Some(cursors) = out.cursors_changed {
+        sink.send(Input::WsCursorsChanged { ws_gen, cursors });
+    }
+    out.close
+}
+
+#[async_trait]
+impl WsDriver for ScriptedWsDriver {
+    fn start(&self, params: WsStartParams, sink: ActorSink, runtime: &Handle) {
+        if self.suppress {
+            return;
+        }
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(old) = st.task_abort.take() {
+            old.abort();
+        }
+        let core = Arc::new(Mutex::new(WsCore::new()));
+        core.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cursors
+            .seed(&params.seed_cursors);
+        st.core = Arc::clone(&core);
+
+        let (push_tx, mut push_rx) = mpsc::unbounded_channel::<usize>();
+        st.push_tx = Some(push_tx);
+        let now_unix_secs = st.fixed_now_secs;
+
+        let endpoints: Vec<String> = if params.endpoints.is_empty() {
+            DEFAULT_WS_ENDPOINTS
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect()
+        } else {
+            params.endpoints
+        };
+        let ws_gen = params.ws_gen;
+        let recorded = Arc::clone(&self.recorded);
+        let ws_connects = Arc::clone(&self.ws_connects);
+        let ws_events = Arc::clone(&self.ws_events);
+        let parse_state = new_shared_parse(params.my_uid, params.self_conv_id);
+
+        let handle = runtime
+            .spawn(async move {
+                let mut policy = ReconnectPolicy::new(endpoints.len());
+                while let Some(idx) = policy.current_endpoint() {
+                    let endpoint = &endpoints[idx];
+                    let accept = {
+                        let mut connects =
+                            ws_connects.lock().unwrap_or_else(PoisonError::into_inner);
+                        if let Some(front) = connects.front() {
+                            let acc = front.accept.unwrap_or(true);
+                            if !front.repeat {
+                                connects.pop_front();
+                            }
+                            acc
+                        } else {
+                            true
+                        }
+                    };
+                    record_ws_connect(&recorded, endpoint);
+                    if !accept {
+                        let delay = policy.on_session_ended(Duration::from_secs(0));
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+
+                    core.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .on_connect();
+
+                    // Auto-deliver an immediate `cmd == 1` auth reply on connect if scripted next.
+                    let auth_entry = {
+                        let mut evs = ws_events.lock().unwrap_or_else(PoisonError::into_inner);
+                        if evs
+                            .front()
+                            .is_some_and(|e| e.kind == "ws_frame" && e.cmd == Some(CMD_AUTHEN))
+                        {
+                            evs.pop_front()
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(entry) = auth_entry
+                        && deliver_frame_to_core(
+                            &core,
+                            &recorded,
+                            &parse_state,
+                            &sink,
+                            ws_gen,
+                            now_unix_secs,
+                            &entry,
+                        )
+                        .is_some()
+                    {
+                        let was_authed = {
+                            let mut c = core.lock().unwrap_or_else(PoisonError::into_inner);
+                            let was = c.is_authed();
+                            let _ = c.on_disconnect();
+                            was
+                        };
+                        if was_authed {
+                            sink.send(Input::WsAuthChanged {
+                                ws_gen,
+                                authed: false,
+                            });
+                        }
+                        let delay = policy.on_session_ended(Duration::from_secs(0));
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+
+                    // Wait for explicit `ws_push` steps for all subsequent frames/closes.
+                    let mut reconnect = false;
+                    while let Some(count) = push_rx.recv().await {
+                        for _ in 0..count {
+                            let next = ws_events
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .pop_front();
+                            let Some(entry) = next else {
+                                break;
+                            };
+                            if entry.kind == "ws_close" {
+                                let was_authed = {
+                                    let mut c = core.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let was = c.is_authed();
+                                    let _ = c.on_disconnect();
+                                    was
+                                };
+                                if was_authed {
+                                    sink.send(Input::WsAuthChanged {
+                                        ws_gen,
+                                        authed: false,
+                                    });
+                                }
+                                reconnect = true;
+                                break;
+                            }
+                            if deliver_frame_to_core(
+                                &core,
+                                &recorded,
+                                &parse_state,
+                                &sink,
+                                ws_gen,
+                                now_unix_secs,
+                                &entry,
+                            )
+                            .is_some()
+                            {
+                                let was_authed = {
+                                    let mut c = core.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let was = c.is_authed();
+                                    let _ = c.on_disconnect();
+                                    was
+                                };
+                                if was_authed {
+                                    sink.send(Input::WsAuthChanged {
+                                        ws_gen,
+                                        authed: false,
+                                    });
+                                }
+                                reconnect = true;
+                                break;
+                            }
+                        }
+                        if reconnect {
+                            break;
+                        }
+                    }
+
+                    if !reconnect {
+                        break;
+                    }
+                    let delay = policy.on_session_ended(Duration::from_secs(0));
+                    tokio::time::sleep(delay).await;
+                }
+            })
+            .abort_handle();
+
+        st.task_abort = Some(handle);
+    }
+
+    fn stop(&self, reset_cursors: bool) {
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(old) = st.task_abort.take() {
+            old.abort();
+        }
+        st.push_tx = None;
+        let _ = st
+            .core
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .stop(reset_cursors);
+    }
+
+    fn record_file_done(&self, file_id: String, url: String) {
+        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = st
+            .core
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .files
+            .record(&file_id, &url);
+    }
+
+    async fn send_frame(&self, cmd: u16, sub_cmd: u8, payload_json: Option<Vec<u8>>) -> bool {
+        self.send_frame_versioned(cmd, sub_cmd, FRAME_VERSION, payload_json)
+            .await
+    }
+
+    async fn send_frame_versioned(
+        &self,
+        cmd: u16,
+        sub_cmd: u8,
+        version: u8,
+        payload_json: Option<Vec<u8>>,
+    ) -> bool {
+        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let core = st.core.lock().unwrap_or_else(PoisonError::into_inner);
+        if !core.is_authed() {
+            return false;
+        }
+        let raw = olaz_ws::encode_frame(cmd, sub_cmd, version, payload_json.as_deref());
+        record_ws_send_bytes(&self.recorded, &raw);
+        true
+    }
+
+    async fn send_request(
+        &self,
+        cmd: u16,
+        sub_cmd: u8,
+        version: u8,
+        req_id: Option<String>,
+        inner_data: Map<String, Value>,
+        _timeout: Duration,
+    ) -> Option<Map<String, Value>> {
+        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut core = st.core.lock().unwrap_or_else(PoisonError::into_inner);
+        let prep = core.prepare_request(cmd, sub_cmd, version, req_id.as_deref(), &inner_data)?;
+        record_ws_send_bytes(&self.recorded, &prep.frame);
+        None
+    }
+
+    async fn wait_for_file_done(&self, file_id: String, _timeout: Duration) -> Option<String> {
+        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut core = st.core.lock().unwrap_or_else(PoisonError::into_inner);
+        match core.wait_for_file_done(&file_id) {
+            olaz_ws::FileWait::Ready(url) => Some(url),
+            olaz_ws::FileWait::Pending(_) | olaz_ws::FileWait::Invalid => None,
+        }
+    }
+
+    async fn is_authed(&self) -> bool {
+        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let core = Arc::clone(&st.core);
+        drop(st);
+        let guard = core.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.is_authed()
+    }
+
+    async fn current_cursors(&self) -> CursorMap {
+        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let core = Arc::clone(&st.core);
+        drop(st);
+        let guard = core.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.cursors.current()
+    }
+
+    async fn seed_cursors(&self, cursors: CursorMap) {
+        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        st.core
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cursors
+            .seed(&cursors);
+    }
+}
+
+/// Fake [`Host`] that answers `load_saved_session` / `load_legacy_cookie` / `load_transport_state`
+/// from the case `seed` and records every traced domain activity in Case format v1 `host` order.
 pub struct RecordingHost {
     saved_session: Option<String>,
     legacy_cookie: Option<LegacyCookie>,
+    transport_state: PersistedTransportState,
     calls: Mutex<Vec<Value>>,
+    notify: Notify,
 }
 
 impl RecordingHost {
@@ -598,10 +1114,25 @@ impl RecordingHost {
             .as_ref()
             .and_then(|v| serde_json::to_string(v).ok());
         let legacy_cookie = parse_legacy_cookie_seed(seed.legacy_cookie.as_ref());
+        let poll_state = seed
+            .poll_state
+            .as_ref()
+            .and_then(|v| serde_json::from_value::<PollState>(v.clone()).ok())
+            .unwrap_or_default();
+        let ws_cursors = seed
+            .ws_cursors
+            .as_ref()
+            .and_then(|v| serde_json::from_value::<CursorMap>(v.clone()).ok())
+            .unwrap_or_default();
         Self {
             saved_session,
             legacy_cookie,
+            transport_state: PersistedTransportState {
+                poll_state,
+                ws_cursors,
+            },
             calls: Mutex::new(Vec::new()),
+            notify: Notify::new(),
         }
     }
 
@@ -612,11 +1143,33 @@ impl RecordingHost {
             .clone()
     }
 
+    /// Waits until a host call named `call_name` appears at index `>= *cursor`, then advances
+    /// `*cursor` past that entry.
+    pub async fn await_call(&self, call_name: &str, cursor: &mut usize) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let calls = self.calls.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(rel) = calls[*cursor..]
+                    .iter()
+                    .position(|c| c.get("call").and_then(Value::as_str) == Some(call_name))
+                {
+                    *cursor += rel + 1;
+                    return;
+                }
+            }
+            notified.await;
+        }
+    }
+
     fn record(&self, call: &str, args: Value) {
         self.calls
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(json!({ "call": call, "args": args }));
+        self.notify.notify_waiters();
     }
 }
 
@@ -658,19 +1211,21 @@ impl Host for RecordingHost {
         self.legacy_cookie.clone()
     }
 
-    async fn set_pref(&self, _key: String, _value: String) {
-        // Storage primitive: reflected in `state.prefs`, not in `host` trace.
+    async fn load_transport_state(&self) -> PersistedTransportState {
+        self.transport_state.clone()
     }
+
+    async fn set_pref(&self, _key: String, _value: String) {}
 
     async fn prepare_store(&self, user_id: String, _account: LoginAccount) {
         self.record("prepare_store", json!({ "user_id": user_id }));
     }
 
-    async fn start_ws(&self, endpoints: Vec<String>, _zpw_sek: String) {
+    async fn on_ws_started(&self, endpoints: Vec<String>) {
         self.record("start_ws", json!({ "endpoints": endpoints }));
     }
 
-    async fn start_long_poll(&self) {
+    async fn on_long_poll_started(&self) {
         self.record("start_long_poll", json!({}));
     }
 
@@ -696,6 +1251,120 @@ impl Host for RecordingHost {
 
     async fn mark_expired(&self, _snapshot_json: String) {
         self.record("mark_expired", json!({}));
+    }
+
+    async fn persist_poll_state(&self, state: PollState) {
+        self.record("persist_poll_state", json!({ "state": state }));
+    }
+
+    async fn persist_ws_cursors(&self, cursors: CursorMap) {
+        self.record("persist_ws_cursors", json!({ "cursors": cursors }));
+    }
+
+    async fn apply_batch(
+        &self,
+        cmd: Option<u16>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        payload: Map<String, Value>,
+    ) -> u32 {
+        let root = Value::Object(payload.clone());
+        let opts = WireParseOptions {
+            cmd: cmd.unwrap_or(0),
+            fallback_conv_id: None,
+            is_group_hint: None,
+            self_conv_id: None,
+            name_lookup: None,
+        };
+        let events = extract_batch_events(&root, "", &opts);
+        let count = u32::try_from(events.len()).unwrap_or(u32::MAX);
+        self.record(
+            "apply_batch",
+            json!({
+                "cmd": cmd,
+                "increment_unread": increment_unread,
+                "notify_incoming": notify_incoming,
+                "payload": Value::Object(payload),
+            }),
+        );
+        count
+    }
+
+    async fn apply_parsed_events(
+        &self,
+        cmd: u16,
+        increment_unread: bool,
+        notify_incoming: bool,
+        envelope: TypedChatEnvelope,
+    ) {
+        self.record(
+            "apply_parsed_events",
+            json!({
+                "cmd": cmd,
+                "increment_unread": increment_unread,
+                "notify_incoming": notify_incoming,
+                "count": envelope.events.len(),
+                "uids": envelope.uids,
+            }),
+        );
+    }
+
+    async fn mobile_sync(&self, events: Vec<MobileSyncEvent>) {
+        self.record("mobile_sync", json!({ "count": events.len() }));
+    }
+
+    async fn e2ee_signal(&self, cmd: u16, payload: Map<String, Value>) {
+        self.record(
+            "e2ee_signal",
+            json!({ "cmd": cmd, "payload": Value::Object(payload) }),
+        );
+    }
+
+    async fn e2ee_deliver_reports(&self, cmd: u16, payload: Map<String, Value>) {
+        self.record(
+            "e2ee_deliver_reports",
+            json!({ "cmd": cmd, "payload": Value::Object(payload) }),
+        );
+    }
+
+    async fn e2ee_connected(&self, uid: String) {
+        self.record("e2ee_connected", json!({ "uid": uid }));
+    }
+
+    async fn e2ee_disconnected(&self) {
+        self.record("e2ee_disconnected", json!({}));
+    }
+
+    async fn voip_control(&self, act: String, raw_data: Value, data: Map<String, Value>) {
+        self.record(
+            "voip_control",
+            json!({ "act": act, "raw_data": raw_data, "data": Value::Object(data) }),
+        );
+    }
+
+    async fn show_typing(&self, conv_id: String, uid: String, on_pc: bool) {
+        self.record(
+            "show_typing",
+            json!({ "conv_id": conv_id, "uid": uid, "on_pc": on_pc }),
+        );
+    }
+
+    async fn pin_topic(&self, conv_id: String) {
+        self.record("pin_topic", json!({ "conv_id": conv_id }));
+    }
+
+    async fn group_notice(&self, act: String, data: Map<String, Value>, ts: i64) {
+        self.record(
+            "group_notice",
+            json!({ "act": act, "data": Value::Object(data), "ts": ts }),
+        );
+    }
+
+    async fn mute(&self, conv_id: String, set: bool, start: i64, duration: i64) {
+        self.record(
+            "mute",
+            json!({ "conv_id": conv_id, "set": set, "start": start, "duration": duration }),
+        );
     }
 }
 
@@ -743,6 +1412,21 @@ fn parse_command(cmd: &str, args: &Value) -> Result<Command, String> {
                 .map_err(|e| format!("invalid apply_account_profile args: {e}"))?;
             Ok(Command::ApplyAccountProfile(account))
         }
+        "drain_chat_polling" => {
+            let max_batches = args
+                .get("max_batches")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(3);
+            let notify_incoming = args
+                .get("notify_incoming")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Ok(Command::DrainChatPolling {
+                max_batches,
+                notify_incoming,
+            })
+        }
         other => Err(format!("unknown step cmd: {other}")),
     }
 }
@@ -752,7 +1436,24 @@ fn parse_command(cmd: &str, args: &Value) -> Result<Command, String> {
 pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let seed_domains = extract_seed_domains(&case.seed);
     let initial_key = extract_seed_secret_key(&case.seed);
-    let transport = Arc::new(ScriptedTransport::new(case.server.clone(), initial_key));
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let transport = Arc::new(ScriptedTransport::with_recorded(
+        case.server.clone(),
+        initial_key,
+        Arc::clone(&recorded),
+    ));
+
+    // Session-domain cases recorded under U1a trace `start_ws` / `start_long_poll` without running
+    // the real loops; suppress both loops automatically for `domain == "session"`.
+    let suppress_ws = case.domain == "session" || case.seed.suppress.iter().any(|s| s == "ws");
+    let suppress_lp =
+        case.domain == "session" || case.seed.suppress.iter().any(|s| s == "long_poll");
+
+    let ws_driver = Arc::new(ScriptedWsDriver::new(
+        &case.server,
+        Arc::clone(&recorded),
+        suppress_ws,
+    ));
 
     let client = Arc::new(SessionClient::new(
         ArcTransport(Arc::clone(&transport)),
@@ -764,11 +1465,13 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     }
 
     let host = Arc::new(RecordingHost::from_seed(&case.seed));
-    let runner = Arc::new(SessionEffectRunner::with_default_domains(
+    let runner = Arc::new(SessionEffectRunner::with_options(
         Arc::clone(&client),
         Arc::clone(&host) as Arc<dyn Host>,
+        Arc::clone(&ws_driver) as Arc<dyn WsDriver>,
         Handle::current(),
         seed_domains,
+        suppress_lp,
     ));
 
     let mut initial_state = CoreState::default();
@@ -776,6 +1479,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let core = CoreHandle::start_with_state(initial_state, runner, Handle::current());
 
     let mut snapshots = BTreeMap::new();
+    let mut host_cursor = 0usize;
 
     for step in &case.steps {
         match step {
@@ -783,20 +1487,23 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 let parsed = parse_command(cmd, args)?;
                 match parsed {
                     Command::LogOut | Command::SessionExpired { .. } => {
-                        // Match `SessionRecorderTests`: await boot completion before interrupting.
                         let _ =
                             tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
                         core.send(parsed);
                     }
                     Command::RefreshQr => {
-                        // Allow any in-flight scripted waitScan request to reach the transport
-                        // before `refresh_qr` cancels it, without advancing into a 60s timeout.
                         let _ = tokio::time::timeout(Duration::from_millis(500), core.wait_idle())
                             .await;
                         core.send(parsed);
                     }
                     Command::ApplyAccountProfile(_) => {
                         let _ = core.send_and_ack(parsed).await;
+                    }
+                    Command::DrainChatPolling {
+                        max_batches,
+                        notify_incoming,
+                    } => {
+                        let _ = core.drain_chat_polling(max_batches, notify_incoming).await;
                     }
                     Command::Start => {
                         core.send(parsed);
@@ -807,6 +1514,18 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 let wait_fut = core.wait_until(|snap| predicate.matches(snap));
                 let _ = tokio::time::timeout(Duration::from_secs(3600), wait_fut).await;
             }
+            Step::AwaitHost {
+                await_host,
+                timeout_ms,
+            } => {
+                let dur = Duration::from_millis(timeout_ms.unwrap_or(15_000));
+                tokio::time::timeout(dur, host.await_call(await_host, &mut host_cursor))
+                    .await
+                    .map_err(|_| format!("timed out awaiting host call `{await_host}`"))?;
+            }
+            Step::WsPush { ws_push } => {
+                ws_driver.push(*ws_push);
+            }
             Step::Snapshot { snapshot } => {
                 if let Some(snap) = core.snapshot().await {
                     snapshots.insert(snapshot.clone(), snap.to_case_json(&render_core_fail_en));
@@ -815,9 +1534,6 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         }
     }
 
-    // Drain remaining finite work (each normal scripted HTTP call uses 10ms virtual RTT)
-    // without letting a stalled `"error": "timeout"` or `repeat: true` waitScan sleep advance
-    // virtual time past the 60s QR timeout floor.
     if !transport.has_repeat_entries() {
         let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
     } else {
@@ -940,7 +1656,6 @@ pub fn diff_json(path: &str, expected: &Value, actual: &Value, out: &mut Vec<Mis
             }
         }
         (Value::Number(e), Value::Number(a)) => {
-            // Exact comparison (preserving 64-bit ints vs floats via arbitrary_precision representation).
             if e.to_string() != a.to_string() {
                 out.push(Mismatch {
                     path: path.to_owned(),

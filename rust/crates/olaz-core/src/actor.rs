@@ -3,6 +3,7 @@
 //! The actor loop never awaits I/O or host callbacks inline: it runs `reduce(&mut state, input)`,
 //! publishes dirty keys to [`ChangeHub`], and hands effects to [`EffectRunner`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -10,6 +11,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::changes::{ChangeHub, CoreChanges};
+use crate::effect::Effect;
 use crate::input::{Command, Input};
 use crate::reduce::reduce;
 use crate::runner::EffectRunner;
@@ -19,6 +21,11 @@ enum ActorMsg {
     Input {
         input: Box<Input>,
         ack: Option<oneshot::Sender<u64>>,
+    },
+    DrainChatPolling {
+        max_batches: u32,
+        notify_incoming: bool,
+        reply: oneshot::Sender<u32>,
     },
     Snapshot(oneshot::Sender<SessionSnapshot>),
     Settle(oneshot::Sender<u64>),
@@ -193,6 +200,26 @@ impl CoreHandle {
         ack_rx.await.ok()
     }
 
+    /// Drains up to `max_batches` long-poll batches serialized behind any in-flight drain
+    /// (ADR-018) and returns the total applied event count (`0` if long-poll or actor is stopped).
+    pub async fn drain_chat_polling(&self, max_batches: u32, notify_incoming: bool) -> u32 {
+        let (reply, rx) = oneshot::channel();
+        self.tracker.increment();
+        if self
+            .tx
+            .send(ActorMsg::DrainChatPolling {
+                max_batches,
+                notify_incoming,
+                reply,
+            })
+            .is_err()
+        {
+            self.tracker.decrement();
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
+
     /// Pulls the next batch of dirty domain snapshots (`None` once stopped and drained).
     pub async fn next_changes(&self) -> Option<CoreChanges> {
         self.changes.next_changes().await
@@ -272,6 +299,41 @@ impl Drop for CoreHandle {
     }
 }
 
+fn dispatch_reduce_output(
+    state: &CoreState,
+    out: crate::reduce::ReduceOutput,
+    runner: &Arc<dyn EffectRunner>,
+    sink: &ActorSink,
+    changes: &Arc<ChangeHub>,
+    state_notify: &Arc<Notify>,
+    drain_waiters: &mut HashMap<u64, oneshot::Sender<u32>>,
+) -> u64 {
+    let version = changes.publish(&out.dirty, state);
+    if !out.effects.is_empty() {
+        let mut runner_effects = Vec::with_capacity(out.effects.len());
+        for effect in out.effects {
+            if let Effect::CompleteDrain {
+                drain_id,
+                total_events,
+            } = effect
+            {
+                if let Some(waiter) = drain_waiters.remove(&drain_id) {
+                    let _ = waiter.send(total_events);
+                }
+            } else {
+                runner_effects.push(effect);
+            }
+        }
+        if !runner_effects.is_empty() {
+            runner.dispatch(runner_effects, sink.clone());
+        }
+    }
+    if !out.dirty.is_empty() {
+        state_notify.notify_waiters();
+    }
+    version
+}
+
 async fn run_actor(
     mut state: CoreState,
     mut rx: mpsc::UnboundedReceiver<ActorMsg>,
@@ -281,21 +343,50 @@ async fn run_actor(
     tracker: Arc<ActivityTracker>,
     state_notify: Arc<Notify>,
 ) {
+    let mut drain_waiters: HashMap<u64, oneshot::Sender<u32>> = HashMap::new();
     while let Some(msg) = rx.recv().await {
         match msg {
             ActorMsg::Input { input, ack } => {
                 let out = reduce(&mut state, *input);
-                let version = changes.publish(&out.dirty, &state);
-                if !out.effects.is_empty() {
-                    runner.dispatch(out.effects, sink.clone());
-                }
-                if !out.dirty.is_empty() {
-                    state_notify.notify_waiters();
-                }
+                let version = dispatch_reduce_output(
+                    &state,
+                    out,
+                    &runner,
+                    &sink,
+                    &changes,
+                    &state_notify,
+                    &mut drain_waiters,
+                );
                 if let Some(reply) = ack {
                     let _ = reply.send(version);
                 }
                 // Decrement AFTER dispatching effects so their InFlightGuards are already active.
+                tracker.decrement();
+            }
+            ActorMsg::DrainChatPolling {
+                max_batches,
+                notify_incoming,
+                reply,
+            } => {
+                let drain_id = state.transport.alloc_drain_id();
+                drain_waiters.insert(drain_id, reply);
+                let out = reduce(
+                    &mut state,
+                    Input::DrainRequested {
+                        drain_id,
+                        max_batches,
+                        notify_incoming,
+                    },
+                );
+                let _ = dispatch_reduce_output(
+                    &state,
+                    out,
+                    &runner,
+                    &sink,
+                    &changes,
+                    &state_notify,
+                    &mut drain_waiters,
+                );
                 tracker.decrement();
             }
             ActorMsg::Snapshot(reply) => {
@@ -308,6 +399,9 @@ async fn run_actor(
                 break;
             }
         }
+    }
+    for (_, waiter) in drain_waiters.drain() {
+        let _ = waiter.send(0);
     }
     runner.shutdown();
     changes.close();
@@ -372,5 +466,13 @@ mod tests {
 
         core.stop();
         assert_eq!(core.settle().await, None);
+    }
+
+    #[tokio::test]
+    async fn drain_chat_polling_when_lp_stopped_resolves_immediately_with_zero() {
+        let core = CoreHandle::start(Arc::new(NoopRunner), Handle::current());
+        assert_eq!(core.drain_chat_polling(4, false).await, 0);
+        core.stop();
+        assert_eq!(core.drain_chat_polling(4, false).await, 0);
     }
 }

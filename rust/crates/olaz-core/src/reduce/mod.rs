@@ -4,10 +4,11 @@
 
 pub mod classify;
 pub mod session;
+pub mod transport;
 
 use crate::changes::DirtySet;
 use crate::effect::Effect;
-use crate::input::Input;
+use crate::input::{Command, Input};
 use crate::state::CoreState;
 
 /// Effects to execute and keys dirtied by a single `reduce` call.
@@ -20,6 +21,34 @@ pub struct ReduceOutput {
 /// Pure transition function for the entire core state.
 pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
     let mut out = ReduceOutput::default();
-    session::reduce_session(&mut state.session, input, &mut out);
+    match input {
+        Input::Command(
+            Command::Start
+            | Command::RefreshQr
+            | Command::LogOut
+            | Command::SessionExpired { .. }
+            | Command::ApplyAccountProfile(_),
+        )
+        | Input::SavedSessionLoaded { .. }
+        | Input::LegacyCookieResult { .. }
+        | Input::PrepareStoreDone { .. }
+        | Input::SessionStatusResult { .. }
+        | Input::SyncProfileMeDone { .. }
+        | Input::QrRequested { .. }
+        | Input::QrRotated { .. }
+        | Input::QrScanned { .. }
+        | Input::QrConfirmed { .. }
+        | Input::LoginCompleted { .. } => session::reduce_session(state, input, &mut out),
+
+        Input::Command(Command::DrainChatPolling { .. })
+        | Input::DrainRequested { .. }
+        | Input::WsEvent { .. }
+        | Input::WsTypedChat { .. }
+        | Input::WsAuthChanged { .. }
+        | Input::WsCursorsChanged { .. }
+        | Input::LpTick { .. }
+        | Input::PollBatchFetched { .. }
+        | Input::PollBatchApplied { .. } => transport::reduce_transport(state, input, &mut out),
+    }
     out
 }
