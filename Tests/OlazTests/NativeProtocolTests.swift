@@ -134,6 +134,26 @@ import Testing
         #expect(custom.ws.first == "wss://ws1-msg.zaloapp.com")
     }
 
+    @Test func isolatedDomainsOmitDefaultsAndFallbacks() throws {
+        var nonIsolated = ZaloDomains()
+        nonIsolated.serviceCandidates["profile"] = ["http://127.0.0.1:9999"]
+        let full = nonIsolated.candidates(for: "profile")
+        #expect(full.count > 1)
+        #expect(full.first == "http://127.0.0.1:9999")
+        #expect(full.contains(where: { $0.contains("zaloapp.com") }))
+
+        var isolated = nonIsolated
+        isolated.isolated = true
+        #expect(isolated.candidates(for: "profile") == ["http://127.0.0.1:9999"])
+        #expect(isolated.candidates(for: "chat").isEmpty)
+
+        let nonIsolatedText = String(decoding: try JSONEncoder().encode(nonIsolated), as: UTF8.self)
+        #expect(!nonIsolatedText.contains("\"isolated\""))
+        let isolatedData = try JSONEncoder().encode(isolated)
+        #expect(String(decoding: isolatedData, as: UTF8.self).contains("\"isolated\":true"))
+        #expect(try JSONDecoder().decode(ZaloDomains.self, from: isolatedData).isolated)
+    }
+
     @Test func wsFrameCodecURLSlashAndAuthQueues() {
         let encoded = ZaloWebSocket.encodeFrame(cmd: 510, subCmd: 1, version: 1, data: ["first": true])
         let decoded = ZaloWebSocket.decodeFrame(encoded)

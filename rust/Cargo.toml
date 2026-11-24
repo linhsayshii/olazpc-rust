@@ -2,7 +2,8 @@
 resolver = "3"
 members = ["crates/*"]
 # Vendored, patched third-party crates: built as path dependencies only (never linted).
-exclude = ["vendor"]
+# U1b removes "crates/olaz-core" when olaz-core gets its Cargo.toml.
+exclude = ["vendor", "crates/olaz-core"]
 
 [workspace.package]
 edition = "2024"

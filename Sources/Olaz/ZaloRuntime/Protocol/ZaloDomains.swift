@@ -85,6 +85,39 @@ struct ZaloDomains: Codable, Sendable {
     ]
     var serviceCandidates: [String: [String]] = [:]
     var preferredHosts: [String: String] = [:]
+    var isolated: Bool = false
+
+    private enum CodingKeys: String, CodingKey {
+        case auth, wpaChat, lpChat, lpControl, ws, serviceCandidates, preferredHosts, isolated
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        auth = try c.decode(String.self, forKey: .auth)
+        wpaChat = try c.decode(String.self, forKey: .wpaChat)
+        lpChat = try c.decode(String.self, forKey: .lpChat)
+        lpControl = try c.decode(String.self, forKey: .lpControl)
+        ws = try c.decode([String].self, forKey: .ws)
+        serviceCandidates = try c.decode([String: [String]].self, forKey: .serviceCandidates)
+        preferredHosts = try c.decode([String: String].self, forKey: .preferredHosts)
+        isolated = try c.decodeIfPresent(Bool.self, forKey: .isolated) ?? false
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(auth, forKey: .auth)
+        try c.encode(wpaChat, forKey: .wpaChat)
+        try c.encode(lpChat, forKey: .lpChat)
+        try c.encode(lpControl, forKey: .lpControl)
+        try c.encode(ws, forKey: .ws)
+        try c.encode(serviceCandidates, forKey: .serviceCandidates)
+        try c.encode(preferredHosts, forKey: .preferredHosts)
+        if isolated {
+            try c.encode(true, forKey: .isolated)
+        }
+    }
 
     /// Clears stale `.chat.zalo.me` HTTP preferred hosts left over from legacy `zpw_type=30` sessions.
     mutating func healFromVerified() {
@@ -163,11 +196,13 @@ struct ZaloDomains: Codable, Sendable {
             appendUnique(auth)
             appendUnique(wpaChat)
         }
-        if let defaults = Self.defaultServiceMapV3[key] {
-            for host in defaults { appendUnique(host) }
-        }
-        if let fallbacks = Self.fallbackHosts[key] {
-            for host in fallbacks { appendUnique(host) }
+        if !isolated {
+            if let defaults = Self.defaultServiceMapV3[key] {
+                for host in defaults { appendUnique(host) }
+            }
+            if let fallbacks = Self.fallbackHosts[key] {
+                for host in fallbacks { appendUnique(host) }
+            }
         }
         return list
     }
