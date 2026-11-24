@@ -1,6 +1,6 @@
 # Olaz Rust port map
 
-Goal: move Olaz's protocol engine to a Rust core called from the existing SwiftUI app (macOS only), for speed and a smoother main thread. Decisions: [DECISIONS.md](DECISIONS.md) (ADR-001..015). Terms: [GLOSSARY.md](GLOSSARY.md).
+Goal: move Olaz's protocol engine to a Rust core called from the existing SwiftUI app (macOS only), for speed and a smoother main thread. Decisions: [DECISIONS.md](DECISIONS.md) (ADR-001..017). Terms: [GLOSSARY.md](GLOSSARY.md).
 
 Workflow per unit: claim here, port into its own crate, port Swift fixtures as Rust tests, `cargo fmt --check && cargo clippy -p <crate> -- -D warnings && cargo test -p <crate>` green, mark done with test counts.
 
@@ -27,7 +27,8 @@ Workflow per unit: claim here, port into its own crate, port Swift fixtures as R
 | 4a | Typed records across FFI on hot paths (ws events -> parsed wire events in Rust, ChatMessage record, store rows); release-mode benchmark | done 2026-11-23 (rust 256, swift 443 both modes; realtime 70.9->51.5 ms, history 56.6->40.0 ms per 2,000 vs Swift; conv list 0.5 vs 3.5 ms, plain save 13.1 vs 14.5 ms still slower) |
 | 4b | Chat state (conversation list merge/sort/unread, per-conversation message window) in Rust; Swift gets diffs | deferred (small remaining gain) |
 | 4c | Flip `OLAZ_RUST_CORE` default on (ADR-012) | done 2026-11-23 (swift 443 both modes) |
-| 4d | Delete Swift chat path | open (after commit + daily use) |
+| 4d | Delete Swift chat path | done 2026-11-24 as U0a |
+| U0a | Delete Swift fallback of all Rust-ported layers (`RustCore.isEnabled`, `useRustCore`, HTTP/API/WS/Store/Wire/Media fallbacks); move `URLProtocol` tests to `FakeZaloServer` and `:memory:` DB tests to temp files; port remaining parity fixtures to Rust (ADR-017) | done 2026-11-24 (`Sources/` −3,626 / +382, `Tests/` −1,354 / +362, `rust/` +411 golden tests; `swift test` 579/98 → 555/97, `SessionRecorderTests` slow green with 0 diff on `session.jsonl`) |
 | 5a | typed history/lookup/envelopes | done 2026-11-23 (rust 258, swift 449 both modes; non-plain ws envelopes stay raw, ADR-013) |
 | 5b | generic signed HTTP seam (all feature endpoints) + timeout fix | done 2026-11-23 (rust 271 = +8 golden/seam, +2 timeout, +5 ffi; swift 452 both modes). `CoreHttp` (`request`, `post_multipart`, `post_multipart_file`) over `olaz_net::GenericCall`; Swift `ZaloSessionClient.get/post/postMultipart` delegate to it when `useRustCore`. Still Swift: `rawGetJSON`/`rawRequest` callers (QR/login already Rust), `zCloudGet` (cloud-viewer-key header, no ParamCipher), `rawDownloadData`, `downloadSyncBatch` |
 

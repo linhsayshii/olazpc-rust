@@ -4,6 +4,71 @@ import Network
 @testable import Olaz
 
 final class FakeZaloServer: @unchecked Sendable {
+    struct HTTPRequest: Sendable {
+        let method: String
+        let path: String
+        let query: String
+        let rawQuery: [String: String]
+        let headers: [String: String]
+        let body: Data
+
+        func header(_ name: String) -> String? {
+            headers[name.lowercased()]
+        }
+
+        func decodeEncryptedParams(key: Data) -> [String: Any]? {
+            for raw in [query, String(decoding: body, as: UTF8.self)] {
+                if let part = raw.split(separator: "&").first(where: { $0.hasPrefix("params=") }) {
+                    let encoded = String(part.dropFirst("params=".count))
+                    let decoded = encoded.removingPercentEncoding ?? encoded
+                    if let plain = try? ZaloCrypto.decodeAES(key: key, base64: decoded),
+                       let obj = JSONLossless.parseObject(Data(plain.utf8)) {
+                        return obj
+                    }
+                }
+            }
+            return nil
+        }
+
+        func decodeEncryptedParamsQuery(key: Data) -> [String: Any]? {
+            guard let part = query.split(separator: "&").first(where: { $0.hasPrefix("params=") }) else {
+                return nil
+            }
+            let encoded = String(part.dropFirst("params=".count))
+            let decoded = encoded.removingPercentEncoding ?? encoded
+            guard let plain = try? ZaloCrypto.decodeAES(key: key, base64: decoded),
+                  let obj = JSONLossless.parseObject(Data(plain.utf8)) else {
+                return nil
+            }
+            return obj
+        }
+
+        func decodeEncryptedParamsBody(key: Data) -> [String: Any]? {
+            let bodyStr = String(decoding: body, as: UTF8.self)
+            guard let part = bodyStr.split(separator: "&").first(where: { $0.hasPrefix("params=") }) else {
+                return nil
+            }
+            let encoded = String(part.dropFirst("params=".count))
+            let decoded = encoded.removingPercentEncoding ?? encoded
+            guard let plain = try? ZaloCrypto.decodeAES(key: key, base64: decoded),
+                  let obj = JSONLossless.parseObject(Data(plain.utf8)) else {
+                return nil
+            }
+            return obj
+        }
+    }
+
+    struct HTTPResponse: Sendable {
+        let status: Int
+        let headers: [String: String]
+        let body: Data
+
+        static func json(_ status: Int = 200, _ obj: [String: Any], headers: [String: String] = [:]) -> HTTPResponse {
+            let data = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data("{}".utf8)
+            return HTTPResponse(status: status, headers: headers, body: data)
+        }
+    }
+
     struct ScriptEntry: Sendable {
         let kind: String // "http" | "ws"
         let path: String
@@ -22,6 +87,7 @@ final class FakeZaloServer: @unchecked Sendable {
     private let queue = DispatchQueue(label: "olaz.test.fake-zalo-server")
     private let lock = NSLock()
     private var entries: [ScriptEntry]
+    private let customHTTPHandler: (@Sendable (HTTPRequest) -> HTTPResponse)?
     private var recordedRequests: [CaseJSON] = []
     private var hasUnscripted = false
     private var sessionSecretKey: Data?
@@ -41,12 +107,28 @@ final class FakeZaloServer: @unchecked Sendable {
             let accept = item["accept"]?.boolValue ?? true
             return ScriptEntry(kind: kind, path: path, method: method, repeat: rep, response: resp, accept: accept)
         }
+        self.customHTTPHandler = nil
         self.sessionSecretKey = initialSecretKey
+        self.listener = try NWListener(using: .tcp)
+    }
+
+    init(httpHandler: @escaping @Sendable (HTTPRequest) -> HTTPResponse) throws {
+        self.entries = []
+        self.customHTTPHandler = httpHandler
+        self.sessionSecretKey = nil
         self.listener = try NWListener(using: .tcp)
     }
 
     var baseURLString: String { "http://127.0.0.1:\(port)" }
     var wsBaseURLString: String { "ws://127.0.0.1:\(port)" }
+
+    func domains(for services: [String]) -> ZaloDomains {
+        var domains = ZaloDomains(isolated: true)
+        for svc in services {
+            domains.serviceCandidates[ZaloDomains.canonicalService(svc)] = [baseURLString]
+        }
+        return domains
+    }
 
     func updateSecretKey(_ key: Data) {
         lock.lock()
@@ -239,9 +321,24 @@ final class FakeZaloServer: @unchecked Sendable {
 
         let components = URLComponents(string: "http://127.0.0.1\(rawTarget.hasPrefix("/") ? rawTarget : "/\(rawTarget)")")
         let path = components?.path ?? rawTarget
+        let rawQueryString = rawTarget.split(separator: "?", maxSplits: 1).dropFirst().first.map(String.init) ?? ""
         var rawQuery: [String: String] = [:]
         for item in components?.queryItems ?? [] {
             rawQuery[item.name] = item.value ?? ""
+        }
+
+        if let customHTTPHandler {
+            let req = HTTPRequest(
+                method: method,
+                path: path,
+                query: rawQueryString,
+                rawQuery: rawQuery,
+                headers: headers,
+                body: bodyData
+            )
+            let resp = customHTTPHandler(req)
+            sendHTTP(connection: connection, status: resp.status, headers: resp.headers, body: resp.body)
+            return
         }
 
         if headers["upgrade"]?.lowercased() == "websocket" {

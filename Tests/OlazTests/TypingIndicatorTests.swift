@@ -37,7 +37,4 @@ import Testing
         #expect(throttle.shouldSend(in: "200", now: t0.addingTimeInterval(10)))
     }
 
-    @Test func oneOneTypingTargetsOfficialUserDestType() {
-        #expect(ZaloSessionClient.typingDestUser == 3)
-    }
 }

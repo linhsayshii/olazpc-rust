@@ -154,17 +154,7 @@ import Testing
         #expect(try JSONDecoder().decode(ZaloDomains.self, from: isolatedData).isolated)
     }
 
-    @Test func wsFrameCodecURLSlashAndAuthQueues() {
-        let encoded = ZaloWebSocket.encodeFrame(cmd: 510, subCmd: 1, version: 1, data: ["first": true])
-        let decoded = ZaloWebSocket.decodeFrame(encoded)
-        #expect(decoded?.version == 1)
-        #expect(decoded?.cmd == 510)
-        #expect(decoded?.subCmd == 1)
-        #expect((decoded?.envelope["first"] as? Bool) == true)
-
-        let url = ZaloWebSocket.buildSocketURL(base: "wss://ws1-msg.chat.zalo.me", nowMs: 123456)
-        #expect(url?.absoluteString.hasPrefix("wss://ws1-msg.chat.zalo.me/?") == true)
-
+    @Test func wsQueuesFromAuthDedupsAndOrders() {
         let queues = ZaloWebSocket.queuesFromAuth([
             "data": [
                 "ctrl_qCmds": [["cmd": 603, "subCmd": 1], ["cmd": 604, "subCmd": 0]],
@@ -179,7 +169,10 @@ import Testing
 
 @Suite struct NativeSQLiteAndWireTests {
     @Test func sqliteStoreConversationsMessagesMediaAndPrefs() async throws {
-        let store = try ZaloSQLiteStore(path: ":memory:")
+        let dbDir = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-np-sqlite-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dbDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dbDir) }
+        let store = try ZaloSQLiteStore(path: dbDir.appendingPathComponent("history.sqlite3").path)
         try await store.saveConversations([
             StoredConversation(id: "u1", isGroup: false, name: "An", avatar: "", pinned: false, members: 0, unread: 2, previewText: "Hi", previewTsMs: 1000, previewFromMe: false, updatedAtMs: 1000),
             StoredConversation(id: "g2", isGroup: true, name: "Team", avatar: "", pinned: true, members: 5, unread: 0, previewText: "Yo", previewTsMs: 500, previewFromMe: true, updatedAtMs: 500)
@@ -303,25 +296,6 @@ import Testing
         let dataDict = unwrapped["data"] as? [String: Any]
         let groupMsgs = dataDict?["groupMsgs"] as? [[String: Any]]
         #expect(groupMsgs?.count == 1)
-    }
-
-    @Test func pollStateEncodesAndIgnoresSocketQueue15() {
-        var state = ZaloPollState()
-        let initial = state.encodedParams()
-        #expect(initial.hasPrefix("1,1,"))
-        let res = state.applyResponse([
-            "lastActionId": "42",
-            "lastActionIdOther": "43",
-            "more": 1,
-            "queueStatus": [
-                "1": ["lastId": "100", "ids": ["a"]],
-                "15": ["lastId": "999", "ids": ["skip"]]
-            ]
-        ])
-        #expect(res.more == true)
-        #expect(state.lastActionId == "42")
-        #expect(state.queues["1"]?.lastId == "100")
-        #expect(state.queues["15"] == nil)
     }
 
     @Test func wsExtractFileDoneControls() {
@@ -457,19 +431,6 @@ import Testing
             ]
         ]
         #expect(ZaloSessionClient.extractZpwSek(from: goodResp) == "abcd.123456.a0.xyz789")
-    }
-
-    @Test func extractZpwSekCookieHandlesExpiresCommaAndSkipsMaxAgeZero() {
-        let authURL = URL(string: "https://wpa.chat.zalo.me/api/login/getLoginInfo")!
-        let onlyExpiredHeaders = [
-            "Set-Cookie": "zpw_sek=; Domain=.zalo.me; Path=/; Expires=Thu, 01-Jan-1970 00:00:01 GMT; Max-Age=0, zpw_sek=; Domain=.chat.zalo.me; Path=/; Expires=Thu, 01-Jan-1970 00:00:01 GMT; Max-Age=0"
-        ]
-        #expect(ZaloSessionClient.extractZpwSekCookie(headers: onlyExpiredHeaders, url: authURL) == nil)
-
-        let mixedHeaders = [
-            "Set-Cookie": "zpw_sek=; Domain=.zalo.me; Path=/; Expires=Thu, 01-Jan-1970 00:00:01 GMT; Max-Age=0, zpw_sek=hdr.999999.a0.validToken; Domain=.zalo.me; Path=/; HttpOnly"
-        ]
-        #expect(ZaloSessionClient.extractZpwSekCookie(headers: mixedHeaders, url: authURL) == "hdr.999999.a0.validToken")
     }
 
     private func encodeVarint(_ value: UInt64) -> [UInt8] {
@@ -1489,48 +1450,6 @@ import Testing
     }
 }
 
-private final class MockProfileURLProtocol: URLProtocol, @unchecked Sendable {
-    typealias Handler = @Sendable (URLRequest, Data) -> (Int, [String: Any])
-    static let handlers = OSAllocatedUnfairLock<[String: Handler]>(initialState: [:])
-
-    override class func canInit(with request: URLRequest) -> Bool {
-        guard let host = request.url?.host else { return false }
-        return handlers.withLock { $0[host] != nil }
-    }
-
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
-        request
-    }
-
-    override func startLoading() {
-        guard let url = request.url,
-              let host = url.host,
-              let handler = Self.handlers.withLock({ $0[host] }) else {
-            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
-            return
-        }
-        var bodyData = request.httpBody ?? Data()
-        if bodyData.isEmpty, let stream = request.httpBodyStream {
-            stream.open()
-            defer { stream.close() }
-            var buf = [UInt8](repeating: 0, count: 4096)
-            while stream.hasBytesAvailable {
-                let n = stream.read(&buf, maxLength: buf.count)
-                if n > 0 { bodyData.append(contentsOf: buf.prefix(n)) }
-                else { break }
-            }
-        }
-        let (status, jsonObj) = handler(request, bodyData)
-        let respData = (try? JSONSerialization.data(withJSONObject: jsonObj)) ?? Data("{}".utf8)
-        let http = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
-        client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: respData)
-        client?.urlProtocolDidFinishLoading(self)
-    }
-
-    override func stopLoading() {}
-}
-
 @Suite struct SyncProfilesAndSQLiteIndexTests {
     @Test func sanitizeProfileUidAndExtractProfilesMapVariants() {
         // Rejects invalid / group / zero / stranger / global IDs / overlong
@@ -1586,55 +1505,36 @@ private final class MockProfileURLProtocol: URLProtocol, @unchecked Sendable {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let host = "mock-prof-\(UUID().uuidString.lowercased()).invalid"
         let key = Data("0123456789abcdef".utf8)
         let callLog = OSAllocatedUnfairLock<[(path: String, uids: [String])]>(initialState: [])
 
-        MockProfileURLProtocol.handlers.withLock { handlers in
-            handlers[host] = { req, bodyData in
-                let path = req.url?.path ?? ""
-                let bodyStr = String(decoding: bodyData, as: UTF8.self)
-                var requestedUids: [String] = []
-                if let paramsPart = bodyStr.split(separator: "&").first(where: { $0.hasPrefix("params=") }) {
-                    let encoded = String(paramsPart.dropFirst("params=".count))
-                    let decodedB64 = encoded.removingPercentEncoding ?? encoded
-                    if let plain = try? ZaloCrypto.decodeAES(key: key, base64: decodedB64),
-                       let obj = JSONLossless.parseObject(Data(plain.utf8)),
-                       let arr = obj["friend_pversion_map"] as? [String] {
-                        requestedUids = arr
-                    }
-                }
-                let uids = requestedUids
-                callLog.withLock { $0.append((path: path, uids: uids)) }
+        let server = try FakeZaloServer { req in
+            let requestedUids = (req.decodeEncryptedParams(key: key)?["friend_pversion_map"] as? [String]) ?? []
+            callLog.withLock { $0.append((path: req.path, uids: requestedUids)) }
 
-                // Poison UID "999" triggers 114 on both endpoints so recursive split isolates it
-                if requestedUids.contains("999_0") {
-                    return (200, ["error_code": 114, "error_message": "Invalid parameter"])
-                }
-                // Primary endpoint rejects with 114 even for valid batch -> triggers fallback to getprofiles/v2
-                if path == "/api/social/group/members" {
-                    return (200, ["error_code": 114, "error_message": "Group members fallback"])
-                }
-                if path == "/api/social/friend/getprofiles/v2" {
-                    var changed: [String: [String: Any]] = [:]
-                    for pver in requestedUids {
-                        let uid = String(pver.split(separator: "_").first ?? "")
-                        changed[uid] = ["userId": uid, "displayName": "User \(uid)", "avatar": "https://ava.example/\(uid).jpg"]
-                    }
-                    return (200, ["error_code": 0, "data": ["changed_profiles": changed, "unchanged_profiles": [:]]])
-                }
-                return (404, ["error_code": -1])
+            // Poison UID "999" triggers 114 on both endpoints so recursive split isolates it
+            if requestedUids.contains("999_0") {
+                return .json(200, ["error_code": 114, "error_message": "Invalid parameter"])
             }
+            // Primary endpoint rejects with 114 even for valid batch -> triggers fallback to getprofiles/v2
+            if req.path == "/api/social/group/members" {
+                return .json(200, ["error_code": 114, "error_message": "Group members fallback"])
+            }
+            if req.path == "/api/social/friend/getprofiles/v2" {
+                var changed: [String: [String: Any]] = [:]
+                for pver in requestedUids {
+                    let uid = String(pver.split(separator: "_").first ?? "")
+                    changed[uid] = ["userId": uid, "displayName": "User \(uid)", "avatar": "https://ava.example/\(uid).jpg"]
+                }
+                return .json(200, ["error_code": 0, "data": ["changed_profiles": changed, "unchanged_profiles": [:]]])
+            }
+            return .json(404, ["error_code": -1])
         }
-        defer { _ = MockProfileURLProtocol.handlers.withLock { $0.removeValue(forKey: host) } }
+        try await server.start()
+        defer { server.stop() }
 
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [MockProfileURLProtocol.self]
-        let session = URLSession(configuration: config)
-
-        let client = ZaloSessionClient(dataDirectory: root, useKeychain: false, urlSession: session)
-        var domains = ZaloDomains()
-        domains.serviceCandidates["profile"] = ["https://\(host)"]
+        let client = ZaloSessionClient(dataDirectory: root, useKeychain: false)
+        let domains = server.domains(for: ["profile"])
         var account = ZaloLoginAccount()
         account.userId = "100"
         await client.updateCredentials(account: account, secretKey: key, zpwSek: "sek.1.2", domains: domains)
@@ -1958,20 +1858,6 @@ private final class MockProfileURLProtocol: URLProtocol, @unchecked Sendable {
         let uidsSingle = try #require(getBundleSingle["uids"] as? [[String: Any]])
         #expect(uidsSingle.count == 1)
 
-        // Verify `ZaloWebSocket.encodeRequestFrame` wraps `innerData` exactly once (`{"data": ..., "reqId": ...}`).
-        let frame = try #require(ZaloWebSocket.encodeRequestFrame(
-            cmd: ZaloE2EEManager.cmdSubmitBundle,
-            subCmd: 0,
-            version: 1,
-            reqId: "req_540",
-            innerData: submitBundle
-        ))
-        let decoded = try #require(ZaloWebSocket.decodeFrame(frame))
-        #expect(decoded.cmd == ZaloE2EEManager.cmdSubmitBundle)
-        #expect(decoded.envelope["reqId"] as? String == "req_540")
-        let outerData = try #require(decoded.envelope["data"] as? [String: Any])
-        #expect(outerData["delSS"] as? Int == 0)
-        #expect(outerData["data"] == nil)
     }
 
     @Test func e2eePeerListBundleParsingAndSQLitePersistence() async throws {
@@ -2015,7 +1901,10 @@ private final class MockProfileURLProtocol: URLProtocol, @unchecked Sendable {
         #expect(bundles[0].devices.count == 1)
 
         // Verify `e2eeThreadsV1` persistence in SQLite across manager instances.
-        let store = try ZaloSQLiteStore(path: ":memory:")
+        let dbDir = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-np-e2ee-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dbDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dbDir) }
+        let store = try ZaloSQLiteStore(path: dbDir.appendingPathComponent("history.sqlite3").path)
         let mgr1 = ZaloE2EEManager()
         await mgr1.markE2EEConversation("222", enabled: true, store: store)
         await mgr1.markE2EEConversation("g999", enabled: true, store: store)
@@ -2104,35 +1993,19 @@ private final class MockProfileURLProtocol: URLProtocol, @unchecked Sendable {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let host = "mock-e2ee-\(UUID().uuidString.lowercased()).invalid"
         let key = Data("0123456789abcdef".utf8)
         let captured = OSAllocatedUnfairLock<(path: String, payload: ZaloJSONBox)?>(initialState: nil)
 
-        MockProfileURLProtocol.handlers.withLock { handlers in
-            handlers[host] = { req, bodyData in
-                let path = req.url?.path ?? ""
-                let bodyStr = String(decoding: bodyData, as: UTF8.self)
-                var decodedObj: [String: Any] = [:]
-                if let paramsPart = bodyStr.split(separator: "&").first(where: { $0.hasPrefix("params=") }) {
-                    let encoded = String(paramsPart.dropFirst("params=".count))
-                    let decodedB64 = encoded.removingPercentEncoding ?? encoded
-                    if let plain = try? ZaloCrypto.decodeAES(key: key, base64: decodedB64),
-                       let obj = JSONLossless.parseObject(Data(plain.utf8)) {
-                        decodedObj = obj
-                    }
-                }
-                let box = ZaloJSONBox(decodedObj)
-                captured.withLock { $0 = (path: path, payload: box) }
-                return (200, ["error_code": 0, "data": ["msgId": "8800112233"]])
-            }
+        let server = try FakeZaloServer { req in
+            let box = ZaloJSONBox(req.decodeEncryptedParams(key: key) ?? [:])
+            captured.withLock { $0 = (path: req.path, payload: box) }
+            return .json(200, ["error_code": 0, "data": ["msgId": "8800112233"]])
         }
-        defer { _ = MockProfileURLProtocol.handlers.withLock { $0.removeValue(forKey: host) } }
+        try await server.start()
+        defer { server.stop() }
 
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [MockProfileURLProtocol.self]
-        let client = ZaloSessionClient(dataDirectory: root, useKeychain: false, urlSession: URLSession(configuration: config))
-        var mockDomains = ZaloDomains()
-        mockDomains.serviceCandidates["chat_e2e"] = ["https://\(host)"]
+        let client = ZaloSessionClient(dataDirectory: root, useKeychain: false)
+        let mockDomains = server.domains(for: ["chat_e2e"])
         var account = ZaloLoginAccount()
         account.userId = "100"
         await client.updateCredentials(account: account, secretKey: key, zpwSek: "sek.1.2", domains: mockDomains)

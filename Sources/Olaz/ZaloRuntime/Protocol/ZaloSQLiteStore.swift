@@ -85,23 +85,18 @@ struct StoredCloudMediaItem: Equatable, Sendable {
     var url: String
 }
 
-/// Pure Swift SQLite3 local store for Olaz conversations, message history, shared media index, and account preferences.
-/// All public inputs and outputs are strictly `Sendable` so Swift 6 actor isolation remains warning-free.
+/// SQLite3 local store for Olaz conversations, message history, shared media index, and account preferences,
+/// backed by Rust `CoreStore` (all public inputs/outputs are strictly `Sendable` for warning-free Swift 6 actor isolation).
 actor ZaloSQLiteStore {
     let path: String
     nonisolated(unsafe) private var db: OpaquePointer?
-    nonisolated(unsafe) private var readDb: OpaquePointer?
-    private let readLock = NSLock()
-    /// Rust store on the same file (ADR-010: same system SQLite, WAL). Non-nil only on the Rust path; the chat-path
-    /// methods below forward to it. In-memory stores always stay on Swift (a second connection would be a second DB).
-    private let core: CoreStore?
+    /// Rust store on the same file (ADR-010: same system SQLite, WAL).
+    private let core: CoreStore
 
-    init(path: String, useRustCore: Bool = RustCore.isEnabled) throws {
+    init(path: String) throws {
         self.path = path
-        if path != ":memory:" {
-            let url = URL(fileURLWithPath: path)
-            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        }
+        let url = URL(fileURLWithPath: path)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         var handle: OpaquePointer?
         let flags = SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
         let rc = sqlite3_open_v2(path, &handle, flags, nil)
@@ -110,19 +105,9 @@ actor ZaloSQLiteStore {
             if let handle { sqlite3_close(handle) }
             throw ZaloSQLiteError.openFailed(msg)
         }
-        self.db = handle
-        if useRustCore, path != ":memory:" {
-            do {
-                self.core = try CoreStore.open(path: path)
-            } catch {
-                sqlite3_close(handle)
-                throw RustCore.mapError(error)
-            }
-        } else {
-            self.core = nil
-        }
-        Self.registerSearchFunctions(on: handle)
-        try Self.exec(handle, """
+        sqlite3_busy_timeout(handle, 5000)
+        do {
+            try Self.exec(handle, """
         PRAGMA journal_mode=WAL;
         PRAGMA synchronous=NORMAL;
         PRAGMA busy_timeout=5000;
@@ -163,29 +148,22 @@ actor ZaloSQLiteStore {
             value_json TEXT NOT NULL
         );
         """)
-        if path != ":memory:" {
-            var rHandle: OpaquePointer?
-            if sqlite3_open_v2(path, &rHandle, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
-               let rHandle {
-                sqlite3_busy_timeout(rHandle, 5000)
-                Self.registerSearchFunctions(on: rHandle)
-                self.readDb = rHandle
-            }
+            self.core = try CoreStore.open(path: path)
+            self.db = handle
+        } catch let error as ZaloSQLiteError {
+            sqlite3_close(handle)
+            throw error
+        } catch {
+            sqlite3_close(handle)
+            throw RustCore.mapError(error)
         }
     }
 
     deinit {
-        if let readDb { sqlite3_close(readDb) }
         if let db { sqlite3_close(db) }
     }
 
     func close() {
-        readLock.lock()
-        if let rHandle = readDb {
-            sqlite3_close(rHandle)
-            readDb = nil
-        }
-        readLock.unlock()
         if let handle = db {
             sqlite3_close(handle)
             db = nil
@@ -196,45 +174,7 @@ actor ZaloSQLiteStore {
 
     func saveConversations(_ items: [StoredConversation]) async throws {
         guard !items.isEmpty else { return }
-        if let core {
-            do { try await core.saveConversations(items: items.map(RustCore.row)) } catch { throw RustCore.mapError(error) }
-            return
-        }
-        try inTransaction {
-            let sql = """
-            INSERT INTO conversations(id, is_group, name, avatar, pinned, members, unread, preview_text, preview_ts, preview_from_me, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-            ON CONFLICT(id) DO UPDATE SET
-                is_group = excluded.is_group,
-                name = CASE WHEN excluded.name != '' THEN excluded.name ELSE conversations.name END,
-                avatar = CASE WHEN excluded.avatar != '' THEN excluded.avatar ELSE conversations.avatar END,
-                pinned = excluded.pinned,
-                members = CASE WHEN excluded.members > 0 THEN excluded.members ELSE conversations.members END,
-                unread = excluded.unread,
-                preview_text = CASE WHEN excluded.preview_ts >= conversations.preview_ts THEN excluded.preview_text ELSE conversations.preview_text END,
-                preview_ts = CASE WHEN excluded.preview_ts >= conversations.preview_ts THEN excluded.preview_ts ELSE conversations.preview_ts END,
-                preview_from_me = CASE WHEN excluded.preview_ts >= conversations.preview_ts THEN excluded.preview_from_me ELSE conversations.preview_from_me END,
-                updated_at = excluded.updated_at;
-            """
-            let stmt = try prepare(sql)
-            defer { sqlite3_finalize(stmt) }
-            for c in items {
-                sqlite3_reset(stmt)
-                sqlite3_clear_bindings(stmt)
-                bindText(stmt, 1, c.id)
-                sqlite3_bind_int(stmt, 2, c.isGroup ? 1 : 0)
-                bindText(stmt, 3, c.name)
-                bindText(stmt, 4, c.avatar)
-                sqlite3_bind_int(stmt, 5, c.pinned ? 1 : 0)
-                sqlite3_bind_int(stmt, 6, Int32(c.members))
-                sqlite3_bind_int(stmt, 7, Int32(c.unread))
-                bindText(stmt, 8, c.previewText)
-                sqlite3_bind_int64(stmt, 9, c.previewTsMs)
-                sqlite3_bind_int(stmt, 10, c.previewFromMe ? 1 : 0)
-                sqlite3_bind_int64(stmt, 11, c.updatedAtMs)
-                try stepDone(stmt)
-            }
-        }
+        do { try await core.saveConversations(items: items.map(RustCore.row)) } catch { throw RustCore.mapError(error) }
     }
 
     func upsertConversation(_ item: StoredConversation) async throws {
@@ -242,86 +182,27 @@ actor ZaloSQLiteStore {
     }
 
     func loadConversations() async throws -> [StoredConversation] {
-        if let core {
-            do {
-                return try await core.loadConversations().map(RustCore.stored)
-            } catch { throw RustCore.mapError(error) }
-        }
-        let sql = """
-        SELECT id, is_group, name, avatar, pinned, members, unread, preview_text, preview_ts, preview_from_me, updated_at
-        FROM conversations
-        ORDER BY pinned DESC, preview_ts DESC, updated_at DESC;
-        """
-        let stmt = try prepare(sql)
-        defer { sqlite3_finalize(stmt) }
-        var out: [StoredConversation] = []
-        while true {
-            let rc = sqlite3_step(stmt)
-            if rc == SQLITE_DONE { break }
-            guard rc == SQLITE_ROW else { throw ZaloSQLiteError.stepFailed(lastError) }
-            out.append(StoredConversation(
-                id: columnText(stmt, 0),
-                isGroup: sqlite3_column_int(stmt, 1) != 0,
-                name: columnText(stmt, 2),
-                avatar: columnText(stmt, 3),
-                pinned: sqlite3_column_int(stmt, 4) != 0,
-                members: Int(sqlite3_column_int(stmt, 5)),
-                unread: Int(sqlite3_column_int(stmt, 6)),
-                previewText: columnText(stmt, 7),
-                previewTsMs: sqlite3_column_int64(stmt, 8),
-                previewFromMe: sqlite3_column_int(stmt, 9) != 0,
-                updatedAtMs: sqlite3_column_int64(stmt, 10)
-            ))
-        }
-        return out
+        do {
+            return try await core.loadConversations().map(RustCore.stored)
+        } catch { throw RustCore.mapError(error) }
     }
 
     func setConversationUnread(id: String, unread: Int) async throws {
-        if let core {
-            do {
-                try await core.setConversationUnread(id: id, unread: Int64(max(0, unread)))
-                return
-            } catch { throw RustCore.mapError(error) }
-        }
-        let stmt = try prepare("UPDATE conversations SET unread = ?1 WHERE id = ?2;")
-        defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_int(stmt, 1, Int32(max(0, unread)))
-        bindText(stmt, 2, id)
-        try stepDone(stmt)
+        do {
+            try await core.setConversationUnread(id: id, unread: Int64(max(0, unread)))
+        } catch { throw RustCore.mapError(error) }
     }
 
     func setConversationPinned(id: String, pinned: Bool) async throws {
-        if let core {
-            do {
-                try await core.setConversationPinned(id: id, pinned: pinned)
-                return
-            } catch { throw RustCore.mapError(error) }
-        }
-        let stmt = try prepare("UPDATE conversations SET pinned = ?1 WHERE id = ?2;")
-        defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_int(stmt, 1, pinned ? 1 : 0)
-        bindText(stmt, 2, id)
-        try stepDone(stmt)
+        do {
+            try await core.setConversationPinned(id: id, pinned: pinned)
+        } catch { throw RustCore.mapError(error) }
     }
 
     func deleteConversation(id: String) async throws {
-        if let core {
-            do {
-                try await core.deleteConversation(id: id)
-                return
-            } catch { throw RustCore.mapError(error) }
-        }
-        try inTransaction {
-            let s1 = try prepare("DELETE FROM messages WHERE conv_id = ?1;")
-            defer { sqlite3_finalize(s1) }
-            bindText(s1, 1, id)
-            try stepDone(s1)
-
-            let s2 = try prepare("DELETE FROM conversations WHERE id = ?1;")
-            defer { sqlite3_finalize(s2) }
-            bindText(s2, 1, id)
-            try stepDone(s2)
-        }
+        do {
+            try await core.deleteConversation(id: id)
+        } catch { throw RustCore.mapError(error) }
     }
 
     // MARK: - Messages
@@ -347,135 +228,12 @@ actor ZaloSQLiteStore {
     }
 
     func saveMessages(_ items: [StoredMessage], skipTwinChecks: Bool = false, preserveExistingReactions: Bool = false) async throws {
-        if let core {
-            do {
-                try await core.saveMessagesWith(
-                    items: items.map(RustCore.row),
-                    skipTwinChecks: skipTwinChecks,
-                    preserveExistingReactions: preserveExistingReactions)
-                return
-            } catch { throw RustCore.mapError(error) }
-        }
-        guard !items.isEmpty else { return }
-        try inTransaction {
-            let rawJSONUpdateExpr: String = preserveExistingReactions
-                ? """
-                CASE
-                    WHEN excluded.kind_tag != 'recalled'
-                         AND json_valid(messages.raw_json)
-                         AND json_valid(excluded.raw_json)
-                         AND COALESCE(json_array_length(excluded.raw_json, '$.reactions'), 0) = 0
-                         AND COALESCE(json_array_length(messages.raw_json, '$.reactions'), 0) > 0
-                    THEN json_set(excluded.raw_json, '$.reactions', json_extract(messages.raw_json, '$.reactions'))
-                    ELSE excluded.raw_json
-                END
-                """
-                : "excluded.raw_json"
-            let upsertSQL = """
-            INSERT INTO messages(id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-            ON CONFLICT(conv_id, id) DO UPDATE SET
-                client_id = CASE WHEN excluded.client_id != '' THEN excluded.client_id ELSE messages.client_id END,
-                sender_id = CASE WHEN excluded.sender_id != '' THEN excluded.sender_id ELSE messages.sender_id END,
-                sender_name = CASE WHEN excluded.sender_name != '' THEN excluded.sender_name ELSE messages.sender_name END,
-                sender_avatar = CASE WHEN excluded.sender_avatar != '' THEN excluded.sender_avatar ELSE messages.sender_avatar END,
-                is_mine = excluded.is_mine,
-                text = excluded.text,
-                kind_tag = excluded.kind_tag,
-                ts_ms = CASE WHEN excluded.ts_ms > 0 THEN excluded.ts_ms ELSE messages.ts_ms END,
-                status = excluded.status,
-                raw_json = \(rawJSONUpdateExpr)
-            WHERE excluded.status != 'e2ee_locked' OR messages.status = 'e2ee_locked';
-            """
-            let checkPlainTwinSQL = """
-            SELECT id FROM (
-                SELECT id FROM messages WHERE conv_id = ?1 AND id = ?2 AND status != 'e2ee_locked'
-                UNION ALL
-                SELECT id FROM messages WHERE conv_id = ?1 AND client_id = ?2 AND status != 'e2ee_locked'
-            ) LIMIT 1;
-            """
-            let deleteStaleIdTwinSQL = """
-            DELETE FROM messages
-            WHERE conv_id = ?1 AND id = ?3 AND id != ?2;
-            """
-            let deleteStaleClientTwinSQL = """
-            DELETE FROM messages
-            WHERE conv_id = ?1 AND client_id = ?3 AND id != ?2 AND status = 'e2ee_locked';
-            """
-            let stmt = try prepare(upsertSQL)
-            defer { sqlite3_finalize(stmt) }
-            let checkStmt = skipTwinChecks ? nil : try prepare(checkPlainTwinSQL)
-            defer { if let checkStmt { sqlite3_finalize(checkStmt) } }
-            let delIdStmt = skipTwinChecks ? nil : try prepare(deleteStaleIdTwinSQL)
-            defer { if let delIdStmt { sqlite3_finalize(delIdStmt) } }
-            let delClientStmt = skipTwinChecks ? nil : try prepare(deleteStaleClientTwinSQL)
-            defer { if let delClientStmt { sqlite3_finalize(delClientStmt) } }
-            let serverTwinStmt = skipTwinChecks ? nil : try prepare(
-                "SELECT 1 FROM messages WHERE conv_id = ?1 AND client_id = ?2 AND id != ?2 AND status != 'e2ee_locked' LIMIT 1;")
-            defer { if let serverTwinStmt { sqlite3_finalize(serverTwinStmt) } }
-
-            for m in items {
-                let isLocked = (m.status == "e2ee_locked")
-                if !skipTwinChecks, !m.clientId.isEmpty {
-                    if !isLocked, m.isMine, m.clientId == m.id, let serverTwinStmt {
-                        // A provisional row (the send reply had no server id): the server copy already saved wins.
-                        sqlite3_reset(serverTwinStmt)
-                        sqlite3_clear_bindings(serverTwinStmt)
-                        bindText(serverTwinStmt, 1, m.convId)
-                        bindText(serverTwinStmt, 2, m.clientId)
-                        if sqlite3_step(serverTwinStmt) == SQLITE_ROW { continue }
-                    } else if isLocked, let checkStmt {
-                        sqlite3_reset(checkStmt)
-                        sqlite3_clear_bindings(checkStmt)
-                        bindText(checkStmt, 1, m.convId)
-                        bindText(checkStmt, 2, m.clientId)
-                        if sqlite3_step(checkStmt) == SQLITE_ROW {
-                            let existingId = columnText(checkStmt, 0)
-                            if existingId == m.clientId, !m.id.isEmpty, m.id != m.clientId {
-                                _ = try? performUpgradeMessageIdInTransaction(
-                                    convId: m.convId,
-                                    oldId: m.clientId,
-                                    newId: m.id,
-                                    clientId: m.clientId
-                                )
-                            }
-                            continue
-                        }
-                    } else if !isLocked, m.clientId != m.id, let delIdStmt, let delClientStmt {
-                        sqlite3_reset(delIdStmt)
-                        sqlite3_clear_bindings(delIdStmt)
-                        bindText(delIdStmt, 1, m.convId)
-                        bindText(delIdStmt, 2, m.id)
-                        bindText(delIdStmt, 3, m.clientId)
-                        try stepDone(delIdStmt)
-
-                        sqlite3_reset(delClientStmt)
-                        sqlite3_clear_bindings(delClientStmt)
-                        bindText(delClientStmt, 1, m.convId)
-                        bindText(delClientStmt, 2, m.id)
-                        bindText(delClientStmt, 3, m.clientId)
-                        try stepDone(delClientStmt)
-                    }
-                }
-
-                let rawStr = String(data: m.rawJSONData, encoding: .utf8) ?? "{}"
-                sqlite3_reset(stmt)
-                sqlite3_clear_bindings(stmt)
-                bindText(stmt, 1, m.id)
-                bindText(stmt, 2, m.convId)
-                bindText(stmt, 3, m.clientId)
-                bindText(stmt, 4, m.senderId)
-                bindText(stmt, 5, m.senderName)
-                bindText(stmt, 6, m.senderAvatar)
-                sqlite3_bind_int(stmt, 7, m.isMine ? 1 : 0)
-                bindText(stmt, 8, m.text)
-                bindText(stmt, 9, m.kindTag)
-                sqlite3_bind_int64(stmt, 10, m.tsMs)
-                bindText(stmt, 11, m.status)
-                bindText(stmt, 12, rawStr)
-                try stepDone(stmt)
-            }
-        }
+        do {
+            try await core.saveMessagesWith(
+                items: items.map(RustCore.row),
+                skipTwinChecks: skipTwinChecks,
+                preserveExistingReactions: preserveExistingReactions)
+        } catch { throw RustCore.mapError(error) }
     }
 
     /// One-time migration scrubbing pre-fix corrupted/ghost reactions (entries missing `userCounts`
@@ -763,128 +521,21 @@ actor ZaloSQLiteStore {
     /// Loads messages for `convId` in chronological ascending order (oldest -> newest).
     /// When `beforeTsMs` is provided, fetches messages strictly older than `beforeTsMs`.
     func messages(convId: String, beforeTsMs: Int64? = nil, limit: Int = 50) async throws -> [StoredMessage] {
-        if let core {
-            do {
-                return try await core.messages(convId: convId, beforeTsMs: beforeTsMs, limit: Int64(limit)).map(RustCore.stored)
-            } catch { throw RustCore.mapError(error) }
-        }
-        let clampedLimit = max(1, min(limit, 500))
-        let sql: String
-        if beforeTsMs != nil {
-            sql = """
-            SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
-            FROM messages
-            WHERE conv_id = ?1 AND ts_ms < ?2
-            ORDER BY ts_ms DESC, id DESC
-            LIMIT ?3;
-            """
-        } else {
-            sql = """
-            SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
-            FROM messages
-            WHERE conv_id = ?1
-            ORDER BY ts_ms DESC, id DESC
-            LIMIT ?2;
-            """
-        }
-        let stmt = try prepare(sql)
-        defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, convId)
-        if let beforeTsMs {
-            sqlite3_bind_int64(stmt, 2, beforeTsMs)
-            sqlite3_bind_int(stmt, 3, Int32(clampedLimit))
-        } else {
-            sqlite3_bind_int(stmt, 2, Int32(clampedLimit))
-        }
-        var desc: [StoredMessage] = []
-        while true {
-            let rc = sqlite3_step(stmt)
-            if rc == SQLITE_DONE { break }
-            guard rc == SQLITE_ROW else { throw ZaloSQLiteError.stepFailed(lastError) }
-            desc.append(readStoredMessage(stmt))
-        }
-        return desc.reversed()
-    }
-
-    /// Escapes SQLite `LIKE` wildcards (`%`, `_`, and `\`) using `\` as the escape character.
-    static func escapeLikePattern(_ query: String) -> String {
-        var out = ""
-        out.reserveCapacity(query.count)
-        for ch in query {
-            if ch == "\\" || ch == "%" || ch == "_" {
-                out.append("\\")
-            }
-            out.append(ch)
-        }
-        return out
+        do {
+            return try await core.messages(convId: convId, beforeTsMs: beforeTsMs, limit: Int64(limit)).map(RustCore.stored)
+        } catch { throw RustCore.mapError(error) }
     }
 
     /// Searches stored messages in `conversationId` case-insensitively using `LIKE ? ESCAPE '\'`,
     /// returning newest-first (`ts_ms DESC`).
     func searchMessages(conversationId: String, query: String, limit: Int = 50) async throws -> [StoredMessage] {
-        if let core {
-            do {
-                return try await core.searchMessages(convId: conversationId, query: query, limit: Int64(limit)).map(RustCore.stored)
-            } catch { throw RustCore.mapError(error) }
-        }
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !conversationId.isEmpty, !trimmed.isEmpty, limit > 0 else { return [] }
-        let clampedLimit = max(1, min(limit, 500))
-        let pattern = "%\(Self.escapeLikePattern(trimmed.lowercased()))%"
-        let sql = """
-        SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
-        FROM messages
-        WHERE conv_id = ?1
-          AND kind_tag != 'recalled'
-          AND status != 'e2ee_locked'
-          AND (
-              olaz_fold(text) LIKE ?2 ESCAPE '\\'
-              OR (
-                  json_valid(raw_json)
-                  AND (
-                      olaz_fold(COALESCE(json_extract(raw_json, '$.text'), '')) LIKE ?2 ESCAPE '\\'
-                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.caption'), '')) LIKE ?2 ESCAPE '\\'
-                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.body'), '')) LIKE ?2 ESCAPE '\\'
-                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.caption'), '')) LIKE ?2 ESCAPE '\\'
-                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.title'), '')) LIKE ?2 ESCAPE '\\'
-                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.description'), '')) LIKE ?2 ESCAPE '\\'
-                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.name'), '')) LIKE ?2 ESCAPE '\\'
-                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.address'), '')) LIKE ?2 ESCAPE '\\'
-                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.question'), '')) LIKE ?2 ESCAPE '\\'
-                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.header'), '')) LIKE ?2 ESCAPE '\\'
-                      OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.text'), '')) LIKE ?2 ESCAPE '\\'
-                      OR (
-                          kind_tag = 'oaMessage'
-                          AND json_type(raw_json, '$.kind.parts') = 'array'
-                          AND EXISTS (
-                              SELECT 1 FROM json_each(raw_json, '$.kind.parts')
-                              WHERE olaz_fold(COALESCE(json_extract(value, '$.title'), '')) LIKE ?2 ESCAPE '\\'
-                                 OR olaz_fold(COALESCE(json_extract(value, '$.description'), '')) LIKE ?2 ESCAPE '\\'
-                          )
-                      )
-                  )
-              )
-          )
-        ORDER BY ts_ms DESC, id DESC
-        LIMIT ?3;
-        """
-        let stmt = try prepare(sql)
-        defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, conversationId)
-        bindText(stmt, 2, pattern)
-        sqlite3_bind_int(stmt, 3, Int32(clampedLimit))
-        var out: [StoredMessage] = []
-        while true {
-            let rc = sqlite3_step(stmt)
-            if rc == SQLITE_DONE { break }
-            guard rc == SQLITE_ROW else { throw ZaloSQLiteError.stepFailed(lastError) }
-            out.append(readStoredMessage(stmt))
-        }
-        return out
+        do {
+            return try await core.searchMessages(convId: conversationId, query: query, limit: Int64(limit)).map(RustCore.stored)
+        } catch { throw RustCore.mapError(error) }
     }
 
-    /// Loads messages from `targetTsMs` upward (optionally capped at `beforeOldestTsMs`) plus `contextBefore`
-    /// earlier messages so jumping to an older search match has surrounding context in chronological order.
+    /// Loads a context window anchored around a target timestamp (`ts_ms >= targetTsMs`, plus up to
+    /// `contextBefore` older messages right before it), stopping before `beforeOldestTsMs` if provided.
     func messagesAround(
         convId: String,
         targetTsMs: Int64,
@@ -892,300 +543,46 @@ actor ZaloSQLiteStore {
         contextBefore: Int = 25,
         maxWindow: Int = 3000
     ) async throws -> (messages: [StoredMessage], hasMoreOlder: Bool) {
-        if let core {
-            do {
-                let r = try await core.messagesAround(
-                    convId: convId, targetTsMs: targetTsMs, beforeOldestTsMs: beforeOldestTsMs,
-                    contextBefore: Int64(contextBefore), maxWindow: Int64(maxWindow))
-                return (r.messages.map(RustCore.stored), r.hasMoreOlder)
-            } catch { throw RustCore.mapError(error) }
-        }
-        let clampedBefore = max(0, min(contextBefore, 200))
-        let clampedWindow = max(1, min(maxWindow, 5000))
-
-        var olderDesc: [StoredMessage] = []
-        if clampedBefore > 0 {
-            let olderSQL = """
-            SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
-            FROM messages
-            WHERE conv_id = ?1 AND ts_ms < ?2
-            ORDER BY ts_ms DESC, id DESC
-            LIMIT ?3;
-            """
-            let stmt = try prepare(olderSQL)
-            defer { sqlite3_finalize(stmt) }
-            bindText(stmt, 1, convId)
-            sqlite3_bind_int64(stmt, 2, targetTsMs)
-            sqlite3_bind_int(stmt, 3, Int32(clampedBefore + 1))
-            while true {
-                let rc = sqlite3_step(stmt)
-                if rc == SQLITE_DONE { break }
-                guard rc == SQLITE_ROW else { throw ZaloSQLiteError.stepFailed(lastError) }
-                olderDesc.append(readStoredMessage(stmt))
-            }
-        }
-        let hasMoreOlder = olderDesc.count > clampedBefore
-        let contextAsc = Array(olderDesc.prefix(clampedBefore).reversed())
-
-        let newerSQL: String
-        if beforeOldestTsMs != nil {
-            newerSQL = """
-            SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
-            FROM messages
-            WHERE conv_id = ?1 AND ts_ms >= ?2 AND ts_ms <= ?3
-            ORDER BY ts_ms ASC, id ASC
-            LIMIT ?4;
-            """
-        } else {
-            newerSQL = """
-            SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
-            FROM messages
-            WHERE conv_id = ?1 AND ts_ms >= ?2
-            ORDER BY ts_ms ASC, id ASC
-            LIMIT ?3;
-            """
-        }
-        let newerStmt = try prepare(newerSQL)
-        defer { sqlite3_finalize(newerStmt) }
-        bindText(newerStmt, 1, convId)
-        sqlite3_bind_int64(newerStmt, 2, targetTsMs)
-        if let beforeOldestTsMs {
-            sqlite3_bind_int64(newerStmt, 3, beforeOldestTsMs)
-            sqlite3_bind_int(newerStmt, 4, Int32(clampedWindow))
-        } else {
-            sqlite3_bind_int(newerStmt, 3, Int32(clampedWindow))
-        }
-        var newerAsc: [StoredMessage] = []
-        while true {
-            let rc = sqlite3_step(newerStmt)
-            if rc == SQLITE_DONE { break }
-            guard rc == SQLITE_ROW else { throw ZaloSQLiteError.stepFailed(lastError) }
-            newerAsc.append(readStoredMessage(newerStmt))
-        }
-
-        return (contextAsc + newerAsc, hasMoreOlder)
-    }
-
-    private func readStoredMessage(_ stmt: OpaquePointer) -> StoredMessage {
-        let raw = columnText(stmt, 11)
-        return StoredMessage(
-            id: columnText(stmt, 0),
-            convId: columnText(stmt, 1),
-            clientId: columnText(stmt, 2),
-            senderId: columnText(stmt, 3),
-            senderName: columnText(stmt, 4),
-            senderAvatar: columnText(stmt, 5),
-            isMine: sqlite3_column_int(stmt, 6) != 0,
-            text: columnText(stmt, 7),
-            kindTag: columnText(stmt, 8),
-            tsMs: sqlite3_column_int64(stmt, 9),
-            status: columnText(stmt, 10),
-            rawJSONData: Data(raw.utf8)
-        )
+        do {
+            let page = try await core.messagesAround(
+                convId: convId,
+                targetTsMs: targetTsMs,
+                beforeOldestTsMs: beforeOldestTsMs,
+                contextBefore: Int64(contextBefore),
+                maxWindow: Int64(maxWindow))
+            return (page.messages.map(RustCore.stored), page.hasMoreOlder)
+        } catch { throw RustCore.mapError(error) }
     }
 
     func message(convId: String, idOrClientId: String) async throws -> StoredMessage? {
-        if let core {
-            do {
-                return try await core.message(convId: convId, idOrClientId: idOrClientId).map(RustCore.stored)
-            } catch { throw RustCore.mapError(error) }
-        }
-        let sql = """
-        SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
-        FROM messages
-        WHERE conv_id = ?1 AND id = ?2
-        UNION ALL
-        SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
-        FROM messages
-        WHERE conv_id = ?1 AND client_id = ?2 AND id != ?2
-        LIMIT 1;
-        """
-        let stmt = try prepare(sql)
-        defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, convId)
-        bindText(stmt, 2, idOrClientId)
-        let rc = sqlite3_step(stmt)
-        if rc == SQLITE_DONE { return nil }
-        guard rc == SQLITE_ROW else { throw ZaloSQLiteError.stepFailed(lastError) }
-        return StoredMessage(
-            id: columnText(stmt, 0),
-            convId: columnText(stmt, 1),
-            clientId: columnText(stmt, 2),
-            senderId: columnText(stmt, 3),
-            senderName: columnText(stmt, 4),
-            senderAvatar: columnText(stmt, 5),
-            isMine: sqlite3_column_int(stmt, 6) != 0,
-            text: columnText(stmt, 7),
-            kindTag: columnText(stmt, 8),
-            tsMs: sqlite3_column_int64(stmt, 9),
-            status: columnText(stmt, 10),
-            rawJSONData: Data(columnText(stmt, 11).utf8)
-        )
+        do {
+            return try await core.message(convId: convId, idOrClientId: idOrClientId).map(RustCore.stored)
+        } catch { throw RustCore.mapError(error) }
     }
 
     @discardableResult
     func upgradeMessageId(convId: String, oldId: String, newId: String, clientId: String) async throws -> Bool {
-        if let core {
-            do {
-                return try await core.upgradeMessageId(convId: convId, oldId: oldId, newId: newId, clientId: clientId)
-            } catch { throw RustCore.mapError(error) }
-        }
-        var upgraded = false
-        try inTransaction {
-            upgraded = try performUpgradeMessageIdInTransaction(
-                convId: convId,
-                oldId: oldId,
-                newId: newId,
-                clientId: clientId
-            )
-        }
-        return upgraded
-    }
-
-    private func performUpgradeMessageIdInTransaction(
-        convId: String,
-        oldId: String,
-        newId: String,
-        clientId: String
-    ) throws -> Bool {
-        guard !convId.isEmpty, !oldId.isEmpty, !newId.isEmpty, oldId != newId else { return false }
-
-        let targetCheck = try prepare("SELECT 1 FROM messages WHERE conv_id = ?1 AND id = ?2 LIMIT 1;")
-        defer { sqlite3_finalize(targetCheck) }
-        bindText(targetCheck, 1, convId)
-        bindText(targetCheck, 2, newId)
-        if sqlite3_step(targetCheck) == SQLITE_ROW {
-            return false
-        }
-
-        let sourceFetch = try prepare("""
-        SELECT raw_json FROM messages
-        WHERE conv_id = ?1 AND id = ?2 AND status != 'e2ee_locked'
-        LIMIT 1;
-        """)
-        defer { sqlite3_finalize(sourceFetch) }
-        bindText(sourceFetch, 1, convId)
-        bindText(sourceFetch, 2, oldId)
-        guard sqlite3_step(sourceFetch) == SQLITE_ROW else {
-            return false
-        }
-
-        let oldRaw = columnText(sourceFetch, 0)
-        let updatedRawJSON: String = {
-            guard let data = oldRaw.data(using: .utf8),
-                  var obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-                return oldRaw
-            }
-            obj["id"] = newId
-            if !clientId.isEmpty {
-                obj["clientId"] = clientId
-            }
-            guard let outData = try? JSONSerialization.data(withJSONObject: obj),
-                  let str = String(data: outData, encoding: .utf8) else {
-                return oldRaw
-            }
-            return str
-        }()
-
-        let upd = try prepare("""
-        UPDATE messages
-        SET id = ?1,
-            client_id = CASE WHEN ?2 != '' THEN ?2 ELSE client_id END,
-            raw_json = ?3
-        WHERE conv_id = ?4 AND id = ?5 AND status != 'e2ee_locked';
-        """)
-        defer { sqlite3_finalize(upd) }
-        bindText(upd, 1, newId)
-        bindText(upd, 2, clientId)
-        bindText(upd, 3, updatedRawJSON)
-        bindText(upd, 4, convId)
-        bindText(upd, 5, oldId)
-        try stepDone(upd)
-        return sqlite3_changes(db) > 0
+        do {
+            return try await core.upgradeMessageId(convId: convId, oldId: oldId, newId: newId, clientId: clientId)
+        } catch { throw RustCore.mapError(error) }
     }
 
     func deleteMessage(convId: String, id: String) async throws {
-        if let core {
-            do {
-                try await core.deleteMessage(convId: convId, id: id)
-                return
-            } catch { throw RustCore.mapError(error) }
-        }
-        try inTransaction {
-            let s1 = try prepare("DELETE FROM messages WHERE conv_id = ?1 AND id = ?2;")
-            defer { sqlite3_finalize(s1) }
-            bindText(s1, 1, convId)
-            bindText(s1, 2, id)
-            try stepDone(s1)
-
-            let s2 = try prepare("DELETE FROM messages WHERE conv_id = ?1 AND client_id = ?2;")
-            defer { sqlite3_finalize(s2) }
-            bindText(s2, 1, convId)
-            bindText(s2, 2, id)
-            try stepDone(s2)
-        }
+        do {
+            try await core.deleteMessage(convId: convId, id: id)
+        } catch { throw RustCore.mapError(error) }
     }
 
     func markRecalled(convId: String, id: String, cliMsgId: String = "") async throws {
-        if let core {
-            do {
-                try await core.markRecalled(convId: convId, id: id, cliMsgId: cliMsgId)
-                return
-            } catch { throw RustCore.mapError(error) }
-        }
-        var lookup = try await message(convId: convId, idOrClientId: id)
-        if lookup == nil, !cliMsgId.isEmpty {
-            lookup = try await message(convId: convId, idOrClientId: cliMsgId)
-        }
-        guard let existing = lookup,
-              var dict = (try? JSONSerialization.jsonObject(with: existing.rawJSONData)) as? [String: Any] else {
-            return
-        }
-        dict["type"] = "recalled"
-        dict["kind"] = ["type": "recalled"]
-        dict["text"] = ""
-        dict["reactions"] = []
-        dict["buttons"] = []
-        dict.removeValue(forKey: "quote")
-        if var menu = dict["menu"] as? [String: Any] {
-            menu["recall"] = false
-            menu["forward"] = ""
-            menu["pin"] = false
-            menu["star"] = ""
-            menu["starred"] = false
-            dict["menu"] = menu
-        }
-        guard let updatedData = try? JSONSerialization.data(withJSONObject: dict) else { return }
-        let updated = StoredMessage(
-            id: existing.id, convId: existing.convId, clientId: existing.clientId,
-            senderId: existing.senderId, senderName: existing.senderName, senderAvatar: existing.senderAvatar,
-            isMine: existing.isMine, text: "", kindTag: "recalled", tsMs: existing.tsMs,
-            status: existing.status, rawJSONData: updatedData
-        )
-        try await saveMessages([updated])
+        do {
+            try await core.markRecalled(convId: convId, id: id, cliMsgId: cliMsgId)
+        } catch { throw RustCore.mapError(error) }
     }
 
     func updateMessageReactionsJSON(convId: String, id: String, reactionsJSONData: Data) async throws {
-        if let core {
-            do {
-                try await core.updateMessageReactionsJson(convId: convId, id: id, reactionsJson: reactionsJSONData)
-                return
-            } catch { throw RustCore.mapError(error) }
-        }
-        guard let existing = try await message(convId: convId, idOrClientId: id),
-              var dict = (try? JSONSerialization.jsonObject(with: existing.rawJSONData)) as? [String: Any],
-              let reactionsObj = try? JSONSerialization.jsonObject(with: reactionsJSONData) else {
-            return
-        }
-        dict["reactions"] = reactionsObj
-        guard let updatedData = try? JSONSerialization.data(withJSONObject: dict) else { return }
-        let updated = StoredMessage(
-            id: existing.id, convId: existing.convId, clientId: existing.clientId,
-            senderId: existing.senderId, senderName: existing.senderName, senderAvatar: existing.senderAvatar,
-            isMine: existing.isMine, text: existing.text, kindTag: existing.kindTag, tsMs: existing.tsMs,
-            status: existing.status, rawJSONData: updatedData
-        )
-        try await saveMessages([updated])
+        do {
+            try await core.updateMessageReactionsJson(convId: convId, id: id, reactionsJson: reactionsJSONData)
+        } catch { throw RustCore.mapError(error) }
     }
 
     /// Queries locally indexed shared-media JSON blobs for `convId` filtered by `kindTags`.
@@ -1414,73 +811,23 @@ actor ZaloSQLiteStore {
 
     /// Returns the subset of `ids` (matching either `id` or `client_id`) already persisted in `convId`.
     func existingMessageIds(convId: String, ids: [String]) async throws -> Set<String> {
-        if let core {
-            do {
-                return Set(try await core.existingMessageIds(convId: convId, ids: ids))
-            } catch { throw RustCore.mapError(error) }
-        }
-        let unique = Array(Set(ids.filter { !$0.isEmpty }))
-        guard !convId.isEmpty, !unique.isEmpty else { return [] }
-        var found = Set<String>()
-        for start in stride(from: 0, to: unique.count, by: 200) {
-            let chunk = Array(unique[start..<min(start + 200, unique.count)])
-            let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
-            let sql = """
-            SELECT id, client_id
-            FROM messages
-            WHERE conv_id = ? AND (id IN (\(placeholders)) OR client_id IN (\(placeholders)));
-            """
-            let stmt = try prepare(sql)
-            defer { sqlite3_finalize(stmt) }
-            var idx: Int32 = 1
-            bindText(stmt, idx, convId); idx += 1
-            for id in chunk { bindText(stmt, idx, id); idx += 1 }
-            for id in chunk { bindText(stmt, idx, id); idx += 1 }
-            while true {
-                let rc = sqlite3_step(stmt)
-                if rc == SQLITE_DONE { break }
-                guard rc == SQLITE_ROW else { throw ZaloSQLiteError.stepFailed(lastError) }
-                let rowId = columnText(stmt, 0)
-                let cliId = columnText(stmt, 1)
-                if !rowId.isEmpty { found.insert(rowId) }
-                if !cliId.isEmpty { found.insert(cliId) }
-            }
-        }
-        return found
+        do {
+            return Set(try await core.existingMessageIds(convId: convId, ids: ids))
+        } catch { throw RustCore.mapError(error) }
     }
 
     // MARK: - Preferences
 
     func getPreferenceData(key: String) async throws -> Data? {
-        if let core {
-            do {
-                return try await core.preferenceData(key: key)
-            } catch { throw RustCore.mapError(error) }
-        }
-        let stmt = try prepare("SELECT value_json FROM preferences WHERE key = ?1 LIMIT 1;")
-        defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, key)
-        let rc = sqlite3_step(stmt)
-        if rc == SQLITE_DONE { return nil }
-        guard rc == SQLITE_ROW else { throw ZaloSQLiteError.stepFailed(lastError) }
-        return Data(columnText(stmt, 0).utf8)
+        do {
+            return try await core.preferenceData(key: key)
+        } catch { throw RustCore.mapError(error) }
     }
 
     func setPreferenceData(key: String, data: Data) async throws {
-        if let core {
-            do {
-                try await core.setPreferenceData(key: key, data: data)
-                return
-            } catch { throw RustCore.mapError(error) }
-        }
-        let stmt = try prepare("""
-        INSERT INTO preferences(key, value_json) VALUES (?1, ?2)
-        ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json;
-        """)
-        defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, key)
-        bindText(stmt, 2, String(data: data, encoding: .utf8) ?? "{}")
-        try stepDone(stmt)
+        do {
+            try await core.setPreferenceData(key: key, data: data)
+        } catch { throw RustCore.mapError(error) }
     }
 
     func getPreferenceString(key: String) async throws -> String? {
@@ -1514,63 +861,38 @@ actor ZaloSQLiteStore {
     }
 
     func deletePreference(key: String) async throws {
-        if let core {
-            do {
-                try await core.deletePreference(key: key)
-                return
-            } catch { throw RustCore.mapError(error) }
-        }
-        let stmt = try prepare("DELETE FROM preferences WHERE key = ?1;")
-        defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, key)
-        try stepDone(stmt)
+        do {
+            try await core.deletePreference(key: key)
+        } catch { throw RustCore.mapError(error) }
     }
 
-    // MARK: - Typed reads / writes (no JSON in Swift on the Rust path)
-
-    private static func decoded(_ stored: [StoredMessage]) -> [DecodedMessageRow] {
-        stored.compactMap { s in
-            ZaloWireParser.decodeStoredMessage(s).map { DecodedMessageRow(message: $0, rowId: s.id, rowClientId: s.clientId) }
-        }
-    }
+    // MARK: - Typed reads / writes (no JSON in Swift)
 
     private static func decoded(_ rows: [StoredChat]) -> [DecodedMessageRow] {
         rows.map { DecodedMessageRow(message: ChatMessage(record: $0.message), rowId: $0.rowId, rowClientId: $0.rowClientId) }
     }
 
-    /// `messages(...)` decoded to `ChatMessage`s (Rust path: decoded in the core, no JSON re-parse in Swift).
+    /// `messages(...)` decoded to `ChatMessage`s (decoded in the core, no JSON re-parse in Swift).
     func decodedMessages(convId: String, beforeTsMs: Int64? = nil, limit: Int = 50) async throws -> [DecodedMessageRow] {
-        if let core {
-            do { return Self.decoded(try await core.messagesChat(convId: convId, beforeTsMs: beforeTsMs, limit: Int64(limit))) }
-            catch { throw RustCore.mapError(error) }
-        }
-        return Self.decoded(try await messages(convId: convId, beforeTsMs: beforeTsMs, limit: limit))
+        do { return Self.decoded(try await core.messagesChat(convId: convId, beforeTsMs: beforeTsMs, limit: Int64(limit))) }
+        catch { throw RustCore.mapError(error) }
     }
 
-    /// `message(convId:idOrClientId:)` decoded to a `ChatMessage` (nil when missing or undecodable). Rust path: decoded in
-    /// the core, no JSON re-parse in Swift. The row's `id` / `clientId` columns come back with it.
+    /// `message(convId:idOrClientId:)` decoded to a `ChatMessage` (nil when missing or undecodable).
     func decodedMessage(convId: String, idOrClientId: String) async throws -> DecodedMessageRow? {
-        if let core {
-            do {
-                return try await core.messageChat(convId: convId, idOrClientId: idOrClientId).map {
-                    DecodedMessageRow(message: ChatMessage(record: $0.message), rowId: $0.rowId, rowClientId: $0.rowClientId)
-                }
-            } catch { throw RustCore.mapError(error) }
-        }
-        guard let stored = try await message(convId: convId, idOrClientId: idOrClientId),
-              let decoded = ZaloWireParser.decodeStoredMessage(stored) else { return nil }
-        return DecodedMessageRow(message: decoded, rowId: stored.id, rowClientId: stored.clientId)
+        do {
+            return try await core.messageChat(convId: convId, idOrClientId: idOrClientId).map {
+                DecodedMessageRow(message: ChatMessage(record: $0.message), rowId: $0.rowId, rowClientId: $0.rowClientId)
+            }
+        } catch { throw RustCore.mapError(error) }
     }
 
     /// `searchMessages(...)` decoded to `ChatMessage`s.
     func decodedSearch(conversationId: String, query: String, limit: Int = 50) async throws -> [DecodedMessageRow] {
-        if let core {
-            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !conversationId.isEmpty, !trimmed.isEmpty, limit > 0 else { return [] }
-            do { return Self.decoded(try await core.searchMessagesChat(convId: conversationId, query: query, limit: Int64(limit))) }
-            catch { throw RustCore.mapError(error) }
-        }
-        return Self.decoded(try await searchMessages(conversationId: conversationId, query: query, limit: limit))
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !conversationId.isEmpty, !trimmed.isEmpty, limit > 0 else { return [] }
+        do { return Self.decoded(try await core.searchMessagesChat(convId: conversationId, query: query, limit: Int64(limit))) }
+        catch { throw RustCore.mapError(error) }
     }
 
     /// `messagesAround(...)` decoded to `ChatMessage`s.
@@ -1581,106 +903,29 @@ actor ZaloSQLiteStore {
         contextBefore: Int = 25,
         maxWindow: Int = 3000
     ) async throws -> (rows: [DecodedMessageRow], hasMoreOlder: Bool) {
-        if let core {
-            do {
-                let r = try await core.messagesAroundChat(
-                    convId: convId, targetTsMs: targetTsMs, beforeOldestTsMs: beforeOldestTsMs,
-                    contextBefore: Int64(contextBefore), maxWindow: Int64(maxWindow))
-                return (Self.decoded(r.messages), r.hasMoreOlder)
-            } catch { throw RustCore.mapError(error) }
-        }
-        let r = try await messagesAround(
-            convId: convId, targetTsMs: targetTsMs, beforeOldestTsMs: beforeOldestTsMs, contextBefore: contextBefore, maxWindow: maxWindow)
-        return (Self.decoded(r.messages), r.hasMoreOlder)
+        do {
+            let r = try await core.messagesAroundChat(
+                convId: convId, targetTsMs: targetTsMs, beforeOldestTsMs: beforeOldestTsMs,
+                contextBefore: Int64(contextBefore), maxWindow: Int64(maxWindow))
+            return (Self.decoded(r.messages), r.hasMoreOlder)
+        } catch { throw RustCore.mapError(error) }
     }
 
-    /// `readMessagesNow(...)` decoded to `ChatMessage`s: the synchronous first-frame read. Rust path: the core's
-    /// separate read-only connection, decoded in Rust.
+    /// Synchronous first-frame read decoded in the core on its separate read-only connection.
     nonisolated func readDecodedMessagesNow(convId: String, beforeTsMs: Int64? = nil, limit: Int = 50) -> [DecodedMessageRow]? {
-        if let core {
-            return core.readChatMessagesNow(convId: convId, beforeTsMs: beforeTsMs, limit: Int64(limit)).map(Self.decoded)
-        }
-        return readMessagesNow(convId: convId, beforeTsMs: beforeTsMs, limit: limit).map(Self.decoded)
+        core.readChatMessagesNow(convId: convId, beforeTsMs: beforeTsMs, limit: Int64(limit)).map(Self.decoded)
     }
 
-    /// Saves typed messages. Rust path: encoded to the canonical row in the core (no `StoredMessage` / JSON in Swift).
+    /// Saves typed messages (encoded to the canonical row in the core).
     func saveChatMessages(_ items: [ChatMessage], skipTwinChecks: Bool = false, preserveExistingReactions: Bool = false) async throws {
-        if let core {
-            do {
-                try await core.saveChatMessages(
-                    items: items.map { ChatMessageRecord(message: $0) },
-                    skipTwinChecks: skipTwinChecks, preserveExistingReactions: preserveExistingReactions)
-                return
-            } catch { throw RustCore.mapError(error) }
-        }
-        try await saveMessages(
-            items.compactMap { ZaloWireParser.encodeChatMessage($0) },
-            skipTwinChecks: skipTwinChecks, preserveExistingReactions: preserveExistingReactions)
-    }
-
-    nonisolated func readMessagesNow(convId: String, beforeTsMs: Int64? = nil, limit: Int = 50) -> [StoredMessage]? {
-        readLock.lock()
-        defer { readLock.unlock() }
-        guard let handle = readDb else { return nil }
-        let clampedLimit = max(1, min(limit, 500))
-        let cols = "id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json"
-        let sql = beforeTsMs != nil
-            ? "SELECT \(cols) FROM messages WHERE conv_id = ?1 AND ts_ms < ?2 ORDER BY ts_ms DESC, id DESC LIMIT ?3;"
-            : "SELECT \(cols) FROM messages WHERE conv_id = ?1 ORDER BY ts_ms DESC, id DESC LIMIT ?2;"
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(handle, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return nil }
-        defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_text(stmt, 1, convId, -1, SQLITE_TRANSIENT)
-        if let beforeTsMs {
-            sqlite3_bind_int64(stmt, 2, beforeTsMs)
-            sqlite3_bind_int(stmt, 3, Int32(clampedLimit))
-        } else {
-            sqlite3_bind_int(stmt, 2, Int32(clampedLimit))
-        }
-        var desc: [StoredMessage] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            let col: (Int32) -> String = { idx in
-                guard let ptr = sqlite3_column_text(stmt, idx) else { return "" }
-                return String(cString: ptr)
-            }
-            let raw = col(11)
-            desc.append(StoredMessage(
-                id: col(0),
-                convId: col(1),
-                clientId: col(2),
-                senderId: col(3),
-                senderName: col(4),
-                senderAvatar: col(5),
-                isMine: sqlite3_column_int(stmt, 6) != 0,
-                text: col(7),
-                kindTag: col(8),
-                tsMs: sqlite3_column_int64(stmt, 9),
-                status: col(10),
-                rawJSONData: Data(raw.utf8)
-            ))
-        }
-        return desc.reversed()
+        do {
+            try await core.saveChatMessages(
+                items: items.map { ChatMessageRecord(message: $0) },
+                skipTwinChecks: skipTwinChecks, preserveExistingReactions: preserveExistingReactions)
+        } catch { throw RustCore.mapError(error) }
     }
 
     // MARK: - Low-level SQLite Helpers
-
-    private static func registerSearchFunctions(on db: OpaquePointer?) {
-        guard let db else { return }
-        let flags = SQLITE_UTF8 | SQLITE_DETERMINISTIC
-        sqlite3_create_function_v2(db, "olaz_fold", 1, flags, nil, { ctx, argc, argv in
-            guard argc == 1,
-                  let arg = argv?[0],
-                  sqlite3_value_type(arg) != SQLITE_NULL,
-                  let cStr = sqlite3_value_text(arg) else {
-                sqlite3_result_text(ctx, "", 0, nil)
-                return
-            }
-            let folded = String(cString: cStr).lowercased()
-            folded.withCString { ptr in
-                sqlite3_result_text(ctx, ptr, -1, SQLITE_TRANSIENT)
-            }
-        }, nil, nil, nil)
-    }
 
     private var lastError: String {
         db.map { String(cString: sqlite3_errmsg($0)) } ?? "closed"

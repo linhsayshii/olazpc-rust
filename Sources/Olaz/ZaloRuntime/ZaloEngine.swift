@@ -209,11 +209,10 @@ final class ZaloEngine {
     init(
         dataDirectory: URL = ZaloPlatform.defaultUserData,
         useKeychain: Bool = true,
-        urlSession: URLSession? = nil,
         domains: ZaloDomains = ZaloDomains()
     ) {
         self.dataDirectory = dataDirectory
-        self.sessionClient = ZaloSessionClient(dataDirectory: dataDirectory, useKeychain: useKeychain, urlSession: urlSession, domains: domains)
+        self.sessionClient = ZaloSessionClient(dataDirectory: dataDirectory, useKeychain: useKeychain, domains: domains)
     }
 
     // MARK: - Lifecycle
@@ -227,7 +226,7 @@ final class ZaloEngine {
                 self?.recentLog.removeFirst(count - 200)
             }
         }
-        EngineLog.shared.write("engine: start native runtime core=\(RustCore.isEnabled ? "rust" : "swift") (zpw_ver=\(ZaloDomains.zpwVer))")
+        EngineLog.shared.write("engine: start native runtime core=rust (zpw_ver=\(ZaloDomains.zpwVer))")
         NativeNotifier.shared.attach(engine: self)
         ZaloRuntime.prepareForLaunch()
         call.helperInstalled = CallBridge.isHelperInstalled()

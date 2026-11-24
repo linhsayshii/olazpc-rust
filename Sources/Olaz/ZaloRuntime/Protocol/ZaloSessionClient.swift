@@ -83,10 +83,8 @@ private struct StoredNativeSession: Codable {
 
 actor ZaloSessionClient {
     let dataDirectory: URL
-    private let session: URLSession
     private let useKeychain: Bool
     /// Rust chat path (ADR-011). Swift stays the owner of Keychain persistence; the core session mirrors our state.
-    let useRustCore: Bool
     private var coreSession: CoreSession?
     private var coreApiHandle: CoreApi?
     private var coreHttpHandle: CoreHttp?
@@ -105,7 +103,6 @@ actor ZaloSessionClient {
     var cachedStickerCategories: [[String: Any]]?
     var globalIdToUidCache: [String: String] = [:]
     var uidToGlobalIdCache: [String: String] = [:]
-    var cloudIsOldByConv: [String: Bool] = [:]
     var cloudViewerKey: String?
     var cloudEnk: String?
 
@@ -121,29 +118,12 @@ actor ZaloSessionClient {
     init(
         dataDirectory: URL = ZaloPlatform.defaultUserData,
         useKeychain: Bool = true,
-        urlSession: URLSession? = nil,
-        useRustCore: Bool = RustCore.isEnabled,
         domains: ZaloDomains = ZaloDomains()
     ) {
         self.dataDirectory = dataDirectory
         self.useKeychain = useKeychain
         self.domains = domains
-        // An injected URLSession means a test stubbing the network (URLProtocol): the Rust client has its own
-        // transport and would bypass the stub, so those sessions stay on the Swift path.
-        self.useRustCore = useRustCore && urlSession == nil
         self.computerName = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
-
-        if let urlSession {
-            self.session = urlSession
-        } else {
-            let config = URLSessionConfiguration.ephemeral
-            config.httpShouldSetCookies = false
-            config.httpCookieAcceptPolicy = .never
-            config.timeoutIntervalForRequest = 35
-            config.timeoutIntervalForResource = 180
-            config.waitsForConnectivity = false
-            self.session = URLSession(configuration: config)
-        }
 
         let expectedSuffix = ZaloCrypto.md5Hex(ZaloDomains.userAgent)
         let storedIMEI = UserDefaults.standard.string(forKey: Self.imeiDefaultsKey)
@@ -243,17 +223,22 @@ actor ZaloSessionClient {
         syncCoreSession() ? coreHttpHandle : nil
     }
 
-    /// The session-free raw HTTP seam (`rawRequest`, downloads), or `nil` on the Swift path. It needs no account: the QR
+    /// The session-free raw HTTP seam (`rawRequest`, downloads). It needs no account: the QR
     /// login flow uses it before one exists, and Swift passes its own `zpwSek` on every call so there is one owner.
-    private func coreRaw() -> CoreRawHttp? {
-        guard useRustCore else { return nil }
-        if coreRawHandle == nil { coreRawHandle = try? CoreRawHttp() }
-        return coreRawHandle
+    private func coreRaw() throws -> CoreRawHttp {
+        if let coreRawHandle { return coreRawHandle }
+        do {
+            let created = try CoreRawHttp()
+            coreRawHandle = created
+            return created
+        } catch {
+            throw RustCore.mapError(error)
+        }
     }
 
     /// Creates the core session on first use and pushes our current state into it when it changed.
     private func syncCoreSession() -> Bool {
-        guard useRustCore, let account else { return false }
+        guard let account else { return false }
         let snapshot = StoredNativeSession(
             zpwType: ZaloDomains.zpwType,
             imei: imei,
@@ -291,7 +276,14 @@ actor ZaloSessionClient {
     }
 
     func updateCredentials(account: ZaloLoginAccount, secretKey: Data, zpwSek: String, domains: ZaloDomains? = nil) {
-        self.account = account
+        var updated = account
+        if updated.zpwSek.isEmpty && !zpwSek.isEmpty {
+            updated.zpwSek = zpwSek
+        }
+        if updated.zpwEnk.isEmpty && (secretKey.count == 16 || secretKey.count == 32) {
+            updated.zpwEnk = secretKey.base64EncodedString()
+        }
+        self.account = updated
         self.secretKey = secretKey
         self.zpwSek = zpwSek
         if let domains { self.domains = domains }
@@ -884,25 +876,7 @@ actor ZaloSessionClient {
         return updated
     }
 
-    // MARK: Authenticated Requests & Multi-Host Failover
-
-    func encodedParams(_ payload: [String: Any]) throws -> String {
-        guard let key = secretKey, key.count == 16 || key.count == 32 else {
-            throw ZaloTransportError.notAuthenticated
-        }
-        let data = try JSONSerialization.data(withJSONObject: payload, options: [])
-        let jsonStr = String(decoding: data, as: UTF8.self)
-        let b64 = try ZaloCrypto.encodeAES(key: key, plaintext: jsonStr)
-        return Self.urlEncode(b64)
-    }
-
-    func encodedStringParam(_ plaintext: String) throws -> String {
-        guard let key = secretKey, key.count == 16 || key.count == 32 else {
-            throw ZaloTransportError.notAuthenticated
-        }
-        let b64 = try ZaloCrypto.encodeAES(key: key, plaintext: plaintext)
-        return Self.urlEncode(b64)
-    }
+    // MARK: Authenticated Requests
 
     func get(
         service: String,
@@ -913,30 +887,10 @@ actor ZaloSessionClient {
         rawEncryptedString: String? = nil,
         decryptResponse: Bool = true
     ) async throws -> [String: Any] {
-        if let http = coreHttp() {
-            return try await coreRequest(
-                http, method: .get, service: service, path: path, queryParams: queryParams, headers: headers,
-                payload: encryptedPayload, rawEncrypted: rawEncryptedString, decryptResponse: decryptResponse)
-        }
-        var suffix = "\(path)?\(commonParams())"
-        if let encryptedPayload {
-            let enc = try encodedParams(encryptedPayload)
-            suffix += "&params=\(enc)"
-        } else if let rawEncryptedString {
-            let enc = try encodedStringParam(rawEncryptedString)
-            suffix += "&params=\(enc)"
-        }
-        for (k, v) in queryParams.sorted(by: { $0.key < $1.key }) {
-            suffix += "&\(k)=\(Self.urlEncode(v))"
-        }
-        return try await requestWithFailover(
-            service: service,
-            suffix: suffix,
-            method: "GET",
-            body: nil,
-            extraHeaders: headers,
-            decryptResponse: decryptResponse
-        )
+        guard let http = coreHttp() else { throw ZaloTransportError.notAuthenticated }
+        return try await coreRequest(
+            http, method: .get, service: service, path: path, queryParams: queryParams, headers: headers,
+            payload: encryptedPayload, rawEncrypted: rawEncryptedString, decryptResponse: decryptResponse)
     }
 
     // MARK: Rust generic seam (get / post / postMultipart)
@@ -983,8 +937,7 @@ actor ZaloSessionClient {
         return object
     }
 
-    /// `postMultipart` with the file part read from disk (`length` bytes from `offset`, to EOF when `nil`). On the Rust
-    /// path the bytes never cross the FFI boundary; the Swift fallback reads the slice and uses the `Data` overload.
+    /// `postMultipart` with the file part read from disk (`length` bytes from `offset`, to EOF when `nil`).
     func postMultipart(
         service: String,
         path: String,
@@ -997,96 +950,37 @@ actor ZaloSessionClient {
         offset: UInt64 = 0,
         length: UInt64? = nil
     ) async throws -> [String: Any] {
-        if let http = coreHttp() {
-            let record = try coreRecord(
-                method: .post, service: service, path: path, queryParams: queryParams, headers: [:],
-                payload: encryptedPayload, rawEncrypted: nil, decryptResponse: true)
-            let part = UploadPartRecord(fieldName: fieldName, fileName: fileName, mimeType: mimeType)
-            do {
-                return try Self.coreAnswer(
-                    try await http.postMultipartFile(request: record, part: part, filePath: filePath, offset: offset, length: length))
-            } catch { throw RustCore.mapError(error, path: path) }
-        }
-        let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: filePath))
-        defer { try? handle.close() }
-        try handle.seek(toOffset: offset)
-        let slice: Data
-        if let length {
-            slice = try handle.read(upToCount: Int(length)) ?? Data()
-        } else {
-            slice = try handle.readToEnd() ?? Data()
-        }
-        return try await postMultipart(
-            service: service, path: path, queryParams: queryParams, encryptedPayload: encryptedPayload,
-            fieldName: fieldName, fileName: fileName, mimeType: mimeType, chunkData: slice)
-    }
-
-    func rawGetJSON(url: URL, timeout: TimeInterval = 12, decryptResponse: Bool = true) async throws -> [String: Any] {
-        let (status, data, _) = try await rawRequest(method: "GET", url: url, body: nil, contentType: nil, timeout: timeout)
-        guard (200..<300).contains(status) else {
-            throw ZaloTransportError.httpError(status, "")
-        }
-        let result = try parseAndDecryptResponse(data, decryptResponse: decryptResponse)
-        try checkResponseError(result, url: url.path)
-        return result
+        guard let http = coreHttp() else { throw ZaloTransportError.notAuthenticated }
+        let record = try coreRecord(
+            method: .post, service: service, path: path, queryParams: queryParams, headers: [:],
+            payload: encryptedPayload, rawEncrypted: nil, decryptResponse: true)
+        let part = UploadPartRecord(fieldName: fieldName, fileName: fileName, mimeType: mimeType)
+        do {
+            return try Self.coreAnswer(
+                try await http.postMultipartFile(request: record, part: part, filePath: filePath, offset: offset, length: length))
+        } catch { throw RustCore.mapError(error, path: path) }
     }
 
     func rawDownloadData(url: URL, timeout: TimeInterval = 20) async throws -> Data {
-        if let raw = coreRaw() {
-            do { return try await raw.download(url: url.absoluteString, timeoutSecs: timeout) }
-            catch { throw RustCore.mapError(error, quietTimeout: true) }
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = "GET"
-        req.timeoutInterval = timeout
-        req.setValue(ZaloDomains.userAgent, forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await session.data(for: req)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard (200..<300).contains(status) else {
-            throw ZaloTransportError.httpError(status, "")
-        }
-        return data
+        let raw = try coreRaw()
+        do { return try await raw.download(url: url.absoluteString, timeoutSecs: timeout) }
+        catch { throw RustCore.mapError(error, quietTimeout: true) }
     }
 
     func downloadSyncBatch(url: URL, timeout: TimeInterval = 45) async throws -> Data {
-        if let raw = coreRaw() {
-            do {
-                return try await raw.downloadSyncBatch(
-                    url: url.absoluteString, timeoutSecs: timeout, zpwSek: zpwSek, userId: account?.userId)
-            } catch {
-                if case CoreError.Http(let status) = error {
-                    let host = url.host ?? "-"
-                    Task { @MainActor in
-                        EngineLog.shared.write("sync-v2: batch download failed http=\(status) host=\(host)")
-                    }
+        let raw = try coreRaw()
+        do {
+            return try await raw.downloadSyncBatch(
+                url: url.absoluteString, timeoutSecs: timeout, zpwSek: zpwSek, userId: account?.userId)
+        } catch {
+            if case CoreError.Http(let status) = error {
+                let host = url.host ?? "-"
+                Task { @MainActor in
+                    EngineLog.shared.write("sync-v2: batch download failed http=\(status) host=\(host)")
                 }
-                throw RustCore.mapError(error, quietTimeout: true)
             }
+            throw RustCore.mapError(error, quietTimeout: true)
         }
-        var req = URLRequest(url: url)
-        req.httpMethod = "GET"
-        req.timeoutInterval = timeout
-        req.setValue(ZaloDomains.userAgent, forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await session.data(for: req)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        if (200..<300).contains(status) {
-            return data
-        }
-        if (status == 401 || status == 403),
-           let sek = zpwSek, Self.isValidZpwSek(sek),
-           let uid = account?.userId, !uid.isEmpty {
-            req.setValue("zpw_sek=\(sek); zpw_uin=\(uid)", forHTTPHeaderField: "Cookie")
-            let (retryData, retryResp) = try await session.data(for: req)
-            let retryStatus = (retryResp as? HTTPURLResponse)?.statusCode ?? 0
-            if (200..<300).contains(retryStatus) {
-                return retryData
-            }
-        }
-        let host = url.host ?? "-"
-        Task { @MainActor in
-            EngineLog.shared.write("sync-v2: batch download failed http=\(status) host=\(host)")
-        }
-        throw ZaloTransportError.httpError(status, "")
     }
 
     func post(
@@ -1097,25 +991,10 @@ actor ZaloSessionClient {
         encryptedPayload: [String: Any],
         decryptResponse: Bool = true
     ) async throws -> [String: Any] {
-        if let http = coreHttp() {
-            return try await coreRequest(
-                http, method: .post, service: service, path: path, queryParams: queryParams, headers: headers,
-                payload: encryptedPayload, rawEncrypted: nil, decryptResponse: decryptResponse)
-        }
-        var suffix = "\(path)?\(commonParams())"
-        for (k, v) in queryParams.sorted(by: { $0.key < $1.key }) {
-            suffix += "&\(k)=\(Self.urlEncode(v))"
-        }
-        let enc = try encodedParams(encryptedPayload)
-        let body = Data("params=\(enc)".utf8)
-        return try await requestWithFailover(
-            service: service,
-            suffix: suffix,
-            method: "POST",
-            body: body,
-            extraHeaders: headers,
-            decryptResponse: decryptResponse
-        )
+        guard let http = coreHttp() else { throw ZaloTransportError.notAuthenticated }
+        return try await coreRequest(
+            http, method: .post, service: service, path: path, queryParams: queryParams, headers: headers,
+            payload: encryptedPayload, rawEncrypted: nil, decryptResponse: decryptResponse)
     }
 
     func postMultipart(
@@ -1128,141 +1007,14 @@ actor ZaloSessionClient {
         mimeType: String,
         chunkData: Data
     ) async throws -> [String: Any] {
-        if let http = coreHttp() {
-            let record = try coreRecord(
-                method: .post, service: service, path: path, queryParams: queryParams, headers: [:],
-                payload: encryptedPayload, rawEncrypted: nil, decryptResponse: true)
-            let part = UploadPartRecord(fieldName: fieldName, fileName: fileName, mimeType: mimeType)
-            do {
-                return try Self.coreAnswer(try await http.postMultipart(request: record, part: part, data: chunkData))
-            } catch { throw RustCore.mapError(error, path: path) }
-        }
-        let enc = try encodedParams(encryptedPayload)
-        var suffix = "\(path)?\(commonParams())&params=\(enc)"
-        for (k, v) in queryParams.sorted(by: { $0.key < $1.key }) {
-            suffix += "&\(k)=\(Self.urlEncode(v))"
-        }
-
-        let boundary = "----OlazBoundary\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
-        var body = Data()
-        body.append(Data("--\(boundary)\r\n".utf8))
-        body.append(Data("Content-Disposition: form-data; name=\"\(fieldName)\"; filename=\"\(fileName)\"\r\n".utf8))
-        body.append(Data("Content-Type: \(mimeType)\r\n\r\n".utf8))
-        body.append(chunkData)
-        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
-
-        let hosts = domains.candidates(for: service)
-        var lastError: Error = ZaloTransportError.invalidURL(service)
-        for host in hosts {
-            guard let url = URL(string: "\(host)\(suffix)") else { continue }
-            do {
-                let (status, data, _) = try await rawRequest(
-                    method: "POST",
-                    url: url,
-                    body: body,
-                    contentType: "multipart/form-data; boundary=\(boundary)"
-                )
-                if status == 404 {
-                    lastError = ZaloTransportError.httpError(404, "")
-                    continue
-                }
-                guard (200..<300).contains(status) else {
-                    throw ZaloTransportError.httpError(status, String(decoding: data.prefix(200), as: UTF8.self))
-                }
-                let result = try parseAndDecryptResponse(data, decryptResponse: true)
-                try checkResponseError(result, url: url.path)
-                domains.rememberWinner(for: service, host: host)
-                return result
-            } catch let err as ZaloSessionError {
-                throw err
-            } catch {
-                if Self.shouldFailover(error) {
-                    lastError = error
-                    continue
-                }
-                throw error
-            }
-        }
-        throw lastError
-    }
-
-    private func requestWithFailover(
-        service: String,
-        suffix: String,
-        method: String,
-        body: Data?,
-        extraHeaders: [String: String] = [:],
-        decryptResponse: Bool
-    ) async throws -> [String: Any] {
-        let hosts = domains.candidates(for: service)
-        var lastError: Error = ZaloTransportError.invalidURL(service)
-
-        for host in hosts {
-            let fullURLString = "\(host)\(suffix)"
-            guard let url = URL(string: fullURLString) else { continue }
-            do {
-                let (status, data, _) = try await rawRequest(
-                    method: method,
-                    url: url,
-                    body: body,
-                    contentType: body != nil ? "application/x-www-form-urlencoded" : nil,
-                    extraHeaders: extraHeaders
-                )
-                if status == 404 {
-                    lastError = ZaloTransportError.httpError(404, "")
-                    continue
-                }
-                guard (200..<300).contains(status) else {
-                    throw ZaloTransportError.httpError(status, String(decoding: data.prefix(200), as: UTF8.self))
-                }
-                let result = try parseAndDecryptResponse(data, decryptResponse: decryptResponse)
-                try checkResponseError(result, url: url.path)
-                domains.rememberWinner(for: service, host: host)
-                return result
-            } catch let err as ZaloSessionError {
-                throw err
-            } catch {
-                if Self.shouldFailover(error) {
-                    lastError = error
-                    continue
-                }
-                throw error
-            }
-        }
-        throw lastError
-    }
-
-    func parseAndDecryptResponse(_ data: Data, decryptResponse: Bool) throws -> [String: Any] {
-        let trimmed = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            return ["error_code": 0, "data": NSNull()]
-        }
-        if let parsed = JSONLossless.parseObject(data) {
-            return decryptResponse ? maybeDecrypt(parsed, key: secretKey) : parsed
-        }
-        if decryptResponse, !trimmed.hasPrefix("{"), !trimmed.hasPrefix("["),
-           let key = secretKey, key.count == 16 || key.count == 32,
-           let plain = try? ZaloCrypto.decodeAES(key: key, base64: trimmed),
-           let plainData = plain.data(using: .utf8),
-           let decoded = JSONLossless.parseObject(plainData) {
-            return maybeDecrypt(decoded, key: key)
-        }
-        throw ZaloTransportError.invalidJSON
-    }
-
-    private func checkResponseError(_ response: [String: Any], url: String) throws {
-        guard let code = JSONLossless.int64(response["error_code"]).map(Int.init) else { return }
-        if code != 0 {
-            // Board pin disabled/empty codes (112/265, or -1 on `/oneone/list`) are expected; skip noisy logging.
-            let isExpectedBoardNotice = url.contains("/api/board/") && (code == 112 || code == 265 || (url.contains("/oneone/list") && code == -1))
-            if !isExpectedBoardNotice {
-                Task { @MainActor in
-                    EngineLog.shared.write("api: path=\(url) error_code=\(code)")
-                }
-            }
-            let msg = JSONLossless.string(response["error_message"])
-            throw ZaloSessionError(code: code, message: msg, url: url)
-        }
+        guard let http = coreHttp() else { throw ZaloTransportError.notAuthenticated }
+        let record = try coreRecord(
+            method: .post, service: service, path: path, queryParams: queryParams, headers: [:],
+            payload: encryptedPayload, rawEncrypted: nil, decryptResponse: true)
+        let part = UploadPartRecord(fieldName: fieldName, fileName: fileName, mimeType: mimeType)
+        do {
+            return try Self.coreAnswer(try await http.postMultipart(request: record, part: part, data: chunkData))
+        } catch { throw RustCore.mapError(error, path: path) }
     }
 
     static func shouldFailover(_ error: Error) -> Bool {
@@ -1320,41 +1072,14 @@ actor ZaloSessionClient {
         timeout: TimeInterval? = nil,
         extraHeaders: [String: String] = [:]
     ) async throws -> (Int, Data, String?) {
-        if let raw = coreRaw() {
-            let record = RawRequestRecord(
-                method: method.uppercased() == "POST" ? .post : .get, url: url.absoluteString, body: body,
-                contentType: contentType, timeoutSecs: timeout, headers: extraHeaders, zpwSek: zpwSek)
-            do {
-                let out = try await raw.request(request: record)
-                return (Int(out.status), out.body, out.zpwSekCookie)
-            } catch { throw RustCore.mapError(error, quietTimeout: true) }
-        }
-        var req = URLRequest(url: url)
-        req.httpMethod = method
-        if let timeout {
-            req.timeoutInterval = timeout
-        }
-        req.setValue(ZaloDomains.userAgent, forHTTPHeaderField: "User-Agent")
-        if let sek = zpwSek, !sek.isEmpty {
-            let host = url.host?.lowercased() ?? ""
-            if host.contains("zalo.me") || host.contains("zaloapp.com") || host.contains("zadn.vn") {
-                req.setValue("zpw_sek=\(sek); _zlang=vi", forHTTPHeaderField: "Cookie")
-                req.setValue(sek, forHTTPHeaderField: "zpw_sek")
-            }
-        }
-        if let contentType {
-            req.setValue(contentType, forHTTPHeaderField: "Content-Type")
-        }
-        for (k, v) in extraHeaders {
-            req.setValue(v, forHTTPHeaderField: k)
-        }
-        req.httpBody = body
-
-        let (data, response) = try await session.data(for: req)
-        let http = response as? HTTPURLResponse
-        let status = http?.statusCode ?? 0
-        let sek = http.flatMap(Self.extractZpwSekCookie(from:))
-        return (status, data, sek)
+        let raw = try coreRaw()
+        let record = RawRequestRecord(
+            method: method.uppercased() == "POST" ? .post : .get, url: url.absoluteString, body: body,
+            contentType: contentType, timeoutSecs: timeout, headers: extraHeaders, zpwSek: zpwSek)
+        do {
+            let out = try await raw.request(request: record)
+            return (Int(out.status), out.body, out.zpwSekCookie)
+        } catch { throw RustCore.mapError(error, quietTimeout: true) }
     }
 
     static func isValidZpwSek(_ candidate: String?) -> Bool {
@@ -1367,49 +1092,6 @@ actor ZaloSessionClient {
             return false
         }
         return true
-    }
-
-    static func extractZpwSekCookie(from response: HTTPURLResponse) -> String? {
-        var headers: [String: String] = [:]
-        for (k, v) in response.allHeaderFields {
-            let keyStr = String(describing: k)
-            if let str = v as? String {
-                headers[keyStr] = str
-            }
-        }
-        return extractZpwSekCookie(headers: headers, url: response.url ?? URL(string: "https://zalo.me")!)
-    }
-
-    static func extractZpwSekCookie(headers: [String: String], url: URL) -> String? {
-        var lastValid: String?
-        for cookie in HTTPCookie.cookies(withResponseHeaderFields: headers, for: url) {
-            guard cookie.name == "zpw_sek" else { continue }
-            if let exp = cookie.expiresDate, exp <= Date() { continue }
-            let val = cookie.value.trimmingCharacters(in: .whitespacesAndNewlines)
-            if isValidZpwSek(val) {
-                lastValid = val
-            }
-        }
-        if let lastValid {
-            return lastValid
-        }
-
-        for (k, raw) in headers where k.lowercased() == "set-cookie" {
-            let ns = raw as NSString
-            guard let regex = try? NSRegularExpression(pattern: #"zpw_sek=([^;,\s]+)"#) else { continue }
-            for match in regex.matches(in: raw, range: NSRange(location: 0, length: ns.length)) {
-                let token = ns.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
-                guard isValidZpwSek(token) else { continue }
-                let tailStart = match.range.location + match.range.length
-                let tailLen = min(140, ns.length - tailStart)
-                let tail = tailLen > 0 ? ns.substring(with: NSRange(location: tailStart, length: tailLen)).lowercased() : ""
-                if tail.contains("max-age=0") || tail.contains("1970") {
-                    continue
-                }
-                lastValid = token
-            }
-        }
-        return lastValid
     }
 
     static func extractZpwSek(from json: [String: Any]) -> String? {

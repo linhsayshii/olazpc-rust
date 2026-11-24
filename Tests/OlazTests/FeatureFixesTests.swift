@@ -168,42 +168,6 @@ import Testing
         #expect(decoded.clientId == "cli_1700001")
     }
 
-    @Test func buildRecallMessageRequestCoversAllFourRoutes() {
-        let normal11 = ZaloSessionClient.buildRecallMessageRequest(
-            convId: "200", msgId: "9001", cliMsgId: "7001", clientId: 888, isE2EE: false, imei: "imei-1"
-        )
-        #expect(normal11.service == "chat")
-        #expect(normal11.path == "/api/message/undo")
-        #expect(normal11.payload["toid"] as? String == "200")
-        #expect(normal11.payload["msgId"] as? String == "9001")
-        #expect(normal11.payload["cliMsgIdUndo"] as? String == "7001")
-        #expect(normal11.payload["clientId"] as? Int64 == 888)
-
-        let normalGroup = ZaloSessionClient.buildRecallMessageRequest(
-            convId: "g555", msgId: "9002", cliMsgId: "7002", clientId: 889, isE2EE: false, imei: "imei-1", visibility: 1
-        )
-        #expect(normalGroup.service == "group")
-        #expect(normalGroup.path == "/api/group/undomsg")
-        #expect(normalGroup.payload["grid"] as? String == "555")
-        #expect(normalGroup.payload["visibility"] as? Int == 1)
-        #expect(normalGroup.payload["imei"] as? String == "imei-1")
-
-        let e2ee11 = ZaloSessionClient.buildRecallMessageRequest(
-            convId: "200", msgId: "9003", cliMsgId: "7003", clientId: 890, isE2EE: true, imei: "imei-1"
-        )
-        #expect(e2ee11.service == "chat_e2e")
-        #expect(e2ee11.path == "/api/e2ee/pc/message/undo")
-        #expect(e2ee11.payload["destType"] as? Int == 3)
-        #expect(e2ee11.payload["toid"] as? String == "200")
-
-        let e2eeGroup = ZaloSessionClient.buildRecallMessageRequest(
-            convId: "g555", msgId: "9004", cliMsgId: "7004", clientId: 891, isE2EE: true, imei: "imei-1"
-        )
-        #expect(e2eeGroup.service == "group_e2e")
-        #expect(e2eeGroup.path == "/api/e2ee/pc/group/undoMsg")
-        #expect(e2eeGroup.payload["grid"] as? String == "555")
-    }
-
     @Test func myCloudWireMessageExcludesRecallMenu() throws {
         let evt = ZaloWireParser.parseWireMessage(
             [
@@ -870,50 +834,6 @@ import Testing
     }
 }
 
-private final class MockReactionURLProtocol: URLProtocol, @unchecked Sendable {
-    typealias Handler = @Sendable (URLRequest, Data) -> (Int, [String: Any])
-    static let handlers = OSAllocatedUnfairLock<[String: Handler]>(initialState: [:])
-
-    override class func canInit(with request: URLRequest) -> Bool {
-        guard let host = request.url?.host else { return false }
-        return handlers.withLock { $0[host] != nil }
-    }
-
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-
-    override func startLoading() {
-        guard let url = request.url,
-              let host = url.host,
-              let handler = Self.handlers.withLock({ $0[host] }) else {
-            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
-            return
-        }
-        var bodyData = request.httpBody ?? Data()
-        if bodyData.isEmpty, let stream = request.httpBodyStream {
-            stream.open()
-            defer { stream.close() }
-            var buf = [UInt8](repeating: 0, count: 4096)
-            while stream.hasBytesAvailable {
-                let n = stream.read(&buf, maxLength: buf.count)
-                if n > 0 { bodyData.append(contentsOf: buf.prefix(n)) } else { break }
-            }
-        }
-        let (status, jsonObj) = handler(request, bodyData)
-        let respData = (try? JSONSerialization.data(withJSONObject: jsonObj)) ?? Data("{}".utf8)
-        let http = HTTPURLResponse(
-            url: url,
-            statusCode: status,
-            httpVersion: "HTTP/1.1",
-            headerFields: ["Content-Type": "application/json"]
-        )!
-        client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: respData)
-        client?.urlProtocolDidFinishLoading(self)
-    }
-
-    override func stopLoading() {}
-}
-
 @Suite(.serialized) struct ReactionFixTests {
     @Test func reactionSpecAndIconMappings() {
         #expect(ZaloWireParser.reactionSpec(forEmoji: "😡") == (":-h", 20))
@@ -946,51 +866,6 @@ private final class MockReactionURLProtocol: URLProtocol, @unchecked Sendable {
         #expect(ZaloWireParser.reactionClientMsgType(for: .gif(url: nil)) == 49)
     }
 
-    @Test func buildReactionRequestFormattingAndRoutes() throws {
-        let photoSpec = ZaloSessionClient.buildReactionRequest(
-            convId: "200",
-            msgId: "88001",
-            cliMsgId: "17001",
-            rIcon: "/-heart",
-            rType: 5,
-            msgType: 32,
-            clientId: 9991,
-            imei: "imei-1"
-        )
-        #expect(photoSpec.service == "reaction")
-        #expect(photoSpec.path == "/api/message/reaction")
-        #expect(photoSpec.payload["toid"] as? String == "200")
-        let photoReactList = try #require(photoSpec.payload["react_list"] as? [[String: Any]])
-        let photoMsgStr = try #require(photoReactList.first?["message"] as? String)
-        #expect(photoMsgStr.contains("/-heart"))
-        #expect(!photoMsgStr.contains("\\/-heart"))
-        let photoInner = try #require(JSONLossless.parseObject(Data(photoMsgStr.utf8)))
-        let photoRMsg = try #require((photoInner["rMsg"] as? [[String: Any]])?.first)
-        #expect((photoRMsg["gMsgID"] as? NSNumber)?.int64Value == 88001)
-        #expect((photoRMsg["cMsgID"] as? NSNumber)?.int64Value == 17001)
-        #expect((photoRMsg["msgType"] as? NSNumber)?.intValue == 32)
-
-        let groupFileSpec = ZaloSessionClient.buildReactionRequest(
-            convId: "g555",
-            msgId: "99001",
-            cliMsgId: "27001",
-            rIcon: "/-strong",
-            rType: 3,
-            msgType: 46,
-            clientId: 9992,
-            imei: "imei-g"
-        )
-        #expect(groupFileSpec.path == "/api/group/reaction")
-        #expect(groupFileSpec.payload["grid"] as? String == "555")
-        #expect(groupFileSpec.payload["imei"] as? String == "imei-g")
-        let grpList = try #require(groupFileSpec.payload["react_list"] as? [[String: Any]])
-        let grpMsgStr = try #require(grpList.first?["message"] as? String)
-        #expect(grpMsgStr.contains("/-strong"))
-        let grpInner = try #require(JSONLossless.parseObject(Data(grpMsgStr.utf8)))
-        let grpRMsg = try #require((grpInner["rMsg"] as? [[String: Any]])?.first)
-        #expect((grpRMsg["msgType"] as? NSNumber)?.intValue == 46)
-    }
-
     @Test @MainActor func localReactEchoDuplicateDeliveryAndFileFallbackWorkReliably() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-react-fix-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -1000,57 +875,34 @@ private final class MockReactionURLProtocol: URLProtocol, @unchecked Sendable {
         }
 
         let key = Data("0123456789abcdef".utf8)
-        let host = "mock-react-\(UUID().uuidString.lowercased()).invalid"
         let capturedMsgTypes = OSAllocatedUnfairLock<[Int]>(initialState: [])
 
-        @Sendable func decodeParams(_ encoded: String) -> [String: Any] {
-            let unescaped = encoded.removingPercentEncoding ?? encoded
-            guard let plain = try? ZaloCrypto.decodeAES(key: key, base64: unescaped),
-                  let obj = JSONLossless.parseObject(Data(plain.utf8)) else {
-                return [:]
-            }
-            return obj
-        }
-
-        MockReactionURLProtocol.handlers.withLock { map in
-            map[host] = { req, bodyData in
-                let bodyStr = String(decoding: bodyData, as: UTF8.self)
-                let query = req.url?.query ?? ""
-                var payload: [String: Any] = [:]
-                if let p = query.split(separator: "&").first(where: { $0.hasPrefix("params=") }) {
-                    payload = decodeParams(String(p.dropFirst("params=".count)))
-                } else if let p = bodyStr.split(separator: "&").first(where: { $0.hasPrefix("params=") }) {
-                    payload = decodeParams(String(p.dropFirst("params=".count)))
+        let server = try FakeZaloServer { req in
+            let payload = req.decodeEncryptedParams(key: key) ?? [:]
+            if let list = payload["react_list"] as? [[String: Any]],
+               let msgStr = list.first?["message"] as? String,
+               let inner = JSONLossless.parseObject(Data(msgStr.utf8)),
+               let rMsg = (inner["rMsg"] as? [[String: Any]])?.first,
+               let mType = (rMsg["msgType"] as? NSNumber)?.intValue {
+                let count = capturedMsgTypes.withLock { arr in
+                    arr.append(mType)
+                    return arr.count
                 }
-                if let list = payload["react_list"] as? [[String: Any]],
-                   let msgStr = list.first?["message"] as? String,
-                   let inner = JSONLossless.parseObject(Data(msgStr.utf8)),
-                   let rMsg = (inner["rMsg"] as? [[String: Any]])?.first,
-                   let mType = (rMsg["msgType"] as? NSNumber)?.intValue {
-                    let count = capturedMsgTypes.withLock { arr in
-                        arr.append(mType)
-                        return arr.count
-                    }
-                    // Simulate server rejecting msgType=46 on first try to verify fallback to msgType=1.
-                    if mType == 46 && count == 3 {
-                        return (200, ["error_code": 112, "error_message": "invalid msgType"])
-                    }
+                // Simulate server rejecting msgType=46 on first try to verify fallback to msgType=1.
+                if mType == 46 && count == 3 {
+                    return .json(200, ["error_code": 112, "error_message": "invalid msgType"])
                 }
-                return (200, ["error_code": 0, "data": [:]])
             }
+            return .json(200, ["error_code": 0, "data": [:]])
         }
-        defer { _ = MockReactionURLProtocol.handlers.withLock { $0.removeValue(forKey: host) } }
+        try await server.start()
+        defer { server.stop() }
 
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [MockReactionURLProtocol.self]
-        let engine = ZaloEngine(dataDirectory: root, useKeychain: false, urlSession: URLSession(configuration: config))
+        let engine = ZaloEngine(dataDirectory: root, useKeychain: false)
         let store = try ZaloSQLiteStore(path: root.appendingPathComponent("history.sqlite3").path)
         engine.sqliteStore = store
 
-        var domains = ZaloDomains()
-        for svc in ["reaction", "chat", "group", "conversation", "group_cloud_message"] {
-            domains.serviceCandidates[svc] = ["https://\(host)"]
-        }
+        let domains = server.domains(for: ["reaction", "chat", "group", "conversation", "group_cloud_message"])
         var account = ZaloLoginAccount()
         account.userId = "100"
         account.displayName = "Minh"
@@ -1156,17 +1008,6 @@ private final class MockReactionURLProtocol: URLProtocol, @unchecked Sendable {
         #expect(reactions[0].icon.type == "5")
         #expect(reactions[0].includesMe == false)
         #expect(reactions[0].userCounts == ["200": 1])
-    }
-
-    @Test func removeReactionWireFormat() throws {
-        let spec = ZaloSessionClient.buildReactionRequest(
-            convId: "200", msgId: "88001", cliMsgId: "17001", rIcon: "", rType: -1,
-            msgType: 1, clientId: 1, imei: "i")
-        let list = try #require(spec.payload["react_list"] as? [[String: Any]])
-        let msg = try #require(list.first?["message"] as? String)
-        let inner = try #require(JSONLossless.parseObject(Data(msg.utf8)))
-        #expect((inner["rType"] as? NSNumber)?.intValue == -1)
-        #expect(inner["rIcon"] as? String == "")
     }
 
     @Test @MainActor func remoteUnreactAndCorruptedGhostReactionsAreEliminated() async throws {
@@ -1609,40 +1450,31 @@ private final class MockReactionURLProtocol: URLProtocol, @unchecked Sendable {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let key = Data("0123456789abcdef".utf8)
-        let host = "mock-reactors-\(UUID().uuidString.lowercased()).invalid"
-
-        MockReactionURLProtocol.handlers.withLock { map in
-            map[host] = { req, _ in
-                let path = req.url?.path ?? ""
-                if path == "/api/social/group/members" {
-                    return (200, [
-                        "error_code": 0,
-                        "data": [
-                            "profiles": [
-                                "555": [
-                                    "userId": "555",
-                                    "displayName": "Hùng",
-                                    "avatar": "https://ava.example/555.jpg"
-                                ]
+        let server = try FakeZaloServer { req in
+            if req.path == "/api/social/group/members" {
+                return .json(200, [
+                    "error_code": 0,
+                    "data": [
+                        "profiles": [
+                            "555": [
+                                "userId": "555",
+                                "displayName": "Hùng",
+                                "avatar": "https://ava.example/555.jpg"
                             ]
                         ]
-                    ])
-                }
-                return (200, ["error_code": 0, "data": [:]])
+                    ]
+                ])
             }
+            return .json(200, ["error_code": 0, "data": [:]])
         }
-        defer { _ = MockReactionURLProtocol.handlers.withLock { $0.removeValue(forKey: host) } }
+        try await server.start()
+        defer { server.stop() }
 
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [MockReactionURLProtocol.self]
-        let engine = ZaloEngine(dataDirectory: root, useKeychain: false, urlSession: URLSession(configuration: config))
+        let engine = ZaloEngine(dataDirectory: root, useKeychain: false)
         let store = try ZaloSQLiteStore(path: root.appendingPathComponent("history.sqlite3").path)
         engine.sqliteStore = store
 
-        var domains = ZaloDomains()
-        for svc in ["profile", "reaction", "chat", "group", "conversation"] {
-            domains.serviceCandidates[svc] = ["https://\(host)"]
-        }
+        let domains = server.domains(for: ["profile", "reaction", "chat", "group", "conversation"])
         var account = ZaloLoginAccount()
         account.userId = "100"
         account.displayName = "Minh"

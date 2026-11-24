@@ -1,8 +1,7 @@
 import Foundation
 import OlazCore
 
-/// Rust-core path of `ZaloWireParser.extractBatchEvents` (ADR-011). The Swift parser stays the default and the fallback:
-/// any input the bridge cannot handle returns `nil` and the caller runs the Swift walk instead.
+/// Rust-core path of `ZaloWireParser.extractBatchEvents` and `historyEventsAsync`.
 extension ZaloWireParser {
     /// Keys whose string values are sender / quote-owner uids; the Swift parser resolves each through `nameLookup`.
     private static let uidKeys: Set<String> = ["uidFrom", "senderId", "ownerId"]
@@ -107,8 +106,8 @@ extension ZaloWireParser {
         return rustParseBatch(input)
     }
 
-    /// Same result as `extractBatchEvents`, but on the Rust path the parse and the `ChatMessage` decoding run off the
-    /// caller's actor (only serialization and the name lookup stay on it). The Swift path runs inline as before.
+    /// Same result as `extractBatchEvents`, but the parse and the `ChatMessage` decoding run off the
+    /// caller's actor (only serialization and the name lookup stay on it).
     @MainActor
     static func extractBatchEventsAsync(
         _ root: Any,
@@ -117,25 +116,19 @@ extension ZaloWireParser {
         defaultCmd: UInt16 = 0,
         fallbackConvId: String? = nil,
         isGroupHint: Bool? = nil,
-        nameLookup: ((String) -> (name: String, avatar: String)?)? = nil,
-        useRustCore: Bool = RustCore.isEnabled
+        nameLookup: ((String) -> (name: String, avatar: String)?)? = nil
     ) async -> [ParsedWireEvent] {
-        if useRustCore,
-           let input = rustBatchInput(
-               root, myUid: myUid, selfConvId: selfConvId, defaultCmd: defaultCmd,
-               fallbackConvId: fallbackConvId, isGroupHint: isGroupHint, nameLookup: nameLookup
-           ),
-           let events = await Task.detached(priority: .userInitiated, operation: { rustParseBatch(input) }).value {
-            return events
+        guard let input = rustBatchInput(
+            root, myUid: myUid, selfConvId: selfConvId, defaultCmd: defaultCmd,
+            fallbackConvId: fallbackConvId, isGroupHint: isGroupHint, nameLookup: nameLookup
+        ) else {
+            return []
         }
-        return extractBatchEvents(
-            root, myUid: myUid, selfConvId: selfConvId, defaultCmd: defaultCmd, fallbackConvId: fallbackConvId,
-            isGroupHint: isGroupHint, nameLookup: nameLookup, useRustCore: false)
+        return await Task.detached(priority: .userInitiated, operation: { rustParseBatch(input) }).value ?? []
     }
 
-    /// Typed events of a history page. Rust path: the core already holds the parsed body, so only the contact-name lookup
-    /// (on the caller's actor) and the typed mapping happen here, no JSON and no dictionary. Swift path: the Swift walk
-    /// over the page's dictionary, as before.
+    /// Typed events of a history page. The core already holds the parsed body, so only the contact-name lookup
+    /// (on the caller's actor) and the typed mapping happen here, no JSON and no dictionary.
     @MainActor
     static func historyEventsAsync(
         _ page: ZaloHistoryPage,
@@ -145,11 +138,7 @@ extension ZaloWireParser {
         isGroupHint: Bool? = nil,
         nameLookup: ((String) -> (name: String, avatar: String)?)? = nil
     ) async -> [ParsedWireEvent] {
-        guard let batch = page.rustBatch else {
-            return await extractBatchEventsAsync(
-                page.box.dict, myUid: myUid, selfConvId: selfConvId, fallbackConvId: fallbackConvId,
-                isGroupHint: isGroupHint, nameLookup: nameLookup, useRustCore: false)
-        }
+        let batch = page.rustBatch
         var names: [NameEntry] = []
         if let nameLookup {
             for uid in page.uids {
