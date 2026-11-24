@@ -2,8 +2,9 @@ import Foundation
 
 @MainActor
 extension ZaloEngine {
-    internal func traceHost(_ name: String, args: [String: Any] = [:]) -> Bool {
-        hostTrace?(name, args) ?? true
+    internal func traceHost(_ name: String, args: @autoclosure () -> [String: Any] = [:]) -> Bool {
+        guard let hostTrace else { return true }
+        return hostTrace(name, args())
     }
 
     internal func syncSessionClientTrace() async {
@@ -38,5 +39,108 @@ extension ZaloEngine {
         _ = await bootTask?.value
         _ = await qrTask?.value
         _ = await pendingCleanupTask?.value
+    }
+
+    internal static func serializeMobileSyncEvents(_ events: [ZaloMobileSyncEvent]) -> [[String: Any]] {
+        events.map { ev in
+            switch ev {
+            case .transferAfterLogin(let tempKey):
+                return ["kind": "transfer_after_login", "temp_key": tempKey]
+            case .waitingConfirmOnPhone(let syncId):
+                return ["kind": "waiting_confirm_on_phone", "sync_id": syncId]
+            case .userConfirmed:
+                return ["kind": "user_confirmed"]
+            case .userRejected:
+                return ["kind": "user_rejected"]
+            case .mobileBusy:
+                return ["kind": "mobile_busy"]
+            case .uploadBatch(let syncId, let url, let batchType, let idx, let isLast):
+                return [
+                    "kind": "upload_batch",
+                    "sync_id": syncId,
+                    "url": url,
+                    "batch_type": batchType,
+                    "idx": idx,
+                    "is_last": isLast,
+                ]
+            }
+        }
+    }
+
+    internal static func serializeParsedWireEvents(_ events: [ParsedWireEvent]) -> [[String: Any]] {
+        events.map { ev in
+            switch ev {
+            case .message(let msg, let stored):
+                return [
+                    "kind": "message",
+                    "conv_id": msg.conversationId,
+                    "msg_id": msg.id,
+                    "client_id": stored.clientId,
+                    "sender_id": msg.senderId,
+                    "sender_name": msg.senderName,
+                    "sender_avatar": msg.senderAvatar?.absoluteString ?? NSNull(),
+                    "is_mine": msg.isMine,
+                    "kind_tag": stored.kindTag,
+                    "text": msg.text,
+                    "ts_ms": stored.tsMs,
+                    "status": stored.status,
+                    "is_e2ee": msg.isE2EE,
+                ]
+            case .reaction(
+                let convId, let msgId, let cliMsgId, let senderId,
+                let rType, let rIcon, let eventId, let reactClientId,
+                let tsMs, let seqId, let senderName
+            ):
+                return [
+                    "kind": "reaction",
+                    "conv_id": convId,
+                    "msg_id": msgId,
+                    "cli_msg_id": cliMsgId,
+                    "sender_id": senderId,
+                    "sender_name": senderName,
+                    "r_type": rType,
+                    "r_icon": rIcon,
+                    "event_id": eventId,
+                    "react_client_id": reactClientId,
+                    "ts_ms": tsMs,
+                    "seq_id": seqId,
+                ]
+            case .undo(let convId, let msgId, let cliMsgId):
+                return [
+                    "kind": "undo",
+                    "conv_id": convId,
+                    "msg_id": msgId,
+                    "cli_msg_id": cliMsgId,
+                ]
+            case .delete(let convId, let msgId, let cliMsgId):
+                return [
+                    "kind": "delete",
+                    "conv_id": convId,
+                    "msg_id": msgId,
+                    "cli_msg_id": cliMsgId,
+                ]
+            case .typing(let convId, let senderId, let isGroup):
+                return [
+                    "kind": "typing",
+                    "conv_id": convId,
+                    "sender_id": senderId,
+                    "is_group": isGroup,
+                ]
+            case .ignore:
+                return ["kind": "ignore"]
+            }
+        }
+    }
+
+    internal static func serializePollState(_ state: ZaloPollState) -> [String: Any] {
+        [
+            "lastActionId": state.lastActionId,
+            "lastActionIdOther": state.lastActionIdOther,
+            "queues": state.queues.mapValues { ["lastId": $0.lastId, "ids": $0.ids] },
+        ]
+    }
+
+    internal static func serializeWSQueueCursors(_ cursors: [String: ZaloWSQueueCursorSnapshot]) -> [String: Any] {
+        cursors.mapValues { ["lastId": $0.lastId, "preIds": $0.preIds] }
     }
 }

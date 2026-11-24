@@ -138,6 +138,7 @@ final class ZaloEngine {
     internal var isEngineStarted: Bool { started }
     @ObservationIgnored internal var hostTrace: ((String, [String: Any]) -> Bool)?
     @ObservationIgnored internal var stateTrace: (() -> Void)?
+    @ObservationIgnored internal var transportSettleTrace: (() -> Void)?
     @ObservationIgnored internal var recordedQRPayload: String?
     @ObservationIgnored internal var recordedSessionPrefs: [String: String] = [:]
     @ObservationIgnored internal var pendingCleanupTask: Task<Void, Never>?
@@ -914,6 +915,7 @@ final class ZaloEngine {
 
     @discardableResult
     internal func drainChatPolling(maxBatches: Int = 3, notifyIncoming: Bool = false) async -> Int {
+        defer { transportSettleTrace?() }
         var totalEvents = 0
         for _ in 0..<maxBatches {
             guard !Task.isCancelled else { break }
@@ -925,11 +927,20 @@ final class ZaloEngine {
                 }
                 let syncEvents = ZaloPhoneSync.extractMobileSyncEvents(box.dict)
                 if !syncEvents.isEmpty {
-                    await processMobileSyncEvents(syncEvents)
+                    if traceHost("mobile_sync", args: ["events": Self.serializeMobileSyncEvents(syncEvents)]) {
+                        await processMobileSyncEvents(syncEvents)
+                    }
                 }
                 await processControlEnvelope(box.dict)
-                let count = await applyBatchResponse(box.dict, incrementUnread: notifyIncoming, notifyIncoming: notifyIncoming)
-                totalEvents += count
+                if traceHost("apply_batch", args: [
+                    "cmd": 0,
+                    "increment_unread": notifyIncoming,
+                    "notify_incoming": notifyIncoming,
+                    "payload": box.dict,
+                ]) {
+                    let count = await applyBatchResponse(box.dict, incrementUnread: notifyIncoming, notifyIncoming: notifyIncoming)
+                    totalEvents += count
+                }
                 if !more { break }
             } catch let err as ZaloSessionError where err.isAuthError {
                 handleSessionExpiredNotice("Phiên đăng nhập đã hết hạn hoặc bị đăng xuất.")
@@ -1323,6 +1334,11 @@ final class ZaloEngine {
         }
         wsTask = Task { [weak self] in
             guard let self else { return }
+            await self.webSocket.setQueueCursorObserver { [weak self] updated in
+                Task { @MainActor [weak self] in
+                    await self?.persistWSQueueCursors(updated)
+                }
+            }
             let stream = await self.webSocket.start(
                 endpoints: endpoints, zpwSek: zpwSek, myUid: self.profile?.userId, selfConvId: self.selfConversationId)
             let authWatchTask = Task { [weak self] in
@@ -1331,19 +1347,25 @@ final class ZaloEngine {
                 while !Task.isCancelled {
                     let nowAuthed = await self.webSocket.isAuthed
                     if wasAuthed && !nowAuthed {
-                        await self.e2eeManager.markDisconnected()
+                        if self.traceHost("e2ee_disconnected") {
+                            await self.e2eeManager.markDisconnected()
+                        }
+                        self.transportSettleTrace?()
                     }
                     if !wasAuthed && nowAuthed, let uid = self.profile?.userId, !uid.isEmpty {
-                        await self.e2eeManager.syncBundleWithServerIfNeeded(
-                            uid: uid,
-                            webSocket: self.webSocket,
-                            store: self.sqliteStore
-                        )
-                        await self.e2eeManager.fetchE2EEPeerList(
-                            webSocket: self.webSocket,
-                            store: self.sqliteStore,
-                            myUid: uid
-                        )
+                        if self.traceHost("e2ee_connected", args: ["uid": uid]) {
+                            await self.e2eeManager.syncBundleWithServerIfNeeded(
+                                uid: uid,
+                                webSocket: self.webSocket,
+                                store: self.sqliteStore
+                            )
+                            await self.e2eeManager.fetchE2EEPeerList(
+                                webSocket: self.webSocket,
+                                store: self.sqliteStore,
+                                myUid: uid
+                            )
+                        }
+                        self.transportSettleTrace?()
                     }
                     wasAuthed = nowAuthed
                     try? await Task.sleep(for: .milliseconds(nowAuthed ? 500 : 250))
@@ -1358,6 +1380,7 @@ final class ZaloEngine {
     }
 
     private func handleWSEvent(_ event: ZaloWSEvent) async {
+        defer { transportSettleTrace?() }
         if let typed = event.typed {
             await handleTypedChatEvent(event, typed)
             return
@@ -1378,20 +1401,24 @@ final class ZaloEngine {
             || event.cmd == ZaloE2EEManager.cmdSessionOffline
             || event.cmd == ZaloE2EEManager.cmdRequestPreKeys {
             if let uid = profile?.userId, !uid.isEmpty {
-                await e2eeManager.handleSignalSocketEvent(
-                    cmd: event.cmd,
-                    payload: ZaloJSONBox(payload),
-                    uid: uid,
-                    webSocket: webSocket,
-                    store: sqliteStore
-                )
+                if traceHost("e2ee_signal", args: ["cmd": Int(event.cmd), "payload": payload]) {
+                    await e2eeManager.handleSignalSocketEvent(
+                        cmd: event.cmd,
+                        payload: ZaloJSONBox(payload),
+                        uid: uid,
+                        webSocket: webSocket,
+                        store: sqliteStore
+                    )
+                }
             }
             return
         }
 
         if event.cmd == ZaloE2EEManager.cmdDeliverSeenOneOne {
-            let resends = await e2eeManager.handleDeliverReports(cmd: event.cmd, payload: ZaloJSONBox(payload), webSocket: webSocket)
-            for request in resends { await resendE2EEMessage(request) }
+            if traceHost("e2ee_deliver_reports", args: ["cmd": Int(event.cmd), "payload": payload]) {
+                let resends = await e2eeManager.handleDeliverReports(cmd: event.cmd, payload: ZaloJSONBox(payload), webSocket: webSocket)
+                for request in resends { await resendE2EEMessage(request) }
+            }
             return
         }
 
@@ -1402,7 +1429,9 @@ final class ZaloEngine {
 
         let mobileSyncEvents = ZaloPhoneSync.extractMobileSyncEvents(payload)
         if !mobileSyncEvents.isEmpty {
-            await processMobileSyncEvents(mobileSyncEvents)
+            if traceHost("mobile_sync", args: ["events": Self.serializeMobileSyncEvents(mobileSyncEvents)]) {
+                await processMobileSyncEvents(mobileSyncEvents)
+            }
         }
 
         // Control action events (typing, mute, voip, etc.)
@@ -1415,7 +1444,14 @@ final class ZaloEngine {
             || event.cmd == ZaloE2EEManager.cmdReceiveOneOne
             || event.cmd == ZaloE2EEManager.cmdReceiveGroup
         )
-        _ = await applyBatchResponse(payload, defaultCmd: event.cmd, incrementUnread: isLivePush, notifyIncoming: isLivePush)
+        if traceHost("apply_batch", args: [
+            "cmd": Int(event.cmd),
+            "increment_unread": isLivePush,
+            "notify_incoming": isLivePush,
+            "payload": payload,
+        ]) {
+            _ = await applyBatchResponse(payload, defaultCmd: event.cmd, incrementUnread: isLivePush, notifyIncoming: isLivePush)
+        }
     }
 
     /// Rust-core hot path: a plain chat envelope arrives parsed. The core guarantees nothing else in it needs the JSON
@@ -1439,7 +1475,14 @@ final class ZaloEngine {
             event.cmd == ZaloWebSocket.cmdPushMsg11
             || event.cmd == ZaloWebSocket.cmdPushMsgGroup
         )
-        _ = await applyParsedEvents(events, incrementUnread: isLivePush, notifyIncoming: isLivePush)
+        if traceHost("apply_parsed_events", args: [
+            "cmd": Int(event.cmd),
+            "increment_unread": isLivePush,
+            "notify_incoming": isLivePush,
+            "events": Self.serializeParsedWireEvents(events),
+        ]) {
+            _ = await applyParsedEvents(events, incrementUnread: isLivePush, notifyIncoming: isLivePush)
+        }
     }
 
     internal func processControlEnvelope(_ payload: [String: Any], cmd: UInt16 = 0) async {
@@ -1492,7 +1535,10 @@ final class ZaloEngine {
             }()
 
             if actType == "voip" || cmd == ZaloWebSocket.cmdCtrlPullVoip {
-                await handleVoipControlEvent(act: act, rawDataValue: contentObj["data"] ?? actData, parsedData: actData)
+                let rawDataValue: Any = contentObj["data"] ?? actData
+                if traceHost("voip_control", args: ["act": act, "raw_data": rawDataValue, "data": actData]) {
+                    await handleVoipControlEvent(act: act, rawDataValue: rawDataValue, parsedData: actData)
+                }
             } else if actType == "typing" || act == "typing" || act == "gtyping" {
                 let uid = ZaloWireParser.stripUserPrefix(JSONLossless.string(actData["uid"] ?? actData["uidFrom"]))
                 let gid = JSONLossless.string(actData["gid"] ?? actData["grid"])
@@ -1501,14 +1547,23 @@ final class ZaloEngine {
                 let shape = "\(act) keys=\(actData.keys.sorted().joined(separator: ",")) isPC=\(actData["isPC"].map { "\($0)" } ?? "nil")"
                 if Self.loggedTypingShapes.insert(shape).inserted { EngineLog.shared.write("typing: shape \(shape)") }
                 if !convId.isEmpty, uid != myUid {
-                    let name = lookupPersonInfo(uid)?.name ?? "Ai đó"
-                    showTyping(convId: convId, name: name, onPC: JSONLossless.int64(actData["isPC"]) == 1)
+                    let onPC = JSONLossless.int64(actData["isPC"]) == 1
+                    if traceHost("show_typing", args: ["conv_id": convId, "uid": uid, "on_pc": onPC]) {
+                        let name = lookupPersonInfo(uid)?.name ?? "Ai đó"
+                        showTyping(convId: convId, name: name, onPC: onPC)
+                    }
                 }
             } else if case let pinConvs = ZaloWireParser.pinTopicEventConversations(actType: actType, act: act, data: actData), !pinConvs.isEmpty {
-                for pinConv in pinConvs { handlePinTopicEvent(conversationId: pinConv) }
+                for pinConv in pinConvs {
+                    if traceHost("pin_topic", args: ["conv_id": pinConv]) {
+                        handlePinTopicEvent(conversationId: pinConv)
+                    }
+                }
             } else if actType == "group", ZaloWireParser.groupEventNoticeActs.contains(act) {
                 let ts = JSONLossless.int64(ctrl["ts"] ?? contentObj["ts"] ?? actData["ts"]) ?? 0
-                await handleGroupEventNotice(act: act, data: actData, ts: ts)
+                if traceHost("group_notice", args: ["act": act, "data": actData, "ts": ts]) {
+                    await handleGroupEventNotice(act: act, data: actData, ts: ts)
+                }
             } else if actType == "mute" {
                 let rawId = JSONLossless.string(actData["toId"] ?? actData["toid"] ?? actData["id"])
                 let muteType = JSONLossless.int64(actData["muteType"]) ?? 1
@@ -1516,16 +1571,20 @@ final class ZaloEngine {
                 let convId = isGrp ? ZaloWireParser.groupConvId(rawId) : ZaloWireParser.stripUserPrefix(rawId)
                 let duration = JSONLossless.int64(actData["duration"]) ?? -1
                 let muteMode = JSONLossless.int64(actData["muteMode"]) ?? 1
-                let start = JSONLossless.int64(actData["startTime"] ?? actData["systemTime"]) ?? Int64(Date().timeIntervalSince1970)
+                let explicitStart = JSONLossless.int64(actData["startTime"] ?? actData["systemTime"])
+                let start = explicitStart ?? Int64(Date().timeIntervalSince1970)
                 let isSet = (act == "set" || (act != "unset" && JSONLossless.int64(actData["action"]) == 1))
                     && muteMode == 1 && duration != 0
                 if !convId.isEmpty {
-                    if isSet {
-                        notificationSettings.mutes[convId] = MuteInfo(startTime: Double(start), duration: Double(duration))
-                    } else {
-                        notificationSettings.mutes.removeValue(forKey: convId)
+                    let startArg: Any = (explicitStart == nil && hostTrace != nil) ? "<volatile>" : start
+                    if traceHost("mute", args: ["conv_id": convId, "set": isSet, "start": startArg, "duration": duration]) {
+                        if isSet {
+                            notificationSettings.mutes[convId] = MuteInfo(startTime: Double(start), duration: Double(duration))
+                        } else {
+                            notificationSettings.mutes.removeValue(forKey: convId)
+                        }
+                        await saveNotificationPreferences()
                     }
-                    await saveNotificationPreferences()
                 }
             }
         }
@@ -1882,12 +1941,14 @@ final class ZaloEngine {
     }
 
     internal func persistPollState() async {
+        guard traceHost("persist_poll_state", args: ["state": Self.serializePollState(pollState)]) else { return }
         guard let store = sqliteStore,
               let data = try? JSONEncoder().encode(pollState) else { return }
         try? await store.setPreferenceData(key: "pollState", data: data)
     }
 
     internal func persistWSQueueCursors(_ cursors: [String: ZaloWSQueueCursorSnapshot]) async {
+        guard traceHost("persist_ws_cursors", args: ["cursors": Self.serializeWSQueueCursors(cursors)]) else { return }
         guard let store = sqliteStore,
               let data = try? JSONEncoder().encode(cursors) else { return }
         try? await store.setPreferenceData(key: "wsQueueCursors", data: data)
