@@ -209,11 +209,10 @@ final class ZaloEngine {
     init(
         dataDirectory: URL = ZaloPlatform.defaultUserData,
         useKeychain: Bool = true,
-        urlSession: URLSession? = nil,
         domains: ZaloDomains = ZaloDomains()
     ) {
         self.dataDirectory = dataDirectory
-        self.sessionClient = ZaloSessionClient(dataDirectory: dataDirectory, useKeychain: useKeychain, urlSession: urlSession, domains: domains)
+        self.sessionClient = ZaloSessionClient(dataDirectory: dataDirectory, useKeychain: useKeychain, domains: domains)
     }
 
     // MARK: - Lifecycle

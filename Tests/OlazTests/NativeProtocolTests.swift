@@ -154,17 +154,7 @@ import Testing
         #expect(try JSONDecoder().decode(ZaloDomains.self, from: isolatedData).isolated)
     }
 
-    @Test func wsFrameCodecURLSlashAndAuthQueues() {
-        let encoded = ZaloWebSocket.encodeFrame(cmd: 510, subCmd: 1, version: 1, data: ["first": true])
-        let decoded = ZaloWebSocket.decodeFrame(encoded)
-        #expect(decoded?.version == 1)
-        #expect(decoded?.cmd == 510)
-        #expect(decoded?.subCmd == 1)
-        #expect((decoded?.envelope["first"] as? Bool) == true)
-
-        let url = ZaloWebSocket.buildSocketURL(base: "wss://ws1-msg.chat.zalo.me", nowMs: 123456)
-        #expect(url?.absoluteString.hasPrefix("wss://ws1-msg.chat.zalo.me/?") == true)
-
+    @Test func wsQueuesFromAuthDedupsAndOrders() {
         let queues = ZaloWebSocket.queuesFromAuth([
             "data": [
                 "ctrl_qCmds": [["cmd": 603, "subCmd": 1], ["cmd": 604, "subCmd": 0]],
@@ -308,25 +298,6 @@ import Testing
         #expect(groupMsgs?.count == 1)
     }
 
-    @Test func pollStateEncodesAndIgnoresSocketQueue15() {
-        var state = ZaloPollState()
-        let initial = state.encodedParams()
-        #expect(initial.hasPrefix("1,1,"))
-        let res = state.applyResponse([
-            "lastActionId": "42",
-            "lastActionIdOther": "43",
-            "more": 1,
-            "queueStatus": [
-                "1": ["lastId": "100", "ids": ["a"]],
-                "15": ["lastId": "999", "ids": ["skip"]]
-            ]
-        ])
-        #expect(res.more == true)
-        #expect(state.lastActionId == "42")
-        #expect(state.queues["1"]?.lastId == "100")
-        #expect(state.queues["15"] == nil)
-    }
-
     @Test func wsExtractFileDoneControls() {
         let events = ZaloWebSocket.extractFileDoneEvents([
             "data": [
@@ -460,19 +431,6 @@ import Testing
             ]
         ]
         #expect(ZaloSessionClient.extractZpwSek(from: goodResp) == "abcd.123456.a0.xyz789")
-    }
-
-    @Test func extractZpwSekCookieHandlesExpiresCommaAndSkipsMaxAgeZero() {
-        let authURL = URL(string: "https://wpa.chat.zalo.me/api/login/getLoginInfo")!
-        let onlyExpiredHeaders = [
-            "Set-Cookie": "zpw_sek=; Domain=.zalo.me; Path=/; Expires=Thu, 01-Jan-1970 00:00:01 GMT; Max-Age=0, zpw_sek=; Domain=.chat.zalo.me; Path=/; Expires=Thu, 01-Jan-1970 00:00:01 GMT; Max-Age=0"
-        ]
-        #expect(ZaloSessionClient.extractZpwSekCookie(headers: onlyExpiredHeaders, url: authURL) == nil)
-
-        let mixedHeaders = [
-            "Set-Cookie": "zpw_sek=; Domain=.zalo.me; Path=/; Expires=Thu, 01-Jan-1970 00:00:01 GMT; Max-Age=0, zpw_sek=hdr.999999.a0.validToken; Domain=.zalo.me; Path=/; HttpOnly"
-        ]
-        #expect(ZaloSessionClient.extractZpwSekCookie(headers: mixedHeaders, url: authURL) == "hdr.999999.a0.validToken")
     }
 
     private func encodeVarint(_ value: UInt64) -> [UInt8] {
@@ -1900,20 +1858,6 @@ import Testing
         let uidsSingle = try #require(getBundleSingle["uids"] as? [[String: Any]])
         #expect(uidsSingle.count == 1)
 
-        // Verify `ZaloWebSocket.encodeRequestFrame` wraps `innerData` exactly once (`{"data": ..., "reqId": ...}`).
-        let frame = try #require(ZaloWebSocket.encodeRequestFrame(
-            cmd: ZaloE2EEManager.cmdSubmitBundle,
-            subCmd: 0,
-            version: 1,
-            reqId: "req_540",
-            innerData: submitBundle
-        ))
-        let decoded = try #require(ZaloWebSocket.decodeFrame(frame))
-        #expect(decoded.cmd == ZaloE2EEManager.cmdSubmitBundle)
-        #expect(decoded.envelope["reqId"] as? String == "req_540")
-        let outerData = try #require(decoded.envelope["data"] as? [String: Any])
-        #expect(outerData["delSS"] as? Int == 0)
-        #expect(outerData["data"] == nil)
     }
 
     @Test func e2eePeerListBundleParsingAndSQLitePersistence() async throws {

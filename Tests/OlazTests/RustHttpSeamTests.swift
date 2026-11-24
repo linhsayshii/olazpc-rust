@@ -34,16 +34,16 @@ private extension ZaloSessionClient {
     @Test func coreHttpFollowsTheSameGatingAsCoreApi() async throws {
         let dir = Self.tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let client = ZaloSessionClient(dataDirectory: dir, useKeychain: false, useRustCore: true)
+        let client = ZaloSessionClient(dataDirectory: dir, useKeychain: false)
         #expect(await client.coreHttp() == nil)   // no account yet
         await Self.login(client)
         #expect(await client.coreHttp() != nil)
     }
 
-    @Test func swiftPathStillThrowsNotAuthenticatedWithoutASession() async {
+    @Test func postThrowsNotAuthenticatedWithoutASession() async {
         let dir = Self.tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let client = ZaloSessionClient(dataDirectory: dir, useKeychain: false, useRustCore: true)
+        let client = ZaloSessionClient(dataDirectory: dir, useKeychain: false)
         await #expect(throws: ZaloTransportError.self) {
             _ = try await client.postBox(service: "profile", path: "/api/x", payload: [:])
         }

@@ -198,24 +198,20 @@ import Testing
 
     // MARK: websocket cursors
 
-    @Test func wsCursorSnapshotRoundTripsThroughBothPaths() async throws {
+    @Test func wsCursorSnapshotRoundTrips() async throws {
         let seed: [String: ZaloWSQueueCursorSnapshot] = [
             "501_0": ZaloWSQueueCursorSnapshot(lastId: "7412345678901234567", preIds: ["7412345678901234560"]),
             "521_0": ZaloWSQueueCursorSnapshot(lastId: "99", preIds: []),
-            "510_0": ZaloWSQueueCursorSnapshot(lastId: "1", preIds: [])   // initial cursor: dropped by both paths
+            "510_0": ZaloWSQueueCursorSnapshot(lastId: "1", preIds: [])   // initial cursor: dropped
         ]
-        let swiftWS = ZaloWebSocket(useRustCore: false)
-        let rustWS = ZaloWebSocket(useRustCore: true)
-        await swiftWS.seedQueueCursors(seed)
+        let rustWS = ZaloWebSocket()
         await rustWS.seedQueueCursors(seed)
-        let s = await swiftWS.currentQueueCursors()
         let r = await rustWS.currentQueueCursors()
-        #expect(s == r)
         #expect(r.keys.sorted() == ["501_0", "521_0"])
 
         // Same preference key / JSON shape the engine persists under `wsQueueCursors`.
         let data = try JSONEncoder().encode(r)
-        #expect(try JSONDecoder().decode([String: ZaloWSQueueCursorSnapshot].self, from: data) == s)
+        #expect(try JSONDecoder().decode([String: ZaloWSQueueCursorSnapshot].self, from: data) == r)
 
         // Core -> Swift: cursor updates reach the observer exactly when they change.
         final class Sink: @unchecked Sendable { var seen: [[String: ZaloWSQueueCursorSnapshot]] = [] }
@@ -235,14 +231,12 @@ import Testing
     @Test func sessionClientPushesLiveStateToTheCore() async throws {
         let dir = Self.tempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let client = ZaloSessionClient(dataDirectory: dir, useKeychain: false, useRustCore: true)
-        #expect(await client.coreApi() == nil)   // no account yet: Swift path reports notAuthenticated
+        let client = ZaloSessionClient(dataDirectory: dir, useKeychain: false)
+        #expect(await client.coreApi() == nil)   // no account yet
         await client.updateCredentials(
             account: ZaloLoginAccount(userId: "100", displayName: "An", send2MeId: "999", zpwEnk: "0123456789abcdef", zpwSek: "sek.1.2"),
             secretKey: Data("0123456789abcdef".utf8), zpwSek: "sek.1.2")
         #expect(await client.coreApi() != nil)
-        let swiftOnly = ZaloSessionClient(dataDirectory: dir, useKeychain: false, useRustCore: false)
-        #expect(await swiftOnly.coreApi() == nil)
     }
 
     @Test func coreErrorsMapToTheErrorsTheEngineHandles() {
@@ -437,26 +431,21 @@ import Testing
     ] }
 
     @MainActor
-    @Test func historyPageMatchesSwiftWalkAndHead() async throws {
+    @Test func historyPagePreservesHeadAndEvents() async throws {
         let json = String(decoding: try JSONSerialization.data(withJSONObject: Self.historyBody), as: UTF8.self)
         let rustPage = ZaloHistoryPage(record: try historyRecordFromJson(json: json))
-        let swiftPage = ZaloHistoryPage(box: ZaloJSONBox(JSONLossless.parseObject(string: json) ?? [:]))
-        // The paging head reads the same on both paths, 64-bit ids exact.
-        #expect(rustPage.hasMore && swiftPage.hasMore)
-        #expect(!rustPage.isOld && !swiftPage.isOld)
-        #expect(rustPage.lastMsgId == "7412345678901234500" && swiftPage.lastMsgId == rustPage.lastMsgId)
+        #expect(rustPage.hasMore)
+        #expect(!rustPage.isOld)
+        #expect(rustPage.lastMsgId == "7412345678901234500")
         #expect(rustPage.uids == ["me", "u1"])
-        #expect(rustPage.rustBatch != nil && swiftPage.rustBatch == nil)
+        #expect(rustPage.rustBatch != nil)
         for fallback in [("g1", true), ("g:g1", true)] {
             let rust = await ZaloWireParser.historyEventsAsync(
                 rustPage, myUid: "me", selfConvId: "cloud999", fallbackConvId: fallback.0, isGroupHint: fallback.1, nameLookup: Self.lookup)
-            let swift = await ZaloWireParser.historyEventsAsync(
-                swiftPage, myUid: "me", selfConvId: "cloud999", fallbackConvId: fallback.0, isGroupHint: fallback.1, nameLookup: Self.lookup)
             let walk = ZaloWireParser.extractBatchEvents(
-                swiftPage.box.dict, myUid: "me", selfConvId: "cloud999", fallbackConvId: fallback.0, isGroupHint: fallback.1,
+                rustPage.box.dict, myUid: "me", selfConvId: "cloud999", fallbackConvId: fallback.0, isGroupHint: fallback.1,
                 nameLookup: Self.lookup, useRustCore: false)
             #expect(rust.count >= 3)
-            #expect(Self.equalEvents(swift, walk))
             #expect(Self.equalEvents(rust, walk), "typed history events differ from the Swift walk")
         }
         // The raw fallback still yields the whole answer (ids intact).

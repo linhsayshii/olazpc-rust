@@ -168,42 +168,6 @@ import Testing
         #expect(decoded.clientId == "cli_1700001")
     }
 
-    @Test func buildRecallMessageRequestCoversAllFourRoutes() {
-        let normal11 = ZaloSessionClient.buildRecallMessageRequest(
-            convId: "200", msgId: "9001", cliMsgId: "7001", clientId: 888, isE2EE: false, imei: "imei-1"
-        )
-        #expect(normal11.service == "chat")
-        #expect(normal11.path == "/api/message/undo")
-        #expect(normal11.payload["toid"] as? String == "200")
-        #expect(normal11.payload["msgId"] as? String == "9001")
-        #expect(normal11.payload["cliMsgIdUndo"] as? String == "7001")
-        #expect(normal11.payload["clientId"] as? Int64 == 888)
-
-        let normalGroup = ZaloSessionClient.buildRecallMessageRequest(
-            convId: "g555", msgId: "9002", cliMsgId: "7002", clientId: 889, isE2EE: false, imei: "imei-1", visibility: 1
-        )
-        #expect(normalGroup.service == "group")
-        #expect(normalGroup.path == "/api/group/undomsg")
-        #expect(normalGroup.payload["grid"] as? String == "555")
-        #expect(normalGroup.payload["visibility"] as? Int == 1)
-        #expect(normalGroup.payload["imei"] as? String == "imei-1")
-
-        let e2ee11 = ZaloSessionClient.buildRecallMessageRequest(
-            convId: "200", msgId: "9003", cliMsgId: "7003", clientId: 890, isE2EE: true, imei: "imei-1"
-        )
-        #expect(e2ee11.service == "chat_e2e")
-        #expect(e2ee11.path == "/api/e2ee/pc/message/undo")
-        #expect(e2ee11.payload["destType"] as? Int == 3)
-        #expect(e2ee11.payload["toid"] as? String == "200")
-
-        let e2eeGroup = ZaloSessionClient.buildRecallMessageRequest(
-            convId: "g555", msgId: "9004", cliMsgId: "7004", clientId: 891, isE2EE: true, imei: "imei-1"
-        )
-        #expect(e2eeGroup.service == "group_e2e")
-        #expect(e2eeGroup.path == "/api/e2ee/pc/group/undoMsg")
-        #expect(e2eeGroup.payload["grid"] as? String == "555")
-    }
-
     @Test func myCloudWireMessageExcludesRecallMenu() throws {
         let evt = ZaloWireParser.parseWireMessage(
             [
@@ -902,51 +866,6 @@ import Testing
         #expect(ZaloWireParser.reactionClientMsgType(for: .gif(url: nil)) == 49)
     }
 
-    @Test func buildReactionRequestFormattingAndRoutes() throws {
-        let photoSpec = ZaloSessionClient.buildReactionRequest(
-            convId: "200",
-            msgId: "88001",
-            cliMsgId: "17001",
-            rIcon: "/-heart",
-            rType: 5,
-            msgType: 32,
-            clientId: 9991,
-            imei: "imei-1"
-        )
-        #expect(photoSpec.service == "reaction")
-        #expect(photoSpec.path == "/api/message/reaction")
-        #expect(photoSpec.payload["toid"] as? String == "200")
-        let photoReactList = try #require(photoSpec.payload["react_list"] as? [[String: Any]])
-        let photoMsgStr = try #require(photoReactList.first?["message"] as? String)
-        #expect(photoMsgStr.contains("/-heart"))
-        #expect(!photoMsgStr.contains("\\/-heart"))
-        let photoInner = try #require(JSONLossless.parseObject(Data(photoMsgStr.utf8)))
-        let photoRMsg = try #require((photoInner["rMsg"] as? [[String: Any]])?.first)
-        #expect((photoRMsg["gMsgID"] as? NSNumber)?.int64Value == 88001)
-        #expect((photoRMsg["cMsgID"] as? NSNumber)?.int64Value == 17001)
-        #expect((photoRMsg["msgType"] as? NSNumber)?.intValue == 32)
-
-        let groupFileSpec = ZaloSessionClient.buildReactionRequest(
-            convId: "g555",
-            msgId: "99001",
-            cliMsgId: "27001",
-            rIcon: "/-strong",
-            rType: 3,
-            msgType: 46,
-            clientId: 9992,
-            imei: "imei-g"
-        )
-        #expect(groupFileSpec.path == "/api/group/reaction")
-        #expect(groupFileSpec.payload["grid"] as? String == "555")
-        #expect(groupFileSpec.payload["imei"] as? String == "imei-g")
-        let grpList = try #require(groupFileSpec.payload["react_list"] as? [[String: Any]])
-        let grpMsgStr = try #require(grpList.first?["message"] as? String)
-        #expect(grpMsgStr.contains("/-strong"))
-        let grpInner = try #require(JSONLossless.parseObject(Data(grpMsgStr.utf8)))
-        let grpRMsg = try #require((grpInner["rMsg"] as? [[String: Any]])?.first)
-        #expect((grpRMsg["msgType"] as? NSNumber)?.intValue == 46)
-    }
-
     @Test @MainActor func localReactEchoDuplicateDeliveryAndFileFallbackWorkReliably() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-react-fix-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -1089,17 +1008,6 @@ import Testing
         #expect(reactions[0].icon.type == "5")
         #expect(reactions[0].includesMe == false)
         #expect(reactions[0].userCounts == ["200": 1])
-    }
-
-    @Test func removeReactionWireFormat() throws {
-        let spec = ZaloSessionClient.buildReactionRequest(
-            convId: "200", msgId: "88001", cliMsgId: "17001", rIcon: "", rType: -1,
-            msgType: 1, clientId: 1, imei: "i")
-        let list = try #require(spec.payload["react_list"] as? [[String: Any]])
-        let msg = try #require(list.first?["message"] as? String)
-        let inner = try #require(JSONLossless.parseObject(Data(msg.utf8)))
-        #expect((inner["rType"] as? NSNumber)?.intValue == -1)
-        #expect(inner["rIcon"] as? String == "")
     }
 
     @Test @MainActor func remoteUnreactAndCorruptedGhostReactionsAreEliminated() async throws {
