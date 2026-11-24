@@ -243,6 +243,9 @@ actor ZaloSessionClient {
     /// this client's IMEI, computer name, and any non-default domains if needed.
     func sharedCoreSession() -> CoreSession? {
         if let existing = coreSession {
+            if !coreOwned {
+                _ = syncCoreSession()
+            }
             coreOwned = true
             return existing
         }
@@ -351,7 +354,7 @@ actor ZaloSessionClient {
                 computerName: computerName,
                 domains: self.domains,
                 sealedSecretsBase64: nil,
-                plainAccount: account,
+                plainAccount: updated,
                 expiredAt: nil
             )
             if let data = try? JSONEncoder().encode(snapshot),
