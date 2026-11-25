@@ -28,7 +28,7 @@ extension ZaloEngine {
         let isGrp = ZaloWireParser.isGroupId(id)
         updateCallGateForConversation(id)
 
-        Task { [weak self] in
+        openConversationTask = Task { [weak self] in
             guard let self else { return }
             // 1. Fallback async read for in-memory test DBs without a separate WAL handle.
             if (self.messages[id]?.isEmpty ?? true),
@@ -57,7 +57,9 @@ extension ZaloEngine {
             }
 
             // 3. Mark read locally & remotely.
-            self.markRead(id)
+            if self.traceU4Host("mark_read", args: ["conv_id": id]) {
+                self.markRead(id)
+            }
         }
     }
 
@@ -165,7 +167,7 @@ extension ZaloEngine {
 
     func loadOlderMessages(_ id: String) {
         guard !id.isEmpty else { return }
-        Task { [weak self] in
+        loadOlderTask = Task { [weak self] in
             guard let self else { return }
             let existing = self.messages[id] ?? []
             let oldest = existing.first
