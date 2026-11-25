@@ -201,6 +201,8 @@ final class ZaloEngine {
     @ObservationIgnored internal var deleteUndoTimerTask: Task<Void, Never>?
     @ObservationIgnored internal var messageActionTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var contactsTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored internal var pollRefreshTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored internal var pollDebounceSleep: (@MainActor (Int) async -> Bool)?
     @ObservationIgnored internal var activeSendTask: Task<Bool, Never>?
     @ObservationIgnored internal var batchImportTask: Task<Void, Never>?
     @ObservationIgnored internal var activeSyncBatchTasks: [UUID: Task<Void, Never>] = [:]

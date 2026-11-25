@@ -37,6 +37,15 @@ extension ZaloEngine {
         messageActionTasks[key] = task
     }
 
+    internal func trackPollTask(_ body: @escaping @MainActor () async -> Void) {
+        let key = UUID()
+        let task = Task { @MainActor [weak self] in
+            defer { self?.pollRefreshTasks.removeValue(forKey: key) }
+            await body()
+        }
+        pollRefreshTasks[key] = task
+    }
+
     internal func syncSessionClientTrace() async {
         guard hostTrace != nil else {
             await sessionClient.setSessionTrace(nil)
@@ -76,6 +85,9 @@ extension ZaloEngine {
         messageActionTasks.removeAll()
         contactsTasks.values.forEach { $0.cancel() }
         contactsTasks.removeAll()
+        pollDebounceSleep = nil
+        resetPolls()
+        pollRefreshTasks.values.forEach { $0.cancel() }
         typingResetTasks.values.forEach { $0.cancel() }
         typingResetTasks = [:]
     }
@@ -128,6 +140,15 @@ extension ZaloEngine {
         await awaitMessageActionTasksForRecording()
     }
 
+    internal func awaitPollTasksForRecording() async {
+        while !pollRefreshTasks.isEmpty {
+            let tasks = Array(pollRefreshTasks.values)
+            pollRefreshTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
+        _ = await persistConversationsTask?.value
+    }
+
     internal func finishTearDownForRecording() async {
         await sessionClient.setSessionTrace(nil)
         _ = await bootTask?.value
@@ -149,6 +170,11 @@ extension ZaloEngine {
         while !messageActionTasks.isEmpty {
             let tasks = Array(messageActionTasks.values)
             messageActionTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
+        while !pollRefreshTasks.isEmpty {
+            let tasks = Array(pollRefreshTasks.values)
+            pollRefreshTasks.removeAll()
             for task in tasks { _ = await task.value }
         }
         _ = await persistConversationsTask?.value
