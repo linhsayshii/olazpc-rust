@@ -167,6 +167,11 @@ impl CoreSession {
         self.client.is_authenticated()
     }
 
+    /// Seeds the deterministic client id sequence (test recorder).
+    pub fn seed_next_client_id(&self, next: i64) {
+        self.client.seed_next_client_id(next);
+    }
+
     /// Next strictly increasing client message id (epoch ms).
     pub fn next_client_id(&self) -> i64 {
         self.client.next_client_id()

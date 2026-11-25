@@ -20,6 +20,7 @@ use crate::messages::{
     ContactsState, HistoryFreshness, PendingWindowOp, WindowDelta, coalesce_window_op,
 };
 use crate::state::{CoreState, SessionSnapshot};
+use crate::typing::TypingStatus;
 
 /// Upper bound on queued distinct session transitions; keeps hub memory strictly `O(1)`.
 const MAX_SESSION_QUEUE: usize = 64;
@@ -37,6 +38,8 @@ pub enum DirtyKey {
     MessageMeta,
     MessagesResetAll,
     Contacts,
+    // U5
+    Typing,
 }
 
 /// Set of keys dirtied by one `reduce` step.
@@ -80,6 +83,8 @@ pub struct CoreChanges {
     pub message_meta: Option<MessageMetaSnapshot>,
     /// Updated partial-U9 contacts state.
     pub contacts: Option<ContactsState>,
+    // U5
+    pub typing: Option<BTreeMap<String, TypingStatus>>,
 }
 
 impl fmt::Debug for CoreChanges {
@@ -92,6 +97,7 @@ impl fmt::Debug for CoreChanges {
             .field("messages_reset_all", &self.messages_reset_all)
             .field("has_message_meta", &self.message_meta.is_some())
             .field("has_contacts", &self.contacts.is_some())
+            .field("has_typing", &self.typing.is_some())
             .finish()
     }
 }
@@ -115,6 +121,8 @@ struct DirtyBuffer {
     messages_reset_all: bool,
     message_meta: Option<MessageMetaSnapshot>,
     contacts: Option<ContactsState>,
+    // U5
+    typing: Option<BTreeMap<String, TypingStatus>>,
     closed: bool,
 }
 
@@ -129,6 +137,7 @@ impl DirtyBuffer {
             || self.messages_reset_all
             || self.message_meta.is_some()
             || self.contacts.is_some()
+            || self.typing.is_some()
     }
 }
 
@@ -243,6 +252,10 @@ impl ChangeHub {
                 DirtyKey::Contacts => {
                     buf.contacts = Some(state.contacts.clone());
                 }
+                // U5
+                DirtyKey::Typing => {
+                    buf.typing = Some(state.typing.active.clone());
+                }
             }
             buf.dirty.insert(key);
         }
@@ -313,6 +326,8 @@ impl ChangeHub {
                             messages_reset_all: false,
                             message_meta: None,
                             contacts: None,
+                            // U5
+                            typing: None,
                         });
                     }
                 }
@@ -365,6 +380,8 @@ impl ChangeHub {
                         messages_reset_all: reset_all,
                         message_meta: buf.message_meta.take(),
                         contacts: buf.contacts.take(),
+                        // U5
+                        typing: buf.typing.take(),
                     });
                 }
                 if buf.closed {
@@ -463,5 +480,51 @@ mod tests {
         assert!(first.is_some());
         let second = hub.next_changes().await;
         assert!(second.is_none());
+    }
+
+    #[tokio::test]
+    async fn typing_changes_coalesce_in_place() {
+        let hub = ChangeHub::new();
+        let mut state = CoreState::default();
+        state.typing.active.insert(
+            "3000515".to_owned(),
+            TypingStatus {
+                name: "Alice".to_owned(),
+                on_pc: true,
+            },
+        );
+        hub.publish(&DirtySet::from([DirtyKey::Typing]), &state);
+        state.typing.active.insert(
+            "g500515".to_owned(),
+            TypingStatus {
+                name: "Bob".to_owned(),
+                on_pc: false,
+            },
+        );
+        hub.publish(&DirtySet::from([DirtyKey::Typing]), &state);
+
+        let Some(batch) = hub.next_changes().await else {
+            panic!("expected typing batch");
+        };
+        assert_eq!(batch.version, 2);
+        assert!(batch.session.is_none());
+        let Some(typing) = batch.typing else {
+            panic!("expected typing payload");
+        };
+        assert_eq!(typing.len(), 2);
+        assert_eq!(
+            typing.get("3000515"),
+            Some(&TypingStatus {
+                name: "Alice".to_owned(),
+                on_pc: true,
+            })
+        );
+        assert_eq!(
+            typing.get("g500515"),
+            Some(&TypingStatus {
+                name: "Bob".to_owned(),
+                on_pc: false,
+            })
+        );
     }
 }

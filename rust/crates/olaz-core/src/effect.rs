@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
-use olaz_api::PollState;
+use olaz_api::{PollState, SendTextParams};
 use olaz_net::{LoginAccount, QrTicket};
 use olaz_store::{StoredConversation, StoredMessage};
 use olaz_wire::ChatMessage;
@@ -12,7 +12,7 @@ use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
 use crate::conversations::{ConversationActionResult, IdentityTable, PinBoard};
-use crate::input::{HiddenPinSyncKind, SeenTarget, StoreToken};
+use crate::input::{E2eeQuoteArg, HiddenPinSyncKind, SeenTarget, StoreToken};
 use crate::messages::MuteEntry;
 use crate::reduce::classify::MobileSyncEvent;
 use crate::typed_chat::TypedChatEnvelope;
@@ -373,6 +373,14 @@ pub enum HostCall {
     },
     /// Fires after a transport-originated batch/parsed-events ingestion and all Pass 2 host jobs complete.
     TransportBatchSettled,
+    // U5-send
+    SendE2eeText {
+        send_id: u64,
+        conv_id: String,
+        text: String,
+        client_id: String,
+        quote: Option<E2eeQuoteArg>,
+    },
 }
 
 impl fmt::Debug for HostCall {
@@ -501,6 +509,12 @@ impl fmt::Debug for HostCall {
                 .finish(),
             Self::ShowBatchTyping { .. } => f.write_str("ShowBatchTyping"),
             Self::TransportBatchSettled => f.write_str("TransportBatchSettled"),
+            // U5-send
+            Self::SendE2eeText { send_id, quote, .. } => f
+                .debug_struct("SendE2eeText")
+                .field("send_id", send_id)
+                .field("has_quote", &quote.is_some())
+                .finish(),
         }
     }
 }
@@ -693,6 +707,24 @@ pub enum Effect {
         chunk: Vec<String>,
         remaining_chunks: Vec<Vec<String>>,
         cache_updated: bool,
+    },
+
+    // U5
+    /// Calls `ZaloApi::send_typing` when `SessionClient::is_authenticated()` is true.
+    SendTypingApi { conv_id: String },
+    /// Starts or resets the incoming typing expiry timer for `conv_id`.
+    StartTypingExpiry {
+        conv_id: String,
+        expiry_gen: u64,
+        delay: Duration,
+    },
+    /// Cancels any active incoming typing expiry timer for `conv_id`.
+    CancelTypingExpiry { conv_id: String },
+    // U5-send
+    /// Calls `ZaloApi::send_text` for a plain-text send and returns [`Input::SendTextDone`].
+    SendTextApi {
+        send_id: u64,
+        params: SendTextParams,
     },
 
     /// Domain activity delegated to Swift via `CoreHost`.
@@ -913,6 +945,22 @@ impl fmt::Debug for Effect {
                 .field("resolve_id", resolve_id)
                 .field("chunk_len", &chunk.len())
                 .field("remaining", &remaining_chunks.len())
+                .finish(),
+            // U5
+            Self::SendTypingApi { .. } => f.write_str("SendTypingApi"),
+            Self::StartTypingExpiry {
+                expiry_gen, delay, ..
+            } => f
+                .debug_struct("StartTypingExpiry")
+                .field("expiry_gen", expiry_gen)
+                .field("delay_ms", &delay.as_millis())
+                .finish(),
+            Self::CancelTypingExpiry { .. } => f.write_str("CancelTypingExpiry"),
+            // U5-send
+            Self::SendTextApi { send_id, params } => f
+                .debug_struct("SendTextApi")
+                .field("send_id", send_id)
+                .field("params", params)
                 .finish(),
             Self::Host(call) => f.debug_tuple("Host").field(call).finish(),
         }

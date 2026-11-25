@@ -121,6 +121,11 @@ impl<T: Transport> SessionClient<T> {
         f(&mut self.lock())
     }
 
+    /// Seeds the deterministic client id sequence (test recorder).
+    pub fn seed_next_client_id(&self, next: i64) {
+        self.lock().seed_next_client_id(next);
+    }
+
     pub fn next_client_id(&self) -> i64 {
         let now = self.now_ms();
         self.lock().next_client_id(now)

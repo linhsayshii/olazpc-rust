@@ -1059,9 +1059,12 @@ import Testing
         // Peer reacts twice via distinct eventIds, then unreacts once -> removes ALL their reactions (no ghost 1)
         await engine.applyRemoteReaction(convId: "201", msgId: "9001", cliMsgId: "c9001", senderId: "201", rType: "3", rIcon: "/-strong", eventId: "e1")
         await engine.applyRemoteReaction(convId: "201", msgId: "9001", cliMsgId: "c9001", senderId: "201", rType: "3", rIcon: "/-strong", eventId: "e2")
+        // Swift and the core both write the mirror until U6; read it once the core deltas have landed.
+        await engine.settleForRecording()
         #expect(engine.messages["201"]?.first?.reactions.first?.count == 2)
 
         await engine.applyRemoteReaction(convId: "201", msgId: "9001", cliMsgId: "c9001", senderId: "201", rType: "-1", rIcon: "", eventId: "e3")
+        await engine.settleForRecording()
         #expect(engine.messages["201"]?.first?.reactions.isEmpty == true)
 
         // Legacy reaction without userCounts (people=1, count=2, names=["An"]) -> peer unreact removes completely
@@ -1076,8 +1079,11 @@ import Testing
                 people: 1
             )
         ]
+        // Core deltas from the reactions above must land before the mirror is overwritten by hand.
+        await engine.settleForRecording()
         engine.messages["201"] = [legacyMsg]
         await engine.applyRemoteReaction(convId: "201", msgId: "9002", cliMsgId: "", senderId: "201", rType: "-1", rIcon: "", eventId: "e4")
+        await engine.settleForRecording()
         #expect(engine.messages["201"]?.first?.reactions.isEmpty == true)
 
         // Corrupted ghost reaction persisted in SQLite (`count: 1, people: 0, includesMe: false, names: []`) is dropped on decode

@@ -593,6 +593,10 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
         }
 
         Command::SetOpenConversation { id } => {
+            // U5: opening a conversation clears any active incoming typing indicator for it.
+            if let Some(conv_id) = id.as_deref() {
+                crate::typing::clear_typing(&mut state.typing, conv_id, out);
+            }
             state.conversations.open_conversation_id = id;
             complete_op(op_id, OpResult::Unit, false, out);
         }
@@ -691,58 +695,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
         }
 
         Command::MarkConversationRead { id, seen_target } => {
-            if id.is_empty() {
-                complete_op(op_id, OpResult::Unit, false, out);
-                return;
-            }
-            let self_conv_id = state.session.self_conversation_id.clone();
-            let mut extras_changed = false;
-            if let Some(conv) = state
-                .conversations
-                .conversations
-                .iter_mut()
-                .find(|c| c.id == id)
-                && conv.unread > 0
-            {
-                conv.unread = 0;
-                out.dirty.insert(DirtyKey::Conversations);
-                extras_changed = true;
-            }
-            let had_unread_mark = state.conversations.unread_marks.remove(&id);
-            if had_unread_mark {
-                if state
-                    .conversations
-                    .rebuild_conversation_flags(self_conv_id.as_deref())
-                {
-                    out.dirty.insert(DirtyKey::ConversationFlags);
-                }
-                extras_changed = true;
-                out.effects
-                    .push(Effect::Store(StoreOp::SetPreferenceStrings {
-                        key: "unreadMarks".to_owned(),
-                        values: sorted_set_vec(&state.conversations.unread_marks),
-                    }));
-                out.effects.push(Effect::SetUnreadMarkApi {
-                    conv_id: id.clone(),
-                    unread: false,
-                });
-            }
-            if extras_changed
-                && state
-                    .conversations
-                    .rebuild_conversation_extras(self_conv_id.as_deref())
-            {
-                out.dirty.insert(DirtyKey::ConversationExtras);
-            }
-            out.effects
-                .push(Effect::Store(StoreOp::SetConversationUnread {
-                    id,
-                    unread: 0,
-                }));
-            if let Some(target) = seen_target {
-                out.effects.push(Effect::SendSeenApi(target));
-            }
-            complete_op(op_id, OpResult::Unit, true, out);
+            mark_conversation_read(state, id, seen_target, op_id, out);
         }
 
         Command::MarkConversationUnread { id } => {
@@ -1393,6 +1346,68 @@ fn complete_op(op_id: Option<u64>, result: OpResult, after_store: bool, out: &mu
             after_store,
         });
     }
+}
+
+// U5-send
+pub(crate) fn mark_conversation_read(
+    state: &mut CoreState,
+    id: String,
+    seen_target: Option<crate::input::SeenTarget>,
+    op_id: Option<u64>,
+    out: &mut ReduceOutput,
+) {
+    if id.is_empty() {
+        complete_op(op_id, OpResult::Unit, false, out);
+        return;
+    }
+    let self_conv_id = state.session.self_conversation_id.clone();
+    let mut extras_changed = false;
+    if let Some(conv) = state
+        .conversations
+        .conversations
+        .iter_mut()
+        .find(|c| c.id == id)
+        && conv.unread > 0
+    {
+        conv.unread = 0;
+        out.dirty.insert(DirtyKey::Conversations);
+        extras_changed = true;
+    }
+    let had_unread_mark = state.conversations.unread_marks.remove(&id);
+    if had_unread_mark {
+        if state
+            .conversations
+            .rebuild_conversation_flags(self_conv_id.as_deref())
+        {
+            out.dirty.insert(DirtyKey::ConversationFlags);
+        }
+        extras_changed = true;
+        out.effects
+            .push(Effect::Store(StoreOp::SetPreferenceStrings {
+                key: "unreadMarks".to_owned(),
+                values: sorted_set_vec(&state.conversations.unread_marks),
+            }));
+        out.effects.push(Effect::SetUnreadMarkApi {
+            conv_id: id.clone(),
+            unread: false,
+        });
+    }
+    if extras_changed
+        && state
+            .conversations
+            .rebuild_conversation_extras(self_conv_id.as_deref())
+    {
+        out.dirty.insert(DirtyKey::ConversationExtras);
+    }
+    out.effects
+        .push(Effect::Store(StoreOp::SetConversationUnread {
+            id,
+            unread: 0,
+        }));
+    if let Some(target) = seen_target {
+        out.effects.push(Effect::SendSeenApi(target));
+    }
+    complete_op(op_id, OpResult::Unit, true, out);
 }
 
 // U4-bootstrap

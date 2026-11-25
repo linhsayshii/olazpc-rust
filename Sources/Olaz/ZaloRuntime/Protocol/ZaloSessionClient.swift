@@ -115,6 +115,7 @@ actor ZaloSessionClient {
     private var serverQrForm: Int = 0
     private var needsPCTypeUpgrade: Bool = false
     private var lastClientIdMs: Int64 = 0
+    private var seededNextClientId: Int64?
     private var sessionTrace: (@MainActor @Sendable (String) -> Bool)?
 
     private static let keychainIdentifier = "olaz.native.session"
@@ -277,6 +278,9 @@ actor ZaloSessionClient {
         ) else {
             return nil
         }
+        if let seeded = seededNextClientId {
+            created.seedNextClientId(next: seeded)
+        }
         coreSession = created
         coreApiHandle = CoreApi(session: created)
         coreHttpHandle = CoreHttp(session: created)
@@ -319,6 +323,9 @@ actor ZaloSessionClient {
         guard let data = try? JSONEncoder().encode(snapshot), let json = String(data: data, encoding: .utf8) else { return false }
         if coreSession == nil {
             guard let created = try? CoreSession(computerName: computerName) else { return false }
+            if let seeded = seededNextClientId {
+                created.seedNextClientId(next: seeded)
+            }
             coreSession = created
             coreApiHandle = CoreApi(session: created)
             coreHttpHandle = CoreHttp(session: created)
@@ -336,7 +343,32 @@ actor ZaloSessionClient {
         "zpw_ver=\(ZaloDomains.zpwVer)&zpw_type=\(ZaloDomains.zpwType)"
     }
 
+    func seedNextClientId(_ next: Int64) {
+        seededNextClientId = next
+        lastClientIdMs = next - 1
+        coreSession?.seedNextClientId(next: next)
+    }
+
+    func clearAuthForTesting() {
+        zpwSek = nil
+        secretKey = nil
+        if var acc = account {
+            acc.zpwSek = ""
+            acc.zpwEnk = ""
+            account = acc
+        }
+        coreSession?.clearSession()
+    }
+
     func nextClientId() -> Int64 {
+        if let coreSession {
+            return coreSession.nextClientId()
+        }
+        if let seeded = seededNextClientId {
+            seededNextClientId = seeded + 1
+            lastClientIdMs = seeded
+            return seeded
+        }
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let next = now > lastClientIdMs ? now : (lastClientIdMs + 1)
         lastClientIdMs = next

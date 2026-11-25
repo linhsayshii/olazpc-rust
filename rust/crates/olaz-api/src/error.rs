@@ -22,4 +22,15 @@ impl ApiError {
         self.session_error()
             .is_some_and(ZaloSessionError::is_auth_error)
     }
+
+    /// Formats the error without the ` ({url})` suffix on server session errors, matching Swift's
+    /// `ZaloSessionError.errorDescription` when `RustCore.mapError` is called without a path
+    /// (as in `sendTextAPI` -> `"sendText failed: Zalo error {code}: {message}"`).
+    #[must_use]
+    pub fn display_without_url(&self) -> String {
+        match self {
+            Self::Net(NetError::Session(s)) => format!("Zalo error {}: {}", s.code, s.message),
+            other => other.to_string(),
+        }
+    }
 }

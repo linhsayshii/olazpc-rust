@@ -48,7 +48,8 @@ import Testing
             windowDeltas: windowDeltas,
             messagesResetAll: messagesResetAll,
             messageMeta: messageMeta,
-            contacts: contacts
+            contacts: contacts,
+            typing: nil
         )
     }
 

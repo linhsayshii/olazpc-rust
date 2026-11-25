@@ -27,8 +27,8 @@ use crate::conversations::{
 };
 use crate::effect::{Effect, HistoryFetchPurpose, HostCall, OpResult, StoreOp};
 use crate::input::{
-    BootstrapAliasesError, Command, CompletedLogin, Input, LegacyCookie, PollBatchError,
-    PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
+    BootstrapAliasesError, Command, CompletedLogin, E2eeQuoteArg, Input, LegacyCookie,
+    PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
 };
 use crate::messages::MuteEntry;
 use crate::reduce::classify::MobileSyncEvent;
@@ -473,6 +473,17 @@ pub trait Host: Send + Sync {
         start_explicit: bool,
         duration: i64,
     );
+
+    // --- Send domain callbacks (U5-send) ---
+    async fn send_e2ee_text(
+        &self,
+        _conv_id: String,
+        _text: String,
+        _client_id: String,
+        _quote: Option<E2eeQuoteArg>,
+    ) -> Result<olaz_api::SendMessageResult, String> {
+        Err("send_e2ee_text not implemented by host".to_owned())
+    }
 }
 
 enum HostJob {
@@ -728,6 +739,7 @@ enum StoreJob {
 pub struct SessionEffectRunner<T: Transport + 'static> {
     client: Arc<SessionClient<T>>,
     api: Arc<ZaloApi<T>>,
+    host: Arc<dyn Host>,
     ws_driver: Arc<dyn WsDriver>,
     default_domains: Option<ZaloDomains>,
     suppress_long_poll: bool,
@@ -742,6 +754,8 @@ pub struct SessionEffectRunner<T: Transport + 'static> {
     bootstrap_tasks: Arc<Mutex<Vec<AbortHandle>>>,
     lp_timer_abort: Arc<Mutex<Option<AbortHandle>>>,
     lp_fetch_abort: Mutex<Option<AbortHandle>>,
+    // U5: per-conversation incoming typing expiry timers (`conv_id -> (expiry_gen, AbortHandle)`).
+    typing_expiry_aborts: Arc<Mutex<BTreeMap<String, (u64, AbortHandle)>>>,
     host_worker_abort: AbortHandle,
     store_worker_abort: AbortHandle,
     runtime: Handle,
@@ -808,7 +822,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         let worker_handle = runtime.spawn(run_host_worker(HostWorkerDeps {
             rx: host_rx,
             client: Arc::clone(&client),
-            host,
+            host: Arc::clone(&host),
             shared_store: Arc::clone(&shared_store),
             store_tx: store_tx.clone(),
             ws_driver: Arc::clone(&ws_driver),
@@ -822,6 +836,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         Self {
             client,
             api,
+            host,
             ws_driver,
             default_domains,
             suppress_long_poll,
@@ -836,6 +851,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
             bootstrap_tasks,
             lp_timer_abort,
             lp_fetch_abort: Mutex::new(None),
+            typing_expiry_aborts: Arc::new(Mutex::new(BTreeMap::new())),
             host_worker_abort: worker_handle.abort_handle(),
             store_worker_abort: store_handle.abort_handle(),
             runtime,
@@ -925,6 +941,25 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         };
         for handle in handles {
             handle.abort();
+        }
+    }
+
+    fn cancel_typing_expiry(&self, conv_id: Option<&str>) {
+        let mut map = self
+            .typing_expiry_aborts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match conv_id {
+            Some(id) => {
+                if let Some((_, abort)) = map.remove(id) {
+                    abort.abort();
+                }
+            }
+            None => {
+                for (_, (_, abort)) in std::mem::take(&mut *map) {
+                    abort.abort();
+                }
+            }
         }
     }
 
@@ -1821,6 +1856,82 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         drop(guard);
                     });
                 }
+                // U5
+                Effect::SendTypingApi { conv_id } => {
+                    let client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        if client.is_authenticated() {
+                            api.send_typing(&conv_id).await;
+                        }
+                        drop(guard);
+                    });
+                }
+                Effect::StartTypingExpiry {
+                    conv_id,
+                    expiry_gen,
+                    delay,
+                } => {
+                    let aborts = Arc::clone(&self.typing_expiry_aborts);
+                    let timer_sink = sink.clone();
+                    let conv_key = conv_id.clone();
+                    let aborts_inner = Arc::clone(&aborts);
+                    let handle = self
+                        .runtime
+                        .spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            {
+                                let mut map =
+                                    aborts_inner.lock().unwrap_or_else(PoisonError::into_inner);
+                                if map.get(&conv_key).is_some_and(|(g, _)| *g == expiry_gen) {
+                                    map.remove(&conv_key);
+                                }
+                            }
+                            timer_sink.send(Input::TypingExpired {
+                                conv_id: conv_key,
+                                expiry_gen,
+                            });
+                        })
+                        .abort_handle();
+                    let mut map = aborts.lock().unwrap_or_else(PoisonError::into_inner);
+                    if let Some((_, prev)) = map.insert(conv_id, (expiry_gen, handle)) {
+                        prev.abort();
+                    }
+                }
+                Effect::CancelTypingExpiry { conv_id } => {
+                    self.cancel_typing_expiry(Some(&conv_id));
+                }
+                // U5-send
+                Effect::SendTextApi { send_id, params } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = api
+                            .send_text(&params.as_args())
+                            .await
+                            .map_err(|err| err.display_without_url());
+                        sink.send(Input::SendTextDone { send_id, result });
+                        drop(guard);
+                    });
+                }
+                Effect::Host(HostCall::SendE2eeText {
+                    send_id,
+                    conv_id,
+                    text,
+                    client_id,
+                    quote,
+                }) => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = host.send_e2ee_text(conv_id, text, client_id, quote).await;
+                        sink.send(Input::SendTextDone { send_id, result });
+                        drop(guard);
+                    });
+                }
                 Effect::Host(call) => {
                     let guard = sink.track();
                     let job = match call {
@@ -2082,6 +2193,9 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         HostCall::TransportBatchSettled => {
                             HostJob::TransportBatchSettled { _guard: guard }
                         }
+                        HostCall::SendE2eeText { .. } => {
+                            continue;
+                        }
                     };
                     self.send_host(job);
                 }
@@ -2100,6 +2214,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
             .unwrap_or_else(PoisonError::into_inner) = None;
         self.cancel_active_tasks();
         self.cancel_bootstrap_tasks();
+        self.cancel_typing_expiry(None);
         self.cancel_long_poll();
         self.ws_driver.stop(false);
         self.host_worker_abort.abort();
@@ -3246,6 +3361,404 @@ mod tests {
             "expected u42 from returned ApplyBatch delta, got {:?}",
             snap.conversations
         );
+        core.stop();
+    }
+
+    #[derive(Default)]
+    struct RecordingTypingHost {
+        calls: Mutex<Vec<(String, String, bool)>>,
+    }
+
+    #[async_trait]
+    impl Host for RecordingTypingHost {
+        async fn load_saved_session(&self) -> Option<String> {
+            None
+        }
+        async fn load_legacy_cookie(&self) -> Option<LegacyCookie> {
+            None
+        }
+        async fn set_pref(&self, _key: String, _value: String) {}
+        async fn prepare_store(&self, _user_id: String, _account: LoginAccount) {}
+        async fn start_bootstrap(&self) {}
+        async fn offer_first_login_transfer(&self, _force: bool) {}
+        async fn reset_domains(&self) {}
+        async fn persist_session(&self, _snapshot_json: String) {}
+        async fn clear_session(&self) {}
+        async fn mark_expired(&self, _snapshot_json: String) {}
+        async fn persist_poll_state(&self, _state: PollState) {}
+        async fn persist_ws_cursors(&self, _cursors: CursorMap) {}
+        async fn apply_batch(
+            &self,
+            _cmd: Option<u16>,
+            _increment_unread: bool,
+            _notify_incoming: bool,
+            _payload: Map<String, Value>,
+        ) -> BatchApplyDelta {
+            BatchApplyDelta::default()
+        }
+        async fn apply_parsed_events(
+            &self,
+            _cmd: u16,
+            _increment_unread: bool,
+            _notify_incoming: bool,
+            _envelope: TypedChatEnvelope,
+        ) -> BatchApplyDelta {
+            BatchApplyDelta::default()
+        }
+        async fn mobile_sync(&self, _events: Vec<MobileSyncEvent>) {}
+        async fn e2ee_signal(&self, _cmd: u16, _payload: Map<String, Value>) {}
+        async fn e2ee_deliver_reports(&self, _cmd: u16, _payload: Map<String, Value>) {}
+        async fn e2ee_connected(&self, _uid: String) {}
+        async fn e2ee_disconnected(&self) {}
+        async fn voip_control(&self, _act: String, _raw_data: Value, _data: Map<String, Value>) {}
+        async fn show_typing(&self, conv_id: String, uid: String, on_pc: bool) {
+            self.calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((conv_id, uid, on_pc));
+        }
+        async fn pin_topic(&self, _conv_id: String) {}
+        async fn group_notice(&self, _act: String, _data: Map<String, Value>, _ts: i64) {}
+        async fn mute(
+            &self,
+            _conv_id: String,
+            _set: bool,
+            _start: i64,
+            _start_explicit: bool,
+            _duration: i64,
+        ) {
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn typing_expiry_runs_on_paused_time_restarts_on_reping_and_cancels_on_open() {
+        use olaz_net::mock::MockTransport;
+
+        use crate::actor::CoreHandle;
+        use crate::input::Command;
+        use crate::state::{CoreState, Phase};
+        use crate::typing::{TYPING_DISPLAY_DURATION, TypingStatus};
+
+        let client = Arc::new(SessionClient::new(
+            MockTransport::scripted(vec![]),
+            "imei-t".to_owned(),
+            "Mac".to_owned(),
+        ));
+        let runner = Arc::new(SessionEffectRunner::new(
+            client,
+            Arc::new(RecordingTypingHost::default()),
+            tokio::runtime::Handle::current(),
+        ));
+        let mut initial = CoreState::default();
+        initial.session.phase = Phase::Ready;
+        let core = CoreHandle::start_with_state(initial, runner, tokio::runtime::Handle::current());
+
+        let ping = |conv: &str, name: &str, on_pc: bool| match serde_json::json!({"typing": {"convId": conv, "name": name, "isPC": on_pc}})
+        {
+            Value::Object(map) => map,
+            other => panic!("expected object, got {other:?}"),
+        };
+
+        core.send_and_ack(Command::HandleTyping {
+            state: ping("3000515", "Alice", true),
+        })
+        .await;
+        // wait_idle returns immediately even while the 10 s expiry timer is pending.
+        core.wait_idle().await;
+        let Some(batch1) = core.next_changes().await else {
+            panic!("expected initial typing batch");
+        };
+        assert_eq!(
+            batch1.typing.as_ref().and_then(|m| m.get("3000515")),
+            Some(&TypingStatus {
+                name: "Alice".to_owned(),
+                on_pc: true,
+            })
+        );
+
+        // Advance 5 s: still active. Re-ping restarts the 10 s window.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            core.full_snapshot()
+                .await
+                .is_some_and(|s| s.typing.contains_key("3000515"))
+        );
+
+        core.send_and_ack(Command::HandleTyping {
+            state: ping("3000515", "Alice", true),
+        })
+        .await;
+
+        // 6 s after re-ping (11 s since first ping): still active because gen1 was cancelled/superseded.
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            core.full_snapshot()
+                .await
+                .is_some_and(|s| s.typing.contains_key("3000515"))
+        );
+
+        // 4 more seconds (10 s since re-ping): expires cleanly.
+        tokio::time::advance(Duration::from_secs(4)).await;
+        let Some(batch_exp) = core.next_changes().await else {
+            panic!("expected expiry typing batch");
+        };
+        assert!(batch_exp.typing.as_ref().is_some_and(BTreeMap::is_empty));
+        assert!(
+            core.full_snapshot()
+                .await
+                .is_some_and(|s| s.typing.is_empty())
+        );
+
+        // Opening a conversation clears its typing indicator and cancels the expiry timer.
+        core.send_and_ack(Command::HandleTyping {
+            state: ping("g500515", "Dana", false),
+        })
+        .await;
+        let _ = core.next_changes().await;
+        core.send_and_ack(Command::SetOpenConversation {
+            id: Some("g500515".to_owned()),
+        })
+        .await;
+        let Some(batch_cleared) = core.next_changes().await else {
+            panic!("expected cleared typing batch");
+        };
+        assert!(
+            batch_cleared
+                .typing
+                .as_ref()
+                .is_some_and(BTreeMap::is_empty)
+        );
+
+        tokio::time::advance(TYPING_DISPLAY_DURATION + Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            core.full_snapshot()
+                .await
+                .is_some_and(|s| s.typing.is_empty())
+        );
+
+        core.stop();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ws_601_typing_updates_core_state_emits_host_call_and_expires() {
+        use olaz_net::mock::MockTransport;
+
+        use crate::actor::CoreHandle;
+        use crate::conversations::FriendIdentity;
+        use crate::input::Command;
+        use crate::state::{CoreState, Phase, Profile, WsPhase};
+        use crate::typing::{TYPING_DISPLAY_DURATION, TypingStatus};
+
+        struct SinkCaptureRunner<T: Transport + 'static> {
+            inner: Arc<SessionEffectRunner<T>>,
+            sink: Mutex<Option<ActorSink>>,
+        }
+
+        impl<T: Transport + 'static> EffectRunner for SinkCaptureRunner<T> {
+            fn dispatch(&self, effects: Vec<Effect>, sink: ActorSink) {
+                *self.sink.lock().unwrap_or_else(PoisonError::into_inner) = Some(sink.clone());
+                self.inner.dispatch(effects, sink);
+            }
+
+            fn shutdown(&self) {
+                self.inner.shutdown();
+            }
+        }
+
+        let host = Arc::new(RecordingTypingHost {
+            calls: Mutex::new(Vec::new()),
+        });
+        let client = Arc::new(SessionClient::new(
+            MockTransport::scripted(vec![]),
+            "imei-t2".to_owned(),
+            "Mac".to_owned(),
+        ));
+        let inner = Arc::new(SessionEffectRunner::new(
+            client,
+            Arc::clone(&host) as Arc<dyn Host>,
+            tokio::runtime::Handle::current(),
+        ));
+        let capture = Arc::new(SinkCaptureRunner {
+            inner: Arc::clone(&inner),
+            sink: Mutex::new(None),
+        });
+
+        let mut initial = CoreState::default();
+        initial.session.phase = Phase::Ready;
+        initial.session.profile = Some(Profile {
+            user_id: "2000515".to_owned(),
+            display_name: "Me".to_owned(),
+            avatar: None,
+            phone: None,
+        });
+        initial.conversations.identities.friends = vec![
+            FriendIdentity {
+                id: "3000515".to_owned(),
+                name: "Alice".to_owned(),
+                avatar: None,
+            },
+            FriendIdentity {
+                id: "3000516".to_owned(),
+                name: "Bob".to_owned(),
+                avatar: None,
+            },
+        ];
+        initial.transport.ws_phase = WsPhase::Running;
+        initial.transport.ws_gen = 1;
+
+        let core = CoreHandle::start_with_state(
+            initial,
+            Arc::clone(&capture) as Arc<dyn EffectRunner>,
+            tokio::runtime::Handle::current(),
+        );
+        // Prime sink capture via a command that dispatches an effect through EffectRunner.
+        core.send_and_ack(Command::PersistConversations).await;
+        let Some(sink) = capture
+            .sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
+            panic!("sink captured");
+        };
+
+        let Value::Object(payload) = serde_json::json!({
+            "error_code": 0,
+            "data": {
+                "controls": [
+                    {"act": "typing", "act_type": "typing", "data": {"isPC": 1, "uid": "3000515"}},
+                    {"act": "gtyping", "act_type": "typing", "data": {"gid": "500515", "uid": "3000516"}}
+                ]
+            }
+        }) else {
+            panic!("expected payload object");
+        };
+
+        sink.send(Input::WsEvent {
+            ws_gen: 1,
+            cmd: 601,
+            payload,
+            now_unix_secs: 1_700_000_000,
+        });
+        core.settle().await;
+        inner.flush_host().await;
+
+        let recorded = host
+            .calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            recorded,
+            vec![
+                ("3000515".to_owned(), "3000515".to_owned(), true),
+                ("g500515".to_owned(), "3000516".to_owned(), false),
+            ]
+        );
+        let Some(snap) = core.full_snapshot().await else {
+            panic!("expected core snapshot");
+        };
+        assert_eq!(
+            snap.typing.get("3000515"),
+            Some(&TypingStatus {
+                name: "Alice".to_owned(),
+                on_pc: true,
+            })
+        );
+        assert_eq!(
+            snap.typing.get("g500515"),
+            Some(&TypingStatus {
+                name: "Bob".to_owned(),
+                on_pc: false,
+            })
+        );
+
+        // Advance paused time by 10 s: both expire without wall-clock sleeps.
+        tokio::time::advance(TYPING_DISPLAY_DURATION).await;
+        tokio::task::yield_now().await;
+        core.settle().await;
+        assert!(
+            core.full_snapshot()
+                .await
+                .is_some_and(|s| s.typing.is_empty())
+        );
+
+        core.stop();
+    }
+
+    #[tokio::test]
+    async fn send_typing_api_checks_auth_and_routes_1_1_and_group() {
+        use olaz_net::http::RawResponse;
+        use olaz_net::mock::MockTransport;
+
+        use crate::actor::CoreHandle;
+        use crate::input::Command;
+        use crate::state::{CoreState, Phase};
+
+        let transport = MockTransport::from_fn(|_| {
+            Ok(RawResponse::new(
+                200,
+                br#"{"error_code":0,"data":{}}"#.to_vec(),
+            ))
+        });
+        let client = Arc::new(SessionClient::new(
+            transport,
+            "imei-t3".to_owned(),
+            "Mac".to_owned(),
+        ));
+        client.update_credentials(
+            LoginAccount {
+                user_id: "2000517".to_owned(),
+                ..LoginAccount::default()
+            },
+            b"0123456789abcdef".to_vec(),
+            "sek.1".to_owned(),
+            Some(ZaloDomains::default()),
+        );
+        let runner = Arc::new(SessionEffectRunner::new(
+            Arc::clone(&client),
+            Arc::new(RecordingTypingHost::default()),
+            tokio::runtime::Handle::current(),
+        ));
+        let mut initial = CoreState::default();
+        initial.session.phase = Phase::Ready;
+        let core = CoreHandle::start_with_state(initial, runner, tokio::runtime::Handle::current());
+
+        core.send(Command::NotifyTyping {
+            conv_id: "  3000517  ".to_owned(),
+            now_ms: 1_700_000_000_000,
+        });
+        core.send(Command::NotifyTyping {
+            conv_id: "3000517".to_owned(),
+            now_ms: 1_700_000_005_000,
+        });
+        core.send(Command::NotifyTyping {
+            conv_id: "g500517".to_owned(),
+            now_ms: 1_700_000_005_000,
+        });
+        core.wait_idle().await;
+
+        let mut paths: Vec<String> = client
+            .transport()
+            .requests()
+            .into_iter()
+            .map(|r| r.path())
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec!["/api/group/typing", "/api/message/typing"]);
+
+        // Clearing client auth suppresses SendTypingApi even while phase stays Ready.
+        client.clear_session();
+        core.send(Command::NotifyTyping {
+            conv_id: "3000519".to_owned(),
+            now_ms: 1_700_000_020_000,
+        });
+        core.wait_idle().await;
+        assert_eq!(client.transport().requests().len(), 2);
+
         core.stop();
     }
 }

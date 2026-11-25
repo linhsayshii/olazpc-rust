@@ -30,6 +30,7 @@ extension ZaloEngine {
 
     internal func cancelTasksForRecording() {
         hostTrace = nil
+        sendE2EETextHostHandler = nil
         traceU4HostEnabled = false
         stateTrace = nil
         EngineLog.shared.onAppend = nil
@@ -40,6 +41,12 @@ extension ZaloEngine {
         openConversationTask?.cancel()
         loadOlderTask?.cancel()
         persistConversationsTask?.cancel()
+        notifyTypingTask?.cancel()
+        markReadTasks.values.forEach { $0.cancel() }
+        markReadTasks.removeAll()
+        activeSendTask?.cancel()
+        typingResetTasks.values.forEach { $0.cancel() }
+        typingResetTasks = [:]
     }
 
     internal func settleForRecording() async {
@@ -56,12 +63,52 @@ extension ZaloEngine {
         await waitForMirrorVersion(version)
     }
 
+    internal func awaitMarkReadTasksForRecording() async {
+        while !markReadTasks.isEmpty {
+            let tasks = Array(markReadTasks.values)
+            markReadTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
+        if let core = coreLifecycle.core {
+            if phase == .ready, activeSendTask == nil {
+                if let v = try? await core.waitIdle() {
+                    await waitForMirrorVersion(v)
+                }
+            } else if let v = try? await core.settle() {
+                await waitForMirrorVersion(v)
+            }
+        }
+        _ = await persistConversationsTask?.value
+    }
+
+    internal func awaitNotifyTypingTaskForRecording() async {
+        let task = notifyTypingTask
+        notifyTypingTask = nil
+        _ = await task?.value
+        if let core = coreLifecycle.core {
+            if phase == .ready, activeSendTask == nil {
+                if let v = try? await core.waitIdle() {
+                    await waitForMirrorVersion(v)
+                }
+            } else if let v = try? await core.settle() {
+                await waitForMirrorVersion(v)
+            }
+        }
+    }
+
     internal func finishTearDownForRecording() async {
         await sessionClient.setSessionTrace(nil)
         _ = await bootTask?.value
         _ = await qrTask?.value
         _ = await openConversationTask?.value
         _ = await loadOlderTask?.value
+        _ = await activeSendTask?.value
+        _ = await notifyTypingTask?.value
+        while !markReadTasks.isEmpty {
+            let tasks = Array(markReadTasks.values)
+            markReadTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
         _ = await persistConversationsTask?.value
         _ = await pendingCleanupTask?.value
     }
