@@ -536,6 +536,633 @@ final class GroupRecorderTests: XCTestCase {
                     ]),
                 ]
             ),
+
+            // 5. invite
+            GroupRecorderHarness.ScenarioDef(
+                name: "invite",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2001001",
+                    displayName: "Groups User",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "local_conversations": .array([
+                            localConv(id: "g500501", name: "Nhóm Mời 1", members: 2),
+                            localConv(id: "g500502", name: "Nhóm Mời 2", members: 10),
+                        ]),
+                        "contacts": .object([
+                            "friends": .array([
+                                seedFriend(id: "3001004", name: "Dũng"),
+                                seedFriend(id: "3001006", name: "Giang"),
+                                seedFriend(id: "3001008", name: "Hương"),
+                            ]),
+                            "groups": .array([
+                                seedGroup(id: "g500501", name: "Nhóm Mời 1", members: 2),
+                                seedGroup(id: "g500502", name: "Nhóm Mời 2", members: 10),
+                            ]),
+                            "friends_loaded": .bool(true),
+                            "groups_loaded": .bool(true),
+                        ]),
+                        "cached_group_details": .object([
+                            "500501": .object([
+                                "groupId": .string("500501"),
+                                "name": .string("Nhóm Mời 1"),
+                                "memIds": .array([.string("2001001"), .string("3001001")]),
+                                "totalMember": .int(2),
+                            ]),
+                            "500502": .object([
+                                "groupId": .string("500502"),
+                                "name": .string("Nhóm Mời 2"),
+                                "totalMember": .int(10),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2001001", displayName: "Groups User"),
+                    MessageRecorderHarness.profileMeScript(uid: "2001001", displayName: "Groups User"),
+                    // 1. All added
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/invite/v2",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "gridInfoMap": .object([
+                                    "500501": .object([
+                                        "groupId": .string("500501"),
+                                        "name": .string("Nhóm Mời 1"),
+                                        "memIds": .array([.string("2001001"), .string("3001001"), .string("3001002"), .string("3001003")]),
+                                        "totalMember": .int(4),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    // 2. errorMem (single rejected member for deterministic Set order)
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/invite/v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object(["errorMem": .array([.string("3001004")])]),
+                        ])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["gridInfoMap": .object([:])])])
+                    ),
+                    // 3. errorMembers
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/invite/v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object(["errorMembers": .array([.string("3001006")])]),
+                        ])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["gridInfoMap": .object([:])])])
+                    ),
+                    // 4. rejectedMembers
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/invite/v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object(["rejectedMembers": .array([.string("3001008")])]),
+                        ])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["gridInfoMap": .object([:])])])
+                    ),
+                    // 5. All rejected -> early return, no getmg-v2
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/invite/v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object(["errorMem": .array([.string("3001010")])]),
+                        ])
+                    ),
+                    // 6. me filtered out (only 3001011 sent)
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/invite/v2",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["gridInfoMap": .object([:])])])
+                    ),
+                    // 7. Unknown member list count rule on g500502 (10 -> 11)
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/invite/v2",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["gridInfoMap": .object([:])])])
+                    ),
+                    // 8. API failure
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/invite/v2",
+                        method: "POST",
+                        status: 500,
+                        json: .object(["error_code": .int(500), "error_message": .string("Invite failed")])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")])]),
+                    .object([
+                        "cmd": .string("invite"),
+                        "now_ms": .int(1700010051000),
+                        "args": .object(["id": .string("g500501"), "members": .array([.string("3001002"), .string("u3001003")])]),
+                    ]),
+                    .object(["snapshot": .string("after_all_added")]),
+                    .object([
+                        "cmd": .string("invite"),
+                        "now_ms": .int(1700010052000),
+                        "args": .object(["id": .string("g500501"), "members": .array([.string("3001004"), .string("3001005")])]),
+                    ]),
+                    .object(["snapshot": .string("after_errorMem")]),
+                    .object([
+                        "cmd": .string("invite"),
+                        "now_ms": .int(1700010053000),
+                        "args": .object(["id": .string("g500501"), "members": .array([.string("3001006"), .string("3001007")])]),
+                    ]),
+                    .object(["snapshot": .string("after_errorMembers")]),
+                    .object([
+                        "cmd": .string("invite"),
+                        "now_ms": .int(1700010054000),
+                        "args": .object(["id": .string("g500501"), "members": .array([.string("3001008"), .string("3001009")])]),
+                    ]),
+                    .object(["snapshot": .string("after_rejectedMembers")]),
+                    .object([
+                        "cmd": .string("invite"),
+                        "args": .object(["id": .string("g500501"), "members": .array([.string("3001010")])]),
+                    ]),
+                    .object(["snapshot": .string("after_all_rejected")]),
+                    .object([
+                        "cmd": .string("invite"),
+                        "args": .object(["id": .string("g500501"), "members": .array([.string("2001001")])]),
+                    ]),
+                    .object([
+                        "cmd": .string("invite"),
+                        "now_ms": .int(1700010055000),
+                        "args": .object(["id": .string("g500501"), "members": .array([.string("u2001001"), .string("3001011")])]),
+                    ]),
+                    .object(["snapshot": .string("after_me_filtered")]),
+                    .object([
+                        "cmd": .string("invite"),
+                        "now_ms": .int(1700010056000),
+                        "args": .object(["id": .string("g500502"), "members": .array([.string("3001012")])]),
+                    ]),
+                    .object(["snapshot": .string("after_unknown_count_rule")]),
+                    .object([
+                        "cmd": .string("invite"),
+                        "args": .object(["id": .string("g500502"), "members": .array([.string("3001013")])]),
+                    ]),
+                ]
+            ),
+
+            // 6. kick
+            GroupRecorderHarness.ScenarioDef(
+                name: "kick",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2001001",
+                    displayName: "Groups User",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "local_conversations": .array([
+                            localConv(id: "g500601", name: "Nhóm Known", members: 3),
+                            localConv(id: "g500602", name: "Nhóm Unknown 2", members: 2),
+                            localConv(id: "g500603", name: "Nhóm Floor 1", members: 1),
+                        ]),
+                        "contacts": .object([
+                            "groups": .array([
+                                seedGroup(id: "g500601", name: "Nhóm Known", members: 3),
+                                seedGroup(id: "g500602", name: "Nhóm Unknown 2", members: 2),
+                                seedGroup(id: "g500603", name: "Nhóm Floor 1", members: 1),
+                            ]),
+                            "friends_loaded": .bool(true),
+                            "groups_loaded": .bool(true),
+                        ]),
+                        "cached_group_details": .object([
+                            "500601": .object([
+                                "groupId": .string("500601"),
+                                "name": .string("Nhóm Known"),
+                                "memIds": .array([.string("2001001"), .string("3001001"), .string("3001002")]),
+                                "totalMember": .int(3),
+                            ]),
+                            "500602": .object([
+                                "groupId": .string("500602"),
+                                "name": .string("Nhóm Unknown 2"),
+                                "totalMember": .int(2),
+                            ]),
+                            "500603": .object([
+                                "groupId": .string("500603"),
+                                "name": .string("Nhóm Floor 1"),
+                                "totalMember": .int(1),
+                            ]),
+                        ]),
+                        "group_member_cache": .object([
+                            "g500601": .array([
+                                .object(["id": .string("-1"), "name": .string("All"), "avatar": .null, "is_all": .bool(true)]),
+                                .object(["id": .string("3001001"), "name": .string("An"), "avatar": .null, "is_all": .bool(false)]),
+                                .object(["id": .string("3001002"), "name": .string("Bình"), "avatar": .null, "is_all": .bool(false)]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2001001", displayName: "Groups User"),
+                    MessageRecorderHarness.profileMeScript(uid: "2001001", displayName: "Groups User"),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/kickout",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "gridInfoMap": .object([
+                                    "500601": .object([
+                                        "groupId": .string("500601"),
+                                        "name": .string("Nhóm Known"),
+                                        "memIds": .array([.string("2001001"), .string("3001002")]),
+                                        "totalMember": .int(2),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/kickout",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["gridInfoMap": .object([:])])])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/kickout",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["gridInfoMap": .object([:])])])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/kickout",
+                        method: "POST",
+                        status: 500,
+                        json: .object(["error_code": .int(500), "error_message": .string("Kick failed")])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")])]),
+                    .object([
+                        "cmd": .string("kick"),
+                        "now_ms": .int(1700010061000),
+                        "args": .object(["id": .string("g500601"), "member": .string("u3001001")]),
+                    ]),
+                    .object(["snapshot": .string("after_kick_known")]),
+                    .object([
+                        "cmd": .string("kick"),
+                        "now_ms": .int(1700010062000),
+                        "args": .object(["id": .string("g500602"), "member": .string("3001001")]),
+                    ]),
+                    .object(["snapshot": .string("after_kick_unknown_2_to_1")]),
+                    .object([
+                        "cmd": .string("kick"),
+                        "now_ms": .int(1700010063000),
+                        "args": .object(["id": .string("g500603"), "member": .string("3001001")]),
+                    ]),
+                    .object(["snapshot": .string("after_kick_floor_1")]),
+                    .object([
+                        "cmd": .string("kick"),
+                        "args": .object(["id": .string("g500601"), "member": .string("u2001001")]),
+                    ]),
+                    .object(["snapshot": .string("after_kick_me")]),
+                    .object([
+                        "cmd": .string("kick"),
+                        "args": .object(["id": .string("g500601"), "member": .string("3001002")]),
+                    ]),
+                ]
+            ),
+
+            // 7. leave
+            GroupRecorderHarness.ScenarioDef(
+                name: "leave",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2001001",
+                    displayName: "Groups User",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "pinned_ids": .array([.string("g500701"), .string("g500702")]),
+                        "archived_ids": .array([.string("g500701"), .string("g500702")]),
+                        "unread_marks": .array([.string("g500701"), .string("g500702")]),
+                        "history_freshness": .object(["g500701": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "g500701", name: "Nhóm Rời", pinned: true, members: 4, unread: 1, previewText: "Hi", previewTsMs: 1700000001000),
+                            localConv(id: "g500702", name: "Nhóm Giữ", pinned: true, members: 3),
+                        ]),
+                        "local_messages": .array([
+                            .object([
+                                "id": .string("m701"),
+                                "conv_id": .string("g500701"),
+                                "client_id": .string("c701"),
+                                "sender_id": .string("2001001"),
+                                "sender_name": .string("Groups User"),
+                                "sender_avatar": .string(""),
+                                "is_mine": .bool(true),
+                                "text": .string("Hi"),
+                                "kind_tag": .string("text"),
+                                "ts_ms": .int(1700000001000),
+                                "status": .string("sent"),
+                            ]),
+                        ]),
+                        "contacts": .object([
+                            "groups": .array([
+                                seedGroup(id: "g500701", name: "Nhóm Rời", members: 4),
+                                seedGroup(id: "g500702", name: "Nhóm Giữ", members: 3),
+                            ]),
+                            "cached_profiles": .object([
+                                "3001001": .object(["name": .string("An"), "avatar": .string("")]),
+                            ]),
+                            "cached_groups": .object([
+                                "g500701": .object(["name": .string("Nhóm Rời"), "avatar": .string(""), "members": .int(4)]),
+                                "g500702": .object(["name": .string("Nhóm Giữ"), "avatar": .string(""), "members": .int(3)]),
+                            ]),
+                            "friends_loaded": .bool(true),
+                            "groups_loaded": .bool(true),
+                        ]),
+                        "cached_group_details": .object([
+                            "500701": .object(["groupId": .string("500701"), "name": .string("Nhóm Rời"), "memIds": .array([.string("2001001"), .string("3001001")])]),
+                            "500702": .object(["groupId": .string("500702"), "name": .string("Nhóm Giữ"), "memIds": .array([.string("2001001"), .string("3001002")])]),
+                        ]),
+                        "group_member_cache": .object([
+                            "g500701": .array([
+                                .object(["id": .string("-1"), "name": .string("All"), "avatar": .null, "is_all": .bool(true)]),
+                                .object(["id": .string("3001001"), "name": .string("An"), "avatar": .null, "is_all": .bool(false)]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2001001", displayName: "Groups User"),
+                    MessageRecorderHarness.profileMeScript(uid: "2001001", displayName: "Groups User"),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/leave",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/leave",
+                        method: "POST",
+                        status: 500,
+                        json: .object(["error_code": .int(500), "error_message": .string("Leave failed")])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")])]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("g500701")])]),
+                    .object(["snapshot": .string("before_leave")]),
+                    .object([
+                        "cmd": .string("leave_group"),
+                        "args": .object(["id": .string("g500701"), "silent": .bool(true)]),
+                    ]),
+                    .object(["snapshot": .string("after_leave_ok")]),
+                    .object([
+                        "cmd": .string("leave_group"),
+                        "args": .object(["id": .string("g500702"), "silent": .bool(false)]),
+                    ]),
+                ]
+            ),
+
+            // 8. refresh_metadata
+            GroupRecorderHarness.ScenarioDef(
+                name: "refresh_metadata",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2001001",
+                    displayName: "Groups User",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "local_conversations": .array([
+                            localConv(id: "g500804", name: "Nhóm Giữ Nguyên", members: 9),
+                        ]),
+                        "contacts": .object([
+                            "groups": .array([
+                                seedGroup(id: "g500804", name: "Nhóm Giữ Nguyên", members: 9),
+                            ]),
+                            "friends_loaded": .bool(true),
+                            "groups_loaded": .bool(true),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2001001", displayName: "Groups User"),
+                    MessageRecorderHarness.profileMeScript(uid: "2001001", displayName: "Groups User"),
+                    // 1. memVerList + totalMember
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "gridInfoMap": .object([
+                                    "500801": .object([
+                                        "groupId": .string("500801"),
+                                        "name": .string("Nhóm VerList"),
+                                        "avt": .string("https://cdn.example.invalid/g801.jpg"),
+                                        "memVerList": .array([.string("3001001_10"), .string("3001002_20")]),
+                                        "totalMember": .int(5),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    // 2. memIds + total
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "gridInfoMap": .object([
+                                    "500802": .object([
+                                        "groupId": .string("500802"),
+                                        "name": .string("Nhóm MemIds"),
+                                        "fullAvt": .string("https://cdn.example.invalid/g802.jpg"),
+                                        "memIds": .array([.string("u3001003"), .string("3001004")]),
+                                        "total": .int(7),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    // 3. currentMems + count fallback from ids
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "gridInfoMap": .object([
+                                    "500803": .object([
+                                        "groupId": .string("500803"),
+                                        "name": .string("Nhóm CurrentMems"),
+                                        "currentMems": .array([
+                                            .object(["id": .string("3001005")]),
+                                            .object(["uid": .string("u3001006")]),
+                                            .object(["id": .string("3001007")]),
+                                        ]),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    // 4. Empty response -> nothing changed on g500804
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object(["gridInfoMap": .object([:])]),
+                        ])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")])]),
+                    .object(["cmd": .string("refresh_group"), "now_ms": .int(1700010081000), "args": .object(["id": .string("g500801")])]),
+                    .object(["cmd": .string("refresh_group"), "now_ms": .int(1700010082000), "args": .object(["id": .string("g500802")])]),
+                    .object(["cmd": .string("refresh_group"), "now_ms": .int(1700010083000), "args": .object(["id": .string("g500803")])]),
+                    .object(["cmd": .string("refresh_group"), "now_ms": .int(1700010084000), "args": .object(["id": .string("g500804")])]),
+                ]
+            ),
+
+            // 9. load_members
+            GroupRecorderHarness.ScenarioDef(
+                name: "load_members",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2001001",
+                    displayName: "Groups User",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "contacts": .object([
+                            "friends": .array([
+                                seedFriend(id: "3001002", name: "Bình Bạn", avatar: "https://cdn.example.invalid/f2.jpg"),
+                            ]),
+                            "friends_loaded": .bool(true),
+                            "groups_loaded": .bool(true),
+                        ]),
+                        "cached_group_details": .object([
+                            // Single non-self member per group keeps Set order in mentionCandidates deterministic
+                            "500901": .object([
+                                "groupId": .string("500901"),
+                                "name": .string("Nhóm Mention"),
+                                "memIds": .array([.string("2001001"), .string("3001001")]),
+                                "totalMember": .int(2),
+                            ]),
+                            "500903": .object([
+                                "groupId": .string("500903"),
+                                "name": .string("Nhóm Fallback Friend"),
+                                "memIds": .array([.string("2001001"), .string("3001002")]),
+                                "totalMember": .int(2),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2001001", displayName: "Groups User"),
+                    MessageRecorderHarness.profileMeScript(uid: "2001001", displayName: "Groups User"),
+                    // Mention path for g500901 (cachedGroupDetails already present)
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/social/group/members",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "profiles": .object([
+                                    "3001001": .object([
+                                        "uid": .string("3001001"),
+                                        "displayName": .string("An Pro"),
+                                        "avatar": .string("https://cdn.example.invalid/p1.jpg"),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    // Fallback path with unknown member on g500902 (no detail yet -> fetch getmg-v2 first, then fetchProfiles empty)
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "gridInfoMap": .object([
+                                    "500902": .object([
+                                        "groupId": .string("500902"),
+                                        "name": .string("Nhóm Fallback"),
+                                        "memIds": .array([.string("2001001"), .string("3001003")]),
+                                        "totalMember": .int(2),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/social/group/members",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object(["profiles": .object([:])]),
+                        ])
+                    ),
+                    // Fallback path with known friend on g500903
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/social/group/members",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object(["profiles": .object([:])]),
+                        ])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")])]),
+                    .object(["cmd": .string("load_members"), "args": .object(["id": .string("g500901")])]),
+                    .object(["snapshot": .string("after_mention_path")]),
+                    .object(["cmd": .string("load_members"), "now_ms": .int(1700010091000), "args": .object(["id": .string("g500902")])]),
+                    .object(["snapshot": .string("after_fallback_unknown")]),
+                    .object(["cmd": .string("load_members"), "args": .object(["id": .string("g500903")])]),
+                ]
+            ),
         ]
     }
 }
