@@ -75,6 +75,7 @@ final class FakeZaloServer: @unchecked Sendable {
         let path: String
         let method: String?
         let `repeat`: Bool
+        let hold: Bool
         let response: CaseJSON?
         let accept: Bool
         let cmd: UInt16
@@ -94,11 +95,13 @@ final class FakeZaloServer: @unchecked Sendable {
     enum ServerError: Error, CustomStringConvertible {
         case wsPushTimeout(String)
         case noScriptedWSAction(String)
+        case httpReleaseTimeout(String)
 
         var description: String {
             switch self {
             case .wsPushTimeout(let msg): return "FakeZaloServer.wsPushTimeout: \(msg)"
             case .noScriptedWSAction(let msg): return "FakeZaloServer.noScriptedWSAction: \(msg)"
+            case .httpReleaseTimeout(let msg): return "FakeZaloServer.httpReleaseTimeout: \(msg)"
             }
         }
     }
@@ -115,6 +118,7 @@ final class FakeZaloServer: @unchecked Sendable {
     private var activeWSConnection: NWConnection?
     private var activeWSCipherKey: Data?
     private var hadWSUpgrade = false
+    private var heldHTTPResponses: [@Sendable () -> Void] = []
     private var waiters: [() -> Void] = []
     private var refuseNewConnections = false
     private let wsAuthManual: Bool
@@ -131,6 +135,7 @@ final class FakeZaloServer: @unchecked Sendable {
             let path = item["path"]?.stringValue ?? "/"
             let method = item["method"]?.stringValue?.uppercased()
             let rep = item["repeat"]?.boolValue ?? false
+            let hold = item["hold"]?.boolValue ?? false
             let resp = item["response"]
             let accept = item["accept"]?.boolValue ?? true
             let cmd = UInt16(clamping: max(0, item["cmd"]?.int64Value ?? 0))
@@ -144,6 +149,7 @@ final class FakeZaloServer: @unchecked Sendable {
                 path: path,
                 method: method,
                 repeat: rep,
+                hold: hold,
                 response: resp,
                 accept: accept,
                 cmd: cmd,
@@ -215,6 +221,7 @@ final class FakeZaloServer: @unchecked Sendable {
         openConnections.removeAll()
         activeWSConnection = nil
         activeWSCipherKey = nil
+        heldHTTPResponses.removeAll()
         let pendingWaiters = waiters
         waiters.removeAll()
         lock.unlock()
@@ -249,6 +256,60 @@ final class FakeZaloServer: @unchecked Sendable {
                 $0["kind"]?.stringValue == "http" && $0["path"]?.stringValue == path
             }.count >= atLeast
         }
+    }
+
+    func heldHTTPCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return heldHTTPResponses.count
+    }
+
+    @discardableResult
+    func waitForHeldHTTPRequests(atLeast: Int, timeoutMs: Int = 2000) async -> Bool {
+        await waitUntil(timeoutMs: timeoutMs) {
+            heldHTTPResponses.count >= atLeast
+        }
+    }
+
+    func releaseHeldHTTPResponses(count: Int, timeoutMs: Int = 5000) async throws {
+        guard count > 0 else { return }
+        for idx in 0..<count {
+            let reached = await waitUntil(timeoutMs: timeoutMs) {
+                !heldHTTPResponses.isEmpty || stopped
+            }
+            guard reached else {
+                throw ServerError.httpReleaseTimeout("Timed out waiting for held HTTP response \(idx + 1)/\(count)")
+            }
+            let action = popNextHeldHTTPResponse()
+            action?()
+        }
+    }
+
+    private func popNextHeldHTTPResponse() -> (@Sendable () -> Void)? {
+        lock.lock()
+        defer { lock.unlock() }
+        return heldHTTPResponses.isEmpty ? nil : heldHTTPResponses.removeFirst()
+    }
+
+    private func enqueueOrRunHTTPResponse(hold: Bool, _ sendAction: @escaping @Sendable () -> Void) {
+        guard hold else {
+            sendAction()
+            return
+        }
+        lock.lock()
+        let pendingWaiters: [() -> Void]
+        if stopped {
+            pendingWaiters = waiters
+            waiters.removeAll()
+            lock.unlock()
+            for w in pendingWaiters { w() }
+            return
+        }
+        heldHTTPResponses.append(sendAction)
+        pendingWaiters = waiters
+        waiters.removeAll()
+        lock.unlock()
+        for w in pendingWaiters { w() }
     }
 
     private enum WSPushTarget {
@@ -577,23 +638,27 @@ final class FakeZaloServer: @unchecked Sendable {
         }
 
         guard let resp = entry.response else {
-            cancelListenerIfAllRemainingRefusedThen {
-                self.sendHTTP(connection: connection, status: 200, headers: [:], body: Data(#"{"error_code":0,"data":{}}"#.utf8))
+            enqueueOrRunHTTPResponse(hold: entry.hold) {
+                self.cancelListenerIfAllRemainingRefusedThen {
+                    self.sendHTTP(connection: connection, status: 200, headers: [:], body: Data(#"{"error_code":0,"data":{}}"#.utf8))
+                }
             }
             return
         }
 
         if let errKind = resp["error"]?.stringValue {
-            switch errKind {
-            case "reset":
-                connection.forceCancel()
-            case "timeout":
-                // Hold open without replying until client times out or server stops.
-                break
-            case "refused":
-                connection.forceCancel()
-            default:
-                connection.forceCancel()
+            enqueueOrRunHTTPResponse(hold: entry.hold) {
+                switch errKind {
+                case "reset":
+                    connection.forceCancel()
+                case "timeout":
+                    // Hold open without replying until client times out or server stops.
+                    break
+                case "refused":
+                    connection.forceCancel()
+                default:
+                    connection.forceCancel()
+                }
             }
             return
         }
@@ -608,8 +673,10 @@ final class FakeZaloServer: @unchecked Sendable {
         let finalHeaders = respHeaders
 
         if let rawText = resp["raw"]?.stringValue {
-            cancelListenerIfAllRemainingRefusedThen {
-                self.sendHTTP(connection: connection, status: status, headers: finalHeaders, body: Data(rawText.utf8))
+            enqueueOrRunHTTPResponse(hold: entry.hold) {
+                self.cancelListenerIfAllRemainingRefusedThen {
+                    self.sendHTTP(connection: connection, status: status, headers: finalHeaders, body: Data(rawText.utf8))
+                }
             }
             return
         }
@@ -622,19 +689,23 @@ final class FakeZaloServer: @unchecked Sendable {
                 paramCipherKey: paramCipherKey
             )
             let bodyData = Data(bodyJSON.canonicalString().utf8)
-            cancelListenerIfAllRemainingRefusedThen {
-                self.sendHTTP(
-                    connection: connection,
-                    status: status,
-                    headers: finalHeaders,
-                    body: bodyData
-                )
+            enqueueOrRunHTTPResponse(hold: entry.hold) {
+                self.cancelListenerIfAllRemainingRefusedThen {
+                    self.sendHTTP(
+                        connection: connection,
+                        status: status,
+                        headers: finalHeaders,
+                        body: bodyData
+                    )
+                }
             }
             return
         }
 
-        cancelListenerIfAllRemainingRefusedThen {
-            self.sendHTTP(connection: connection, status: status, headers: finalHeaders, body: Data())
+        enqueueOrRunHTTPResponse(hold: entry.hold) {
+            self.cancelListenerIfAllRemainingRefusedThen {
+                self.sendHTTP(connection: connection, status: status, headers: finalHeaders, body: Data())
+            }
         }
     }
 

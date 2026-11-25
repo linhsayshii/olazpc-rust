@@ -14,6 +14,22 @@ DOMAIN_CAP="${(C)DOMAIN}"
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 
+if [[ -f "$ROOT/rust/crates/olaz-core/tests/cases.rs" ]] && python3 - "$ROOT/rust/crates/olaz-core/tests/cases.rs" "$DOMAIN" <<'PY'; then
+import re, sys
+
+cases_rs, domain = sys.argv[1], sys.argv[2]
+src = open(cases_rs, encoding="utf-8").read()
+m = re.search(r'\bPENDING_DOMAINS\s*:\s*&\[\s*&str\s*\]\s*=\s*&\[(.*?)\];', src, re.S)
+if not m:
+    sys.exit(1)
+body = "\n".join(line.split("//", 1)[0] for line in m.group(1).splitlines())
+pending = set(re.findall(r'"([^"]+)"', body))
+sys.exit(0 if domain in pending else 1)
+PY
+    echo "gate FAIL: domain '$DOMAIN' is listed in PENDING_DOMAINS (rust/crates/olaz-core/tests/cases.rs); remove it before gating" >&2
+    exit 1
+fi
+
 export PATH="$HOME/.cargo/bin:$PATH"
 if [[ -z "${DEVELOPER_DIR:-}" && "$(xcode-select -p 2>/dev/null || true)" == "/Library/Developer/CommandLineTools" ]]; then
     for candidate in /Applications/Xcode.app/Contents/Developer /Applications/Xcode-beta.app/Contents/Developer; do
@@ -203,6 +219,18 @@ case "$DOMAIN" in
         ;;
     messages)
         RECORDER_FILTER="MessageRecorderTests"
+        ;;
+    message_actions)
+        RECORDER_FILTER="MessageActionRecorderTests"
+        ;;
+    contacts)
+        RECORDER_FILTER="ContactRecorderTests"
+        ;;
+    groups)
+        RECORDER_FILTER="GroupRecorderTests"
+        ;;
+    polls)
+        RECORDER_FILTER="PollRecorderTests"
         ;;
     *)
         RECORDER_FILTER="${DOMAIN_CAP}RecorderTests"
