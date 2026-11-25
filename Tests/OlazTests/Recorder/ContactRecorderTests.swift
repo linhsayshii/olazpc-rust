@@ -521,6 +521,219 @@ final class ContactRecorderTests: XCTestCase {
                     .object(["cmd": .string("lookup"), "args": .object(["uid": .string("gid_old_3000900")])]),
                 ]
             ),
+
+            // 5. request_accept
+            ContactRecorderHarness.ScenarioDef(
+                name: "request_accept",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000905",
+                    displayName: "Contacts User 5",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "contacts": .object([
+                            "received": .array([
+                                .object([
+                                    "id": .string("3000913"),
+                                    "name": .string("Rec Older"),
+                                    "avatar": .string("https://cdn.example.invalid/r1.jpg"),
+                                    "message": .string("Kết bạn nhé"),
+                                    "date_ms": .int(1700000003000),
+                                ]),
+                                .object([
+                                    "id": .string("3000914"),
+                                    "name": .string("Rec Newer"),
+                                    "message": .string("Xin chào"),
+                                    "date_ms": .int(1700000007000),
+                                ]),
+                            ]),
+                            "pending_request_count": .int(2),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000905", displayName: "Contacts User 5"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000905", displayName: "Contacts User 5"),
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/accept",
+                        method: "POST",
+                        status: 500,
+                        json: .object(["error_code": .int(500), "error_message": .string("Accept error")])
+                    ),
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/accept",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                ] + emptySyncScripts(
+                    friends: [
+                        .object([
+                            "userId": .string("3000913"),
+                            "zaloName": .string("Rec Older"),
+                            "avatar": .string("https://cdn.example.invalid/r1.jpg"),
+                        ]),
+                    ],
+                    recommItems: [
+                        .object([
+                            "dataInfo": .object([
+                                "recommType": .int(2),
+                                "userId": .string("3000914"),
+                                "zaloName": .string("Rec Newer"),
+                                "message": .string("Xin chào"),
+                                "recommTime": .int(1700000007000),
+                            ]),
+                        ]),
+                    ]
+                ),
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("accept_request"), "args": .object(["id": .string("3000913")])]),
+                    .object(["snapshot": .string("after_fail")]),
+                    .object(["cmd": .string("accept_request"), "args": .object(["id": .string("3000913")])]),
+                ]
+            ),
+
+            // 6. request_decline
+            ContactRecorderHarness.ScenarioDef(
+                name: "request_decline",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000906",
+                    displayName: "Contacts User 6",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "contacts": .object([
+                            "received": .array([
+                                .object([
+                                    "id": .string("3000913"),
+                                    "name": .string("Rec Older"),
+                                    "message": .string("Kết bạn nhé"),
+                                    "date_ms": .int(1700000003000),
+                                ]),
+                                .object([
+                                    "id": .string("3000914"),
+                                    "name": .string("Rec Newer"),
+                                    "message": .string("Xin chào"),
+                                    "date_ms": .int(1700000007000),
+                                ]),
+                            ]),
+                            "pending_request_count": .int(2),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000906", displayName: "Contacts User 6"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000906", displayName: "Contacts User 6"),
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/reject",
+                        method: "POST",
+                        status: 500,
+                        json: .object(["error_code": .int(500), "error_message": .string("Reject error")])
+                    ),
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/reject",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("decline_request"), "args": .object(["id": .string("3000913")])]),
+                    .object(["snapshot": .string("after_fail")]),
+                    .object(["cmd": .string("decline_request"), "args": .object(["id": .string("3000913")])]),
+                ]
+            ),
+
+            // 7. request_cancel
+            ContactRecorderHarness.ScenarioDef(
+                name: "request_cancel",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000907",
+                    displayName: "Contacts User 7",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "contacts": .object([
+                            "sent": .array([
+                                .object([
+                                    "id": .string("3000911"),
+                                    "name": .string("Sent One"),
+                                    "message": .string("Xin chào 1"),
+                                    "date_ms": .int(1700000005000),
+                                ]),
+                                .object([
+                                    "id": .string("3000912"),
+                                    "name": .string("Sent Two"),
+                                    "message": .string("Xin chào 2"),
+                                    "date_ms": .int(1700000006000),
+                                ]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000907", displayName: "Contacts User 7"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000907", displayName: "Contacts User 7"),
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/undo",
+                        method: "POST",
+                        status: 500,
+                        json: .object(["error_code": .int(500), "error_message": .string("Cancel error")])
+                    ),
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/undo",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("cancel_request"), "args": .object(["id": .string("3000911")])]),
+                    .object(["snapshot": .string("after_fail")]),
+                    .object(["cmd": .string("cancel_request"), "args": .object(["id": .string("3000911")])]),
+                ]
+            ),
+
+            // 8. request_send
+            ContactRecorderHarness.ScenarioDef(
+                name: "request_send",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000908",
+                    displayName: "Contacts User 8",
+                    suppress: ["ws", "long_poll"]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000908", displayName: "Contacts User 8"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000908", displayName: "Contacts User 8"),
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/sendreq",
+                        method: "POST",
+                        status: 500,
+                        json: .object(["error_code": .int(500), "error_message": .string("Send error")])
+                    ),
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/sendreq",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                ] + emptySyncScripts(
+                    sentRows: [
+                        .object([
+                            "toUid": .string("3000915"),
+                            "zaloName": .string("Requested User"),
+                            "msg": .string("Xin chào 915"),
+                            "ts": .int(1700000018000),
+                        ]),
+                    ]
+                ),
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("send_request"), "args": .object(["id": .string("3000915"), "message": .string("Xin chào 915")])]),
+                    .object(["snapshot": .string("after_fail")]),
+                    .object(["cmd": .string("send_request"), "args": .object(["id": .string("3000915"), "message": .string("Xin chào 915")])]),
+                ]
+            ),
         ]
     }
 }
