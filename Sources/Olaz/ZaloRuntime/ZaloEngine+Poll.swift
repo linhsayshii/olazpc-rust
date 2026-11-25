@@ -179,29 +179,65 @@ struct PollVoteDraft: Equatable {
         var id = UUID()
         var text = ""
         var voted = false
+        fileprivate var cachedDuplicate = false
+
+        init(id: UUID = UUID(), text: String = "", voted: Bool = false, isDuplicate: Bool = false) {
+            self.id = id
+            self.text = text
+            self.voted = voted
+            self.cachedDuplicate = isDuplicate
+        }
+
+        static func == (lhs: Added, rhs: Added) -> Bool {
+            lhs.id == rhs.id && lhs.text == rhs.text && lhs.voted == rhs.voted
+        }
     }
 
     private(set) var selected: Set<String>
     private let original: Set<String>
     private let multi: Bool
+    private var baseDetail: PollDetail
     private var selectionChanged: Bool
     private var selectionEmpty: Bool
-    var added: [Added] = []
+    private var cachedHasChanges: Bool
+    private var cachedVotesNothing: Bool
+    private var cachedHasDuplicates: Bool
+    private var cachedApplied: PollDetail
+    private var cachedAdded: [Added] = []
+    private var isMutatingFromCore = false
+
+    var added: [Added] {
+        get { cachedAdded }
+        set {
+            cachedAdded = newValue
+            if !isMutatingFromCore {
+                recomputeInCore()
+            }
+        }
+    }
 
     init(_ detail: PollDetail) {
         let rec = pollVoteDraftNew(detail: detail.coreRecord)
+        baseDetail = detail
         selected = Set(rec.selected)
         original = Set(rec.original)
         multi = rec.multi
         selectionChanged = rec.selectionChanged
         selectionEmpty = rec.selectionEmpty
+        cachedHasChanges = rec.hasChanges
+        cachedVotesNothing = rec.votesNothing
+        cachedHasDuplicates = rec.hasDuplicates
+        cachedApplied = rec.applied.map(PollDetail.init(coreRecord:)) ?? detail
+        cachedAdded = rec.added.map { row in
+            Added(id: UUID(uuidString: row.id) ?? UUID(), text: row.text, voted: row.voted, isDuplicate: row.isDuplicate)
+        }
     }
 
     static func == (lhs: PollVoteDraft, rhs: PollVoteDraft) -> Bool {
         lhs.selected == rhs.selected
             && lhs.original == rhs.original
             && lhs.multi == rhs.multi
-            && lhs.added == rhs.added
+            && lhs.cachedAdded == rhs.cachedAdded
     }
 
     var coreRecord: PollVoteDraftRecord {
@@ -209,49 +245,78 @@ struct PollVoteDraft: Equatable {
             selected: selected.sorted(),
             original: original.sorted(),
             multi: multi,
-            added: added.map { AddedPollOptionRecord(id: $0.id.uuidString, text: $0.text, voted: $0.voted) },
+            added: cachedAdded.map {
+                AddedPollOptionRecord(
+                    id: $0.id.uuidString,
+                    text: $0.text,
+                    voted: $0.voted,
+                    isDuplicate: $0.cachedDuplicate
+                )
+            },
             selectionChanged: selectionChanged,
-            selectionEmpty: selectionEmpty
+            selectionEmpty: selectionEmpty,
+            hasChanges: cachedHasChanges,
+            votesNothing: cachedVotesNothing,
+            hasDuplicates: cachedHasDuplicates,
+            applied: cachedApplied.coreRecord
         )
     }
 
     private mutating func applyCoreRecord(_ rec: PollVoteDraftRecord) {
+        isMutatingFromCore = true
+        defer { isMutatingFromCore = false }
         selected = Set(rec.selected)
         selectionChanged = rec.selectionChanged
         selectionEmpty = rec.selectionEmpty
-        added = rec.added.map { row in
-            Added(id: UUID(uuidString: row.id) ?? UUID(), text: row.text, voted: row.voted)
+        cachedHasChanges = rec.hasChanges
+        cachedVotesNothing = rec.votesNothing
+        cachedHasDuplicates = rec.hasDuplicates
+        if let app = rec.applied {
+            cachedApplied = PollDetail(coreRecord: app)
+        }
+        cachedAdded = rec.added.map { row in
+            Added(id: UUID(uuidString: row.id) ?? UUID(), text: row.text, voted: row.voted, isDuplicate: row.isDuplicate)
         }
     }
 
+    private mutating func recomputeInCore() {
+        applyCoreRecord(pollVoteDraftRecompute(draft: coreRecord, detail: baseDetail.coreRecord))
+    }
+
     mutating func toggle(_ optionId: String) {
-        applyCoreRecord(pollVoteDraftToggle(draft: coreRecord, optionId: optionId))
+        applyCoreRecord(pollVoteDraftToggle(draft: coreRecord, optionId: optionId, detail: baseDetail.coreRecord))
     }
 
     mutating func setAddedVoted(_ id: UUID, _ voted: Bool) {
-        applyCoreRecord(pollVoteDraftSetAddedVoted(draft: coreRecord, id: id.uuidString, voted: voted))
+        applyCoreRecord(pollVoteDraftSetAddedVoted(draft: coreRecord, id: id.uuidString, voted: voted, detail: baseDetail.coreRecord))
     }
 
-    mutating func addRow() { added.append(Added()) }
-    mutating func removeAdded(_ id: UUID) { added.removeAll { $0.id == id } }
+    mutating func addRow() {
+        cachedAdded.append(Added())
+        recomputeInCore()
+    }
+
+    mutating func removeAdded(_ id: UUID) {
+        cachedAdded.removeAll { $0.id == id }
+        recomputeInCore()
+    }
 
     /// Anything to send: a changed tick or a new option (official confirm button state).
-    var hasChanges: Bool {
-        added.isEmpty ? selectionChanged : pollVoteDraftHasChanges(draft: coreRecord)
-    }
+    var hasChanges: Bool { cachedHasChanges }
 
     /// Nothing is ticked (existing or added): the official "hide results" confirmation is skipped for this.
-    var votesNothing: Bool {
-        added.isEmpty ? selectionEmpty : pollVoteDraftVotesNothing(draft: coreRecord)
-    }
+    var votesNothing: Bool { cachedVotesNothing }
 
     /// Same trimmed text used twice among the existing and the added options.
     func hasDuplicates(in detail: PollDetail) -> Bool {
-        added.isEmpty ? detail.hasDuplicateOptions : pollVoteDraftHasDuplicates(draft: coreRecord, detail: detail.coreRecord)
+        detail == baseDetail ? cachedHasDuplicates : pollVoteDraftHasDuplicates(draft: coreRecord, detail: detail.coreRecord)
     }
 
     func isDuplicate(_ id: UUID, in detail: PollDetail) -> Bool {
-        pollVoteDraftIsDuplicate(draft: coreRecord, id: id.uuidString, detail: detail.coreRecord)
+        if detail == baseDetail {
+            return cachedAdded.first { $0.id == id }?.cachedDuplicate ?? false
+        }
+        return pollVoteDraftIsDuplicate(draft: coreRecord, id: id.uuidString, detail: detail.coreRecord)
     }
 
     /// Arguments of the vote / add-option request (option ids in the poll's own order).
@@ -263,7 +328,7 @@ struct PollVoteDraft: Equatable {
 
     /// The poll as it would look after this vote (live preview of the bars, like the official popup).
     func applied(to detail: PollDetail) -> PollDetail {
-        PollDetail(coreRecord: pollVoteDraftApplied(draft: coreRecord, detail: detail.coreRecord))
+        detail == baseDetail ? cachedApplied : PollDetail(coreRecord: pollVoteDraftApplied(draft: coreRecord, detail: detail.coreRecord))
     }
 
     var canSubmit: Bool { hasChanges }

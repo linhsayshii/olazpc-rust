@@ -11059,13 +11059,15 @@ public struct AddedPollOptionRecord: Equatable, Hashable {
     public var id: String
     public var text: String
     public var voted: Bool
+    public var isDuplicate: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: String, text: String, voted: Bool) {
+    public init(id: String, text: String, voted: Bool, isDuplicate: Bool = false) {
         self.id = id
         self.text = text
         self.voted = voted
+        self.isDuplicate = isDuplicate
     }
 
     
@@ -11086,7 +11088,8 @@ public struct FfiConverterTypeAddedPollOptionRecord: FfiConverterRustBuffer {
             try AddedPollOptionRecord(
                 id: FfiConverterString.read(from: &buf), 
                 text: FfiConverterString.read(from: &buf), 
-                voted: FfiConverterBool.read(from: &buf)
+                voted: FfiConverterBool.read(from: &buf), 
+                isDuplicate: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -11094,6 +11097,7 @@ public struct FfiConverterTypeAddedPollOptionRecord: FfiConverterRustBuffer {
         FfiConverterString.write(value.id, into: &buf)
         FfiConverterString.write(value.text, into: &buf)
         FfiConverterBool.write(value.voted, into: &buf)
+        FfiConverterBool.write(value.isDuplicate, into: &buf)
     }
 }
 
@@ -17010,8 +17014,8 @@ public func FfiConverterTypePollStateRecord_lower(_ value: PollStateRecord) -> R
 
 
 /**
- * Vote form state (`PollVoteDraft`), with precomputed selection flags so untouched / tick-only
- * drafts do not cross FFI per render getter.
+ * Vote form state (`PollVoteDraft`), with derived render fields (`has_changes`, `votes_nothing`,
+ * `has_duplicates`, per-row `is_duplicate`, and `applied`) computed once per draft mutation in core.
  */
 public struct PollVoteDraftRecord: Equatable, Hashable {
     public var selected: [String]
@@ -17020,16 +17024,24 @@ public struct PollVoteDraftRecord: Equatable, Hashable {
     public var added: [AddedPollOptionRecord]
     public var selectionChanged: Bool
     public var selectionEmpty: Bool
+    public var hasChanges: Bool
+    public var votesNothing: Bool
+    public var hasDuplicates: Bool
+    public var applied: PollDetailRecord?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(selected: [String], original: [String], multi: Bool, added: [AddedPollOptionRecord], selectionChanged: Bool = false, selectionEmpty: Bool = true) {
+    public init(selected: [String], original: [String], multi: Bool, added: [AddedPollOptionRecord], selectionChanged: Bool = false, selectionEmpty: Bool = true, hasChanges: Bool = false, votesNothing: Bool = true, hasDuplicates: Bool = false, applied: PollDetailRecord? = nil) {
         self.selected = selected
         self.original = original
         self.multi = multi
         self.added = added
         self.selectionChanged = selectionChanged
         self.selectionEmpty = selectionEmpty
+        self.hasChanges = hasChanges
+        self.votesNothing = votesNothing
+        self.hasDuplicates = hasDuplicates
+        self.applied = applied
     }
 
     
@@ -17053,7 +17065,11 @@ public struct FfiConverterTypePollVoteDraftRecord: FfiConverterRustBuffer {
                 multi: FfiConverterBool.read(from: &buf), 
                 added: FfiConverterSequenceTypeAddedPollOptionRecord.read(from: &buf), 
                 selectionChanged: FfiConverterBool.read(from: &buf), 
-                selectionEmpty: FfiConverterBool.read(from: &buf)
+                selectionEmpty: FfiConverterBool.read(from: &buf), 
+                hasChanges: FfiConverterBool.read(from: &buf), 
+                votesNothing: FfiConverterBool.read(from: &buf), 
+                hasDuplicates: FfiConverterBool.read(from: &buf), 
+                applied: FfiConverterOptionTypePollDetailRecord.read(from: &buf)
         )
     }
 
@@ -17064,6 +17080,10 @@ public struct FfiConverterTypePollVoteDraftRecord: FfiConverterRustBuffer {
         FfiConverterSequenceTypeAddedPollOptionRecord.write(value.added, into: &buf)
         FfiConverterBool.write(value.selectionChanged, into: &buf)
         FfiConverterBool.write(value.selectionEmpty, into: &buf)
+        FfiConverterBool.write(value.hasChanges, into: &buf)
+        FfiConverterBool.write(value.votesNothing, into: &buf)
+        FfiConverterBool.write(value.hasDuplicates, into: &buf)
+        FfiConverterOptionTypePollDetailRecord.write(value.applied, into: &buf)
     }
 }
 
@@ -25837,6 +25857,15 @@ public func pollVoteDraftNew(detail: PollDetailRecord) -> PollVoteDraftRecord  {
     )
 })
 }
+public func pollVoteDraftRecompute(draft: PollVoteDraftRecord, detail: PollDetailRecord?) -> PollVoteDraftRecord  {
+    return try!  FfiConverterTypePollVoteDraftRecord_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_vote_draft_recompute(
+        FfiConverterTypePollVoteDraftRecord_lower(draft),
+        FfiConverterOptionTypePollDetailRecord.lower(detail),uniffiCallStatus
+    )
+})
+}
 public func pollVoteDraftRequest(draft: PollVoteDraftRecord, detail: PollDetailRecord) -> PollVoteRequestRecord  {
     return try!  FfiConverterTypePollVoteRequestRecord_lift(try! rustCall() {
         uniffiCallStatus in
@@ -25846,22 +25875,24 @@ public func pollVoteDraftRequest(draft: PollVoteDraftRecord, detail: PollDetailR
     )
 })
 }
-public func pollVoteDraftSetAddedVoted(draft: PollVoteDraftRecord, id: String, voted: Bool) -> PollVoteDraftRecord  {
+public func pollVoteDraftSetAddedVoted(draft: PollVoteDraftRecord, id: String, voted: Bool, detail: PollDetailRecord?) -> PollVoteDraftRecord  {
     return try!  FfiConverterTypePollVoteDraftRecord_lift(try! rustCall() {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_func_poll_vote_draft_set_added_voted(
         FfiConverterTypePollVoteDraftRecord_lower(draft),
         FfiConverterString.lower(id),
-        FfiConverterBool.lower(voted),uniffiCallStatus
+        FfiConverterBool.lower(voted),
+        FfiConverterOptionTypePollDetailRecord.lower(detail),uniffiCallStatus
     )
 })
 }
-public func pollVoteDraftToggle(draft: PollVoteDraftRecord, optionId: String) -> PollVoteDraftRecord  {
+public func pollVoteDraftToggle(draft: PollVoteDraftRecord, optionId: String, detail: PollDetailRecord?) -> PollVoteDraftRecord  {
     return try!  FfiConverterTypePollVoteDraftRecord_lift(try! rustCall() {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_func_poll_vote_draft_toggle(
         FfiConverterTypePollVoteDraftRecord_lower(draft),
-        FfiConverterString.lower(optionId),uniffiCallStatus
+        FfiConverterString.lower(optionId),
+        FfiConverterOptionTypePollDetailRecord.lower(detail),uniffiCallStatus
     )
 })
 }
@@ -26128,13 +26159,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_func_poll_vote_draft_new() != 39944) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_func_poll_vote_draft_recompute() != 63378) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_func_poll_vote_draft_request() != 47233) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_func_poll_vote_draft_set_added_voted() != 15851) {
+    if (uniffi_olaz_ffi_checksum_func_poll_vote_draft_set_added_voted() != 49077) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_func_poll_vote_draft_toggle() != 48336) {
+    if (uniffi_olaz_ffi_checksum_func_poll_vote_draft_toggle() != 38970) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_func_poll_vote_draft_votes_nothing() != 39763) {

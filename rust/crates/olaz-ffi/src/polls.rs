@@ -620,12 +620,15 @@ pub struct AddedPollOptionRecord {
     pub id: String,
     pub text: String,
     pub voted: bool,
+    #[uniffi(default = false)]
+    pub is_duplicate: bool,
 }
 
 impl fmt::Debug for AddedPollOptionRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AddedPollOptionRecord")
             .field("voted", &self.voted)
+            .field("is_duplicate", &self.is_duplicate)
             .finish()
     }
 }
@@ -636,6 +639,7 @@ impl From<AddedPollOption> for AddedPollOptionRecord {
             id: a.id,
             text: a.text,
             voted: a.voted,
+            is_duplicate: false,
         }
     }
 }
@@ -650,9 +654,9 @@ impl From<AddedPollOptionRecord> for AddedPollOption {
     }
 }
 
-/// Vote form state (`PollVoteDraft`), with precomputed selection flags so untouched / tick-only
-/// drafts do not cross FFI per render getter.
-#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+/// Vote form state (`PollVoteDraft`), with derived render fields (`has_changes`, `votes_nothing`,
+/// `has_duplicates`, per-row `is_duplicate`, and `applied`) computed once per draft mutation in core.
+#[derive(Clone, PartialEq, uniffi::Record)]
 pub struct PollVoteDraftRecord {
     pub selected: Vec<String>,
     pub original: Vec<String>,
@@ -662,6 +666,14 @@ pub struct PollVoteDraftRecord {
     pub selection_changed: bool,
     #[uniffi(default = true)]
     pub selection_empty: bool,
+    #[uniffi(default = false)]
+    pub has_changes: bool,
+    #[uniffi(default = true)]
+    pub votes_nothing: bool,
+    #[uniffi(default = false)]
+    pub has_duplicates: bool,
+    #[uniffi(default = None)]
+    pub applied: Option<PollDetailRecord>,
 }
 
 impl fmt::Debug for PollVoteDraftRecord {
@@ -670,18 +682,69 @@ impl fmt::Debug for PollVoteDraftRecord {
             .field("selected", &self.selected.len())
             .field("added", &self.added.len())
             .field("multi", &self.multi)
+            .field("has_changes", &self.has_changes)
+            .field("votes_nothing", &self.votes_nothing)
+            .field("has_duplicates", &self.has_duplicates)
             .finish()
     }
 }
 
-impl From<PollVoteDraft> for PollVoteDraftRecord {
-    fn from(d: PollVoteDraft) -> Self {
+impl PollVoteDraftRecord {
+    #[must_use]
+    pub fn from_draft_and_detail(d: PollVoteDraft, detail: Option<&PollDetail>) -> Self {
         let selection_changed = d.selected() != d.original();
         let selection_empty = d.selected().is_empty();
+        let has_changes = d.has_changes();
+        let votes_nothing = d.votes_nothing();
+        let (has_duplicates, applied, added) = if let Some(det) = detail {
+            let has_dups = d.has_duplicates(det);
+            let app: PollDetailRecord = d.applied(det).into();
+            let rows = d
+                .added
+                .iter()
+                .map(|a| AddedPollOptionRecord {
+                    id: a.id.clone(),
+                    text: a.text.clone(),
+                    voted: a.voted,
+                    is_duplicate: d.is_duplicate(&a.id, det),
+                })
+                .collect();
+            (has_dups, Some(app), rows)
+        } else {
+            let empty_det = PollDetail {
+                id: String::new(),
+                group_id: String::new(),
+                question: String::new(),
+                creator: String::new(),
+                creator_name: String::new(),
+                created_ms: None,
+                expires_ms: None,
+                closed: false,
+                joined: false,
+                multi: d.multi(),
+                allow_add: true,
+                anonymous: false,
+                hide_preview: false,
+                voter_count: 0,
+                can_close: false,
+                options: Vec::new(),
+            };
+            let has_dups = d.has_duplicates(&empty_det);
+            let rows = d
+                .added
+                .iter()
+                .map(|a| AddedPollOptionRecord {
+                    id: a.id.clone(),
+                    text: a.text.clone(),
+                    voted: a.voted,
+                    is_duplicate: d.is_duplicate(&a.id, &empty_det),
+                })
+                .collect();
+            (has_dups, None, rows)
+        };
         let selected = d.selected().iter().cloned().collect();
         let original = d.original().iter().cloned().collect();
         let multi = d.multi();
-        let added = d.added.into_iter().map(Into::into).collect();
         Self {
             selected,
             original,
@@ -689,7 +752,17 @@ impl From<PollVoteDraft> for PollVoteDraftRecord {
             added,
             selection_changed,
             selection_empty,
+            has_changes,
+            votes_nothing,
+            has_duplicates,
+            applied,
         }
+    }
+}
+
+impl From<PollVoteDraft> for PollVoteDraftRecord {
+    fn from(d: PollVoteDraft) -> Self {
+        Self::from_draft_and_detail(d, None)
     }
 }
 
@@ -1188,7 +1261,19 @@ pub fn poll_action_result_message(
 #[must_use]
 pub fn poll_vote_draft_new(detail: PollDetailRecord) -> PollVoteDraftRecord {
     let d: PollDetail = detail.into();
-    PollVoteDraft::new(&d).into()
+    let draft = PollVoteDraft::new(&d);
+    PollVoteDraftRecord::from_draft_and_detail(draft, Some(&d))
+}
+
+#[uniffi::export]
+#[must_use]
+pub fn poll_vote_draft_recompute(
+    draft: PollVoteDraftRecord,
+    detail: Option<PollDetailRecord>,
+) -> PollVoteDraftRecord {
+    let d: PollVoteDraft = draft.into();
+    let det: Option<PollDetail> = detail.map(Into::into);
+    PollVoteDraftRecord::from_draft_and_detail(d, det.as_ref())
 }
 
 #[uniffi::export]
@@ -1196,10 +1281,12 @@ pub fn poll_vote_draft_new(detail: PollDetailRecord) -> PollVoteDraftRecord {
 pub fn poll_vote_draft_toggle(
     draft: PollVoteDraftRecord,
     option_id: String,
+    detail: Option<PollDetailRecord>,
 ) -> PollVoteDraftRecord {
     let mut d: PollVoteDraft = draft.into();
     d.toggle(&option_id);
-    d.into()
+    let det: Option<PollDetail> = detail.map(Into::into);
+    PollVoteDraftRecord::from_draft_and_detail(d, det.as_ref())
 }
 
 #[uniffi::export]
@@ -1208,10 +1295,12 @@ pub fn poll_vote_draft_set_added_voted(
     draft: PollVoteDraftRecord,
     id: String,
     voted: bool,
+    detail: Option<PollDetailRecord>,
 ) -> PollVoteDraftRecord {
     let mut d: PollVoteDraft = draft.into();
     d.set_added_voted(&id, voted);
-    d.into()
+    let det: Option<PollDetail> = detail.map(Into::into);
+    PollVoteDraftRecord::from_draft_and_detail(d, det.as_ref())
 }
 
 #[uniffi::export]
