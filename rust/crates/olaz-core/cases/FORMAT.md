@@ -347,3 +347,23 @@ Keys marked `"<volatile>"` by the recorder:
 ## Comparing
 
 Values compare as canonical JSON: keys sorted, integers kept exact (64-bit ids stay integers or strings exactly as the source wrote them, see ADR-009), no float tolerance. Output per domain: `N/M cases match`, then each mismatch as `name: path: expected X, got Y`.
+
+## Known diffs
+
+`rust/crates/olaz-core/cases/known-diffs.jsonl` records user-approved, intentional divergences from the committed `cases/<domain>.jsonl` recordings (for example, fixing a verified bug in the pre-port Swift recording without rewriting the historical `cases/*.jsonl` file).
+
+Each non-empty line is a JSON object with five fields:
+
+```json
+{"domain": "conversations", "name": "recall_preview_via_batch", "path": "final.conversations[0].preview.text", "actual": "Tin nhắn đã được thu hồi", "reason": "..."}
+```
+
+- `domain`, `name`: identify the case in `cases/<domain>.jsonl`.
+- `path`: leaf path under `expect` using dot-separated object keys and `[index]` array subscripts (e.g. `final.conversations[0].preview.text`, `snapshots.after_delete_1_1.store.prefs.pinned_ids[0]`).
+- `actual`: the port's exact canonical JSON value at `path`, copied from the runner's mismatch output (never hand-written). When a key or array element present in the recording is absent from the port's output, `actual` is the sentinel string `"<missing>"`.
+- `reason`: short explanation referencing the user approval.
+
+Both the Rust replay runner (`tests/cases.rs`) and the Swift recorder freshness tests (`CaseFile.compareCase` / `CaseFile.staleKnownDiffs`) enforce the same two rules:
+
+1. **Exact-`actual` match only**: a mismatch at `(domain, name, path)` is accepted if and only if a `known-diffs.jsonl` entry exists for `(domain, name, path)` whose canonical `actual` equals the observed value exactly. Any other difference fails the run.
+2. **Stale entries fail the gate**: every entry in `known-diffs.jsonl` belonging to an executed case in the tested domain must match an actual divergence. If the recording no longer differs at that path (or the case name does not exist), the runner fails so stale entries cannot linger.

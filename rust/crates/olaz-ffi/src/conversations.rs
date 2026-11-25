@@ -7,11 +7,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use olaz_core::conversations::{
-    BatchApplyDelta, CachedGroup, CachedProfile, ConvMessageDelta, ConversationActionResult,
-    ConversationActionUI, ConversationActionsState, ConversationExtras, ConversationLabel,
-    ConversationLeaveType, ConversationPreview, ConversationPrompt, ConversationRemoval,
-    ConversationSummary, ConversationToast, FriendIdentity, GroupIdentity, IdentityTable,
-    MessagePreviewInput, PinBoard, StrangerBox,
+    BatchApplyDelta, CachedGroup, CachedProfile, ConvMessageDelta, ConvPreviewOverride,
+    ConversationActionResult, ConversationActionUI, ConversationActionsState, ConversationExtras,
+    ConversationLabel, ConversationLeaveType, ConversationPreview, ConversationPrompt,
+    ConversationRemoval, ConversationSummary, ConversationToast, FriendIdentity, GroupIdentity,
+    IdentityTable, MessagePreviewInput, PinBoard, StrangerBox,
 };
 use olaz_core::input::SeenTarget;
 use olaz_wire::Mention;
@@ -742,10 +742,37 @@ impl From<ConvMessageDeltaRecord> for ConvMessageDelta {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ConvPreviewOverrideRecord {
+    pub conv_id: String,
+    pub target_date_ms: i64,
+    pub preview: Option<ConversationPreviewRecord>,
+}
+
+impl fmt::Debug for ConvPreviewOverrideRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConvPreviewOverrideRecord")
+            .field("target_date_ms", &self.target_date_ms)
+            .field("has_preview", &self.preview.is_some())
+            .finish()
+    }
+}
+
+impl From<ConvPreviewOverrideRecord> for ConvPreviewOverride {
+    fn from(o: ConvPreviewOverrideRecord) -> Self {
+        Self {
+            conv_id: o.conv_id,
+            target_date_ms: o.target_date_ms,
+            preview: o.preview.map(Into::into),
+        }
+    }
+}
+
 #[derive(Clone, Default, PartialEq, Eq, uniffi::Record)]
 pub struct BatchApplyDeltaRecord {
     pub applied_count: u32,
     pub updates: Vec<ConvMessageDeltaRecord>,
+    pub preview_overrides: Vec<ConvPreviewOverrideRecord>,
     pub persist_conversations: bool,
 }
 
@@ -754,6 +781,7 @@ impl fmt::Debug for BatchApplyDeltaRecord {
         f.debug_struct("BatchApplyDeltaRecord")
             .field("applied_count", &self.applied_count)
             .field("updates", &self.updates.len())
+            .field("preview_overrides", &self.preview_overrides.len())
             .field("persist_conversations", &self.persist_conversations)
             .finish()
     }
@@ -764,6 +792,7 @@ impl From<BatchApplyDeltaRecord> for BatchApplyDelta {
         Self {
             applied_count: d.applied_count,
             updates: d.updates.into_iter().map(Into::into).collect(),
+            preview_overrides: d.preview_overrides.into_iter().map(Into::into).collect(),
             persist_conversations: d.persist_conversations,
         }
     }

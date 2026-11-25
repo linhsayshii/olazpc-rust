@@ -909,7 +909,7 @@ final class ZaloEngine {
     ) async -> BatchApplyDeltaRecord {
         let myUid = profile?.userId ?? ""
         guard !events.isEmpty else {
-            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], persistConversations: false)
+            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], previewOverrides: [], persistConversations: false)
         }
 
         var storedBatch: [StoredMessage] = []
@@ -978,13 +978,28 @@ final class ZaloEngine {
                 )
             }
         }
+        var previewOverrides: [ConvPreviewOverrideRecord] = []
         for ev in events {
             switch ev {
             case .undo(let convId, let msgId, let cliMsgId):
-                await applyRemoteRecall(convId: convId, msgId: msgId, cliMsgId: cliMsgId, updateConversationPreview: false)
+                if let ov = await applyRemoteRecall(
+                    convId: convId,
+                    msgId: msgId,
+                    cliMsgId: cliMsgId,
+                    updateConversationPreview: false
+                ) {
+                    previewOverrides.append(ov)
+                }
 
             case .delete(let convId, let msgId, let cliMsgId):
-                await applyRemoteDelete(convId: convId, msgId: msgId, cliMsgId: cliMsgId)
+                if let ov = await applyRemoteDelete(
+                    convId: convId,
+                    msgId: msgId,
+                    cliMsgId: cliMsgId,
+                    updateConversationPreview: false
+                ) {
+                    previewOverrides.append(ov)
+                }
 
             case .typing(let convId, let senderId, _):
                 if senderId != myUid {
@@ -1086,6 +1101,7 @@ final class ZaloEngine {
         return BatchApplyDeltaRecord(
             appliedCount: UInt32(events.count),
             updates: updates,
+            previewOverrides: previewOverrides,
             persistConversations: persistConversations
         )
     }
@@ -1850,26 +1866,34 @@ final class ZaloEngine {
         }
     }
 
-    internal func applyRemoteRecall(convId: String, msgId: String, cliMsgId: String, updateConversationPreview: Bool = true) async {
+    @discardableResult
+    internal func applyRemoteRecall(
+        convId: String,
+        msgId: String,
+        cliMsgId: String,
+        updateConversationPreview: Bool = true
+    ) async -> ConvPreviewOverrideRecord? {
         guard traceU4Host("apply_remote_recall", args: [
             "conv_id": convId,
             "msg_id": msgId,
             "cli_msg_id": cliMsgId,
         ]) else {
-            return
+            return nil
         }
         let targetId = !msgId.isEmpty ? msgId : cliMsgId
-        guard !targetId.isEmpty else { return }
+        guard !convId.isEmpty, !targetId.isEmpty else { return nil }
 
-        var updatedPreview = false
+        var foundInMemory = false
+        var recalledLast: (targetDateMs: Int64, fromMe: Bool)?
         if var list = messages[convId],
            let idx = list.firstIndex(where: {
                (!msgId.isEmpty && ($0.id == msgId || $0.clientId == msgId))
                    || (!cliMsgId.isEmpty && ($0.clientId == cliMsgId || $0.id == cliMsgId))
            }) {
+            foundInMemory = true
             let recalledId = list[idx].id
             let wasLast = (idx == list.count - 1)
-            let msgDate = list[idx].date
+            let msgDateMs = Int64((list[idx].date.timeIntervalSince1970 * 1000).rounded())
             let msgFromMe = list[idx].isMine
 
             list[idx].kind = .recalled
@@ -1888,60 +1912,150 @@ final class ZaloEngine {
                 try? await sqliteStore?.setPreferenceStrings(key: "starredIds", value: Array(cachedStarredIds))
             }
 
-            if updateConversationPreview, wasLast, let convIdx = conversations.firstIndex(where: { $0.id == convId }) {
-                var conv = conversations[convIdx]
-                if (conv.preview?.date ?? .distantPast) <= msgDate.addingTimeInterval(1) {
-                    conv.preview = ConversationSummary.Preview(
-                        text: "Tin nhắn đã được thu hồi",
-                        date: conv.preview?.date ?? msgDate,
-                        fromMe: conv.preview?.fromMe ?? msgFromMe
-                    )
-                    conversations[convIdx] = conv
-                    updatedPreview = true
-                }
+            if wasLast {
+                recalledLast = (msgDateMs, msgFromMe)
             }
         }
 
         try? await sqliteStore?.markRecalled(convId: convId, id: targetId, cliMsgId: cliMsgId)
 
-        if updateConversationPreview, !updatedPreview,
-           let convIdx = conversations.firstIndex(where: { $0.id == convId }),
-           let latest = try? await sqliteStore?.messages(convId: convId, limit: 1).first,
-           latest.kindTag == "recalled" {
-            let latestDate = Date(timeIntervalSince1970: Double(latest.tsMs) / 1000)
-            var conv = conversations[convIdx]
-            if conv.preview?.text != "Tin nhắn đã được thu hồi",
-               (conv.preview?.date ?? .distantPast) <= latestDate.addingTimeInterval(1) {
-                conv.preview = ConversationSummary.Preview(
-                    text: "Tin nhắn đã được thu hồi",
-                    date: conv.preview?.date ?? latestDate,
-                    fromMe: conv.preview?.fromMe ?? latest.isMine
-                )
-                conversations[convIdx] = conv
-                updatedPreview = true
-            }
+        if !foundInMemory,
+           let latest = try? await sqliteStore?.messages(convId: convId, limit: 1).last,
+           latest.kindTag == "recalled",
+           (latest.id == targetId
+               || latest.clientId == targetId
+               || (!cliMsgId.isEmpty && (latest.id == cliMsgId || latest.clientId == cliMsgId))) {
+            recalledLast = (latest.tsMs, latest.isMine)
         }
 
-        if updatedPreview {
-            await persistConversationsToSQLite()
+        let override: ConvPreviewOverrideRecord? = recalledLast.map { targetMs, fromMe in
+            ConvPreviewOverrideRecord(
+                convId: convId,
+                targetDateMs: targetMs,
+                preview: ConversationPreviewRecord(
+                    text: "Tin nhắn đã được thu hồi",
+                    dateMs: targetMs,
+                    fromMe: fromMe
+                )
+            )
         }
+        if updateConversationPreview, let override {
+            await commitBatchDeltaToCore(BatchApplyDeltaRecord(
+                appliedCount: 0,
+                updates: [],
+                previewOverrides: [override],
+                persistConversations: true
+            ))
+        }
+        return override
     }
 
-    internal func applyRemoteDelete(convId: String, msgId: String, cliMsgId: String) async {
+    @discardableResult
+    internal func applyRemoteDelete(
+        convId: String,
+        msgId: String,
+        cliMsgId: String,
+        updateConversationPreview: Bool = true
+    ) async -> ConvPreviewOverrideRecord? {
         guard traceU4Host("apply_remote_delete", args: [
             "conv_id": convId,
             "msg_id": msgId,
             "cli_msg_id": cliMsgId,
         ]) else {
-            return
+            return nil
         }
         let targetId = !msgId.isEmpty ? msgId : cliMsgId
-        guard !targetId.isEmpty else { return }
+        guard !convId.isEmpty, !targetId.isEmpty else { return nil }
+
+        var deletedTsMs: Int64?
+        var memLatest: ConversationPreviewRecord?
         if var list = messages[convId] {
-            list.removeAll { $0.id == targetId || $0.id == cliMsgId }
+            for m in list where
+                m.id == targetId
+                || m.clientId == targetId
+                || (!cliMsgId.isEmpty && (m.id == cliMsgId || m.clientId == cliMsgId)) {
+                let ts = Int64((m.date.timeIntervalSince1970 * 1000).rounded())
+                deletedTsMs = deletedTsMs.map { max($0, ts) } ?? ts
+            }
+            list.removeAll {
+                $0.id == targetId
+                    || $0.clientId == targetId
+                    || (!cliMsgId.isEmpty && ($0.id == cliMsgId || $0.clientId == cliMsgId))
+            }
             messages[convId] = list
+            if let last = list.last {
+                memLatest = ConversationPreviewRecord(
+                    text: Self.messagePreviewLabel(last),
+                    dateMs: Int64((last.date.timeIntervalSince1970 * 1000).rounded()),
+                    fromMe: last.isMine
+                )
+            }
         }
+
+        if deletedTsMs == nil {
+            if let existing = try? await sqliteStore?.message(convId: convId, idOrClientId: targetId) {
+                deletedTsMs = existing.tsMs
+            } else if !cliMsgId.isEmpty,
+                      let existing = try? await sqliteStore?.message(convId: convId, idOrClientId: cliMsgId) {
+                deletedTsMs = existing.tsMs
+            }
+        }
+
+
         try? await sqliteStore?.deleteMessage(convId: convId, id: targetId)
+        if !cliMsgId.isEmpty, cliMsgId != targetId {
+            try? await sqliteStore?.deleteMessage(convId: convId, id: cliMsgId)
+        }
+
+        var storeLatest: ConversationPreviewRecord?
+        if let row = try? await sqliteStore?.messages(convId: convId, limit: 1).last {
+            if let decoded = ZaloWireParser.decodeStoredMessage(row) {
+                storeLatest = ConversationPreviewRecord(
+                    text: Self.messagePreviewLabel(decoded),
+                    dateMs: Int64((decoded.date.timeIntervalSince1970 * 1000).rounded()),
+                    fromMe: decoded.isMine
+                )
+            } else {
+                let text = row.kindTag == "recalled" ? "Tin nhắn đã được thu hồi" : row.text
+                storeLatest = ConversationPreviewRecord(
+                    text: text,
+                    dateMs: row.tsMs,
+                    fromMe: row.isMine
+                )
+            }
+        }
+
+        guard let targetMs = deletedTsMs else { return nil }
+        let bestRemaining: ConversationPreviewRecord? = {
+            switch (memLatest, storeLatest) {
+            case let (a?, b?):
+                return (a.dateMs ?? 0) >= (b.dateMs ?? 0) ? a : b
+            case let (a?, nil):
+                return a
+            case let (nil, b?):
+                return b
+            case (nil, nil):
+                return nil
+            }
+        }()
+        if let remDate = bestRemaining?.dateMs, remDate > targetMs {
+            return nil
+        }
+
+        let override = ConvPreviewOverrideRecord(
+            convId: convId,
+            targetDateMs: targetMs,
+            preview: bestRemaining
+        )
+        if updateConversationPreview {
+            await commitBatchDeltaToCore(BatchApplyDeltaRecord(
+                appliedCount: 0,
+                updates: [],
+                previewOverrides: [override],
+                persistConversations: true
+            ))
+        }
+        return override
     }
 
     nonisolated static func listOrder(_ conversations: [ConversationSummary]) -> [ConversationSummary] {

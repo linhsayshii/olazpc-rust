@@ -26,6 +26,12 @@ pub enum StoreOp {
         id: String,
         unread: i64,
     },
+    SetConversationPreview {
+        id: String,
+        preview_text: String,
+        preview_ts_ms: i64,
+        preview_from_me: bool,
+    },
     DeleteConversation {
         id: String,
     },
@@ -65,6 +71,17 @@ impl fmt::Debug for StoreOp {
             Self::SetConversationUnread { unread, .. } => f
                 .debug_struct("SetConversationUnread")
                 .field("unread", unread)
+                .finish(),
+            Self::SetConversationPreview {
+                preview_text,
+                preview_ts_ms,
+                preview_from_me,
+                ..
+            } => f
+                .debug_struct("SetConversationPreview")
+                .field("text_len", &preview_text.len())
+                .field("preview_ts_ms", preview_ts_ms)
+                .field("preview_from_me", preview_from_me)
                 .finish(),
             Self::DeleteConversation { .. } => f.write_str("DeleteConversation"),
             Self::SetPreferenceString { key, .. } => f
