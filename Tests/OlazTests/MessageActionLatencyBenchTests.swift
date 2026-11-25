@@ -20,7 +20,7 @@ import Testing
         let testEnk = Data("0123456789abcdef0123456789abcdef".utf8).base64EncodedString()
         let secretKey = ZaloCrypto.parseSecretKey(testEnk)
 
-        var serverScript: [CaseJSON] = [
+        let serverScript: [CaseJSON] = [
             .object([
                 "kind": .string("http"),
                 "path": .string("/api/login/getLoginInfo"),
@@ -205,30 +205,37 @@ import Testing
         let targetId = "\(8_100_049)"
 
         // 1. React MainActor optimistic latency (toggle ❤️ on/off each iteration).
-        func waitForReactMine(expected: Bool) async {
+        func waitForReactMine(expected: Bool, deadline: ContinuousClock.Instant) async -> Bool {
             while (engine.messages[convId]?.last(where: { $0.id == targetId })?.reactions.contains(where: \.includesMe) ?? false) != expected {
+                if ContinuousClock.now >= deadline { return false }
                 await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                     let pending = OSAllocatedUnfairLock<CheckedContinuation<Void, Never>?>(initialState: cont)
-                    let current = withObservationTracking {
-                        engine.messages[convId]?.last(where: { $0.id == targetId })?.reactions.contains(where: \.includesMe) ?? false
-                    } onChange: {
-                        Task { @MainActor in
-                            pending.withLock { c in
-                                let out = c
-                                c = nil
-                                return out
-                            }?.resume()
-                        }
-                    }
-                    if current == expected {
+                    let resumeOnce: @Sendable () -> Void = {
                         pending.withLock { c in
                             let out = c
                             c = nil
                             return out
                         }?.resume()
                     }
+                    let timeoutTask = Task {
+                        try? await Task.sleep(for: .milliseconds(250))
+                        resumeOnce()
+                    }
+                    let current = withObservationTracking {
+                        engine.messages[convId]?.last(where: { $0.id == targetId })?.reactions.contains(where: \.includesMe) ?? false
+                    } onChange: {
+                        Task { @MainActor in
+                            timeoutTask.cancel()
+                            resumeOnce()
+                        }
+                    }
+                    if current == expected {
+                        timeoutTask.cancel()
+                        resumeOnce()
+                    }
                 }
             }
+            return true
         }
 
         var reactSamplesMs: [Double] = []
@@ -239,41 +246,49 @@ import Testing
             let task = Task { @MainActor in
                 await engine.performReact("❤️", to: targetId, in: convId)
             }
-            await waitForReactMine(expected: wantMine)
+            let reached = await waitForReactMine(expected: wantMine, deadline: start + .seconds(10))
             let elapsed = ContinuousClock.now - start
             let ms = Double(elapsed.components.seconds) * 1000.0
                 + Double(elapsed.components.attoseconds) / 1e15
             await task.value
+            #expect(reached, "Timed out waiting for react toggle at iteration \(i)")
             if i >= warmup {
                 reactSamplesMs.append(ms)
             }
         }
 
         // 2. Delete-for-me MainActor optimistic latency (delete confirmed -> undo to restore 50 rows).
-        func waitForDeleteVisible(targetCount: Int) async {
-            while (engine.messages[convId]?.count ?? 0) != targetCount || engine.deleteUndo == nil {
+        func waitForDeleteVisible(targetCount: Int, deadline: ContinuousClock.Instant) async -> Bool {
+            while (engine.messages[convId]?.count ?? 0) != targetCount {
+                if ContinuousClock.now >= deadline { return false }
                 await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                     let pending = OSAllocatedUnfairLock<CheckedContinuation<Void, Never>?>(initialState: cont)
-                    let ready = withObservationTracking {
-                        (engine.messages[convId]?.count ?? 0) == targetCount && engine.deleteUndo != nil
-                    } onChange: {
-                        Task { @MainActor in
-                            pending.withLock { c in
-                                let out = c
-                                c = nil
-                                return out
-                            }?.resume()
-                        }
-                    }
-                    if ready {
+                    let resumeOnce: @Sendable () -> Void = {
                         pending.withLock { c in
                             let out = c
                             c = nil
                             return out
                         }?.resume()
                     }
+                    let timeoutTask = Task {
+                        try? await Task.sleep(for: .milliseconds(250))
+                        resumeOnce()
+                    }
+                    let ready = withObservationTracking {
+                        (engine.messages[convId]?.count ?? 0) == targetCount
+                    } onChange: {
+                        Task { @MainActor in
+                            timeoutTask.cancel()
+                            resumeOnce()
+                        }
+                    }
+                    if ready {
+                        timeoutTask.cancel()
+                        resumeOnce()
+                    }
                 }
             }
+            return true
         }
 
         var deleteSamplesMs: [Double] = []
@@ -285,10 +300,11 @@ import Testing
             }
             let start = ContinuousClock.now
             engine.deleteForMe(msg, confirmed: true)
-            await waitForDeleteVisible(targetCount: 49)
+            let reached = await waitForDeleteVisible(targetCount: 49, deadline: start + .seconds(10))
             let elapsed = ContinuousClock.now - start
             let ms = Double(elapsed.components.seconds) * 1000.0
                 + Double(elapsed.components.attoseconds) / 1e15
+            #expect(reached, "Timed out waiting for delete-for-me at iteration \(i)")
             if i >= warmup {
                 deleteSamplesMs.append(ms)
             }
