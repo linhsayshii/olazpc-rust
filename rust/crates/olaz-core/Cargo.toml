@@ -18,6 +18,7 @@ olaz-api = { path = "../olaz-api" }
 olaz-crypto = { path = "../olaz-crypto" }
 olaz-json = { path = "../olaz-json" }
 olaz-net = { path = "../olaz-net" }
+olaz-store = { path = "../olaz-store" }
 olaz-wire = { path = "../olaz-wire" }
 olaz-ws = { path = "../olaz-ws", features = ["transport"] }
 serde = { version = "1", features = ["derive"] }
@@ -27,5 +28,6 @@ tokio = { version = "1", features = ["rt", "sync", "time"] }
 tracing = "0.1"
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "test-util"] }
 url = "2"

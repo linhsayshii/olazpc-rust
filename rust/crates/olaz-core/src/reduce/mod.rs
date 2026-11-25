@@ -3,6 +3,7 @@
 //! No I/O, no clock, and no randomness may live inside `reduce`.
 
 pub mod classify;
+pub mod conversations;
 pub mod session;
 pub mod transport;
 
@@ -49,6 +50,24 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::LpTick { .. }
         | Input::PollBatchFetched { .. }
         | Input::PollBatchApplied { .. } => transport::reduce_transport(state, input, &mut out),
+
+        Input::Command(_)
+        | Input::OpRequest { .. }
+        | Input::BatchDeltaApplied { .. }
+        | Input::PinApiDone { .. }
+        | Input::PinReplacingStepDone { .. }
+        | Input::MoveApiDone { .. }
+        | Input::DeleteApiDone { .. }
+        | Input::HiddenPinSyncDone { .. }
+        | Input::ResetHiddenPinApiDone { .. }
+        | Input::SyncHiddenFetched { .. }
+        | Input::ResolveNamesChunkDone { .. }
+        | Input::MentionPreviewsLoaded { .. }
+        | Input::SyncLabelsFetched { .. }
+        | Input::OpApiDone { .. }
+        | Input::OpStoreFlushed { .. } => {
+            conversations::reduce_conversations(state, input, &mut out);
+        }
     }
     out
 }

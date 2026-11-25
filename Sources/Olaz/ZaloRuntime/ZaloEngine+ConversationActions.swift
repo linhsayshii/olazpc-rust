@@ -1,5 +1,5 @@
-import CryptoKit
 import Foundation
+import OlazCore
 
 // Native conversation context-menu actions: pin / unpin, "Khác" / "Ưu tiên", mark read / unread, hide / unhide, delete.
 // Backed by Zalo Web APIs + SQLite3 local state. Conversation ids, names and PINs never go to the log.
@@ -153,8 +153,17 @@ final class ConversationActionUI {
     /// Hidden conversations listed by the current PIN search; selecting one unlocks just that one.
     private(set) var pinSearchIds: [String] = []
     private var seq = 0
+    @ObservationIgnored private var isMirroring = false
+    @ObservationIgnored internal var onRelock: (() -> Void)?
+    @ObservationIgnored internal var onDropUnlock: (() -> Void)?
+    @ObservationIgnored internal var onShowToast: ((Toast.Kind, String) -> Bool)?
 
-    func show(_ kind: Toast.Kind, _ text: String) { seq += 1; toast = Toast(seq: seq, kind: kind, text: text) }
+    func show(_ kind: Toast.Kind, _ text: String) {
+        if !isMirroring, let onShowToast, onShowToast(kind, text) {
+            return
+        }
+        seq += 1; toast = Toast(seq: seq, kind: kind, text: text)
+    }
     func remove(_ ids: Set<String>) {
         guard !ids.isEmpty else { return }
         seq += 1; removal = Removal(seq: seq, ids: ids)
@@ -164,10 +173,54 @@ final class ConversationActionUI {
     func isUnlocked(_ id: String) -> Bool { unlockedId == id }
     func setPinSearch(_ ids: [String]) { if ids != pinSearchIds { pinSearchIds = ids } }
     /// The selection moved to another conversation.
-    func dropUnlock() { unlockedId = nil }
+    func dropUnlock() {
+        unlockedId = nil
+        if !isMirroring { onDropUnlock?() }
+    }
     /// Search cleared, app resigned active, PIN reset, logout.
-    func relock() { unlockedId = nil; if !pinSearchIds.isEmpty { pinSearchIds = [] } }
-    func reset() { relock(); toast = nil; removal = nil }
+    func relock() {
+        unlockedId = nil
+        if !pinSearchIds.isEmpty { pinSearchIds = [] }
+        if !isMirroring { onRelock?() }
+    }
+    func reset() {
+        isMirroring = true
+        defer { isMirroring = false }
+        unlockedId = nil
+        if !pinSearchIds.isEmpty { pinSearchIds = [] }
+        toast = nil
+        removal = nil
+    }
+
+    internal func applyCoreMirror(_ record: ConversationActionUiRecord) {
+        isMirroring = true
+        defer { isMirroring = false }
+        let nextToast: Toast? = record.toast.map { t in
+            let kind: Toast.Kind
+            switch t.kind {
+            case "success": kind = .success
+            case "neutral": kind = .neutral
+            default: kind = .failure
+            }
+            return Toast(seq: Int(t.seq), kind: kind, text: t.text)
+        }
+        if nextToast != toast {
+            toast = nextToast
+        }
+        let nextRemoval: Removal? = record.removal.map { r in
+            Removal(seq: Int(r.seq), ids: Set(r.ids))
+        }
+        if nextRemoval != removal {
+            removal = nextRemoval
+        }
+        if record.unlockedId != unlockedId {
+            unlockedId = record.unlockedId
+        }
+        if record.pinSearchIds != pinSearchIds {
+            pinSearchIds = record.pinSearchIds
+        }
+        seq = max(seq, Int(record.toast?.seq ?? 0), Int(record.removal?.seq ?? 0))
+    }
 }
 
 /// Result of an adapter action; `text` is the official toast text.
@@ -277,124 +330,50 @@ extension ZaloEngine {
     // MARK: Pin
 
     func pinConversation(_ id: String) {
-        Task { [weak self] in
-            guard let self else { return }
-            let pinnedCount = cachedPinnedIds.count
-            if !cachedPinnedIds.contains(id), pinnedCount >= 10 {
-                conversationPrompt = .pinBoard(id: id)
-                return
-            }
-            do {
-                try await sessionClient.updatePinnedConversation(convId: id, pinned: true)
-                cachedPinnedIds.insert(id)
-                applyPinStatus(id: id, pinned: true)
-                try? await sqliteStore?.setPreferenceStrings(key: "pinnedIds", value: Array(cachedPinnedIds))
-                try? await sqliteStore?.setConversationPinned(id: id, pinned: true)
-                report(ConversationActionResult(ok: true, text: "Đã ghim hội thoại"))
-            } catch {
-                report(ConversationActionResult(ok: false, text: "Ghim hội thoại không thành công."))
-            }
-        }
+        coreLifecycle.core?.pinConversation(id: id)
     }
 
     func unpinConversation(_ id: String) {
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await sessionClient.updatePinnedConversation(convId: id, pinned: false)
-                cachedPinnedIds.remove(id)
-                applyPinStatus(id: id, pinned: false)
-                try? await sqliteStore?.setPreferenceStrings(key: "pinnedIds", value: Array(cachedPinnedIds))
-                try? await sqliteStore?.setConversationPinned(id: id, pinned: false)
-                report(ConversationActionResult(ok: true, text: "Đã bỏ ghim hội thoại"))
-            } catch {
-                report(ConversationActionResult(ok: false, text: "Bỏ ghim không thành công."))
-            }
-        }
-    }
-
-    private func applyPinStatus(id: String, pinned: Bool) {
-        var list = conversations
-        if let idx = list.firstIndex(where: { $0.id == id }) {
-            list[idx].pinned = pinned
-        }
-        sortConversations(&list)
-        conversations = list
-        rebuildConversationFlags()
-        rebuildConversationExtras()
+        coreLifecycle.core?.unpinConversation(id: id)
     }
 
     func pinBoard(for id: String) async -> PinBoard? {
-        let items = conversations.filter { cachedPinnedIds.contains($0.id) || $0.pinned }.map(\.id)
-        let limit = 10
-        let need = max(1, items.count - limit + 1)
-        return PinBoard(tab: 0, limit: limit, total: items.count, need: need, items: items)
+        guard let core = await ensureCoreEngine() else { return nil }
+        guard let record = try? await core.requestPinBoard(id: id) else { return nil }
+        return PinBoard(coreRecord: record)
     }
 
     func pinReplacing(_ unpinIds: [String], pinning id: String) async -> ConversationActionResult {
-        do {
-            for old in unpinIds {
-                try await sessionClient.updatePinnedConversation(convId: old, pinned: false)
-                cachedPinnedIds.remove(old)
-                applyPinStatus(id: old, pinned: false)
-                try? await sqliteStore?.setConversationPinned(id: old, pinned: false)
-            }
-            try await sessionClient.updatePinnedConversation(convId: id, pinned: true)
-            cachedPinnedIds.insert(id)
-            applyPinStatus(id: id, pinned: true)
-            try? await sqliteStore?.setPreferenceStrings(key: "pinnedIds", value: Array(cachedPinnedIds))
-            try? await sqliteStore?.setConversationPinned(id: id, pinned: true)
-            let res = ConversationActionResult(ok: true, text: "Đã ghim hội thoại")
-            report(res)
-            return res
-        } catch {
-            let res = ConversationActionResult(ok: false, text: "Ghim hội thoại không thành công.")
-            report(res)
-            return res
+        guard let core = await ensureCoreEngine() else {
+            return ConversationActionResult(ok: false, text: "Ghim hội thoại không thành công.")
         }
+        guard let record = try? await core.pinReplacing(unpinIds: unpinIds, pinId: id) else {
+            return ConversationActionResult(ok: false, text: "Ghim hội thoại không thành công.")
+        }
+        await waitForMirrorVersion(core.currentVersion())
+        return ConversationActionResult(coreRecord: record)
     }
 
     // MARK: Archive
 
     func moveConversation(_ id: String, toOther: Bool) {
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await sessionClient.updateArchivedChat(convId: id, archived: toOther)
-                if toOther { cachedArchivedIds.insert(id) } else { cachedArchivedIds.remove(id) }
-                try? await sqliteStore?.setPreferenceStrings(key: "archivedIds", value: Array(cachedArchivedIds))
-                rebuildConversationFlags()
-                rebuildConversationExtras()
-                let text = toOther ? "Đã chuyển sang mục Khác" : "Đã chuyển về Hộp thư đến"
-                report(ConversationActionResult(ok: true, text: text, neutral: toOther))
-            } catch {
-                report(ConversationActionResult(ok: false, text: "Không thể chuyển cuộc trò chuyện."))
-            }
-        }
+        coreLifecycle.core?.moveConversation(id: id, toOther: toOther)
     }
 
     // MARK: Delete
 
     func requestDeleteConversation(_ id: String) {
+        if let core = coreLifecycle.core {
+            core.requestDeleteConversation(id: id)
+            return
+        }
         conversationPrompt = .delete(id: id)
     }
 
     func confirmDeleteConversation(_ id: String) {
         let lastCliId = messages[id]?.last?.id ?? ""
-        Task { [weak self] in
-            guard let self else { return }
-            await sessionClient.deleteConversationAPI(convId: id, lastCliMsgId: lastCliId)
-            try? await sqliteStore?.deleteConversation(id: id)
-            conversations.removeAll { $0.id == id }
-            messages[id] = nil
-            cachedPinnedIds.remove(id)
-            cachedArchivedIds.remove(id)
-            cachedUnreadMarks.remove(id)
-            conversationUI.remove([id])
-            rebuildConversationFlags()
-            rebuildConversationExtras()
-            report(ConversationActionResult(ok: true, text: "Đã xóa hội thoại"))
-        }
+        messages[id] = nil
+        coreLifecycle.core?.confirmDeleteConversation(id: id, lastCliMsgId: lastCliId)
     }
 
     // MARK: Read / unread
@@ -404,190 +383,92 @@ extension ZaloEngine {
     }
 
     func markConversationUnread(_ id: String) {
-        cachedUnreadMarks.insert(id)
-        rebuildConversationFlags()
-        rebuildConversationExtras()
-        Task {
-            try? await sqliteStore?.setPreferenceStrings(key: "unreadMarks", value: Array(cachedUnreadMarks))
-            try? await sessionClient.setUnreadMarkAPI(convId: id, unread: true)
-        }
+        coreLifecycle.core?.markConversationUnread(id: id)
     }
 
-    // MARK: Hidden chats (server MD5 PIN sync + local SHA-256 fallback + SQLite)
-
-    private static func hashPIN(_ pin: String) -> String {
-        let digest = SHA256.hash(data: Data("olaz-hidden-pin:\(pin)".utf8))
-        return digest.map { String(format: "%02x", $0) }.joined()
-    }
-
-    private func storedHiddenPinDigests() async -> (md5: String?, sha256: String?) {
-        if let store = sqliteStore {
-            let md5 = try? await store.getPreferenceString(key: "hiddenPinMD5")
-            let sha = try? await store.getPreferenceString(key: "hiddenPinHash")
-            return (
-                md5?.isEmpty == false ? md5 : nil,
-                sha?.isEmpty == false ? sha : nil
-            )
-        }
-        return (
-            cachedHiddenPinMD5?.isEmpty == false ? cachedHiddenPinMD5 : nil,
-            cachedHiddenPinHash?.isEmpty == false ? cachedHiddenPinHash : nil
-        )
-    }
+    // MARK: Hidden chats (delegated to `olaz-core`)
 
     func syncHiddenConversations() async {
-        guard await sessionClient.isAuthenticated else { return }
-        guard let snap = try? await sessionClient.fetchHiddenConversationsAPI() else { return }
-        await applyServerHiddenConversations(snap)
+        guard let core = await ensureCoreEngine() else { return }
+        if let v = try? await core.syncHiddenConversations() {
+            await waitForMirrorVersion(v)
+        }
     }
 
     internal func applyServerHiddenConversations(_ snap: HiddenConversationsSnapshot) async {
-        let serverPin = snap.pin.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let serverHiddenIds = Set(snap.threadIds.filter { !$0.isEmpty && $0 != selfConversationId })
-        let oldHiddenIds = conversationActions.hiddenIds
-
-        if !serverPin.isEmpty {
-            let prevMD5 = (try? await sqliteStore?.getPreferenceString(key: "hiddenPinMD5")) ?? cachedHiddenPinMD5
-            if prevMD5?.lowercased() != serverPin {
-                cachedHiddenPinHash = nil
-                try? await sqliteStore?.deletePreference(key: "hiddenPinHash")
-            }
-            cachedHiddenPinMD5 = serverPin
-            try? await sqliteStore?.setPreferenceString(key: "hiddenPinMD5", value: serverPin)
-        } else {
-            cachedHiddenPinMD5 = nil
-            cachedHiddenPinHash = nil
-            try? await sqliteStore?.deletePreference(key: "hiddenPinMD5")
-            try? await sqliteStore?.deletePreference(key: "hiddenPinHash")
+        guard let core = await ensureCoreEngine() else { return }
+        if let v = try? await core.applyServerHiddenConversations(pin: snap.pin, threadIds: snap.threadIds) {
+            await waitForMirrorVersion(v)
         }
-        try? await sqliteStore?.setPreferenceStrings(key: "hiddenIds", value: Array(serverHiddenIds))
-
-        var next = conversationActions
-        next.hiddenKnown = true
-        next.hiddenEnabled = true
-        next.hasHiddenPIN = !serverPin.isEmpty
-        next.hiddenIds = serverHiddenIds
-        conversationActions = next
-
-        let newlyHidden = serverHiddenIds.subtracting(oldHiddenIds)
-        if !newlyHidden.isEmpty {
-            conversationUI.remove(newlyHidden)
-        }
-        rebuildConversationFlags()
-        rebuildConversationExtras()
     }
 
     func checkHiddenChatPIN(_ pin: String) async -> Bool {
-        let digests = await storedHiddenPinDigests()
-        if let md5Stored = digests.md5 {
-            return ZaloSessionClient.hiddenPinMD5Hex(pin) == md5Stored.lowercased()
-        }
-        if let shaStored = digests.sha256 {
-            return Self.hashPIN(pin) == shaStored
-        }
-        return false
+        guard let core = await ensureCoreEngine() else { return false }
+        return (try? await core.checkHiddenPin(pin: pin)) ?? false
     }
 
     func hideConversation(_ id: String, pin: String) async -> ConversationActionResult {
-        guard await checkHiddenChatPIN(pin) else {
+        guard let core = await ensureCoreEngine() else {
             return ConversationActionResult(ok: false, text: "Mã PIN không đúng.", badPIN: true)
         }
-        conversationActions.hiddenIds.insert(id)
-        try? await sqliteStore?.setPreferenceStrings(key: "hiddenIds", value: Array(conversationActions.hiddenIds))
-        await sessionClient.setHiddenConversationAPI(convId: id, hidden: true)
-        conversationUI.remove([id])
-        rebuildConversationFlags()
-        rebuildConversationExtras()
-        return ConversationActionResult(ok: true, text: "Đã ẩn trò chuyện")
-    }
-
-    private func syncAndPersistHiddenPin(_ pin: String) async -> Bool {
-        if await sessionClient.isAuthenticated {
-            do {
-                _ = try await sessionClient.updateHiddenPinAPI(pin: pin)
-            } catch {
-                return false
-            }
-            let md5 = ZaloSessionClient.hiddenPinMD5Hex(pin)
-            cachedHiddenPinMD5 = md5
-            try? await sqliteStore?.setPreferenceString(key: "hiddenPinMD5", value: md5)
+        guard let record = try? await core.hideConversation(id: id, pin: pin) else {
+            return ConversationActionResult(ok: false, text: "Mã PIN không đúng.", badPIN: true)
         }
-        let hash = Self.hashPIN(pin)
-        cachedHiddenPinHash = hash
-        try? await sqliteStore?.setPreferenceString(key: "hiddenPinHash", value: hash)
-        conversationActions.hasHiddenPIN = true
-        return true
+        await waitForMirrorVersion(core.currentVersion())
+        return ConversationActionResult(coreRecord: record)
     }
 
     func hideConversation(_ id: String, settingNewPIN pin: String) async -> ConversationActionResult {
-        let existing = await storedHiddenPinDigests()
-        if conversationActions.hasHiddenPIN || existing.md5 != nil || existing.sha256 != nil {
-            conversationActions.hasHiddenPIN = true
-            return ConversationActionResult(ok: false, text: "Mã PIN đã được thiết lập trước đó.", pinExists: true)
-        }
-        guard await syncAndPersistHiddenPin(pin) else {
+        guard let core = await ensureCoreEngine() else {
             return ConversationActionResult(ok: false, text: "Không thể cài mã PIN trò chuyện ẩn.")
         }
-        conversationActions.hiddenIds.insert(id)
-        try? await sqliteStore?.setPreferenceStrings(key: "hiddenIds", value: Array(conversationActions.hiddenIds))
-        await sessionClient.setHiddenConversationAPI(convId: id, hidden: true)
-        conversationUI.remove([id])
-        rebuildConversationFlags()
-        rebuildConversationExtras()
-        return ConversationActionResult(ok: true, text: "Đã ẩn trò chuyện")
+        guard let record = try? await core.hideConversationNewPin(id: id, pin: pin) else {
+            return ConversationActionResult(ok: false, text: "Không thể cài mã PIN trò chuyện ẩn.")
+        }
+        await waitForMirrorVersion(core.currentVersion())
+        return ConversationActionResult(coreRecord: record)
     }
 
     func unhideConversation(_ id: String, pin: String?) async -> ConversationActionResult {
-        if let pin, !(await checkHiddenChatPIN(pin)) {
+        guard let core = await ensureCoreEngine() else {
             return ConversationActionResult(ok: false, text: "Mã PIN không đúng.", badPIN: true)
         }
-        conversationActions.hiddenIds.remove(id)
-        try? await sqliteStore?.setPreferenceStrings(key: "hiddenIds", value: Array(conversationActions.hiddenIds))
-        await sessionClient.setHiddenConversationAPI(convId: id, hidden: false)
-        rebuildConversationFlags()
-        rebuildConversationExtras()
-        return ConversationActionResult(ok: true, text: "Đã bỏ ẩn trò chuyện")
+        guard let record = try? await core.unhideConversation(id: id, pin: pin) else {
+            return ConversationActionResult(ok: false, text: "Mã PIN không đúng.", badPIN: true)
+        }
+        await waitForMirrorVersion(core.currentVersion())
+        return ConversationActionResult(coreRecord: record)
     }
 
     func setHiddenChatPIN(_ pin: String, changed: Bool) async -> ConversationActionResult {
-        guard await syncAndPersistHiddenPin(pin) else {
+        guard let core = await ensureCoreEngine() else {
             return ConversationActionResult(ok: false, text: changed ? "Không thể đổi mã PIN." : "Không thể cài mã PIN.")
         }
-        rebuildConversationFlags()
-        rebuildConversationExtras()
-        return ConversationActionResult(ok: true, text: changed ? "Đã đổi mã PIN" : "Đã cài mã PIN")
+        guard let record = try? await core.setHiddenPin(pin: pin, changed: changed) else {
+            return ConversationActionResult(ok: false, text: changed ? "Không thể đổi mã PIN." : "Không thể cài mã PIN.")
+        }
+        await waitForMirrorVersion(core.currentVersion())
+        return ConversationActionResult(coreRecord: record)
     }
 
     func resetHiddenChatPIN() async -> ConversationActionResult {
-        if await sessionClient.isAuthenticated {
-            do {
-                _ = try await sessionClient.resetHiddenPinAPI()
-            } catch {
-                return ConversationActionResult(ok: false, text: "Không thể xóa mã PIN.")
-            }
+        guard let core = await ensureCoreEngine() else {
+            return ConversationActionResult(ok: false, text: "Không thể xóa mã PIN.")
         }
-        let formerlyHidden = conversationActions.hiddenIds
-        conversationActions.hiddenIds.removeAll()
-        conversationActions.hasHiddenPIN = false
-        cachedHiddenPinHash = nil
-        cachedHiddenPinMD5 = nil
-        try? await sqliteStore?.deletePreference(key: "hiddenPinHash")
-        try? await sqliteStore?.deletePreference(key: "hiddenPinMD5")
-        try? await sqliteStore?.setPreferenceStrings(key: "hiddenIds", value: [])
-        conversationUI.remove(formerlyHidden)
-        conversationUI.relock()
-        rebuildConversationFlags()
-        rebuildConversationExtras()
-        return ConversationActionResult(ok: true, text: "Đã xóa mã PIN")
+        guard let record = try? await core.resetHiddenPin() else {
+            return ConversationActionResult(ok: false, text: "Không thể xóa mã PIN.")
+        }
+        await waitForMirrorVersion(core.currentVersion())
+        return ConversationActionResult(coreRecord: record)
     }
 
     func hiddenConversations(matching query: String) async -> [String]? {
-        guard conversationActions.hiddenEnabled, query.count == 4, await checkHiddenChatPIN(query) else {
+        guard let core = await ensureCoreEngine() else {
             conversationUI.setPinSearch([])
             return nil
         }
-        let ids = Array(conversationActions.hiddenIds)
-        conversationUI.setPinSearch(ids)
+        let ids = (try? await core.hiddenSearch(query: query)) ?? nil
+        await waitForMirrorVersion(core.currentVersion())
         return ids
     }
 
@@ -598,10 +479,14 @@ extension ZaloEngine {
     func unlockFromPINSearch(_ id: String) -> Bool {
         guard conversationUI.pinSearchIds.contains(id) else { return false }
         conversationUI.unlock(id)
+        coreLifecycle.core?.unlockFromPinSearch(id: id)
         return true
     }
 
-    func unlockHiddenConversation(_ id: String) { conversationUI.unlock(id) }
+    func unlockHiddenConversation(_ id: String) {
+        conversationUI.unlock(id)
+        coreLifecycle.core?.unlockHiddenConversation(id: id)
+    }
 
     // MARK: Hidden chats elsewhere in the app
 
@@ -620,16 +505,21 @@ extension ZaloEngine {
     // MARK: Feedback
 
     func report(_ result: ConversationActionResult) {
-        guard !result.text.isEmpty, !result.full, !result.pinExists else { return }
-        conversationUI.show(result.ok ? (result.neutral ? .neutral : .success) : .failure, result.text)
+        if let core = coreLifecycle.core {
+            core.reportConversationActionResult(result: result.coreRecord)
+            return
+        }
+        let batch = offlineConversationsCore().reportConversationActionResult(result: result.coreRecord)
+        applyCoreChanges(batch)
     }
 
     func resetConversationActions() {
-        conversationActions = ConversationActionsState()
-        conversationPrompt = nil
-        cachedHiddenPinHash = nil
-        cachedHiddenPinMD5 = nil
-        conversationUI.reset()
+        if let core = coreLifecycle.core {
+            core.resetConversationActions()
+            return
+        }
+        let batch = offlineConversationsCore().resetConversationActions()
+        applyCoreChanges(batch)
     }
 
     func republishConversationActions() {
@@ -637,42 +527,23 @@ extension ZaloEngine {
     }
 
     internal func rebuildConversationFlags() {
-        var next = conversationActions
-        next.hiddenKnown = true
-        next.loaded = true
-        next.hiddenEnabled = true
-        next.markUnreadEnabled = true
-        var nextFlags: [String: ConversationActionFlags] = [:]
-        for c in conversations {
-            var f: ConversationActionFlags = []
-            if cachedPinnedIds.contains(c.id) || c.pinned { f.insert(.pinned) }
-            if cachedArchivedIds.contains(c.id) { f.insert(.archived) }
-            if next.hiddenIds.contains(c.id) { f.insert(.hidden) }
-            if cachedUnreadMarks.contains(c.id) { f.insert(.unreadMark) }
-            if c.id == selfConversationId {
-                f.formUnion([.cannotDelete, .cannotHide, .cannotArchive])
-            }
-            if !f.isEmpty { nextFlags[c.id] = f }
+        if let core = coreLifecycle.core {
+            core.republishConversationActions()
+            return
         }
-        next.flags = nextFlags
-        if next != conversationActions { conversationActions = next }
+        let batch = offlineConversationsCore().republishConversationActions()
+        applyCoreChanges(batch)
     }
 
     var isInCall: Bool { call.busy || call.nativeRunning }
 
     func handleConversationActions(state: [String: Any]) {
-        guard let json = state["convActions"] as? [String: Any] else { return }
-        var next = conversationActions
-        next.apply(json: json)
-        let epoch = (json["epoch"] as? NSNumber)?.int64Value ?? next.lateEpoch
-        if epoch != next.lateEpoch { next.lateEpoch = epoch; next.lateSeq = 0 }
-        if let late = json["late"] as? [String: Any], let seq = (late["seq"] as? NSNumber)?.intValue, seq > next.lateSeq {
-            next.lateSeq = seq
-            let text = late["text"] as? String ?? ""
-            let ok = late["ok"] as? Bool ?? false
-            if !text.isEmpty { conversationUI.show(ok ? ((late["neutral"] as? Bool) == true ? .neutral : .success) : .failure, text) }
-            if let removed = late["removedId"] as? String, !removed.isEmpty { conversationUI.remove([removed]) }
+        let json = Self.jsonString(for: state)
+        if let core = coreLifecycle.core {
+            core.handleConversationActions(stateJson: json)
+            return
         }
-        if next != conversationActions { conversationActions = next }
+        let batch = offlineConversationsCore().handleConversationActions(stateJson: json)
+        applyCoreChanges(batch)
     }
 }

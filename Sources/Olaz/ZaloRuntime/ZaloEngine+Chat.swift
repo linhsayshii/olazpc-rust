@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import OlazCore
 
 extension ZaloEngine {
     // MARK: - Open / Close / History
@@ -722,28 +723,16 @@ extension ZaloEngine {
 
     func markRead(_ id: String) {
         guard !id.isEmpty else { return }
-        var extrasChanged = false
+        let seenTarget: SeenTargetRecord? = {
+            guard let last = messages[id]?.last, !last.isMine else { return nil }
+            return SeenTargetRecord(convId: id, msgId: last.id, cliMsgId: last.id, senderId: last.senderId)
+        }()
+        if let core = coreLifecycle.core {
+            core.markConversationRead(id: id, seenTarget: seenTarget)
+            return
+        }
         if let idx = conversations.firstIndex(where: { $0.id == id }), conversations[idx].unread > 0 {
             conversations[idx].unread = 0
-            extrasChanged = true
-        }
-        let hadUnreadMark = cachedUnreadMarks.remove(id) != nil
-        if hadUnreadMark {
-            rebuildConversationFlags()
-            extrasChanged = true
-            Task {
-                try? await sqliteStore?.setPreferenceStrings(key: "unreadMarks", value: Array(cachedUnreadMarks))
-                try? await sessionClient.setUnreadMarkAPI(convId: id, unread: false)
-            }
-        }
-        if extrasChanged {
-            rebuildConversationExtras()
-        }
-        Task {
-            try? await sqliteStore?.setConversationUnread(id: id, unread: 0)
-            if let last = messages[id]?.last, !last.isMine {
-                await sessionClient.sendSeenAPI(convId: id, msgId: last.id, cliMsgId: last.id, senderId: last.senderId)
-            }
         }
     }
 

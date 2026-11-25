@@ -62,13 +62,25 @@ final class ZaloEngine {
     }
 
     private(set) var phase: Phase = .starting
-    var conversations: [ConversationSummary] = []
+    var conversations: [ConversationSummary] = [] {
+        didSet {
+            if !isApplyingCoreMirror {
+                coreLifecycle.core?.syncConversationsSnapshot(list: conversations.map(\.coreRecord))
+            }
+        }
+    }
     private(set) var profile: Profile?
     private(set) var signOutNotice: String?
     private(set) var clientVersion: String? = "694 (Native)"
     private(set) var recentLog: [String] = []
 
-    var openConversationId: String?
+    var openConversationId: String? {
+        didSet {
+            if !isApplyingCoreMirror {
+                coreLifecycle.core?.setOpenConversation(id: openConversationId)
+            }
+        }
+    }
     var failedDrafts = FailedDraftStore()
     var messages: [String: [ChatMessage]] = [:] {
         didSet { messageSignal.changed(from: oldValue, to: messages) }
@@ -102,8 +114,18 @@ final class ZaloEngine {
     var conversationExtras = ConversationExtras()
     var conversationActions = ConversationActionsState()
     let conversationUI = ConversationActionUI()
-    var conversationPrompt: ConversationPrompt?
-    var contacts = ContactsState()
+    var conversationPrompt: ConversationPrompt? {
+        didSet {
+            if !isApplyingCoreMirror {
+                if let core = coreLifecycle.core {
+                    core.setConversationPrompt(prompt: conversationPrompt?.coreRecord)
+                } else if let offline = offlineConvCore {
+                    _ = offline.setConversationPrompt(prompt: conversationPrompt?.coreRecord)
+                }
+            }
+        }
+    }
+    var contacts = ContactsState() { didSet { pushCoreIdentitiesIfRunning() } }
     var notificationSettings = NotificationSettingsState()
     var cloud = CloudState()
     var call = CallState()
@@ -123,7 +145,17 @@ final class ZaloEngine {
     @ObservationIgnored internal let sessionClient: ZaloSessionClient
     @ObservationIgnored internal let webSocket = ZaloWebSocket()
     @ObservationIgnored internal let dataDirectory: URL
-    @ObservationIgnored internal var sqliteStore: ZaloSQLiteStore?
+    @ObservationIgnored internal var sqliteStore: ZaloSQLiteStore? {
+        didSet {
+            if let core = coreLifecycle.core {
+                if let store = sqliteStore {
+                    core.attachStore(store: store.coreStoreHandle)
+                } else {
+                    core.detachStore()
+                }
+            }
+        }
+    }
     @ObservationIgnored internal var callBridge: CallBridge?
 
     @ObservationIgnored private var started = false
@@ -132,12 +164,25 @@ final class ZaloEngine {
     @ObservationIgnored internal var coreInitTask: Task<CoreEngine?, Never>?
     @ObservationIgnored internal var pendingCoreCommands: [PendingCoreCommand] = []
     @ObservationIgnored internal var appliedMirrorVersion: UInt64 = 0
+    @ObservationIgnored internal var isApplyingCoreMirror = false
+    @ObservationIgnored internal var offlineConvCore: CoreOfflineConversations?
     @ObservationIgnored internal var mirrorVersionWaiters: [(target: UInt64, continuation: CheckedContinuation<Void, Never>)] = []
     @ObservationIgnored internal var cachedQRPayload: String?
     @ObservationIgnored internal var cachedQRPNG: Data?
     @ObservationIgnored internal var hostTrace: ((String, [String: Any]) -> Bool)?
     @ObservationIgnored internal var stateTrace: (() -> Void)?
-    @ObservationIgnored internal var transportSettleTrace: (() -> Void)?
+    @ObservationIgnored private let transportSettleTraceActive = OSAllocatedUnfairLock<Bool>(initialState: false)
+    nonisolated internal var hasTransportSettleTrace: Bool {
+        transportSettleTraceActive.withLock { $0 }
+    }
+    @ObservationIgnored internal var transportSettleTrace: (() -> Void)? {
+        didSet {
+            let active = transportSettleTrace != nil
+            transportSettleTraceActive.withLock { $0 = active }
+        }
+    }
+    @ObservationIgnored internal var nowMs: () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }
+    @ObservationIgnored internal var randomTag4: () -> String = { String(UUID().uuidString.prefix(4)) }
     @ObservationIgnored internal var recordedQRPayload: String?
     @ObservationIgnored internal var recordedSessionPrefs: [String: String] = [:]
     @ObservationIgnored internal var pendingCleanupTask: Task<Void, Never>?
@@ -176,7 +221,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var cachedSentRequestsRaw: [[String: Any]] = []
     @ObservationIgnored internal var cachedReceivedRequestsRaw: [[String: Any]] = []
     @ObservationIgnored internal var cachedGroupDetails: [String: [String: Any]] = [:]
-    @ObservationIgnored internal var cachedFriendGlobalIds: [String: String] = [:] { didSet { friendUidByGlobalId = nil } }
+    @ObservationIgnored internal var cachedFriendGlobalIds: [String: String] = [:] { didSet { friendUidByGlobalId = nil; pushCoreIdentitiesIfRunning() } }
     /// `cachedFriendGlobalIds` reversed (global id → uid), built on first use: looking a sender up scanned the whole map for every
     /// message (50 per chat opened, ~25 ms of main thread).
     @ObservationIgnored private var friendUidByGlobalId: [String: String]?
@@ -184,16 +229,15 @@ final class ZaloEngine {
     @ObservationIgnored internal var cachedArchivedIds: Set<String> = []
     @ObservationIgnored internal var cachedStarredIds: Set<String> = []
     @ObservationIgnored internal var cachedUnreadMarks: Set<String> = []
-    @ObservationIgnored internal var cachedAliases: [String: String] = [:]
-    @ObservationIgnored internal var cachedProfiles: [String: ZaloWebKitMigrator.CachedProfile] = [:]
-    @ObservationIgnored internal var cachedGroups: [String: ZaloWebKitMigrator.CachedGroup] = [:]
-    @ObservationIgnored internal var cachedActivityRanks: [String: Int64] = [:]
+    @ObservationIgnored internal var cachedAliases: [String: String] = [:] { didSet { pushCoreIdentitiesIfRunning() } }
+    @ObservationIgnored internal var cachedProfiles: [String: ZaloWebKitMigrator.CachedProfile] = [:] { didSet { pushCoreIdentitiesIfRunning() } }
+    @ObservationIgnored internal var cachedGroups: [String: ZaloWebKitMigrator.CachedGroup] = [:] { didSet { pushCoreIdentitiesIfRunning() } }
+    @ObservationIgnored internal var cachedActivityRanks: [String: Int64] = [:] { didSet { pushCoreIdentitiesIfRunning() } }
     /// Per-conversation result of the launch preload probe (see `ZaloEngine+HistoryFreshness.swift`).
     @ObservationIgnored internal var historyFreshness: [String: HistoryFreshness] = [:]
     @ObservationIgnored internal var historyFullRefreshDue = false
     @ObservationIgnored internal var cachedBoardRawTopics: [String: (version: Int64, topics: [String: [String: Any]])] = [:]
-    @ObservationIgnored internal var cachedHiddenPinHash: String?
-    @ObservationIgnored internal var cachedHiddenPinMD5: String?
+
     @ObservationIgnored internal var reminderWatchCache: [String: (sig: String, snapshot: ReminderSnapshot)] = [:]
     @ObservationIgnored internal var reminderWatchWaiters: [String: [UUID: @Sendable () -> Void]] = [:]
     @ObservationIgnored private var webkitMigrateTask: Task<Void, Never>?
@@ -219,6 +263,23 @@ final class ZaloEngine {
             userDefaultsSuiteName: userDefaultsSuiteName,
             cookieStorage: cookieStorage
         )
+        self.conversationUI.onRelock = { [weak self] in
+            self?.coreLifecycle.core?.relockHidden()
+        }
+        self.conversationUI.onDropUnlock = { [weak self] in
+            self?.coreLifecycle.core?.dropHiddenUnlock()
+        }
+        self.conversationUI.onShowToast = { [weak self] kind, text in
+            guard let self, let core = self.coreLifecycle.core else { return false }
+            let result: ConversationActionResult
+            switch kind {
+            case .success: result = ConversationActionResult(ok: true, text: text)
+            case .neutral: result = ConversationActionResult(ok: true, text: text, neutral: true)
+            case .failure: result = ConversationActionResult(ok: false, text: text)
+            }
+            core.reportConversationActionResult(result: result.coreRecord)
+            return true
+        }
     }
 
     deinit {
@@ -326,6 +387,9 @@ final class ZaloEngine {
     }
 
     private func resetSessionState() {
+        isApplyingCoreMirror = true
+        defer { isApplyingCoreMirror = false }
+        offlineConvCore = nil
         pollState = ZaloPollState()
         conversations = []
         openConversationId = nil
@@ -341,7 +405,9 @@ final class ZaloEngine {
         syncInitialEmptyDB = false
         navigationRequest = nil
         conversationExtras = ConversationExtras()
-        resetConversationActions()
+        conversationActions = ConversationActionsState()
+        conversationPrompt = nil
+        conversationUI.reset()
         contacts = ContactsState()
         notificationSettings = NotificationSettingsState()
         call = CallState()
@@ -451,7 +517,6 @@ final class ZaloEngine {
 
     internal func loadLocalAccountState(from store: ZaloSQLiteStore, account: ZaloLoginAccount? = nil) async {
         let effectiveMyUid = account?.userId ?? profile?.userId ?? ""
-        let effectiveSelfId = account.map { $0.send2MeId.isEmpty ? $0.userId : $0.send2MeId } ?? selfConversationId
         // Self-heal any legacy raw Signal ciphertexts / broken E2EE sticker URLs / corrupted legacy reactions in SQLite before hydrating UI.
         if let repairedCount = try? await store.repairUndecryptedE2EEMessages(), repairedCount > 0 {
             EngineLog.shared.write("e2ee: repaired \(repairedCount) legacy ciphertext rows")
@@ -492,11 +557,8 @@ final class ZaloEngine {
             }
         }
 
-        // Load identity & preference caches first so conversation hydration resolves aliases & profiles immediately.
-        cachedPinnedIds = Set((try? await store.getPreferenceStrings(key: "pinnedIds")) ?? [])
-        cachedArchivedIds = Set((try? await store.getPreferenceStrings(key: "archivedIds")) ?? [])
+        // Load identity & non-U3 preference caches; U3 conversations/actions/labels/hidden state are hydrated by `olaz-core`.
         cachedStarredIds = Set((try? await store.getPreferenceStrings(key: "starredIds")) ?? [])
-        cachedUnreadMarks = Set((try? await store.getPreferenceStrings(key: "unreadMarks")) ?? [])
 
         if let aliasesData = try? await store.getPreferenceData(key: "aliases"),
            let dict = (try? JSONSerialization.jsonObject(with: aliasesData)) as? [String: String] {
@@ -526,106 +588,8 @@ final class ZaloEngine {
             }
         }
 
-        // Rescue any misrouted 1-1 messages from legacy "g0" before deleting ghost rows.
-        let ghostSelfGroupId = (effectiveSelfId?.isEmpty == false) ? "g\(effectiveSelfId!)" : ""
-        let ghostIds: Set<String> = ghostSelfGroupId.isEmpty ? ["g0", "0"] : ["g0", "0", ghostSelfGroupId]
-        if let g0Msgs = try? await store.messages(convId: "g0", limit: 200), !g0Msgs.isEmpty {
-            let myUid = effectiveMyUid
-            var rescued: [StoredMessage] = []
-            for var m in g0Msgs where !m.isMine && !m.senderId.isEmpty && m.senderId != "0" && m.senderId != myUid {
-                let peerId = ZaloWireParser.stripUserPrefix(m.senderId)
-                guard !peerId.isEmpty, peerId != "0", !ZaloWireParser.isGroupId(peerId) else { continue }
-                m.convId = peerId
-                if let info = lookupPersonInfo(peerId) {
-                    if !info.name.isEmpty { m.senderName = info.name }
-                    if !info.avatar.isEmpty { m.senderAvatar = info.avatar }
-                }
-                if var obj = (try? JSONSerialization.jsonObject(with: m.rawJSONData)) as? [String: Any] {
-                    obj["conversationId"] = peerId
-                    obj["senderName"] = m.senderName
-                    obj["senderAvatar"] = m.senderAvatar
-                    if let updatedRaw = try? JSONSerialization.data(withJSONObject: obj) {
-                        m.rawJSONData = updatedRaw
-                    }
-                }
-                rescued.append(m)
-            }
-            if !rescued.isEmpty {
-                try? await store.saveMessages(rescued)
-                for m in rescued {
-                    let ident = lookupConversationIdentity(m.convId)
-                    let conv = StoredConversation(
-                        id: m.convId,
-                        isGroup: false,
-                        name: ident.name.isEmpty ? m.senderName : ident.name,
-                        avatar: ident.avatar?.absoluteString ?? m.senderAvatar,
-                        pinned: cachedPinnedIds.contains(m.convId),
-                        members: 0,
-                        unread: 0,
-                        previewText: ZaloWireParser.previewLabel(for: m.kindTag, text: m.text),
-                        previewTsMs: m.tsMs,
-                        previewFromMe: false,
-                        updatedAtMs: m.tsMs
-                    )
-                    try? await store.upsertConversation(conv)
-                }
-            }
-        }
-
-        if let savedConvs = try? await store.loadConversations() {
-            for ghost in ghostIds where savedConvs.contains(where: { $0.id == ghost }) {
-                try? await store.deleteConversation(id: ghost)
-            }
-            var summaries: [ConversationSummary] = savedConvs
-                .filter { !ghostIds.contains($0.id) }
-                .map { c in
-                    let ident = lookupConversationIdentity(c.id)
-                    let effectiveName: String = {
-                        if !ident.name.isEmpty && ident.name != c.id { return ident.name }
-                        return c.name.isEmpty ? c.id : c.name
-                    }()
-                    let effectiveAvatar = ident.avatar ?? (c.avatar.isEmpty ? nil : URL(string: c.avatar))
-                    let effectiveMembers = ident.members > 0 ? ident.members : c.members
-                    return ConversationSummary(
-                        id: c.id,
-                        isGroup: c.isGroup,
-                        name: effectiveName,
-                        avatar: effectiveAvatar,
-                        pinned: cachedPinnedIds.contains(c.id) || c.pinned,
-                        members: effectiveMembers,
-                        unread: c.unread,
-                        preview: c.previewTsMs > 0 || !c.previewText.isEmpty
-                            ? ConversationSummary.Preview(
-                                text: c.previewText,
-                                date: c.previewTsMs > 0 ? Date(timeIntervalSince1970: Double(c.previewTsMs) / 1000) : nil,
-                                fromMe: c.previewFromMe
-                            )
-                            : nil
-                    )
-                }
-            sortConversations(&summaries)
-            conversations = summaries
-            await refreshMentionPreviews()
-        }
-
-        let hiddenIds = Set((try? await store.getPreferenceStrings(key: "hiddenIds")) ?? [])
-        let hiddenHash = try? await store.getPreferenceString(key: "hiddenPinHash")
-        let hiddenMD5 = try? await store.getPreferenceString(key: "hiddenPinMD5")
-        cachedHiddenPinHash = (hiddenHash?.isEmpty == false) ? hiddenHash : nil
-        cachedHiddenPinMD5 = (hiddenMD5?.isEmpty == false) ? hiddenMD5 : nil
-        var actions = conversationActions
-        actions.hiddenKnown = true
-        actions.loaded = true
-        actions.hiddenEnabled = true
-        actions.hasHiddenPIN = (cachedHiddenPinHash != nil) || (cachedHiddenPinMD5 != nil)
-        actions.hiddenIds = hiddenIds
-        actions.markUnreadEnabled = true
-        conversationActions = actions
-        rebuildConversationFlags()
-
-        await loadLabelsPreference(from: store)
+        pushCoreIdentitiesIfRunning()
         await loadNotificationPreferences(from: store)
-        rebuildConversationExtras()
     }
 
     // MARK: - Online Bootstrap & WebSocket Loop
@@ -668,13 +632,17 @@ final class ZaloEngine {
         async let archivedFetch = try? sessionClient.fetchArchivedChats()
         async let mutesFetch = try? sessionClient.fetchMuteList()
         let (pinsResult, archivedResult, mutesResult) = await (pinsFetch, archivedFetch, mutesFetch)
-        if let pins = pinsResult {
-            cachedPinnedIds = Set(pins)
-            try? await sqliteStore?.setPreferenceStrings(key: "pinnedIds", value: Array(cachedPinnedIds))
-        }
-        if let archived = archivedResult {
-            cachedArchivedIds = Set(archived)
-            try? await sqliteStore?.setPreferenceStrings(key: "archivedIds", value: Array(cachedArchivedIds))
+        if pinsResult != nil || archivedResult != nil {
+            if let pins = pinsResult {
+                cachedPinnedIds = Set(pins)
+            }
+            if let archived = archivedResult {
+                cachedArchivedIds = Set(archived)
+            }
+            if let core = coreLifecycle.core,
+               let v = try? await core.applyBootstrapPinArchive(pinnedIds: pinsResult, archivedIds: archivedResult) {
+                await waitForMirrorVersion(v)
+            }
         }
         if let mutesBox = mutesResult {
             var map = notificationSettings.mutes
@@ -819,53 +787,16 @@ final class ZaloEngine {
     }
 
     internal func resolveMissingConversationNames() async {
-        let missingUids = conversations.compactMap { conv -> String? in
-            guard !conv.isGroup, conv.id != selfConversationId else { return nil }
-            let trimmed = conv.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty || trimmed == conv.id || trimmed == "Người dùng Zalo" || conv.avatar == nil {
-                return conv.id
-            }
-            return nil
+        guard let core = await ensureCoreEngine() else { return }
+        if let v = try? await core.resolveMissingNames() {
+            await waitForMirrorVersion(v)
         }
-        guard !missingUids.isEmpty else { return }
-        var profilesCacheChanged = false
-        for offset in stride(from: 0, to: missingUids.count, by: 50) {
-            let chunk = Array(missingUids[offset..<min(offset + 50, missingUids.count)])
-            guard let box = try? await sessionClient.fetchProfiles(uids: chunk) else { continue }
-            let profilesMap = ZaloWireParser.extractProfilesMap(box.dict)
-            guard !profilesMap.isEmpty else { continue }
-            for (uid, row) in profilesMap {
-                let clean = ZaloWireParser.stripUserPrefix(uid)
-                let fetchedName = ZaloWireParser.preferredName(row)
-                let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
-                if !clean.isEmpty, (!fetchedName.isEmpty || !avt.isEmpty) {
-                    cachedProfiles[clean] = ZaloWebKitMigrator.CachedProfile(name: fetchedName, avatar: avt)
-                    profilesCacheChanged = true
-                }
-            }
-            var list = conversations
-            var changed = false
-            for i in list.indices {
-                guard !list[i].isGroup, let row = profilesMap[list[i].id] else { continue }
-                let alias = cachedAliases[list[i].id]
-                let fetchedName = ZaloWireParser.preferredName(row)
-                let bestName = (alias?.isEmpty == false) ? alias! : fetchedName
-                let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
-                if !bestName.isEmpty && list[i].name != bestName {
-                    list[i].name = bestName
-                    changed = true
-                }
-                if !avt.isEmpty && list[i].avatar == nil {
-                    list[i].avatar = URL(string: avt)
-                    changed = true
-                }
-            }
-            if changed {
-                conversations = list
-            }
-        }
-        if profilesCacheChanged, let data = try? JSONEncoder().encode(cachedProfiles) {
-            try? await sqliteStore?.setPreferenceData(key: "cachedProfiles", data: data)
+        if let store = sqliteStore,
+           let profData = try? await store.getPreferenceData(key: "cachedProfiles"),
+           let decoded = try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedProfile].self, from: profData) {
+            isApplyingCoreMirror = true
+            cachedProfiles = decoded
+            isApplyingCoreMirror = false
         }
     }
 
@@ -880,6 +811,30 @@ final class ZaloEngine {
         persistConversations: Bool = true,
         probeFreshness: Bool = false
     ) async -> Int {
+        let delta = await applyBatchResponseCollectingDelta(
+            root,
+            defaultCmd: defaultCmd,
+            fallbackConvId: fallbackConvId,
+            isGroupHint: isGroupHint,
+            incrementUnread: incrementUnread,
+            notifyIncoming: notifyIncoming,
+            persistConversations: persistConversations,
+            probeFreshness: probeFreshness
+        )
+        await commitBatchDeltaToCore(delta)
+        return Int(delta.appliedCount)
+    }
+
+    internal func applyBatchResponseCollectingDelta(
+        _ root: Any,
+        defaultCmd: UInt16 = 0,
+        fallbackConvId: String? = nil,
+        isGroupHint: Bool? = nil,
+        incrementUnread: Bool = false,
+        notifyIncoming: Bool = false,
+        persistConversations: Bool = true,
+        probeFreshness: Bool = false
+    ) async -> BatchApplyDeltaRecord {
         let myUid = profile?.userId ?? ""
         let effectiveRoot: Any
         if let rootDict = root as? [String: Any], !myUid.isEmpty {
@@ -901,12 +856,16 @@ final class ZaloEngine {
             nameLookup: { [weak self] uid in self?.lookupPersonInfo(uid) }
         )
         if probeFreshness { await probeHistoryFreshness(events) }
-        return await applyParsedEvents(
-            events, incrementUnread: incrementUnread, notifyIncoming: notifyIncoming, persistConversations: persistConversations)
+        return await applyParsedEventsCollectingDelta(
+            events,
+            incrementUnread: incrementUnread,
+            notifyIncoming: notifyIncoming,
+            persistConversations: persistConversations
+        )
     }
 
-    /// Applies parsed wire events: persists messages, applies reactions / recalls / deletes / typing, refreshes the
-    /// conversation list and raises notifications. Shared by the JSON path (`applyBatchResponse`) and the typed path.
+    /// Applies parsed wire events: persists messages, applies reactions / recalls / deletes / typing, commits the
+    /// resulting conversation delta to `olaz-core`, and raises notifications.
     @discardableResult
     internal func applyParsedEvents(
         _ events: [ParsedWireEvent],
@@ -914,11 +873,29 @@ final class ZaloEngine {
         notifyIncoming: Bool = false,
         persistConversations: Bool = true
     ) async -> Int {
+        let delta = await applyParsedEventsCollectingDelta(
+            events,
+            incrementUnread: incrementUnread,
+            notifyIncoming: notifyIncoming,
+            persistConversations: persistConversations
+        )
+        await commitBatchDeltaToCore(delta)
+        return Int(delta.appliedCount)
+    }
+
+    /// Applies message/reaction/recall/delete/typing side effects and returns the conversation delta for `olaz-core`.
+    internal func applyParsedEventsCollectingDelta(
+        _ events: [ParsedWireEvent],
+        incrementUnread: Bool = false,
+        notifyIncoming: Bool = false,
+        persistConversations: Bool = true
+    ) async -> BatchApplyDeltaRecord {
         let myUid = profile?.userId ?? ""
-        guard !events.isEmpty else { return 0 }
+        guard !events.isEmpty else {
+            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], persistConversations: false)
+        }
 
         var storedBatch: [StoredMessage] = []
-        var updatedSummaries = Dictionary(uniqueKeysWithValues: conversations.map { ($0.id, $0) })
         var unreadDeltaByConv: [String: Int] = [:]
         var latestByConv: [String: ChatMessage] = [:]
         var incomingForNotice: [ChatMessage] = []
@@ -987,7 +964,7 @@ final class ZaloEngine {
         for ev in events {
             switch ev {
             case .undo(let convId, let msgId, let cliMsgId):
-                await applyRemoteRecall(convId: convId, msgId: msgId, cliMsgId: cliMsgId)
+                await applyRemoteRecall(convId: convId, msgId: msgId, cliMsgId: cliMsgId, updateConversationPreview: false)
 
             case .delete(let convId, let msgId, let cliMsgId):
                 await applyRemoteDelete(convId: convId, msgId: msgId, cliMsgId: cliMsgId)
@@ -1002,48 +979,26 @@ final class ZaloEngine {
             }
         }
 
+        var updates: [ConvMessageDeltaRecord] = []
         if !latestByConv.isEmpty {
             var pollMsgs: [ChatMessage] = []
+            pollMsgs.reserveCapacity(latestByConv.count)
+            updates.reserveCapacity(latestByConv.count)
             for (convId, latest) in latestByConv {
                 pollMsgs.append(latest)
-                let isGrp = ZaloWireParser.isGroupId(convId)
-                let info = lookupConversationIdentity(convId)
-                let prevText = Self.messagePreviewLabel(latest)
-                let prev = ConversationSummary.Preview(text: prevText, date: latest.date, fromMe: latest.isMine)
-                let existing = updatedSummaries[convId]
-                let delta = unreadDeltaByConv[convId] ?? 0
-                let bestName = !info.name.isEmpty ? info.name : (!latest.isMine && !isGrp ? latest.senderName : (existing?.name ?? convId))
-                let effectivePrev: ConversationSummary.Preview? = {
-                    if let existingPrev = existing?.preview,
-                       (existingPrev.date ?? .distantPast) > latest.date {
-                        return existingPrev
-                    }
-                    return prev
-                }()
-                updatedSummaries[convId] = ConversationSummary(
-                    id: convId,
-                    isGroup: isGrp,
-                    name: bestName.isEmpty ? convId : bestName,
-                    avatar: info.avatar ?? existing?.avatar ?? (!isGrp && !latest.isMine ? latest.senderAvatar : nil),
-                    pinned: cachedPinnedIds.contains(convId),
-                    members: info.members > 0 ? info.members : (existing?.members ?? 0),
-                    unread: (existing?.unread ?? 0) + delta,
-                    preview: effectivePrev
-                )
+                updates.append(ConvMessageDeltaRecord(
+                    convId: convId,
+                    previewText: Self.messagePreviewLabel(latest),
+                    previewDateMs: Int64((latest.date.timeIntervalSince1970 * 1000).rounded()),
+                    previewFromMe: latest.isMine,
+                    isMine: latest.isMine,
+                    senderName: latest.senderName,
+                    senderAvatar: latest.senderAvatar?.absoluteString,
+                    unreadDelta: Int64(unreadDeltaByConv[convId] ?? 0)
+                ))
             }
             notePollMessages(pollMsgs)
         }
-
-        var list = Array(updatedSummaries.values)
-        sortConversations(&list)
-        if list != conversations {
-            conversations = list
-        }
-        if persistConversations {
-            await persistConversationsToSQLite()
-        }
-        rebuildConversationFlags()
-        rebuildConversationExtras()
 
         if notifyIncoming {
             for msg in incomingForNotice where !isConversationMuted(msg.conversationId) && notificationSettings.enabled {
@@ -1111,70 +1066,20 @@ final class ZaloEngine {
                 )
             }
         }
-        return events.count
+        return BatchApplyDeltaRecord(
+            appliedCount: UInt32(events.count),
+            updates: updates,
+            persistConversations: persistConversations
+        )
     }
 
     internal func ensureKnownContactsInConversations() {
-        var existing = Dictionary(uniqueKeysWithValues: conversations.map { ($0.id, $0) })
-        if let selfId = selfConversationId, !selfId.isEmpty, existing[selfId] == nil {
-            existing[selfId] = ConversationSummary(
-                id: selfId, isGroup: false, name: "Cloud của tôi", avatar: nil,
-                pinned: cachedPinnedIds.contains(selfId), members: 0, unread: 0, preview: nil
-            )
+        if let core = coreLifecycle.core {
+            core.ensureKnownContacts()
+            return
         }
-        for grp in contacts.groups where existing[grp.id] == nil {
-            existing[grp.id] = ConversationSummary(
-                id: grp.id, isGroup: true, name: grp.name, avatar: grp.avatar,
-                pinned: cachedPinnedIds.contains(grp.id), members: grp.members, unread: 0, preview: nil
-            )
-        }
-        for pinnedId in cachedPinnedIds where existing[pinnedId] == nil {
-            let info = lookupConversationIdentity(pinnedId)
-            existing[pinnedId] = ConversationSummary(
-                id: pinnedId,
-                isGroup: ZaloWireParser.isGroupId(pinnedId),
-                name: info.name.isEmpty ? pinnedId : info.name,
-                avatar: info.avatar,
-                pinned: true,
-                members: info.members,
-                unread: 0,
-                preview: nil
-            )
-        }
-        let knownGroupSet = Set(contacts.groups.map(\.id))
-        for (activeId, rank) in cachedActivityRanks where rank > 0 && existing[activeId] == nil {
-            let isGrp = ZaloWireParser.isGroupId(activeId)
-            if isGrp && !knownGroupSet.contains(activeId) && !contacts.groups.isEmpty {
-                continue
-            }
-            let info = lookupConversationIdentity(activeId)
-            existing[activeId] = ConversationSummary(
-                id: activeId,
-                isGroup: isGrp,
-                name: info.name.isEmpty ? activeId : info.name,
-                avatar: info.avatar,
-                pinned: cachedPinnedIds.contains(activeId),
-                members: info.members,
-                unread: 0,
-                preview: nil
-            )
-        }
-        // Apply updated friend/alias/group metadata to existing entries
-        for (id, var summary) in existing {
-            let info = lookupConversationIdentity(id)
-            if !info.name.isEmpty && summary.name != info.name {
-                summary.name = info.name
-            }
-            if let av = info.avatar { summary.avatar = av }
-            if info.members > 0 { summary.members = info.members }
-            summary.pinned = cachedPinnedIds.contains(id)
-            existing[id] = summary
-        }
-        var list = Array(existing.values)
-        sortConversations(&list)
-        if list != conversations {
-            conversations = list
-        }
+        let batch = offlineConversationsCore().ensureKnownContacts()
+        applyCoreChanges(batch)
     }
 
     /// Classifies a control envelope through `olaz-core` (`classify_control_envelope`) and dispatches
@@ -1241,16 +1146,9 @@ final class ZaloEngine {
 
     /// Stored list previews hold the text as sent: redo those that may carry an @mention from the newest stored message.
     internal func refreshMentionPreviews() async {
-        guard let store = sqliteStore else { return }
-        for conv in conversations where conv.isGroup && (conv.preview?.text.contains("@") ?? false) {
-            guard let latest = (try? await store.decodedMessages(convId: conv.id, limit: 1))?.last?.message,
-                  !latest.mentions.isEmpty,
-                  let idx = conversations.firstIndex(where: { $0.id == conv.id }),
-                  let preview = conversations[idx].preview,
-                  preview.text == Self.messagePreviewLabel(latest) else { continue }
-            let text = conversationPreviewText(latest)
-            guard text != preview.text else { continue }
-            conversations[idx].preview?.text = text
+        guard let core = await ensureCoreEngine() else { return }
+        if let v = try? await core.refreshMentionPreviews() {
+            await waitForMirrorVersion(v)
         }
     }
 
@@ -1492,59 +1390,28 @@ final class ZaloEngine {
     }
 
     internal func updateConversationOnMessage(_ msg: ChatMessage, incrementUnread: Bool) {
-        var list = conversations
-        let isGrp = ZaloWireParser.isGroupId(msg.conversationId)
-        let preview = ConversationSummary.Preview(
-            text: conversationPreviewText(msg),
-            date: msg.date,
-            fromMe: msg.isMine
-        )
-        if let idx = list.firstIndex(where: { $0.id == msg.conversationId }) {
-            var item = list[idx]
-            if (item.preview?.date ?? .distantPast) <= msg.date {
-                item.preview = preview
-            }
-            if incrementUnread {
-                item.unread += 1
-            }
-            // Nothing changed (re-merged history, an open without new messages): leave the list, its order and the store alone,
-            // so the conversation list is not re-diffed for nothing.
-            if item == list[idx] { return }
-            list[idx] = item
-        } else {
-            let identity = lookupConversationIdentity(msg.conversationId)
-            list.append(ConversationSummary(
-                id: msg.conversationId,
-                isGroup: isGrp,
-                name: identity.name.isEmpty ? msg.senderName : identity.name,
-                avatar: identity.avatar ?? msg.senderAvatar,
-                pinned: cachedPinnedIds.contains(msg.conversationId),
-                members: identity.members,
-                unread: incrementUnread ? 1 : 0,
-                preview: preview
-            ))
+        let input = messagePreviewInputRecord(for: msg)
+        if let core = coreLifecycle.core {
+            core.updateConversationOnMessage(msg: input, incrementUnread: incrementUnread)
+            return
         }
-        sortConversations(&list)
-        conversations = list
-        rebuildConversationFlags()
-        rebuildConversationExtras()
-        Task { await persistConversationsToSQLite() }
+        let batch = offlineConversationsCore().updateConversationOnMessage(msg: input, incrementUnread: incrementUnread)
+        applyCoreChanges(batch)
     }
 
     internal func sortConversations(_ list: inout [ConversationSummary]) {
-        list.sort { a, b in
-            if a.pinned != b.pinned { return a.pinned }
-            let ad = a.preview?.date ?? .distantPast
-            let bd = b.preview?.date ?? .distantPast
-            if ad != bd { return ad > bd }
-            let ra = cachedActivityRanks[a.id] ?? 0
-            let rb = cachedActivityRanks[b.id] ?? 0
-            if ra != rb { return ra > rb }
-            return a.id < b.id
-        }
+        let ranks = cachedActivityRanks.map { RankEntry(convId: $0.key, rank: $0.value) }
+        list = sortConversationsOrder(items: list.map(\.coreRecord), activityRanks: ranks)
+            .map(ConversationSummary.init(coreRecord:))
     }
 
     internal func persistConversationsToSQLite() async {
+        if let core = coreLifecycle.core {
+            if let v = try? await core.persistConversations() {
+                await waitForMirrorVersion(v)
+            }
+            return
+        }
         guard let store = sqliteStore else { return }
         let rows = conversations.map { c in
             StoredConversation(
@@ -1950,7 +1817,7 @@ final class ZaloEngine {
         }
     }
 
-    internal func applyRemoteRecall(convId: String, msgId: String, cliMsgId: String) async {
+    internal func applyRemoteRecall(convId: String, msgId: String, cliMsgId: String, updateConversationPreview: Bool = true) async {
         let targetId = !msgId.isEmpty ? msgId : cliMsgId
         guard !targetId.isEmpty else { return }
 
@@ -1981,7 +1848,7 @@ final class ZaloEngine {
                 try? await sqliteStore?.setPreferenceStrings(key: "starredIds", value: Array(cachedStarredIds))
             }
 
-            if wasLast, let convIdx = conversations.firstIndex(where: { $0.id == convId }) {
+            if updateConversationPreview, wasLast, let convIdx = conversations.firstIndex(where: { $0.id == convId }) {
                 var conv = conversations[convIdx]
                 if (conv.preview?.date ?? .distantPast) <= msgDate.addingTimeInterval(1) {
                     conv.preview = ConversationSummary.Preview(
@@ -1997,7 +1864,7 @@ final class ZaloEngine {
 
         try? await sqliteStore?.markRecalled(convId: convId, id: targetId, cliMsgId: cliMsgId)
 
-        if !updatedPreview,
+        if updateConversationPreview, !updatedPreview,
            let convIdx = conversations.firstIndex(where: { $0.id == convId }),
            let latest = try? await sqliteStore?.messages(convId: convId, limit: 1).first,
            latest.kindTag == "recalled" {
@@ -2031,13 +1898,8 @@ final class ZaloEngine {
     }
 
     nonisolated static func listOrder(_ conversations: [ConversationSummary]) -> [ConversationSummary] {
-        conversations.sorted { a, b in
-            if a.pinned != b.pinned { return a.pinned }
-            let ad = a.preview?.date ?? .distantPast
-            let bd = b.preview?.date ?? .distantPast
-            if ad != bd { return ad > bd }
-            return a.id < b.id
-        }
+        sortConversationsOrder(items: conversations.map(\.coreRecord), activityRanks: [])
+            .map(ConversationSummary.init(coreRecord:))
     }
 }
 

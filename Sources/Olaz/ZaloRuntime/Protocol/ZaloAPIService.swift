@@ -391,7 +391,7 @@ extension ZaloSessionClient {
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
         let entry: [[String: Any]] = [["thread_id": cleanId, "is_group": isGroup ? 1 : 0]]
-        let entryStr = (try? JSONSerialization.data(withJSONObject: entry)).map { String(decoding: $0, as: UTF8.self) } ?? "[]"
+        let entryStr = (try? JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys])).map { String(decoding: $0, as: UTF8.self) } ?? "[]"
         let addStr = hidden ? entryStr : "[]"
         let delStr = hidden ? "[]" : entryStr
         _ = try? await post(

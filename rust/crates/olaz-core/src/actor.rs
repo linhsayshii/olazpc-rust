@@ -11,16 +11,21 @@ use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::changes::{ChangeHub, CoreChanges};
-use crate::effect::Effect;
+use crate::conversations::{ConversationActionResult, PinBoard};
+use crate::effect::{Effect, OpResult};
 use crate::input::{Command, Input};
 use crate::reduce::reduce;
 use crate::runner::EffectRunner;
-use crate::state::{CoreState, SessionSnapshot};
+use crate::state::{CoreSnapshot, CoreState, SessionSnapshot};
 
 enum ActorMsg {
     Input {
         input: Box<Input>,
         ack: Option<oneshot::Sender<u64>>,
+    },
+    OpRequest {
+        cmd: Box<Command>,
+        reply: oneshot::Sender<OpResult>,
     },
     DrainChatPolling {
         max_batches: u32,
@@ -28,6 +33,7 @@ enum ActorMsg {
         reply: oneshot::Sender<u32>,
     },
     Snapshot(oneshot::Sender<SessionSnapshot>),
+    FullSnapshot(oneshot::Sender<CoreSnapshot>),
     Settle(oneshot::Sender<u64>),
     Stop,
 }
@@ -200,6 +206,60 @@ impl CoreHandle {
         ack_rx.await.ok()
     }
 
+    /// Sends a request-reply command and awaits its completion [`OpResult`].
+    pub async fn request(&self, command: Command) -> Option<OpResult> {
+        let (reply, rx) = oneshot::channel();
+        self.tracker.increment();
+        if self
+            .tx
+            .send(ActorMsg::OpRequest {
+                cmd: Box::new(command),
+                reply,
+            })
+            .is_err()
+        {
+            self.tracker.decrement();
+            return None;
+        }
+        rx.await.ok()
+    }
+
+    /// Awaits a request-reply command that completes with `OpResult::Unit`.
+    pub async fn request_unit(&self, command: Command) {
+        let _ = self.request(command).await;
+    }
+
+    /// Awaits a conversation action returning [`ConversationActionResult`].
+    pub async fn request_action(&self, command: Command) -> ConversationActionResult {
+        match self.request(command).await {
+            Some(OpResult::ActionResult(res)) => res,
+            _ => ConversationActionResult::fail(
+                "Chưa nhận được phản hồi. Hãy kiểm tra lại trước khi thử lại.",
+            ),
+        }
+    }
+
+    /// Awaits [`Command::RequestPinBoard`].
+    pub async fn request_pin_board(&self, id: String) -> Option<PinBoard> {
+        match self.request(Command::RequestPinBoard { id }).await {
+            Some(OpResult::PinBoard(board)) => board,
+            _ => None,
+        }
+    }
+
+    /// Awaits [`Command::HiddenSearch`].
+    pub async fn request_hidden_search(&self, query: String) -> Option<Vec<String>> {
+        match self.request(Command::HiddenSearch { query }).await {
+            Some(OpResult::HiddenSearch(ids)) => ids,
+            _ => None,
+        }
+    }
+
+    /// Awaits a request-reply command returning `bool` (e.g., `UnlockFromPinSearch`).
+    pub async fn request_bool(&self, command: Command) -> bool {
+        matches!(self.request(command).await, Some(OpResult::Bool(true)))
+    }
+
     /// Drains up to `max_batches` long-poll batches serialized behind any in-flight drain
     /// (ADR-018) and returns the total applied event count (`0` if long-poll or actor is stopped).
     pub async fn drain_chat_polling(&self, max_batches: u32, notify_incoming: bool) -> u32 {
@@ -245,6 +305,15 @@ impl CoreHandle {
     pub async fn snapshot(&self) -> Option<SessionSnapshot> {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(ActorMsg::Snapshot(tx)).is_err() {
+            return None;
+        }
+        rx.await.ok()
+    }
+
+    /// Reads the full [`CoreSnapshot`] across session and conversations domains.
+    pub async fn full_snapshot(&self) -> Option<CoreSnapshot> {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(ActorMsg::FullSnapshot(tx)).is_err() {
             return None;
         }
         rx.await.ok()
@@ -320,6 +389,27 @@ impl Drop for CoreHandle {
     }
 }
 
+struct ActorWaiters {
+    drains: HashMap<u64, oneshot::Sender<u32>>,
+    ops: HashMap<u64, oneshot::Sender<OpResult>>,
+    next_op_id: u64,
+}
+
+impl ActorWaiters {
+    fn new() -> Self {
+        Self {
+            drains: HashMap::new(),
+            ops: HashMap::new(),
+            next_op_id: 0,
+        }
+    }
+
+    fn alloc_op_id(&mut self) -> u64 {
+        self.next_op_id = self.next_op_id.saturating_add(1);
+        self.next_op_id
+    }
+}
+
 fn dispatch_reduce_output(
     state: &CoreState,
     out: crate::reduce::ReduceOutput,
@@ -327,22 +417,31 @@ fn dispatch_reduce_output(
     sink: &ActorSink,
     changes: &Arc<ChangeHub>,
     state_notify: &Arc<Notify>,
-    drain_waiters: &mut HashMap<u64, oneshot::Sender<u32>>,
+    waiters: &mut ActorWaiters,
 ) -> u64 {
     let version = changes.publish(&out.dirty, state);
     if !out.effects.is_empty() {
         let mut runner_effects = Vec::with_capacity(out.effects.len());
         for effect in out.effects {
-            if let Effect::CompleteDrain {
-                drain_id,
-                total_events,
-            } = effect
-            {
-                if let Some(waiter) = drain_waiters.remove(&drain_id) {
-                    let _ = waiter.send(total_events);
+            match effect {
+                Effect::CompleteDrain {
+                    drain_id,
+                    total_events,
+                } => {
+                    if let Some(waiter) = waiters.drains.remove(&drain_id) {
+                        let _ = waiter.send(total_events);
+                    }
                 }
-            } else {
-                runner_effects.push(effect);
+                Effect::CompleteOp {
+                    op_id,
+                    result,
+                    after_store: false,
+                } => {
+                    if let Some(waiter) = waiters.ops.remove(&op_id) {
+                        let _ = waiter.send(result);
+                    }
+                }
+                other => runner_effects.push(other),
             }
         }
         if !runner_effects.is_empty() {
@@ -364,7 +463,7 @@ async fn run_actor(
     tracker: Arc<ActivityTracker>,
     state_notify: Arc<Notify>,
 ) {
-    let mut drain_waiters: HashMap<u64, oneshot::Sender<u32>> = HashMap::new();
+    let mut waiters = ActorWaiters::new();
     while let Some(msg) = rx.recv().await {
         match msg {
             ActorMsg::Input { input, ack } => {
@@ -376,12 +475,27 @@ async fn run_actor(
                     &sink,
                     &changes,
                     &state_notify,
-                    &mut drain_waiters,
+                    &mut waiters,
                 );
                 if let Some(reply) = ack {
                     let _ = reply.send(version);
                 }
                 // Decrement AFTER dispatching effects so their InFlightGuards are already active.
+                tracker.decrement();
+            }
+            ActorMsg::OpRequest { cmd, reply } => {
+                let op_id = waiters.alloc_op_id();
+                waiters.ops.insert(op_id, reply);
+                let out = reduce(&mut state, Input::OpRequest { op_id, cmd: *cmd });
+                let _ = dispatch_reduce_output(
+                    &state,
+                    out,
+                    &runner,
+                    &sink,
+                    &changes,
+                    &state_notify,
+                    &mut waiters,
+                );
                 tracker.decrement();
             }
             ActorMsg::DrainChatPolling {
@@ -390,7 +504,7 @@ async fn run_actor(
                 reply,
             } => {
                 let drain_id = state.transport.alloc_drain_id();
-                drain_waiters.insert(drain_id, reply);
+                waiters.drains.insert(drain_id, reply);
                 let out = reduce(
                     &mut state,
                     Input::DrainRequested {
@@ -406,12 +520,15 @@ async fn run_actor(
                     &sink,
                     &changes,
                     &state_notify,
-                    &mut drain_waiters,
+                    &mut waiters,
                 );
                 tracker.decrement();
             }
             ActorMsg::Snapshot(reply) => {
                 let _ = reply.send(state.session.snapshot());
+            }
+            ActorMsg::FullSnapshot(reply) => {
+                let _ = reply.send(state.full_snapshot());
             }
             ActorMsg::Settle(reply) => {
                 let _ = reply.send(changes.current_version());
@@ -421,9 +538,10 @@ async fn run_actor(
             }
         }
     }
-    for (_, waiter) in drain_waiters.drain() {
+    for (_, waiter) in waiters.drains.drain() {
         let _ = waiter.send(0);
     }
+    waiters.ops.clear();
     runner.shutdown();
     changes.close();
     state_notify.notify_waiters();

@@ -292,6 +292,7 @@ struct TransportRecorderTests {
                         throw RecorderError.timeout(scenario: scenario.name, detail: "\(error)")
                     }
                 } else if let label = step["snapshot"]?.stringValue {
+                    await engine.settleForRecording()
                     snapshots[label] = transitionRecorder.currentCursorSnapshot()
                 } else {
                     throw RecorderError.invalidStep(scenario: scenario.name, detail: "Unknown step: \(step.canonicalString())")

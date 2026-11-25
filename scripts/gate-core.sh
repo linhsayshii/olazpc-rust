@@ -194,9 +194,20 @@ run_quiet 5 "swift build && swift test" zsh -c '
 echo "check 5 PASS: swift build and swift test"
 
 # 6. Recorder freshness (including slow cases)
-run_quiet 6 "${DOMAIN_CAP}RecorderTests freshness" zsh -c '
+case "$DOMAIN" in
+    conversations)
+        RECORDER_FILTER="ConversationRecorderTests/testConversationsCases"
+        ;;
+    conversation_actions)
+        RECORDER_FILTER="ConversationRecorderTests/testConversationActionsCases"
+        ;;
+    *)
+        RECORDER_FILTER="${DOMAIN_CAP}RecorderTests"
+        ;;
+esac
+run_quiet 6 "${RECORDER_FILTER} freshness" zsh -c '
     set -euo pipefail
     cd "$1"
-    OLAZ_SLOW_CASES=1 swift test --filter "${2}RecorderTests"
-' _ "$ROOT" "$DOMAIN_CAP"
-echo "check 6 PASS: ${DOMAIN_CAP}RecorderTests (with OLAZ_SLOW_CASES=1)"
+    OLAZ_SLOW_CASES=1 swift test --filter "$2"
+' _ "$ROOT" "$RECORDER_FILTER"
+echo "check 6 PASS: ${RECORDER_FILTER} (with OLAZ_SLOW_CASES=1)"

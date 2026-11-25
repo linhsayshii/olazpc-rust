@@ -117,6 +117,7 @@ final class FakeZaloServer: @unchecked Sendable {
     private var hadWSUpgrade = false
     private var waiters: [() -> Void] = []
     private var refuseNewConnections = false
+    private let wsAuthManual: Bool
     private(set) var port: UInt16 = 0
     private var stopped = false
 
@@ -124,7 +125,7 @@ final class FakeZaloServer: @unchecked Sendable {
     private static let fixedWSIV = Data("0123456789abcdef".utf8)
     private static let fixedWSAAD = Data("fedcba9876543210".utf8)
 
-    init(serverScript: [CaseJSON], initialSecretKey: Data? = nil) throws {
+    init(serverScript: [CaseJSON], initialSecretKey: Data? = nil, wsAuthManual: Bool = false) throws {
         self.entries = serverScript.map { item in
             let kind = item["kind"]?.stringValue ?? "http"
             let path = item["path"]?.stringValue ?? "/"
@@ -155,6 +156,7 @@ final class FakeZaloServer: @unchecked Sendable {
         }
         self.customHTTPHandler = nil
         self.sessionSecretKey = initialSecretKey
+        self.wsAuthManual = wsAuthManual
         self.listener = try NWListener(using: .tcp)
     }
 
@@ -162,6 +164,7 @@ final class FakeZaloServer: @unchecked Sendable {
         self.entries = []
         self.customHTTPHandler = httpHandler
         self.sessionSecretKey = nil
+        self.wsAuthManual = false
         self.listener = try NWListener(using: .tcp)
     }
 
@@ -229,6 +232,22 @@ final class FakeZaloServer: @unchecked Sendable {
     func waitForConsumed(path: String, timeoutMs: Int = 2000) async {
         _ = await waitUntil(timeoutMs: timeoutMs) {
             entries.allSatisfy { ($0.kind != "http" && $0.kind != "ws") || $0.path != path || $0.repeat || $0.isRefused || $0.consumed }
+        }
+    }
+
+    func httpRequestCount(path: String) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedRequests.filter {
+            $0["kind"]?.stringValue == "http" && $0["path"]?.stringValue == path
+        }.count
+    }
+
+    func waitForHTTPRequests(path: String, atLeast: Int, timeoutMs: Int = 2000) async {
+        _ = await waitUntil(timeoutMs: timeoutMs) {
+            recordedRequests.filter {
+                $0["kind"]?.stringValue == "http" && $0["path"]?.stringValue == path
+            }.count >= atLeast
         }
     }
 
@@ -751,7 +770,7 @@ final class FakeZaloServer: @unchecked Sendable {
             break
         }
         var autoAuthFrame: (Int, ScriptEntry)?
-        if let wsIdx = foundIndex, entries[wsIdx].accept {
+        if !wsAuthManual, let wsIdx = foundIndex, entries[wsIdx].accept {
             let nextIdx = wsIdx + 1
             if entries.indices.contains(nextIdx),
                !entries[nextIdx].consumed,
@@ -1088,7 +1107,10 @@ final class FakeZaloServer: @unchecked Sendable {
         lock.lock()
         recordedRequests.append(req)
         if unscripted { hasUnscripted = true }
+        let pendingWaiters = waiters
+        waiters.removeAll()
         lock.unlock()
+        for w in pendingWaiters { w() }
     }
 
     private func sendHTTP(connection: NWConnection, status: Int, headers: [String: String], body: Data) {

@@ -55,6 +55,7 @@ fn ready_seed(suppress: &[&str]) -> Seed {
         poll_state: None,
         ws_cursors: None,
         suppress: suppress.iter().map(|s| (*s).to_owned()).collect(),
+        ..Seed::default()
     }
 }
 
@@ -151,6 +152,8 @@ fn step_start() -> Step {
     Step::Cmd {
         cmd: "start".to_owned(),
         args: json!({}),
+        now_ms: None,
+        rand4: None,
     }
 }
 
@@ -1185,6 +1188,8 @@ async fn t25_lp_stopped_on_logout() {
             Step::Cmd {
                 cmd: "log_out".to_owned(),
                 args: json!({}),
+                now_ms: None,
+                rand4: None,
             },
             step_await_host("reset_domains"),
         ],
@@ -1230,6 +1235,8 @@ async fn t26_drain_command_four_batches_flags_false_and_serialized() {
             Step::Cmd {
                 cmd: "drain_chat_polling".to_owned(),
                 args: json!({ "max_batches": 4, "notify_incoming": false }),
+                now_ms: None,
+                rand4: None,
             },
         ],
     );
@@ -1322,7 +1329,11 @@ async fn adr018_concurrent_drains_are_serialized() {
         Input::PollBatchApplied {
             lp_gen: 1,
             drain_id: d1,
-            applied_count: 3,
+            delta: olaz_core::BatchApplyDelta {
+                applied_count: 3,
+                updates: Vec::new(),
+                persist_conversations: false,
+            },
         },
     );
     assert!(matches!(
@@ -1352,7 +1363,11 @@ async fn adr018_concurrent_drains_are_serialized() {
         Input::PollBatchApplied {
             lp_gen: 1,
             drain_id: d2,
-            applied_count: 5,
+            delta: olaz_core::BatchApplyDelta {
+                applied_count: 5,
+                updates: Vec::new(),
+                persist_conversations: false,
+            },
         },
     );
     let periodic_id = match out_done2.effects.as_slice() {
@@ -1388,7 +1403,11 @@ async fn adr018_concurrent_drains_are_serialized() {
         Input::PollBatchApplied {
             lp_gen: 1,
             drain_id: periodic_id,
-            applied_count: 1,
+            delta: olaz_core::BatchApplyDelta {
+                applied_count: 1,
+                updates: Vec::new(),
+                persist_conversations: false,
+            },
         },
     );
     assert!(matches!(
@@ -1442,8 +1461,12 @@ async fn core_handle_drain_chat_polling_returns_total_event_count() {
             _increment_unread: bool,
             _notify_incoming: bool,
             _payload: Map<String, Value>,
-        ) -> u32 {
-            4
+        ) -> olaz_core::BatchApplyDelta {
+            olaz_core::BatchApplyDelta {
+                applied_count: 4,
+                updates: Vec::new(),
+                persist_conversations: false,
+            }
         }
         async fn apply_parsed_events(
             &self,
@@ -1451,7 +1474,8 @@ async fn core_handle_drain_chat_polling_returns_total_event_count() {
             _increment_unread: bool,
             _notify_incoming: bool,
             _envelope: olaz_core::TypedChatEnvelope,
-        ) {
+        ) -> olaz_core::BatchApplyDelta {
+            olaz_core::BatchApplyDelta::default()
         }
         async fn mobile_sync(&self, _events: Vec<olaz_core::MobileSyncEvent>) {}
         async fn e2ee_signal(&self, _cmd: u16, _payload: Map<String, Value>) {}
