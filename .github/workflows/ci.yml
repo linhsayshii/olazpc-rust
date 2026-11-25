@@ -1,8 +1,10 @@
 name: CI
 
 on:
+  # Branch pushes are tested by their PR; pushing to feature branches here would take the macOS runners
+  # that stress.yml needs (5 at a time).
   push:
-    branches: [main, "feat/**", "fix/**"]
+    branches: [main]
     tags-ignore: ["v*"]
   pull_request:
   workflow_dispatch:
