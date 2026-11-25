@@ -1873,34 +1873,29 @@ final class GroupRecorderTests: XCTestCase {
     }
 }
 
-private final class GroupTransitionRecorder: @unchecked Sendable {
+@MainActor
+private final class GroupTransitionRecorder {
     private let scenarioName: String
-    private let captureState: @MainActor () async -> CaseJSON
+    private let captureState: () -> CaseJSON
     private var history: [CaseJSON] = []
-    private var lastSerialized: String?
     private var searchFromIndex = 0
     private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
 
-    init(scenarioName: String, captureState: @escaping @MainActor () async -> CaseJSON) {
+    init(scenarioName: String, captureState: @escaping () -> CaseJSON) {
         self.scenarioName = scenarioName
         self.captureState = captureState
     }
 
-    @MainActor
     func recordTransition() {
-        Task { @MainActor in
-            let state = await captureState()
-            let canonical = state.canonicalString()
-            if canonical == self.lastSerialized {
-                return
-            }
-            self.lastSerialized = canonical
-            self.history.append(state)
-            let pending = self.waiters
-            self.waiters.removeAll()
-            for cont in pending.values {
-                cont.resume()
-            }
+        let state = captureState()
+        if history.last == state {
+            return
+        }
+        history.append(state)
+        let pending = waiters
+        waiters.removeAll()
+        for cont in pending.values {
+            cont.resume()
         }
     }
 
@@ -2267,7 +2262,7 @@ enum GroupRecorderHarness {
         }
 
         let transitionRecorder = GroupTransitionRecorder(scenarioName: scenario.name) {
-            normalizeRecordedURLs(await GroupSnapshot.capture(from: engine))
+            normalizeRecordedURLs(SessionSnapshot.capture(from: engine))
         }
         engine.stateTrace = { [weak transitionRecorder] in
             transitionRecorder?.recordTransition()
