@@ -1174,6 +1174,189 @@ final class ContactRecorderTests: XCTestCase {
                     .object(["cmd": .string("mention_name"), "args": .object(["uid": .string("3000975")])]),
                 ]
             ),
+
+            // 13. blocked_load
+            ContactRecorderHarness.ScenarioDef(
+                name: "blocked_load",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000913",
+                    displayName: "Contacts User 13",
+                    suppress: ["ws", "long_poll"]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000913", displayName: "Contacts User 13"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000913", displayName: "Contacts User 13"),
+                    // 1. fail from nil -> []
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/blocklistv2",
+                        method: "GET",
+                        status: 500,
+                        json: .object(["error_code": .int(500), "error_message": .string("Block list failed")])
+                    ),
+                    // 2. page 1 with has_more=1
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/blocklistv2",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "has_more": .int(1),
+                                "profiles": .array([
+                                    .object([
+                                        "userId": .string("u3000981"),
+                                        "displayName": .string("Blocked One"),
+                                        "avatar": .string("https://cdn.example.invalid/b1.jpg"),
+                                    ]),
+                                    .object([
+                                        "uid": .string("3000982"),
+                                        "zaloName": .string("Blocked Two"),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    // 3. page 2 with has_more=0
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/blocklistv2",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "has_more": .int(0),
+                                "profiles": .array([
+                                    .object([
+                                        "userId": .string("3000983"),
+                                        "displayName": .string(""),
+                                        "zaloName": .string(""),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    // 4. fail when already loaded -> kept
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/blocklistv2",
+                        method: "GET",
+                        status: 500,
+                        json: .object(["error_code": .int(500), "error_message": .string("Block list failed again")])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("load_blocked")]),
+                    .object(["snapshot": .string("fail_from_nil")]),
+                    .object(["cmd": .string("load_blocked")]),
+                    .object(["snapshot": .string("loaded_two_pages")]),
+                    .object(["cmd": .string("load_blocked")]),
+                ]
+            ),
+
+            // 14. blocked_set
+            ContactRecorderHarness.ScenarioDef(
+                name: "blocked_set",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000914",
+                    displayName: "Contacts User 14",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "open_conversation_id": .string("3000981"),
+                        "blocked_users": .array([
+                            .object([
+                                "id": .string("3000980"),
+                                "name": .string("Existing Blocked"),
+                                "avatar": .null,
+                            ]),
+                        ]),
+                        "contacts": .object([
+                            "friends": .array([
+                                .object([
+                                    "id": .string("3000981"),
+                                    "name": .string("Alice Identity"),
+                                    "zalo_name": .string("Alice Identity"),
+                                    "avatar": .string("https://cdn.example.invalid/a981.jpg"),
+                                ]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000914", displayName: "Contacts User 14"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000914", displayName: "Contacts User 14"),
+                    ContactRecorderHarness.httpScript(path: "/api/friend/block", method: "POST", json: .object(["error_code": .int(0), "data": .object([:])])),
+                    ContactRecorderHarness.httpScript(path: "/api/friend/block", method: "POST", json: .object(["error_code": .int(0), "data": .object([:])])),
+                    ContactRecorderHarness.httpScript(path: "/api/friend/unblock", method: "POST", json: .object(["error_code": .int(0), "data": .object([:])])),
+                    ContactRecorderHarness.httpScript(path: "/api/friend/block", method: "POST", json: .object(["error_code": .int(0), "data": .object([:])])),
+                    ContactRecorderHarness.httpScript(path: "/api/friend/block", method: "POST", json: .object(["error_code": .int(0), "data": .object([:])])),
+                    ContactRecorderHarness.httpScript(path: "/api/friend/block", method: "POST", json: .object(["error_code": .int(0), "data": .object([:])])),
+                    ContactRecorderHarness.httpScript(path: "/api/friend/block", method: "POST", status: 500, json: .object(["error_code": .int(500), "error_message": .string("Block failed")])),
+                    ContactRecorderHarness.httpScript(path: "/api/friend/unblock", method: "POST", status: 500, json: .object(["error_code": .int(500), "error_message": .string("Unblock failed")])),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("set_blocked"), "args": .object(["uid": .string("3000981"), "blocked": .bool(true), "name": .string("Explicit Blocked")])]),
+                    .object(["snapshot": .string("block_with_name")]),
+                    .object(["cmd": .string("set_blocked"), "args": .object(["uid": .string("3000980"), "blocked": .bool(true), "name": .string("")])]),
+                    .object(["snapshot": .string("block_existing_to_front")]),
+                    .object(["cmd": .string("set_blocked"), "args": .object(["uid": .string("3000981"), "blocked": .bool(false), "name": .string("")])]),
+                    .object(["snapshot": .string("unblock")]),
+                    .object(["cmd": .string("set_blocked"), "args": .object(["uid": .string("3000981"), "blocked": .bool(true), "name": .string("")])]),
+                    .object(["snapshot": .string("block_identity_name")]),
+                    .object(["cmd": .string("set_blocked"), "args": .object(["uid": .string("3000982"), "blocked": .bool(true), "name": .string("")])]),
+                    .object(["snapshot": .string("block_empty_name")]),
+                    .object(["cmd": .string("set_blocked"), "args": .object(["uid": .string("u3000983"), "blocked": .bool(true), "name": .string("Prefixed User")])]),
+                    .object(["snapshot": .string("block_prefixed")]),
+                    .object(["cmd": .string("set_blocked"), "args": .object(["uid": .string("3000984"), "blocked": .bool(true), "name": .string("Fail Block")])]),
+                    .object(["snapshot": .string("block_fail")]),
+                    .object(["cmd": .string("set_blocked"), "args": .object(["uid": .string("3000980"), "blocked": .bool(false), "name": .string("")])]),
+                ]
+            ),
+
+            // 15. alias_save
+            ContactRecorderHarness.ScenarioDef(
+                name: "alias_save",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000915",
+                    displayName: "Contacts User 15",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "contacts": .object([
+                            "friends": .array([
+                                .object([
+                                    "id": .string("3000991"),
+                                    "name": .string("Original Friend"),
+                                    "zalo_name": .string("Original Friend"),
+                                    "avatar": .string("https://cdn.example.invalid/f991.jpg"),
+                                ]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000915", displayName: "Contacts User 15"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000915", displayName: "Contacts User 15"),
+                    ContactRecorderHarness.httpScript(path: "/api/alias/update", method: "GET", json: .object(["error_code": .int(0), "data": .object([:])])),
+                    ContactRecorderHarness.httpScript(path: "/api/alias/update", method: "GET", json: .object(["error_code": .int(0), "data": .object([:])])),
+                    ContactRecorderHarness.httpScript(path: "/api/alias/remove", method: "GET", json: .object(["error_code": .int(0), "data": .object([:])])),
+                    ContactRecorderHarness.httpScript(path: "/api/alias/update", method: "GET", status: 500, json: .object(["error_code": .int(500), "error_message": .string("Alias failed")])),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("save_alias"), "args": .object(["uid": .string("3000991"), "name": .string("  Tên Gợi Nhớ 1  ")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("3000991")])]),
+                    .object(["snapshot": .string("after_set")]),
+                    .object(["cmd": .string("save_alias"), "args": .object(["uid": .string("3000991"), "name": .string("Tên Gợi Nhớ 2")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("3000991")])]),
+                    .object(["snapshot": .string("after_change")]),
+                    .object(["cmd": .string("save_alias"), "args": .object(["uid": .string("3000991"), "name": .string("   ")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("3000991")])]),
+                    .object(["snapshot": .string("after_clear")]),
+                    .object(["cmd": .string("save_alias"), "args": .object(["uid": .string("3000991"), "name": .string("Will Fail")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("3000991")])]),
+                ]
+            ),
         ]
     }
 }
