@@ -1390,3 +1390,187 @@ async fn send_text_carries_text_properties() {
     .unwrap();
     assert!(params_of(&last(&api)).get("textProperties").is_none());
 }
+
+// ---------------------------------------------------------------- U3 conversation action endpoints
+
+#[tokio::test]
+async fn update_pinned_conversation_formats_user_and_group_wire_ids() {
+    let api = api_ok();
+    api.update_pinned_conversation("3000202", true)
+        .await
+        .unwrap();
+    let req = last(&api);
+    assert_service(&api, &req, "conversation");
+    assert_eq!(req.path(), "/api/pinconvers/updatev2");
+    assert_eq!(
+        params_of(&req),
+        json!({"actionType": 1, "conversations": ["u3000202"], "tab": 0})
+    );
+
+    api.update_pinned_conversation("g900001", false)
+        .await
+        .unwrap();
+    let req = last(&api);
+    assert_eq!(
+        params_of(&req),
+        json!({"actionType": 2, "conversations": ["g900001"], "tab": 0})
+    );
+}
+
+#[tokio::test]
+async fn update_archived_chat_uses_tracked_version_and_action_type() {
+    let api = api_with(|req| {
+        if req.path() == "/api/archivedchat/list" {
+            ok(json!({"version": 7, "items": []}))
+        } else {
+            ok(json!({}))
+        }
+    });
+    api.fetch_archived_chats().await.unwrap();
+    assert_eq!(api.archived_version(), 7);
+
+    api.update_archived_chat("3000271", true).await.unwrap();
+    let req = last(&api);
+    assert_service(&api, &req, "label");
+    assert_eq!(req.path(), "/api/archivedchat/update");
+    assert_eq!(
+        params_of(&req),
+        json!({
+            "ids": [{"id": "3000271", "type": 0}],
+            "version": 7,
+            "actionType": 0,
+            "imei": "imei-1",
+        })
+    );
+
+    api.update_archived_chat("g555", false).await.unwrap();
+    let req = last(&api);
+    assert_eq!(
+        params_of(&req),
+        json!({
+            "ids": [{"id": "555", "type": 1}],
+            "version": 7,
+            "actionType": 1,
+            "imei": "imei-1",
+        })
+    );
+}
+
+#[tokio::test]
+async fn update_conversation_labels_tracks_version_across_calls() {
+    let api = api_with(|_| ok(json!({"version": 42})));
+    api.update_conversation_labels(r#"[{"id":1}]"#)
+        .await
+        .unwrap();
+    let req = last(&api);
+    assert_service(&api, &req, "label");
+    assert_eq!(req.path(), "/api/convlabel/update");
+    assert_eq!(
+        params_of(&req),
+        json!({"labelData": r#"[{"id":1}]"#, "version": 0, "imei": "imei-1"})
+    );
+    assert_eq!(api.label_version(), 42);
+
+    api.update_conversation_labels(r#"[]"#).await.unwrap();
+    assert_eq!(params_of(&last(&api))["version"], json!(42));
+}
+
+#[tokio::test]
+async fn delete_conversation_routes_dm_and_group_and_generates_fallback_cli_id() {
+    let api = api_ok();
+    api.delete_conversation("3000281", "m281_last")
+        .await
+        .unwrap();
+    let req = last(&api);
+    assert_service(&api, &req, "chat");
+    assert_eq!(req.path(), "/api/message/deleteconver");
+    assert_eq!(
+        params_of(&req),
+        json!({
+            "toid": "3000281",
+            "cliMsgId": "m281_last",
+            "conver": {},
+            "onlyMe": 1,
+            "imei": "imei-1",
+        })
+    );
+
+    api.delete_conversation("g888", "").await.unwrap();
+    let req = last(&api);
+    assert_service(&api, &req, "group");
+    assert_eq!(req.path(), "/api/group/deleteconver");
+    let p = params_of(&req);
+    assert_eq!(p["grid"], json!("888"));
+    assert_eq!(p["conver"], json!({}));
+    assert_eq!(p["onlyMe"], json!(1));
+    assert!(!p["cliMsgId"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn hidden_conversation_endpoints_match_wire_contract() {
+    let api = api_with(|req| match req.path().as_str() {
+        "/api/hiddenconvers/get-all" => ok(json!({
+            "pin": " 81DC9BDB52D04DC20036DBD8313ED055 ",
+            "threads": [
+                {"thread_id": " 3000301 ", "is_group": 0},
+                {"threadId": "90001", "isGroup": true},
+                {"thread_id": "3000301", "is_group": 0},
+                {"thread_id": "0", "is_group": 0},
+                {"thread_id": "g0", "is_group": 1}
+            ]
+        })),
+        _ => ok(json!({})),
+    });
+
+    let snap = api.fetch_hidden_conversations().await.unwrap();
+    assert_eq!(snap.pin, "81dc9bdb52d04dc20036dbd8313ed055");
+    assert_eq!(snap.thread_ids, vec!["3000301", "g90001"]);
+    let req = last(&api);
+    assert_service(&api, &req, "conversation");
+    assert_eq!(req.path(), "/api/hiddenconvers/get-all");
+    assert_eq!(params_of(&req), json!({"imei": "imei-1"}));
+
+    api.set_hidden_conversation("3000301", true).await.unwrap();
+    let req = last(&api);
+    assert_eq!(req.path(), "/api/hiddenconvers/add-remove");
+    assert_eq!(
+        params_of(&req),
+        json!({
+            "add_threads": r#"[{"is_group":0,"thread_id":"3000301"}]"#,
+            "del_threads": "[]",
+            "imei": "imei-1",
+        })
+    );
+
+    api.set_hidden_conversation("g90001", false).await.unwrap();
+    assert_eq!(
+        params_of(&last(&api)),
+        json!({
+            "add_threads": "[]",
+            "del_threads": r#"[{"is_group":1,"thread_id":"90001"}]"#,
+            "imei": "imei-1",
+        })
+    );
+
+    api.update_hidden_pin("1234").await.unwrap();
+    let req = last(&api);
+    assert_eq!(req.path(), "/api/hiddenconvers/update-pin");
+    assert_eq!(
+        params_of(&req),
+        json!({
+            "new_pin": "81dc9bdb52d04dc20036dbd8313ed055",
+            "imei": "imei-1",
+        })
+    );
+
+    let err = api.update_hidden_pin("").await.unwrap_err();
+    assert_eq!(
+        err,
+        ApiError::Net(NetError::InvalidUrl("hiddenconvers:update-pin".to_owned()))
+    );
+
+    api.reset_hidden_pin().await.unwrap();
+    let req = last(&api);
+    assert_eq!(req.path(), "/api/hiddenconvers/reset");
+    assert!(req.query_value("params").is_none());
+}

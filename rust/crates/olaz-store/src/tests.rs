@@ -1163,3 +1163,45 @@ fn open_drops_stored_provisional_twins() {
     assert!(store.message("c", "cli2").unwrap().is_some());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn set_conversation_preview_allows_rollback_and_empty_clear() {
+    let dir = std::env::temp_dir().join(format!("olaz-set-conv-preview-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("store.sqlite");
+    let mut store = Store::open(&path).unwrap();
+    store
+        .save_conversations(&[StoredConversation {
+            id: "c1".into(),
+            is_group: false,
+            name: "Peer".into(),
+            avatar: String::new(),
+            pinned: false,
+            members: 0,
+            unread: 1,
+            preview_text: "Latest".into(),
+            preview_ts_ms: 2_000,
+            preview_from_me: false,
+            updated_at_ms: 2_000,
+        }])
+        .unwrap();
+
+    // Roll back to an older message timestamp (save_conversations would refuse because 1_000 < 2_000).
+    store
+        .set_conversation_preview("c1", "Earlier", 1_000, true, 3_000)
+        .unwrap();
+    let row = store.load_conversations().unwrap().remove(0);
+    assert_eq!(row.preview_text, "Earlier");
+    assert_eq!(row.preview_ts_ms, 1_000);
+    assert!(row.preview_from_me);
+
+    // Clear when no message remains.
+    store
+        .set_conversation_preview("c1", "", 0, false, 4_000)
+        .unwrap();
+    let row = store.load_conversations().unwrap().remove(0);
+    assert_eq!(row.preview_text, "");
+    assert_eq!(row.preview_ts_ms, 0);
+    assert!(!row.preview_from_me);
+    let _ = std::fs::remove_dir_all(&dir);
+}

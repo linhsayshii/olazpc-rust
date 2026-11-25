@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import OlazCore
 
 extension ZaloEngine {
     // MARK: - Open / Close / History
@@ -745,37 +746,17 @@ extension ZaloEngine {
 
     func markRead(_ id: String) {
         guard !id.isEmpty else { return }
-        var extrasChanged = false
+        let seenTarget: SeenTargetRecord? = {
+            guard let last = messages[id]?.last, !last.isMine else { return nil }
+            return SeenTargetRecord(convId: id, msgId: last.id, cliMsgId: last.id, senderId: last.senderId)
+        }()
+        if let core = coreLifecycle.core {
+            core.markConversationRead(id: id, seenTarget: seenTarget)
+            return
+        }
         if let idx = conversations.firstIndex(where: { $0.id == id }), conversations[idx].unread > 0 {
             conversations[idx].unread = 0
-            extrasChanged = true
         }
-        let hadUnreadMark = cachedUnreadMarks.remove(id) != nil
-        if hadUnreadMark {
-            rebuildConversationFlags()
-            extrasChanged = true
-            let key = UUID()
-            let t = Task { @MainActor [weak self] in
-                defer { self?.markReadTasks.removeValue(forKey: key) }
-                guard let self else { return }
-                try? await self.sqliteStore?.setPreferenceStrings(key: "unreadMarks", value: Array(self.cachedUnreadMarks))
-                try? await self.sessionClient.setUnreadMarkAPI(convId: id, unread: false)
-            }
-            markReadTasks[key] = t
-        }
-        if extrasChanged {
-            rebuildConversationExtras()
-        }
-        let key = UUID()
-        let t = Task { @MainActor [weak self] in
-            defer { self?.markReadTasks.removeValue(forKey: key) }
-            guard let self else { return }
-            try? await self.sqliteStore?.setConversationUnread(id: id, unread: 0)
-            if let last = self.messages[id]?.last, !last.isMine {
-                await self.sessionClient.sendSeenAPI(convId: id, msgId: last.id, cliMsgId: last.id, senderId: last.senderId)
-            }
-        }
-        markReadTasks[key] = t
     }
 
     func react(_ emoji: String, to messageId: String, in conversationId: String) {

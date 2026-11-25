@@ -13,7 +13,7 @@ use crate::reduce::ReduceOutput;
 use crate::reduce::classify::{
     CMD_PUSH_MSG_11, CMD_PUSH_MSG_GROUP, LP_EXPIRED_REASON, Route, classify, classify_poll,
 };
-use crate::reduce::session;
+use crate::reduce::{conversations, session};
 use crate::state::{ActiveDrain, CoreState, PendingDrain, Phase, WsPhase};
 use crate::typed_chat::{PlainChatParse, try_parse_plain_chat_pure};
 
@@ -281,11 +281,13 @@ pub(crate) fn reduce_transport(state: &mut CoreState, input: Input, out: &mut Re
         Input::PollBatchApplied {
             lp_gen,
             drain_id,
-            applied_count,
+            delta,
         } => {
             if lp_gen != state.transport.lp_gen || !state.transport.lp_running {
                 return;
             }
+            let applied_count = delta.applied_count;
+            conversations::apply_batch_delta(state, delta, out);
             let should_continue = match state.transport.active_drain.as_mut() {
                 Some(active) if active.drain_id == drain_id && active.lp_gen == lp_gen => {
                     active.total_events = active.total_events.saturating_add(applied_count);

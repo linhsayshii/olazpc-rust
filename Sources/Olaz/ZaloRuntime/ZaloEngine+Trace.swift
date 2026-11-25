@@ -84,6 +84,7 @@ extension ZaloEngine {
     }
 
     internal func awaitMarkReadTasksForRecording() async {
+        await settleForRecording()
         while !markReadTasks.isEmpty {
             let tasks = Array(markReadTasks.values)
             markReadTasks.removeAll()

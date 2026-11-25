@@ -29,16 +29,38 @@ struct SessionRecorderTests {
             let expectedScenarios = Self.scenarios()
             #expect(committed.count == expectedScenarios.count, "Committed case count \(committed.count) != scenario count \(expectedScenarios.count)")
 
+            let knownDiffs = try CaseFile.loadKnownDiffs()
+            var usedKnownDiffs = Array(repeating: false, count: knownDiffs.count)
+            var executedNames: Set<String> = []
+
             for scenario in expectedScenarios {
                 let expected = try #require(byName[scenario.name], "Missing committed case for \(scenario.name)")
                 if scenario.slow && !runSlow {
                     print("skipped slow: \(scenario.name)")
                     continue
                 }
+                executedNames.insert(scenario.name)
                 let actual = try await Self.recordScenario(scenario)
-                if let diff = CaseJSON.firstDiff(expected: expected, actual: actual) {
+                let diffs = CaseFile.compareCase(
+                    domain: "session",
+                    name: scenario.name,
+                    expected: expected,
+                    actual: actual,
+                    knownDiffs: knownDiffs,
+                    usedKnownDiffs: &usedKnownDiffs
+                )
+                for diff in diffs {
                     Issue.record("\(scenario.name): \(diff)")
                 }
+            }
+            for stale in CaseFile.staleKnownDiffs(
+                domain: "session",
+                executedNames: executedNames,
+                allCaseNames: Set(byName.keys),
+                knownDiffs: knownDiffs,
+                usedKnownDiffs: usedKnownDiffs
+            ) {
+                Issue.record("\(stale)")
             }
         }
     }
@@ -224,6 +246,7 @@ struct SessionRecorderTests {
                     let timeoutMs = Int(step["timeout_ms"]?.int64Value ?? 5000)
                     try await transitionRecorder.awaitPredicate(pred, timeoutMs: timeoutMs)
                 } else if let label = step["snapshot"]?.stringValue {
+                    await engine.settleForRecording()
                     snapshots[label] = transitionRecorder.currentCursorSnapshot()
                 } else {
                     throw RecorderError.invalidStep(scenario: scenario.name, detail: "Unknown step: \(step.canonicalString())")
