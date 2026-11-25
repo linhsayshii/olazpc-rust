@@ -734,6 +734,446 @@ final class ContactRecorderTests: XCTestCase {
                     .object(["cmd": .string("send_request"), "args": .object(["id": .string("3000915"), "message": .string("Xin chào 915")])]),
                 ]
             ),
+
+            // 9. find_phone
+            ContactRecorderHarness.ScenarioDef(
+                name: "find_phone",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000909",
+                    displayName: "Contacts User 9",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "contacts": .object([
+                            "friends": .array([
+                                .object([
+                                    "id": .string("3000941"),
+                                    "name": .string("Friend One"),
+                                    "zalo_name": .string("Friend One"),
+                                ]),
+                            ]),
+                            "sent": .array([
+                                .object([
+                                    "id": .string("3000942"),
+                                    "name": .string("Sent Target"),
+                                    "message": .string("Hi"),
+                                ]),
+                            ]),
+                            "received": .array([
+                                .object([
+                                    "id": .string("3000943"),
+                                    "name": .string("Recv Target"),
+                                    "message": .string("Hello"),
+                                ]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000909", displayName: "Contacts User 9"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000909", displayName: "Contacts User 9"),
+                    // 1. stranger (held so we can snapshot searching)
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/profile/get",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "uid": .string("u3000940"),
+                                "display_name": .string("Stranger Found"),
+                                "zalo_name": .string("Stranger Zalo"),
+                                "avatar": .string("https://cdn.example.invalid/s940.jpg"),
+                                "status": .string("Bio 940"),
+                            ]),
+                        ]),
+                        hold: true
+                    ),
+                    // 2. friend
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/profile/get",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "userId": .string("3000941"),
+                                "displayName": .string("Friend One"),
+                                "zaloName": .string("Friend One"),
+                            ]),
+                        ])
+                    ),
+                    // 3. self
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/profile/get",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "uid": .string("2000909"),
+                                "display_name": .string("Contacts User 9"),
+                                "zalo_name": .string("Contacts User 9"),
+                            ]),
+                        ])
+                    ),
+                    // 4. requested (sent)
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/profile/get",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "uid": .string("3000942"),
+                                "zalo_name": .string("Sent Target"),
+                            ]),
+                        ])
+                    ),
+                    // 5. requesting (received)
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/profile/get",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "uid": .string("3000943"),
+                                "zalo_name": .string("Recv Target"),
+                            ]),
+                        ])
+                    ),
+                    // 6. not found (empty uid)
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/profile/get",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([:]),
+                        ])
+                    ),
+                    // 7. request error
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/friend/profile/get",
+                        method: "GET",
+                        status: 500,
+                        json: .object([
+                            "error_code": .int(500),
+                            "error_message": .string("Phone lookup failed"),
+                        ])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("find_by_phone"), "args": .object(["phone": .string("   \t\n  ")])]),
+                    .object(["snapshot": .string("blank_ignored")]),
+                    .object(["cmd": .string("find_by_phone"), "args": .object(["phone": .string(" 0901234561 "), "async": .bool(true)])]),
+                    .object(["snapshot": .string("searching")]),
+                    .object(["http_release": .int(1)]),
+                    .object(["cmd": .string("await_contacts")]),
+                    .object(["snapshot": .string("found_stranger")]),
+                    .object(["cmd": .string("reset_search")]),
+                    .object(["snapshot": .string("after_reset")]),
+                    .object(["cmd": .string("find_by_phone"), "args": .object(["phone": .string("0901234562")])]),
+                    .object(["snapshot": .string("found_friend")]),
+                    .object(["cmd": .string("find_by_phone"), "args": .object(["phone": .string("0901234563")])]),
+                    .object(["snapshot": .string("found_self")]),
+                    .object(["cmd": .string("find_by_phone"), "args": .object(["phone": .string("0901234564")])]),
+                    .object(["snapshot": .string("found_sent")]),
+                    .object(["cmd": .string("find_by_phone"), "args": .object(["phone": .string("0901234565")])]),
+                    .object(["snapshot": .string("found_received")]),
+                    .object(["cmd": .string("find_by_phone"), "args": .object(["phone": .string("0901234566")])]),
+                    .object(["snapshot": .string("not_found")]),
+                    .object(["cmd": .string("find_by_phone"), "args": .object(["phone": .string("0901234567")])]),
+                ]
+            ),
+
+            // 10. contacts_state
+            ContactRecorderHarness.ScenarioDef(
+                name: "contacts_state",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000910",
+                    displayName: "Contacts User 10",
+                    suppress: ["ws", "long_poll"]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000910", displayName: "Contacts User 10"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000910", displayName: "Contacts User 10"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object([
+                        "cmd": .string("contacts_state"),
+                        "args": .object([
+                            "json": .object([
+                                "contacts": .object([
+                                    "friends": .array([
+                                        .object([
+                                            "id": .string("3000951"),
+                                            "name": .string("Adapter Friend"),
+                                            "zaloName": .string("Adapter Friend"),
+                                            "avatar": .string("https://cdn.example.invalid/af1.jpg"),
+                                            "lastActive": .int(1700000001000),
+                                            "online": .bool(true),
+                                        ]),
+                                    ]),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                    .object(["snapshot": .string("friends_only")]),
+                    .object([
+                        "cmd": .string("contacts_state"),
+                        "args": .object([
+                            "json": .object([
+                                "contacts": .object([
+                                    "groups": .array([
+                                        .object([
+                                            "id": .string("g500951"),
+                                            "name": .string("Adapter Group"),
+                                            "avatar": .string("https://cdn.example.invalid/ag1.jpg"),
+                                            "members": .int(15),
+                                        ]),
+                                    ]),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                    .object(["snapshot": .string("groups_only")]),
+                    .object([
+                        "cmd": .string("contacts_state"),
+                        "args": .object([
+                            "json": .object([
+                                "contacts": .object([
+                                    "received": .array([
+                                        .object([
+                                            "id": .string("3000952"),
+                                            "name": .string("Adapter Rec"),
+                                            "message": .string("Hi"),
+                                            "time": .int(1700000002000),
+                                        ]),
+                                    ]),
+                                    "sent": .array([
+                                        .object([
+                                            "id": .string("3000953"),
+                                            "name": .string("Adapter Sent"),
+                                            "message": .string("Yo"),
+                                            "time": .int(1700000003000),
+                                        ]),
+                                    ]),
+                                    "pendingRequestCount": .int(-4),
+                                    "loading": .object(["requests": .bool(true)]),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                    .object(["snapshot": .string("requests_clamped")]),
+                    .object([
+                        "cmd": .string("contacts_state"),
+                        "args": .object([
+                            "json": .object([
+                                "contacts": .object([
+                                    "search": .object([
+                                        "status": .string("found"),
+                                        "user": .object([
+                                            "id": .string("3000954"),
+                                            "name": .string("Search Hit"),
+                                            "zaloName": .string("Search Hit"),
+                                            "avatar": .string("https://cdn.example.invalid/sh1.jpg"),
+                                            "bio": .string("Hello bio"),
+                                            "isFriend": .bool(false),
+                                            "isSelf": .bool(false),
+                                            "requested": .bool(true),
+                                            "requesting": .bool(false),
+                                            "defaultMessage": .string("Xin chào"),
+                                            "maxMessage": .int(150),
+                                        ]),
+                                    ]),
+                                    "notice": .object([
+                                        "seq": .int(4),
+                                        "ok": .bool(true),
+                                        "text": .string("Adapter notice"),
+                                    ]),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                    .object(["snapshot": .string("search_and_notice")]),
+                    .object([
+                        "cmd": .string("contacts_state"),
+                        "args": .object([
+                            "json": .object([
+                                "contacts": .object([
+                                    "friends": .array([
+                                        .object([
+                                            "id": .string("3000955"),
+                                            "name": .string("Combined Friend"),
+                                            "zaloName": .string("Combined Friend"),
+                                        ]),
+                                    ]),
+                                    "groups": .array([
+                                        .object([
+                                            "id": .string("g500952"),
+                                            "name": .string("Combined Group"),
+                                            "members": .int(7),
+                                        ]),
+                                    ]),
+                                    "received": .array([
+                                        .object([
+                                            "id": .string("3000956"),
+                                            "name": .string("Combined Rec"),
+                                            "message": .string("M1"),
+                                        ]),
+                                    ]),
+                                    "sent": .array([
+                                        .object([
+                                            "id": .string("3000957"),
+                                            "name": .string("Combined Sent"),
+                                            "message": .string("M2"),
+                                        ]),
+                                    ]),
+                                    "pendingRequestCount": .int(2),
+                                    "loading": .object(["requests": .bool(false)]),
+                                    "search": .object(["status": .string("error"), "error": .string("Search err")]),
+                                    "notice": .object(["seq": .int(5), "ok": .bool(false), "text": .string("Combined err")]),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                ]
+            ),
+
+            // 11. lookup_rules
+            ContactRecorderHarness.ScenarioDef(
+                name: "lookup_rules",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000911",
+                    displayName: "Contacts User 11",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "contacts": .object([
+                            "friends": .array([
+                                .object([
+                                    "id": .string("3000961"),
+                                    "name": .string("Friend Name One"),
+                                    "zalo_name": .string("Friend Name One"),
+                                ]),
+                                .object([
+                                    "id": .string("3000962"),
+                                    "name": .string("Friend With Avatar"),
+                                    "zalo_name": .string("Friend With Avatar"),
+                                    "avatar": .string("https://cdn.example.invalid/friend_avt.jpg"),
+                                ]),
+                            ]),
+                            "aliases": .object([
+                                "3000961": .string("Alias Over Friend"),
+                                "3000964": .string("Alias Over Unknown"),
+                            ]),
+                            "cached_profiles": .object([
+                                "3000961": .object([
+                                    "name": .string("Profile Name One"),
+                                    "avatar": .string("https://cdn.example.invalid/profile_avt1.jpg"),
+                                ]),
+                                "3000962": .object([
+                                    "name": .string("Profile Name Two"),
+                                    "avatar": .string("https://cdn.example.invalid/profile_avt2.jpg"),
+                                ]),
+                                "3000963": .object([
+                                    "name": .string("Cached Profile Only"),
+                                    "avatar": .string("https://cdn.example.invalid/profile_avt3.jpg"),
+                                ]),
+                                "3000964": .object([
+                                    "name": .string("Người dùng Zalo"),
+                                    "avatar": .string(""),
+                                ]),
+                                "3000965": .object([
+                                    "name": .string("Người dùng Zalo"),
+                                    "avatar": .string(""),
+                                ]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000911", displayName: "Contacts User 11"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000911", displayName: "Contacts User 11"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("0")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("-1")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("__legacy__")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("unknown")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("2000911")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("u2000911")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("3000961")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("u3000961")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("3000962")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("3000963")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("3000964")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("3000965")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("3000998")])]),
+                ]
+            ),
+
+            // 12. mention_names
+            ContactRecorderHarness.ScenarioDef(
+                name: "mention_names",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000912",
+                    displayName: "Contacts User 12",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "contacts": .object([
+                            "friends": .array([
+                                .object([
+                                    "id": .string("3000971"),
+                                    "name": .string("Alias Target"),
+                                    "zalo_name": .string("Alias Target"),
+                                ]),
+                                .object([
+                                    "id": .string("3000972"),
+                                    "name": .string("Bạn"),
+                                    "zalo_name": .string("Bạn"),
+                                ]),
+                                .object([
+                                    "id": .string("3000973"),
+                                    "name": .string("Người dùng Zalo"),
+                                    "zalo_name": .string("Người dùng Zalo"),
+                                ]),
+                                .object([
+                                    "id": .string("3000974"),
+                                    "name": .string("3000974"),
+                                    "zalo_name": .string("3000974"),
+                                ]),
+                                .object([
+                                    "id": .string("3000975"),
+                                    "name": .string("Plain Friend"),
+                                    "zalo_name": .string("Plain Friend"),
+                                ]),
+                            ]),
+                            "aliases": .object([
+                                "3000971": .string("Bí danh"),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000912", displayName: "Contacts User 12"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000912", displayName: "Contacts User 12"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("mention_name"), "args": .object(["uid": .string("2000912")])]),
+                    .object(["cmd": .string("mention_name"), "args": .object(["uid": .string("u2000912")])]),
+                    .object(["cmd": .string("mention_name"), "args": .object(["uid": .string("-1")])]),
+                    .object(["cmd": .string("mention_name"), "args": .object(["uid": .string("3000999")])]),
+                    .object(["cmd": .string("mention_name"), "args": .object(["uid": .string("3000974")])]),
+                    .object(["cmd": .string("mention_name"), "args": .object(["uid": .string("3000972")])]),
+                    .object(["cmd": .string("mention_name"), "args": .object(["uid": .string("3000973")])]),
+                    .object(["cmd": .string("mention_name"), "args": .object(["uid": .string("3000971")])]),
+                    .object(["cmd": .string("mention_name"), "args": .object(["uid": .string("3000975")])]),
+                ]
+            ),
         ]
     }
 }
