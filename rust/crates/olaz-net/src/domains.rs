@@ -24,13 +24,14 @@ pub fn default_service_hosts(service: &str) -> Option<&'static [&'static str]> {
     Some(match service {
         "profile" => &["https://tt-profile-wpa.zaloapp.com"],
         "friend" => &["https://tt-friend-wpa.zaloapp.com"],
+        "friend_board" => &["https://friendboard-wpa.chat.zalo.me"],
         "conversation" => &["https://tt-convers-wpa.api.zaloapp.com"],
         "chat" | "chat_e2e" => CHAT_HOSTS,
         "group" | "group_e2e" | "group_poll" => &["https://tt-group-wpa.zaloapp.com"],
         "group_board" => &["https://groupboard-wpa.api.zaloapp.com"],
         "group_cloud_message" => &["https://tt-group-cm.api.zaloapp.com"],
         "sticker" => &["https://tt-sticker-wpa.zaloapp.com"],
-        "alias" => &["https://tt-alias-wpa.api.zaloapp.com"],
+        "alias" => &["https://tt-alias-wpa.zaloapp.com"],
         "label" => &["https://label-wpa.api.zaloapp.com"],
         "reaction" => &["https://reaction.api.zaloapp.com"],
         "emoji_status" => &["https://emoji-status.api.zaloapp.com"],
@@ -290,6 +291,21 @@ impl ZaloDomains {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn friend_board_default_host_is_present_when_not_isolated() {
+        let d = ZaloDomains::default();
+        assert_eq!(
+            d.candidates("friend_board"),
+            vec!["https://friendboard-wpa.chat.zalo.me".to_owned()]
+        );
+
+        let isolated = ZaloDomains {
+            isolated: true,
+            ..Default::default()
+        };
+        assert!(isolated.candidates("friend_board").is_empty());
+    }
 
     #[test]
     fn isolated_omits_defaults_and_fallbacks_while_default_is_unchanged() {
