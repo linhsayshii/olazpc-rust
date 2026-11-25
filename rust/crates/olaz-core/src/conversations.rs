@@ -689,6 +689,26 @@ impl fmt::Debug for ConvMessageDelta {
     }
 }
 
+/// Preview override produced by Pass 2 recalls / deletes for a conversation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConvPreviewOverride {
+    pub conv_id: String,
+    /// Timestamp (ms) of the recalled or deleted message; applied only when the conversation's
+    /// current preview date is `<= target_date_ms + 1_000`.
+    pub target_date_ms: i64,
+    /// Replacement preview (`None` clears `conv.preview` when no remaining message exists).
+    pub preview: Option<ConversationPreview>,
+}
+
+impl fmt::Debug for ConvPreviewOverride {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConvPreviewOverride")
+            .field("target_date_ms", &self.target_date_ms)
+            .field("has_preview", &self.preview.is_some())
+            .finish()
+    }
+}
+
 /// Result returned by `Host::apply_batch` and `Host::apply_parsed_events`.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct BatchApplyDelta {
@@ -696,6 +716,8 @@ pub struct BatchApplyDelta {
     pub applied_count: u32,
     /// Per-conversation latest message + unread delta from Pass 1.
     pub updates: Vec<ConvMessageDelta>,
+    /// Per-conversation preview overrides from Pass 2 recalls / deletes, applied in order after `updates`.
+    pub preview_overrides: Vec<ConvPreviewOverride>,
     /// Whether `conversations` should be persisted to SQLite after applying this batch.
     pub persist_conversations: bool,
 }
@@ -705,6 +727,7 @@ impl fmt::Debug for BatchApplyDelta {
         f.debug_struct("BatchApplyDelta")
             .field("applied_count", &self.applied_count)
             .field("updates_count", &self.updates.len())
+            .field("preview_overrides_count", &self.preview_overrides.len())
             .field("persist_conversations", &self.persist_conversations)
             .finish()
     }
@@ -1442,7 +1465,10 @@ impl ConversationsState {
         delta: &BatchApplyDelta,
         self_conv_id: Option<&str>,
     ) -> (bool, bool, bool) {
-        if delta.applied_count == 0 {
+        if delta.applied_count == 0
+            && delta.updates.is_empty()
+            && delta.preview_overrides.is_empty()
+        {
             return (false, false, false);
         }
         let mut by_id: HashMap<String, ConversationSummary> = self
@@ -1503,6 +1529,19 @@ impl ConversationsState {
                     preview: Some(effective_prev),
                 },
             );
+        }
+
+        for ov in &delta.preview_overrides {
+            if let Some(conv) = by_id.get_mut(&ov.conv_id) {
+                let existing_date = conv
+                    .preview
+                    .as_ref()
+                    .and_then(|p| p.date_ms)
+                    .unwrap_or(i64::MIN);
+                if existing_date <= ov.target_date_ms.saturating_add(1_000) {
+                    conv.preview = ov.preview.clone();
+                }
+            }
         }
 
         let mut list: Vec<ConversationSummary> = by_id.into_values().collect();
@@ -3116,5 +3155,131 @@ mod tests {
         assert!(!dbg.contains("SECRET_MESSAGE_BODY"));
         assert!(!dbg.contains("SECRET_PIN_MD5"));
         assert!(!dbg.contains("SECRET_TOAST"));
+    }
+
+    #[test]
+    fn batch_preview_overrides_apply_recall_delete_and_empty_clear() {
+        let mut st = ConversationsState::default();
+        st.conversations.push(ConversationSummary {
+            id: "c1".to_owned(),
+            is_group: false,
+            name: "Peer 1".to_owned(),
+            avatar: None,
+            pinned: false,
+            members: 0,
+            unread: 1,
+            preview: Some(ConversationPreview {
+                text: "Latest".to_owned(),
+                date_ms: Some(2_000),
+                from_me: false,
+            }),
+        });
+        st.conversations.push(ConversationSummary {
+            id: "c2".to_owned(),
+            is_group: false,
+            name: "Peer 2".to_owned(),
+            avatar: None,
+            pinned: false,
+            members: 0,
+            unread: 0,
+            preview: Some(ConversationPreview {
+                text: "Mid".to_owned(),
+                date_ms: Some(1_500),
+                from_me: false,
+            }),
+        });
+
+        // Older recall (>1s before current preview) is ignored.
+        let older = BatchApplyDelta {
+            applied_count: 1,
+            updates: vec![],
+            preview_overrides: vec![ConvPreviewOverride {
+                conv_id: "c1".to_owned(),
+                target_date_ms: 500,
+                preview: Some(ConversationPreview {
+                    text: "Tin nhắn đã được thu hồi".to_owned(),
+                    date_ms: Some(500),
+                    from_me: false,
+                }),
+            }],
+            persist_conversations: true,
+        };
+        let (changed, _, _) = st.apply_batch_delta(&older, None);
+        assert!(!changed);
+        assert_eq!(
+            st.conversations[0]
+                .preview
+                .as_ref()
+                .map(|p| p.text.as_str()),
+            Some("Latest")
+        );
+
+        // Recall on latest updates text and keeps timestamp.
+        let recall = BatchApplyDelta {
+            applied_count: 1,
+            updates: vec![],
+            preview_overrides: vec![ConvPreviewOverride {
+                conv_id: "c1".to_owned(),
+                target_date_ms: 2_000,
+                preview: Some(ConversationPreview {
+                    text: "Tin nhắn đã được thu hồi".to_owned(),
+                    date_ms: Some(2_000),
+                    from_me: false,
+                }),
+            }],
+            persist_conversations: true,
+        };
+        let (changed, _, _) = st.apply_batch_delta(&recall, None);
+        assert!(changed);
+        assert_eq!(
+            st.conversations[0]
+                .preview
+                .as_ref()
+                .map(|p| p.text.as_str()),
+            Some("Tin nhắn đã được thu hồi")
+        );
+
+        // Delete recomputes preview to older remaining message and re-sorts c2 ahead of c1.
+        let delete_to_older = BatchApplyDelta {
+            applied_count: 1,
+            updates: vec![],
+            preview_overrides: vec![ConvPreviewOverride {
+                conv_id: "c1".to_owned(),
+                target_date_ms: 2_000,
+                preview: Some(ConversationPreview {
+                    text: "Older msg".to_owned(),
+                    date_ms: Some(1_000),
+                    from_me: true,
+                }),
+            }],
+            persist_conversations: true,
+        };
+        let (changed, _, _) = st.apply_batch_delta(&delete_to_older, None);
+        assert!(changed);
+        assert_eq!(st.conversations[0].id, "c2");
+        assert_eq!(st.conversations[1].id, "c1");
+        assert_eq!(
+            st.conversations[1].preview,
+            Some(ConversationPreview {
+                text: "Older msg".to_owned(),
+                date_ms: Some(1_000),
+                from_me: true,
+            })
+        );
+
+        // Delete last remaining message clears preview to None.
+        let delete_all = BatchApplyDelta {
+            applied_count: 1,
+            updates: vec![],
+            preview_overrides: vec![ConvPreviewOverride {
+                conv_id: "c1".to_owned(),
+                target_date_ms: 1_000,
+                preview: None,
+            }],
+            persist_conversations: true,
+        };
+        let (changed, _, _) = st.apply_batch_delta(&delete_all, None);
+        assert!(changed);
+        assert_eq!(st.conversations[1].preview, None);
     }
 }

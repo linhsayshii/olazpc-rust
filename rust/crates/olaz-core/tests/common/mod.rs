@@ -19,8 +19,9 @@ use async_trait::async_trait;
 use olaz_api::{PollState, ZaloApi};
 use olaz_core::actor::{ActorSink, CoreHandle};
 use olaz_core::conversations::{
-    BatchApplyDelta, CachedGroup, CachedProfile, ConvMessageDelta, FriendIdentity, GroupIdentity,
-    IdentityTable, MessagePreviewInput, message_preview_label, to_wire_stored,
+    BatchApplyDelta, CachedGroup, CachedProfile, ConvMessageDelta, ConvPreviewOverride,
+    ConversationPreview, FriendIdentity, GroupIdentity, IdentityTable, MessagePreviewInput,
+    message_preview_label, to_wire_stored,
 };
 use olaz_core::input::{Command, Input, LegacyCookie, SeenTarget};
 use olaz_core::reduce::classify::MobileSyncEvent;
@@ -38,7 +39,7 @@ use olaz_net::{
 };
 use olaz_store::{Store, StoredConversation, StoredMessage};
 use olaz_wire::{
-    ChatMessage, NameLookup, ParsedWireEvent, WireParseOptions, decode_stored_message,
+    ChatMessage, Kind, NameLookup, ParsedWireEvent, WireParseOptions, decode_stored_message,
     extract_batch_events,
 };
 use olaz_ws::consts::{CMD_AUTHEN, CMD_PING, CMD_PING_ACTIVE, DEFAULT_WS_ENDPOINTS, FRAME_VERSION};
@@ -1508,6 +1509,172 @@ impl RecordingHost {
             let _ = store.save_messages(&stored_batch);
         }
 
+        let mut preview_overrides: Vec<ConvPreviewOverride> = Vec::new();
+        for ev in events {
+            match ev {
+                ParsedWireEvent::Undo {
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                } => {
+                    let target_id = if !msg_id.is_empty() {
+                        msg_id.as_str()
+                    } else {
+                        cli_msg_id.as_str()
+                    };
+                    if conv_id.is_empty() || target_id.is_empty() {
+                        continue;
+                    }
+                    let mut found_in_memory = false;
+                    let mut recalled_last: Option<(i64, bool)> = None;
+                    {
+                        let mut messages =
+                            self.messages.lock().unwrap_or_else(PoisonError::into_inner);
+                        if let Some(list) = messages.get_mut(conv_id)
+                            && let Some(idx) = list.iter().position(|m| {
+                                m.id == target_id
+                                    || m.client_id == target_id
+                                    || (!cli_msg_id.is_empty()
+                                        && (m.id == *cli_msg_id || m.client_id == *cli_msg_id))
+                            })
+                        {
+                            found_in_memory = true;
+                            let was_last = idx + 1 == list.len();
+                            let msg = &mut list[idx];
+                            msg.kind = Kind::Recalled;
+                            msg.text.clear();
+                            msg.reactions.clear();
+                            msg.quote = None;
+                            msg.card_buttons.clear();
+                            if was_last {
+                                recalled_last = Some((msg.date_ms, msg.is_mine));
+                            }
+                        }
+                    }
+                    if let Some(store_arc) = self.attached_store() {
+                        let mut store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                        let _ = store.mark_recalled(conv_id, target_id, cli_msg_id);
+                        if !found_in_memory
+                            && let Ok(rows) = store.messages(conv_id, None, 1)
+                            && let Some(latest) = rows.last()
+                            && latest.kind_tag == "recalled"
+                            && (latest.id == target_id
+                                || latest.client_id == target_id
+                                || (!cli_msg_id.is_empty()
+                                    && (latest.id == *cli_msg_id
+                                        || latest.client_id == *cli_msg_id)))
+                        {
+                            recalled_last = Some((latest.ts_ms, latest.is_mine));
+                        }
+                    }
+                    if let Some((target_date_ms, from_me)) = recalled_last {
+                        preview_overrides.push(ConvPreviewOverride {
+                            conv_id: conv_id.clone(),
+                            target_date_ms,
+                            preview: Some(ConversationPreview {
+                                text: "Tin nhắn đã được thu hồi".to_owned(),
+                                date_ms: Some(target_date_ms),
+                                from_me,
+                            }),
+                        });
+                    }
+                }
+                ParsedWireEvent::Delete {
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                } => {
+                    let target_id = if !msg_id.is_empty() {
+                        msg_id.as_str()
+                    } else {
+                        cli_msg_id.as_str()
+                    };
+                    if conv_id.is_empty() || target_id.is_empty() {
+                        continue;
+                    }
+                    let mut deleted_ts_ms: Option<i64> = None;
+                    let mem_latest: Option<ConversationPreview> = {
+                        let mut messages =
+                            self.messages.lock().unwrap_or_else(PoisonError::into_inner);
+                        if let Some(list) = messages.get_mut(conv_id) {
+                            for m in list.iter() {
+                                if m.id == target_id
+                                    || m.client_id == target_id
+                                    || (!cli_msg_id.is_empty()
+                                        && (m.id == *cli_msg_id || m.client_id == *cli_msg_id))
+                                {
+                                    deleted_ts_ms = Some(
+                                        deleted_ts_ms.map_or(m.date_ms, |prev| prev.max(m.date_ms)),
+                                    );
+                                }
+                            }
+                            list.retain(|m| {
+                                !(m.id == target_id
+                                    || m.client_id == target_id
+                                    || (!cli_msg_id.is_empty()
+                                        && (m.id == *cli_msg_id || m.client_id == *cli_msg_id)))
+                            });
+                            list.last().map(|m| ConversationPreview {
+                                text: message_preview_label(m),
+                                date_ms: Some(m.date_ms),
+                                from_me: m.is_mine,
+                            })
+                        } else {
+                            None
+                        }
+                    };
+                    let mut store_latest: Option<ConversationPreview> = None;
+                    if let Some(store_arc) = self.attached_store() {
+                        let mut store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                        if deleted_ts_ms.is_none() {
+                            if let Ok(Some(row)) = store.message(conv_id, target_id) {
+                                deleted_ts_ms = Some(row.ts_ms);
+                            } else if !cli_msg_id.is_empty()
+                                && let Ok(Some(row)) = store.message(conv_id, cli_msg_id)
+                            {
+                                deleted_ts_ms = Some(row.ts_ms);
+                            }
+                        }
+                        let _ = store.delete_message(conv_id, target_id);
+                        if !cli_msg_id.is_empty() && cli_msg_id != target_id {
+                            let _ = store.delete_message(conv_id, cli_msg_id);
+                        }
+                        if let Ok(rows) = store.messages(conv_id, None, 1)
+                            && let Some(row) = rows.last()
+                        {
+                            store_latest = Some(Self::preview_from_stored_message(row));
+                        }
+                    }
+                    if let Some(target_date_ms) = deleted_ts_ms {
+                        let best_remaining = match (mem_latest, store_latest) {
+                            (Some(a), Some(b)) => {
+                                if a.date_ms.unwrap_or(0) >= b.date_ms.unwrap_or(0) {
+                                    Some(a)
+                                } else {
+                                    Some(b)
+                                }
+                            }
+                            (Some(a), None) => Some(a),
+                            (None, Some(b)) => Some(b),
+                            (None, None) => None,
+                        };
+                        let still_newer = best_remaining
+                            .as_ref()
+                            .and_then(|p| p.date_ms)
+                            .is_some_and(|d| d > target_date_ms);
+                        if !still_newer {
+                            preview_overrides.push(ConvPreviewOverride {
+                                conv_id: conv_id.clone(),
+                                target_date_ms,
+                                preview: best_remaining,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let updates: Vec<ConvMessageDelta> = latest_by_conv
             .into_iter()
             .map(|(conv_id, latest)| {
@@ -1528,7 +1695,29 @@ impl RecordingHost {
         BatchApplyDelta {
             applied_count: u32::try_from(events.len()).unwrap_or(u32::MAX),
             updates,
+            preview_overrides,
             persist_conversations,
+        }
+    }
+
+    fn preview_from_stored_message(row: &StoredMessage) -> ConversationPreview {
+        if let Some(decoded) = decode_stored_message(&to_wire_stored(row)) {
+            ConversationPreview {
+                text: message_preview_label(&decoded),
+                date_ms: Some(decoded.date_ms),
+                from_me: decoded.is_mine,
+            }
+        } else {
+            let text = if row.kind_tag == "recalled" {
+                "Tin nhắn đã được thu hồi".to_owned()
+            } else {
+                row.text.clone()
+            };
+            ConversationPreview {
+                text,
+                date_ms: Some(row.ts_ms),
+                from_me: row.is_mine,
+            }
         }
     }
 
@@ -1767,6 +1956,7 @@ impl Host for RecordingHost {
             BatchApplyDelta {
                 applied_count: count,
                 updates: Vec::new(),
+                preview_overrides: Vec::new(),
                 persist_conversations: false,
             }
         };

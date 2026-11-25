@@ -2,12 +2,13 @@
 //!
 //! No I/O, no clock, and no randomness live here (D9).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::changes::DirtyKey;
 use crate::conversations::{
-    BatchApplyDelta, ConversationActionResult, ConversationLabel, ConversationPrompt, PIN_LIMIT,
-    parse_server_labels_response, serialize_labels_local_json, serialize_labels_server_json,
+    BatchApplyDelta, ConversationActionResult, ConversationLabel, ConversationPreview,
+    ConversationPrompt, PIN_LIMIT, parse_server_labels_response, serialize_labels_local_json,
+    serialize_labels_server_json,
 };
 use crate::effect::{Effect, OpResult, StoreOp};
 use crate::input::{Command, HiddenPinSyncKind, Input};
@@ -22,9 +23,26 @@ pub(crate) fn apply_batch_delta(
     delta: BatchApplyDelta,
     out: &mut ReduceOutput,
 ) {
-    if delta.applied_count == 0 && delta.updates.is_empty() {
+    if delta.applied_count == 0 && delta.updates.is_empty() && delta.preview_overrides.is_empty() {
         return;
     }
+    let override_ids: BTreeSet<String> = delta
+        .preview_overrides
+        .iter()
+        .map(|ov| ov.conv_id.clone())
+        .collect();
+    let before_previews: HashMap<String, Option<ConversationPreview>> = if override_ids.is_empty() {
+        HashMap::new()
+    } else {
+        state
+            .conversations
+            .conversations
+            .iter()
+            .filter(|c| override_ids.contains(&c.id))
+            .map(|c| (c.id.clone(), c.preview.clone()))
+            .collect()
+    };
+
     let self_conv_id = state.session.self_conversation_id.clone();
     let (convs_changed, flags_changed, extras_changed) = state
         .conversations
@@ -40,6 +58,26 @@ pub(crate) fn apply_batch_delta(
     }
     if delta.persist_conversations {
         emit_save_conversations(state, out);
+        for id in &override_ids {
+            if let Some(conv) = state
+                .conversations
+                .conversations
+                .iter()
+                .find(|c| &c.id == id)
+                && before_previews.get(id) != Some(&conv.preview)
+            {
+                out.effects
+                    .push(Effect::Store(StoreOp::SetConversationPreview {
+                        id: conv.id.clone(),
+                        preview_text: conv
+                            .preview
+                            .as_ref()
+                            .map_or_else(String::new, |p| p.text.clone()),
+                        preview_ts_ms: conv.preview.as_ref().and_then(|p| p.date_ms).unwrap_or(0),
+                        preview_from_me: conv.preview.as_ref().is_some_and(|p| p.from_me),
+                    }));
+            }
+        }
     }
 }
 
@@ -208,11 +246,27 @@ pub(crate) fn reduce_conversations(state: &mut CoreState, input: Input, out: &mu
             if state.conversations.conversations.len() != prev_len {
                 out.dirty.insert(DirtyKey::Conversations);
             }
-            // Match Swift `confirmDeleteConversation`: clears in-memory sets without re-persisting
-            // `pinnedIds` / `archivedIds` / `unreadMarks` prefs.
-            state.conversations.pinned_ids.remove(&id);
-            state.conversations.archived_ids.remove(&id);
-            state.conversations.unread_marks.remove(&id);
+            if state.conversations.pinned_ids.remove(&id) {
+                out.effects
+                    .push(Effect::Store(StoreOp::SetPreferenceStrings {
+                        key: "pinnedIds".to_owned(),
+                        values: sorted_set_vec(&state.conversations.pinned_ids),
+                    }));
+            }
+            if state.conversations.archived_ids.remove(&id) {
+                out.effects
+                    .push(Effect::Store(StoreOp::SetPreferenceStrings {
+                        key: "archivedIds".to_owned(),
+                        values: sorted_set_vec(&state.conversations.archived_ids),
+                    }));
+            }
+            if state.conversations.unread_marks.remove(&id) {
+                out.effects
+                    .push(Effect::Store(StoreOp::SetPreferenceStrings {
+                        key: "unreadMarks".to_owned(),
+                        values: sorted_set_vec(&state.conversations.unread_marks),
+                    }));
+            }
             state.conversations.ui.remove(BTreeSet::from([id]));
             out.dirty.insert(DirtyKey::ConversationUi);
             rebuild_flags_and_extras(state, out);
@@ -1331,4 +1385,90 @@ fn complete_op(op_id: Option<u64>, result: OpResult, after_store: bool, out: &mu
 
 fn sorted_set_vec(set: &BTreeSet<String>) -> Vec<String> {
     set.iter().cloned().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conversations::ConversationSummary;
+
+    #[test]
+    fn delete_api_done_persists_removed_pin_archive_unread_prefs() {
+        let mut state = CoreState::default();
+        state.conversations.conversations.push(ConversationSummary {
+            id: "c1".to_owned(),
+            is_group: false,
+            name: "Peer".to_owned(),
+            avatar: None,
+            pinned: true,
+            members: 0,
+            unread: 1,
+            preview: None,
+        });
+        state.conversations.pinned_ids.insert("c1".to_owned());
+        state.conversations.pinned_ids.insert("c2".to_owned());
+        state.conversations.archived_ids.insert("c1".to_owned());
+        state.conversations.unread_marks.insert("c1".to_owned());
+
+        let out = crate::reduce::reduce(
+            &mut state,
+            Input::DeleteApiDone {
+                id: "c1".to_owned(),
+                op_id: Some(7),
+            },
+        );
+
+        let pref_writes: Vec<(&str, &Vec<String>)> = out
+            .effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Store(StoreOp::SetPreferenceStrings { key, values }) => {
+                    Some((key.as_str(), values))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pref_writes,
+            vec![
+                ("pinnedIds", &vec!["c2".to_owned()]),
+                ("archivedIds", &vec![]),
+                ("unreadMarks", &vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn delete_api_done_skips_unmodified_pref_writes() {
+        let mut state = CoreState::default();
+        state.conversations.conversations.push(ConversationSummary {
+            id: "c1".to_owned(),
+            is_group: false,
+            name: "Peer".to_owned(),
+            avatar: None,
+            pinned: false,
+            members: 0,
+            unread: 0,
+            preview: None,
+        });
+        state.conversations.pinned_ids.insert("c2".to_owned());
+
+        let out = crate::reduce::reduce(
+            &mut state,
+            Input::DeleteApiDone {
+                id: "c1".to_owned(),
+                op_id: Some(8),
+            },
+        );
+
+        let pref_keys: Vec<&str> = out
+            .effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Store(StoreOp::SetPreferenceStrings { key, .. }) => Some(key.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(pref_keys.is_empty());
+    }
 }

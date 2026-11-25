@@ -910,5 +910,43 @@ async fn compare_case_detects_mismatches_and_applies_known_diffs() -> Result<(),
     let diffs = compare_case(&case, &res, &[], &mut used);
     assert_eq!(diffs.len(), 1);
     assert_eq!(diffs[0].path, "final.profile.display_name");
+
+    // Exact-`actual` known diff suppresses the mismatch and marks itself used.
+    let exact_kd = common::KnownDiff {
+        domain: "session".to_owned(),
+        name: "diff_check".to_owned(),
+        path: "final.profile.display_name".to_owned(),
+        actual: json!("Minh"),
+        reason: "expected port divergence".to_owned(),
+    };
+    let mut used_exact = vec![false];
+    assert!(compare_case(&case, &res, &[exact_kd], &mut used_exact).is_empty());
+    assert_eq!(used_exact, vec![true]);
+
+    // Wrong-`actual` known diff does NOT suppress the mismatch and stays unused.
+    let wrong_kd = common::KnownDiff {
+        domain: "session".to_owned(),
+        name: "diff_check".to_owned(),
+        path: "final.profile.display_name".to_owned(),
+        actual: json!("SomeoneElse"),
+        reason: "wrong actual".to_owned(),
+    };
+    let mut used_wrong = vec![false];
+    let diffs_wrong = compare_case(&case, &res, &[wrong_kd], &mut used_wrong);
+    assert_eq!(diffs_wrong.len(), 1);
+    assert_eq!(used_wrong, vec![false]);
+
+    // Stale known diff (case no longer differs from recording) stays unused so the gate fails.
+    case.expect.final_state["profile"]["display_name"] = json!("Minh");
+    let stale_kd = common::KnownDiff {
+        domain: "session".to_owned(),
+        name: "diff_check".to_owned(),
+        path: "final.profile.display_name".to_owned(),
+        actual: json!("Minh"),
+        reason: "stale".to_owned(),
+    };
+    let mut used_stale = vec![false];
+    assert!(compare_case(&case, &res, &[stale_kd], &mut used_stale).is_empty());
+    assert_eq!(used_stale, vec![false]);
     Ok(())
 }

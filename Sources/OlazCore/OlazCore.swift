@@ -6348,6 +6348,8 @@ public protocol CoreStoreProtocol: AnyObject, Sendable {
     
     func setConversationPinned(id: String, pinned: Bool) async throws 
     
+    func setConversationPreview(id: String, previewText: String, previewTsMs: Int64, previewFromMe: Bool, updatedAtMs: Int64) async throws 
+    
     func setConversationUnread(id: String, unread: Int64) async throws 
     
     func setPreferenceBool(key: String, value: Bool) async throws 
@@ -6862,6 +6864,22 @@ open func setConversationPinned(id: String, pinned: Bool)async throws   {
             rustFutureFunc: {
                 uniffi_olaz_ffi_fn_method_corestore_set_conversation_pinned(
                         self.uniffiCloneHandle(),FfiConverterString.lower(id),FfiConverterBool.lower(pinned)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
+            freeFunc: ffi_olaz_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func setConversationPreview(id: String, previewText: String, previewTsMs: Int64, previewFromMe: Bool, updatedAtMs: Int64)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corestore_set_conversation_preview(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(id),FfiConverterString.lower(previewText),FfiConverterInt64.lower(previewTsMs),FfiConverterBool.lower(previewFromMe),FfiConverterInt64.lower(updatedAtMs)
                 )
             },
             pollFunc: ffi_olaz_ffi_rust_future_poll_void,
@@ -9105,13 +9123,15 @@ public func FfiConverterTypeWsSession_lower(_ value: WsSession) -> UInt64 {
 public struct BatchApplyDeltaRecord: Equatable, Hashable {
     public var appliedCount: UInt32
     public var updates: [ConvMessageDeltaRecord]
+    public var previewOverrides: [ConvPreviewOverrideRecord]
     public var persistConversations: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(appliedCount: UInt32, updates: [ConvMessageDeltaRecord], persistConversations: Bool) {
+    public init(appliedCount: UInt32, updates: [ConvMessageDeltaRecord], previewOverrides: [ConvPreviewOverrideRecord], persistConversations: Bool) {
         self.appliedCount = appliedCount
         self.updates = updates
+        self.previewOverrides = previewOverrides
         self.persistConversations = persistConversations
     }
 
@@ -9133,6 +9153,7 @@ public struct FfiConverterTypeBatchApplyDeltaRecord: FfiConverterRustBuffer {
             try BatchApplyDeltaRecord(
                 appliedCount: FfiConverterUInt32.read(from: &buf), 
                 updates: FfiConverterSequenceTypeConvMessageDeltaRecord.read(from: &buf), 
+                previewOverrides: FfiConverterSequenceTypeConvPreviewOverrideRecord.read(from: &buf), 
                 persistConversations: FfiConverterBool.read(from: &buf)
         )
     }
@@ -9140,6 +9161,7 @@ public struct FfiConverterTypeBatchApplyDeltaRecord: FfiConverterRustBuffer {
     public static func write(_ value: BatchApplyDeltaRecord, into buf: inout [UInt8]) {
         FfiConverterUInt32.write(value.appliedCount, into: &buf)
         FfiConverterSequenceTypeConvMessageDeltaRecord.write(value.updates, into: &buf)
+        FfiConverterSequenceTypeConvPreviewOverrideRecord.write(value.previewOverrides, into: &buf)
         FfiConverterBool.write(value.persistConversations, into: &buf)
     }
 }
@@ -9628,6 +9650,64 @@ public func FfiConverterTypeConvMessageDeltaRecord_lift(_ buf: RustBuffer) throw
 #endif
 public func FfiConverterTypeConvMessageDeltaRecord_lower(_ value: ConvMessageDeltaRecord) -> RustBuffer {
     return FfiConverterTypeConvMessageDeltaRecord.lower(value)
+}
+
+
+public struct ConvPreviewOverrideRecord: Equatable, Hashable {
+    public var convId: String
+    public var targetDateMs: Int64
+    public var preview: ConversationPreviewRecord?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(convId: String, targetDateMs: Int64, preview: ConversationPreviewRecord?) {
+        self.convId = convId
+        self.targetDateMs = targetDateMs
+        self.preview = preview
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ConvPreviewOverrideRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConvPreviewOverrideRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConvPreviewOverrideRecord {
+        return
+            try ConvPreviewOverrideRecord(
+                convId: FfiConverterString.read(from: &buf), 
+                targetDateMs: FfiConverterInt64.read(from: &buf), 
+                preview: FfiConverterOptionTypeConversationPreviewRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ConvPreviewOverrideRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.convId, into: &buf)
+        FfiConverterInt64.write(value.targetDateMs, into: &buf)
+        FfiConverterOptionTypeConversationPreviewRecord.write(value.preview, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConvPreviewOverrideRecord_lift(_ buf: RustBuffer) throws -> ConvPreviewOverrideRecord {
+    return try FfiConverterTypeConvPreviewOverrideRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConvPreviewOverrideRecord_lower(_ value: ConvPreviewOverrideRecord) -> RustBuffer {
+    return FfiConverterTypeConvPreviewOverrideRecord.lower(value)
 }
 
 
@@ -18578,6 +18658,31 @@ fileprivate struct FfiConverterSequenceTypeConvMessageDeltaRecord: FfiConverterR
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeConvPreviewOverrideRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [ConvPreviewOverrideRecord]
+
+    public static func write(_ value: [ConvPreviewOverrideRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeConvPreviewOverrideRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ConvPreviewOverrideRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ConvPreviewOverrideRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeConvPreviewOverrideRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeConversationLabelRecord: FfiConverterRustBuffer {
     typealias SwiftType = [ConversationLabelRecord]
 
@@ -20309,6 +20414,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_corestore_set_conversation_pinned() != 1091) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corestore_set_conversation_preview() != 51390) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_corestore_set_conversation_unread() != 58839) {

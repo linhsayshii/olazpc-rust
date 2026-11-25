@@ -1332,6 +1332,7 @@ async fn adr018_concurrent_drains_are_serialized() {
             delta: olaz_core::BatchApplyDelta {
                 applied_count: 3,
                 updates: Vec::new(),
+                preview_overrides: Vec::new(),
                 persist_conversations: false,
             },
         },
@@ -1366,6 +1367,7 @@ async fn adr018_concurrent_drains_are_serialized() {
             delta: olaz_core::BatchApplyDelta {
                 applied_count: 5,
                 updates: Vec::new(),
+                preview_overrides: Vec::new(),
                 persist_conversations: false,
             },
         },
@@ -1406,6 +1408,7 @@ async fn adr018_concurrent_drains_are_serialized() {
             delta: olaz_core::BatchApplyDelta {
                 applied_count: 1,
                 updates: Vec::new(),
+                preview_overrides: Vec::new(),
                 persist_conversations: false,
             },
         },
@@ -1465,6 +1468,7 @@ async fn core_handle_drain_chat_polling_returns_total_event_count() {
             olaz_core::BatchApplyDelta {
                 applied_count: 4,
                 updates: Vec::new(),
+                preview_overrides: Vec::new(),
                 persist_conversations: false,
             }
         }
