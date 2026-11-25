@@ -157,6 +157,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var markReadTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var deleteUndoTimerTask: Task<Void, Never>?
     @ObservationIgnored internal var messageActionTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored internal var contactsTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var activeSendTask: Task<Bool, Never>?
     @ObservationIgnored internal var batchImportTask: Task<Void, Never>?
     @ObservationIgnored internal var activeSyncBatchTasks: [UUID: Task<Void, Never>] = [:]
@@ -1691,7 +1692,7 @@ final class ZaloEngine {
         }
 
         if !changedRows.isEmpty, let store = sqliteStore {
-            Task {
+            trackMessageActionTask {
                 try? await store.saveMessages(changedRows, preserveExistingReactions: false)
             }
         }
