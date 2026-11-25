@@ -204,6 +204,8 @@ final class ZaloEngine {
     @ObservationIgnored internal var persistConversationsTask: Task<Void, Never>?
     @ObservationIgnored internal var notifyTypingTask: Task<Void, Never>?
     @ObservationIgnored internal var markReadTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored internal var deleteUndoTimerTask: Task<Void, Never>?
+    @ObservationIgnored internal var messageActionTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var activeSendTask: Task<Bool, Never>?
     @ObservationIgnored internal var batchImportTask: Task<Void, Never>?
     @ObservationIgnored internal var activeSyncBatchTasks: [UUID: Task<Void, Never>] = [:]
@@ -1870,7 +1872,7 @@ final class ZaloEngine {
             }
         }
 
-        let now = Date()
+        let now = Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
         pendingLocalReactions.removeAll { now.timeIntervalSince($0.createdAt) > 20 }
         if isMe, let matchIdx = pendingLocalReactions.firstIndex(where: { pending in
             guard pending.convId == trimmedConv || pending.convId == sanitizedConv else { return false }
@@ -2101,7 +2103,6 @@ final class ZaloEngine {
                 deletedTsMs = existing.tsMs
             }
         }
-
 
         try? await sqliteStore?.deleteMessage(convId: convId, id: targetId)
         if !cliMsgId.isEmpty, cliMsgId != targetId {
