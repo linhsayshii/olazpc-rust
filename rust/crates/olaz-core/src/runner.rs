@@ -27,8 +27,8 @@ use crate::conversations::{
 };
 use crate::effect::{Effect, HistoryFetchPurpose, HostCall, OpResult, StoreOp};
 use crate::input::{
-    CompletedLogin, Input, LegacyCookie, PollBatchError, PollBatchOutcome, SeenTarget,
-    SessionFailure, StoreToken,
+    BootstrapAliasesError, Command, CompletedLogin, Input, LegacyCookie, PollBatchError,
+    PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
 };
 use crate::messages::MuteEntry;
 use crate::reduce::classify::MobileSyncEvent;
@@ -458,6 +458,7 @@ enum HostJob {
         _guard: InFlightGuard,
     },
     StartBootstrap {
+        sink: ActorSink,
         _guard: InFlightGuard,
     },
     OfferFirstLoginTransfer {
@@ -676,6 +677,7 @@ pub struct SessionEffectRunner<T: Transport + 'static> {
     host_dispatched: AtomicU64,
     store_dispatched: AtomicU64,
     active_tasks: Arc<Mutex<Vec<AbortHandle>>>,
+    bootstrap_tasks: Arc<Mutex<Vec<AbortHandle>>>,
     lp_timer_abort: Arc<Mutex<Option<AbortHandle>>>,
     lp_fetch_abort: Mutex<Option<AbortHandle>>,
     host_worker_abort: AbortHandle,
@@ -731,6 +733,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         let (store_tx, store_rx) = mpsc::unbounded_channel();
         let shared_store: SharedStoreSlot = Arc::new(Mutex::new(None));
         let active_tasks: Arc<Mutex<Vec<AbortHandle>>> = Arc::new(Mutex::new(Vec::new()));
+        let bootstrap_tasks: Arc<Mutex<Vec<AbortHandle>>> = Arc::new(Mutex::new(Vec::new()));
         let ws_active_gen: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let lp_active_gen: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let lp_timer_abort: Arc<Mutex<Option<AbortHandle>>> = Arc::new(Mutex::new(None));
@@ -766,6 +769,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
             host_dispatched: AtomicU64::new(0),
             store_dispatched: AtomicU64::new(0),
             active_tasks,
+            bootstrap_tasks,
             lp_timer_abort,
             lp_fetch_abort: Mutex::new(None),
             host_worker_abort: worker_handle.abort_handle(),
@@ -887,6 +891,33 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         list.push(handle);
     }
 
+    // U4-bootstrap
+    fn cancel_bootstrap_tasks(&self) {
+        let handles = {
+            let mut list = self
+                .bootstrap_tasks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            std::mem::take(&mut *list)
+        };
+        for handle in handles {
+            handle.abort();
+        }
+    }
+
+    fn spawn_bootstrap<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let handle = self.runtime.spawn(fut).abort_handle();
+        let mut list = self
+            .bootstrap_tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        list.retain(|h| !h.is_finished());
+        list.push(handle);
+    }
+
     fn snapshot_json(&self) -> String {
         serde_json::to_string(&self.client.snapshot()).unwrap_or_default()
     }
@@ -898,6 +929,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
             match effect {
                 Effect::CancelSessionTasks => {
                     self.cancel_active_tasks();
+                    self.cancel_bootstrap_tasks();
                 }
                 Effect::ClearCoreSession => {
                     let pre_clear_domains = self.client.domains();
@@ -1461,34 +1493,34 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.spawn_cancellable(async move {
-                            let page = if client.is_authenticated() {
-                                let api = ZaloApi::from_shared(client);
-                                api.fetch_history(&conv_id, before_msg_id.as_deref(), count, is_old)
-                                    .await
-                                    .ok()
-                            } else {
-                                None
-                            };
-                            match purpose {
-                                HistoryFetchPurpose::Open { open_seq, op_id } => {
-                                    sink.send(Input::OpenHistoryPageFetched {
-                                        open_seq,
-                                        conv_id,
-                                        page,
-                                        op_id,
-                                    });
-                                }
-                                HistoryFetchPurpose::LoadOlder { load_seq, op_id } => {
-                                    sink.send(Input::LoadOlderPageFetched {
-                                        load_seq,
-                                        conv_id,
-                                        before_msg_id,
-                                        page,
-                                        op_id,
-                                    });
-                                }
+                        let page = if client.is_authenticated() {
+                            let api = ZaloApi::from_shared(client);
+                            api.fetch_history(&conv_id, before_msg_id.as_deref(), count, is_old)
+                                .await
+                                .ok()
+                        } else {
+                            None
+                        };
+                        match purpose {
+                            HistoryFetchPurpose::Open { open_seq, op_id } => {
+                                sink.send(Input::OpenHistoryPageFetched {
+                                    open_seq,
+                                    conv_id,
+                                    page,
+                                    op_id,
+                                });
                             }
-                            drop(guard);
+                            HistoryFetchPurpose::LoadOlder { load_seq, op_id } => {
+                                sink.send(Input::LoadOlderPageFetched {
+                                    load_seq,
+                                    conv_id,
+                                    before_msg_id,
+                                    page,
+                                    op_id,
+                                });
+                            }
+                        }
+                        drop(guard);
                     });
                 }
                 Effect::FetchSenderProfilesChunkApi {
@@ -1502,23 +1534,210 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.spawn_cancellable(async move {
-                            let profiles_map = if client.is_authenticated() {
-                                let api = ZaloApi::from_shared(client);
-                                match api.fetch_profiles(&chunk).await {
-                                    Ok(raw) => extract_profiles_map(&raw),
-                                    Err(_) => Map::new(),
-                                }
-                            } else {
-                                Map::new()
-                            };
-                            sink.send(Input::SenderProfilesChunkDone {
-                                resolve_id,
-                                conv_id,
-                                remaining_chunks,
-                                profiles_map,
-                                cache_updated,
+                        let profiles_map = if client.is_authenticated() {
+                            let api = ZaloApi::from_shared(client);
+                            match api.fetch_profiles(&chunk).await {
+                                Ok(raw) => extract_profiles_map(&raw),
+                                Err(_) => Map::new(),
+                            }
+                        } else {
+                            Map::new()
+                        };
+                        sink.send(Input::SenderProfilesChunkDone {
+                            resolve_id,
+                            conv_id,
+                            remaining_chunks,
+                            profiles_map,
+                            cache_updated,
+                        });
+                        drop(guard);
+                    });
+                }
+                // --- Launch bootstrap network effects (U4-bootstrap) ---
+                Effect::CancelBootstrapTasks => {
+                    self.cancel_bootstrap_tasks();
+                }
+                Effect::BootstrapFetchAliasesApi { boot_gen } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let result = match api.fetch_aliases().await {
+                            Ok(aliases) => Ok(aliases),
+                            Err(err) if err.is_auth_error() => Err(BootstrapAliasesError::Auth),
+                            Err(_) => Err(BootstrapAliasesError::Other),
+                        };
+                        sink.send(Input::BootstrapAliasesDone { boot_gen, result });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchPamApi { boot_gen } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let (pinned_res, archived_res, mute_res) = tokio::join!(
+                            api.fetch_pinned_conversations(),
+                            api.fetch_archived_chats(),
+                            api.fetch_mute_list(),
+                        );
+                        sink.send(Input::BootstrapPamDone {
+                            boot_gen,
+                            pinned_ids: pinned_res.ok(),
+                            archived_ids: archived_res.ok(),
+                            mute_rows: mute_res.ok(),
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchLabelsApi { boot_gen } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let payload = api.fetch_conversation_labels().await.ok();
+                        sink.send(Input::BootstrapLabelsDone { boot_gen, payload });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchHiddenApi { boot_gen } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        let snapshot = if client.is_authenticated() {
+                            let api = ZaloApi::from_shared(client);
+                            api.fetch_hidden_conversations().await.ok()
+                        } else {
+                            None
+                        };
+                        sink.send(Input::BootstrapHiddenDone { boot_gen, snapshot });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchContactsApi { boot_gen } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let (friends_res, groups_res, sent_res, received_res) = tokio::join!(
+                            api.fetch_friends(1, 20000),
+                            api.fetch_groups_list(),
+                            api.fetch_sent_friend_requests(),
+                            api.fetch_received_friend_requests(),
+                        );
+                        sink.send(Input::BootstrapContactsDone {
+                            boot_gen,
+                            friends_rows: friends_res.ok(),
+                            groups_dict: groups_res.ok(),
+                            sent_rows: sent_res.ok(),
+                            received_rows: received_res.ok(),
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchPreloadApi {
+                    boot_gen,
+                    thread_ids,
+                    is_overview,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let payload = api.fetch_preload_conversations(&thread_ids).await.ok();
+                        sink.send(Input::BootstrapPreloadDone {
+                            boot_gen,
+                            is_overview,
+                            payload,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchHistoryApi {
+                    boot_gen,
+                    conv_id,
+                    count,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let payload = api
+                            .fetch_history(&conv_id, None, count, Some(false))
+                            .await
+                            .ok();
+                        sink.send(Input::BootstrapSelfCloudDone {
+                            boot_gen,
+                            conv_id,
+                            payload,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchGroupWaveApi {
+                    boot_gen,
+                    gids,
+                    count,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        type WaveEntry = (String, Option<Map<String, Value>>);
+                        let len = gids.len();
+                        let mut set: tokio::task::JoinSet<(usize, WaveEntry)> =
+                            tokio::task::JoinSet::new();
+                        for (idx, gid) in gids.into_iter().enumerate() {
+                            let task_client = Arc::clone(&client);
+                            set.spawn(async move {
+                                let api = ZaloApi::from_shared(task_client);
+                                let payload =
+                                    api.fetch_history(&gid, None, count, Some(false)).await.ok();
+                                (idx, (gid, payload))
                             });
-                            drop(guard);
+                        }
+                        let mut slots: Vec<Option<WaveEntry>> = vec![None; len];
+                        while let Some(joined) = set.join_next().await {
+                            if let Ok((idx, entry)) = joined
+                                && let Some(slot) = slots.get_mut(idx)
+                            {
+                                *slot = Some(entry);
+                            }
+                        }
+                        let results: Vec<WaveEntry> = slots.into_iter().flatten().collect();
+                        sink.send(Input::BootstrapGroupWaveDone { boot_gen, results });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchProfilesChunkApi {
+                    boot_gen,
+                    chunk,
+                    remaining_chunks,
+                    profiles_cache_changed,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let profiles_map = match api.fetch_profiles(&chunk).await {
+                            Ok(raw) => extract_profiles_map(&raw),
+                            Err(_) => Map::new(),
+                        };
+                        sink.send(Input::BootstrapResolveNamesChunkDone {
+                            boot_gen,
+                            remaining_chunks,
+                            profiles_map,
+                            profiles_cache_changed,
+                        });
+                        drop(guard);
                     });
                 }
                 Effect::Host(call) => {
@@ -1537,7 +1756,10 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             sink: sink.clone(),
                             _guard: guard,
                         },
-                        HostCall::StartBootstrap => HostJob::StartBootstrap { _guard: guard },
+                        HostCall::StartBootstrap => HostJob::StartBootstrap {
+                            sink: sink.clone(),
+                            _guard: guard,
+                        },
                         HostCall::OfferFirstLoginTransfer { force } => {
                             HostJob::OfferFirstLoginTransfer {
                                 force,
@@ -1792,6 +2014,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
         self.cancel_active_tasks();
+        self.cancel_bootstrap_tasks();
         self.cancel_long_poll();
         self.ws_driver.stop(false);
         self.host_worker_abort.abort();
@@ -1890,7 +2113,7 @@ async fn run_store_worker(
                         } else {
                             probe_targets.into_keys().map(|c| (c, false)).collect()
                         };
-                        if !probes.is_empty() {
+                        if !probes.is_empty() || reply_boot_gen.is_some() {
                             sink.send(Input::FreshnessProbed {
                                 boot_gen: reply_boot_gen,
                                 probes,
@@ -2273,8 +2496,12 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                     }
                 }
             }
-            HostJob::StartBootstrap { _guard } => {
-                host.start_bootstrap().await;
+            HostJob::StartBootstrap { sink, _guard } => {
+                if host.on_bootstrap_started().await {
+                    sink.send(Input::Command(Command::Bootstrap {
+                        now_ms: unix_now_ms(),
+                    }));
+                }
             }
             HostJob::OfferFirstLoginTransfer { force, _guard } => {
                 host.offer_first_login_transfer(force).await;
@@ -2302,6 +2529,13 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 snapshot_json,
                 _guard,
             } => {
+                // U4-bootstrap: Swift `markExpired` calls `hostResetDomains` and closes SQLite,
+                // so drain pending store ops and detach the shared store handle first.
+                let (tx, rx) = oneshot::channel();
+                if store_tx.send(StoreJob::Drain(tx)).is_ok() {
+                    let _ = rx.await;
+                }
+                *shared_store.lock().unwrap_or_else(PoisonError::into_inner) = None;
                 host.mark_expired(snapshot_json).await;
             }
             HostJob::PersistPollState { state, _guard } => {

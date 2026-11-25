@@ -5,7 +5,7 @@ use olaz_net::{LoginAccount, QrTicket, SessionStatus};
 use crate::changes::DirtyKey;
 use crate::effect::{Effect, HostCall};
 use crate::input::{Command, Input, SessionFailure, StoreToken};
-use crate::reduce::{ReduceOutput, transport};
+use crate::reduce::{ReduceOutput, bootstrap, transport};
 use crate::state::{CoreState, LoginState, LoginStep, PendingStore, Phase, Profile, SessionState};
 
 /// Default Vietnamese display name when the server returns an empty string (Swift `applyAccountProfile`).
@@ -318,6 +318,8 @@ fn reduce_command(state: &mut CoreState, cmd: Command, out: &mut ReduceOutput) {
             tracing::debug!("session: log out");
             reset_session_fields(&mut state.session);
             state.conversations.reset();
+            // U4-bootstrap
+            bootstrap::cancel_bootstrap_state(state, out);
             state.messages.reset();
             state.contacts.reset();
             state.session.sign_out_notice = None;
@@ -391,10 +393,20 @@ fn start_qr_login(state: &mut SessionState, out: &mut ReduceOutput) {
 pub(crate) fn enter_session_expired(state: &mut CoreState, reason: String, out: &mut ReduceOutput) {
     tracing::debug!("session: expired");
     reset_session_fields(&mut state.session);
+    // U4-bootstrap: mirror Swift `markExpired -> hostResetDomains` domain teardown.
+    state.conversations.reset();
+    bootstrap::cancel_bootstrap_state(state, out);
+    state.messages.reset();
+    state.contacts.reset();
     state.session.sign_out_notice = Some(reason);
     state.session.qr_gen = state.session.qr_gen.saturating_add(1);
     state.session.phase = Phase::Login(LoginState::generating());
     out.dirty.insert(DirtyKey::Session);
+    out.dirty.insert(DirtyKey::Conversations);
+    out.dirty.insert(DirtyKey::ConversationFlags);
+    out.dirty.insert(DirtyKey::ConversationExtras);
+    out.dirty.insert(DirtyKey::ConversationUi);
+    out.dirty.insert(DirtyKey::ConversationPrompt);
 
     // Order matches Swift `handleSessionExpiredNotice`: cancel, stop transport, mark_expired, QR.
     // Unlike `logOut`, session expiry does not reset `ZaloDomains`.

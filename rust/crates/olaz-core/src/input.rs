@@ -44,6 +44,16 @@ pub enum HiddenPinSyncKind {
     SetPin { changed: bool },
 }
 
+// U4-bootstrap
+/// Failure category of `/api/alias/list` during launch bootstrap step 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapAliasesError {
+    /// Auth error (code 600 or -102): aborts bootstrap and expires the session.
+    Auth,
+    /// Non-auth error: logged/ignored and bootstrap proceeds.
+    Other,
+}
+
 /// Commands sent from Swift (or test scripts) into the actor.
 #[derive(Clone)]
 pub enum Command {
@@ -733,14 +743,6 @@ pub enum Input {
         profiles_map: Map<String, Value>,
         cache_updated: bool,
     },
-    BootstrapFreshnessLoaded {
-        boot_gen: u64,
-        last_refresh_pref: Option<String>,
-    },
-    FreshnessProbed {
-        boot_gen: Option<u64>,
-        probes: Vec<(String, bool)>,
-    },
     DecryptedEnvelopeReady {
         payload: Map<String, Value>,
         default_cmd: u16,
@@ -752,6 +754,61 @@ pub enum Input {
         probe_freshness: bool,
         poll_batch_done: Option<(u64, u64)>,
         op_id: Option<u64>,
+    },
+
+    // --- Launch bootstrap completions (U4-bootstrap) ---
+    BootstrapAliasesDone {
+        boot_gen: u64,
+        result: Result<BTreeMap<String, String>, BootstrapAliasesError>,
+    },
+    BootstrapFreshnessLoaded {
+        boot_gen: u64,
+        last_refresh_pref: Option<String>,
+    },
+    BootstrapPamDone {
+        boot_gen: u64,
+        pinned_ids: Option<Vec<String>>,
+        archived_ids: Option<Vec<String>>,
+        mute_rows: Option<Vec<Map<String, Value>>>,
+    },
+    BootstrapLabelsDone {
+        boot_gen: u64,
+        payload: Option<Map<String, Value>>,
+    },
+    BootstrapHiddenDone {
+        boot_gen: u64,
+        snapshot: Option<HiddenConversationsSnapshot>,
+    },
+    BootstrapContactsDone {
+        boot_gen: u64,
+        friends_rows: Option<Vec<Map<String, Value>>>,
+        groups_dict: Option<Map<String, Value>>,
+        sent_rows: Option<Vec<Map<String, Value>>>,
+        received_rows: Option<Vec<Map<String, Value>>>,
+    },
+    BootstrapPreloadDone {
+        boot_gen: u64,
+        is_overview: bool,
+        payload: Option<Map<String, Value>>,
+    },
+    FreshnessProbed {
+        boot_gen: Option<u64>,
+        probes: Vec<(String, bool)>,
+    },
+    BootstrapSelfCloudDone {
+        boot_gen: u64,
+        conv_id: String,
+        payload: Option<Map<String, Value>>,
+    },
+    BootstrapGroupWaveDone {
+        boot_gen: u64,
+        results: Vec<(String, Option<Map<String, Value>>)>,
+    },
+    BootstrapResolveNamesChunkDone {
+        boot_gen: u64,
+        remaining_chunks: Vec<Vec<String>>,
+        profiles_map: Map<String, Value>,
+        profiles_cache_changed: bool,
     },
 }
 
@@ -1010,6 +1067,17 @@ impl fmt::Debug for Input {
                 .field("profiles", &profiles_map.len())
                 .field("cache_updated", cache_updated)
                 .finish(),
+            Self::DecryptedEnvelopeReady { default_cmd, .. } => f
+                .debug_struct("DecryptedEnvelopeReady")
+                .field("default_cmd", default_cmd)
+                .finish(),
+            // U4-bootstrap
+            Self::BootstrapAliasesDone { boot_gen, result } => f
+                .debug_struct("BootstrapAliasesDone")
+                .field("boot_gen", boot_gen)
+                .field("ok", &result.is_ok())
+                .field("count", &result.as_ref().map(BTreeMap::len))
+                .finish(),
             Self::BootstrapFreshnessLoaded {
                 boot_gen,
                 last_refresh_pref,
@@ -1018,14 +1086,80 @@ impl fmt::Debug for Input {
                 .field("boot_gen", boot_gen)
                 .field("has_pref", &last_refresh_pref.is_some())
                 .finish(),
+            Self::BootstrapPamDone {
+                boot_gen,
+                pinned_ids,
+                archived_ids,
+                mute_rows,
+            } => f
+                .debug_struct("BootstrapPamDone")
+                .field("boot_gen", boot_gen)
+                .field("pinned_count", &pinned_ids.as_ref().map(Vec::len))
+                .field("archived_count", &archived_ids.as_ref().map(Vec::len))
+                .field("mute_count", &mute_rows.as_ref().map(Vec::len))
+                .finish(),
+            Self::BootstrapLabelsDone { boot_gen, payload } => f
+                .debug_struct("BootstrapLabelsDone")
+                .field("boot_gen", boot_gen)
+                .field("has_payload", &payload.is_some())
+                .finish(),
+            Self::BootstrapHiddenDone { boot_gen, snapshot } => f
+                .debug_struct("BootstrapHiddenDone")
+                .field("boot_gen", boot_gen)
+                .field("has_snapshot", &snapshot.is_some())
+                .finish(),
+            Self::BootstrapContactsDone {
+                boot_gen,
+                friends_rows,
+                groups_dict,
+                sent_rows,
+                received_rows,
+            } => f
+                .debug_struct("BootstrapContactsDone")
+                .field("boot_gen", boot_gen)
+                .field("friends_count", &friends_rows.as_ref().map(Vec::len))
+                .field("has_groups", &groups_dict.is_some())
+                .field("sent_count", &sent_rows.as_ref().map(Vec::len))
+                .field("received_count", &received_rows.as_ref().map(Vec::len))
+                .finish(),
+            Self::BootstrapPreloadDone {
+                boot_gen,
+                is_overview,
+                payload,
+            } => f
+                .debug_struct("BootstrapPreloadDone")
+                .field("boot_gen", boot_gen)
+                .field("is_overview", is_overview)
+                .field("has_payload", &payload.is_some())
+                .finish(),
             Self::FreshnessProbed { boot_gen, probes } => f
                 .debug_struct("FreshnessProbed")
                 .field("boot_gen", boot_gen)
-                .field("probes", &probes.len())
+                .field("probes_count", &probes.len())
                 .finish(),
-            Self::DecryptedEnvelopeReady { default_cmd, .. } => f
-                .debug_struct("DecryptedEnvelopeReady")
-                .field("default_cmd", default_cmd)
+            Self::BootstrapSelfCloudDone {
+                boot_gen, payload, ..
+            } => f
+                .debug_struct("BootstrapSelfCloudDone")
+                .field("boot_gen", boot_gen)
+                .field("has_payload", &payload.is_some())
+                .finish(),
+            Self::BootstrapGroupWaveDone { boot_gen, results } => f
+                .debug_struct("BootstrapGroupWaveDone")
+                .field("boot_gen", boot_gen)
+                .field("count", &results.len())
+                .finish(),
+            Self::BootstrapResolveNamesChunkDone {
+                boot_gen,
+                remaining_chunks,
+                profiles_map,
+                profiles_cache_changed,
+            } => f
+                .debug_struct("BootstrapResolveNamesChunkDone")
+                .field("boot_gen", boot_gen)
+                .field("remaining_chunks", &remaining_chunks.len())
+                .field("profiles_count", &profiles_map.len())
+                .field("cache_changed", profiles_cache_changed)
                 .finish(),
         }
     }

@@ -2,6 +2,8 @@
 //!
 //! No I/O, no clock, and no randomness may live inside `reduce`.
 
+// U4-bootstrap
+pub mod bootstrap;
 pub mod classify;
 pub mod conversations;
 pub mod messages;
@@ -26,7 +28,6 @@ fn is_message_command(cmd: &Command) -> bool {
         Command::OpenConversation { .. }
             | Command::CloseConversation
             | Command::LoadOlderMessages { .. }
-            | Command::Bootstrap { .. }
             | Command::ApplyBatchDirect { .. }
             | Command::ApplyParsedEventsDirect { .. }
             | Command::WriteThroughUpsertMessage { .. }
@@ -72,6 +73,26 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::PollBatchFetched { .. }
         | Input::PollBatchApplied { .. } => transport::reduce_transport(state, input, &mut out),
 
+        // U4-bootstrap
+        Input::Command(Command::Bootstrap { .. })
+        | Input::OpRequest {
+            cmd: Command::Bootstrap { .. },
+            ..
+        }
+        | Input::BootstrapAliasesDone { .. }
+        | Input::BootstrapFreshnessLoaded { .. }
+        | Input::BootstrapPamDone { .. }
+        | Input::BootstrapLabelsDone { .. }
+        | Input::BootstrapHiddenDone { .. }
+        | Input::BootstrapContactsDone { .. }
+        | Input::BootstrapPreloadDone { .. }
+        | Input::FreshnessProbed { .. }
+        | Input::BootstrapSelfCloudDone { .. }
+        | Input::BootstrapGroupWaveDone { .. }
+        | Input::BootstrapResolveNamesChunkDone { .. } => {
+            bootstrap::reduce_bootstrap(state, input, &mut out);
+        }
+
         Input::Command(ref cmd) if is_message_command(cmd) => {
             messages::reduce_messages(state, input, &mut out);
         }
@@ -83,8 +104,6 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::LoadOlderStoreRead { .. }
         | Input::LoadOlderPageFetched { .. }
         | Input::SenderProfilesChunkDone { .. }
-        | Input::BootstrapFreshnessLoaded { .. }
-        | Input::FreshnessProbed { .. }
         | Input::DecryptedEnvelopeReady { .. } => {
             messages::reduce_messages(state, input, &mut out);
         }
