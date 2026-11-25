@@ -24,7 +24,7 @@ pub enum HistoryFetchPurpose {
     LoadOlder { load_seq: u64, op_id: Option<u64> },
 }
 
-/// Serial SQLite persistence operations executed by the core runner's store worker (U3/U4).
+/// Serial SQLite persistence operations executed by the core runner's store worker (U3).
 #[derive(Clone)]
 pub enum StoreOp {
     SaveConversations(Vec<StoredConversation>),
@@ -66,16 +66,20 @@ pub enum StoreOp {
         my_uid: String,
     },
 
-    // --- Messages & bootstrap domain (U4) ---
-    SaveMessages {
-        rows: Vec<StoredMessage>,
-        preserve_existing_reactions: bool,
+    // --- Launch bootstrap & freshness persistence (U4-bootstrap) ---
+    LoadPreferenceString {
+        key: String,
+        boot_gen: u64,
     },
     ProbeAndSaveMessages {
         probe_targets: BTreeMap<String, String>,
         rows: Vec<StoredMessage>,
         preserve_existing_reactions: bool,
         reply_boot_gen: Option<u64>,
+    },
+    SaveMessages {
+        rows: Vec<StoredMessage>,
+        preserve_existing_reactions: bool,
     },
     LoadOpenLocalMessages {
         open_seq: u64,
@@ -89,10 +93,6 @@ pub enum StoreOp {
         before_ts_ms: i64,
         limit: usize,
         op_id: Option<u64>,
-    },
-    LoadPreferenceString {
-        key: String,
-        boot_gen: u64,
     },
 }
 
@@ -145,6 +145,24 @@ impl fmt::Debug for StoreOp {
                 .debug_struct("LoadMentionPreviewMessages")
                 .field("group_count", &group_ids.len())
                 .finish(),
+            // U4-bootstrap
+            Self::LoadPreferenceString { key, boot_gen } => f
+                .debug_struct("LoadPreferenceString")
+                .field("key", key)
+                .field("boot_gen", boot_gen)
+                .finish(),
+            Self::ProbeAndSaveMessages {
+                probe_targets,
+                rows,
+                preserve_existing_reactions,
+                reply_boot_gen,
+            } => f
+                .debug_struct("ProbeAndSaveMessages")
+                .field("probe_count", &probe_targets.len())
+                .field("rows_count", &rows.len())
+                .field("preserve_existing_reactions", preserve_existing_reactions)
+                .field("reply_boot_gen", reply_boot_gen)
+                .finish(),
             Self::SaveMessages {
                 rows,
                 preserve_existing_reactions,
@@ -152,15 +170,6 @@ impl fmt::Debug for StoreOp {
                 .debug_struct("SaveMessages")
                 .field("count", &rows.len())
                 .field("preserve_reactions", preserve_existing_reactions)
-                .finish(),
-            Self::ProbeAndSaveMessages {
-                probe_targets,
-                rows,
-                ..
-            } => f
-                .debug_struct("ProbeAndSaveMessages")
-                .field("probes", &probe_targets.len())
-                .field("rows", &rows.len())
                 .finish(),
             Self::LoadOpenLocalMessages {
                 open_seq, limit, ..
@@ -179,11 +188,6 @@ impl fmt::Debug for StoreOp {
                 .field("load_seq", load_seq)
                 .field("before_ts_ms", before_ts_ms)
                 .field("limit", limit)
-                .finish(),
-            Self::LoadPreferenceString { key, boot_gen } => f
-                .debug_struct("LoadPreferenceString")
-                .field("key", key)
-                .field("boot_gen", boot_gen)
                 .finish(),
         }
     }
@@ -302,7 +306,11 @@ pub enum HostCall {
         duration: i64,
     },
 
-    // --- Messages & bootstrap domain boundaries (U4) ---
+    // --- Launch bootstrap host calls (U4-bootstrap) ---
+    ApplyMutes {
+        mutes: Vec<MuteEntry>,
+    },
+    RefreshCloud,
     OnOpenConversationSync {
         conv_id: String,
         changed: bool,
@@ -338,10 +346,6 @@ pub enum HostCall {
         cli_msg_id: String,
         update_conversation_preview: bool,
     },
-    ApplyMutes {
-        mutes: Vec<MuteEntry>,
-    },
-    RefreshCloud,
     DecryptEnvelope {
         payload: Map<String, Value>,
         default_cmd: u16,
@@ -463,6 +467,12 @@ impl fmt::Debug for HostCall {
                 .field("set", set)
                 .field("duration", duration)
                 .finish(),
+            // U4-bootstrap
+            Self::ApplyMutes { mutes } => f
+                .debug_struct("ApplyMutes")
+                .field("count", &mutes.len())
+                .finish(),
+            Self::RefreshCloud => f.write_str("RefreshCloud"),
             Self::OnOpenConversationSync { changed, .. } => f
                 .debug_struct("OnOpenConversationSync")
                 .field("changed", changed)
@@ -479,11 +489,6 @@ impl fmt::Debug for HostCall {
                 .finish(),
             Self::ApplyRemoteRecall { .. } => f.write_str("ApplyRemoteRecall"),
             Self::ApplyRemoteDelete { .. } => f.write_str("ApplyRemoteDelete"),
-            Self::ApplyMutes { mutes } => f
-                .debug_struct("ApplyMutes")
-                .field("count", &mutes.len())
-                .finish(),
-            Self::RefreshCloud => f.write_str("RefreshCloud"),
             Self::DecryptEnvelope { default_cmd, .. } => f
                 .debug_struct("DecryptEnvelope")
                 .field("default_cmd", default_cmd)
@@ -645,24 +650,6 @@ pub enum Effect {
     /// Calls `ZaloApi::fetch_conversation_labels`.
     FetchConversationLabelsApi { op_id: Option<u64> },
 
-    // --- Messages domain (U4) ---
-    /// Calls `ZaloApi::fetch_history` for `Open` or `LoadOlder`.
-    FetchHistoryPageApi {
-        conv_id: String,
-        before_msg_id: Option<String>,
-        count: i64,
-        is_old: Option<bool>,
-        purpose: HistoryFetchPurpose,
-    },
-    /// Calls `ZaloApi::fetch_profiles` for one chunk of up to 50 sender/reactor UIDs.
-    FetchSenderProfilesChunkApi {
-        resolve_id: u64,
-        conv_id: String,
-        chunk: Vec<String>,
-        remaining_chunks: Vec<Vec<String>>,
-        cache_updated: bool,
-    },
-
     // --- Launch bootstrap network effects (U4-bootstrap) ---
     /// Aborts any in-flight bootstrap HTTP tasks.
     CancelBootstrapTasks,
@@ -701,15 +688,27 @@ pub enum Effect {
         remaining_chunks: Vec<Vec<String>>,
         profiles_cache_changed: bool,
     },
+
+    /// Calls `ZaloApi::fetch_history` for `Open` or `LoadOlder`.
+    FetchHistoryPageApi {
+        conv_id: String,
+        before_msg_id: Option<String>,
+        count: i64,
+        is_old: Option<bool>,
+        purpose: HistoryFetchPurpose,
+    },
+    /// Calls `ZaloApi::fetch_profiles` for one chunk of up to 50 sender/reactor UIDs.
+    FetchSenderProfilesChunkApi {
+        resolve_id: u64,
+        conv_id: String,
+        chunk: Vec<String>,
+        remaining_chunks: Vec<Vec<String>>,
+        cache_updated: bool,
+    },
+
     // U5
     /// Calls `ZaloApi::send_typing` when `SessionClient::is_authenticated()` is true.
     SendTypingApi { conv_id: String },
-    // U5-send
-    /// Calls `ZaloApi::send_text` for a plain-text send and returns [`Input::SendTextDone`].
-    SendTextApi {
-        send_id: u64,
-        params: SendTextParams,
-    },
     /// Starts or resets the incoming typing expiry timer for `conv_id`.
     StartTypingExpiry {
         conv_id: String,
@@ -718,6 +717,12 @@ pub enum Effect {
     },
     /// Cancels any active incoming typing expiry timer for `conv_id`.
     CancelTypingExpiry { conv_id: String },
+    // U5-send
+    /// Calls `ZaloApi::send_text` for a plain-text send and returns [`Input::SendTextDone`].
+    SendTextApi {
+        send_id: u64,
+        params: SendTextParams,
+    },
 
     /// Domain activity delegated to Swift via `CoreHost`.
     Host(HostCall),
@@ -862,22 +867,6 @@ impl fmt::Debug for Effect {
                 .finish(),
             Self::UpdateConversationLabelsApi { .. } => f.write_str("UpdateConversationLabelsApi"),
             Self::FetchConversationLabelsApi { .. } => f.write_str("FetchConversationLabelsApi"),
-            Self::FetchHistoryPageApi { count, purpose, .. } => f
-                .debug_struct("FetchHistoryPageApi")
-                .field("count", count)
-                .field("purpose", purpose)
-                .finish(),
-            Self::FetchSenderProfilesChunkApi {
-                resolve_id,
-                chunk,
-                remaining_chunks,
-                ..
-            } => f
-                .debug_struct("FetchSenderProfilesChunkApi")
-                .field("resolve_id", resolve_id)
-                .field("chunk_len", &chunk.len())
-                .field("remaining", &remaining_chunks.len())
-                .finish(),
             // U4-bootstrap
             Self::CancelBootstrapTasks => f.write_str("CancelBootstrapTasks"),
             Self::BootstrapFetchAliasesApi { boot_gen } => f
@@ -938,14 +927,24 @@ impl fmt::Debug for Effect {
                 .field("chunk_len", &chunk.len())
                 .field("remaining_chunks", &remaining_chunks.len())
                 .finish(),
+            Self::FetchHistoryPageApi { count, purpose, .. } => f
+                .debug_struct("FetchHistoryPageApi")
+                .field("count", count)
+                .field("purpose", purpose)
+                .finish(),
+            Self::FetchSenderProfilesChunkApi {
+                resolve_id,
+                chunk,
+                remaining_chunks,
+                ..
+            } => f
+                .debug_struct("FetchSenderProfilesChunkApi")
+                .field("resolve_id", resolve_id)
+                .field("chunk_len", &chunk.len())
+                .field("remaining", &remaining_chunks.len())
+                .finish(),
             // U5
             Self::SendTypingApi { .. } => f.write_str("SendTypingApi"),
-            // U5-send
-            Self::SendTextApi { send_id, params } => f
-                .debug_struct("SendTextApi")
-                .field("send_id", send_id)
-                .field("params", params)
-                .finish(),
             Self::StartTypingExpiry {
                 expiry_gen, delay, ..
             } => f
@@ -954,6 +953,12 @@ impl fmt::Debug for Effect {
                 .field("delay_ms", &delay.as_millis())
                 .finish(),
             Self::CancelTypingExpiry { .. } => f.write_str("CancelTypingExpiry"),
+            // U5-send
+            Self::SendTextApi { send_id, params } => f
+                .debug_struct("SendTextApi")
+                .field("send_id", send_id)
+                .field("params", params)
+                .finish(),
             Self::Host(call) => f.debug_tuple("Host").field(call).finish(),
         }
     }

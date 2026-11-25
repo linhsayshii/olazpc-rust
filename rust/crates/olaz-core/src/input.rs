@@ -90,6 +90,11 @@ pub enum Command {
         notify_incoming: bool,
     },
 
+    // --- Launch bootstrap domain (U4-bootstrap) ---
+    Bootstrap {
+        now_ms: i64,
+    },
+
     // --- Conversations & conversation actions domain (U3) ---
     UpdateIdentities(IdentityTable),
     ApplyBatchDelta(BatchApplyDelta),
@@ -219,7 +224,7 @@ pub enum Command {
         id: String,
     },
 
-    // --- Messages & bootstrap domain (U4) ---
+    // --- Messages domain (U4) ---
     OpenConversation {
         id: String,
         preloaded: Vec<ChatMessage>,
@@ -228,9 +233,6 @@ pub enum Command {
     CloseConversation,
     LoadOlderMessages {
         id: String,
-    },
-    Bootstrap {
-        now_ms: i64,
     },
     ApplyBatchDirect {
         payload: Map<String, Value>,
@@ -335,6 +337,10 @@ impl fmt::Debug for Command {
                 .field("max_batches", max_batches)
                 .field("notify_incoming", notify_incoming)
                 .finish(),
+            // U4-bootstrap
+            Self::Bootstrap { now_ms } => {
+                f.debug_struct("Bootstrap").field("now_ms", now_ms).finish()
+            }
             Self::UpdateIdentities(tbl) => f.debug_tuple("UpdateIdentities").field(tbl).finish(),
             Self::ApplyBatchDelta(d) => f.debug_tuple("ApplyBatchDelta").field(d).finish(),
             Self::UpdateConversationOnMessage {
@@ -460,9 +466,6 @@ impl fmt::Debug for Command {
                 .finish(),
             Self::CloseConversation => f.write_str("CloseConversation"),
             Self::LoadOlderMessages { .. } => f.write_str("LoadOlderMessages"),
-            Self::Bootstrap { now_ms } => {
-                f.debug_struct("Bootstrap").field("now_ms", now_ms).finish()
-            }
             Self::ApplyBatchDirect { default_cmd, .. } => f
                 .debug_struct("ApplyBatchDirect")
                 .field("default_cmd", default_cmd)
@@ -811,53 +814,6 @@ pub enum Input {
         result: OpResult,
     },
 
-    // --- Messages & bootstrap domain completions (U4) ---
-    OpenLocalMessagesLoaded {
-        open_seq: u64,
-        conv_id: String,
-        rows: Vec<StoredMessage>,
-        op_id: Option<u64>,
-    },
-    OpenHistoryPageFetched {
-        open_seq: u64,
-        conv_id: String,
-        page: Option<Map<String, Value>>,
-        op_id: Option<u64>,
-    },
-    LoadOlderStoreRead {
-        load_seq: u64,
-        conv_id: String,
-        rows: Vec<StoredMessage>,
-        had_before_cursor: bool,
-        op_id: Option<u64>,
-    },
-    LoadOlderPageFetched {
-        load_seq: u64,
-        conv_id: String,
-        before_msg_id: Option<String>,
-        page: Option<Map<String, Value>>,
-        op_id: Option<u64>,
-    },
-    SenderProfilesChunkDone {
-        resolve_id: u64,
-        conv_id: String,
-        remaining_chunks: Vec<Vec<String>>,
-        profiles_map: Map<String, Value>,
-        cache_updated: bool,
-    },
-    DecryptedEnvelopeReady {
-        payload: Map<String, Value>,
-        default_cmd: u16,
-        fallback_conv_id: Option<String>,
-        is_group_hint: Option<bool>,
-        increment_unread: bool,
-        notify_incoming: bool,
-        persist_conversations: bool,
-        probe_freshness: bool,
-        poll_batch_done: Option<(u64, u64)>,
-        op_id: Option<u64>,
-    },
-
     // --- Launch bootstrap completions (U4-bootstrap) ---
     BootstrapAliasesDone {
         boot_gen: u64,
@@ -911,6 +867,58 @@ pub enum Input {
         remaining_chunks: Vec<Vec<String>>,
         profiles_map: Map<String, Value>,
         profiles_cache_changed: bool,
+    },
+    // --- Messages domain completions (U4) ---
+    OpenLocalMessagesLoaded {
+        open_seq: u64,
+        conv_id: String,
+        rows: Vec<StoredMessage>,
+        op_id: Option<u64>,
+    },
+    OpenHistoryPageFetched {
+        open_seq: u64,
+        conv_id: String,
+        page: Option<Map<String, Value>>,
+        op_id: Option<u64>,
+    },
+    LoadOlderStoreRead {
+        load_seq: u64,
+        conv_id: String,
+        rows: Vec<StoredMessage>,
+        had_before_cursor: bool,
+        op_id: Option<u64>,
+    },
+    LoadOlderPageFetched {
+        load_seq: u64,
+        conv_id: String,
+        before_msg_id: Option<String>,
+        page: Option<Map<String, Value>>,
+        op_id: Option<u64>,
+    },
+    SenderProfilesChunkDone {
+        resolve_id: u64,
+        conv_id: String,
+        remaining_chunks: Vec<Vec<String>>,
+        profiles_map: Map<String, Value>,
+        cache_updated: bool,
+    },
+    TypedEnvelopeReady {
+        cmd: u16,
+        increment_unread: bool,
+        notify_incoming: bool,
+        envelope: TypedChatEnvelope,
+    },
+    DecryptedEnvelopeReady {
+        payload: Map<String, Value>,
+        default_cmd: u16,
+        fallback_conv_id: Option<String>,
+        is_group_hint: Option<bool>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        persist_conversations: bool,
+        probe_freshness: bool,
+        poll_batch_done: Option<(u64, u64)>,
+        op_id: Option<u64>,
     },
     // U5
     TypingExpired {
@@ -1146,43 +1154,6 @@ impl fmt::Debug for Input {
                 .field("op_id", op_id)
                 .field("result", result)
                 .finish(),
-            Self::OpenLocalMessagesLoaded { open_seq, rows, .. } => f
-                .debug_struct("OpenLocalMessagesLoaded")
-                .field("open_seq", open_seq)
-                .field("rows", &rows.len())
-                .finish(),
-            Self::OpenHistoryPageFetched { open_seq, page, .. } => f
-                .debug_struct("OpenHistoryPageFetched")
-                .field("open_seq", open_seq)
-                .field("has_page", &page.is_some())
-                .finish(),
-            Self::LoadOlderStoreRead { load_seq, rows, .. } => f
-                .debug_struct("LoadOlderStoreRead")
-                .field("load_seq", load_seq)
-                .field("rows", &rows.len())
-                .finish(),
-            Self::LoadOlderPageFetched { load_seq, page, .. } => f
-                .debug_struct("LoadOlderPageFetched")
-                .field("load_seq", load_seq)
-                .field("has_page", &page.is_some())
-                .finish(),
-            Self::SenderProfilesChunkDone {
-                resolve_id,
-                remaining_chunks,
-                profiles_map,
-                cache_updated,
-                ..
-            } => f
-                .debug_struct("SenderProfilesChunkDone")
-                .field("resolve_id", resolve_id)
-                .field("remaining", &remaining_chunks.len())
-                .field("profiles", &profiles_map.len())
-                .field("cache_updated", cache_updated)
-                .finish(),
-            Self::DecryptedEnvelopeReady { default_cmd, .. } => f
-                .debug_struct("DecryptedEnvelopeReady")
-                .field("default_cmd", default_cmd)
-                .finish(),
             // U4-bootstrap
             Self::BootstrapAliasesDone { boot_gen, result } => f
                 .debug_struct("BootstrapAliasesDone")
@@ -1272,6 +1243,48 @@ impl fmt::Debug for Input {
                 .field("remaining_chunks", &remaining_chunks.len())
                 .field("profiles_count", &profiles_map.len())
                 .field("cache_changed", profiles_cache_changed)
+                .finish(),
+            Self::OpenLocalMessagesLoaded { open_seq, rows, .. } => f
+                .debug_struct("OpenLocalMessagesLoaded")
+                .field("open_seq", open_seq)
+                .field("rows", &rows.len())
+                .finish(),
+            Self::OpenHistoryPageFetched { open_seq, page, .. } => f
+                .debug_struct("OpenHistoryPageFetched")
+                .field("open_seq", open_seq)
+                .field("has_page", &page.is_some())
+                .finish(),
+            Self::LoadOlderStoreRead { load_seq, rows, .. } => f
+                .debug_struct("LoadOlderStoreRead")
+                .field("load_seq", load_seq)
+                .field("rows", &rows.len())
+                .finish(),
+            Self::LoadOlderPageFetched { load_seq, page, .. } => f
+                .debug_struct("LoadOlderPageFetched")
+                .field("load_seq", load_seq)
+                .field("has_page", &page.is_some())
+                .finish(),
+            Self::SenderProfilesChunkDone {
+                resolve_id,
+                remaining_chunks,
+                profiles_map,
+                cache_updated,
+                ..
+            } => f
+                .debug_struct("SenderProfilesChunkDone")
+                .field("resolve_id", resolve_id)
+                .field("remaining", &remaining_chunks.len())
+                .field("profiles", &profiles_map.len())
+                .field("cache_updated", cache_updated)
+                .finish(),
+            Self::TypedEnvelopeReady { cmd, envelope, .. } => f
+                .debug_struct("TypedEnvelopeReady")
+                .field("cmd", cmd)
+                .field("envelope", envelope)
+                .finish(),
+            Self::DecryptedEnvelopeReady { default_cmd, .. } => f
+                .debug_struct("DecryptedEnvelopeReady")
+                .field("default_cmd", default_cmd)
                 .finish(),
             // U5
             Self::TypingExpired { expiry_gen, .. } => f

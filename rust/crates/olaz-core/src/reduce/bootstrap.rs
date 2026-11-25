@@ -284,7 +284,7 @@ pub(crate) fn reduce_bootstrap(state: &mut CoreState, input: Input, out: &mut Re
                 sent_rows,
                 received_rows,
             );
-            // U4-merge: Carbon inserts `out.dirty.insert(DirtyKey::Contacts)` once `changes.rs` lands.
+            out.dirty.insert(DirtyKey::Contacts);
             ensure_known_contacts_and_rebuild(state, out);
 
             state.bootstrap.stage = BootstrapStage::PreloadOverview;
@@ -387,7 +387,9 @@ pub(crate) fn reduce_bootstrap(state: &mut CoreState, input: Input, out: &mut Re
             {
                 return;
             }
-            let _ = state.messages.record_freshness_probes(&probes);
+            if state.messages.record_freshness_probes(&probes) {
+                out.dirty.insert(DirtyKey::MessageMeta);
+            }
             if let Some(bg) = boot_gen {
                 if matches_stage(state, bg, BootstrapStage::PreloadOverviewProbe) {
                     finish_preload_overview(state, out);
@@ -760,7 +762,9 @@ fn ingest_bootstrap_batch(
     if outcome.extras_changed {
         out.dirty.insert(DirtyKey::ConversationExtras);
     }
-    // U4-merge: Carbon inserts `DirtyKey::Messages` when `outcome.windows_changed`.
+    if outcome.windows_changed {
+        out.dirty.insert(DirtyKey::Messages);
+    }
 
     let awaiting_probe = !probe_targets.is_empty();
     if awaiting_probe || !outcome.stored_rows.is_empty() {

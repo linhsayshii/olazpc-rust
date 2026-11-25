@@ -168,9 +168,9 @@ pub struct Seed {
     // U4-bootstrap
     #[serde(default)]
     pub history_full_refresh_at: Option<String>,
-    // U4/U5
     #[serde(default)]
     pub history_freshness: BTreeMap<String, String>,
+    // U5
     #[serde(default)]
     pub next_client_id: Option<i64>,
     #[serde(default)]
@@ -1293,11 +1293,10 @@ pub struct RecordingHost {
     calls: Mutex<Vec<Value>>,
     notify: Notify,
     is_u3: bool,
-    is_u5: bool,
+    is_u4: bool,
     data_dir: Option<PathBuf>,
     shared_store_slot: Mutex<Option<SharedStoreSlot>>,
     store: Mutex<Option<Arc<Mutex<Store>>>>,
-    core_handle: Mutex<Option<Arc<CoreHandle>>>,
     e2ee_send_results: Mutex<VecDeque<Result<SendMessageResult, String>>>,
     messages: Mutex<HashMap<String, Vec<ChatMessage>>>,
     open_conversation_id: Mutex<Option<String>>,
@@ -1310,13 +1309,13 @@ impl RecordingHost {
     }
 
     pub fn from_seed_with_u3(seed: &Seed, is_u3: bool, data_dir: Option<PathBuf>) -> Self {
-        Self::from_seed_with_flags(seed, is_u3, false, data_dir)
+        Self::from_seed_with_modes(seed, is_u3, false, data_dir)
     }
 
-    pub fn from_seed_with_flags(
+    pub fn from_seed_with_modes(
         seed: &Seed,
         is_u3: bool,
-        is_u5: bool,
+        is_u4: bool,
         data_dir: Option<PathBuf>,
     ) -> Self {
         let saved_session = seed
@@ -1423,11 +1422,10 @@ impl RecordingHost {
             calls: Mutex::new(Vec::new()),
             notify: Notify::new(),
             is_u3,
-            is_u5,
+            is_u4,
             data_dir,
             shared_store_slot: Mutex::new(None),
             store: Mutex::new(None),
-            core_handle: Mutex::new(None),
             e2ee_send_results: Mutex::new(e2ee_send_results),
             messages: Mutex::new(HashMap::new()),
             open_conversation_id: Mutex::new(open_conv),
@@ -1440,13 +1438,6 @@ impl RecordingHost {
             .shared_store_slot
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(slot);
-    }
-
-    pub fn bind_core(&self, core: Arc<CoreHandle>) {
-        *self
-            .core_handle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(core);
     }
 
     pub fn attached_store(&self) -> Option<Arc<Mutex<Store>>> {
@@ -2081,8 +2072,116 @@ impl Host for RecordingHost {
         self.record("refresh_cloud", json!({}));
     }
 
+    async fn offer_first_login_transfer(&self, force: bool) {
+        self.record("offer_first_login_transfer", json!({ "force": force }));
+    }
+
+    async fn reset_domains(&self) {
+        self.record("reset_domains", json!({}));
+    }
+
+    async fn persist_session(&self, _snapshot_json: String) {
+        self.record("persist_session", json!({}));
+    }
+
+    async fn clear_session(&self) {
+        *self.store.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.record("clear_session", json!({}));
+    }
+
+    async fn mark_expired(&self, _snapshot_json: String) {
+        *self.store.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.record("mark_expired", json!({}));
+    }
+
+    async fn persist_poll_state(&self, state: PollState) {
+        self.record("persist_poll_state", json!({ "state": state }));
+    }
+
+    async fn persist_ws_cursors(&self, cursors: CursorMap) {
+        self.record("persist_ws_cursors", json!({ "cursors": cursors }));
+    }
+
+    async fn on_batch_received(
+        &self,
+        cmd: Option<u16>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        payload: Map<String, Value>,
+    ) -> Option<Map<String, Value>> {
+        if self.is_u4 {
+            self.record(
+                "apply_batch",
+                json!({
+                    "cmd": cmd,
+                    "increment_unread": increment_unread,
+                    "notify_incoming": notify_incoming,
+                    "payload": Value::Object(payload.clone()),
+                }),
+            );
+            Some(payload)
+        } else {
+            None
+        }
+    }
+
+    async fn on_parsed_events_received(
+        &self,
+        cmd: u16,
+        increment_unread: bool,
+        notify_incoming: bool,
+        envelope: &TypedChatEnvelope,
+    ) -> bool {
+        if self.is_u4 {
+            let profile = self
+                .self_profile
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            let events = if let Some(p) = profile {
+                let mut names = Vec::new();
+                for uid in &envelope.uids {
+                    if let Some(info) = self.lookup_person(uid) {
+                        names.push((uid.clone(), info));
+                    }
+                }
+                envelope
+                    .payload
+                    .resolve(&p.user_id, p.self_conv_id.as_deref(), &names)
+                    .unwrap_or_else(|| envelope.events.clone())
+            } else {
+                envelope.events.clone()
+            };
+            let serialized: Vec<Value> = events
+                .iter()
+                .filter(|ev| !matches!(ev, ParsedWireEvent::Ignore))
+                .map(serialize_parsed_wire_event)
+                .collect();
+            self.record(
+                "apply_parsed_events",
+                json!({
+                    "cmd": cmd,
+                    "increment_unread": increment_unread,
+                    "notify_incoming": notify_incoming,
+                    "events": serialized,
+                }),
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn refresh_board_pins(&self, conv_id: String) {
+        if self.is_u4 {
+            self.record("refresh_board_pins", json!({ "conv_id": conv_id }));
+        }
+    }
+
     async fn mark_read_boundary(&self, conv_id: String, _seen_target: Option<SeenTarget>) {
-        self.record("mark_read", json!({ "conv_id": conv_id }));
+        if self.is_u4 {
+            self.record("mark_read", json!({ "conv_id": conv_id }));
+        }
     }
 
     async fn send_e2ee_text(
@@ -2124,34 +2223,72 @@ impl Host for RecordingHost {
             })
     }
 
-    async fn offer_first_login_transfer(&self, force: bool) {
-        self.record("offer_first_login_transfer", json!({ "force": force }));
+    async fn apply_remote_reaction(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        sender_id: String,
+        r_type: String,
+        r_icon: String,
+        event_id: String,
+        react_client_id: String,
+        sender_name: String,
+    ) {
+        if self.is_u4 {
+            self.record(
+                "apply_remote_reaction",
+                json!({
+                    "conv_id": conv_id,
+                    "msg_id": msg_id,
+                    "cli_msg_id": cli_msg_id,
+                    "sender_id": sender_id,
+                    "r_type": r_type,
+                    "r_icon": r_icon,
+                    "event_id": event_id,
+                    "react_client_id": react_client_id,
+                    "sender_name": sender_name,
+                }),
+            );
+        }
     }
 
-    async fn reset_domains(&self) {
-        self.record("reset_domains", json!({}));
+    async fn apply_remote_recall(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        _update_conversation_preview: bool,
+    ) {
+        if self.is_u4 {
+            self.record(
+                "apply_remote_recall",
+                json!({
+                    "conv_id": conv_id,
+                    "msg_id": msg_id,
+                    "cli_msg_id": cli_msg_id,
+                }),
+            );
+        }
     }
 
-    async fn persist_session(&self, _snapshot_json: String) {
-        self.record("persist_session", json!({}));
-    }
-
-    async fn clear_session(&self) {
-        *self.store.lock().unwrap_or_else(PoisonError::into_inner) = None;
-        self.record("clear_session", json!({}));
-    }
-
-    async fn mark_expired(&self, _snapshot_json: String) {
-        *self.store.lock().unwrap_or_else(PoisonError::into_inner) = None;
-        self.record("mark_expired", json!({}));
-    }
-
-    async fn persist_poll_state(&self, state: PollState) {
-        self.record("persist_poll_state", json!({ "state": state }));
-    }
-
-    async fn persist_ws_cursors(&self, cursors: CursorMap) {
-        self.record("persist_ws_cursors", json!({ "cursors": cursors }));
+    async fn apply_remote_delete(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        _update_conversation_preview: bool,
+    ) {
+        if self.is_u4 {
+            self.record(
+                "apply_remote_delete",
+                json!({
+                    "conv_id": conv_id,
+                    "msg_id": msg_id,
+                    "cli_msg_id": cli_msg_id,
+                }),
+            );
+        }
     }
 
     async fn apply_batch(
@@ -2234,24 +2371,7 @@ impl Host for RecordingHost {
             .filter(|ev| !matches!(ev, ParsedWireEvent::Ignore))
             .map(serialize_parsed_wire_event)
             .collect();
-        let delta = if self.is_u5 {
-            let core_opt = self
-                .core_handle
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            if let Some(core) = core_opt {
-                let _ = core
-                    .request(Command::ApplyParsedEventsDirect {
-                        events: events.clone(),
-                        increment_unread,
-                        notify_incoming,
-                        persist_conversations: true,
-                    })
-                    .await;
-            }
-            BatchApplyDelta::default()
-        } else if self.is_u3 {
+        let delta = if self.is_u3 {
             self.apply_events_pass1(&events, increment_unread, true)
         } else {
             BatchApplyDelta::default()
@@ -2807,13 +2927,13 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
                     .and_then(Value::as_str)
                     .unwrap_or("sent")
                     .to_owned();
-                let is_e2ee = row.get("is_e2ee").and_then(Value::as_bool).unwrap_or(false);
                 let raw_json_data = if let Some(raw_obj) = row.get("raw_json")
                     && !raw_obj.is_null()
                 {
                     canonical_json_string(raw_obj).into_bytes()
                 } else {
-                    let fallback = json!({
+                    let is_e2ee = row.get("is_e2ee").and_then(Value::as_bool).unwrap_or(false);
+                    let mut fallback = json!({
                         "id": id,
                         "conversationId": conv_id,
                         "clientId": client_id,
@@ -2821,12 +2941,18 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
                         "senderName": sender_name,
                         "senderAvatar": sender_avatar,
                         "isMine": is_mine,
-                        "isE2EE": is_e2ee,
-                        "status": status,
                         "text": text,
                         "date": ts_ms,
+                        "status": status,
+                        "isE2EE": is_e2ee,
                         "kind": { "type": kind_tag },
                     });
+                    if let Some(reactions) = row.get("reactions")
+                        && !reactions.is_null()
+                        && let Some(obj) = fallback.as_object_mut()
+                    {
+                        obj.insert("reactions".to_owned(), reactions.clone());
+                    }
                     canonical_json_string(&fallback).into_bytes()
                 };
                 Some(StoredMessage {
@@ -3084,7 +3210,7 @@ fn str_vec_arg(args: &Value, key: &str) -> Vec<String> {
 /// snapshots, final state, sorted canonical requests, and ordered host calls.
 pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let is_u5 = case.domain == "send";
-    let is_u4 = case.domain == "bootstrap" || is_u5;
+    let is_u4 = case.domain == "bootstrap" || case.domain == "messages" || is_u5;
     let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions" || is_u4;
     let temp_dir = if is_u3 {
         Some(tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?)
@@ -3141,10 +3267,10 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         client.seed_next_client_id(next_cid);
     }
 
-    let host = Arc::new(RecordingHost::from_seed_with_flags(
+    let host = Arc::new(RecordingHost::from_seed_with_modes(
         &case.seed,
         is_u3,
-        is_u5,
+        is_u4,
         temp_dir.as_ref().map(|d| d.path().to_path_buf()),
     ));
     let inner_runner = Arc::new(SessionEffectRunner::with_options(
@@ -3158,7 +3284,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     host.bind_store_slot(inner_runner.shared_store_slot());
     let send_logs = Arc::new(Mutex::new(Vec::<String>::new()));
     let runner: Arc<dyn EffectRunner> = Arc::new(LogCapturingRunner {
-        inner: inner_runner,
+        inner: Arc::clone(&inner_runner),
         send_logs: Arc::clone(&send_logs),
     });
 
@@ -3172,12 +3298,16 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             .clone()
             .filter(|id| !id.is_empty());
     }
-    for (conv_id, tag) in &case.seed.history_freshness {
-        if let Some(fresh) = HistoryFreshness::from_str_tag(tag) {
+    if is_u4 && !case.seed.history_freshness.is_empty() {
+        for (cid, raw_f) in &case.seed.history_freshness {
+            let f = match raw_f.as_str() {
+                "up_to_date" => HistoryFreshness::UpToDate,
+                _ => HistoryFreshness::Stale,
+            };
             initial_state
                 .messages
                 .history_freshness
-                .insert(conv_id.clone(), fresh);
+                .insert(cid.clone(), f);
         }
     }
     for tid in &case.seed.e2ee_threads {
@@ -3196,7 +3326,6 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         runner,
         Handle::current(),
     ));
-    host.bind_core(Arc::clone(&core));
 
     let mut snapshots = BTreeMap::new();
     let mut host_cursor = 0usize;
@@ -3245,6 +3374,27 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         }
                         _ => {}
                     }
+                }
+                // U4-messages
+                "open" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    host.set_open_conversation(Some(id.clone()));
+                    core.request_unit(Command::OpenConversation {
+                        id,
+                        preloaded: Vec::new(),
+                        skip_local_read: false,
+                    })
+                    .await;
+                }
+                "close" => {
+                    host.set_open_conversation(None);
+                    core.request_unit(Command::CloseConversation).await;
+                }
+                "load_older" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    core.request_unit(Command::LoadOlderMessages { id }).await;
                 }
                 // U4-bootstrap
                 "bootstrap" => {
@@ -3551,17 +3701,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 "sync_labels" => {
                     core.request_unit(Command::SyncConversationLabels).await;
                 }
-                // U4/U5 send domain commands
-                "open" => {
-                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                    let id = str_arg(args, "id");
-                    core.request_unit(Command::OpenConversation {
-                        id,
-                        preloaded: Vec::new(),
-                        skip_local_read: false,
-                    })
-                    .await;
-                }
+                // U5 send domain commands
                 "send_text" => {
                     let id = str_arg(args, "id");
                     let text_arg = str_arg(args, "text");
@@ -3735,6 +3875,9 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                     .map_err(|_| format!("timed out awaiting host call `{await_host}`"))?;
                 if is_u3 && (await_host == "apply_parsed_events" || await_host == "apply_batch") {
                     if pending_send_task.is_some() {
+                        inner_runner.flush_host().await;
+                        let _ = core.settle().await;
+                        inner_runner.flush_store().await;
                         let _ = core.settle().await;
                     } else {
                         let _ =
@@ -3751,6 +3894,9 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             Step::Snapshot { snapshot } => {
                 if is_u3 {
                     if pending_send_task.is_some() {
+                        inner_runner.flush_host().await;
+                        let _ = core.settle().await;
+                        inner_runner.flush_store().await;
                         let _ = core.settle().await;
                     } else {
                         let _ =

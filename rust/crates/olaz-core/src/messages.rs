@@ -887,10 +887,15 @@ impl MessagesState {
             && (last.date_ms < msg.date_ms || (last.date_ms == msg.date_ms && last.id < msg.id))
         {
             list.push(msg.clone());
-            if removed_ids.is_empty() && had_window {
+            if !had_window {
+                PendingWindowOp::Reset
+            } else if removed_ids.is_empty() {
                 PendingWindowOp::Append(vec![msg])
             } else {
-                PendingWindowOp::Reset
+                PendingWindowOp::Patch {
+                    upserts: vec![msg],
+                    removed_ids,
+                }
             }
         } else if list.is_empty() && removed_ids.is_empty() && had_window {
             list.push(msg.clone());

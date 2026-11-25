@@ -377,6 +377,38 @@ pub(crate) fn reduce_messages(state: &mut CoreState, input: Input, out: &mut Red
             }
         }
 
+        Input::TypedEnvelopeReady {
+            increment_unread,
+            notify_incoming,
+            envelope,
+            ..
+        } => {
+            let snap = state.identity_snapshot();
+            let events = if !snap.my_uid.is_empty() {
+                let mut names = Vec::with_capacity(envelope.uids.len());
+                for uid in &envelope.uids {
+                    if let Some(info) = snap.lookup_person(uid) {
+                        names.push((uid.clone(), info));
+                    }
+                }
+                envelope
+                    .payload
+                    .resolve(&snap.my_uid, state.session.self_conversation_id.as_deref(), &names)
+                    .unwrap_or(envelope.events)
+            } else {
+                envelope.events
+            };
+            let _ = ingest_parsed_events_in_core(
+                state,
+                &events,
+                increment_unread,
+                notify_incoming,
+                true,
+                false,
+                out,
+            );
+        }
+
         Input::DecryptedEnvelopeReady {
             payload,
             default_cmd,

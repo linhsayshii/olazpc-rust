@@ -417,6 +417,8 @@ pub(crate) fn enter_session_expired(state: &mut CoreState, reason: String, out: 
     out.dirty.insert(DirtyKey::ConversationExtras);
     out.dirty.insert(DirtyKey::ConversationUi);
     out.dirty.insert(DirtyKey::ConversationPrompt);
+    out.dirty.insert(DirtyKey::MessagesResetAll);
+    out.dirty.insert(DirtyKey::Contacts);
 
     // Order matches Swift `handleSessionExpiredNotice`: cancel, stop transport, mark_expired, QR.
     // Unlike `logOut`, session expiry does not reset `ZaloDomains`.
