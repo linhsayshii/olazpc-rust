@@ -4118,4 +4118,131 @@ mod tests {
 
         core.stop();
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_debounce_timer_coalesces_and_cancels_on_reset() {
+        use olaz_net::http::RawResponse;
+        use olaz_net::mock::MockTransport;
+
+        use crate::actor::CoreHandle;
+        use crate::input::Command;
+        use crate::polls::{POLL_DEBOUNCE_DELAY_MS, PollDetail, PollMessageNotice};
+        use crate::state::{CoreState, Phase, Profile};
+
+        let transport = MockTransport::from_fn(|_| {
+            Ok(RawResponse::new(
+                200,
+                br#"{"error_code":0,"data":{"group_id":"5001","question":"Q","creator":"2001","status":1,"expired_time":0,"options":[]}}"#.to_vec(),
+            ))
+        });
+        let client = Arc::new(SessionClient::new(
+            transport,
+            "imei-poll-timer".to_owned(),
+            "Mac".to_owned(),
+        ));
+        client.update_credentials(
+            LoginAccount {
+                user_id: "2001".to_owned(),
+                ..LoginAccount::default()
+            },
+            b"0123456789abcdef".to_vec(),
+            "sek.1".to_owned(),
+            Some(ZaloDomains::default()),
+        );
+        // RecordingTypingHost uses the default Host::arm_poll_debounce -> false,
+        // exercising SessionEffectRunner's native tokio::time::sleep_until timer.
+        let runner = Arc::new(SessionEffectRunner::new(
+            Arc::clone(&client),
+            Arc::new(RecordingTypingHost::default()),
+            tokio::runtime::Handle::current(),
+        ));
+        let mut initial = CoreState::default();
+        initial.session.phase = Phase::Ready;
+        initial.session.profile = Some(Profile {
+            user_id: "2001".to_owned(),
+            display_name: "Tester".to_owned(),
+            avatar: None,
+            phone: None,
+        });
+        initial.contacts.group_details_json.insert(
+            "5001".to_owned(),
+            r#"{"groupId":"5001","creatorId":"2001"}"#.to_owned(),
+        );
+        let seeded_detail = serde_json::json!({
+            "id": "p1",
+            "groupId": "g5001",
+            "question": "Old",
+        });
+        if let Some(d) = seeded_detail.as_object().and_then(PollDetail::from_json) {
+            initial.polls.details.insert("p1".to_owned(), d);
+        }
+        let core = CoreHandle::start_with_state(initial, runner, tokio::runtime::Handle::current());
+
+        let now_ms = 1_700_000_000_000_i64;
+        core.send(Command::NotePollMessages {
+            notices: vec![PollMessageNotice {
+                msg_id: "m1".to_owned(),
+                poll_id: "p1".to_owned(),
+                conv_id: "g5001".to_owned(),
+                date_ms: now_ms,
+            }],
+            now_ms,
+        });
+        core.wait_idle().await;
+        tokio::task::yield_now().await;
+
+        // Second message 500 ms later re-arms p1; original 1.5 s deadline must not fire early.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        core.send(Command::NotePollMessages {
+            notices: vec![PollMessageNotice {
+                msg_id: "m2".to_owned(),
+                poll_id: "p1".to_owned(),
+                conv_id: "g5001".to_owned(),
+                date_ms: now_ms + 500,
+            }],
+            now_ms: now_ms + 500,
+        });
+        core.wait_idle().await;
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_millis(1_100)).await;
+        tokio::task::yield_now().await;
+        core.wait_idle().await;
+        assert_eq!(client.transport().requests().len(), 0);
+
+        // Reaching 1.5 s after m2 fires exactly one refresh.
+        tokio::time::advance(Duration::from_millis(POLL_DEBOUNCE_DELAY_MS - 1_100)).await;
+        tokio::task::yield_now().await;
+        core.wait_idle().await;
+        assert_eq!(client.transport().requests().len(), 1);
+        assert_eq!(
+            core.full_snapshot()
+                .await
+                .and_then(|s| s.polls.details.get("p1").map(|d| d.question.clone()))
+                .as_deref(),
+            Some("Q")
+        );
+
+        // ResetPolls cancels an armed native timer before it can fire.
+        core.send(Command::NotePollMessages {
+            notices: vec![PollMessageNotice {
+                msg_id: "m3".to_owned(),
+                poll_id: "p1".to_owned(),
+                conv_id: "g5001".to_owned(),
+                date_ms: now_ms + 2_000,
+            }],
+            now_ms: now_ms + 2_000,
+        });
+        core.wait_idle().await;
+        tokio::task::yield_now().await;
+        core.send(Command::ResetPolls);
+        core.wait_idle().await;
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        core.wait_idle().await;
+        assert_eq!(client.transport().requests().len(), 1);
+
+        core.stop();
+    }
 }

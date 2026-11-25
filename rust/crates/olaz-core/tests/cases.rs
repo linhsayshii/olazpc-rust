@@ -17,7 +17,7 @@ use common::{Case, KnownDiff, canonical_json_string, compare_case, run_case};
 /// Unfiltered runs (`cargo test -p olaz-core --test cases`) print each pending domain with its
 /// case count and skip execution; explicit `-- <domain>` runs (and `scripts/gate-core.sh`) refuse
 /// pending domains. Each port removes its domain from this list in the same PR.
-const PENDING_DOMAINS: &[&str] = &["contacts", "groups", "message_actions", "polls"];
+const PENDING_DOMAINS: &[&str] = &["contacts", "groups", "message_actions"];
 
 fn cases_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cases")
