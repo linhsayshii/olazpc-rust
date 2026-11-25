@@ -345,8 +345,12 @@ fn seeded_client_ids_ignore_wall_clock_and_increment() {
     assert_eq!(s.next_client_id(9_999_999_999_999), 6_000_000_000_002);
     assert_eq!(s.last_client_id_ms, 6_000_000_000_002);
 
-    let client = olaz_net::SessionClient::new(MockTransport::scripted(Vec::new()), IMEI.to_owned(), "Mac".to_owned())
-        .with_clock(|| 1_700_000_000_000);
+    let client = olaz_net::SessionClient::new(
+        MockTransport::scripted(Vec::new()),
+        IMEI.to_owned(),
+        "Mac".to_owned(),
+    )
+    .with_clock(|| 1_700_000_000_000);
     assert_eq!(client.next_client_id(), 1_700_000_000_000);
     assert_eq!(client.next_client_id(), 1_700_000_000_001);
     client.seed_next_client_id(6_000_000_000_050);

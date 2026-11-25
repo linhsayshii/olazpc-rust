@@ -1359,6 +1359,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func handleSessionExpiredNotice(reason: String) 
     
     /**
+     * Routes a `handleTyping(state:)` JSON dictionary into core's incoming typing state.
+     */
+    func handleTyping(stateJson: String) 
+    
+    /**
      * Matches a 4-digit search query against the hidden PIN and populates `pin_search_ids`.
      */
     func hiddenSearch(query: String) async throws  -> [String]?
@@ -1393,6 +1398,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func markConversationUnread(id: String) 
     
     /**
+     * Marks a conversation read using core's own message window for the `send_seen` target.
+     */
+    func markRead(id: String) 
+    
+    /**
      * Moves a conversation between Focus (`to_other = false`) and Other (`to_other = true`).
      */
     func moveConversation(id: String, toOther: Bool) 
@@ -1401,6 +1411,17 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Pulls the next coalesced batch of dirty domain snapshots, or `None` after [`Self::stop`].
      */
     func nextChanges() async throws  -> CoreChangesRecord?
+    
+    /**
+     * Allocates the next strictly increasing client message id from the shared `SessionClient`.
+     */
+    func nextClientId()  -> Int64
+    
+    /**
+     * Triggers an outgoing typing ping subject to core's 10 s per-conversation throttle,
+     * `Phase::Ready` gate, and `olaz.sendTyping` preference.
+     */
+    func notifyTyping(convId: String, nowMs: Int64) 
     
     func openConversation(id: String, preloaded: [ChatMessageRecord]) 
     
@@ -1484,6 +1505,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func resetHiddenPin() async throws  -> ConversationActionResultRecord
     
     /**
+     * Clears the outgoing typing throttle for `conv_id`.
+     */
+    func resetOutgoingTyping(convId: String) 
+    
+    /**
      * Resolves missing conversation display names in 50-UID chunks via `get_profiles`.
      */
     func resolveMissingNames() async throws  -> UInt64
@@ -1491,6 +1517,17 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func seedContacts(contacts: ContactsStateRecord) 
     
     func seedHistoryFreshness(entries: [FreshnessMapEntry]) 
+    
+    /**
+     * Sends a text message (plain API or E2EE host boundary) with core-owned optimistic row,
+     * echo/ack reconciliation, persistence, and conversation preview update.
+     */
+    func sendText(convId: String, text: String, quoteId: String?, mentions: [MessageMention], styles: [TextStyleRecord], urgency: Int64, clientId: Int64, nowMs: Int64, isE2ee: Bool?, ttlMs: Int64?) async throws  -> SendTextOutcomeRecord
+    
+    /**
+     * Updates a single conversation's auto-delete TTL in milliseconds (`0` disables).
+     */
+    func setAutoDeleteTtl(convId: String, ttlMs: Int64) 
     
     /**
      * Updates the sidebar type/label filter and recomputes `list_ids`.
@@ -1508,6 +1545,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func setConversationPrompt(prompt: ConversationPromptRecord?) 
     
     /**
+     * Replaces the set of 1-1 peer UIDs with active E2EE sessions in core.
+     */
+    func setE2eeThreads(threads: [String]) 
+    
+    /**
      * Sets or changes the hidden-chat PIN.
      */
     func setHiddenPin(pin: String, changed: Bool) async throws  -> ConversationActionResultRecord
@@ -1518,6 +1560,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func setOpenConversation(id: String?) 
     
     /**
+     * Updates core's `olaz.sendTyping` preference mirror.
+     */
+    func setSendTypingEnabled(enabled: Bool) 
+    
+    /**
      * Enqueues barriers across the actor mailbox, serial host worker, and serial SQLite store
      * worker until all pending host/store jobs and the inputs they feed back into the actor have
      * been reduced and published (`0` if already stopped).
@@ -1525,6 +1572,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func settle() async throws  -> UInt64
     
     func sharedApi()  -> CoreApi
+    
+    /**
+     * Sets or refreshes an incoming typing indicator directly in core (10 s expiry timer).
+     */
+    func showTypingIndicator(convId: String, name: String, onPc: Bool) 
     
     /**
      * Starts the engine (idempotent; subsequent calls are no-ops).
@@ -2048,6 +2100,18 @@ open func handleSessionExpiredNotice(reason: String)  {try! rustCall() {
 }
     
     /**
+     * Routes a `handleTyping(state:)` JSON dictionary into core's incoming typing state.
+     */
+open func handleTyping(stateJson: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_handle_typing(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(stateJson),uniffiCallStatus
+    )
+}
+}
+    
+    /**
      * Matches a 4-digit search query against the hidden PIN and populates `pin_search_ids`.
      */
 open func hiddenSearch(query: String)async throws  -> [String]?  {
@@ -2166,6 +2230,18 @@ open func markConversationUnread(id: String)  {try! rustCall() {
 }
     
     /**
+     * Marks a conversation read using core's own message window for the `send_seen` target.
+     */
+open func markRead(id: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_mark_read(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(id),uniffiCallStatus
+    )
+}
+}
+    
+    /**
      * Moves a conversation between Focus (`to_other = false`) and Other (`to_other = true`).
      */
 open func moveConversation(id: String, toOther: Bool)  {try! rustCall() {
@@ -2195,6 +2271,32 @@ open func nextChanges()async throws  -> CoreChangesRecord?  {
             liftFunc: FfiConverterOptionTypeCoreChangesRecord.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
+}
+    
+    /**
+     * Allocates the next strictly increasing client message id from the shared `SessionClient`.
+     */
+open func nextClientId() -> Int64  {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_next_client_id(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Triggers an outgoing typing ping subject to core's 10 s per-conversation throttle,
+     * `Phase::Ready` gate, and `olaz.sendTyping` preference.
+     */
+open func notifyTyping(convId: String, nowMs: Int64)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_notify_typing(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(convId),
+        FfiConverterInt64.lower(nowMs),uniffiCallStatus
+    )
+}
 }
     
 open func openConversation(id: String, preloaded: [ChatMessageRecord])  {try! rustCall() {
@@ -2450,6 +2552,18 @@ open func resetHiddenPin()async throws  -> ConversationActionResultRecord  {
 }
     
     /**
+     * Clears the outgoing typing throttle for `conv_id`.
+     */
+open func resetOutgoingTyping(convId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_reset_outgoing_typing(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(convId),uniffiCallStatus
+    )
+}
+}
+    
+    /**
      * Resolves missing conversation display names in 50-UID chunks via `get_profiles`.
      */
 open func resolveMissingNames()async throws  -> UInt64  {
@@ -2482,6 +2596,39 @@ open func seedHistoryFreshness(entries: [FreshnessMapEntry])  {try! rustCall() {
     uniffi_olaz_ffi_fn_method_coreengine_seed_history_freshness(
             self.uniffiCloneHandle(),
         FfiConverterSequenceTypeFreshnessMapEntry.lower(entries),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Sends a text message (plain API or E2EE host boundary) with core-owned optimistic row,
+     * echo/ack reconciliation, persistence, and conversation preview update.
+     */
+open func sendText(convId: String, text: String, quoteId: String?, mentions: [MessageMention], styles: [TextStyleRecord], urgency: Int64, clientId: Int64, nowMs: Int64, isE2ee: Bool?, ttlMs: Int64?)async throws  -> SendTextOutcomeRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_send_text(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(text),FfiConverterOptionString.lower(quoteId),FfiConverterSequenceTypeMessageMention.lower(mentions),FfiConverterSequenceTypeTextStyleRecord.lower(styles),FfiConverterInt64.lower(urgency),FfiConverterInt64.lower(clientId),FfiConverterInt64.lower(nowMs),FfiConverterOptionBool.lower(isE2ee),FfiConverterOptionInt64.lower(ttlMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeSendTextOutcomeRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Updates a single conversation's auto-delete TTL in milliseconds (`0` disables).
+     */
+open func setAutoDeleteTtl(convId: String, ttlMs: Int64)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_set_auto_delete_ttl(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(convId),
+        FfiConverterInt64.lower(ttlMs),uniffiCallStatus
     )
 }
 }
@@ -2525,6 +2672,18 @@ open func setConversationPrompt(prompt: ConversationPromptRecord?)  {try! rustCa
 }
     
     /**
+     * Replaces the set of 1-1 peer UIDs with active E2EE sessions in core.
+     */
+open func setE2eeThreads(threads: [String])  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_set_e2ee_threads(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(threads),uniffiCallStatus
+    )
+}
+}
+    
+    /**
      * Sets or changes the hidden-chat PIN.
      */
 open func setHiddenPin(pin: String, changed: Bool)async throws  -> ConversationActionResultRecord  {
@@ -2551,6 +2710,18 @@ open func setOpenConversation(id: String?)  {try! rustCall() {
     uniffi_olaz_ffi_fn_method_coreengine_set_open_conversation(
             self.uniffiCloneHandle(),
         FfiConverterOptionString.lower(id),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Updates core's `olaz.sendTyping` preference mirror.
+     */
+open func setSendTypingEnabled(enabled: Bool)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_set_send_typing_enabled(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(enabled),uniffiCallStatus
     )
 }
 }
@@ -2583,6 +2754,20 @@ open func sharedApi() -> CoreApi  {
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
+}
+    
+    /**
+     * Sets or refreshes an incoming typing indicator directly in core (10 s expiry timer).
+     */
+open func showTypingIndicator(convId: String, name: String, onPc: Bool)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_show_typing_indicator(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(convId),
+        FfiConverterString.lower(name),
+        FfiConverterBool.lower(onPc),uniffiCallStatus
+    )
+}
 }
     
     /**
@@ -3101,6 +3286,8 @@ public protocol CoreHost: AnyObject, Sendable {
     func groupNotice(act: String, dataJson: String, ts: Int64) async 
     
     func mute(convId: String, set: Bool, start: Int64, startExplicit: Bool, duration: Int64) async 
+    
+    func sendE2eeText(convId: String, text: String, clientId: String, quote: E2eeQuoteArgRecord?) async  -> E2eeSendOutcomeRecord
     
 }
 /**
@@ -3929,6 +4116,23 @@ open func mute(convId: String, set: Bool, start: Int64, startExplicit: Bool, dur
             completeFunc: ffi_olaz_ffi_rust_future_complete_void,
             freeFunc: ffi_olaz_ffi_rust_future_free_void,
             liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+open func sendE2eeText(convId: String, text: String, clientId: String, quote: E2eeQuoteArgRecord?)async  -> E2eeSendOutcomeRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_send_e2ee_text(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(text),FfiConverterString.lower(clientId),FfiConverterOptionTypeE2eeQuoteArgRecord.lower(quote)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeE2eeSendOutcomeRecord_lift,
             errorHandler: nil
             
         )
@@ -5845,6 +6049,54 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                 uniffiFutureCallback(
                     uniffiCallbackData,
                     UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        sendE2eeText: { (
+            uniffiHandle: UInt64,
+            convId: RustBuffer,
+            text: RustBuffer,
+            clientId: RustBuffer,
+            quote: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> E2eeSendOutcomeRecord in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.sendE2eeText(
+                     convId: try FfiConverterString.lift(convId),
+                     text: try FfiConverterString.lift(text),
+                     clientId: try FfiConverterString.lift(clientId),
+                     quote: try FfiConverterOptionTypeE2eeQuoteArgRecord.lift(quote)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: E2eeSendOutcomeRecord) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterTypeE2eeSendOutcomeRecord_lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
                         callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
                     )
                 )
@@ -11901,10 +12153,11 @@ public struct CoreChangesRecord: Equatable, Hashable {
     public var messagesResetAll: Bool
     public var messageMeta: MessageMetaRecord?
     public var contacts: ContactsStateRecord?
+    public var typing: [TypingEntryRecord]?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?) {
+    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, typing: [TypingEntryRecord]?) {
         self.version = version
         self.session = session
         self.conversations = conversations
@@ -11916,6 +12169,7 @@ public struct CoreChangesRecord: Equatable, Hashable {
         self.messagesResetAll = messagesResetAll
         self.messageMeta = messageMeta
         self.contacts = contacts
+        self.typing = typing
     }
 
     
@@ -11944,7 +12198,8 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
                 windowDeltas: FfiConverterSequenceTypeWindowDeltaRecord.read(from: &buf), 
                 messagesResetAll: FfiConverterBool.read(from: &buf), 
                 messageMeta: FfiConverterOptionTypeMessageMetaRecord.read(from: &buf), 
-                contacts: FfiConverterOptionTypeContactsStateRecord.read(from: &buf)
+                contacts: FfiConverterOptionTypeContactsStateRecord.read(from: &buf), 
+                typing: FfiConverterOptionSequenceTypeTypingEntryRecord.read(from: &buf)
         )
     }
 
@@ -11960,6 +12215,7 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
         FfiConverterBool.write(value.messagesResetAll, into: &buf)
         FfiConverterOptionTypeMessageMetaRecord.write(value.messageMeta, into: &buf)
         FfiConverterOptionTypeContactsStateRecord.write(value.contacts, into: &buf)
+        FfiConverterOptionSequenceTypeTypingEntryRecord.write(value.typing, into: &buf)
     }
 }
 
@@ -12037,6 +12293,79 @@ public func FfiConverterTypeCursorEntry_lift(_ buf: RustBuffer) throws -> Cursor
 #endif
 public func FfiConverterTypeCursorEntry_lower(_ value: CursorEntry) -> RustBuffer {
     return FfiConverterTypeCursorEntry.lower(value)
+}
+
+
+/**
+ * Quote metadata passed to Swift's `send_e2ee_text` host boundary (U5).
+ */
+public struct E2eeQuoteArgRecord: Equatable, Hashable {
+    public var msgId: String
+    public var cliMsgId: String
+    public var senderId: String
+    public var senderName: String
+    public var text: String
+    public var tsMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(msgId: String, cliMsgId: String, senderId: String, senderName: String, text: String, tsMs: Int64) {
+        self.msgId = msgId
+        self.cliMsgId = cliMsgId
+        self.senderId = senderId
+        self.senderName = senderName
+        self.text = text
+        self.tsMs = tsMs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension E2eeQuoteArgRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeE2eeQuoteArgRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> E2eeQuoteArgRecord {
+        return
+            try E2eeQuoteArgRecord(
+                msgId: FfiConverterString.read(from: &buf), 
+                cliMsgId: FfiConverterString.read(from: &buf), 
+                senderId: FfiConverterString.read(from: &buf), 
+                senderName: FfiConverterString.read(from: &buf), 
+                text: FfiConverterString.read(from: &buf), 
+                tsMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: E2eeQuoteArgRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.msgId, into: &buf)
+        FfiConverterString.write(value.cliMsgId, into: &buf)
+        FfiConverterString.write(value.senderId, into: &buf)
+        FfiConverterString.write(value.senderName, into: &buf)
+        FfiConverterString.write(value.text, into: &buf)
+        FfiConverterInt64.write(value.tsMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeE2eeQuoteArgRecord_lift(_ buf: RustBuffer) throws -> E2eeQuoteArgRecord {
+    return try FfiConverterTypeE2eeQuoteArgRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeE2eeQuoteArgRecord_lower(_ value: E2eeQuoteArgRecord) -> RustBuffer {
+    return FfiConverterTypeE2eeQuoteArgRecord.lower(value)
 }
 
 
@@ -15836,6 +16165,63 @@ public func FfiConverterTypeSendResultRecord_lower(_ value: SendResultRecord) ->
 
 
 /**
+ * Return value of [`CoreEngine::send_text`] carrying both send status and mirror revision (U5).
+ */
+public struct SendTextOutcomeRecord: Equatable, Hashable {
+    public var ok: Bool
+    public var version: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(ok: Bool, version: UInt64) {
+        self.ok = ok
+        self.version = version
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SendTextOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSendTextOutcomeRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SendTextOutcomeRecord {
+        return
+            try SendTextOutcomeRecord(
+                ok: FfiConverterBool.read(from: &buf), 
+                version: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SendTextOutcomeRecord, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.ok, into: &buf)
+        FfiConverterUInt64.write(value.version, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSendTextOutcomeRecord_lift(_ buf: RustBuffer) throws -> SendTextOutcomeRecord {
+    return try FfiConverterTypeSendTextOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSendTextOutcomeRecord_lower(_ value: SendTextOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypeSendTextOutcomeRecord.lower(value)
+}
+
+
+/**
  * Arguments of `send_text` (Swift `sendTextAPI`). `cli_msg_id` may be empty (a fresh client id
  * is used).
  */
@@ -16662,6 +17048,67 @@ public func FfiConverterTypeTypedEnvelope_lift(_ buf: RustBuffer) throws -> Type
 #endif
 public func FfiConverterTypeTypedEnvelope_lower(_ value: TypedEnvelope) -> RustBuffer {
     return FfiConverterTypeTypedEnvelope.lower(value)
+}
+
+
+/**
+ * Active incoming typing indicator for one conversation (U5).
+ */
+public struct TypingEntryRecord: Equatable, Hashable {
+    public var convId: String
+    public var name: String
+    public var onPc: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(convId: String, name: String, onPc: Bool) {
+        self.convId = convId
+        self.name = name
+        self.onPc = onPc
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TypingEntryRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTypingEntryRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TypingEntryRecord {
+        return
+            try TypingEntryRecord(
+                convId: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                onPc: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TypingEntryRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.convId, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterBool.write(value.onPc, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTypingEntryRecord_lift(_ buf: RustBuffer) throws -> TypingEntryRecord {
+    return try FfiConverterTypeTypingEntryRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTypingEntryRecord_lower(_ value: TypingEntryRecord) -> RustBuffer {
+    return FfiConverterTypeTypingEntryRecord.lower(value)
 }
 
 
@@ -17888,6 +18335,96 @@ public func FfiConverterTypeDeleteModeRecord_lift(_ buf: RustBuffer) throws -> D
 #endif
 public func FfiConverterTypeDeleteModeRecord_lower(_ value: DeleteModeRecord) -> RustBuffer {
     return FfiConverterTypeDeleteModeRecord.lower(value)
+}
+
+
+
+/**
+ * Outcome returned by Swift's `send_e2ee_text` host callback (U5).
+ */
+
+public enum E2eeSendOutcomeRecord: Equatable, Hashable {
+    
+    case sent(msgId: String, cliMsgId: String, tsMs: Int64
+    )
+    /**
+     * Error thrown by E2EE send: core logs `sendText failed: <message>` and removes optimistic row.
+     */
+    case failed(message: String
+    )
+    /**
+     * Pre-flight guard already logged by Swift: core removes optimistic row without extra log.
+     */
+    case aborted
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension E2eeSendOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeE2eeSendOutcomeRecord: FfiConverterRustBuffer {
+    typealias SwiftType = E2eeSendOutcomeRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> E2eeSendOutcomeRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .sent(msgId: try FfiConverterString.read(from: &buf), cliMsgId: try FfiConverterString.read(from: &buf), tsMs: try FfiConverterInt64.read(from: &buf)
+        )
+        
+        case 2: return .failed(message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .aborted
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: E2eeSendOutcomeRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .sent(msgId,cliMsgId,tsMs):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(msgId, into: &buf)
+            FfiConverterString.write(cliMsgId, into: &buf)
+            FfiConverterInt64.write(tsMs, into: &buf)
+            
+        
+        case let .failed(message):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(message, into: &buf)
+            
+        
+        case .aborted:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeE2eeSendOutcomeRecord_lift(_ buf: RustBuffer) throws -> E2eeSendOutcomeRecord {
+    return try FfiConverterTypeE2eeSendOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeE2eeSendOutcomeRecord_lower(_ value: E2eeSendOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypeE2eeSendOutcomeRecord.lower(value)
 }
 
 
@@ -20138,6 +20675,30 @@ fileprivate struct FfiConverterOptionTypeCoreChangesRecord: FfiConverterRustBuff
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeE2eeQuoteArgRecord: FfiConverterRustBuffer {
+    typealias SwiftType = E2eeQuoteArgRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeE2eeQuoteArgRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeE2eeQuoteArgRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeLegacyCookieRecord: FfiConverterRustBuffer {
     typealias SwiftType = LegacyCookieRecord?
 
@@ -20658,6 +21219,30 @@ fileprivate struct FfiConverterOptionSequenceTypeStoredChat: FfiConverterRustBuf
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterSequenceTypeStoredChat.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionSequenceTypeTypingEntryRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [TypingEntryRecord]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceTypeTypingEntryRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceTypeTypingEntryRecord.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -21615,6 +22200,31 @@ fileprivate struct FfiConverterSequenceTypeTickMapEntry: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeTypingEntryRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [TypingEntryRecord]
+
+    public static func write(_ value: [TypingEntryRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeTypingEntryRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [TypingEntryRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [TypingEntryRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeTypingEntryRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeUserCountRecord: FfiConverterRustBuffer {
     typealias SwiftType = [UserCountRecord]
 
@@ -22351,6 +22961,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_handle_session_expired_notice() != 44648) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_handle_typing() != 59394) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_hidden_search() != 49446) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -22375,10 +22988,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_mark_conversation_unread() != 48974) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_mark_read() != 5051) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_move_conversation() != 1144) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_next_changes() != 57544) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_next_client_id() != 14242) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_notify_typing() != 21975) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_open_conversation() != 13873) {
@@ -22435,6 +23057,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_reset_hidden_pin() != 13854) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_reset_outgoing_typing() != 50171) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_resolve_missing_names() != 34703) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -22442,6 +23067,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_seed_history_freshness() != 1024) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_send_text() != 59517) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_set_auto_delete_ttl() != 15133) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_set_conversation_filter() != 10430) {
@@ -22453,16 +23084,25 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_set_conversation_prompt() != 57901) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_set_e2ee_threads() != 49248) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_set_hidden_pin() != 49719) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_set_open_conversation() != 4090) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_set_send_typing_enabled() != 20118) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_settle() != 26622) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_shared_api() != 19658) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_show_typing_indicator() != 3406) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_start() != 22299) {
@@ -22673,6 +23313,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_corehost_mute() != 59631) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_send_e2ee_text() != 12893) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreofflineconversations_apply_batch_delta() != 33957) {

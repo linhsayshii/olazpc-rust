@@ -380,8 +380,10 @@ fn reduce_send_text_done(
             complete_op(pending.op_id, OpResult::Bool(true), true, out);
         }
         Err(err_msg) => {
-            out.effects
-                .push(Effect::EngineLog(format!("sendText failed: {err_msg}")));
+            if !err_msg.is_empty() {
+                out.effects
+                    .push(Effect::EngineLog(format!("sendText failed: {err_msg}")));
+            }
             if matches!(
                 state
                     .messages

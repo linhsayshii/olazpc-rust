@@ -7,9 +7,10 @@ use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use olaz_api::PollState;
+use olaz_api::{PollState, SendMessageResult};
 use olaz_core::changes::{DirtyKey, snapshot_message_meta};
 use olaz_core::conversations::{BatchApplyDelta, ConversationSummary, sort_conversations};
+use olaz_core::input::E2eeQuoteArg;
 use olaz_core::messages::{HistoryFreshness, MuteEntry};
 use olaz_core::reduce::classify::{MobileSyncEvent, Route, classify};
 use olaz_core::reduce::reduce;
@@ -21,13 +22,13 @@ use olaz_core::{
     LegacyCookie, LoginState, LoginStep, Phase, Profile, SessionEffectRunner, SessionSnapshot,
 };
 use olaz_json::to_swift_json_string;
-use olaz_net::{LoginAccount, NetworkErrorKind};
+use olaz_net::{LoginAccount, NetworkErrorKind, ReqwestTransport, SessionClient};
 use olaz_wire::{ChatMessage, NameLookup};
 use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
 use crate::api::PollStateRecord;
-use crate::chat::ChatMessageRecord;
+use crate::chat::{ChatMessageRecord, MessageMention, TextStyleRecord};
 use crate::conversations::{
     BatchApplyDeltaRecord, ConversationActionResultRecord, ConversationActionUiRecord,
     ConversationActionsRecord, ConversationExtrasRecord, ConversationPromptRecord,
@@ -377,6 +378,91 @@ impl From<SessionSnapshot> for SessionStateRecord {
     }
 }
 
+/// Active incoming typing indicator for one conversation (U5).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TypingEntryRecord {
+    pub conv_id: String,
+    pub name: String,
+    pub on_pc: bool,
+}
+
+impl fmt::Debug for TypingEntryRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TypingEntryRecord")
+            .field("has_conv_id", &!self.conv_id.is_empty())
+            .field("has_name", &!self.name.is_empty())
+            .field("on_pc", &self.on_pc)
+            .finish()
+    }
+}
+
+/// Quote metadata passed to Swift's `send_e2ee_text` host boundary (U5).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct E2eeQuoteArgRecord {
+    pub msg_id: String,
+    pub cli_msg_id: String,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub text: String,
+    pub ts_ms: i64,
+}
+
+impl fmt::Debug for E2eeQuoteArgRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("E2eeQuoteArgRecord")
+            .field("ts_ms", &self.ts_ms)
+            .field("has_text", &!self.text.is_empty())
+            .finish()
+    }
+}
+
+impl From<E2eeQuoteArg> for E2eeQuoteArgRecord {
+    fn from(q: E2eeQuoteArg) -> Self {
+        Self {
+            msg_id: q.msg_id,
+            cli_msg_id: q.cli_msg_id,
+            sender_id: q.sender_id,
+            sender_name: q.sender_name,
+            text: q.text,
+            ts_ms: q.ts_ms,
+        }
+    }
+}
+
+/// Outcome returned by Swift's `send_e2ee_text` host callback (U5).
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum E2eeSendOutcomeRecord {
+    Sent {
+        msg_id: String,
+        cli_msg_id: String,
+        ts_ms: i64,
+    },
+    /// Error thrown by E2EE send: core logs `sendText failed: <message>` and removes optimistic row.
+    Failed { message: String },
+    /// Pre-flight guard already logged by Swift: core removes optimistic row without extra log.
+    Aborted,
+}
+
+impl fmt::Debug for E2eeSendOutcomeRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sent { ts_ms, .. } => f.debug_struct("Sent").field("ts_ms", ts_ms).finish(),
+            Self::Failed { message } => f
+                .debug_struct("Failed")
+                .field("msg_len", &message.len())
+                .finish(),
+            Self::Aborted => f.write_str("Aborted"),
+        }
+    }
+}
+
+/// Return value of [`CoreEngine::send_text`] carrying both send status and mirror revision (U5).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SendTextOutcomeRecord {
+    pub ok: bool,
+    pub version: u64,
+}
+
 /// Coalesced dirty-key change batch returned by [`CoreEngine::next_changes`].
 #[derive(Clone, PartialEq, uniffi::Record)]
 pub struct CoreChangesRecord {
@@ -391,6 +477,7 @@ pub struct CoreChangesRecord {
     pub messages_reset_all: bool,
     pub message_meta: Option<MessageMetaRecord>,
     pub contacts: Option<ContactsStateRecord>,
+    pub typing: Option<Vec<TypingEntryRecord>>,
 }
 
 impl fmt::Debug for CoreChangesRecord {
@@ -406,6 +493,7 @@ impl fmt::Debug for CoreChangesRecord {
             .field("conversation_extras", &self.conversation_extras)
             .field("conversation_ui", &self.conversation_ui)
             .field("conversation_prompt", &self.conversation_prompt)
+            .field("typing_count", &self.typing.as_ref().map(Vec::len))
             .finish()
     }
 }
@@ -428,6 +516,15 @@ impl From<CoreChanges> for CoreChangesRecord {
             messages_reset_all: c.messages_reset_all,
             message_meta: c.message_meta.map(Into::into),
             contacts: c.contacts.map(Into::into),
+            typing: c.typing.map(|map| {
+                map.into_iter()
+                    .map(|(conv_id, status)| TypingEntryRecord {
+                        conv_id,
+                        name: status.name,
+                        on_pc: status.on_pc,
+                    })
+                    .collect()
+            }),
         }
     }
 }
@@ -780,6 +877,7 @@ impl CoreOfflineConversations {
             messages_reset_all: false,
             message_meta: None,
             contacts: None,
+            typing: None,
         };
         for key in out.dirty {
             match key {
@@ -819,8 +917,20 @@ impl CoreOfflineConversations {
                 DirtyKey::Contacts => {
                     rec.contacts = Some(state.contacts.clone().into());
                 }
-                // U5-send (wired next in U5 FFI commit)
-                DirtyKey::Typing => {}
+                DirtyKey::Typing => {
+                    rec.typing = Some(
+                        state
+                            .typing
+                            .active
+                            .iter()
+                            .map(|(conv_id, status)| TypingEntryRecord {
+                                conv_id: conv_id.clone(),
+                                name: status.name.clone(),
+                                on_pc: status.on_pc,
+                            })
+                            .collect(),
+                    );
+                }
             }
         }
         rec
@@ -1050,6 +1160,13 @@ pub trait CoreHost: Send + Sync {
         start_explicit: bool,
         duration: i64,
     );
+    async fn send_e2ee_text(
+        &self,
+        conv_id: String,
+        text: String,
+        client_id: String,
+        quote: Option<E2eeQuoteArgRecord>,
+    ) -> E2eeSendOutcomeRecord;
 }
 
 struct FfiHostBridge(Arc<dyn CoreHost>);
@@ -1396,6 +1513,32 @@ impl Host for FfiHostBridge {
             .mute(conv_id, set, start, start_explicit, duration)
             .await;
     }
+
+    async fn send_e2ee_text(
+        &self,
+        conv_id: String,
+        text: String,
+        client_id: String,
+        quote: Option<E2eeQuoteArg>,
+    ) -> Result<SendMessageResult, String> {
+        match self
+            .0
+            .send_e2ee_text(conv_id, text, client_id, quote.map(Into::into))
+            .await
+        {
+            E2eeSendOutcomeRecord::Sent {
+                msg_id,
+                cli_msg_id,
+                ts_ms,
+            } => Ok(SendMessageResult {
+                msg_id,
+                cli_msg_id,
+                ts_ms,
+            }),
+            E2eeSendOutcomeRecord::Failed { message } => Err(message),
+            E2eeSendOutcomeRecord::Aborted => Err(String::new()),
+        }
+    }
 }
 
 fn parse_inner_json(json: &str) -> Result<Map<String, Value>, CoreError> {
@@ -1416,7 +1559,8 @@ fn parse_inner_json(json: &str) -> Result<Map<String, Value>, CoreError> {
 #[derive(uniffi::Object)]
 pub struct CoreEngine {
     handle: Arc<CoreHandle>,
-    runner: Arc<SessionEffectRunner<olaz_net::ReqwestTransport>>,
+    runner: Arc<SessionEffectRunner<ReqwestTransport>>,
+    session_client: Arc<SessionClient<ReqwestTransport>>,
     ws_driver: Arc<dyn WsDriver>,
     shared_store: SharedStoreSlot,
 }
@@ -1427,8 +1571,9 @@ impl CoreEngine {
     #[uniffi::constructor]
     pub fn new(session: Arc<CoreSession>, host: Arc<dyn CoreHost>) -> Result<Arc<Self>, CoreError> {
         let rt_handle = runtime()?.handle().clone();
+        let session_client = Arc::clone(&session.client);
         let runner = Arc::new(SessionEffectRunner::with_default_domains(
-            Arc::clone(&session.client),
+            Arc::clone(&session_client),
             Arc::new(FfiHostBridge(host)),
             rt_handle.clone(),
             session.default_domains.clone(),
@@ -1441,6 +1586,7 @@ impl CoreEngine {
         Ok(Arc::new(Self {
             handle: Arc::new(handle),
             runner,
+            session_client,
             ws_driver,
             shared_store,
         }))
@@ -2136,6 +2282,129 @@ impl CoreEngine {
         crate::api::CoreApi::from_shared_api(Arc::clone(self.runner.api()))
     }
 
+    // --- Send text, seen/mark_read, and typing domain (U5) ---
+
+    /// Allocates the next strictly increasing client message id from the shared `SessionClient`.
+    pub fn next_client_id(&self) -> i64 {
+        self.session_client.next_client_id()
+    }
+
+    /// Sends a text message (plain API or E2EE host boundary) with core-owned optimistic row,
+    /// echo/ack reconciliation, persistence, and conversation preview update.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Mirrors Swift sendText arguments plus deterministic clock/client_id overrides"
+    )]
+    pub async fn send_text(
+        &self,
+        conv_id: String,
+        text: String,
+        quote_id: Option<String>,
+        mentions: Vec<MessageMention>,
+        styles: Vec<TextStyleRecord>,
+        urgency: i64,
+        client_id: i64,
+        now_ms: i64,
+        is_e2ee: Option<bool>,
+        ttl_ms: Option<i64>,
+    ) -> Result<SendTextOutcomeRecord, CoreError> {
+        let wire_mentions: Vec<olaz_wire::Mention> = mentions
+            .into_iter()
+            .map(|m| olaz_wire::Mention {
+                uid: m.uid,
+                pos: m.pos,
+                len: m.len,
+                is_all: m.is_all,
+            })
+            .collect();
+        let wire_styles: Vec<olaz_wire::TextStyle> = styles
+            .into_iter()
+            .map(|s| olaz_wire::TextStyle {
+                start: s.start,
+                len: s.len,
+                st: s.st,
+            })
+            .collect();
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let ok = matches!(
+                handle
+                    .request(Command::SendText {
+                        conv_id,
+                        text,
+                        quote_id,
+                        mentions: wire_mentions,
+                        styles: wire_styles,
+                        urgency,
+                        client_id,
+                        now_ms,
+                        is_e2ee,
+                        ttl_ms,
+                    })
+                    .await,
+                Some(olaz_core::OpResult::Bool(true))
+            );
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            SendTextOutcomeRecord { ok, version }
+        })
+        .await
+    }
+
+    /// Marks a conversation read using core's own message window for the `send_seen` target.
+    pub fn mark_read(&self, id: String) {
+        self.handle.send(Command::MarkRead { id });
+    }
+
+    /// Triggers an outgoing typing ping subject to core's 10 s per-conversation throttle,
+    /// `Phase::Ready` gate, and `olaz.sendTyping` preference.
+    pub fn notify_typing(&self, conv_id: String, now_ms: i64) {
+        self.handle.send(Command::NotifyTyping { conv_id, now_ms });
+    }
+
+    /// Clears the outgoing typing throttle for `conv_id`.
+    pub fn reset_outgoing_typing(&self, conv_id: String) {
+        self.handle.send(Command::ResetOutgoingTyping { conv_id });
+    }
+
+    /// Routes a `handleTyping(state:)` JSON dictionary into core's incoming typing state.
+    pub fn handle_typing(&self, state_json: String) {
+        let state = olaz_json::parse_object_str(&state_json).unwrap_or_default();
+        self.handle.send(Command::HandleTyping { state });
+    }
+
+    /// Sets or refreshes an incoming typing indicator directly in core (10 s expiry timer).
+    pub fn show_typing_indicator(&self, conv_id: String, name: String, on_pc: bool) {
+        let mut inner = Map::new();
+        inner.insert("convId".to_owned(), Value::String(conv_id));
+        inner.insert("name".to_owned(), Value::String(name));
+        inner.insert("isPC".to_owned(), Value::Bool(on_pc));
+        let mut state = Map::new();
+        state.insert("typing".to_owned(), Value::Object(inner));
+        self.handle.send(Command::HandleTyping { state });
+    }
+
+    /// Updates core's `olaz.sendTyping` preference mirror.
+    pub fn set_send_typing_enabled(&self, enabled: bool) {
+        self.handle.send(Command::SetSendTypingEnabled { enabled });
+    }
+
+    /// Replaces the set of 1-1 peer UIDs with active E2EE sessions in core.
+    pub fn set_e2ee_threads(&self, threads: Vec<String>) {
+        self.handle
+            .send(Command::SetE2eeThreads(threads.into_iter().collect()));
+    }
+
+    /// Updates a single conversation's auto-delete TTL in milliseconds (`0` disables).
+    pub fn set_auto_delete_ttl(&self, conv_id: String, ttl_ms: i64) {
+        self.handle
+            .send(Command::SetAutoDeleteTtl { conv_id, ttl_ms });
+    }
+
     // --- Core-owned WebSocket pass-throughs for Swift feature domains ---
 
     /// Sends a raw WebSocket frame. `false` unless authenticated and the write succeeded.
@@ -2417,6 +2686,15 @@ mod tests {
             _start_explicit: bool,
             _duration: i64,
         ) {
+        }
+        async fn send_e2ee_text(
+            &self,
+            _conv_id: String,
+            _text: String,
+            _client_id: String,
+            _quote: Option<E2eeQuoteArgRecord>,
+        ) -> E2eeSendOutcomeRecord {
+            E2eeSendOutcomeRecord::Aborted
         }
     }
 

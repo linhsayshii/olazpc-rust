@@ -70,6 +70,15 @@ extension ZaloEngine {
             markReadTasks.removeAll()
             for task in tasks { _ = await task.value }
         }
+        if let core = coreLifecycle.core {
+            if phase == .ready, activeSendTask == nil {
+                if let v = try? await core.waitIdle() {
+                    await waitForMirrorVersion(v)
+                }
+            } else if let v = try? await core.settle() {
+                await waitForMirrorVersion(v)
+            }
+        }
         _ = await persistConversationsTask?.value
     }
 
@@ -77,6 +86,15 @@ extension ZaloEngine {
         let task = notifyTypingTask
         notifyTypingTask = nil
         _ = await task?.value
+        if let core = coreLifecycle.core {
+            if phase == .ready, activeSendTask == nil {
+                if let v = try? await core.waitIdle() {
+                    await waitForMirrorVersion(v)
+                }
+            } else if let v = try? await core.settle() {
+                await waitForMirrorVersion(v)
+            }
+        }
     }
 
     internal func finishTearDownForRecording() async {
