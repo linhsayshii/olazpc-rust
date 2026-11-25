@@ -115,6 +115,7 @@ actor ZaloSessionClient {
     private var serverQrForm: Int = 0
     private var needsPCTypeUpgrade: Bool = false
     private var lastClientIdMs: Int64 = 0
+    private var seededNextClientId: Int64?
     private var sessionTrace: (@MainActor @Sendable (String) -> Bool)?
 
     private static let keychainIdentifier = "olaz.native.session"
@@ -332,7 +333,27 @@ actor ZaloSessionClient {
         "zpw_ver=\(ZaloDomains.zpwVer)&zpw_type=\(ZaloDomains.zpwType)"
     }
 
+    func seedNextClientId(_ next: Int64) {
+        seededNextClientId = next
+        lastClientIdMs = next - 1
+    }
+
+    func clearAuthForTesting() {
+        zpwSek = nil
+        secretKey = nil
+        if var acc = account {
+            acc.zpwSek = ""
+            acc.zpwEnk = ""
+            account = acc
+        }
+    }
+
     func nextClientId() -> Int64 {
+        if let seeded = seededNextClientId {
+            seededNextClientId = seeded + 1
+            lastClientIdMs = seeded
+            return seeded
+        }
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let next = now > lastClientIdMs ? now : (lastClientIdMs + 1)
         lastClientIdMs = next

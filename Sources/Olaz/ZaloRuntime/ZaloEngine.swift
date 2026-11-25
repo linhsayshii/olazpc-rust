@@ -145,6 +145,7 @@ final class ZaloEngine {
     @ObservationIgnored internal let sessionClient: ZaloSessionClient
     @ObservationIgnored internal let webSocket = ZaloWebSocket()
     @ObservationIgnored internal let dataDirectory: URL
+    @ObservationIgnored internal let userDefaults: UserDefaults
     @ObservationIgnored internal var sqliteStore: ZaloSQLiteStore? {
         didSet {
             if let core = coreLifecycle.core {
@@ -170,6 +171,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var cachedQRPayload: String?
     @ObservationIgnored internal var cachedQRPNG: Data?
     @ObservationIgnored internal var hostTrace: ((String, [String: Any]) -> Bool)?
+    @ObservationIgnored internal var sendE2EETextHostHandler: (([String: Any]) async throws -> SendMessageResult)?
     @ObservationIgnored internal var traceU4HostEnabled: Bool = false
     @ObservationIgnored internal var stateTrace: (() -> Void)?
     @ObservationIgnored private let transportSettleTraceActive = OSAllocatedUnfairLock<Bool>(initialState: false)
@@ -194,6 +196,9 @@ final class ZaloEngine {
     @ObservationIgnored internal var openConversationTask: Task<Void, Never>?
     @ObservationIgnored internal var loadOlderTask: Task<Void, Never>?
     @ObservationIgnored internal var persistConversationsTask: Task<Void, Never>?
+    @ObservationIgnored internal var notifyTypingTask: Task<Void, Never>?
+    @ObservationIgnored internal var markReadTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored internal var activeSendTask: Task<Bool, Never>?
     @ObservationIgnored internal var batchImportTask: Task<Void, Never>?
     @ObservationIgnored internal var activeSyncBatchTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var lastSyncConvFlushAt: Date = .distantPast
@@ -260,6 +265,7 @@ final class ZaloEngine {
         cookieStorage: HTTPCookieStorage = .shared
     ) {
         self.dataDirectory = dataDirectory
+        self.userDefaults = userDefaultsSuiteName.flatMap { UserDefaults(suiteName: $0) } ?? .standard
         self.sessionClient = ZaloSessionClient(
             dataDirectory: dataDirectory,
             useKeychain: useKeychain,
