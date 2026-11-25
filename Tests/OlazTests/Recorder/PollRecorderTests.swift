@@ -527,7 +527,7 @@ final class PollRecorderTests: XCTestCase {
                     "poll_clock": .object([
                         "watched": .object(preSeededWatched),
                     ]),
-                    "watched_check_ids": .array([.string("9400"), .string("9401"), .string("9402"), .string("9499")]),
+                    "watched_check_ids": .array([.string("9499")]),
                 ]
             ),
             server: [
