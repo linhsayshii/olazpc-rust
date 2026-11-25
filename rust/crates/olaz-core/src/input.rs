@@ -251,6 +251,20 @@ pub enum Command {
     },
     SeedHistoryFreshness(BTreeMap<String, HistoryFreshness>),
     SeedContacts(Box<ContactsState>),
+    // U5
+    HandleTyping {
+        state: Map<String, Value>,
+    },
+    NotifyTyping {
+        conv_id: String,
+        now_ms: i64,
+    },
+    ResetOutgoingTyping {
+        conv_id: String,
+    },
+    SetSendTypingEnabled {
+        enabled: bool,
+    },
 }
 
 impl fmt::Debug for Command {
@@ -432,6 +446,20 @@ impl fmt::Debug for Command {
                 .field("count", &m.len())
                 .finish(),
             Self::SeedContacts(c) => f.debug_tuple("SeedContacts").field(c).finish(),
+            // U5
+            Self::HandleTyping { state } => f
+                .debug_struct("HandleTyping")
+                .field("keys", &state.len())
+                .finish(),
+            Self::NotifyTyping { now_ms, .. } => f
+                .debug_struct("NotifyTyping")
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::ResetOutgoingTyping { .. } => f.write_str("ResetOutgoingTyping"),
+            Self::SetSendTypingEnabled { enabled } => f
+                .debug_struct("SetSendTypingEnabled")
+                .field("enabled", enabled)
+                .finish(),
         }
     }
 }
@@ -810,6 +838,11 @@ pub enum Input {
         profiles_map: Map<String, Value>,
         profiles_cache_changed: bool,
     },
+    // U5
+    TypingExpired {
+        conv_id: String,
+        expiry_gen: u64,
+    },
 }
 
 impl fmt::Debug for Input {
@@ -1160,6 +1193,11 @@ impl fmt::Debug for Input {
                 .field("remaining_chunks", &remaining_chunks.len())
                 .field("profiles_count", &profiles_map.len())
                 .field("cache_changed", profiles_cache_changed)
+                .finish(),
+            // U5
+            Self::TypingExpired { expiry_gen, .. } => f
+                .debug_struct("TypingExpired")
+                .field("expiry_gen", expiry_gen)
                 .finish(),
         }
     }

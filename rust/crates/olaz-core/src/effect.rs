@@ -685,6 +685,17 @@ pub enum Effect {
         remaining_chunks: Vec<Vec<String>>,
         profiles_cache_changed: bool,
     },
+    // U5
+    /// Calls `ZaloApi::send_typing` when `SessionClient::is_authenticated()` is true.
+    SendTypingApi { conv_id: String },
+    /// Starts or resets the incoming typing expiry timer for `conv_id`.
+    StartTypingExpiry {
+        conv_id: String,
+        expiry_gen: u64,
+        delay: Duration,
+    },
+    /// Cancels any active incoming typing expiry timer for `conv_id`.
+    CancelTypingExpiry { conv_id: String },
 
     /// Domain activity delegated to Swift via `CoreHost`.
     Host(HostCall),
@@ -905,6 +916,16 @@ impl fmt::Debug for Effect {
                 .field("chunk_len", &chunk.len())
                 .field("remaining_chunks", &remaining_chunks.len())
                 .finish(),
+            // U5
+            Self::SendTypingApi { .. } => f.write_str("SendTypingApi"),
+            Self::StartTypingExpiry {
+                expiry_gen, delay, ..
+            } => f
+                .debug_struct("StartTypingExpiry")
+                .field("expiry_gen", expiry_gen)
+                .field("delay_ms", &delay.as_millis())
+                .finish(),
+            Self::CancelTypingExpiry { .. } => f.write_str("CancelTypingExpiry"),
             Self::Host(call) => f.debug_tuple("Host").field(call).finish(),
         }
     }

@@ -107,6 +107,22 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::DecryptedEnvelopeReady { .. } => {
             messages::reduce_messages(state, input, &mut out);
         }
+        // U5
+        Input::Command(
+            Command::HandleTyping { .. }
+            | Command::NotifyTyping { .. }
+            | Command::ResetOutgoingTyping { .. }
+            | Command::SetSendTypingEnabled { .. },
+        )
+        | Input::OpRequest {
+            cmd:
+                Command::HandleTyping { .. }
+                | Command::NotifyTyping { .. }
+                | Command::ResetOutgoingTyping { .. }
+                | Command::SetSendTypingEnabled { .. },
+            ..
+        }
+        | Input::TypingExpired { .. } => crate::typing::reduce_typing(state, input, &mut out),
 
         Input::Command(_)
         | Input::OpRequest { .. }

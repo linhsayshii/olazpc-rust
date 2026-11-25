@@ -17,6 +17,7 @@ pub mod reduce;
 pub mod runner;
 pub mod state;
 pub mod typed_chat;
+pub mod typing;
 
 pub use actor::{ActorSink, CoreHandle};
 pub use changes::{ChangeHub, CoreChanges, DirtyKey, DirtySet, MessageMetaSnapshot, snapshot_message_meta};
@@ -58,4 +59,8 @@ pub use state::{
 pub use typed_chat::{
     ParseState, PlainChatParse, SharedParse, TypedChatEnvelope, WirePayloadHandle,
     new_shared_parse, try_parse_plain_chat,
+};
+pub use typing::{
+    DEFAULT_TYPING_NAME, OUTGOING_TYPING_THROTTLE_MS, TYPING_DISPLAY_DURATION, TypingState,
+    TypingStatus, clear_typing, set_typing,
 };
