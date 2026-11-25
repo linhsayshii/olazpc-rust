@@ -372,6 +372,10 @@ pub enum Command {
         conv_id: String,
         now_ms: i64,
     },
+    RecordSeenReactionKeys {
+        keys: Vec<String>,
+        persist: bool,
+    },
 }
 
 impl fmt::Debug for Command {
@@ -662,6 +666,11 @@ impl fmt::Debug for Command {
             Self::PruneExpiredMessages { now_ms, .. } => f
                 .debug_struct("PruneExpiredMessages")
                 .field("now_ms", now_ms)
+                .finish(),
+            Self::RecordSeenReactionKeys { keys, persist } => f
+                .debug_struct("RecordSeenReactionKeys")
+                .field("count", &keys.len())
+                .field("persist", persist)
                 .finish(),
         }
     }

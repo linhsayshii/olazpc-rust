@@ -2826,6 +2826,36 @@ impl CoreEngine {
             .send(Command::PruneExpiredMessages { conv_id, now_ms });
     }
 
+    /// Seeds previously loaded seen-reaction dedup keys into core without writing back to SQLite.
+    pub fn seed_seen_reaction_keys(&self, keys: Vec<String>) {
+        if keys.is_empty() {
+            return;
+        }
+        self.handle.send(Command::RecordSeenReactionKeys {
+            keys,
+            persist: false,
+        });
+    }
+
+    /// Records seen-reaction dedup keys in core and flushes `"seenReactionEventIds"` to SQLite.
+    pub async fn record_seen_reaction_keys(&self, keys: Vec<String>) -> Result<(), CoreError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            handle
+                .request_unit(Command::RecordSeenReactionKeys {
+                    keys,
+                    persist: true,
+                })
+                .await;
+            runner.flush_store().await;
+        })
+        .await
+    }
+
     // --- Core-owned WebSocket pass-throughs for Swift feature domains ---
 
     /// Sends a raw WebSocket frame. `false` unless authenticated and the write succeeded.

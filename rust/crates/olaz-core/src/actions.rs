@@ -1766,6 +1766,17 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                 });
             }
         }
+        Command::RecordSeenReactionKeys { keys, persist } => {
+            let persisted = state.actions.seen_reactions.record(&keys) && persist;
+            if persisted {
+                out.effects
+                    .push(Effect::Store(StoreOp::SetPreferenceStrings {
+                        key: PREF_SEEN_REACTION_EVENT_IDS.to_owned(),
+                        values: state.actions.seen_reactions.ordered(),
+                    }));
+            }
+            complete_unit_after(op_id, persisted, out);
+        }
         _ => {}
     }
 }

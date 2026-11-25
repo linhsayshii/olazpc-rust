@@ -57,6 +57,7 @@ fn is_action_command(cmd: &Command) -> bool {
             | Command::LoadAutoDelete
             | Command::SetAutoDelete { .. }
             | Command::PruneExpiredMessages { .. }
+            | Command::RecordSeenReactionKeys { .. }
     )
 }
 

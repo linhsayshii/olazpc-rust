@@ -561,6 +561,7 @@ final class ZaloEngine {
             let capped = Array(savedSeen.suffix(1000))
             seenReactionEventOrder = capped
             seenReactionEventIds = Set(capped)
+            coreLifecycle.core?.seedSeenReactionKeys(keys: capped)
         }
         if let pollData = try? await store.getPreferenceData(key: "pollState"),
            let savedPoll = try? JSONDecoder().decode(ZaloPollState.self, from: pollData) {
@@ -1200,15 +1201,16 @@ final class ZaloEngine {
 
     internal func recordSeenReactionKeys(_ keys: [String]) async {
         var insertedAny = false
+        var trimmedKeys: [String] = []
         for rawKey in keys {
             let key = rawKey.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !key.isEmpty else { continue }
+            trimmedKeys.append(key)
             if seenReactionEventIds.insert(key).inserted {
                 seenReactionEventOrder.append(key)
                 insertedAny = true
             }
         }
-        guard insertedAny else { return }
         if seenReactionEventOrder.count > 1000 {
             let overflow = seenReactionEventOrder.count - 1000
             let evicted = seenReactionEventOrder.prefix(overflow)
@@ -1217,6 +1219,13 @@ final class ZaloEngine {
                 seenReactionEventIds.remove(old)
             }
         }
+        if let core = coreLifecycle.core {
+            if !trimmedKeys.isEmpty {
+                try? await core.recordSeenReactionKeys(keys: trimmedKeys)
+            }
+            return
+        }
+        guard insertedAny else { return }
         try? await sqliteStore?.setPreferenceStrings(key: "seenReactionEventIds", value: seenReactionEventOrder)
     }
 

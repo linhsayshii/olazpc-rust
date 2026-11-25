@@ -988,6 +988,9 @@ extension ZaloEngine {
                 core.attachStore(store: store.coreStoreHandle)
             }
             core.updateIdentities(table: self.currentIdentityTableRecord())
+            if !self.seenReactionEventOrder.isEmpty {
+                core.seedSeenReactionKeys(keys: self.seenReactionEventOrder)
+            }
             self.pushCoreContactsIfRunning()
             self.pushCoreHistoryFreshnessIfRunning()
             if let openId = self.openConversationId {
