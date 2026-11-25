@@ -1,0 +1,100 @@
+name: Stress
+
+# Runs the recorder suites repeatedly under CPU load on any ref, spread over several runners.
+# Usage: gh workflow run stress.yml -f ref=<branch or sha> [-f filter=<swift test filter>] [-f shards=5] [-f runs=4]
+# Total runs = shards x runs; each run is `swift test --skip-build --filter <filter>` with 4x `yes` in the background.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or SHA to test
+        required: true
+      filter:
+        description: swift test --filter value
+        default: RecorderTests
+      shards:
+        description: Runners in parallel (1-5)
+        default: "5"
+      runs:
+        description: Runs per runner
+        default: "4"
+
+run-name: Stress ${{ inputs.ref }} (${{ inputs.filter }}, ${{ inputs.shards }}x${{ inputs.runs }})
+
+concurrency:
+  group: stress-${{ inputs.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.shards.outputs.list }}
+    steps:
+      - id: shards
+        env:
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          n=$(( SHARDS < 1 ? 1 : (SHARDS > 5 ? 5 : SHARDS) ))
+          echo "list=[$(seq -s, 1 "$n")]" >> "$GITHUB_OUTPUT"
+
+  stress:
+    name: Shard ${{ matrix.shard }}
+    needs: plan
+    runs-on: macos-26
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Build Rust core (xcframework + UniFFI bindings)
+        run: ./scripts/build-rust.sh
+
+      - name: Build tests
+        run: swift build --build-tests
+
+      - name: Stressed runs
+        env:
+          FILTER: ${{ inputs.filter }}
+          RUNS: ${{ inputs.runs }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          mkdir -p stress-logs
+          for i in 1 2 3 4; do yes > /dev/null & done
+          pass=0; fail=0
+          for i in $(seq 1 "$RUNS"); do
+            log="stress-logs/shard${SHARD}-run${i}.log"
+            if swift test --skip-build --filter "$FILTER" > "$log" 2>&1; then
+              pass=$((pass + 1)); rm "$log"
+            else
+              fail=$((fail + 1))
+              echo "::error::shard $SHARD run $i failed"
+              grep -E "recorded an issue|error: -\[|failed \(" "$log" | head -5 || true
+            fi
+          done
+          kill $(jobs -p) 2>/dev/null || true
+          echo "shard $SHARD: $pass pass, $fail fail" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$fail" -eq 0 ]
+
+      - name: Upload failing logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-logs-shard${{ matrix.shard }}
+          path: stress-logs/
