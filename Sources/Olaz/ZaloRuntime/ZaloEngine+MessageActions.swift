@@ -1,3 +1,4 @@
+import OlazCore
 import AppKit
 
 // Message context-menu actions — Chia sẻ, Copy, Thu hồi, Xóa chỉ ở phía tôi, Ghim tin nhắn, Đánh dấu tin nhắn — bridged to
@@ -389,22 +390,26 @@ extension ZaloEngine {
                 effectiveMsgId = stored.id
                 if var list = messages[conv],
                    let idx = list.firstIndex(where: { $0.id == message.id || $0.clientId == resolvedCliId }) {
+                    let oldId = list[idx].id
                     list[idx].id = stored.id
                     if list[idx].clientId.isEmpty {
                         list[idx].clientId = resolvedCliId
                     }
                     messages[conv] = list
+                    coreLifecycle.core?.writeThroughUpsertMessage(msg: ChatMessageRecord(message: list[idx]), replacingClientId: oldId)
                 }
             } else if let histBox = try? await sessionClient.fetchHistory(convId: conv, lastMsgId: nil, count: 30),
                       let resolved = Self.findServerMsgId(in: histBox.dict, matchingClientId: resolvedCliId) {
                 effectiveMsgId = resolved
                 if var list = messages[conv],
                    let idx = list.firstIndex(where: { $0.id == message.id || $0.clientId == resolvedCliId }) {
+                    let oldId = list[idx].id
                     list[idx].id = resolved
                     if list[idx].clientId.isEmpty {
                         list[idx].clientId = resolvedCliId
                     }
                     messages[conv] = list
+                    coreLifecycle.core?.writeThroughUpsertMessage(msg: ChatMessageRecord(message: list[idx]), replacingClientId: oldId)
                 }
                 _ = try? await sqliteStore?.upgradeMessageId(
                     convId: conv,
@@ -516,6 +521,7 @@ extension ZaloEngine {
             current.removeAll { ids.contains($0.id) }
             messages[conversation] = current
         }
+        coreLifecycle.core?.writeThroughRemoveMessages(convId: conversation, ids: Array(ids))
         let now = Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
         showDeleteUndo(DeleteUndo(
             id: undoId,
@@ -592,6 +598,7 @@ extension ZaloEngine {
             list[idx].menu.star = on ? .unstar : .star
             messages[conv] = list
             let updated = list[idx]
+            coreLifecycle.core?.writeThroughUpsertMessage(msg: ChatMessageRecord(message: updated), replacingClientId: nil)
             trackMessageActionTask { [weak self] in
                 guard let self else { return }
                 if on { self.cachedStarredIds.insert(message.id) } else { self.cachedStarredIds.remove(message.id) }

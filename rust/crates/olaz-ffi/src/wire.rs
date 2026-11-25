@@ -235,3 +235,90 @@ pub fn parse_wire_batch_bytes(
             .collect()
     }))
 }
+
+pub(crate) fn unconvert(event: WireEvent) -> ParsedWireEvent {
+    match event {
+        WireEvent::Message { message, stored } => {
+            let chat: olaz_wire::ChatMessage = (&message).into();
+            let status = if stored.locked {
+                "e2ee_locked".to_owned()
+            } else {
+                match chat.status {
+                    olaz_wire::Status::Sending => "sending".to_owned(),
+                    olaz_wire::Status::Sent => "sent".to_owned(),
+                    olaz_wire::Status::Delivered => "delivered".to_owned(),
+                    olaz_wire::Status::Seen => "seen".to_owned(),
+                    olaz_wire::Status::Failed => "failed".to_owned(),
+                }
+            };
+            let wire_stored = olaz_wire::StoredMessage {
+                id: chat.id.clone(),
+                conv_id: chat.conversation_id.clone(),
+                client_id: chat.client_id.clone(),
+                sender_id: chat.sender_id.clone(),
+                sender_name: chat.sender_name.clone(),
+                sender_avatar: stored.sender_avatar,
+                is_mine: chat.is_mine,
+                text: chat.text.clone(),
+                kind_tag: stored.kind_tag,
+                ts_ms: chat.date_ms,
+                status,
+                raw_json_data: stored.raw_json,
+            };
+            ParsedWireEvent::Message(Box::new(chat), Box::new(wire_stored))
+        }
+        WireEvent::Reaction {
+            conv_id,
+            msg_id,
+            cli_msg_id,
+            sender_id,
+            r_type,
+            r_icon,
+            event_id,
+            react_client_id,
+            ts_ms,
+            seq_id,
+            sender_name,
+        } => ParsedWireEvent::Reaction {
+            conv_id,
+            msg_id,
+            cli_msg_id,
+            sender_id,
+            r_type,
+            r_icon,
+            event_id,
+            react_client_id,
+            ts_ms,
+            seq_id,
+            sender_name,
+        },
+        WireEvent::Undo {
+            conv_id,
+            msg_id,
+            cli_msg_id,
+        } => ParsedWireEvent::Undo {
+            conv_id,
+            msg_id,
+            cli_msg_id,
+        },
+        WireEvent::Delete {
+            conv_id,
+            msg_id,
+            cli_msg_id,
+        } => ParsedWireEvent::Delete {
+            conv_id,
+            msg_id,
+            cli_msg_id,
+        },
+        WireEvent::Typing {
+            conv_id,
+            sender_id,
+            is_group,
+        } => ParsedWireEvent::Typing {
+            conv_id,
+            sender_id,
+            is_group,
+        },
+        WireEvent::Ignore => ParsedWireEvent::Ignore,
+    }
+}

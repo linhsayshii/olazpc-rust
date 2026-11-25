@@ -84,6 +84,34 @@ extension ZaloWireParser {
         return out
     }
 
+    static func wireEvents(from events: [ParsedWireEvent]) -> [WireEvent] {
+        events.map { ev in
+            switch ev {
+            case .message(let msg, let stored):
+                let storedRec = WireStored(
+                    kindTag: stored.kindTag,
+                    senderAvatar: stored.senderAvatar,
+                    locked: stored.status == "e2ee_locked",
+                    rawJson: stored.rawJSONData
+                )
+                return .message(message: ChatMessageRecord(message: msg), stored: storedRec)
+            case .reaction(let convId, let msgId, let cliMsgId, let senderId, let rType, let rIcon, let eventId, let reactClientId, let tsMs, let seqId, let senderName):
+                return .reaction(
+                    convId: convId, msgId: msgId, cliMsgId: cliMsgId, senderId: senderId, rType: rType, rIcon: rIcon,
+                    eventId: eventId, reactClientId: reactClientId, tsMs: tsMs, seqId: seqId, senderName: senderName
+                )
+            case .undo(let convId, let msgId, let cliMsgId):
+                return .undo(convId: convId, msgId: msgId, cliMsgId: cliMsgId)
+            case .delete(let convId, let msgId, let cliMsgId):
+                return .delete(convId: convId, msgId: msgId, cliMsgId: cliMsgId)
+            case .typing(let convId, let senderId, let isGroup):
+                return .typing(convId: convId, senderId: senderId, isGroup: isGroup)
+            case .ignore:
+                return .ignore
+            }
+        }
+    }
+
     /// Runs the Rust parser and maps its events to the Swift types; `nil` when the core rejects the input.
     static func rustParseBatch(_ input: RustBatchInput) -> [ParsedWireEvent]? {
         guard let events = try? parseWireBatch(json: input.json, myUid: input.myUid, options: input.options) else { return nil }

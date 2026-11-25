@@ -482,6 +482,7 @@ extension ZaloEngine {
             groupMemberCache.removeValue(forKey: gid)
             cachedGroups.removeValue(forKey: gid)
             messages.removeValue(forKey: gid)
+            coreLifecycle.core?.writeThroughRemoveWindow(convId: gid)
             hasMoreHistory.removeValue(forKey: gid)
             historyTicks.removeValue(forKey: gid)
             typing.removeValue(forKey: gid)

@@ -7,12 +7,14 @@ use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use olaz_api::PollState;
-use olaz_core::changes::DirtyKey;
+use olaz_api::{PollState, SendMessageResult};
+use olaz_core::changes::{DirtyKey, snapshot_message_meta};
 use olaz_core::conversations::{BatchApplyDelta, ConversationSummary, sort_conversations};
+use olaz_core::input::E2eeQuoteArg;
+use olaz_core::messages::{HistoryFreshness, MuteEntry};
 use olaz_core::reduce::classify::{MobileSyncEvent, Route, classify};
 use olaz_core::reduce::reduce;
-use olaz_core::runner::{SharedStoreSlot, WsDriver};
+use olaz_core::runner::{BatchHookOutcome, ParsedEventsHookOutcome, SharedStoreSlot, WsDriver};
 use olaz_core::state::PersistedTransportState;
 use olaz_core::typed_chat::{TypedChatEnvelope, WirePayloadHandle};
 use olaz_core::{
@@ -20,23 +22,30 @@ use olaz_core::{
     LegacyCookie, LoginState, LoginStep, Phase, Profile, SessionEffectRunner, SessionSnapshot,
 };
 use olaz_json::to_swift_json_string;
-use olaz_net::{LoginAccount, NetworkErrorKind};
-use olaz_wire::NameLookup;
+use olaz_net::{LoginAccount, NetworkErrorKind, ReqwestTransport, SessionClient};
+use olaz_wire::{ChatMessage, NameLookup};
 use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
 use crate::api::PollStateRecord;
+use crate::chat::{ChatMessageRecord, MessageMention, TextStyleRecord};
 use crate::conversations::{
-    BatchApplyDeltaRecord, ConversationActionResultRecord, ConversationActionUiRecord,
+    ConvPreviewOverrideRecord, ConversationActionResultRecord, ConversationActionUiRecord,
     ConversationActionsRecord, ConversationExtrasRecord, ConversationPromptRecord,
     ConversationSummaryRecord, IdentityTableRecord, MessagePreviewInputRecord, PinBoardRecord,
     PromptUpdateRecord, RankEntry, SeenTargetRecord,
 };
 use crate::error::{CoreError, NetworkKind};
+use crate::messages::{
+    ContactsStateRecord, FreshnessMapEntry, MessageMetaRecord, MuteEntryRecord, WindowDeltaRecord,
+    records_to_chat_messages,
+};
 use crate::runtime::{run, runtime};
 use crate::session::CoreSession;
 use crate::store::CoreStore;
-use crate::wire::{NameEntry, WireEvent, convert as convert_wire_event};
+use crate::wire::{
+    NameEntry, WireEvent, convert as convert_wire_event, unconvert as unconvert_wire_event,
+};
 use crate::ws::{CursorEntry, to_entries as cursors_to_entries, to_map as cursors_to_map};
 
 /// Core/transport error kind rendered by Swift via `RustCore.mapError(...).localizedDescription`.
@@ -369,8 +378,93 @@ impl From<SessionSnapshot> for SessionStateRecord {
     }
 }
 
-/// Coalesced dirty-key change batch returned by [`CoreEngine::next_changes`].
+/// Active incoming typing indicator for one conversation (U5).
 #[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TypingEntryRecord {
+    pub conv_id: String,
+    pub name: String,
+    pub on_pc: bool,
+}
+
+impl fmt::Debug for TypingEntryRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TypingEntryRecord")
+            .field("has_conv_id", &!self.conv_id.is_empty())
+            .field("has_name", &!self.name.is_empty())
+            .field("on_pc", &self.on_pc)
+            .finish()
+    }
+}
+
+/// Quote metadata passed to Swift's `send_e2ee_text` host boundary (U5).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct E2eeQuoteArgRecord {
+    pub msg_id: String,
+    pub cli_msg_id: String,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub text: String,
+    pub ts_ms: i64,
+}
+
+impl fmt::Debug for E2eeQuoteArgRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("E2eeQuoteArgRecord")
+            .field("ts_ms", &self.ts_ms)
+            .field("has_text", &!self.text.is_empty())
+            .finish()
+    }
+}
+
+impl From<E2eeQuoteArg> for E2eeQuoteArgRecord {
+    fn from(q: E2eeQuoteArg) -> Self {
+        Self {
+            msg_id: q.msg_id,
+            cli_msg_id: q.cli_msg_id,
+            sender_id: q.sender_id,
+            sender_name: q.sender_name,
+            text: q.text,
+            ts_ms: q.ts_ms,
+        }
+    }
+}
+
+/// Outcome returned by Swift's `send_e2ee_text` host callback (U5).
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum E2eeSendOutcomeRecord {
+    Sent {
+        msg_id: String,
+        cli_msg_id: String,
+        ts_ms: i64,
+    },
+    /// Error thrown by E2EE send: core logs `sendText failed: <message>` and removes optimistic row.
+    Failed { message: String },
+    /// Pre-flight guard already logged by Swift: core removes optimistic row without extra log.
+    Aborted,
+}
+
+impl fmt::Debug for E2eeSendOutcomeRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sent { ts_ms, .. } => f.debug_struct("Sent").field("ts_ms", ts_ms).finish(),
+            Self::Failed { message } => f
+                .debug_struct("Failed")
+                .field("msg_len", &message.len())
+                .finish(),
+            Self::Aborted => f.write_str("Aborted"),
+        }
+    }
+}
+
+/// Return value of [`CoreEngine::send_text`] carrying both send status and mirror revision (U5).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SendTextOutcomeRecord {
+    pub ok: bool,
+    pub version: u64,
+}
+
+/// Coalesced dirty-key change batch returned by [`CoreEngine::next_changes`].
+#[derive(Clone, PartialEq, uniffi::Record)]
 pub struct CoreChangesRecord {
     pub version: u64,
     pub session: Option<SessionStateRecord>,
@@ -379,6 +473,11 @@ pub struct CoreChangesRecord {
     pub conversation_extras: Option<ConversationExtrasRecord>,
     pub conversation_ui: Option<ConversationActionUiRecord>,
     pub conversation_prompt: Option<PromptUpdateRecord>,
+    pub window_deltas: Vec<WindowDeltaRecord>,
+    pub messages_reset_all: bool,
+    pub message_meta: Option<MessageMetaRecord>,
+    pub contacts: Option<ContactsStateRecord>,
+    pub typing: Option<Vec<TypingEntryRecord>>,
 }
 
 impl fmt::Debug for CoreChangesRecord {
@@ -394,6 +493,7 @@ impl fmt::Debug for CoreChangesRecord {
             .field("conversation_extras", &self.conversation_extras)
             .field("conversation_ui", &self.conversation_ui)
             .field("conversation_prompt", &self.conversation_prompt)
+            .field("typing_count", &self.typing.as_ref().map(Vec::len))
             .finish()
     }
 }
@@ -411,6 +511,19 @@ impl From<CoreChanges> for CoreChangesRecord {
             conversation_ui: c.conversation_ui.map(Into::into),
             conversation_prompt: c.conversation_prompt.map(|p| PromptUpdateRecord {
                 prompt: p.map(Into::into),
+            }),
+            window_deltas: c.window_deltas.into_iter().map(Into::into).collect(),
+            messages_reset_all: c.messages_reset_all,
+            message_meta: c.message_meta.map(Into::into),
+            contacts: c.contacts.map(Into::into),
+            typing: c.typing.map(|map| {
+                map.into_iter()
+                    .map(|(conv_id, status)| TypingEntryRecord {
+                        conv_id,
+                        name: status.name,
+                        on_pc: status.on_pc,
+                    })
+                    .collect()
             }),
         }
     }
@@ -751,6 +864,7 @@ impl CoreOfflineConversations {
         if !out.dirty.is_empty() {
             *version = version.saturating_add(1);
         }
+        let _ = state.messages.take_pending_window_ops();
         let mut rec = CoreChangesRecord {
             version: *version,
             session: None,
@@ -759,6 +873,11 @@ impl CoreOfflineConversations {
             conversation_extras: None,
             conversation_ui: None,
             conversation_prompt: None,
+            window_deltas: Vec::new(),
+            messages_reset_all: false,
+            message_meta: None,
+            contacts: None,
+            typing: None,
         };
         for key in out.dirty {
             match key {
@@ -787,6 +906,30 @@ impl CoreOfflineConversations {
                     rec.conversation_prompt = Some(PromptUpdateRecord {
                         prompt: state.conversations.prompt.clone().map(Into::into),
                     });
+                }
+                DirtyKey::Messages => {}
+                DirtyKey::MessageMeta => {
+                    rec.message_meta = Some(snapshot_message_meta(state).into());
+                }
+                DirtyKey::MessagesResetAll => {
+                    rec.messages_reset_all = true;
+                }
+                DirtyKey::Contacts => {
+                    rec.contacts = Some(state.contacts.clone().into());
+                }
+                DirtyKey::Typing => {
+                    rec.typing = Some(
+                        state
+                            .typing
+                            .active
+                            .iter()
+                            .map(|(conv_id, status)| TypingEntryRecord {
+                                conv_id: conv_id.clone(),
+                                name: status.name.clone(),
+                                on_pc: status.on_pc,
+                            })
+                            .collect(),
+                    );
                 }
             }
         }
@@ -842,8 +985,16 @@ impl CoreOfflineConversations {
         })
     }
 
-    pub fn apply_batch_delta(&self, delta: BatchApplyDeltaRecord) -> CoreChangesRecord {
-        self.apply_cmd(Command::ApplyBatchDelta(delta.into()))
+    pub fn apply_preview_override(
+        &self,
+        override_rec: ConvPreviewOverrideRecord,
+    ) -> CoreChangesRecord {
+        self.apply_cmd(Command::ApplyBatchDelta(BatchApplyDelta {
+            applied_count: 0,
+            updates: Vec::new(),
+            preview_overrides: vec![override_rec.into()],
+            persist_conversations: true,
+        }))
     }
 
     pub fn ensure_known_contacts(&self) -> CoreChangesRecord {
@@ -915,7 +1066,66 @@ pub trait CoreHost: Send + Sync {
     async fn on_ws_started(&self, endpoints: Vec<String>) -> bool;
     /// Return `true` to start periodic long-poll ticks, `false` to suppress.
     async fn on_long_poll_started(&self) -> bool;
-    async fn start_bootstrap(&self);
+    async fn on_bootstrap_started(&self) -> bool;
+    async fn apply_mutes(&self, mutes: Vec<MuteEntryRecord>);
+    async fn refresh_cloud(&self);
+    async fn on_batch_received(
+        &self,
+        cmd: Option<u16>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        payload_json: String,
+    ) -> Option<String>;
+    async fn on_parsed_events_received(
+        &self,
+        cmd: u16,
+        increment_unread: bool,
+        notify_incoming: bool,
+        events: Vec<WireEvent>,
+        uids: Vec<String>,
+        payload: Arc<CoreWirePayload>,
+    ) -> bool;
+    async fn on_open_conversation_sync(&self, conv_id: String, changed: bool);
+    async fn on_close_conversation(&self);
+    async fn refresh_board_pins(&self, conv_id: String);
+    async fn mark_read_boundary(&self, conv_id: String, seen_target: Option<SeenTargetRecord>);
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Matches apply_remote_reaction case schema fields 1-for-1"
+    )]
+    async fn apply_remote_reaction(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        sender_id: String,
+        r_type: String,
+        r_icon: String,
+        event_id: String,
+        react_client_id: String,
+        sender_name: String,
+    );
+    async fn apply_remote_recall(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        update_conversation_preview: bool,
+    );
+    async fn apply_remote_delete(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        update_conversation_preview: bool,
+    );
+    async fn decrypt_envelope(&self, payload_json: String) -> String;
+    async fn mark_e2ee_conversations(&self, conv_ids: Vec<String>);
+    async fn note_poll_messages(&self, messages: Vec<ChatMessageRecord>);
+    async fn notify_incoming_messages(&self, messages: Vec<ChatMessageRecord>);
+    async fn show_batch_typing(&self, conv_id: String, sender_id: String);
+    async fn transport_batch_settled(&self);
+    async fn engine_log(&self, message: String);
     async fn offer_first_login_transfer(&self, force: bool);
     async fn reset_domains(&self);
     async fn persist_session(&self, snapshot_json: String);
@@ -925,22 +1135,6 @@ pub trait CoreHost: Send + Sync {
     // --- Transport domain callbacks (U2 / U3) ---
     async fn persist_poll_state(&self, state: PollStateRecord);
     async fn persist_ws_cursors(&self, cursors: Vec<CursorEntry>);
-    async fn apply_batch(
-        &self,
-        cmd: Option<u16>,
-        increment_unread: bool,
-        notify_incoming: bool,
-        payload_json: String,
-    ) -> BatchApplyDeltaRecord;
-    async fn apply_parsed_events(
-        &self,
-        cmd: u16,
-        increment_unread: bool,
-        notify_incoming: bool,
-        events: Vec<WireEvent>,
-        uids: Vec<String>,
-        payload: Arc<CoreWirePayload>,
-    ) -> BatchApplyDeltaRecord;
     async fn mobile_sync(&self, events: Vec<MobileSyncEventRecord>);
     async fn e2ee_signal(&self, cmd: u16, payload_json: String);
     async fn e2ee_deliver_reports(&self, cmd: u16, payload_json: String);
@@ -958,6 +1152,13 @@ pub trait CoreHost: Send + Sync {
         start_explicit: bool,
         duration: i64,
     );
+    async fn send_e2ee_text(
+        &self,
+        conv_id: String,
+        text: String,
+        client_id: String,
+        quote: Option<E2eeQuoteArgRecord>,
+    ) -> E2eeSendOutcomeRecord;
 }
 
 struct FfiHostBridge(Arc<dyn CoreHost>);
@@ -993,7 +1194,186 @@ impl Host for FfiHostBridge {
     }
 
     async fn start_bootstrap(&self) {
-        self.0.start_bootstrap().await;
+        let _ = self.0.on_bootstrap_started().await;
+    }
+
+    async fn on_bootstrap_started(&self) -> bool {
+        self.0.on_bootstrap_started().await
+    }
+
+    async fn apply_mutes(&self, mutes: Vec<MuteEntry>) {
+        self.0
+            .apply_mutes(mutes.into_iter().map(Into::into).collect())
+            .await;
+    }
+
+    async fn refresh_cloud(&self) {
+        self.0.refresh_cloud().await;
+    }
+
+    async fn on_batch_received(
+        &self,
+        cmd: Option<u16>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        payload: Map<String, Value>,
+    ) -> BatchHookOutcome {
+        let payload_json = to_swift_json_string(&Value::Object(payload.clone()));
+        match self
+            .0
+            .on_batch_received(cmd, increment_unread, notify_incoming, payload_json)
+            .await
+        {
+            Some(decrypted_json) => BatchHookOutcome::IngestInCore(
+                olaz_json::parse_object_str(&decrypted_json).unwrap_or(payload),
+            ),
+            None => BatchHookOutcome::Suppressed,
+        }
+    }
+
+    async fn on_parsed_events_received(
+        &self,
+        cmd: u16,
+        increment_unread: bool,
+        notify_incoming: bool,
+        envelope: &TypedChatEnvelope,
+    ) -> ParsedEventsHookOutcome {
+        let events = envelope
+            .events
+            .iter()
+            .cloned()
+            .map(convert_wire_event)
+            .collect();
+        let payload = Arc::new(CoreWirePayload {
+            inner: Arc::clone(&envelope.payload),
+        });
+        if self
+            .0
+            .on_parsed_events_received(
+                cmd,
+                increment_unread,
+                notify_incoming,
+                events,
+                envelope.uids.clone(),
+                payload,
+            )
+            .await
+        {
+            ParsedEventsHookOutcome::IngestInCore
+        } else {
+            ParsedEventsHookOutcome::Suppressed
+        }
+    }
+
+    async fn on_open_conversation_sync(&self, conv_id: String, changed: bool) {
+        self.0.on_open_conversation_sync(conv_id, changed).await;
+    }
+
+    async fn on_close_conversation(&self) {
+        self.0.on_close_conversation().await;
+    }
+
+    async fn refresh_board_pins(&self, conv_id: String) {
+        self.0.refresh_board_pins(conv_id).await;
+    }
+
+    async fn mark_read_boundary(
+        &self,
+        conv_id: String,
+        seen_target: Option<olaz_core::input::SeenTarget>,
+    ) {
+        let rec = seen_target.map(|t| SeenTargetRecord {
+            conv_id: t.conv_id,
+            msg_id: t.msg_id,
+            cli_msg_id: t.cli_msg_id,
+            sender_id: t.sender_id,
+        });
+        self.0.mark_read_boundary(conv_id, rec).await;
+    }
+
+    async fn apply_remote_reaction(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        sender_id: String,
+        r_type: String,
+        r_icon: String,
+        event_id: String,
+        react_client_id: String,
+        sender_name: String,
+    ) {
+        self.0
+            .apply_remote_reaction(
+                conv_id,
+                msg_id,
+                cli_msg_id,
+                sender_id,
+                r_type,
+                r_icon,
+                event_id,
+                react_client_id,
+                sender_name,
+            )
+            .await;
+    }
+
+    async fn apply_remote_recall(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        update_conversation_preview: bool,
+    ) {
+        self.0
+            .apply_remote_recall(conv_id, msg_id, cli_msg_id, update_conversation_preview)
+            .await;
+    }
+
+    async fn apply_remote_delete(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        update_conversation_preview: bool,
+    ) {
+        self.0
+            .apply_remote_delete(conv_id, msg_id, cli_msg_id, update_conversation_preview)
+            .await;
+    }
+
+    async fn decrypt_envelope(&self, payload: Map<String, Value>) -> Map<String, Value> {
+        let payload_json = to_swift_json_string(&Value::Object(payload.clone()));
+        let decrypted_json = self.0.decrypt_envelope(payload_json).await;
+        olaz_json::parse_object_str(&decrypted_json).unwrap_or(payload)
+    }
+
+    async fn mark_e2ee_conversations(&self, conv_ids: Vec<String>) {
+        self.0.mark_e2ee_conversations(conv_ids).await;
+    }
+
+    async fn note_poll_messages(&self, messages: Vec<ChatMessage>) {
+        self.0
+            .note_poll_messages(messages.into_iter().map(Into::into).collect())
+            .await;
+    }
+
+    async fn notify_incoming_messages(&self, messages: Vec<ChatMessage>) {
+        self.0
+            .notify_incoming_messages(messages.into_iter().map(Into::into).collect())
+            .await;
+    }
+
+    async fn show_batch_typing(&self, conv_id: String, sender_id: String) {
+        self.0.show_batch_typing(conv_id, sender_id).await;
+    }
+
+    async fn transport_batch_settled(&self) {
+        self.0.transport_batch_settled().await;
+    }
+
+    async fn engine_log(&self, message: String) {
+        self.0.engine_log(message).await;
     }
 
     async fn offer_first_login_transfer(&self, force: bool) {
@@ -1030,44 +1410,22 @@ impl Host for FfiHostBridge {
 
     async fn apply_batch(
         &self,
-        cmd: Option<u16>,
-        increment_unread: bool,
-        notify_incoming: bool,
-        payload: Map<String, Value>,
+        _cmd: Option<u16>,
+        _increment_unread: bool,
+        _notify_incoming: bool,
+        _payload: Map<String, Value>,
     ) -> BatchApplyDelta {
-        let payload_json = to_swift_json_string(&Value::Object(payload));
-        self.0
-            .apply_batch(cmd, increment_unread, notify_incoming, payload_json)
-            .await
-            .into()
+        BatchApplyDelta::default()
     }
 
     async fn apply_parsed_events(
         &self,
-        cmd: u16,
-        increment_unread: bool,
-        notify_incoming: bool,
-        envelope: TypedChatEnvelope,
+        _cmd: u16,
+        _increment_unread: bool,
+        _notify_incoming: bool,
+        _envelope: TypedChatEnvelope,
     ) -> BatchApplyDelta {
-        let events = envelope
-            .events
-            .into_iter()
-            .map(convert_wire_event)
-            .collect();
-        let payload = Arc::new(CoreWirePayload {
-            inner: envelope.payload,
-        });
-        self.0
-            .apply_parsed_events(
-                cmd,
-                increment_unread,
-                notify_incoming,
-                events,
-                envelope.uids,
-                payload,
-            )
-            .await
-            .into()
+        BatchApplyDelta::default()
     }
 
     async fn mobile_sync(&self, events: Vec<MobileSyncEvent>) {
@@ -1125,6 +1483,32 @@ impl Host for FfiHostBridge {
             .mute(conv_id, set, start, start_explicit, duration)
             .await;
     }
+
+    async fn send_e2ee_text(
+        &self,
+        conv_id: String,
+        text: String,
+        client_id: String,
+        quote: Option<E2eeQuoteArg>,
+    ) -> Result<SendMessageResult, String> {
+        match self
+            .0
+            .send_e2ee_text(conv_id, text, client_id, quote.map(Into::into))
+            .await
+        {
+            E2eeSendOutcomeRecord::Sent {
+                msg_id,
+                cli_msg_id,
+                ts_ms,
+            } => Ok(SendMessageResult {
+                msg_id,
+                cli_msg_id,
+                ts_ms,
+            }),
+            E2eeSendOutcomeRecord::Failed { message } => Err(message),
+            E2eeSendOutcomeRecord::Aborted => Err(String::new()),
+        }
+    }
 }
 
 fn parse_inner_json(json: &str) -> Result<Map<String, Value>, CoreError> {
@@ -1145,7 +1529,8 @@ fn parse_inner_json(json: &str) -> Result<Map<String, Value>, CoreError> {
 #[derive(uniffi::Object)]
 pub struct CoreEngine {
     handle: Arc<CoreHandle>,
-    runner: Arc<SessionEffectRunner<olaz_net::ReqwestTransport>>,
+    runner: Arc<SessionEffectRunner<ReqwestTransport>>,
+    session_client: Arc<SessionClient<ReqwestTransport>>,
     ws_driver: Arc<dyn WsDriver>,
     shared_store: SharedStoreSlot,
 }
@@ -1156,8 +1541,9 @@ impl CoreEngine {
     #[uniffi::constructor]
     pub fn new(session: Arc<CoreSession>, host: Arc<dyn CoreHost>) -> Result<Arc<Self>, CoreError> {
         let rt_handle = runtime()?.handle().clone();
+        let session_client = Arc::clone(&session.client);
         let runner = Arc::new(SessionEffectRunner::with_default_domains(
-            Arc::clone(&session.client),
+            Arc::clone(&session_client),
             Arc::new(FfiHostBridge(host)),
             rt_handle.clone(),
             session.default_domains.clone(),
@@ -1170,6 +1556,7 @@ impl CoreEngine {
         Ok(Arc::new(Self {
             handle: Arc::new(handle),
             runner,
+            session_client,
             ws_driver,
             shared_store,
         }))
@@ -1261,13 +1648,23 @@ impl CoreEngine {
         ));
     }
 
-    /// Applies a Swift-computed [`BatchApplyDeltaRecord`] and awaits store persistence if requested.
-    pub async fn apply_batch_delta(&self, delta: BatchApplyDeltaRecord) -> Result<u64, CoreError> {
+    /// Applies a standalone recall/delete [`ConvPreviewOverrideRecord`] and awaits store persistence.
+    pub async fn apply_preview_override(
+        &self,
+        override_rec: ConvPreviewOverrideRecord,
+    ) -> Result<u64, CoreError> {
         let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
         run(async move {
             handle
-                .request_unit(Command::ApplyBatchDelta(delta.into()))
+                .request_unit(Command::ApplyBatchDelta(BatchApplyDelta {
+                    applied_count: 0,
+                    updates: Vec::new(),
+                    preview_overrides: vec![override_rec.into()],
+                    persist_conversations: true,
+                }))
                 .await;
+            runner.flush_store().await;
             handle.current_version()
         })
         .await
@@ -1658,6 +2055,336 @@ impl CoreEngine {
         .await
     }
 
+    // --- Messages, history freshness, bootstrap, and contacts domain (U4) ---
+
+    pub fn open_conversation(&self, id: String, preloaded: Vec<ChatMessageRecord>) {
+        self.handle.send(Command::OpenConversation {
+            id,
+            preloaded: records_to_chat_messages(preloaded),
+            skip_local_read: false,
+        });
+    }
+
+    pub async fn open_conversation_and_wait(
+        &self,
+        id: String,
+        preloaded: Vec<ChatMessageRecord>,
+    ) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        let msgs = records_to_chat_messages(preloaded);
+        run(async move {
+            handle
+                .request_unit(Command::OpenConversation {
+                    id,
+                    preloaded: msgs,
+                    skip_local_read: false,
+                })
+                .await;
+            runner.flush_host().await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn close_conversation(&self) {
+        self.handle.send(Command::CloseConversation);
+    }
+
+    pub fn load_older_messages(&self, id: String) {
+        self.handle.send(Command::LoadOlderMessages { id });
+    }
+
+    pub async fn load_older_messages_and_wait(&self, id: String) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle.request_unit(Command::LoadOlderMessages { id }).await;
+            handle.current_version()
+        })
+        .await
+    }
+
+    pub async fn bootstrap(&self, now_ms: i64) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle.request_unit(Command::Bootstrap { now_ms }).await;
+            handle.current_version()
+        })
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Mirrors Swift applyBatchResponse signature 1-for-1"
+    )]
+    pub async fn apply_batch_direct(
+        &self,
+        payload_json: String,
+        default_cmd: u16,
+        fallback_conv_id: Option<String>,
+        is_group_hint: Option<bool>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        persist_conversations: bool,
+        probe_freshness: bool,
+    ) -> Result<i64, CoreError> {
+        let payload = olaz_json::parse_object_str(&payload_json).unwrap_or_default();
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let n = match handle
+                .request(Command::ApplyBatchDirect {
+                    payload,
+                    default_cmd,
+                    fallback_conv_id,
+                    is_group_hint,
+                    increment_unread,
+                    notify_incoming,
+                    persist_conversations,
+                    probe_freshness,
+                })
+                .await
+            {
+                Some(olaz_core::OpResult::Int(n)) => n,
+                _ => 0,
+            };
+            runner.flush_host().await;
+            runner.flush_store().await;
+            let _ = handle.settle().await;
+            n
+        })
+        .await
+    }
+
+    pub async fn apply_parsed_events_direct(
+        &self,
+        events: Vec<WireEvent>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        persist_conversations: bool,
+    ) -> Result<i64, CoreError> {
+        let parsed: Vec<olaz_wire::ParsedWireEvent> =
+            events.into_iter().map(unconvert_wire_event).collect();
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let n = match handle
+                .request(Command::ApplyParsedEventsDirect {
+                    events: parsed,
+                    increment_unread,
+                    notify_incoming,
+                    persist_conversations,
+                })
+                .await
+            {
+                Some(olaz_core::OpResult::Int(n)) => n,
+                _ => 0,
+            };
+            runner.flush_host().await;
+            runner.flush_store().await;
+            let _ = handle.settle().await;
+            n
+        })
+        .await
+    }
+
+    pub fn write_through_upsert_message(
+        &self,
+        msg: ChatMessageRecord,
+        replacing_client_id: Option<String>,
+    ) {
+        let chat: ChatMessage = (&msg).into();
+        self.handle.send(Command::WriteThroughUpsertMessage {
+            msg: Box::new(chat),
+            replacing_client_id,
+        });
+    }
+
+    pub fn write_through_remove_messages(&self, conv_id: String, ids: Vec<String>) {
+        self.handle
+            .send(Command::WriteThroughRemoveMessages { conv_id, ids });
+    }
+
+    pub fn write_through_replace_window(&self, conv_id: String, messages: Vec<ChatMessageRecord>) {
+        self.handle.send(Command::WriteThroughReplaceWindow {
+            conv_id,
+            messages: records_to_chat_messages(messages),
+        });
+    }
+
+    pub fn write_through_set_has_more(&self, conv_id: String, has_more: bool) {
+        self.handle
+            .send(Command::WriteThroughSetHasMore { conv_id, has_more });
+    }
+
+    pub fn write_through_remove_window(&self, conv_id: String) {
+        self.handle
+            .send(Command::WriteThroughRemoveWindow { conv_id });
+    }
+
+    pub fn refresh_reaction_names(&self, conv_id: Option<String>) {
+        self.handle.send(Command::RefreshReactionNames { conv_id });
+    }
+
+    pub fn seed_history_freshness(&self, entries: Vec<FreshnessMapEntry>) {
+        let mut map = BTreeMap::new();
+        for entry in entries {
+            let f: HistoryFreshness = entry.freshness.into();
+            map.insert(entry.conv_id, f);
+        }
+        self.handle.send(Command::SeedHistoryFreshness(map));
+    }
+
+    pub fn seed_contacts(&self, contacts: ContactsStateRecord) {
+        self.handle
+            .send(Command::SeedContacts(Box::new(contacts.into())));
+    }
+
+    pub async fn flush_all(&self) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            runner.flush_host().await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn shared_api(&self) -> Arc<crate::api::CoreApi> {
+        crate::api::CoreApi::from_shared_api(Arc::clone(self.runner.api()))
+    }
+
+    // --- Send text, seen/mark_read, and typing domain (U5) ---
+
+    /// Allocates the next strictly increasing client message id from the shared `SessionClient`.
+    pub fn next_client_id(&self) -> i64 {
+        self.session_client.next_client_id()
+    }
+
+    /// Sends a text message (plain API or E2EE host boundary) with core-owned optimistic row,
+    /// echo/ack reconciliation, persistence, and conversation preview update.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Mirrors Swift sendText arguments plus deterministic clock/client_id overrides"
+    )]
+    pub async fn send_text(
+        &self,
+        conv_id: String,
+        text: String,
+        quote_id: Option<String>,
+        mentions: Vec<MessageMention>,
+        styles: Vec<TextStyleRecord>,
+        urgency: i64,
+        client_id: i64,
+        now_ms: i64,
+        is_e2ee: Option<bool>,
+        ttl_ms: Option<i64>,
+    ) -> Result<SendTextOutcomeRecord, CoreError> {
+        let wire_mentions: Vec<olaz_wire::Mention> = mentions
+            .into_iter()
+            .map(|m| olaz_wire::Mention {
+                uid: m.uid,
+                pos: m.pos,
+                len: m.len,
+                is_all: m.is_all,
+            })
+            .collect();
+        let wire_styles: Vec<olaz_wire::TextStyle> = styles
+            .into_iter()
+            .map(|s| olaz_wire::TextStyle {
+                start: s.start,
+                len: s.len,
+                st: s.st,
+            })
+            .collect();
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let ok = matches!(
+                handle
+                    .request(Command::SendText {
+                        conv_id,
+                        text,
+                        quote_id,
+                        mentions: wire_mentions,
+                        styles: wire_styles,
+                        urgency,
+                        client_id,
+                        now_ms,
+                        is_e2ee,
+                        ttl_ms,
+                    })
+                    .await,
+                Some(olaz_core::OpResult::Bool(true))
+            );
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            SendTextOutcomeRecord { ok, version }
+        })
+        .await
+    }
+
+    /// Marks a conversation read using core's own message window for the `send_seen` target.
+    pub fn mark_read(&self, id: String) {
+        self.handle.send(Command::MarkRead { id });
+    }
+
+    /// Triggers an outgoing typing ping subject to core's 10 s per-conversation throttle,
+    /// `Phase::Ready` gate, and `olaz.sendTyping` preference.
+    pub fn notify_typing(&self, conv_id: String, now_ms: i64) {
+        self.handle.send(Command::NotifyTyping { conv_id, now_ms });
+    }
+
+    /// Clears the outgoing typing throttle for `conv_id`.
+    pub fn reset_outgoing_typing(&self, conv_id: String) {
+        self.handle.send(Command::ResetOutgoingTyping { conv_id });
+    }
+
+    /// Routes a `handleTyping(state:)` JSON dictionary into core's incoming typing state.
+    pub fn handle_typing(&self, state_json: String) {
+        let state = olaz_json::parse_object_str(&state_json).unwrap_or_default();
+        self.handle.send(Command::HandleTyping { state });
+    }
+
+    /// Sets or refreshes an incoming typing indicator directly in core (10 s expiry timer).
+    pub fn show_typing_indicator(&self, conv_id: String, name: String, on_pc: bool) {
+        let mut inner = Map::new();
+        inner.insert("convId".to_owned(), Value::String(conv_id));
+        inner.insert("name".to_owned(), Value::String(name));
+        inner.insert("isPC".to_owned(), Value::Bool(on_pc));
+        let mut state = Map::new();
+        state.insert("typing".to_owned(), Value::Object(inner));
+        self.handle.send(Command::HandleTyping { state });
+    }
+
+    /// Updates core's `olaz.sendTyping` preference mirror.
+    pub fn set_send_typing_enabled(&self, enabled: bool) {
+        self.handle.send(Command::SetSendTypingEnabled { enabled });
+    }
+
+    /// Replaces the set of 1-1 peer UIDs with active E2EE sessions in core.
+    pub fn set_e2ee_threads(&self, threads: Vec<String>) {
+        self.handle
+            .send(Command::SetE2eeThreads(threads.into_iter().collect()));
+    }
+
+    /// Updates a single conversation's auto-delete TTL in milliseconds (`0` disables).
+    pub fn set_auto_delete_ttl(&self, conv_id: String, ttl_ms: i64) {
+        self.handle
+            .send(Command::SetAutoDeleteTtl { conv_id, ttl_ms });
+    }
+
     // --- Core-owned WebSocket pass-throughs for Swift feature domains ---
 
     /// Sends a raw WebSocket frame. `false` unless authenticated and the write succeeded.
@@ -1823,24 +2550,21 @@ mod tests {
         async fn on_long_poll_started(&self) -> bool {
             false
         }
-        async fn start_bootstrap(&self) {}
-        async fn offer_first_login_transfer(&self, _force: bool) {}
-        async fn reset_domains(&self) {}
-        async fn persist_session(&self, _snapshot_json: String) {}
-        async fn clear_session(&self) {}
-        async fn mark_expired(&self, _snapshot_json: String) {}
-        async fn persist_poll_state(&self, _state: PollStateRecord) {}
-        async fn persist_ws_cursors(&self, _cursors: Vec<CursorEntry>) {}
-        async fn apply_batch(
+        async fn on_bootstrap_started(&self) -> bool {
+            false
+        }
+        async fn apply_mutes(&self, _mutes: Vec<MuteEntryRecord>) {}
+        async fn refresh_cloud(&self) {}
+        async fn on_batch_received(
             &self,
             _cmd: Option<u16>,
             _increment_unread: bool,
             _notify_incoming: bool,
             _payload_json: String,
-        ) -> BatchApplyDeltaRecord {
-            BatchApplyDeltaRecord::default()
+        ) -> Option<String> {
+            None
         }
-        async fn apply_parsed_events(
+        async fn on_parsed_events_received(
             &self,
             _cmd: u16,
             _increment_unread: bool,
@@ -1848,9 +2572,63 @@ mod tests {
             _events: Vec<WireEvent>,
             _uids: Vec<String>,
             _payload: Arc<CoreWirePayload>,
-        ) -> BatchApplyDeltaRecord {
-            BatchApplyDeltaRecord::default()
+        ) -> bool {
+            false
         }
+        async fn on_open_conversation_sync(&self, _conv_id: String, _changed: bool) {}
+        async fn on_close_conversation(&self) {}
+        async fn refresh_board_pins(&self, _conv_id: String) {}
+        async fn mark_read_boundary(
+            &self,
+            _conv_id: String,
+            _seen_target: Option<SeenTargetRecord>,
+        ) {
+        }
+        async fn apply_remote_reaction(
+            &self,
+            _conv_id: String,
+            _msg_id: String,
+            _cli_msg_id: String,
+            _sender_id: String,
+            _r_type: String,
+            _r_icon: String,
+            _event_id: String,
+            _react_client_id: String,
+            _sender_name: String,
+        ) {
+        }
+        async fn apply_remote_recall(
+            &self,
+            _conv_id: String,
+            _msg_id: String,
+            _cli_msg_id: String,
+            _update_conversation_preview: bool,
+        ) {
+        }
+        async fn apply_remote_delete(
+            &self,
+            _conv_id: String,
+            _msg_id: String,
+            _cli_msg_id: String,
+            _update_conversation_preview: bool,
+        ) {
+        }
+        async fn decrypt_envelope(&self, payload_json: String) -> String {
+            payload_json
+        }
+        async fn mark_e2ee_conversations(&self, _conv_ids: Vec<String>) {}
+        async fn note_poll_messages(&self, _messages: Vec<ChatMessageRecord>) {}
+        async fn notify_incoming_messages(&self, _messages: Vec<ChatMessageRecord>) {}
+        async fn show_batch_typing(&self, _conv_id: String, _sender_id: String) {}
+        async fn transport_batch_settled(&self) {}
+        async fn engine_log(&self, _message: String) {}
+        async fn offer_first_login_transfer(&self, _force: bool) {}
+        async fn reset_domains(&self) {}
+        async fn persist_session(&self, _snapshot_json: String) {}
+        async fn clear_session(&self) {}
+        async fn mark_expired(&self, _snapshot_json: String) {}
+        async fn persist_poll_state(&self, _state: PollStateRecord) {}
+        async fn persist_ws_cursors(&self, _cursors: Vec<CursorEntry>) {}
         async fn mobile_sync(&self, _events: Vec<MobileSyncEventRecord>) {}
         async fn e2ee_signal(&self, _cmd: u16, _payload_json: String) {}
         async fn e2ee_deliver_reports(&self, _cmd: u16, _payload_json: String) {}
@@ -1868,6 +2646,15 @@ mod tests {
             _start_explicit: bool,
             _duration: i64,
         ) {
+        }
+        async fn send_e2ee_text(
+            &self,
+            _conv_id: String,
+            _text: String,
+            _client_id: String,
+            _quote: Option<E2eeQuoteArgRecord>,
+        ) -> E2eeSendOutcomeRecord {
+            E2eeSendOutcomeRecord::Aborted
         }
     }
 

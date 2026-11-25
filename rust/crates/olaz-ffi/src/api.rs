@@ -225,6 +225,12 @@ pub struct CoreApi {
     api: Arc<Api>,
 }
 
+impl CoreApi {
+    pub(crate) fn from_shared_api(api: Arc<Api>) -> Arc<Self> {
+        Arc::new(Self { api })
+    }
+}
+
 #[uniffi::export]
 impl CoreApi {
     #[uniffi::constructor]

@@ -4,8 +4,8 @@
 //! publishes dirty keys to [`ChangeHub`], and hands effects to [`EffectRunner`].
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -14,6 +14,7 @@ use crate::changes::{ChangeHub, CoreChanges};
 use crate::conversations::{ConversationActionResult, PinBoard};
 use crate::effect::{Effect, OpResult};
 use crate::input::{Command, Input};
+use crate::messages::IdentitySnapshot;
 use crate::reduce::reduce;
 use crate::runner::EffectRunner;
 use crate::state::{CoreSnapshot, CoreState, SessionSnapshot};
@@ -131,6 +132,7 @@ pub struct CoreHandle {
     changes: Arc<ChangeHub>,
     tracker: Arc<ActivityTracker>,
     state_notify: Arc<Notify>,
+    identity_snapshot: Arc<Mutex<Arc<IdentitySnapshot>>>,
 }
 
 impl CoreHandle {
@@ -151,6 +153,7 @@ impl CoreHandle {
         let changes = Arc::new(ChangeHub::new());
         let tracker = Arc::new(ActivityTracker::new());
         let state_notify = Arc::new(Notify::new());
+        let identity_snapshot = Arc::new(Mutex::new(Arc::new(initial.identity_snapshot())));
         let sink = ActorSink {
             tx: tx.clone(),
             tracker: Arc::clone(&tracker),
@@ -163,13 +166,26 @@ impl CoreHandle {
             Arc::clone(&changes),
             Arc::clone(&tracker),
             Arc::clone(&state_notify),
+            Arc::clone(&identity_snapshot),
         ));
         Self {
             tx,
             changes,
             tracker,
             state_notify,
+            identity_snapshot,
         }
+    }
+
+    /// Instant non-async clone of the latest [`IdentitySnapshot`] for Frame 1 synchronous WAL decode.
+    #[must_use]
+    pub fn identity_snapshot(&self) -> Arc<IdentitySnapshot> {
+        Arc::clone(
+            &self
+                .identity_snapshot
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
     }
 
     /// Enqueues a command without blocking.
@@ -310,7 +326,7 @@ impl CoreHandle {
         rx.await.ok()
     }
 
-    /// Reads the full [`CoreSnapshot`] across session and conversations domains.
+    /// Reads the full [`CoreSnapshot`] across session, conversations, messages, and contacts domains.
     pub async fn full_snapshot(&self) -> Option<CoreSnapshot> {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(ActorMsg::FullSnapshot(tx)).is_err() {
@@ -410,16 +426,33 @@ impl ActorWaiters {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Actor dispatch helper borrows all actor-local handles directly"
+)]
 fn dispatch_reduce_output(
-    state: &CoreState,
+    state: &mut CoreState,
     out: crate::reduce::ReduceOutput,
     runner: &Arc<dyn EffectRunner>,
     sink: &ActorSink,
     changes: &Arc<ChangeHub>,
     state_notify: &Arc<Notify>,
+    identity_snapshot: &Arc<Mutex<Arc<IdentitySnapshot>>>,
     waiters: &mut ActorWaiters,
 ) -> u64 {
-    let version = changes.publish(&out.dirty, state);
+    let window_ops = state.messages.take_pending_window_ops();
+    // Refresh the lock-free IdentitySnapshot whenever session, conversations, or contacts mutated.
+    if out.dirty.contains(&crate::changes::DirtyKey::Session)
+        || out.dirty.contains(&crate::changes::DirtyKey::Conversations)
+        || out.dirty.contains(&crate::changes::DirtyKey::Contacts)
+    {
+        let next_snap = Arc::new(state.identity_snapshot());
+        *identity_snapshot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = next_snap;
+    }
+
+    let version = changes.publish_with_window_ops(&out.dirty, &window_ops, state);
     if !out.effects.is_empty() {
         let mut runner_effects = Vec::with_capacity(out.effects.len());
         for effect in out.effects {
@@ -448,12 +481,16 @@ fn dispatch_reduce_output(
             runner.dispatch(runner_effects, sink.clone());
         }
     }
-    if !out.dirty.is_empty() {
+    if !out.dirty.is_empty() || !window_ops.is_empty() {
         state_notify.notify_waiters();
     }
     version
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Single spawned actor task receives its owned channels and shared handles"
+)]
 async fn run_actor(
     mut state: CoreState,
     mut rx: mpsc::UnboundedReceiver<ActorMsg>,
@@ -462,6 +499,7 @@ async fn run_actor(
     changes: Arc<ChangeHub>,
     tracker: Arc<ActivityTracker>,
     state_notify: Arc<Notify>,
+    identity_snapshot: Arc<Mutex<Arc<IdentitySnapshot>>>,
 ) {
     let mut waiters = ActorWaiters::new();
     while let Some(msg) = rx.recv().await {
@@ -469,12 +507,13 @@ async fn run_actor(
             ActorMsg::Input { input, ack } => {
                 let out = reduce(&mut state, *input);
                 let version = dispatch_reduce_output(
-                    &state,
+                    &mut state,
                     out,
                     &runner,
                     &sink,
                     &changes,
                     &state_notify,
+                    &identity_snapshot,
                     &mut waiters,
                 );
                 if let Some(reply) = ack {
@@ -488,12 +527,13 @@ async fn run_actor(
                 waiters.ops.insert(op_id, reply);
                 let out = reduce(&mut state, Input::OpRequest { op_id, cmd: *cmd });
                 let _ = dispatch_reduce_output(
-                    &state,
+                    &mut state,
                     out,
                     &runner,
                     &sink,
                     &changes,
                     &state_notify,
+                    &identity_snapshot,
                     &mut waiters,
                 );
                 tracker.decrement();
@@ -514,12 +554,13 @@ async fn run_actor(
                     },
                 );
                 let _ = dispatch_reduce_output(
-                    &state,
+                    &mut state,
                     out,
                     &runner,
                     &sink,
                     &changes,
                     &state_notify,
+                    &identity_snapshot,
                     &mut waiters,
                 );
                 tracker.decrement();

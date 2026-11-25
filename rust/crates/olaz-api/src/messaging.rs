@@ -42,6 +42,58 @@ pub struct SendTextArgs<'a> {
     pub urgency: i64,
 }
 
+/// Owned counterpart of [`SendTextArgs`] for async callers (e.g. `olaz-core` effects).
+///
+/// `Debug` is shape-only (ADR-008): message body, quote text, and style payloads are redacted.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SendTextParams {
+    pub conv_id: String,
+    pub text: String,
+    pub cli_msg_id: String,
+    pub quote_msg_id: Option<String>,
+    pub quote_cli_msg_id: Option<String>,
+    pub quote_owner_id: Option<String>,
+    pub quote_text: Option<String>,
+    pub quote_ts_ms: Option<i64>,
+    pub mentions: Vec<Mention>,
+    pub text_properties: Option<String>,
+    pub ttl: i64,
+    pub urgency: i64,
+}
+
+impl SendTextParams {
+    /// Borrows this request as [`SendTextArgs`] for [`ZaloApi::send_text`].
+    #[must_use]
+    pub fn as_args(&self) -> SendTextArgs<'_> {
+        SendTextArgs {
+            conv_id: &self.conv_id,
+            text: &self.text,
+            cli_msg_id: &self.cli_msg_id,
+            quote_msg_id: self.quote_msg_id.as_deref(),
+            quote_cli_msg_id: self.quote_cli_msg_id.as_deref(),
+            quote_owner_id: self.quote_owner_id.as_deref(),
+            quote_text: self.quote_text.as_deref(),
+            quote_ts_ms: self.quote_ts_ms,
+            mentions: &self.mentions,
+            text_properties: self.text_properties.as_deref(),
+            ttl: self.ttl,
+            urgency: self.urgency,
+        }
+    }
+}
+
+impl std::fmt::Debug for SendTextParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendTextParams")
+            .field("has_quote", &self.quote_msg_id.is_some())
+            .field("mentions_count", &self.mentions.len())
+            .field("has_text_properties", &self.text_properties.is_some())
+            .field("ttl", &self.ttl)
+            .field("urgency", &self.urgency)
+            .finish()
+    }
+}
+
 fn mention_info(mentions: &[Mention]) -> Value {
     let objs: Vec<Value> = mentions
         .iter()

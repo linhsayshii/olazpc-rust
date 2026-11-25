@@ -2,8 +2,11 @@
 //!
 //! No I/O, no clock, and no randomness may live inside `reduce`.
 
+pub mod bootstrap;
 pub mod classify;
 pub mod conversations;
+pub mod messages;
+pub mod send;
 pub mod session;
 pub mod transport;
 
@@ -17,6 +20,25 @@ use crate::state::CoreState;
 pub struct ReduceOutput {
     pub effects: Vec<Effect>,
     pub dirty: DirtySet,
+}
+
+fn is_message_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::OpenConversation { .. }
+            | Command::CloseConversation
+            | Command::LoadOlderMessages { .. }
+            | Command::ApplyBatchDirect { .. }
+            | Command::ApplyParsedEventsDirect { .. }
+            | Command::WriteThroughUpsertMessage { .. }
+            | Command::WriteThroughRemoveMessages { .. }
+            | Command::WriteThroughReplaceWindow { .. }
+            | Command::WriteThroughSetHasMore { .. }
+            | Command::WriteThroughRemoveWindow { .. }
+            | Command::RefreshReactionNames { .. }
+            | Command::SeedHistoryFreshness(_)
+            | Command::SeedContacts(_)
+    )
 }
 
 /// Pure transition function for the entire core state.
@@ -50,6 +72,76 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::LpTick { .. }
         | Input::PollBatchFetched { .. }
         | Input::PollBatchApplied { .. } => transport::reduce_transport(state, input, &mut out),
+
+        Input::Command(Command::Bootstrap { .. })
+        | Input::OpRequest {
+            cmd: Command::Bootstrap { .. },
+            ..
+        }
+        | Input::BootstrapAliasesDone { .. }
+        | Input::BootstrapFreshnessLoaded { .. }
+        | Input::BootstrapPamDone { .. }
+        | Input::BootstrapLabelsDone { .. }
+        | Input::BootstrapHiddenDone { .. }
+        | Input::BootstrapContactsDone { .. }
+        | Input::BootstrapPreloadDone { .. }
+        | Input::BootstrapSelfCloudDone { .. }
+        | Input::BootstrapGroupWaveDone { .. }
+        | Input::BootstrapResolveNamesChunkDone { .. }
+        | Input::FreshnessProbed {
+            boot_gen: Some(_), ..
+        } => {
+            bootstrap::reduce_bootstrap(state, input, &mut out);
+        }
+
+        Input::Command(ref cmd) if is_message_command(cmd) => {
+            messages::reduce_messages(state, input, &mut out);
+        }
+        Input::OpRequest { ref cmd, .. } if is_message_command(cmd) => {
+            messages::reduce_messages(state, input, &mut out);
+        }
+        Input::OpenLocalMessagesLoaded { .. }
+        | Input::OpenHistoryPageFetched { .. }
+        | Input::LoadOlderStoreRead { .. }
+        | Input::LoadOlderPageFetched { .. }
+        | Input::SenderProfilesChunkDone { .. }
+        | Input::FreshnessProbed { boot_gen: None, .. }
+        | Input::TypedEnvelopeReady { .. }
+        | Input::DecryptedEnvelopeReady { .. } => {
+            messages::reduce_messages(state, input, &mut out);
+        }
+        // U5
+        Input::Command(
+            Command::HandleTyping { .. }
+            | Command::NotifyTyping { .. }
+            | Command::ResetOutgoingTyping { .. }
+            | Command::SetSendTypingEnabled { .. },
+        )
+        | Input::OpRequest {
+            cmd:
+                Command::HandleTyping { .. }
+                | Command::NotifyTyping { .. }
+                | Command::ResetOutgoingTyping { .. }
+                | Command::SetSendTypingEnabled { .. },
+            ..
+        }
+        | Input::TypingExpired { .. } => crate::typing::reduce_typing(state, input, &mut out),
+        // U5-send
+        Input::Command(
+            Command::SendText { .. }
+            | Command::MarkRead { .. }
+            | Command::SetE2eeThreads(_)
+            | Command::SetAutoDeleteTtl { .. },
+        )
+        | Input::OpRequest {
+            cmd:
+                Command::SendText { .. }
+                | Command::MarkRead { .. }
+                | Command::SetE2eeThreads(_)
+                | Command::SetAutoDeleteTtl { .. },
+            ..
+        }
+        | Input::SendTextDone { .. } => send::reduce_send(state, input, &mut out),
 
         Input::Command(_)
         | Input::OpRequest { .. }

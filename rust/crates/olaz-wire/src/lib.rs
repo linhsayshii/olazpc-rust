@@ -22,7 +22,10 @@ pub mod util;
 
 pub use batch::{extract_batch_events, extract_profiles_map, sort_reaction_events_chronologically};
 pub use codec::{decode_stored_message, encode_chat_message, serialize_kind};
-pub use envelope::{TYPED_CHAT_CMDS, collect_name_uids, is_plain_chat_envelope, is_typed_chat_cmd};
+pub use envelope::{
+    TYPED_CHAT_CMDS, collect_name_uids, envelope_contains_signal_cipher, is_plain_chat_envelope,
+    is_typed_chat_cmd,
+};
 pub use ids::{
     clean_group_id, group_conv_id, is_group_id, normalize_thread_id_from_list,
     sanitize_profile_uid, strip_user_prefix,
@@ -36,7 +39,8 @@ pub use message::{
 pub use model::{
     Availability, CardButton, ChatMessage, ContactCard, DeleteMode, ECard, ECardStyle, Kind,
     LocationInfo, Mention, MessageMenu, OaPart, ParsedWireEvent, PollInfo, Quote, Reaction,
-    ReactionIcon, StarMode, Status, StoredMessage, TextStyle, UNKNOWN_NAME, web_link_sanitized,
+    ReactionIcon, StarMode, Status, StoredMessage, TextStyle, UNKNOWN_NAME, text_properties_json,
+    web_link_sanitized,
 };
 pub use signal::{
     is_signal_ciphertext, removing_percent_encoding, url_has_undecrypted_signal_cipher,

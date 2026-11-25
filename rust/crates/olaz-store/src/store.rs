@@ -362,6 +362,17 @@ ORDER BY pinned DESC, preview_ts DESC, updated_at DESC;",
         query_messages(self.db()?, conv_id, before_ts_ms, limit)
     }
 
+    /// Loads every row in `messages` ordered by `(conv_id ASC, ts_ms ASC, id ASC)`.
+    pub fn load_all_messages(&self) -> Result<Vec<StoredMessage>> {
+        let mut stmt = self.db()?.prepare_cached(&format!(
+            "SELECT {MESSAGE_COLS}
+FROM messages
+ORDER BY conv_id ASC, ts_ms ASC, id ASC;"
+        ))?;
+        let rows = stmt.query_map([], read_stored_message)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Case-insensitive (via `olaz_fold`) search in one conversation, newest first.
     /// Skips recalled and E2EE-locked rows; searches `raw_json` caption/title/etc.
     pub fn search_messages(
