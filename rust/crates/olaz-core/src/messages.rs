@@ -92,6 +92,9 @@ pub enum WindowDelta {
         upserts: Vec<ChatMessage>,
         removed_ids: Vec<String>,
     },
+    Remove {
+        conv_id: String,
+    },
 }
 
 impl fmt::Debug for WindowDelta {
@@ -114,6 +117,7 @@ impl fmt::Debug for WindowDelta {
                 .field("upserts", &upserts.len())
                 .field("removed", &removed_ids.len())
                 .finish(),
+            Self::Remove { .. } => f.debug_struct("WindowDelta::Remove").finish(),
         }
     }
 }
@@ -127,6 +131,7 @@ pub enum PendingWindowOp {
         upserts: Vec<ChatMessage>,
         removed_ids: Vec<String>,
     },
+    Remove,
 }
 
 /// Coalesces a new window operation onto an optional existing pending operation for a conversation
@@ -137,11 +142,15 @@ pub fn coalesce_window_op(
     existing: Option<PendingWindowOp>,
     incoming: PendingWindowOp,
 ) -> PendingWindowOp {
-    if !already_shipped {
+    if matches!(incoming, PendingWindowOp::Remove) {
+        return PendingWindowOp::Remove;
+    }
+    if !already_shipped || matches!(existing, Some(PendingWindowOp::Remove)) {
         return PendingWindowOp::Reset;
     }
     match (existing, incoming) {
         (None, op) => op,
+        (Some(PendingWindowOp::Remove), _) | (_, PendingWindowOp::Remove) => unreachable!(),
         (Some(PendingWindowOp::Reset), _) | (_, PendingWindowOp::Reset) => PendingWindowOp::Reset,
         (Some(PendingWindowOp::Append(mut prev)), PendingWindowOp::Append(next)) => {
             prev.extend(next);
@@ -729,7 +738,7 @@ impl MessagesState {
     pub fn remove_conversation_window(&mut self, conv_id: &str) -> (bool, bool) {
         let win_removed = self.windows.remove(conv_id).is_some();
         if win_removed {
-            self.record_window_op(conv_id.to_owned(), PendingWindowOp::Reset);
+            self.record_window_op(conv_id.to_owned(), PendingWindowOp::Remove);
         }
         let meta_removed = self.has_more_history.remove(conv_id).is_some();
         (win_removed, meta_removed)
@@ -1184,11 +1193,8 @@ impl MessagesState {
         &mut self,
         conv_id: &str,
         mut list: Vec<ChatMessage>,
-        snap: &IdentitySnapshot,
+        _snap: &IdentitySnapshot,
     ) -> WindowChange {
-        for m in &mut list {
-            *m = snap.with_known_sender(m.clone());
-        }
         list.sort_by(cmp_msg_page);
         if self.windows.get(conv_id) == Some(&list) {
             return WindowChange::NoChange;

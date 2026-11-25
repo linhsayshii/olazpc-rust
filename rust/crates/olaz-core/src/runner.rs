@@ -394,6 +394,7 @@ pub trait Host: Send + Sync {
         _msg_id: String,
         _cli_msg_id: String,
         _update_conversation_preview: bool,
+        _persist_conversations: bool,
     ) {
     }
     async fn apply_remote_delete(
@@ -402,6 +403,7 @@ pub trait Host: Send + Sync {
         _msg_id: String,
         _cli_msg_id: String,
         _update_conversation_preview: bool,
+        _persist_conversations: bool,
     ) {
     }
     async fn decrypt_envelope(&self, payload: Map<String, Value>) -> Map<String, Value> {
@@ -588,6 +590,7 @@ enum HostJob {
         msg_id: String,
         cli_msg_id: String,
         update_conversation_preview: bool,
+        persist_conversations: bool,
         _guard: InFlightGuard,
     },
     ApplyRemoteDelete {
@@ -595,6 +598,7 @@ enum HostJob {
         msg_id: String,
         cli_msg_id: String,
         update_conversation_preview: bool,
+        persist_conversations: bool,
         _guard: InFlightGuard,
     },
     DecryptEnvelope {
@@ -2463,11 +2467,13 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             msg_id,
                             cli_msg_id,
                             update_conversation_preview,
+                            persist_conversations,
                         } => HostJob::ApplyRemoteRecall {
                             conv_id,
                             msg_id,
                             cli_msg_id,
                             update_conversation_preview,
+                            persist_conversations,
                             _guard: guard,
                         },
                         HostCall::ApplyRemoteDelete {
@@ -2475,11 +2481,13 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             msg_id,
                             cli_msg_id,
                             update_conversation_preview,
+                            persist_conversations,
                         } => HostJob::ApplyRemoteDelete {
                             conv_id,
                             msg_id,
                             cli_msg_id,
                             update_conversation_preview,
+                            persist_conversations,
                             _guard: guard,
                         },
                         HostCall::DecryptEnvelope {
@@ -3129,20 +3137,34 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 msg_id,
                 cli_msg_id,
                 update_conversation_preview,
+                persist_conversations,
                 _guard,
             } => {
-                host.apply_remote_recall(conv_id, msg_id, cli_msg_id, update_conversation_preview)
-                    .await;
+                host.apply_remote_recall(
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                    update_conversation_preview,
+                    persist_conversations,
+                )
+                .await;
             }
             HostJob::ApplyRemoteDelete {
                 conv_id,
                 msg_id,
                 cli_msg_id,
                 update_conversation_preview,
+                persist_conversations,
                 _guard,
             } => {
-                host.apply_remote_delete(conv_id, msg_id, cli_msg_id, update_conversation_preview)
-                    .await;
+                host.apply_remote_delete(
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                    update_conversation_preview,
+                    persist_conversations,
+                )
+                .await;
             }
             HostJob::DecryptEnvelope {
                 payload,
