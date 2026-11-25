@@ -178,6 +178,12 @@ final class ZaloEngine {
     @ObservationIgnored internal var cachedQRPNG: Data?
     @ObservationIgnored internal var hostTrace: ((String, [String: Any]) -> Bool)?
     @ObservationIgnored internal var sendE2EETextHostHandler: (([String: Any]) async throws -> SendMessageResult)?
+    @ObservationIgnored internal var resolveMediaHostHandler: (([String: Any]) async -> MediaResolution)?
+    @ObservationIgnored internal var resolveFileHostHandler: (([String: Any]) async -> FileResolution)?
+    @ObservationIgnored internal var fetchMediaDataHostHandler: (([String: Any]) async -> Data?)?
+    @ObservationIgnored internal var sendMediaHostHandler: (([String: Any]) async -> ComposerOutcome)?
+    @ObservationIgnored internal var sendFilesHostHandler: (([String: Any]) async -> ComposerOutcome)?
+    @ObservationIgnored internal var forwardTempPhotoURL: (() -> URL)?
     @ObservationIgnored internal var traceU4HostEnabled: Bool = false
     @ObservationIgnored internal var stateTrace: (() -> Void)?
     @ObservationIgnored private let transportSettleTraceActive = OSAllocatedUnfairLock<Bool>(initialState: false)

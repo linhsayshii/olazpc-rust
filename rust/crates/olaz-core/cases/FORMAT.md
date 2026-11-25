@@ -43,16 +43,21 @@ The oracle is what can be observed from outside the engine: the domain state the
 - `seen_reaction_event_ids` *(optional, `message_actions`)*: array of reaction dedupe keys seeded into SQLite `seenReactionEventIds` preference before boot (`loadLocalAccountState` loads them into `seenReactionEventIds` / `seenReactionEventOrder`).
 - `hidden_pin_md5`, `hidden_pin_hash` *(optional, `conversation_actions`)*: `null` or digest hex string seeded into SQLite `hiddenPinMD5` / `hiddenPinHash` preferences before boot.
 - `labels_pref` *(optional, `conversation_actions`)*: array of `{"id", "name", "color", "convIds"}` seeded into SQLite `labels` preference before boot.
-- `activity_ranks` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `pins`)*: map of `<convId>` to positive integer rank seeded into SQLite `activityRanks` preference before boot.
-- `local_conversations` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `pins`)*: array of `{"id", "is_group", "name", "avatar", "pinned", "members", "unread", "preview_text", "preview_ts_ms", "preview_from_me", "updated_at_ms"}` seeded into the SQLite `conversations` table before boot (`loadLocalAccountState` reads them before any network).
-- `local_messages` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `pins`)*: array of `{"id", "conv_id", "client_id", "sender_id", "sender_name", "sender_avatar", "is_mine", "text", "kind_tag", "ts_ms", "status", "raw_json"}` seeded into the SQLite `messages` table before boot.
-- `open_conversation_id` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `pins`)*: `null` or conversation id set as `openConversationId` before steps run.
+- `activity_ranks` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `pins`, `forward`)*: map of `<convId>` to positive integer rank seeded into SQLite `activityRanks` preference before boot.
+- `local_conversations` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `pins`, `forward`)*: array of `{"id", "is_group", "name", "avatar", "pinned", "members", "unread", "preview_text", "preview_ts_ms", "preview_from_me", "updated_at_ms"}` seeded into the SQLite `conversations` table before boot (`loadLocalAccountState` reads them before any network).
+- `local_messages` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `pins`, `forward`)*: array of `{"id", "conv_id", "client_id", "sender_id", "sender_name", "sender_avatar", "is_mine", "text", "kind_tag", "ts_ms", "status", "raw_json"}` seeded into the SQLite `messages` table before boot.
+- `open_conversation_id` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `pins`, `forward`)*: `null` or conversation id set as `openConversationId` before steps run.
 - `history_full_refresh_at` *(optional, `messages`, `bootstrap`)*: `null`, or string/number seeded into SQLite `historyFullRefreshAt` preference before boot (stored as stringified epoch seconds).
-- `history_freshness` *(optional, `messages`, `bootstrap`, `send`, `message_actions`, `pins`)*: `null`, or map of `<convId>` to `"up_to_date" | "stale"` pre-seeded into `ZaloEngine.historyFreshness` before steps run.
-- `next_client_id` *(optional, `send`, `message_actions`)*: positive 64-bit integer seeding `nextClientId()` before steps run. Each `nextClientId()` call returns the current seeded value and increments it by 1.
+- `history_freshness` *(optional, `messages`, `bootstrap`, `send`, `message_actions`, `pins`, `forward`)*: `null`, or map of `<convId>` to `"up_to_date" | "stale"` pre-seeded into `ZaloEngine.historyFreshness` before steps run.
+- `next_client_id` *(optional, `send`, `message_actions`, `forward`)*: positive 64-bit integer seeding `nextClientId()` before steps run. Each `nextClientId()` call returns the current seeded value and increments it by 1.
 - `auto_delete` *(optional, `send`, `message_actions`)*: map of `<convId>` to positive integer TTL milliseconds pre-seeded into `ZaloEngine.autoDelete` before steps run.
-- `e2ee_threads` *(optional, `send`, `message_actions`)*: array of peer uid strings pre-seeded into SQLite `e2eeThreadsV1` preference before boot (`loadLocalAccountState` loads them into `e2eeManager`).
-- `host_results` *(optional, `send`, `message_actions`)*: map of host call name (e.g. `"send_e2ee_text"`) to an ordered queue of scripted outcomes: `{"msg_id": "<str>", "cli_msg_id": "<str>", "ts_ms": <int64>}` on success, or `{"error": {"code": <int>, "message": "<str>", "url": "<str>"}}` (or `{"error": "<message>"}`) on failure. Consumed in order when the host boundary runs.
+- `e2ee_threads` *(optional, `send`, `message_actions`, `forward`)*: array of peer uid strings pre-seeded into SQLite `e2eeThreadsV1` preference before boot (`loadLocalAccountState` loads them into `e2eeManager`).
+- `host_results` *(optional, `send`, `message_actions`, `forward`)*: map of host call name to an ordered queue of scripted outcomes consumed in order when the host boundary runs:
+  - `send_e2ee_text`: `{"msg_id": "<str>", "cli_msg_id": "<str>", "ts_ms": <int64>}` on success, or `{"error": {"code": <int>, "message": "<str>", "url": "<str>"}}` (or `{"error": "<message>"}`) on failure.
+  - `resolve_media` (`forward`): `{"state": "file", "path": "<str>"}` (also accepts `"state": "ok"`), or `{"state": "expired" | "unavailable" | "unsupported"}`.
+  - `resolve_file` (`forward`): `{"state": "ready", "path": "<str>"}`, `{"state": "expired"}`, or `{"state": "failed", "message": "<str>"}`.
+  - `fetch_media_data` (`forward`): `{"ok": true}` (or `{"data_utf8": "<str>"}`) on success, or `{"ok": false}` (or `{"error": "<str>"}`) on failure.
+  - `send_media`, `send_files` (`forward`): `{"outcome": "done" | "cancelled"}`, or `{"outcome": "failed" | "pending", "text": "<str, optional>"}`.
 - `cached_group_details` *(optional, `groups`, `polls`, `pins`)*: map of `<cleanGrid>` to group detail dictionary pre-seeded into `ZaloEngine.cachedGroupDetails` before steps run.
 - `group_member_cache` *(optional, `groups`, `polls`, `pins`)*: map of `<gid>` to `[{"id", "name", "avatar", "is_all"}]` pre-seeded into `ZaloEngine.groupMemberCache` before steps run.
 - `polls` *(optional, `polls`)*: `{"details": {"<pollId>": <PollDetail JSON>}, "failed": ["<pollId>", ...], "pins": {"<pollId>": {"ready": <bool>, "can_pin": <bool>, "pinned": <bool>, "limit": <int>}}}` pre-seeding `ZaloEngine.polls` before steps run.
@@ -219,6 +224,14 @@ Run in order:
   - `pins_state`: `{"json": {...}}` — calls `handlePins(state: json)`.
   - `can_pin`: `{"conv_id": "<convId>", "msg_id": "<msgId>"}` — locates the loaded message in `messages[conv_id]`, calls `canPinMessage(message)`, and records `<bool>` in `results["<stepIndex>"]`.
   - `is_pinned`: `{"conv_id": "<convId>", "msg_id": "<msgId>"}` — locates the loaded message in `messages[conv_id]`, calls `isPinned(message)`, and records `<bool>` in `results["<stepIndex>"]`.
+- Forward `cmd` steps (`forward` domain):
+  - Optional `"now_ms": <int64>` on `cmd` steps seeds `nowMs` for the duration of that step (used for `sendText` optimistic/sent message `date` and forwarded `.contactCard` row `date`).
+  - Inherits `start`, `open`, `close`, `apply_batch`, `send_text`, `await_send`.
+  - `request_forward`: `{"conv_id": "<convId>", "msg_id": "<msgId>"}` — locates the loaded message in `messages[conv_id]` and calls `requestForward(message)`.
+  - `select`: `{"conv_id": "<convId>", "ids": ["<msgId>", ...]}` — when `ids` is empty calls `endSelection()`; otherwise calls `beginSelection` on the first loaded message and `toggleSelection` on each subsequent id.
+  - `forward_selection`: `{}` — calls `forwardSelection()`.
+  - `forward`: `{"conv_id": "<convId>", "msg_id": "<msgId>", "targets": ["<convId>", ...]}` — locates the loaded message in `messages[conv_id]`, awaits `forward(message, to: targets)` + Core settle, and records the `MessageActionOutcome` JSON in `results["<stepIndex>"]`.
+  - `forward_all`: `{"targets": ["<convId>", ...]}` — awaits `forwardAll(to: targets)` on the open `forwardRequest` + Core settle, and records the `MessageActionOutcome` JSON in `results["<stepIndex>"]`.
 - `{"await": {"phase": "<kind>", "step": "<login step, optional>"}, "timeout_ms": 5000}`: wait until the state matches. The Rust runner instead runs the core until no input or effect is pending, then checks the same predicate.
 - `{"await_host": "<call>", "timeout_ms": N}`: wait until the recorded `host` list contains `"<call>"` searching from the current host cursor, then advance the host cursor past that entry (`index + 1`). Used for deterministic ordering (for example awaiting `e2ee_connected` before `ws_push`).
 - `{"ws_push": k}` (optional `"timeout_ms": N`): instruct the fake server to send the next `k` scripted `ws_frame` or `ws_close` entries in script order.
@@ -262,7 +275,13 @@ Run in order:
   - Send domain names (Swift-owned U0b boundaries):
     - `send_e2ee_text {conv_id, text, client_id, quote}` *(E2EE 1-1 send boundary in `sendText`, invoked after the optimistic row is merged; `quote` is `null` or `{"msg_id", "cli_msg_id", "sender_id", "sender_name", "text", "ts_ms"}`, and the result is supplied by `seed.host_results.send_e2ee_text`)*
   - Message actions domain names (Swift-owned UI boundaries):
-    - `show_card {conv_id, text}` *(banner notice shown via `CardActionCenter.shared.show(text, in: convId)` from U6 react, recall, delete undo, star, auto-delete, U7 pin/unpin/choose-many, U9 block/unblock, and U10 group admin / group link flows; `conv_id` is `<str|null>`; traced and skipped during recording)*
+    - `show_card {conv_id, text}` *(banner notice shown via `CardActionCenter.shared.show(text, in: convId)` from U6 react, recall, delete undo, star, auto-delete, U7 pin/unpin/choose-many, U8 forward guards/selection/forwardAll, U9 block/unblock, and U10 group admin / group link flows; `conv_id` is `<str|null>`; traced and skipped during recording)*
+  - Forward domain names (Swift-owned U15 media upload/fetch boundaries):
+    - `resolve_media {conv_id, msg_id, kind}` *(scripted by `seed.host_results.resolve_media`)*
+    - `resolve_file {conv_id, msg_id, name, url}` *(scripted by `seed.host_results.resolve_file`)*
+    - `fetch_media_data {url}` *(photo CDN download fallback; scripted by `seed.host_results.fetch_media_data`)*
+    - `send_media {conv_id, paths}` *(scripted by `seed.host_results.send_media`; temp CDN fallback photo paths are normalized to `"<tmp>/fwd-<n>.jpg"`)*
+    - `send_files {conv_id, paths}` *(scripted by `seed.host_results.send_files`)*
 
 ## Session domain state
 
@@ -762,6 +781,34 @@ Cases in `pins` extend the Groups domain state with `pins`, `cached_board_raw_to
 - `cached_board_raw_topics`: map of `<convId>` to `{"version": <int64>, "topic_ids": [<sorted string>]}` mirroring `ZaloEngine.cachedBoardRawTopics`.
 - `pin_logs`: `"pins: ..."` lines emitted via `EngineLog` (with the wall-clock `HH:mm:ss.SSS ` prefix stripped).
 - `refresh_board_pins` execution: in `pins`, `hostTrace` records `refresh_board_pins {conv_id}` in `expect.host` and returns `true` so `refreshBoardPins` fetches and parses the board for real; in all other domains `hostTrace` returns `false` and skips the fetch.
+
+## Forward domain state
+
+Cases in `forward` extend the Message actions domain state with `forward_request`, `selection`, and `results` (`messages`, `conversations`, and `store.messages` capture forwarded rows across all targets):
+
+```json
+{
+  "forward_request": null | {
+    "conv_id": "3000801",
+    "msg_id": "9008001",
+    "more": ["9008002"]
+  },
+  "selection": null | {
+    "conv_id": "3000801",
+    "ids": ["9008002", "9008001"],
+    "anchor": "9008001"
+  },
+  "results": {
+    "3": { "status": "done", "text": "Đã chia sẻ" },
+    "4": { "status": "failed", "text": "Chưa chọn cuộc trò chuyện." }
+  }
+}
+```
+
+- `forward_request`: `null` or `{"conv_id": <str>, "msg_id": <str>, "more": [<str>, ...]}` mirroring `ZaloEngine.forwardRequest` (`more` holds additional selected message ids oldest first).
+- `selection`: `null` or `{"conv_id": <str>, "ids": [<str>, ...], "anchor": <str|null>}` mirroring `ZaloEngine.messageSelection` (`ids` preserves click order while `forwardSelection()` orders `forward_request` by the conversation window).
+- `results`: map of 0-based `steps` index string (`"0"`, `"1"`, ...) for each `forward` or `forward_all` step executed so far, encoded as `{"status": "done", "text": <str|null>}` | `{"status": "failed"|"pending", "text": <str>}` | `{"status": "confirm", "title": <str>, "message": <str>, "ok": <str>, "cancel": <str>, "ref": <str|null>}`.
+- `forwardTempPhotoURL` normalization: photo CDN fallbacks stage temp bytes under `"<tmp>/fwd-<n>.jpg"` (normalized from the per-run temp directory in `expect.host`).
 
 ## Volatile
 

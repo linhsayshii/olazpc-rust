@@ -64,6 +64,12 @@ extension ZaloEngine {
     internal func cancelTasksForRecording() {
         hostTrace = nil
         sendE2EETextHostHandler = nil
+        resolveMediaHostHandler = nil
+        resolveFileHostHandler = nil
+        fetchMediaDataHostHandler = nil
+        sendMediaHostHandler = nil
+        sendFilesHostHandler = nil
+        forwardTempPhotoURL = nil
         traceU4HostEnabled = false
         stateTrace = nil
         EngineLog.shared.onAppend = nil

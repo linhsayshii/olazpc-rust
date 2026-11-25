@@ -244,9 +244,25 @@ extension ZaloEngine {
 
     // MARK: Chia sẻ
 
+    internal func fetchMediaData(for url: URL) async -> Data? {
+        if let fetchMediaDataHostHandler {
+            let args: [String: Any] = ["url": url.absoluteString]
+            _ = traceHost("fetch_media_data", args: args)
+            return await fetchMediaDataHostHandler(args)
+        }
+        return try? await MediaLoader.shared.data(for: url)
+    }
+
+    private func makeForwardTempPhotoURL() -> URL {
+        if let forwardTempPhotoURL {
+            return forwardTempPhotoURL()
+        }
+        return FileManager.default.temporaryDirectory.appendingPathComponent("fwd-\(UUID().uuidString.prefix(8)).jpg")
+    }
+
     func requestForward(_ message: ChatMessage) {
         guard message.menu.forward == .available else {
-            if message.menu.forward == .blocked { CardActionCenter.shared.show("Trò chuyện này đã bật Chặn chia sẻ", in: message.conversationId) }
+            if message.menu.forward == .blocked { showActionCard("Trò chuyện này đã bật Chặn chia sẻ", in: message.conversationId) }
             return
         }
         forwardRequest = ForwardRequest(conversationId: message.conversationId, message: message)
@@ -269,7 +285,7 @@ extension ZaloEngine {
                         id: res.msgId, conversationId: target,
                         senderId: profile?.userId ?? "", senderName: profile?.displayName ?? "Bạn", senderAvatar: profile?.avatar,
                         isMine: true, kind: .contactCard(card), text: "[Danh thiếp] \(card.name)",
-                        date: Date(), status: .sent, quote: nil, reactions: [], isE2EE: false,
+                        date: Date(timeIntervalSince1970: Double(nowMs()) / 1000.0), status: .sent, quote: nil, reactions: [], isE2EE: false,
                         mentions: [], cardButtons: [], suggestsStickers: false,
                         menu: MessageMenu(json: [
                             "forward": "ok",
@@ -291,8 +307,8 @@ extension ZaloEngine {
                 if case .file(let local) = await resolveMedia(conversationId: message.conversationId, messageId: message.id, kind: .photo),
                    await sendMedia([local], to: target) == .done {
                     succeeded += 1
-                } else if let url, let data = try? await MediaLoader.shared.data(for: url) {
-                    let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("fwd-\(UUID().uuidString.prefix(8)).jpg")
+                } else if let url, let data = await fetchMediaData(for: url) {
+                    let tmp = makeForwardTempPhotoURL()
                     try? data.write(to: tmp, options: .atomic)
                     defer { try? FileManager.default.removeItem(at: tmp) }
                     if await sendMedia([tmp], to: target) == .done { succeeded += 1 }
@@ -307,6 +323,30 @@ extension ZaloEngine {
             }
         }
         return succeeded > 0 ? .done(text: "Đã chia sẻ") : .failed("Có lỗi khi chia sẻ tin nhắn")
+    }
+
+    func forwardAll(to targets: [String]) async -> MessageActionOutcome {
+        guard let request = forwardRequest else {
+            return .failed("Có lỗi khi chia sẻ tin nhắn")
+        }
+        var outcome = MessageActionOutcome.failed("Có lỗi khi chia sẻ tin nhắn")
+        for message in request.all {
+            let one = await forward(message, to: targets)
+            if case .done = outcome { continue }
+            outcome = one
+        }
+        if case .done = outcome, !request.more.isEmpty { endSelection() }
+        switch outcome {
+        case .done(let text):
+            showActionCard(text ?? "Đã chia sẻ tin nhắn", in: request.conversationId)
+            if forwardRequest?.id == request.id { forwardRequest = nil }
+        case .pending(let text):
+            showActionCard(text, in: request.conversationId)
+            if forwardRequest?.id == request.id { forwardRequest = nil }
+        case .failed, .confirm:
+            break
+        }
+        return outcome
     }
 
     // MARK: Thu hồi
