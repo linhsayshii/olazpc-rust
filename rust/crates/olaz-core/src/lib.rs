@@ -19,7 +19,7 @@ pub mod state;
 pub mod typed_chat;
 
 pub use actor::{ActorSink, CoreHandle};
-pub use changes::{ChangeHub, CoreChanges, DirtyKey, DirtySet};
+pub use changes::{ChangeHub, CoreChanges, DirtyKey, DirtySet, MessageMetaSnapshot, snapshot_message_meta};
 pub use conversations::{
     BatchApplyDelta, CachedGroup, CachedProfile, ConvMessageDelta, ConvPreviewOverride,
     ConversationActionResult, ConversationActionUI, ConversationActionsState, ConversationExtras,

@@ -788,6 +788,10 @@ impl CoreOfflineConversations {
                         prompt: state.conversations.prompt.clone().map(Into::into),
                     });
                 }
+                DirtyKey::Messages
+                | DirtyKey::MessageMeta
+                | DirtyKey::MessagesResetAll
+                | DirtyKey::Contacts => {}
             }
         }
         rec
