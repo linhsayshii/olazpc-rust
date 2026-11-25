@@ -6,7 +6,7 @@ The oracle is what can be observed from outside the engine: the domain state the
 
 ## Files
 
-- `rust/crates/olaz-core/cases/<domain>.jsonl`: one case per line, sorted by `name`. Domains: `session`, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`.
+- `rust/crates/olaz-core/cases/<domain>.jsonl`: one case per line, sorted by `name`. Domains: `session`, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`.
 - `rust/crates/olaz-core/cases/known-diffs.jsonl`: intended differences, one line `{"domain", "name", "path", "actual", "reason"}` each. Only lines the user approved. A line whose case no longer differs fails the runner.
 - Data is synthetic. Never content from a real account, never a real token.
 
@@ -32,24 +32,26 @@ The oracle is what can be observed from outside the engine: the domain state the
 - `domains`: the service map used when no session is saved (QR login), pointing every service at the fake server. The fake server's port is not stable, so cases store the host as `"http://fake"`; both sides substitute the real `http://127.0.0.1:<port>` when they run. Every case sets `"isolated": true` so neither side ever fails over to live Zalo hosts.
 - `legacy_cookie`: `null`, or what `tryRestoreLegacyCookieSession` reads.
 - `prefs`: store preference strings present before the run.
-- `poll_state` *(optional, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`)*: `null`, or `ZaloPollState` / `PollState` camelCase JSON (`{"lastActionId": "...", "lastActionIdOther": "...", "queues": {"1": {"lastId": "...", "ids": []}, ...}}`) seeded before long-polling starts.
-- `ws_cursors` *(optional, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`)*: `null`, or a map of `"<cmd>_<subCmd>"` to `{"lastId": "...", "preIds": [...]}` (`ZaloWSQueueCursorSnapshot` / `WsQueueCursorSnapshot`) seeded before WebSocket connects.
-- `suppress` *(optional, runner metadata, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`)*: array of transport names (`"ws"`, `"long_poll"`, or both) to suppress during the run. Both the recorder's `hostTrace` and the Rust replay obey it: `start_ws` / `start_long_poll` are still traced, `hostTrace` returns `false` for listed transports, a suppressed WS never connects, and a suppressed long-poll never ticks.
-- `ws_auth` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`)*: `"manual"` (or omitted for auto-auth). When `"manual"`, the fake server does not send the initial `cmd == 1` auth reply automatically on WebSocket connect; instead, that `cmd == 1` `ws_frame` remains the first scripted `ws_frame` and is delivered by an explicit `ws_push` step (typically `await_host start_bootstrap` → `ws_push 1` → `await_host e2ee_connected`).
-- `contacts` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`)*: `{"friends": [{"id", "name", "zalo_name", "avatar", "last_active_ms", "online", "section", "sort_key"}], "groups": [{"id", "name", "avatar", "members", "sort_key"}], "friends_loaded": <bool>, "groups_loaded": <bool>, "aliases": {"<uid>": "<alias>"}, "cached_profiles": {"<uid>": {"name", "avatar"}}, "cached_groups": {"<gid>": {"name", "avatar", "members"}}, "friend_global_ids": {"<uid>": "<gid>"}}`. Friends/groups populate `ContactsState`; aliases/profiles/groups/global-ids seed the corresponding store preferences before boot so `loadLocalAccountState` loads them.
-- `pinned_ids`, `archived_ids`, `unread_marks`, `hidden_ids` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`)*: arrays of conversation ids seeded into SQLite `pinnedIds`, `archivedIds`, `unreadMarks`, `hiddenIds` preferences before boot.
+- `poll_state` *(optional, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`)*: `null`, or `ZaloPollState` / `PollState` camelCase JSON (`{"lastActionId": "...", "lastActionIdOther": "...", "queues": {"1": {"lastId": "...", "ids": []}, ...}}`) seeded before long-polling starts.
+- `ws_cursors` *(optional, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`)*: `null`, or a map of `"<cmd>_<subCmd>"` to `{"lastId": "...", "preIds": [...]}` (`ZaloWSQueueCursorSnapshot` / `WsQueueCursorSnapshot`) seeded before WebSocket connects.
+- `suppress` *(optional, runner metadata, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`)*: array of transport names (`"ws"`, `"long_poll"`, or both) to suppress during the run. Both the recorder's `hostTrace` and the Rust replay obey it: `start_ws` / `start_long_poll` are still traced, `hostTrace` returns `false` for listed transports, a suppressed WS never connects, and a suppressed long-poll never ticks.
+- `ws_auth` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`)*: `"manual"` (or omitted for auto-auth). When `"manual"`, the fake server does not send the initial `cmd == 1` auth reply automatically on WebSocket connect; instead, that `cmd == 1` `ws_frame` remains the first scripted `ws_frame` and is delivered by an explicit `ws_push` step (typically `await_host start_bootstrap` → `ws_push 1` → `await_host e2ee_connected`).
+- `contacts` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`)*: `{"friends": [{"id", "name", "zalo_name", "avatar", "last_active_ms", "online", "section", "sort_key"}], "groups": [{"id", "name", "avatar", "members", "sort_key"}], "friends_loaded": <bool>, "groups_loaded": <bool>, "aliases": {"<uid>": "<alias>"}, "cached_profiles": {"<uid>": {"name", "avatar"}}, "cached_groups": {"<gid>": {"name", "avatar", "members"}}, "friend_global_ids": {"<uid>": "<gid>"}}`. Friends/groups populate `ContactsState`; aliases/profiles/groups/global-ids seed the corresponding store preferences before boot so `loadLocalAccountState` loads them.
+- `pinned_ids`, `archived_ids`, `unread_marks`, `hidden_ids` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`)*: arrays of conversation ids seeded into SQLite `pinnedIds`, `archivedIds`, `unreadMarks`, `hiddenIds` preferences before boot.
+- `starred_ids` *(optional, `message_actions`)*: array of message ids seeded into SQLite `starredIds` preference before boot (`loadLocalAccountState` loads them into `cachedStarredIds`).
+- `seen_reaction_event_ids` *(optional, `message_actions`)*: array of reaction dedupe keys seeded into SQLite `seenReactionEventIds` preference before boot (`loadLocalAccountState` loads them into `seenReactionEventIds` / `seenReactionEventOrder`).
 - `hidden_pin_md5`, `hidden_pin_hash` *(optional, `conversation_actions`)*: `null` or digest hex string seeded into SQLite `hiddenPinMD5` / `hiddenPinHash` preferences before boot.
 - `labels_pref` *(optional, `conversation_actions`)*: array of `{"id", "name", "color", "convIds"}` seeded into SQLite `labels` preference before boot.
-- `activity_ranks` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`)*: map of `<convId>` to positive integer rank seeded into SQLite `activityRanks` preference before boot.
-- `local_conversations` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`)*: array of `{"id", "is_group", "name", "avatar", "pinned", "members", "unread", "preview_text", "preview_ts_ms", "preview_from_me", "updated_at_ms"}` seeded into the SQLite `conversations` table before boot (`loadLocalAccountState` reads them before any network).
-- `local_messages` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`)*: array of `{"id", "conv_id", "client_id", "sender_id", "sender_name", "sender_avatar", "is_mine", "text", "kind_tag", "ts_ms", "status", "raw_json"}` seeded into the SQLite `messages` table before boot.
-- `open_conversation_id` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`)*: `null` or conversation id set as `openConversationId` before steps run.
+- `activity_ranks` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`)*: map of `<convId>` to positive integer rank seeded into SQLite `activityRanks` preference before boot.
+- `local_conversations` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`)*: array of `{"id", "is_group", "name", "avatar", "pinned", "members", "unread", "preview_text", "preview_ts_ms", "preview_from_me", "updated_at_ms"}` seeded into the SQLite `conversations` table before boot (`loadLocalAccountState` reads them before any network).
+- `local_messages` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`)*: array of `{"id", "conv_id", "client_id", "sender_id", "sender_name", "sender_avatar", "is_mine", "text", "kind_tag", "ts_ms", "status", "raw_json"}` seeded into the SQLite `messages` table before boot.
+- `open_conversation_id` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`)*: `null` or conversation id set as `openConversationId` before steps run.
 - `history_full_refresh_at` *(optional, `messages`, `bootstrap`)*: `null`, or string/number seeded into SQLite `historyFullRefreshAt` preference before boot (stored as stringified epoch seconds).
-- `history_freshness` *(optional, `messages`, `bootstrap`, `send`)*: `null`, or map of `<convId>` to `"up_to_date" | "stale"` pre-seeded into `ZaloEngine.historyFreshness` before steps run.
-- `next_client_id` *(optional, `send`)*: positive 64-bit integer seeding `nextClientId()` before steps run. Each `nextClientId()` call returns the current seeded value and increments it by 1.
-- `auto_delete` *(optional, `send`)*: map of `<convId>` to positive integer TTL milliseconds pre-seeded into `ZaloEngine.autoDelete` before steps run.
-- `e2ee_threads` *(optional, `send`)*: array of peer uid strings pre-seeded into SQLite `e2eeThreadsV1` preference before boot (`loadLocalAccountState` loads them into `e2eeManager`).
-- `host_results` *(optional, `send`)*: map of host call name (e.g. `"send_e2ee_text"`) to an ordered queue of scripted outcomes: `{"msg_id": "<str>", "cli_msg_id": "<str>", "ts_ms": <int64>}` on success, or `{"error": {"code": <int>, "message": "<str>", "url": "<str>"}}` (or `{"error": "<message>"}`) on failure. Consumed in order when the host boundary runs.
+- `history_freshness` *(optional, `messages`, `bootstrap`, `send`, `message_actions`)*: `null`, or map of `<convId>` to `"up_to_date" | "stale"` pre-seeded into `ZaloEngine.historyFreshness` before steps run.
+- `next_client_id` *(optional, `send`, `message_actions`)*: positive 64-bit integer seeding `nextClientId()` before steps run. Each `nextClientId()` call returns the current seeded value and increments it by 1.
+- `auto_delete` *(optional, `send`, `message_actions`)*: map of `<convId>` to positive integer TTL milliseconds pre-seeded into `ZaloEngine.autoDelete` before steps run.
+- `e2ee_threads` *(optional, `send`, `message_actions`)*: array of peer uid strings pre-seeded into SQLite `e2eeThreadsV1` preference before boot (`loadLocalAccountState` loads them into `e2eeManager`).
+- `host_results` *(optional, `send`, `message_actions`)*: map of host call name (e.g. `"send_e2ee_text"`) to an ordered queue of scripted outcomes: `{"msg_id": "<str>", "cli_msg_id": "<str>", "ts_ms": <int64>}` on success, or `{"error": {"code": <int>, "message": "<str>", "url": "<str>"}}` (or `{"error": "<message>"}`) on failure. Consumed in order when the host boundary runs.
 
 ### server
 
@@ -67,7 +69,7 @@ Run in order:
 
 - Session / transport `cmd` steps: `{"cmd": "start" | "refresh_qr" | "log_out" | "session_expired" | "drain_chat_polling", "args": {...}}`.
   - `session_expired` takes `{"reason": "<text>"}`.
-  - `drain_chat_polling` (`transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`) calls `drainChatPolling(maxBatches, notifyIncoming)` with `{"max_batches": <int>, "notify_incoming": <bool>}`.
+  - `drain_chat_polling` (`transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`) calls `drainChatPolling(maxBatches, notifyIncoming)` with `{"max_batches": <int>, "notify_incoming": <bool>}`.
 - Conversations `cmd` steps (`conversations` domain):
   - `apply_batch`: `{"payload": {...}, "default_cmd": <int>, "fallback_conv_id": <str|null>, "is_group_hint": <bool|null>, "increment_unread": <bool>, "notify_incoming": <bool>, "persist_conversations": <bool>}` — calls `applyBatchResponse`.
   - `ensure_known_contacts`: `{}` — calls `ensureKnownContactsInConversations()`, `rebuildConversationFlags()`, `rebuildConversationExtras()`.
@@ -120,6 +122,24 @@ Run in order:
   - `set_pref`: `{"key": "<prefKey>", "value": <bool|string|int|null>}` — sets a key in the isolated `UserDefaults` suite (e.g. `"olaz.sendTyping"`).
   - `clear_client_auth`: `{}` — clears session auth credentials (`zpwSek`) on `sessionClient` while keeping `ZaloEngine.phase == .ready`.
   - `await_typing_expiry`: `{"id": "<convId>"}` *(optional `"timeout_ms": N`)* — waits until `typing[id]` clears via its display timer (`TypingStatus.displaySeconds`, 10 s). Cases using this step carry `"slow": true`.
+- Message actions `cmd` steps (`message_actions` domain):
+  - Optional `"now_ms": <int64>` on `cmd` steps seeds `nowMs` for the duration of that step (used for `PendingLocalReaction.createdAt`, `applyRemoteReaction` 20 s echo expiry, `performRecall` 24 h check, `DeleteUndo.deadline` + 5 s sleep, `setAutoDelete` system row `ms`, and `pruneExpiredMessages` cutoff).
+  - Inherits `open`, `close`, `apply_batch`, `send_text`, `await_send`, `clear_client_auth`, `drain_chat_polling`.
+  - `react`: `{"conv_id": "<str>", "msg_id": "<str>", "emoji": "<str>", "async": <bool, optional>}` — calls `performReact(emoji, to: msg_id, in: conv_id)`. When `"async": true`, launches `performReact` in flight and waits until its held HTTP request arrives or it completes so callers can snapshot the optimistic reaction before `http_release` + `await_action`.
+  - `await_action`: `{}` — awaits any in-flight `async` `react` task and any triggered `messageActionTasks` / SQLite persist.
+  - `remove_my_reactions`: `{"conv_id": "<str>", "msg_id": "<str>"}` — awaits `performReact("", to: msg_id, in: conv_id, removeAll: true)`.
+  - `recall`: `{"conv_id": "<str>", "msg_id": "<str>"}` — looks up `msg_id` (by `id` or `clientId`) in `messages[conv_id]` and awaits `performRecall(msg)`.
+  - `recall_many`: `{"conv_id": "<str>", "msg_ids": ["<str>", ...], "confirm": <bool, optional>}` — selects `msg_ids` in `conv_id` via `beginSelection` / `toggleSelection` and calls `recallSelection()` (when `confirm` is omitted or `true`), or awaits `recallMessages(list)` when `"confirm": false`.
+  - `delete_for_me`: `{"conv_id": "<str>", "msg_id": "<str>", "confirmed": <bool, optional>}` — looks up `msg_id` in `messages[conv_id]` and calls `deleteForMe(msg, confirmed: confirmed ?? false)`.
+  - `delete_many`: `{"conv_id": "<str>", "msg_ids": ["<str>", ...]}` — selects `msg_ids` in `conv_id` via `beginSelection` / `toggleSelection` and calls `deleteSelection()`.
+  - `undo_delete`: `{}` — calls `undoDelete()`.
+  - `dismiss_delete_undo`: `{}` — calls `dismissDeleteUndo()` and awaits spawned delete API / SQLite tasks.
+  - `await_delete_undo_expiry`: `{}` *(optional `"timeout_ms": N`)* — waits until `deleteUndo` clears via its 5 s timer and awaits the resulting commit tasks (under the 10 s `slow` mark).
+  - `answer_confirm`: `{"ok": <bool>}` — if `messageConfirm` is active, calls `answerMessageConfirm(confirm, ok: ok)` and awaits any spawned `messageActionTasks`.
+  - `star`: `{"conv_id": "<str>", "msg_id": "<str>", "on": <bool>}` — looks up `msg_id` in `messages[conv_id]`, calls `setStarred(msg, on)`, and awaits SQLite `starredIds` / row save.
+  - `load_auto_delete`: `{}` — awaits `loadAutoDelete()`.
+  - `set_auto_delete`: `{"conv_id": "<str>", "ttl": <int64>}` — awaits `setAutoDelete(conv_id, ttl: ttl)` and any triggered SQLite conversation persist.
+  - `prune_expired`: `{"conv_id": "<str>"}` — calls `pruneExpiredMessages(in: conv_id)` (reading `nowMs`), records the returned next-expiry timestamp in `prune_next_expiry_ms` (`Int64?` ms, or `null`), and awaits SQLite row deletes.
 - `{"await": {"phase": "<kind>", "step": "<login step, optional>"}, "timeout_ms": 5000}`: wait until the state matches. The Rust runner instead runs the core until no input or effect is pending, then checks the same predicate.
 - `{"await_host": "<call>", "timeout_ms": N}`: wait until the recorded `host` list contains `"<call>"` searching from the current host cursor, then advance the host cursor past that entry (`index + 1`). Used for deterministic ordering (for example awaiting `e2ee_connected` before `ws_push`).
 - `{"ws_push": k}` (optional `"timeout_ms": N`): instruct the fake server to send the next `k` scripted `ws_frame` or `ws_close` entries in script order.
@@ -134,7 +154,7 @@ Run in order:
   - HTTP: `{"kind": "http", "path", "method", "params": {...} | null, "query": {...}}`. `params` is the decrypted ParamCipher payload, keys sorted (`null` when absent or for unencrypted endpoints such as long-poll `GET /`). `query` is the plain query string, keys sorted. Signatures, encrypted blobs and the keys listed under Volatile become `"<volatile>"`.
   - WebSocket connect: `{"kind": "ws_connect", "path", "query": {...}}`.
   - WebSocket client→server frames (`ws_send`): `{"kind": "ws_send", "cmd": <int>, "sub_cmd": <int>, "payload": {...} | "<binary>"}`. `payload` is the decoded JSON body after the 4-byte binary header (`u8 version | u16 LE cmd | u8 sub_cmd`, `{}` when empty, `"<binary>"` when undecodable as UTF-8 JSON). Keepalive pings (`cmd == 2` and `cmd == 4`) are excluded because their count depends on wall time.
-- `host`: ordered list of activities handed to Swift-owned code, `{"call": "<name>", "args": {...}}`. While recording, the engine's trace hook records these and skips the real activity (except where a lifecycle hook in `transport` / `conversations` / `conversation_actions` / `messages` / `bootstrap` / `send` must permit `prepare_store`, `apply_batch`, `apply_parsed_events`, `show_typing` in `send`, or WS/long-poll startup so the domain under test runs).
+- `host`: ordered list of activities handed to Swift-owned code, `{"call": "<name>", "args": {...}}`. While recording, the engine's trace hook records these and skips the real activity (except where a lifecycle hook in `transport` / `conversations` / `conversation_actions` / `messages` / `bootstrap` / `send` / `message_actions` must permit `prepare_store`, `apply_batch`, `apply_parsed_events`, `show_typing` in `send`, `apply_remote_reaction` / `apply_remote_recall` / `apply_remote_delete` in `message_actions`, or WS/long-poll startup so the domain under test runs).
   - Session domain names: `prepare_store {user_id}`, `start_ws {endpoints}`, `start_long_poll {}`, `start_bootstrap {}`, `offer_first_login_transfer {force}`, `reset_domains {}`, `persist_session {}`, `clear_session {}`, `mark_expired {}`.
   - Transport domain names:
     - `apply_batch {cmd, increment_unread, notify_incoming, payload}` *(`cmd` is an integer on the WS path and `null` on the long-poll path)*
@@ -155,13 +175,15 @@ Run in order:
   - Messages and bootstrap domain names (Swift-owned U5–U16 boundaries):
     - `mark_read {conv_id}` *(U5 seen / unread handoff at the end of `openConversation`)*
     - `refresh_board_pins {conv_id}` *(U7 board pins refresh during `openConversation`)*
-    - `apply_remote_reaction {conv_id, msg_id, cli_msg_id, sender_id, r_type, r_icon, event_id, react_client_id, sender_name}` *(U6 remote reaction handler)*
-    - `apply_remote_recall {conv_id, msg_id, cli_msg_id}` *(U6 remote recall handler)*
-    - `apply_remote_delete {conv_id, msg_id, cli_msg_id}` *(U6 remote delete handler)*
+    - `apply_remote_reaction {conv_id, msg_id, cli_msg_id, sender_id, r_type, r_icon, event_id, react_client_id, sender_name}` *(U6 remote reaction handler; allowed to run in `message_actions`)*
+    - `apply_remote_recall {conv_id, msg_id, cli_msg_id}` *(U6 remote recall handler; allowed to run in `message_actions`)*
+    - `apply_remote_delete {conv_id, msg_id, cli_msg_id}` *(U6 remote delete handler; allowed to run in `message_actions`)*
     - `apply_mutes {mutes: [{"conv_id", "start", "duration"}]}` *(U16 mute list handoff during `performBootstrapSync`; `start` falls back to `now_ms / 1000` when `startTime` is absent)*
     - `refresh_cloud {}` *(U11 cloud snapshot refresh at the end of `performBootstrapSync`)*
   - Send domain names (Swift-owned U0b boundaries):
     - `send_e2ee_text {conv_id, text, client_id, quote}` *(E2EE 1-1 send boundary in `sendText`, invoked after the optimistic row is merged; `quote` is `null` or `{"msg_id", "cli_msg_id", "sender_id", "sender_name", "text", "ts_ms"}`, and the result is supplied by `seed.host_results.send_e2ee_text`)*
+  - Message actions domain names (Swift-owned UI boundaries):
+    - `show_card {conv_id, text}` *(banner notice shown via `CardActionCenter.shared.show(text, in: convId)` from U6 react, recall, delete undo, star, and auto-delete flows; traced and skipped during recording)*
 
 ## Session domain state
 
@@ -378,6 +400,63 @@ Cases in `send` extend the Messages and bootstrap domain state, adding per-messa
 - `typing` maps each conversation id with an active incoming indicator in `ZaloEngine.typing` to `{"name": <str>, "on_pc": <bool>}`.
 - `last_send_result` is `null` before any `send_text` completes, then the boolean returned by the most recent `send_text` / `await_send`.
 - `send_logs` holds `"sendText ..."` lines emitted via `EngineLog` (with the wall-clock `HH:mm:ss.SSS ` prefix stripped).
+
+## Message actions domain state
+
+Cases in `message_actions` extend the Send domain state, adding `buttons` to `messages[convId][]`, reaction/star fields to `store.messages[]` and `store.prefs`, and top-level message action state:
+
+```json
+{
+  "messages": {
+    "3000001": [
+      {
+        "buttons": [
+          { "ref": "accept", "label": "Đồng ý", "enabled": true, "help": "" }
+        ]
+      }
+    ]
+  },
+  "delete_undo": null | { "conv_id": "3000001", "count": 1, "deadline_ms": 1700000015000 },
+  "message_confirm": null | {
+    "conv_id": "3000001",
+    "action": "delete_for_me" | "delete_many" | "recall_many" | "pin" | "unpin",
+    "title": "Xóa tin nhắn",
+    "message": "Tin nhắn sẽ chỉ bị xóa ở phía bạn.",
+    "ok": "Xóa",
+    "destructive": true
+  },
+  "auto_delete": null | { "3000001": 3600000 },
+  "starred_ids": [],
+  "prune_next_expiry_ms": null,
+  "cached_profiles": {
+    "3000001": { "name": "Alice", "avatar": "" }
+  },
+  "action_logs": [],
+  "store": {
+    "messages": [
+      {
+        "reactions": [{ "icon": "❤️", "count": 1, "includes_me": true }],
+        "starred": false
+      }
+    ],
+    "prefs": {
+      "starred_ids": [],
+      "seen_reaction_event_ids": []
+    }
+  }
+}
+```
+
+- `messages[convId][].buttons` holds the message's `cardButtons` array (`[{"ref", "label", "enabled", "help"}]`).
+- `delete_undo` is `null` or `{"conv_id", "count", "deadline_ms"}` (without the random `id` UUID).
+- `message_confirm` is `null` or `{"conv_id", "action", "title", "message", "ok", "destructive"}`, where `action` is `"delete_for_me" | "delete_many" | "recall_many" | "pin" | "unpin"`.
+- `auto_delete` is `null` before `loadAutoDelete` / `setAutoDelete` (unless seeded), otherwise a map of `<convId>` to TTL milliseconds.
+- `starred_ids` is the sorted list of in-memory `cachedStarredIds`.
+- `prune_next_expiry_ms` is `null` or the rounded epoch milliseconds returned by the most recent `prune_expired` step.
+- `cached_profiles` mirrors in-memory `ZaloEngine.cachedProfiles` (`{"<uid>": {"name", "avatar"}}`).
+- `action_logs` holds `"react failed..."`, `"recall failed..."`, and `"autodelete: ..."` lines emitted via `EngineLog` (with the wall-clock `HH:mm:ss.SSS ` prefix stripped).
+- `store.messages[]` adds `reactions` (`[{"icon", "count", "includes_me"}]`) and `starred` (`<bool>`) decoded from `raw_json`.
+- `store.prefs` adds `starred_ids` (sorted array from SQLite pref `starredIds`) and `seen_reaction_event_ids` (ordered array from SQLite pref `seenReactionEventIds`).
 
 ## Volatile
 

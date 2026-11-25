@@ -430,8 +430,9 @@ extension ZaloEngine {
               message.status != .failed else {
             return
         }
-        if Date().timeIntervalSince(message.date) >= 86_400 {
-            CardActionCenter.shared.show("Bạn chỉ có thể thu hồi tin nhắn đã gửi trong vòng 24 giờ.", in: conv)
+        let now = Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
+        if now.timeIntervalSince(message.date) >= 86_400 {
+            showActionCard("Bạn chỉ có thể thu hồi tin nhắn đã gửi trong vòng 24 giờ.", in: conv)
             return
         }
         let key = "\(conv)|\(message.id)|recall"
@@ -477,13 +478,13 @@ extension ZaloEngine {
             let text = (err.code == 211)
                 ? "Tin nhắn đã quá thời hạn thu hồi."
                 : "Thu hồi tin nhắn không thành công (mã lỗi \(err.code))."
-            CardActionCenter.shared.show(text, in: conv)
+            showActionCard(text, in: conv)
         } catch is URLError {
             EngineLog.shared.write("recall failed: network error")
-            CardActionCenter.shared.show("Không có kết nối mạng. Vui lòng kiểm tra và thử lại.", in: conv)
+            showActionCard("Không có kết nối mạng. Vui lòng kiểm tra và thử lại.", in: conv)
         } catch {
             EngineLog.shared.write("recall failed: \(error.localizedDescription)")
-            CardActionCenter.shared.show("Thu hồi tin nhắn không thành công.", in: conv)
+            showActionCard("Thu hồi tin nhắn không thành công.", in: conv)
         }
     }
 
@@ -515,22 +516,28 @@ extension ZaloEngine {
             current.removeAll { ids.contains($0.id) }
             messages[conversation] = current
         }
+        let now = Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
         showDeleteUndo(DeleteUndo(
             id: undoId,
             conversationId: conversation,
             count: list.count,
-            deadline: Date().addingTimeInterval(5)
+            deadline: now.addingTimeInterval(5)
         ))
     }
 
     private func showDeleteUndo(_ undo: DeleteUndo) {
+        deleteUndoTimerTask?.cancel()
+        deleteUndoTimerTask = nil
         if let previous = deleteUndo {
             commitPendingDelete(id: previous.id)
         }
         deleteUndo = undo
-        Task { [weak self] in
-            try? await Task.sleep(for: .seconds(max(0.5, undo.deadline.timeIntervalSinceNow)))
-            guard let self, self.deleteUndo == undo else { return }
+        let now = Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
+        let sleepSeconds = max(0.5, undo.deadline.timeIntervalSince(now))
+        deleteUndoTimerTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(sleepSeconds))
+            guard !Task.isCancelled, let self, self.deleteUndo == undo else { return }
+            self.deleteUndoTimerTask = nil
             self.deleteUndo = nil
             self.commitPendingDelete(id: undo.id)
         }
@@ -538,31 +545,36 @@ extension ZaloEngine {
 
     func undoDelete() {
         guard let undo = deleteUndo else { return }
+        deleteUndoTimerTask?.cancel()
+        deleteUndoTimerTask = nil
         deleteUndo = nil
         if let restored = pendingDeletedMessages.removeValue(forKey: undo.id) {
             for message in restored { mergeMessageIntoMemory(message) }
-            CardActionCenter.shared.show("Khôi phục thành công", in: undo.conversationId)
+            showActionCard("Khôi phục thành công", in: undo.conversationId)
         }
     }
 
     func dismissDeleteUndo() {
         guard let undo = deleteUndo else { return }
+        deleteUndoTimerTask?.cancel()
+        deleteUndoTimerTask = nil
         deleteUndo = nil
         commitPendingDelete(id: undo.id)
     }
 
     private func commitPendingDelete(id: String) {
         guard let list = pendingDeletedMessages.removeValue(forKey: id) else { return }
-        Task {
+        trackMessageActionTask { [weak self] in
+            guard let self else { return }
             for msg in list {
                 let resolvedCliId = msg.clientId.isEmpty ? msg.id : msg.clientId
-                try? await sessionClient.deleteMessageForMeAPI(
+                try? await self.sessionClient.deleteMessageForMeAPI(
                     convId: msg.conversationId,
                     msgId: msg.id,
                     cliMsgId: resolvedCliId,
                     senderId: msg.senderId
                 )
-                try? await sqliteStore?.deleteMessage(convId: msg.conversationId, id: msg.id)
+                try? await self.sqliteStore?.deleteMessage(convId: msg.conversationId, id: msg.id)
             }
         }
     }
@@ -571,7 +583,7 @@ extension ZaloEngine {
 
     func setStarred(_ message: ChatMessage, _ on: Bool) {
         if on, message.menu.star == .blocked {
-            CardActionCenter.shared.show("Trò chuyện này đã bật Chặn chia sẻ", in: message.conversationId)
+            showActionCard("Trò chuyện này đã bật Chặn chia sẻ", in: message.conversationId)
             return
         }
         let conv = message.conversationId
@@ -580,15 +592,16 @@ extension ZaloEngine {
             list[idx].menu.star = on ? .unstar : .star
             messages[conv] = list
             let updated = list[idx]
-            Task {
-                if on { cachedStarredIds.insert(message.id) } else { cachedStarredIds.remove(message.id) }
-                try? await sqliteStore?.setPreferenceStrings(key: "starredIds", value: Array(cachedStarredIds))
+            trackMessageActionTask { [weak self] in
+                guard let self else { return }
+                if on { self.cachedStarredIds.insert(message.id) } else { self.cachedStarredIds.remove(message.id) }
+                try? await self.sqliteStore?.setPreferenceStrings(key: "starredIds", value: Array(self.cachedStarredIds))
                 if let stored = ZaloWireParser.encodeChatMessage(updated) {
-                    try? await sqliteStore?.saveMessages([stored])
+                    try? await self.sqliteStore?.saveMessages([stored])
                 }
             }
         }
-        CardActionCenter.shared.show(on ? "Đã đánh dấu tin nhắn" : "Đã bỏ đánh dấu tin nhắn", in: conv)
+        showActionCard(on ? "Đã đánh dấu tin nhắn" : "Đã bỏ đánh dấu tin nhắn", in: conv)
     }
 
     // MARK: Ghim tin nhắn
@@ -740,6 +753,8 @@ extension ZaloEngine {
     }
 
     func resetMessageActions() {
+        deleteUndoTimerTask?.cancel()
+        deleteUndoTimerTask = nil
         forwardRequest = nil
         messageConfirm = nil
         deleteUndo = nil
