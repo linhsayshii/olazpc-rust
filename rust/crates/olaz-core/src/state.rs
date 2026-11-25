@@ -29,6 +29,12 @@ pub struct CoreState {
     pub typing: TypingState,
     // U5-send
     pub send: crate::reduce::send::SendState,
+    // U12
+    pub polls: crate::polls::PollsState,
+    // U7: temporary read-only board pin mirror written through from Swift until U7 lands.
+    pub board_pins: BTreeMap<String, crate::polls::BoardPinList>,
+    // U7: temporary read-only raw board topics mirror written through from Swift until U7 lands.
+    pub board_raw_topics: BTreeMap<String, crate::polls::BoardRawTopics>,
 }
 
 impl CoreState {
@@ -42,6 +48,9 @@ impl CoreState {
             contacts: self.contacts.clone(),
             // U5
             typing: self.typing.active.clone(),
+            // U12
+            polls: self.polls.clone(),
+            board_pins: self.board_pins.clone(),
         }
     }
 
@@ -75,11 +84,15 @@ impl fmt::Debug for CoreState {
             .field("typing", &self.typing)
             // U5-send
             .field("send", &self.send)
+            // U12
+            .field("polls", &self.polls)
+            .field("board_pins_count", &self.board_pins.len())
+            .field("board_raw_topics_count", &self.board_raw_topics.len())
             .finish()
     }
 }
 
-/// Full observable snapshot across session + conversations + messages + contacts + typing domains.
+/// Full observable snapshot across session + conversations + messages + contacts + typing + polls domains.
 #[derive(Clone, Default)]
 pub struct CoreSnapshot {
     pub session: SessionSnapshot,
@@ -88,6 +101,9 @@ pub struct CoreSnapshot {
     pub contacts: ContactsState,
     // U5
     pub typing: BTreeMap<String, TypingStatus>,
+    // U12
+    pub polls: crate::polls::PollsState,
+    pub board_pins: BTreeMap<String, crate::polls::BoardPinList>,
 }
 
 impl fmt::Debug for CoreSnapshot {
@@ -99,6 +115,9 @@ impl fmt::Debug for CoreSnapshot {
             .field("contacts", &self.contacts)
             // U5
             .field("typing_count", &self.typing.len())
+            // U12
+            .field("polls", &self.polls)
+            .field("board_pins_count", &self.board_pins.len())
             .finish()
     }
 }

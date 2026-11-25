@@ -40,6 +40,8 @@ pub enum DirtyKey {
     Contacts,
     // U5
     Typing,
+    // U12
+    Polls,
 }
 
 /// Set of keys dirtied by one `reduce` step.
@@ -85,6 +87,8 @@ pub struct CoreChanges {
     pub contacts: Option<ContactsState>,
     // U5
     pub typing: Option<BTreeMap<String, TypingStatus>>,
+    // U12
+    pub polls: Option<crate::polls::PollsState>,
 }
 
 impl fmt::Debug for CoreChanges {
@@ -98,6 +102,7 @@ impl fmt::Debug for CoreChanges {
             .field("has_message_meta", &self.message_meta.is_some())
             .field("has_contacts", &self.contacts.is_some())
             .field("has_typing", &self.typing.is_some())
+            .field("has_polls", &self.polls.is_some())
             .finish()
     }
 }
@@ -123,6 +128,8 @@ struct DirtyBuffer {
     contacts: Option<ContactsState>,
     // U5
     typing: Option<BTreeMap<String, TypingStatus>>,
+    // U12
+    polls: Option<crate::polls::PollsState>,
     closed: bool,
 }
 
@@ -138,6 +145,7 @@ impl DirtyBuffer {
             || self.message_meta.is_some()
             || self.contacts.is_some()
             || self.typing.is_some()
+            || self.polls.is_some()
     }
 }
 
@@ -256,6 +264,10 @@ impl ChangeHub {
                 DirtyKey::Typing => {
                     buf.typing = Some(state.typing.active.clone());
                 }
+                // U12
+                DirtyKey::Polls => {
+                    buf.polls = Some(state.polls.clone());
+                }
             }
             buf.dirty.insert(key);
         }
@@ -328,6 +340,8 @@ impl ChangeHub {
                             contacts: None,
                             // U5
                             typing: None,
+                            // U12
+                            polls: None,
                         });
                     }
                 }
@@ -382,6 +396,8 @@ impl ChangeHub {
                         contacts: buf.contacts.take(),
                         // U5
                         typing: buf.typing.take(),
+                        // U12
+                        polls: buf.polls.take(),
                     });
                 }
                 if buf.closed {
