@@ -6,7 +6,7 @@ The oracle is what can be observed from outside the engine: the domain state the
 
 ## Files
 
-- `rust/crates/olaz-core/cases/<domain>.jsonl`: one case per line, sorted by `name`. Domains: `session`, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`.
+- `rust/crates/olaz-core/cases/<domain>.jsonl`: one case per line, sorted by `name`. Domains: `session`, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `search`.
 - `rust/crates/olaz-core/cases/known-diffs.jsonl`: intended differences, one line `{"domain", "name", "path", "actual", "reason"}` each. Only lines the user approved. A line whose case no longer differs fails the runner.
 - Data is synthetic. Never content from a real account, never a real token.
 
@@ -34,22 +34,22 @@ The oracle is what can be observed from outside the engine: the domain state the
 - `prefs`: store preference strings present before the run.
 - `poll_state` *(optional, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`)*: `null`, or `ZaloPollState` / `PollState` camelCase JSON (`{"lastActionId": "...", "lastActionIdOther": "...", "queues": {"1": {"lastId": "...", "ids": []}, ...}}`) seeded before long-polling starts.
 - `ws_cursors` *(optional, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`)*: `null`, or a map of `"<cmd>_<subCmd>"` to `{"lastId": "...", "preIds": [...]}` (`ZaloWSQueueCursorSnapshot` / `WsQueueCursorSnapshot`) seeded before WebSocket connects.
-- `suppress` *(optional, runner metadata, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`)*: array of transport names (`"ws"`, `"long_poll"`, or both) to suppress during the run. Both the recorder's `hostTrace` and the Rust replay obey it: `start_ws` / `start_long_poll` are still traced, `hostTrace` returns `false` for listed transports, a suppressed WS never connects, and a suppressed long-poll never ticks.
-- `ws_auth` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`)*: `"manual"` (or omitted for auto-auth). When `"manual"`, the fake server does not send the initial `cmd == 1` auth reply automatically on WebSocket connect; instead, that `cmd == 1` `ws_frame` remains the first scripted `ws_frame` and is delivered by an explicit `ws_push` step (typically `await_host start_bootstrap` → `ws_push 1` → `await_host e2ee_connected`).
-- `contacts` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`)*: `{"friends": [{"id", "name", "zalo_name", "avatar", "last_active_ms", "online", "section", "sort_key"}], "groups": [{"id", "name", "avatar", "members", "sort_key"}], "received": [{"id", "name", "avatar", "message", "date_ms"}], "sent": [{"id", "name", "avatar", "message", "date_ms"}], "pending_request_count": <int>, "loading_requests": <bool>, "search": {"status", "error", "user"}, "notice": {"seq", "ok", "text"}, "friends_loaded": <bool>, "groups_loaded": <bool>, "aliases": {"<uid>": "<alias>"}, "cached_profiles": {"<uid>": {"name", "avatar"}}, "cached_groups": {"<gid>": {"name", "avatar", "members"}}, "friend_global_ids": {"<uid>": "<gid>"}, "gid_to_uid_map": {"<gid>": "<uid>"}}`. Friends/groups/requests/search/notice populate `ContactsState`; aliases/profiles/groups/global-ids seed the corresponding store preferences before boot so `loadLocalAccountState` loads them (in `contacts`, `friend_global_ids` `{"<uid>": "<gid>"}` is inverted into SQLite `gidToUidMap` if `gid_to_uid_map` is omitted).
+- `suppress` *(optional, runner metadata, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `search`)*: array of transport names (`"ws"`, `"long_poll"`, or both) to suppress during the run. Both the recorder's `hostTrace` and the Rust replay obey it: `start_ws` / `start_long_poll` are still traced, `hostTrace` returns `false` for listed transports, a suppressed WS never connects, and a suppressed long-poll never ticks.
+- `ws_auth` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `search`)*: `"manual"` (or omitted for auto-auth). When `"manual"`, the fake server does not send the initial `cmd == 1` auth reply automatically on WebSocket connect; instead, that `cmd == 1` `ws_frame` remains the first scripted `ws_frame` and is delivered by an explicit `ws_push` step (typically `await_host start_bootstrap` → `ws_push 1` → `await_host e2ee_connected`).
+- `contacts` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `search`)*: `{"friends": [{"id", "name", "zalo_name", "avatar", "last_active_ms", "online", "section", "sort_key"}], "groups": [{"id", "name", "avatar", "members", "sort_key"}], "received": [{"id", "name", "avatar", "message", "date_ms"}], "sent": [{"id", "name", "avatar", "message", "date_ms"}], "pending_request_count": <int>, "loading_requests": <bool>, "search": {"status", "error", "user"}, "notice": {"seq", "ok", "text"}, "friends_loaded": <bool>, "groups_loaded": <bool>, "aliases": {"<uid>": "<alias>"}, "cached_profiles": {"<uid>": {"name", "avatar"}}, "cached_groups": {"<gid>": {"name", "avatar", "members"}}, "friend_global_ids": {"<uid>": "<gid>"}, "gid_to_uid_map": {"<gid>": "<uid>"}}`. Friends/groups/requests/search/notice populate `ContactsState`; aliases/profiles/groups/global-ids seed the corresponding store preferences before boot so `loadLocalAccountState` loads them (in `contacts`, `friend_global_ids` `{"<uid>": "<gid>"}` is inverted into SQLite `gidToUidMap` if `gid_to_uid_map` is omitted).
 - `blocked_users` *(optional, `contacts`)*: `null`, or array of `{"id": "<uid>", "name": "<str>", "avatar": <str|null>}` pre-seeding `ZaloEngine.blockedUsers` before steps run.
 - `pinned_ids`, `archived_ids`, `unread_marks`, `hidden_ids` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`)*: arrays of conversation ids seeded into SQLite `pinnedIds`, `archivedIds`, `unreadMarks`, `hiddenIds` preferences before boot.
 - `starred_ids` *(optional, `message_actions`)*: array of message ids seeded into SQLite `starredIds` preference before boot (`loadLocalAccountState` loads them into `cachedStarredIds`).
 - `seen_reaction_event_ids` *(optional, `message_actions`)*: array of reaction dedupe keys seeded into SQLite `seenReactionEventIds` preference before boot (`loadLocalAccountState` loads them into `seenReactionEventIds` / `seenReactionEventOrder`).
 - `hidden_pin_md5`, `hidden_pin_hash` *(optional, `conversation_actions`)*: `null` or digest hex string seeded into SQLite `hiddenPinMD5` / `hiddenPinHash` preferences before boot.
 - `labels_pref` *(optional, `conversation_actions`)*: array of `{"id", "name", "color", "convIds"}` seeded into SQLite `labels` preference before boot.
-- `activity_ranks` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`)*: map of `<convId>` to positive integer rank seeded into SQLite `activityRanks` preference before boot.
-- `local_conversations` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`)*: array of `{"id", "is_group", "name", "avatar", "pinned", "members", "unread", "preview_text", "preview_ts_ms", "preview_from_me", "updated_at_ms"}` seeded into the SQLite `conversations` table before boot (`loadLocalAccountState` reads them before any network).
-- `local_messages` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`)*: array of `{"id", "conv_id", "client_id", "sender_id", "sender_name", "sender_avatar", "is_mine", "text", "kind_tag", "ts_ms", "status", "raw_json"}` seeded into the SQLite `messages` table before boot.
-- `open_conversation_id` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`)*: `null` or conversation id set as `openConversationId` before steps run.
+- `activity_ranks` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `search`)*: map of `<convId>` to positive integer rank seeded into SQLite `activityRanks` preference before boot.
+- `local_conversations` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `search`)*: array of `{"id", "is_group", "name", "avatar", "pinned", "members", "unread", "preview_text", "preview_ts_ms", "preview_from_me", "updated_at_ms"}` seeded into the SQLite `conversations` table before boot (`loadLocalAccountState` reads them before any network).
+- `local_messages` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `search`)*: array of `{"id", "conv_id", "client_id", "sender_id", "sender_name", "sender_avatar", "is_mine", "text", "kind_tag", "ts_ms", "status", "raw_json"}` seeded into the SQLite `messages` table before boot.
+- `open_conversation_id` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `search`)*: `null` or conversation id set as `openConversationId` before steps run.
 - `history_full_refresh_at` *(optional, `messages`, `bootstrap`)*: `null`, or string/number seeded into SQLite `historyFullRefreshAt` preference before boot (stored as stringified epoch seconds).
-- `history_freshness` *(optional, `messages`, `bootstrap`, `send`, `message_actions`)*: `null`, or map of `<convId>` to `"up_to_date" | "stale"` pre-seeded into `ZaloEngine.historyFreshness` before steps run.
-- `next_client_id` *(optional, `send`, `message_actions`)*: positive 64-bit integer seeding `nextClientId()` before steps run. Each `nextClientId()` call returns the current seeded value and increments it by 1.
+- `history_freshness` *(optional, `messages`, `bootstrap`, `send`, `message_actions`, `search`)*: `null`, or map of `<convId>` to `"up_to_date" | "stale"` pre-seeded into `ZaloEngine.historyFreshness` before steps run.
+- `next_client_id` *(optional, `send`, `message_actions`, `search`)*: positive 64-bit integer seeding `nextClientId()` before steps run. Each `nextClientId()` call returns the current seeded value and increments it by 1.
 - `auto_delete` *(optional, `send`, `message_actions`)*: map of `<convId>` to positive integer TTL milliseconds pre-seeded into `ZaloEngine.autoDelete` before steps run.
 - `e2ee_threads` *(optional, `send`, `message_actions`)*: array of peer uid strings pre-seeded into SQLite `e2eeThreadsV1` preference before boot (`loadLocalAccountState` loads them into `e2eeManager`).
 - `host_results` *(optional, `send`, `message_actions`)*: map of host call name (e.g. `"send_e2ee_text"`) to an ordered queue of scripted outcomes: `{"msg_id": "<str>", "cli_msg_id": "<str>", "ts_ms": <int64>}` on success, or `{"error": {"code": <int>, "message": "<str>", "url": "<str>"}}` (or `{"error": "<message>"}`) on failure. Consumed in order when the host boundary runs.
@@ -204,6 +204,12 @@ Run in order:
   - `pins_state`: `{"json": {...}}` — calls `handlePins(state: json)` to update `ZaloEngine.pins` mid-scenario.
   - `reset_polls`: `{}` — calls `resetPolls()` and cancels pending virtual debounces.
   - `poll_model_checks`: `{"checks": [...]}` — exercises pure poll model branches unreachable from engine actions and records outputs in `results["<stepIndex>"]`.
+- Search `cmd` steps (`search` domain):
+  - Optional `"now_ms": <int64>` on `cmd` steps seeds `nowMs` for the duration of that step (used for `delete_for_me` / `delete_many` undo bar deadline).
+  - Inherits `start`, `open`, `close`, `apply_batch`, `send_text`, `await_send`, `delete_for_me`, `delete_many`, `undo_delete`, `dismiss_delete_undo`, `answer_confirm`.
+  - `search`: `{"conv_id": "<str>", "query": "<str>", "limit": <int, optional>}` — awaits `searchMessages(in: conv_id, query: query, limit: limit ?? 50)` and records the ordered array of matched message `id` strings in `results["<stepIndex>"]`.
+  - `ensure_loaded`: `{"conv_id": "<str>", "msg_id": "<str, optional>", "message": <object, optional>}` — resolves a `ChatMessage` from either `message` (canonical `ChatMessageJSON` with `conv_id`/`conversationId`, `date_ms`/`date`, `client_id`/`clientId`, `sender_id`/`senderId`, `sender_name`/`senderName`, `is_mine`/`isMine`, `is_e2ee`/`isE2EE`, `kind`, `text`) or `msg_id` (looked up in memory or SQLite), awaits `ensureMessageLoaded(msg, in: conv_id)`, and records the returned boolean in `results["<stepIndex>"]`.
+  - `load_quoted`: `{"conv_id": "<str>", "msg_id": "<str>"}` — looks up `msg_id` in `messages[conv_id]` (or SQLite store), awaits `loadQuotedMessage(of: msg, in: conv_id)`, and records the returned message `id` string or `null` in `results["<stepIndex>"]`.
 - `{"await": {"phase": "<kind>", "step": "<login step, optional>"}, "timeout_ms": 5000}`: wait until the state matches. The Rust runner instead runs the core until no input or effect is pending, then checks the same predicate.
 - `{"await_host": "<call>", "timeout_ms": N}`: wait until the recorded `host` list contains `"<call>"` searching from the current host cursor, then advance the host cursor past that entry (`index + 1`). Used for deterministic ordering (for example awaiting `e2ee_connected` before `ws_push`).
 - `{"ws_push": k}` (optional `"timeout_ms": N`): instruct the fake server to send the next `k` scripted `ws_frame` or `ws_close` entries in script order.
@@ -708,6 +714,22 @@ Cases in `polls` extend the Groups domain state with `polls`, `pins`, and `poll_
   - `last_attempt_ms` maps `<pollId>` to rounded epoch ms from `PollClock.lastAttempt` (filtered to `seed.watched_check_ids` once eviction has occurred).
   - `rewatchPolls` iteration order is harmless because `expect.requests` is compared as a sorted multiset.
 - `refresh_board_pins` boundary: `refresh_board_pins` remains the U4 `traceU4Host` call (recorded in `expect.host` and skipped during recording without `host_results`); `pins` stays as seeded via `seed.pins` or updated via `pins_state` until U7 owns the board refresh.
+
+## Search domain state
+
+Cases in `search` extend the Message actions domain state with step results:
+
+```json
+{
+  "results": {
+    "3": ["m2", "m1"],
+    "4": true,
+    "5": "m0"
+  }
+}
+```
+
+- `results`: map of 0-based `steps` index string (`"0"`, `"1"`, ...) for each `search`, `ensure_loaded`, or `load_quoted` step executed so far.
 
 ## Volatile
 
