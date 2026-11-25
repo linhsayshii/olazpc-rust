@@ -85,7 +85,7 @@ extension ZaloEngine {
     // MARK: Actions
 
     func refreshContacts() {
-        Task { [weak self] in
+        trackContactsTask { [weak self] in
             await self?.performContactsSync()
         }
     }
@@ -212,7 +212,7 @@ extension ZaloEngine {
     }
 
     func acceptFriendRequest(_ id: String) {
-        Task { [weak self] in
+        trackContactsTask { [weak self] in
             guard let self else { return }
             do {
                 _ = try await sessionClient.acceptFriendRequestAPI(uid: id)
@@ -225,7 +225,7 @@ extension ZaloEngine {
     }
 
     func declineFriendRequest(_ id: String) {
-        Task { [weak self] in
+        trackContactsTask { [weak self] in
             guard let self else { return }
             do {
                 _ = try await sessionClient.rejectFriendRequestAPI(uid: id)
@@ -239,7 +239,7 @@ extension ZaloEngine {
     }
 
     func cancelFriendRequest(_ id: String) {
-        Task { [weak self] in
+        trackContactsTask { [weak self] in
             guard let self else { return }
             do {
                 _ = try await sessionClient.cancelFriendRequestAPI(uid: id)
@@ -255,7 +255,7 @@ extension ZaloEngine {
         let trimmed = phone.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         contacts.search = ContactsState.Search(status: .searching)
-        Task { [weak self] in
+        trackContactsTask { [weak self] in
             guard let self else { return }
             do {
                 let resp = try await sessionClient.searchFriendByPhone(trimmed)
@@ -298,7 +298,7 @@ extension ZaloEngine {
     }
 
     func sendFriendRequest(to id: String, message: String) {
-        Task { [weak self] in
+        trackContactsTask { [weak self] in
             guard let self else { return }
             do {
                 _ = try await sessionClient.sendFriendRequestAPI(toUid: id, message: message)
