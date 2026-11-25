@@ -39,12 +39,12 @@ extension ZaloEngine {
         } catch {
             let code = (error as? ZaloSessionError)?.code
             EngineLog.shared.write("group admin: failed code=\(code.map(String.init) ?? "-")")
-            CardActionCenter.shared.show(code == 166 ? "Chỉ có trưởng/phó nhóm thực hiện được tính năng này." : fail, in: gid)
+            showActionCard(code == 166 ? "Chỉ có trưởng/phó nhóm thực hiện được tính năng này." : fail, in: gid)
             return false
         }
         groupMemberCache[gid] = nil
         await refreshGroupMetadata(gid)
-        if !ok.isEmpty { CardActionCenter.shared.show(ok, in: gid) }
+        if !ok.isEmpty { showActionCard(ok, in: gid) }
         return true
     }
 
@@ -100,7 +100,7 @@ extension ZaloEngine {
         do {
             return try await sessionClient.setGroupLinkAPI(groupId: groupId, renew: renew)
         } catch {
-            CardActionCenter.shared.show("Không thể thực hiện, vui lòng thử lại", in: ZaloWireParser.groupConvId(groupId))
+            showActionCard("Không thể thực hiện, vui lòng thử lại", in: ZaloWireParser.groupConvId(groupId))
             return nil
         }
     }

@@ -409,13 +409,14 @@ struct PollStore: Equatable {
 // MARK: - Engine
 
 @MainActor
-private enum PollClock {
+internal enum PollClock {
     static var refreshTasks: [String: Task<Void, Never>] = [:]
     /// Poll event messages already answered with a refresh (each message once).
     static var seenMessages: Set<String> = []
     /// Polls on screen (id → conversation): re-registered with the page after a WebContent reload.
     static var watched: [String: String] = [:]
     static var lastAttempt: [String: Date] = [:]
+    static var didEvictWatched = false
 }
 
 extension ZaloEngine {
@@ -425,16 +426,18 @@ extension ZaloEngine {
         if PollClock.watched.count > 500, let drop = PollClock.watched.keys.first(where: { $0 != id }) {
             PollClock.watched[drop] = nil
             PollClock.lastAttempt[drop] = nil
+            PollClock.didEvictWatched = true
         }
         guard polls.details[id] == nil else { return }
-        if let last = PollClock.lastAttempt[id], Date.now.timeIntervalSince(last) < 5 { return }
-        PollClock.lastAttempt[id] = .now
+        let now = Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
+        if let last = PollClock.lastAttempt[id], now.timeIntervalSince(last) < 5 { return }
+        PollClock.lastAttempt[id] = now
         polls.failed.remove(id)
         refreshPoll(id)
     }
 
     func retryPoll(_ id: String, in conversationId: String) {
-        PollClock.lastAttempt[id] = .now
+        PollClock.lastAttempt[id] = Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
         polls.failed.remove(id)
         refreshPoll(id)
     }
@@ -445,7 +448,7 @@ extension ZaloEngine {
 
     func refreshPoll(_ id: String) {
         guard !id.isEmpty else { return }
-        Task { [weak self] in
+        trackPollTask { [weak self] in
             guard let self else { return }
             guard let box = try? await sessionClient.fetchPollDetail(pollId: id),
                   let dataNode = box.dict["data"] as? [String: Any] else {
@@ -777,15 +780,22 @@ extension ZaloEngine {
     }
 
     func notePollMessages(_ incoming: [ChatMessage]) {
+        let now = Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
         for message in incoming {
             guard case .poll(let info) = message.kind, !info.pollId.isEmpty, polls.details[info.pollId] != nil,
-                  message.date > Date.now.addingTimeInterval(-120), PollClock.seenMessages.insert(message.id).inserted else { continue }
+                  message.date > now.addingTimeInterval(-120), PollClock.seenMessages.insert(message.id).inserted else { continue }
             if PollClock.seenMessages.count > 2000 { PollClock.seenMessages = [message.id] }
             let id = info.pollId
             PollClock.refreshTasks[id]?.cancel()
             PollClock.refreshTasks[id] = Task { [weak self] in
-                try? await Task.sleep(for: .milliseconds(1500))
-                guard !Task.isCancelled else { return }
+                let completed: Bool
+                if let sleepSeam = self?.pollDebounceSleep {
+                    completed = await sleepSeam(1500)
+                } else {
+                    try? await Task.sleep(for: .milliseconds(1500))
+                    completed = !Task.isCancelled
+                }
+                guard completed, !Task.isCancelled else { return }
                 PollClock.refreshTasks[id] = nil
                 self?.refreshPoll(id)
             }
@@ -809,5 +819,6 @@ extension ZaloEngine {
         PollClock.seenMessages = []
         PollClock.watched = [:]
         PollClock.lastAttempt = [:]
+        PollClock.didEvictWatched = false
     }
 }
