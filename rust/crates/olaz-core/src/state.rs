@@ -11,6 +11,7 @@ use olaz_net::NetworkErrorKind;
 use olaz_ws::CursorMap;
 use serde_json::{Map, Value, json};
 
+use crate::actions::{ActionsState, DeleteUndoSnapshot};
 use crate::conversations::ConversationsState;
 use crate::typing::{TypingState, TypingStatus};
 
@@ -22,6 +23,8 @@ pub struct CoreState {
     pub conversations: ConversationsState,
     // U5
     pub typing: TypingState,
+    // U6
+    pub actions: ActionsState,
 }
 
 impl CoreState {
@@ -33,6 +36,9 @@ impl CoreState {
             conversations: self.conversations.clone(),
             // U5
             typing: self.typing.active.clone(),
+            // U6
+            delete_undo: self.actions.delete_undo.snapshot(),
+            auto_delete: self.actions.auto_delete.clone(),
         }
     }
 }
@@ -45,6 +51,8 @@ impl fmt::Debug for CoreState {
             .field("conversations", &self.conversations)
             // U5
             .field("typing", &self.typing)
+            // U6
+            .field("actions", &self.actions)
             .finish()
     }
 }
@@ -56,6 +64,9 @@ pub struct CoreSnapshot {
     pub conversations: ConversationsState,
     // U5
     pub typing: BTreeMap<String, TypingStatus>,
+    // U6
+    pub delete_undo: Option<DeleteUndoSnapshot>,
+    pub auto_delete: Option<BTreeMap<String, i64>>,
 }
 
 impl fmt::Debug for CoreSnapshot {
@@ -65,6 +76,12 @@ impl fmt::Debug for CoreSnapshot {
             .field("conversations", &self.conversations)
             // U5
             .field("typing_count", &self.typing.len())
+            // U6
+            .field("delete_undo", &self.delete_undo)
+            .field(
+                "auto_delete_count",
+                &self.auto_delete.as_ref().map(BTreeMap::len),
+            )
             .finish()
     }
 }

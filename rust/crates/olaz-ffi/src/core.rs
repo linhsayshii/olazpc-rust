@@ -790,6 +790,8 @@ impl CoreOfflineConversations {
                 }
                 // U5 (wired to FFI once U4+U5 cut over Swift)
                 DirtyKey::Typing => {}
+                // U6 (wired to FFI once U4+U6 cut over Swift)
+                DirtyKey::DeleteUndo | DirtyKey::AutoDelete => {}
             }
         }
         rec

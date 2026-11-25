@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use olaz_api::{HiddenConversationsSnapshot, PollState};
+use olaz_api::{AutoDeleteFetchOutcome, HiddenConversationsSnapshot, PollState};
 use olaz_net::{LoginAccount, NetError, QrScanResult, QrTicket, SessionStatus};
 use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
@@ -199,6 +199,16 @@ pub enum Command {
     SetSendTypingEnabled {
         enabled: bool,
     },
+
+    // U6
+    UndoDelete,
+    DismissDeleteUndo,
+    LoadAutoDelete,
+    SetAutoDelete {
+        conv_id: String,
+        ttl: i64,
+        now_ms: i64,
+    },
 }
 
 impl fmt::Debug for Command {
@@ -355,6 +365,15 @@ impl fmt::Debug for Command {
             Self::SetSendTypingEnabled { enabled } => f
                 .debug_struct("SetSendTypingEnabled")
                 .field("enabled", enabled)
+                .finish(),
+            // U6
+            Self::UndoDelete => f.write_str("UndoDelete"),
+            Self::DismissDeleteUndo => f.write_str("DismissDeleteUndo"),
+            Self::LoadAutoDelete => f.write_str("LoadAutoDelete"),
+            Self::SetAutoDelete { ttl, now_ms, .. } => f
+                .debug_struct("SetAutoDelete")
+                .field("ttl", ttl)
+                .field("now_ms", now_ms)
                 .finish(),
         }
     }
@@ -638,6 +657,22 @@ pub enum Input {
         conv_id: String,
         expiry_gen: u64,
     },
+
+    // U6
+    DeleteUndoExpired {
+        undo_gen: u64,
+    },
+    AutoDeleteLoaded {
+        outcome: Option<AutoDeleteFetchOutcome>,
+        op_id: Option<u64>,
+    },
+    AutoDeleteUpdated {
+        conv_id: String,
+        ttl: i64,
+        now_ms: i64,
+        error_type: Option<String>,
+        op_id: Option<u64>,
+    },
 }
 
 impl fmt::Debug for Input {
@@ -866,6 +901,29 @@ impl fmt::Debug for Input {
             Self::TypingExpired { expiry_gen, .. } => f
                 .debug_struct("TypingExpired")
                 .field("expiry_gen", expiry_gen)
+                .finish(),
+            // U6
+            Self::DeleteUndoExpired { undo_gen } => f
+                .debug_struct("DeleteUndoExpired")
+                .field("undo_gen", undo_gen)
+                .finish(),
+            Self::AutoDeleteLoaded { outcome, op_id } => f
+                .debug_struct("AutoDeleteLoaded")
+                .field("outcome", outcome)
+                .field("op_id", op_id)
+                .finish(),
+            Self::AutoDeleteUpdated {
+                ttl,
+                now_ms,
+                error_type,
+                op_id,
+                ..
+            } => f
+                .debug_struct("AutoDeleteUpdated")
+                .field("ttl", ttl)
+                .field("now_ms", now_ms)
+                .field("error_type", error_type)
+                .field("op_id", op_id)
                 .finish(),
         }
     }

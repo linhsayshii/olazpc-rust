@@ -1254,7 +1254,12 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
         | Command::HandleTyping { .. }
         | Command::NotifyTyping { .. }
         | Command::ResetOutgoingTyping { .. }
-        | Command::SetSendTypingEnabled { .. } => {
+        | Command::SetSendTypingEnabled { .. }
+        // U6
+        | Command::UndoDelete
+        | Command::DismissDeleteUndo
+        | Command::LoadAutoDelete
+        | Command::SetAutoDelete { .. } => {
             complete_op(op_id, OpResult::Unit, false, out);
         }
     }

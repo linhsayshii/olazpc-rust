@@ -381,6 +381,14 @@ impl CoreHandle {
     pub fn stop(&self) {
         let _ = self.tx.send(ActorMsg::Stop);
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_sink(&self) -> ActorSink {
+        ActorSink {
+            tx: self.tx.clone(),
+            tracker: Arc::clone(&self.tracker),
+        }
+    }
 }
 
 impl Drop for CoreHandle {

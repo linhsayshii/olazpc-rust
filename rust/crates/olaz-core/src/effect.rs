@@ -9,6 +9,7 @@ use olaz_store::StoredConversation;
 use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
+use crate::actions::DeleteUndoItem;
 use crate::conversations::{ConversationActionResult, IdentityTable, PinBoard};
 use crate::input::{HiddenPinSyncKind, SeenTarget, StoreToken};
 use crate::reduce::classify::MobileSyncEvent;
@@ -54,6 +55,11 @@ pub enum StoreOp {
         op_id: Option<u64>,
         group_ids: Vec<String>,
         my_uid: String,
+    },
+    // U6
+    DeleteMessage {
+        conv_id: String,
+        id: String,
     },
 }
 
@@ -106,6 +112,8 @@ impl fmt::Debug for StoreOp {
                 .debug_struct("LoadMentionPreviewMessages")
                 .field("group_count", &group_ids.len())
                 .finish(),
+            // U6
+            Self::DeleteMessage { .. } => f.write_str("DeleteMessage"),
         }
     }
 }
@@ -220,6 +228,12 @@ pub enum HostCall {
         start_explicit: bool,
         duration: i64,
     },
+
+    // U6
+    ShowCard {
+        conv_id: String,
+        text: String,
+    },
 }
 
 impl fmt::Debug for HostCall {
@@ -307,6 +321,11 @@ impl fmt::Debug for HostCall {
                 .debug_struct("Mute")
                 .field("set", set)
                 .field("duration", duration)
+                .finish(),
+            // U6
+            Self::ShowCard { text, .. } => f
+                .debug_struct("ShowCard")
+                .field("text_len", &text.len())
                 .finish(),
         }
     }
@@ -457,6 +476,23 @@ pub enum Effect {
     },
     /// Cancels any active incoming typing expiry timer for `conv_id`.
     CancelTypingExpiry { conv_id: String },
+
+    // U6
+    /// Arms the 5 s delete-for-me undo expiry timer.
+    StartDeleteUndoExpiry { undo_gen: u64, delay: Duration },
+    /// Cancels any active delete-for-me undo expiry timer.
+    CancelDeleteUndoExpiry,
+    /// Commits a delete-for-me batch (`delete_message_for_me` API + SQLite delete per item).
+    CommitDeleteBatch { items: Vec<DeleteUndoItem> },
+    /// Calls `ZaloApi::fetch_auto_delete` and reports `Input::AutoDeleteLoaded`.
+    FetchAutoDeleteApi { op_id: Option<u64> },
+    /// Calls `ZaloApi::update_auto_delete` and reports `Input::AutoDeleteUpdated`.
+    UpdateAutoDeleteApi {
+        conv_id: String,
+        ttl: i64,
+        now_ms: i64,
+        op_id: Option<u64>,
+    },
 
     /// Domain activity delegated to Swift via `CoreHost`.
     Host(HostCall),
@@ -611,6 +647,29 @@ impl fmt::Debug for Effect {
                 .field("delay_ms", &delay.as_millis())
                 .finish(),
             Self::CancelTypingExpiry { .. } => f.write_str("CancelTypingExpiry"),
+            // U6
+            Self::StartDeleteUndoExpiry { undo_gen, delay } => f
+                .debug_struct("StartDeleteUndoExpiry")
+                .field("undo_gen", undo_gen)
+                .field("delay_ms", &delay.as_millis())
+                .finish(),
+            Self::CancelDeleteUndoExpiry => f.write_str("CancelDeleteUndoExpiry"),
+            Self::CommitDeleteBatch { items } => f
+                .debug_struct("CommitDeleteBatch")
+                .field("count", &items.len())
+                .finish(),
+            Self::FetchAutoDeleteApi { op_id } => f
+                .debug_struct("FetchAutoDeleteApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::UpdateAutoDeleteApi {
+                ttl, now_ms, op_id, ..
+            } => f
+                .debug_struct("UpdateAutoDeleteApi")
+                .field("ttl", ttl)
+                .field("now_ms", now_ms)
+                .field("op_id", op_id)
+                .finish(),
             Self::Host(call) => f.debug_tuple("Host").field(call).finish(),
         }
     }

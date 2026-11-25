@@ -7,6 +7,7 @@
 //!   emitted order while network calls may run concurrently as cancellable tasks.
 //! - Consumers pull coalesced state snapshots via [`changes::ChangeHub::next_changes`].
 
+pub mod actions;
 pub mod actor;
 pub mod changes;
 pub mod conversations;
@@ -18,6 +19,17 @@ pub mod state;
 pub mod typed_chat;
 pub mod typing;
 
+// U6
+pub use actions::{
+    AUTO_DELETE_FAILED_CARD_TEXT, ActionsState, AutoDeleteSystemNotice, DELETE_UNDO_DURATION,
+    DELETE_UNDO_DURATION_MS, DeleteUndoItem, DeleteUndoSnapshot, DeleteUndoState,
+    PENDING_LOCAL_REACTION_TTL_MS, PREF_SEEN_REACTION_EVENT_IDS, PendingLocalReaction,
+    PendingLocalReactions, RECALL_OVER_24H_CARD_TEXT, RECALL_WINDOW_MS, REMOTE_DELETE_MATCH_POLICY,
+    RESTORE_SUCCESS_CARD_TEXT, RecallFailure, RemoteDeleteMatchPolicy, SEEN_REACTION_CAP,
+    SeenReactionKeys, auto_delete_system_notice, dedupe_conv_id, find_server_msg_id,
+    is_over_recall_window, local_reaction_seen_keys, reaction_dedupe_keys, recall_error_card_text,
+    recall_error_log_line, remote_delete_matches, remote_delete_store_ids, swift_error_type_name,
+};
 pub use actor::{ActorSink, CoreHandle};
 pub use changes::{ChangeHub, CoreChanges, DirtyKey, DirtySet};
 pub use conversations::{

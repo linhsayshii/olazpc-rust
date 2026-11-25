@@ -68,6 +68,25 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         }
         | Input::TypingExpired { .. } => crate::typing::reduce_typing(state, input, &mut out),
 
+        // U6
+        Input::Command(
+            Command::UndoDelete
+            | Command::DismissDeleteUndo
+            | Command::LoadAutoDelete
+            | Command::SetAutoDelete { .. },
+        )
+        | Input::OpRequest {
+            cmd:
+                Command::UndoDelete
+                | Command::DismissDeleteUndo
+                | Command::LoadAutoDelete
+                | Command::SetAutoDelete { .. },
+            ..
+        }
+        | Input::DeleteUndoExpired { .. }
+        | Input::AutoDeleteLoaded { .. }
+        | Input::AutoDeleteUpdated { .. } => crate::actions::reduce_actions(state, input, &mut out),
+
         Input::Command(_)
         | Input::OpRequest { .. }
         | Input::BatchDeltaApplied { .. }
