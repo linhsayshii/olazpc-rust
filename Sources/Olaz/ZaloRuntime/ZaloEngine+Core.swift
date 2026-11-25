@@ -214,7 +214,7 @@ internal struct OptimisticMessageOverlay {
     var suppressedRemovedIds: Set<String> = []
     var suppressedHasUndo: Bool = false
     var suppressedUndo: DeleteUndo?
-    var suppressedStar: (starred: Bool, menuStar: MessageMenu.StarAction?, inCachedSet: Bool)?
+    var suppressedStar: (starred: Bool, menuStar: MessageMenu.Star?, inCachedSet: Bool)?
 }
 
 /// Commands queued on the MainActor while `CoreEngine` completes its one-time async creation.
@@ -1762,7 +1762,7 @@ extension ZaloEngine {
                         list[idx].menu.star,
                         cachedStarredIds.contains(msgId)
                     )
-                    let targetMenuStar: MessageMenu.StarAction = on ? .unstar : .star
+                    let targetMenuStar: MessageMenu.Star = on ? .unstar : .star
                     if list[idx].menu.starred != on || list[idx].menu.star != targetMenuStar {
                         list[idx].menu.starred = on
                         list[idx].menu.star = targetMenuStar

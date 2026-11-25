@@ -293,7 +293,7 @@ import Testing
                 deleteSamplesMs.append(ms)
             }
             engine.undoDelete()
-            await engine.awaitMessageActionTasksForRecording()
+            await engine.settleForRecording()
             #expect((engine.messages[convId]?.count ?? 0) == 50)
         }
 

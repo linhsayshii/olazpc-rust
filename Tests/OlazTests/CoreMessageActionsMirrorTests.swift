@@ -51,13 +51,13 @@ import Testing
             "response": .object([
                 "status": .int(200),
                 "json": .object([
-                    "error_code": .int(reactErrorCode),
+                    "error_code": .int(Int64(reactErrorCode)),
                     "data": .object([:]),
                 ]),
             ]),
         ]
         if reactDelayMs > 0 {
-            reactEntry["delay_ms"] = .int(reactDelayMs)
+            reactEntry["delay_ms"] = .int(Int64(reactDelayMs))
         }
 
         let serverScript: [CaseJSON] = [
