@@ -150,6 +150,30 @@ final class MessageActionRecorderTests: XCTestCase {
         return .object(obj)
     }
 
+    private static func deleteWireMsg(
+        convId: String? = nil,
+        uidFrom: String,
+        idTo: String,
+        targetMsgId: String,
+        targetCliId: String = ""
+    ) -> CaseJSON {
+        var content: [String: CaseJSON] = [:]
+        if !targetMsgId.isEmpty {
+            content["globalDelMsgId"] = .string(targetMsgId)
+        }
+        if !targetCliId.isEmpty {
+            content["clientDelMsgId"] = .string(targetCliId)
+        }
+        var obj: [String: CaseJSON] = [
+            "uidFrom": .string(uidFrom),
+            "idTo": .string(idTo),
+            "msgType": .string("chat.delete"),
+            "content": .object(content),
+        ]
+        if let convId { obj["convId"] = .string(convId) }
+        return .object(obj)
+    }
+
     // MARK: - Scenarios
 
     private static func messageActionScenarios() -> [MessageActionRecorderHarness.ScenarioDef] {
@@ -1571,6 +1595,553 @@ final class MessageActionRecorderTests: XCTestCase {
                             "notify_incoming": .bool(false),
                             "persist_conversations": .bool(false),
                         ]),
+                    ]),
+                ]
+            ),
+
+            // 19. delete_confirm_flow: menu.delete == forMe: confirm state with the official texts;
+            // answer_confirm ok: false: nothing; ok: true: hidden, undo bar (count 1, deadline now + 5 s).
+            MessageActionRecorderHarness.ScenarioDef(
+                name: "delete_confirm_flow",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000619",
+                    displayName: "Action User 19",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "history_freshness": .object(["3000619": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000619", name: "Nora", previewText: "Confirm delete", previewTsMs: 1700000001000),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(
+                                id: "9019001",
+                                convId: "3000619",
+                                clientId: "c9019001",
+                                senderId: "3000619",
+                                senderName: "Nora",
+                                isMine: false,
+                                text: "Delete me",
+                                tsMs: 1700000001000,
+                                menu: .object(["delete": .string("forMe")])
+                            ),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000619", displayName: "Action User 19"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000619", displayName: "Action User 19"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000619")])]),
+                    .object([
+                        "cmd": .string("delete_for_me"),
+                        "now_ms": .int(1700000005000),
+                        "args": .object(["conv_id": .string("3000619"), "msg_id": .string("9019001"), "confirmed": .bool(false)]),
+                    ]),
+                    .object(["snapshot": .string("confirm_prompt")]),
+                    .object([
+                        "cmd": .string("answer_confirm"),
+                        "now_ms": .int(1700000006000),
+                        "args": .object(["ok": .bool(false)]),
+                    ]),
+                    .object(["snapshot": .string("after_cancel")]),
+                    .object([
+                        "cmd": .string("delete_for_me"),
+                        "now_ms": .int(1700000008000),
+                        "args": .object(["conv_id": .string("3000619"), "msg_id": .string("9019001"), "confirmed": .bool(false)]),
+                    ]),
+                    .object([
+                        "cmd": .string("answer_confirm"),
+                        "now_ms": .int(1700000010000),
+                        "args": .object(["ok": .bool(true)]),
+                    ]),
+                ]
+            ),
+
+            // 20. delete_undo: undo_delete: rows back in order, show_card "Khôi phục thành công", no request.
+            MessageActionRecorderHarness.ScenarioDef(
+                name: "delete_undo",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000620",
+                    displayName: "Action User 20",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "history_freshness": .object(["3000620": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000620", name: "Owen", previewText: "Third", previewTsMs: 1700000003000),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(id: "9020001", convId: "3000620", clientId: "c9020001", senderId: "3000620", senderName: "Owen", text: "First", tsMs: 1700000001000),
+                            storedMsg(id: "9020002", convId: "3000620", clientId: "c9020002", senderId: "3000620", senderName: "Owen", text: "Second", tsMs: 1700000002000),
+                            storedMsg(id: "9020003", convId: "3000620", clientId: "c9020003", senderId: "3000620", senderName: "Owen", text: "Third", tsMs: 1700000003000),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000620", displayName: "Action User 20"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000620", displayName: "Action User 20"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000620")])]),
+                    .object([
+                        "cmd": .string("delete_many"),
+                        "now_ms": .int(1700000010000),
+                        "args": .object(["conv_id": .string("3000620"), "msg_ids": .array([.string("9020003"), .string("9020001")])]),
+                    ]),
+                    .object([
+                        "cmd": .string("answer_confirm"),
+                        "now_ms": .int(1700000011000),
+                        "args": .object(["ok": .bool(true)]),
+                    ]),
+                    .object(["snapshot": .string("hidden_before_undo")]),
+                    .object([
+                        "cmd": .string("undo_delete"),
+                        "now_ms": .int(1700000012000),
+                    ]),
+                ]
+            ),
+
+            // 21. delete_dismiss_commits: dismiss_delete_undo: one request per message
+            // (cliMsgId falls back to id), rows gone from the store.
+            MessageActionRecorderHarness.ScenarioDef(
+                name: "delete_dismiss_commits",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000621",
+                    displayName: "Action User 21",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "next_client_id": .int(6000000000200),
+                        "history_freshness": .object(["3000621": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000621", name: "Paul", previewText: "Keep", previewTsMs: 1700000003000),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(id: "9021001", convId: "3000621", clientId: "c9021001", senderId: "3000621", senderName: "Paul", text: "Has cli", tsMs: 1700000001000),
+                            storedMsg(id: "9021002", convId: "3000621", clientId: "", senderId: "2000621", senderName: "Action User 21", isMine: true, text: "Empty cli", tsMs: 1700000002000),
+                            storedMsg(id: "9021003", convId: "3000621", clientId: "c9021003", senderId: "3000621", senderName: "Paul", text: "Keep", tsMs: 1700000003000),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000621", displayName: "Action User 21"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000621", displayName: "Action User 21"),
+                    MessageActionRecorderHarness.httpScript(path: "/api/message/delete", method: "POST", json: .object(["error_code": .int(0), "data": .object([:])])),
+                    MessageActionRecorderHarness.httpScript(path: "/api/message/delete", method: "POST", json: .object(["error_code": .int(0), "data": .object([:])])),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000621")])]),
+                    .object([
+                        "cmd": .string("delete_many"),
+                        "now_ms": .int(1700000010000),
+                        "args": .object(["conv_id": .string("3000621"), "msg_ids": .array([.string("9021001"), .string("9021002")])]),
+                    ]),
+                    .object([
+                        "cmd": .string("answer_confirm"),
+                        "now_ms": .int(1700000011000),
+                        "args": .object(["ok": .bool(true)]),
+                    ]),
+                    .object([
+                        "cmd": .string("dismiss_delete_undo"),
+                        "now_ms": .int(1700000012000),
+                    ]),
+                ]
+            ),
+
+            // 22. delete_second_commits_first: second delete while the first bar shows:
+            // first batch committed, bar shows the second.
+            MessageActionRecorderHarness.ScenarioDef(
+                name: "delete_second_commits_first",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000622",
+                    displayName: "Action User 22",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "next_client_id": .int(6000000000210),
+                        "history_freshness": .object(["3000622": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000622", name: "Quinn", previewText: "Second", previewTsMs: 1700000002000),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(id: "9022001", convId: "3000622", clientId: "c9022001", senderId: "3000622", senderName: "Quinn", text: "First", tsMs: 1700000001000),
+                            storedMsg(id: "9022002", convId: "3000622", clientId: "c9022002", senderId: "3000622", senderName: "Quinn", text: "Second", tsMs: 1700000002000),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000622", displayName: "Action User 22"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000622", displayName: "Action User 22"),
+                    MessageActionRecorderHarness.httpScript(path: "/api/message/delete", method: "POST", json: .object(["error_code": .int(0), "data": .object([:])])),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000622")])]),
+                    .object([
+                        "cmd": .string("delete_for_me"),
+                        "now_ms": .int(1700000010000),
+                        "args": .object(["conv_id": .string("3000622"), "msg_id": .string("9022001"), "confirmed": .bool(true)]),
+                    ]),
+                    .object(["snapshot": .string("first_undo")]),
+                    .object([
+                        "cmd": .string("delete_for_me"),
+                        "now_ms": .int(1700000012000),
+                        "args": .object(["conv_id": .string("3000622"), "msg_id": .string("9022002"), "confirmed": .bool(true)]),
+                    ]),
+                ]
+            ),
+
+            // 23. delete_timeout_commits: no action for 5 s: committed.
+            MessageActionRecorderHarness.ScenarioDef(
+                name: "delete_timeout_commits",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000623",
+                    displayName: "Action User 23",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "next_client_id": .int(6000000000220),
+                        "history_freshness": .object(["3000623": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000623", name: "Rita", previewText: "Timeout", previewTsMs: 1700000001000),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(id: "9023001", convId: "3000623", clientId: "c9023001", senderId: "3000623", senderName: "Rita", text: "Expire me", tsMs: 1700000001000),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000623", displayName: "Action User 23"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000623", displayName: "Action User 23"),
+                    MessageActionRecorderHarness.httpScript(path: "/api/message/delete", method: "POST", json: .object(["error_code": .int(0), "data": .object([:])])),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000623")])]),
+                    .object([
+                        "cmd": .string("delete_for_me"),
+                        "now_ms": .int(1700000010000),
+                        "args": .object(["conv_id": .string("3000623"), "msg_id": .string("9023001"), "confirmed": .bool(true)]),
+                    ]),
+                    .object(["snapshot": .string("undo_active")]),
+                    .object(["cmd": .string("await_delete_undo_expiry"), "timeout_ms": .int(8000)]),
+                ]
+            ),
+
+            // 24. delete_many: selection confirm texts, three rows in one bar.
+            MessageActionRecorderHarness.ScenarioDef(
+                name: "delete_many",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000624",
+                    displayName: "Action User 24",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "history_freshness": .object(["3000624": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000624", name: "Sam", previewText: "Three", previewTsMs: 1700000003000),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(id: "9024001", convId: "3000624", clientId: "c9024001", senderId: "3000624", senderName: "Sam", text: "One", tsMs: 1700000001000),
+                            storedMsg(id: "9024002", convId: "3000624", clientId: "c9024002", senderId: "3000624", senderName: "Sam", text: "Two", tsMs: 1700000002000),
+                            storedMsg(id: "9024003", convId: "3000624", clientId: "c9024003", senderId: "3000624", senderName: "Sam", text: "Three", tsMs: 1700000003000),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000624", displayName: "Action User 24"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000624", displayName: "Action User 24"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000624")])]),
+                    .object([
+                        "cmd": .string("delete_many"),
+                        "now_ms": .int(1700000010000),
+                        "args": .object(["conv_id": .string("3000624"), "msg_ids": .array([.string("9024001"), .string("9024002"), .string("9024003")])]),
+                    ]),
+                    .object(["snapshot": .string("confirm_prompt")]),
+                    .object([
+                        "cmd": .string("answer_confirm"),
+                        "now_ms": .int(1700000011000),
+                        "args": .object(["ok": .bool(true)]),
+                    ]),
+                ]
+            ),
+
+            // 25. remote_delete: by id and by client id; unknown id: nothing.
+            MessageActionRecorderHarness.ScenarioDef(
+                name: "remote_delete",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000625",
+                    displayName: "Action User 25",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "history_freshness": .object(["3000625": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000625", name: "Tara", previewText: "Keep me", previewTsMs: 1700000004000),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(id: "9025001", convId: "3000625", clientId: "c9025001", senderId: "3000625", senderName: "Tara", text: "By server id", tsMs: 1700000001000),
+                            storedMsg(id: "c9025002", convId: "3000625", clientId: "c9025002", senderId: "2000625", senderName: "Action User 25", isMine: true, text: "By cliMsgId match", tsMs: 1700000002000),
+                            storedMsg(id: "9025003", convId: "3000625", clientId: "c9025003", senderId: "2000625", senderName: "Action User 25", isMine: true, text: "Cli-only event", tsMs: 1700000003000),
+                            storedMsg(id: "9025004", convId: "3000625", clientId: "c9025004", senderId: "3000625", senderName: "Tara", text: "Keep me", tsMs: 1700000004000),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000625", displayName: "Action User 25"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000625", displayName: "Action User 25"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000625")])]),
+                    .object([
+                        "cmd": .string("apply_batch"),
+                        "now_ms": .int(1700000010000),
+                        "args": .object([
+                            "payload": .object([
+                                "msgs": .array([
+                                    deleteWireMsg(uidFrom: "3000625", idTo: "2000625", targetMsgId: "9025001", targetCliId: "c9025001"),
+                                    deleteWireMsg(uidFrom: "2000625", idTo: "3000625", targetMsgId: "9025002", targetCliId: "c9025002"),
+                                    deleteWireMsg(uidFrom: "2000625", idTo: "3000625", targetMsgId: "", targetCliId: "c9025003"),
+                                    deleteWireMsg(uidFrom: "3000625", idTo: "2000625", targetMsgId: "9025999", targetCliId: "c9025999"),
+                                ]),
+                            ]),
+                            "default_cmd": .int(501),
+                            "increment_unread": .bool(false),
+                            "notify_incoming": .bool(false),
+                            "persist_conversations": .bool(false),
+                        ]),
+                    ]),
+                ]
+            ),
+
+            // 26. star_on_off: flags, starredIds pref, stored row, card texts; blocked: card only.
+            MessageActionRecorderHarness.ScenarioDef(
+                name: "star_on_off",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000626",
+                    displayName: "Action User 26",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "history_freshness": .object(["3000626": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000626", name: "Uma", previewText: "Blocked", previewTsMs: 1700000002000),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(
+                                id: "9026001",
+                                convId: "3000626",
+                                clientId: "c9026001",
+                                senderId: "3000626",
+                                senderName: "Uma",
+                                text: "Star me",
+                                tsMs: 1700000001000,
+                                menu: .object(["star": .string("star"), "starred": .bool(false)])
+                            ),
+                            storedMsg(
+                                id: "9026002",
+                                convId: "3000626",
+                                clientId: "c9026002",
+                                senderId: "3000626",
+                                senderName: "Uma",
+                                text: "Blocked",
+                                tsMs: 1700000002000,
+                                menu: .object(["star": .string("blocked"), "starred": .bool(false)])
+                            ),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000626", displayName: "Action User 26"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000626", displayName: "Action User 26"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000626")])]),
+                    .object([
+                        "cmd": .string("star"),
+                        "args": .object(["conv_id": .string("3000626"), "msg_id": .string("9026001"), "on": .bool(true)]),
+                    ]),
+                    .object(["snapshot": .string("after_star_on")]),
+                    .object([
+                        "cmd": .string("star"),
+                        "args": .object(["conv_id": .string("3000626"), "msg_id": .string("9026002"), "on": .bool(true)]),
+                    ]),
+                    .object(["snapshot": .string("after_blocked")]),
+                    .object([
+                        "cmd": .string("star"),
+                        "args": .object(["conv_id": .string("3000626"), "msg_id": .string("9026001"), "on": .bool(false)]),
+                    ]),
+                ]
+            ),
+
+            // 27. auto_delete_load: map loaded; fetch fails with no map: {}; fails with a map: kept.
+            MessageActionRecorderHarness.ScenarioDef(
+                name: "auto_delete_load",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000627",
+                    displayName: "Action User 27",
+                    suppress: ["ws", "long_poll"]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000627", displayName: "Action User 27"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000627", displayName: "Action User 27"),
+                    MessageActionRecorderHarness.httpScript(
+                        path: "/api/conv/autodelete/getConvers",
+                        method: "GET",
+                        json: .object(["error_code": .int(500), "error_message": .string("fail initial")])
+                    ),
+                    MessageActionRecorderHarness.httpScript(
+                        path: "/api/conv/autodelete/getConvers",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "convers": .array([
+                                    .object(["destId": .string("3000627"), "isGroup": .int(0), "ttl": .int(3600000)]),
+                                    .object(["destId": .string("627"), "isGroup": .int(1), "ttl": .int(86400000)]),
+                                    .object(["destId": .string("3000628"), "isGroup": .int(0), "ttl": .int(0)]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    MessageActionRecorderHarness.httpScript(
+                        path: "/api/conv/autodelete/getConvers",
+                        method: "GET",
+                        json: .object(["error_code": .int(500), "error_message": .string("fail keep")])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["snapshot": .string("initial_nil")]),
+                    .object(["cmd": .string("load_auto_delete")]),
+                    .object(["snapshot": .string("failed_when_nil")]),
+                    .object(["cmd": .string("load_auto_delete")]),
+                    .object(["snapshot": .string("loaded")]),
+                    .object(["cmd": .string("load_auto_delete")]),
+                ]
+            ),
+
+            // 28. auto_delete_set: on (label text), off text, same value: nothing,
+            // request fails: log shape and card; system row id, stored, list preview.
+            MessageActionRecorderHarness.ScenarioDef(
+                name: "auto_delete_set",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000628",
+                    displayName: "Action User 28",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "history_freshness": .object(["3000628": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000628", name: "Vera", previewText: "Initial", previewTsMs: 1700000001000),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000628", displayName: "Action User 28"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000628", displayName: "Action User 28"),
+                    MessageActionRecorderHarness.httpScript(
+                        path: "/api/conv/autodelete/updateConvers",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    MessageActionRecorderHarness.httpScript(
+                        path: "/api/conv/autodelete/updateConvers",
+                        method: "POST",
+                        json: .object(["error_code": .int(500), "error_message": .string("fail update")])
+                    ),
+                    MessageActionRecorderHarness.httpScript(
+                        path: "/api/conv/autodelete/updateConvers",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000628")])]),
+                    .object([
+                        "cmd": .string("set_auto_delete"),
+                        "now_ms": .int(1700000010000),
+                        "args": .object(["conv_id": .string("3000628"), "ttl": .int(3600000)]),
+                    ]),
+                    .object(["snapshot": .string("after_on")]),
+                    // Same value -> no request
+                    .object([
+                        "cmd": .string("set_auto_delete"),
+                        "now_ms": .int(1700000015000),
+                        "args": .object(["conv_id": .string("3000628"), "ttl": .int(3600000)]),
+                    ]),
+                    // Request fails -> log shape + show_card
+                    .object([
+                        "cmd": .string("set_auto_delete"),
+                        "now_ms": .int(1700000020000),
+                        "args": .object(["conv_id": .string("3000628"), "ttl": .int(0)]),
+                    ]),
+                    .object(["snapshot": .string("after_fail")]),
+                    // Turn off succeeds
+                    .object([
+                        "cmd": .string("set_auto_delete"),
+                        "now_ms": .int(1700000030000),
+                        "args": .object(["conv_id": .string("3000628"), "ttl": .int(0)]),
+                    ]),
+                ]
+            ),
+
+            // 29. auto_delete_prune: expired rows gone from window and store, next expiry returned,
+            // no TTL rows: nothing.
+            MessageActionRecorderHarness.ScenarioDef(
+                name: "auto_delete_prune",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000629",
+                    displayName: "Action User 29",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "history_freshness": .object(["3000629": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000629", name: "Will", previewText: "No TTL", previewTsMs: 1700000009000),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(id: "9029001", convId: "3000629", clientId: "c9029001", senderId: "3000629", senderName: "Will", text: "Expired first", tsMs: 1700000000000, ttl: 5000),
+                            storedMsg(id: "9029002", convId: "3000629", clientId: "c9029002", senderId: "3000629", senderName: "Will", text: "Next expiry", tsMs: 1700000008000, ttl: 10000),
+                            storedMsg(id: "9029003", convId: "3000629", clientId: "c9029003", senderId: "3000629", senderName: "Will", text: "No TTL", tsMs: 1700000009000),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000629", displayName: "Action User 29"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000629", displayName: "Action User 29"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000629")])]),
+                    .object([
+                        "cmd": .string("prune_expired"),
+                        "now_ms": .int(1700000010000),
+                        "args": .object(["conv_id": .string("3000629")]),
+                    ]),
+                    .object(["snapshot": .string("after_first_prune")]),
+                    .object([
+                        "cmd": .string("prune_expired"),
+                        "now_ms": .int(1700000020000),
+                        "args": .object(["conv_id": .string("3000629")]),
+                    ]),
+                    .object(["snapshot": .string("after_all_ttl_pruned")]),
+                    .object([
+                        "cmd": .string("prune_expired"),
+                        "now_ms": .int(1700000025000),
+                        "args": .object(["conv_id": .string("3000629")]),
                     ]),
                 ]
             ),
