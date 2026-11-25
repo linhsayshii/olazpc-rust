@@ -470,7 +470,7 @@ extension ZaloEngine {
             isMine: true,
             kind: kind,
             text: text,
-            date: Date(),
+            date: Date(timeIntervalSince1970: Double(nowMs()) / 1000.0),
             status: .sent,
             quote: nil,
             reactions: [],
@@ -568,14 +568,23 @@ extension ZaloEngine {
         guard composerConfirm?.id == confirm.id else { return }
         composerConfirm = nil
         guard !queuedComposerConfirms.isEmpty else { return }
-        Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(300))
-            guard let self, self.composerConfirm == nil, !self.queuedComposerConfirms.isEmpty else { return }
+        composerConfirmTask?.cancel()
+        composerConfirmTask = Task { @MainActor [weak self] in
+            let completed: Bool
+            if let sleepSeam = self?.composerConfirmSleep {
+                completed = await sleepSeam(300)
+            } else {
+                try? await Task.sleep(for: .milliseconds(300))
+                completed = !Task.isCancelled
+            }
+            guard completed, let self, self.composerConfirm == nil, !self.queuedComposerConfirms.isEmpty else { return }
             self.composerConfirm = self.queuedComposerConfirms.removeFirst()
         }
     }
 
     func dropComposerConfirms() {
+        composerConfirmTask?.cancel()
+        composerConfirmTask = nil
         composerConfirm = nil
         queuedComposerConfirms = []
     }
@@ -584,7 +593,7 @@ extension ZaloEngine {
         guard let event = state["compose"] as? [String: Any] else { return }
         let conversation = (event["convId"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         if event["kind"] as? String == "toast", let text = event["text"] as? String, !text.isEmpty {
-            CardActionCenter.shared.show(text, in: conversation)
+            showActionCard(text, in: conversation)
         }
     }
 
@@ -594,7 +603,7 @@ extension ZaloEngine {
 
     func report(_ outcome: ComposerOutcome, in id: String) {
         switch outcome {
-        case .failed(let text), .pending(let text): CardActionCenter.shared.show(text, in: id.isEmpty ? nil : id)
+        case .failed(let text), .pending(let text): showActionCard(text, in: id.isEmpty ? nil : id)
         case .done, .cancelled: break
         }
     }
