@@ -55,6 +55,28 @@ impl TextStyle {
                 .collect(),
         )
     }
+
+    /// Official `textProperties` JSON sent with a styled message (Swift
+    /// `TextStyle.textProperties(_:)`): `{"styles":[{"len":…,"st":…,"start":…}],"ver":0}` with
+    /// Swift-sorted keys, or `None` when `styles` is empty.
+    #[must_use]
+    pub fn text_properties_json(styles: &[TextStyle]) -> Option<String> {
+        if styles.is_empty() {
+            return None;
+        }
+        let payload = json!({
+            "styles": Self::to_json(styles),
+            "ver": 0,
+        });
+        Some(olaz_json::to_swift_json_string(&payload))
+    }
+}
+
+/// Official `textProperties` JSON for a slice of [`TextStyle`] runs (delegates to
+/// [`TextStyle::text_properties_json`]).
+#[must_use]
+pub fn text_properties_json(styles: &[TextStyle]) -> Option<String> {
+    TextStyle::text_properties_json(styles)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

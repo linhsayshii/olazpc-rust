@@ -13,6 +13,7 @@ use serde_json::{Map, Value, json};
 
 use crate::conversations::ConversationsState;
 use crate::messages::{ContactsState, IdentitySnapshot, MessagesState};
+use crate::typing::{TypingState, TypingStatus};
 
 /// Top-level state owned by the single `olaz-core` actor.
 #[derive(Clone, Default)]
@@ -24,6 +25,10 @@ pub struct CoreState {
     pub contacts: ContactsState,
     // U4-bootstrap
     pub(crate) bootstrap: crate::reduce::bootstrap::BootstrapRuntimeState,
+    // U5
+    pub typing: TypingState,
+    // U5-send
+    pub send: crate::reduce::send::SendState,
 }
 
 impl CoreState {
@@ -35,6 +40,8 @@ impl CoreState {
             conversations: self.conversations.clone(),
             messages: self.messages.clone(),
             contacts: self.contacts.clone(),
+            // U5
+            typing: self.typing.active.clone(),
         }
     }
 
@@ -64,17 +71,23 @@ impl fmt::Debug for CoreState {
             .field("messages", &self.messages)
             .field("contacts", &self.contacts)
             .field("bootstrap", &self.bootstrap)
+            // U5
+            .field("typing", &self.typing)
+            // U5-send
+            .field("send", &self.send)
             .finish()
     }
 }
 
-/// Full observable snapshot across session + conversations + messages + contacts domains.
+/// Full observable snapshot across session + conversations + messages + contacts + typing domains.
 #[derive(Clone, Default)]
 pub struct CoreSnapshot {
     pub session: SessionSnapshot,
     pub conversations: ConversationsState,
     pub messages: MessagesState,
     pub contacts: ContactsState,
+    // U5
+    pub typing: BTreeMap<String, TypingStatus>,
 }
 
 impl fmt::Debug for CoreSnapshot {
@@ -84,6 +97,8 @@ impl fmt::Debug for CoreSnapshot {
             .field("conversations", &self.conversations)
             .field("messages", &self.messages)
             .field("contacts", &self.contacts)
+            // U5
+            .field("typing_count", &self.typing.len())
             .finish()
     }
 }

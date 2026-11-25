@@ -357,6 +357,7 @@ actor ZaloSessionClient {
             acc.zpwEnk = ""
             account = acc
         }
+        coreSession?.clearSession()
     }
 
     func nextClientId() -> Int64 {

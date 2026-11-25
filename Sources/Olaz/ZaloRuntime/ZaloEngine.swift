@@ -92,7 +92,9 @@ final class ZaloEngine {
     /// Accounts I blocked (messages and calls), from `/api/friend/blocklistv2`; nil until loaded.
     var blockedUsers: [BlockedUser]?
     /// "Tin nhắn tự xóa" per conversation (ms); nil until loaded.
-    var autoDelete: [String: Int64]?
+    var autoDelete: [String: Int64]? {
+        didSet { syncAutoDeleteToCore(from: oldValue, to: autoDelete) }
+    }
     /// Account privacy settings (Cài đặt ▸ Quyền riêng tư); nil until loaded.
     var privacy: [PrivacyKey: Bool]?
     /// "Tin nhắn nhanh"; nil until loaded.
@@ -1156,6 +1158,10 @@ final class ZaloEngine {
     @MainActor static var loggedTypingShapes: Set<String> = []
 
     internal func showTyping(convId: String, name: String, onPC: Bool = false) {
+        if let core = coreLifecycle.core {
+            core.showTypingIndicator(convId: convId, name: name, onPc: onPC)
+            return
+        }
         let status = TypingStatus(name: name, onPC: onPC)
         if typing[convId] != status { typing[convId] = status }
         typingResetTasks[convId]?.cancel()

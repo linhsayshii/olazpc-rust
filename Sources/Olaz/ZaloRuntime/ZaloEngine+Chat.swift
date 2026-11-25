@@ -64,6 +64,86 @@ extension ZaloEngine {
                   styles: [TextStyle] = [], urgency: Int = 0) async -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !id.isEmpty else { return false }
+        if let core = coreLifecycle.core {
+            let cliInt = core.nextClientId()
+            let cliId = "\(cliInt)"
+            let isE2EE = ZaloWireParser.isGroupId(id) ? false : e2eeManager.isE2EEConversationSync(id)
+            let tsMs = nowMs()
+            let ttlMs = autoDeleteTTL(id)
+            let quote = quoteId.flatMap { qid in messages[id]?.first(where: { $0.id == qid }) }
+            let quoteBlock = quote.map {
+                ChatMessage.Quote(
+                    senderName: $0.isMine ? "Bạn" : $0.senderName,
+                    text: $0.text.isEmpty ? "[Tin nhắn]" : $0.text,
+                    msgId: $0.id,
+                    cliMsgId: $0.clientId
+                )
+            }
+            var optimistic = ChatMessage(
+                id: cliId,
+                conversationId: id,
+                senderId: profile?.userId ?? "",
+                senderName: profile?.displayName ?? "Bạn",
+                senderAvatar: profile?.avatar,
+                isMine: true,
+                kind: .text,
+                text: text,
+                date: Date(timeIntervalSince1970: Double(tsMs) / 1000.0),
+                status: .sending,
+                quote: quoteBlock,
+                reactions: [],
+                isE2EE: isE2EE,
+                mentions: mentions,
+                cardButtons: [],
+                suggestsStickers: false,
+                menu: MessageMenu(json: [
+                    "forward": "ok",
+                    "recall": id != selfConversationId,
+                    "delete": id == selfConversationId ? "plain" : "forMe",
+                    "pin": ZaloWireParser.isGroupId(id) && id != selfConversationId,
+                    "star": "star"
+                ]),
+                clientId: cliId
+            )
+            if !isE2EE { optimistic.textStyles = styles }
+            optimistic.ttlMs = isE2EE ? 0 : ttlMs
+            optimistic.urgency = isE2EE ? 0 : urgency
+            // Mirror optimistic row immediately on MainActor so composer-to-row-visible
+            // avoids the extra async FFI -> Tokio -> ChangeHub hop; Core's WindowDelta::Patch
+            // reconciles identical optimistic, ack, echo-first, or failure removal idempotently.
+            isSuppressingDirectMessageSync = true
+            mergeMessageIntoMemory(optimistic)
+            isSuppressingDirectMessageSync = false
+
+            let mentionRecords = mentions.map {
+                MessageMention(uid: $0.uid, pos: Int64($0.pos), len: Int64($0.len), isAll: $0.isAll)
+            }
+            let styleRecords = styles.map {
+                TextStyleRecord(start: Int64($0.start), len: Int64($0.len), st: $0.st)
+            }
+            guard let outcome = try? await core.sendText(
+                convId: id,
+                text: text,
+                quoteId: quoteId,
+                mentions: mentionRecords,
+                styles: styleRecords,
+                urgency: Int64(urgency),
+                clientId: cliInt,
+                nowMs: tsMs,
+                isE2ee: isE2EE,
+                ttlMs: ttlMs
+            ) else {
+                isSuppressingDirectMessageSync = true
+                if var list = messages[id] {
+                    list.removeAll { $0.id == cliId }
+                    messages[id] = list
+                }
+                isSuppressingDirectMessageSync = false
+                return false
+            }
+            await waitForMirrorVersion(outcome.version)
+            return outcome.ok
+        }
         resetOutgoingTyping(in: id)
 
         let quote = quoteId.flatMap { qid in messages[id]?.first(where: { $0.id == qid }) }
@@ -515,17 +595,41 @@ extension ZaloEngine {
 
     func markRead(_ id: String) {
         guard !id.isEmpty else { return }
-        let seenTarget: SeenTargetRecord? = {
-            guard let last = messages[id]?.last, !last.isMine else { return nil }
-            return SeenTargetRecord(convId: id, msgId: last.id, cliMsgId: last.id, senderId: last.senderId)
-        }()
         if let core = coreLifecycle.core {
-            core.markConversationRead(id: id, seenTarget: seenTarget)
+            core.markRead(id: id)
             return
         }
+        var extrasChanged = false
         if let idx = conversations.firstIndex(where: { $0.id == id }), conversations[idx].unread > 0 {
             conversations[idx].unread = 0
+            extrasChanged = true
         }
+        let hadUnreadMark = cachedUnreadMarks.remove(id) != nil
+        if hadUnreadMark {
+            rebuildConversationFlags()
+            extrasChanged = true
+            let key = UUID()
+            let t = Task { @MainActor [weak self] in
+                defer { self?.markReadTasks.removeValue(forKey: key) }
+                guard let self else { return }
+                try? await self.sqliteStore?.setPreferenceStrings(key: "unreadMarks", value: Array(self.cachedUnreadMarks))
+                try? await self.sessionClient.setUnreadMarkAPI(convId: id, unread: false)
+            }
+            markReadTasks[key] = t
+        }
+        if extrasChanged {
+            rebuildConversationExtras()
+        }
+        let key = UUID()
+        let t = Task { @MainActor [weak self] in
+            defer { self?.markReadTasks.removeValue(forKey: key) }
+            guard let self else { return }
+            try? await self.sqliteStore?.setConversationUnread(id: id, unread: 0)
+            if let last = self.messages[id]?.last, !last.isMine {
+                await self.sessionClient.sendSeenAPI(convId: id, msgId: last.id, cliMsgId: last.id, senderId: last.senderId)
+            }
+        }
+        markReadTasks[key] = t
     }
 
     func react(_ emoji: String, to messageId: String, in conversationId: String) {
@@ -599,7 +703,7 @@ extension ZaloEngine {
             cliMsgId: resolvedCliId,
             rType: "\(effectiveType)",
             reactClientId: reactClientId,
-            createdAt: Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
+            createdAt: Date()
         ))
 
         func rollbackOnError() {
@@ -662,17 +766,21 @@ extension ZaloEngine {
             EngineLog.shared.write(
                 "react failed: code=\(err.code) msg=\(msgNote) msgId=\(effectiveMsgId) cliId=\(resolvedCliId) msgType=\(msgType)"
             )
-            showActionCard("Không thể thả biểu cảm. Vui lòng thử lại.", in: conversationId)
+            CardActionCenter.shared.show("Không thể thả biểu cảm. Vui lòng thử lại.", in: conversationId)
         } catch {
             rollbackOnError()
             EngineLog.shared.write(
                 "react failed: \(error.localizedDescription) msgId=\(effectiveMsgId) cliId=\(resolvedCliId) msgType=\(msgType)"
             )
-            showActionCard("Không thể thả biểu cảm. Vui lòng thử lại.", in: conversationId)
+            CardActionCenter.shared.show("Không thể thả biểu cảm. Vui lòng thử lại.", in: conversationId)
         }
     }
 
     func handleTyping(state: [String: Any]) {
+        if let core = coreLifecycle.core {
+            core.handleTyping(stateJson: Self.jsonString(for: state))
+            return
+        }
         if let info = state["typing"] as? [String: Any],
            let convId = info["convId"] as? String,
            let name = info["name"] as? String {
@@ -682,6 +790,12 @@ extension ZaloEngine {
 
     @MainActor
     func notifyTyping(in convId: String) {
+        if let core = coreLifecycle.core {
+            let enabled = userDefaults.object(forKey: OlazPrefs.sendTyping) as? Bool ?? true
+            core.setSendTypingEnabled(enabled: enabled)
+            core.notifyTyping(convId: convId, nowMs: nowMs())
+            return
+        }
         let target = convId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !target.isEmpty, phase == .ready else { return }
         // Cài đặt ▸ Quyền riêng tư: "Hiển thị trạng thái đang soạn tin" off sends nothing.
@@ -697,6 +811,10 @@ extension ZaloEngine {
 
     @MainActor
     func resetOutgoingTyping(in convId: String) {
+        if let core = coreLifecycle.core {
+            core.resetOutgoingTyping(convId: convId)
+            return
+        }
         let target = convId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !target.isEmpty else { return }
         OutgoingTypingStore.throttle(for: self).reset(in: target)

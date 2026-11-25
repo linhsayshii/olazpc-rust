@@ -595,8 +595,10 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
 
     func showTyping(convId: String, uid: String, onPc: Bool) async {
         guard let engine else { return }
+        await engine.waitForCoreMirrorDrain()
         await MainActor.run {
-            if engine.traceHost("show_typing", args: ["conv_id": convId, "uid": uid, "on_pc": onPc]) {
+            if engine.traceHost("show_typing", args: ["conv_id": convId, "uid": uid, "on_pc": onPc]),
+               engine.coreLifecycle.core == nil {
                 let name = engine.lookupPersonInfo(uid)?.name ?? "Ai đó"
                 engine.showTyping(convId: convId, name: name, onPC: onPc)
             }
@@ -626,6 +628,21 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
             start: start,
             startExplicit: startExplicit,
             duration: duration
+        )
+    }
+
+    func sendE2eeText(
+        convId: String,
+        text: String,
+        clientId: String,
+        quote: E2eeQuoteArgRecord?
+    ) async -> E2eeSendOutcomeRecord {
+        guard let engine else { return .aborted }
+        return await engine.hostSendE2EEText(
+            convId: convId,
+            text: text,
+            clientId: clientId,
+            quote: quote
         )
     }
 }
@@ -944,6 +961,13 @@ extension ZaloEngine {
             if !self.hasMoreHistory.isEmpty {
                 for (convId, hasMore) in self.hasMoreHistory {
                     core.writeThroughSetHasMore(convId: convId, hasMore: hasMore)
+                }
+            }
+            let sendTypingEnabled = self.userDefaults.object(forKey: OlazPrefs.sendTyping) as? Bool ?? true
+            core.setSendTypingEnabled(enabled: sendTypingEnabled)
+            if let autoDel = self.autoDelete {
+                for (convId, ttl) in autoDel where ttl > 0 {
+                    core.setAutoDeleteTtl(convId: convId, ttlMs: ttl)
                 }
             }
 
@@ -1362,6 +1386,17 @@ extension ZaloEngine {
             applyContactsMirror(cRec)
         }
 
+        if let typingEntries = batch.typing {
+            var nextTyping: [String: TypingStatus] = [:]
+            nextTyping.reserveCapacity(typingEntries.count)
+            for entry in typingEntries {
+                nextTyping[entry.convId] = TypingStatus(name: entry.name, onPC: entry.onPc)
+            }
+            if nextTyping != typing {
+                typing = nextTyping
+            }
+        }
+
         if batch.version > appliedMirrorVersion {
             appliedMirrorVersion = batch.version
         }
@@ -1390,6 +1425,143 @@ extension ZaloEngine {
         )
     }
 
+
+    internal func syncAutoDeleteToCore(from oldValue: [String: Int64]?, to newValue: [String: Int64]?) {
+        guard let core = coreLifecycle.core else { return }
+        let oldMap = oldValue ?? [:]
+        let newMap = newValue ?? [:]
+        for convId in oldMap.keys where newMap[convId] == nil {
+            core.setAutoDeleteTtl(convId: convId, ttlMs: 0)
+        }
+        for (convId, ttl) in newMap where oldMap[convId] != ttl {
+            core.setAutoDeleteTtl(convId: convId, ttlMs: ttl)
+        }
+    }
+
+    internal func hostSendE2EEText(
+        convId id: String,
+        text: String,
+        clientId cliId: String,
+        quote: E2eeQuoteArgRecord?
+    ) async -> E2eeSendOutcomeRecord {
+        do {
+            let res: SendMessageResult
+            if let sendE2EETextHostHandler {
+                let quoteArgs: Any = quote.map { q -> [String: Any] in
+                    [
+                        "msg_id": q.msgId,
+                        "cli_msg_id": q.cliMsgId,
+                        "sender_id": q.senderId,
+                        "sender_name": q.senderName,
+                        "text": q.text,
+                        "ts_ms": q.tsMs,
+                    ]
+                } ?? NSNull()
+                let args: [String: Any] = [
+                    "conv_id": id,
+                    "text": text,
+                    "client_id": cliId,
+                    "quote": quoteArgs,
+                ]
+                _ = traceHost("send_e2ee_text", args: args)
+                res = try await sendE2EETextHostHandler(args)
+            } else {
+                let myUid = profile?.userId ?? ""
+                guard !myUid.isEmpty else {
+                    EngineLog.shared.write("sendText e2ee failed: missing local uid")
+                    return .aborted
+                }
+                let ready = await e2eeManager.ensureSessions(
+                    forPeer: id,
+                    myUid: myUid,
+                    webSocket: webSocket,
+                    store: sqliteStore
+                )
+                guard ready else {
+                    EngineLog.shared.write("sendText e2ee failed: no open Signal session for peer=\(id)")
+                    return .aborted
+                }
+
+                let cliInt: Int64
+                if let parsed = Int64(cliId) {
+                    cliInt = parsed
+                } else {
+                    cliInt = await sessionClient.nextClientId()
+                }
+                let qMsgInt = quote.flatMap { Int64($0.msgId.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                let quoteOwner = quote.map { ZaloWireParser.stripUserPrefix($0.senderId.isEmpty ? myUid : $0.senderId) } ?? ""
+                var ownerGlobalId = ""
+                if quote != nil, qMsgInt != nil, qMsgInt != 0, !quoteOwner.isEmpty {
+                    if let cached = cachedFriendGlobalIds[quoteOwner] {
+                        ownerGlobalId = cached
+                    } else {
+                        ownerGlobalId = await sessionClient.encryptGlobalIds([quoteOwner])[quoteOwner] ?? ""
+                    }
+                    if ownerGlobalId.isEmpty {
+                        EngineLog.shared.write("sendText e2ee: quote owner has no global id, sending without quote")
+                    }
+                }
+                let hasValidQuote = (quote != nil && qMsgInt != nil && qMsgInt != 0 && !ownerGlobalId.isEmpty)
+                let quotePlain = hasValidQuote ? (quote!.text.isEmpty ? "[Tin nhắn]" : quote!.text) : nil
+                let ownerName = quote.map {
+                    let senderClean = ZaloWireParser.stripUserPrefix($0.senderId)
+                    let isMineQuote = !myUid.isEmpty && (senderClean == myUid || $0.senderId == myUid)
+                    return isMineQuote ? (profile?.displayName ?? $0.senderName) : $0.senderName
+                } ?? ""
+                let encryptedDevices = await e2eeManager.encryptTextMessage(
+                    peerUid: id,
+                    myUid: myUid,
+                    text: text,
+                    quoteText: quotePlain,
+                    quoteExtras: hasValidQuote ? ["{}", "", ownerName, ownerGlobalId] : [],
+                    store: sqliteStore
+                )
+                guard !encryptedDevices.isEmpty else {
+                    EngineLog.shared.write("sendText e2ee failed: encryption produced no peer payloads for peer=\(id)")
+                    return .aborted
+                }
+
+                let senderIid = await e2eeManager.localRegistrationId()
+                let imei = await sessionClient.imei
+                let listParams: [[String: Any]] = encryptedDevices.compactMap { dev in
+                    guard let msgCipher = dev.ciphers.first else { return nil }
+                    var extra: [String: Any] = ["message": msgCipher]
+                    if hasValidQuote, let qMsgInt, let quote {
+                        guard let fields = Self.e2eeQuoteFields(
+                            ciphers: dev.ciphers,
+                            msgId: qMsgInt,
+                            cliMsgId: Int64(quote.cliMsgId) ?? qMsgInt,
+                            ts: quote.tsMs
+                        ) else { return nil }
+                        extra.merge(fields) { _, new in new }
+                    }
+                    return ZaloSessionClient.buildE2EEListParamEntry(
+                        toId: dev.toId,
+                        platform: dev.platform,
+                        clientId: cliInt,
+                        imei: imei,
+                        registrationId: dev.registrationId,
+                        senderIid: senderIid,
+                        extraFields: extra
+                    )
+                }
+                guard !listParams.isEmpty else {
+                    EngineLog.shared.write("sendText e2ee failed: empty listParams for peer=\(id)")
+                    return .aborted
+                }
+                res = try await sessionClient.sendE2EEMessageAPI(
+                    endpoint: hasValidQuote ? "quote" : "sms",
+                    threadId: id,
+                    isGroup: false,
+                    clientId: cliInt,
+                    listParams: ZaloJSONArrayBox(listParams)
+                )
+            }
+            return .sent(msgId: res.msgId, cliMsgId: res.cliMsgId, tsMs: res.tsMs)
+        } catch {
+            return .failed(message: error.localizedDescription)
+        }
+    }
 
     internal func syncDirectMessageChangesToCore(from oldValue: [String: [ChatMessage]], to newValue: [String: [ChatMessage]]) {
         guard !isApplyingCoreMirror, !isSuppressingDirectMessageSync, let core = coreLifecycle.core else { return }

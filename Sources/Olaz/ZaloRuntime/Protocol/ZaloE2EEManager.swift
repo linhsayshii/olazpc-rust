@@ -1,5 +1,6 @@
 import Foundation
 import OlazCore
+import os
 
 /// Native Zalo PC Signal E2EE coordinator (`deviceId = 2`).
 ///
@@ -37,12 +38,27 @@ actor ZaloE2EEManager {
     private var jsSnapshotCache: String?
     nonisolated let shadowStats = E2EEShadowStats()
     private let logSink: @Sendable (String) -> Void
-    private var loadedUid: String = ""
+    private struct ThreadCache: Sendable {
+        var loadedUid: String = ""
+        var e2eeThreads: Set<String> = []
+    }
+    private let threadCache = OSAllocatedUnfairLock(initialState: ThreadCache())
+    private var loadedUid: String = "" {
+        didSet {
+            let uid = loadedUid
+            threadCache.withLock { $0.loadedUid = uid }
+        }
+    }
     private var registrationId: Int = 0
     private var bundlePayload: [String: Any] = [:]
     private var didCheckServerBundleForSession = false
     private var storeDirty = false
-    private var e2eeThreads: Set<String> = []
+    private var e2eeThreads: Set<String> = [] {
+        didSet {
+            let threads = e2eeThreads
+            threadCache.withLock { $0.e2eeThreads = threads }
+        }
+    }
     private var peerDeviceMeta: [String: [(deviceId: Int, sessionKey: Int64)]] = [:]
     private var fetchedBundlePeers: Set<String> = []
     /// `cliMsgId.deviceId` already resent after a failed delivery report (official `MAX_RETRY_COUNT` is 1).
@@ -451,6 +467,14 @@ actor ZaloE2EEManager {
         storeDirty = false
         if let json = await exportStoreJSON(), !json.isEmpty {
             try? await store.setPreferenceString(key: Self.storePrefKey, value: json)
+        }
+    }
+
+    nonisolated func isE2EEConversationSync(_ convId: String) -> Bool {
+        let clean = ZaloWireParser.stripUserPrefix(convId)
+        guard !clean.isEmpty, !ZaloWireParser.isGroupId(clean) else { return false }
+        return threadCache.withLock { cache in
+            clean != cache.loadedUid && cache.e2eeThreads.contains(clean)
         }
     }
 
