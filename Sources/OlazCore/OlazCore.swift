@@ -4249,6 +4249,11 @@ public protocol CoreSessionProtocol: AnyObject, Sendable {
     func restore(snapshotJson: String) throws  -> Bool
     
     /**
+     * Seeds the deterministic client id sequence (test recorder).
+     */
+    func seedNextClientId(next: Int64) 
+    
+    /**
      * Validates the stored session against the server.
      */
     func sessionStatus() async throws  -> CoreSessionStatus
@@ -4468,6 +4473,18 @@ open func restore(snapshotJson: String)throws  -> Bool  {
         FfiConverterString.lower(snapshotJson),uniffiCallStatus
     )
 })
+}
+    
+    /**
+     * Seeds the deterministic client id sequence (test recorder).
+     */
+open func seedNextClientId(next: Int64)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coresession_seed_next_client_id(
+            self.uniffiCloneHandle(),
+        FfiConverterInt64.lower(next),uniffiCallStatus
+    )
+}
 }
     
     /**
@@ -16241,6 +16258,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coresession_restore() != 47140) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coresession_seed_next_client_id() != 42227) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coresession_session_status() != 60301) {

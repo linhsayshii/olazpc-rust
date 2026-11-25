@@ -337,6 +337,24 @@ fn client_ids_are_strictly_increasing() {
 }
 
 #[test]
+fn seeded_client_ids_ignore_wall_clock_and_increment() {
+    let mut s = SessionState::new(IMEI.to_owned(), "Mac".to_owned());
+    s.seed_next_client_id(6_000_000_000_001);
+    assert_eq!(s.last_client_id_ms, 6_000_000_000_000);
+    assert_eq!(s.next_client_id(1000), 6_000_000_000_001);
+    assert_eq!(s.next_client_id(9_999_999_999_999), 6_000_000_000_002);
+    assert_eq!(s.last_client_id_ms, 6_000_000_000_002);
+
+    let client = olaz_net::SessionClient::new(MockTransport::scripted(Vec::new()), IMEI.to_owned(), "Mac".to_owned())
+        .with_clock(|| 1_700_000_000_000);
+    assert_eq!(client.next_client_id(), 1_700_000_000_000);
+    assert_eq!(client.next_client_id(), 1_700_000_000_001);
+    client.seed_next_client_id(6_000_000_000_050);
+    assert_eq!(client.next_client_id(), 6_000_000_000_050);
+    assert_eq!(client.next_client_id(), 6_000_000_000_051);
+}
+
+#[test]
 fn is_authenticated_needs_uid_sek_and_a_valid_key_length() {
     let mut s = SessionState::new(IMEI.to_owned(), "Mac".to_owned());
     assert!(!s.is_authenticated());
