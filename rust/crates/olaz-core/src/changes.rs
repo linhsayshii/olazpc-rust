@@ -264,14 +264,21 @@ impl ChangeHub {
             let already_shipped = buf.shipped_windows.contains(conv_id);
             let existing = buf.pending_windows.remove(conv_id);
             let next = coalesce_window_op(already_shipped, existing, op.clone());
-            if matches!(next, PendingWindowOp::Reset) {
-                let full = state
-                    .messages
-                    .windows
-                    .get(conv_id)
-                    .cloned()
-                    .unwrap_or_default();
-                buf.latest_windows.insert(conv_id.clone(), full);
+            match next {
+                PendingWindowOp::Reset => {
+                    let full = state
+                        .messages
+                        .windows
+                        .get(conv_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    buf.latest_windows.insert(conv_id.clone(), full);
+                }
+                PendingWindowOp::Remove => {
+                    buf.latest_windows.remove(conv_id);
+                    buf.shipped_windows.remove(conv_id);
+                }
+                _ => {}
             }
             buf.pending_windows.insert(conv_id.clone(), next);
             buf.dirty.insert(DirtyKey::Messages);
@@ -364,6 +371,10 @@ impl ChangeHub {
                                     upserts,
                                     removed_ids,
                                 });
+                            }
+                            PendingWindowOp::Remove => {
+                                buf.shipped_windows.remove(&conv_id);
+                                window_deltas.push(WindowDelta::Remove { conv_id });
                             }
                         }
                     }

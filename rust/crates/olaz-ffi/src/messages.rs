@@ -30,6 +30,9 @@ pub enum WindowDeltaRecord {
         upserts: Vec<ChatMessageRecord>,
         removed_ids: Vec<String>,
     },
+    Remove {
+        conv_id: String,
+    },
 }
 
 impl fmt::Debug for WindowDeltaRecord {
@@ -52,6 +55,7 @@ impl fmt::Debug for WindowDeltaRecord {
                 .field("upserts", &upserts.len())
                 .field("removed", &removed_ids.len())
                 .finish(),
+            Self::Remove { .. } => f.debug_struct("WindowDeltaRecord::Remove").finish(),
         }
     }
 }
@@ -76,6 +80,7 @@ impl From<WindowDelta> for WindowDeltaRecord {
                 upserts: upserts.into_iter().map(Into::into).collect(),
                 removed_ids,
             },
+            WindowDelta::Remove { conv_id } => Self::Remove { conv_id },
         }
     }
 }
