@@ -223,7 +223,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var syncStage2Progress = SyncStage2ProgressState()
     @ObservationIgnored internal var syncInitialEmptyDB = false
     @ObservationIgnored internal let phoneSync = ZaloPhoneSyncCoordinator()
-    @ObservationIgnored internal let e2eeManager = ZaloE2EEManager()
+    @ObservationIgnored internal let e2eeManager: ZaloE2EEManager
     @ObservationIgnored internal var isTransferHidden = false
     @ObservationIgnored internal var phoneSyncStatusSignal: ZaloMobileSyncEvent?
     @ObservationIgnored internal var pollState = ZaloPollState()
@@ -265,7 +265,8 @@ final class ZaloEngine {
 
     @ObservationIgnored internal var reminderWatchCache: [String: (sig: String, snapshot: ReminderSnapshot)] = [:]
     @ObservationIgnored internal var reminderWatchWaiters: [String: [UUID: @Sendable () -> Void]] = [:]
-    @ObservationIgnored private var webkitMigrateTask: Task<Void, Never>?
+    @ObservationIgnored internal var webkitMigrateTask: Task<Void, Never>?
+    @ObservationIgnored internal var e2eePrepareTask: Task<Void, Never>?
 
     /// Kept for menu toggle binding compatibility; native engine has no hidden WebKit window.
     var isDebugRendererVisible = false
@@ -280,8 +281,10 @@ final class ZaloEngine {
         userDefaultsSuiteName: String? = nil,
         cookieStorage: HTTPCookieStorage = .shared
     ) {
+        let resolvedDefaults = userDefaultsSuiteName.flatMap { UserDefaults(suiteName: $0) } ?? .standard
         self.dataDirectory = dataDirectory
-        self.userDefaults = userDefaultsSuiteName.flatMap { UserDefaults(suiteName: $0) } ?? .standard
+        self.userDefaults = resolvedDefaults
+        self.e2eeManager = ZaloE2EEManager(mode: E2EERustMode.resolve(defaults: resolvedDefaults))
         self.sessionClient = ZaloSessionClient(
             dataDirectory: dataDirectory,
             useKeychain: useKeychain,
@@ -395,6 +398,7 @@ final class ZaloEngine {
         activeSyncBatchTasks.values.forEach { $0.cancel() }
         activeSyncBatchTasks = [:]
         webkitMigrateTask?.cancel(); webkitMigrateTask = nil
+        e2eePrepareTask?.cancel(); e2eePrepareTask = nil
         typingResetTasks.values.forEach { $0.cancel() }
         typingResetTasks = [:]
 
@@ -577,7 +581,8 @@ final class ZaloEngine {
         if !effectiveMyUid.isEmpty {
             let myUid = effectiveMyUid
             let mgr = e2eeManager
-            Task.detached(priority: .utility) {
+            e2eePrepareTask?.cancel()
+            e2eePrepareTask = Task.detached(priority: .utility) {
                 await mgr.prepare(uid: myUid, store: store)
             }
         }

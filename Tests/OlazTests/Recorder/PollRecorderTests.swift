@@ -1959,7 +1959,7 @@ enum PollRecorderHarness {
         }
 
         let transitionRecorder = PollTransitionRecorder(scenarioName: scenario.name) {
-            normalizeRecordedURLs(await PollSnapshot.capture(from: engine, watchedCheckIds: watchedCheckIds))
+            normalizeRecordedURLs(SessionSnapshot.capture(from: engine))
         }
 
         engine.stateTrace = { [weak transitionRecorder] in
@@ -1996,6 +1996,7 @@ enum PollRecorderHarness {
 
         var snapshots: [String: CaseJSON] = [:]
 
+        do {
         for (stepIndex, step) in scenario.steps.enumerated() {
             if let cmd = step["cmd"]?.stringValue {
                 let args = step["args"]
@@ -2615,6 +2616,19 @@ enum PollRecorderHarness {
             caseDict["slow"] = .bool(true)
         }
         return .object(caseDict)
+        } catch {
+            transitionRecorder.cancelWaiters()
+            let pending = signalWaiters
+            signalWaiters.removeAll()
+            for cont in pending.values { cont.resume() }
+            virtualClock.cancelAll()
+            engine.resetPolls()
+            engine.cancelTasksForRecording()
+            engine.transportSettleTrace = nil
+            server.stop()
+            await engine.finishTearDownForRecording()
+            throw error
+        }
     }
 
     @MainActor
@@ -2854,34 +2868,29 @@ enum PollRecorderHarness {
     }
 }
 
-private final class PollTransitionRecorder: @unchecked Sendable {
+@MainActor
+private final class PollTransitionRecorder {
     private let scenarioName: String
-    private let captureState: @MainActor () async -> CaseJSON
+    private let captureState: () -> CaseJSON
     private var history: [CaseJSON] = []
-    private var lastSerialized: String?
     private var searchFromIndex = 0
     private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
 
-    init(scenarioName: String, captureState: @escaping @MainActor () async -> CaseJSON) {
+    init(scenarioName: String, captureState: @escaping () -> CaseJSON) {
         self.scenarioName = scenarioName
         self.captureState = captureState
     }
 
-    @MainActor
     func recordTransition() {
-        Task { @MainActor in
-            let state = await captureState()
-            let canonical = state.canonicalString()
-            if canonical == self.lastSerialized {
-                return
-            }
-            self.lastSerialized = canonical
-            self.history.append(state)
-            let pending = self.waiters
-            self.waiters.removeAll()
-            for cont in pending.values {
-                cont.resume()
-            }
+        let state = captureState()
+        if history.last == state {
+            return
+        }
+        history.append(state)
+        let pending = waiters
+        waiters.removeAll()
+        for cont in pending.values {
+            cont.resume()
         }
     }
 
