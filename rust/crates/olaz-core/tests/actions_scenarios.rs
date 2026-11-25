@@ -227,6 +227,7 @@ impl Host for ActionsScenarioHost {
         msg_id: String,
         _cli_msg_id: String,
         _update_conversation_preview: bool,
+        _persist_conversations: bool,
     ) -> bool {
         self.remote_recalls
             .lock()
@@ -240,6 +241,7 @@ impl Host for ActionsScenarioHost {
         _msg_id: String,
         _cli_msg_id: String,
         _update_conversation_preview: bool,
+        _persist_conversations: bool,
     ) -> bool {
         true
     }

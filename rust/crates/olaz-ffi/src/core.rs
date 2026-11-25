@@ -1204,12 +1204,13 @@ impl CoreOfflineConversations {
     pub fn apply_preview_override(
         &self,
         override_rec: ConvPreviewOverrideRecord,
+        persist_conversations: bool,
     ) -> CoreChangesRecord {
         self.apply_cmd(Command::ApplyBatchDelta(BatchApplyDelta {
             applied_count: 0,
             updates: Vec::new(),
             preview_overrides: vec![override_rec.into()],
-            persist_conversations: true,
+            persist_conversations,
         }))
     }
 
@@ -1327,6 +1328,7 @@ pub trait CoreHost: Send + Sync {
         msg_id: String,
         cli_msg_id: String,
         update_conversation_preview: bool,
+        persist_conversations: bool,
     ) -> bool;
     async fn apply_remote_delete(
         &self,
@@ -1334,6 +1336,7 @@ pub trait CoreHost: Send + Sync {
         msg_id: String,
         cli_msg_id: String,
         update_conversation_preview: bool,
+        persist_conversations: bool,
     ) -> bool;
     async fn decrypt_envelope(&self, payload_json: String) -> String;
     async fn mark_e2ee_conversations(&self, conv_ids: Vec<String>);
@@ -1541,9 +1544,16 @@ impl Host for FfiHostBridge {
         msg_id: String,
         cli_msg_id: String,
         update_conversation_preview: bool,
+        persist_conversations: bool,
     ) -> bool {
         self.0
-            .apply_remote_recall(conv_id, msg_id, cli_msg_id, update_conversation_preview)
+            .apply_remote_recall(
+                conv_id,
+                msg_id,
+                cli_msg_id,
+                update_conversation_preview,
+                persist_conversations,
+            )
             .await
     }
 
@@ -1553,9 +1563,16 @@ impl Host for FfiHostBridge {
         msg_id: String,
         cli_msg_id: String,
         update_conversation_preview: bool,
+        persist_conversations: bool,
     ) -> bool {
         self.0
-            .apply_remote_delete(conv_id, msg_id, cli_msg_id, update_conversation_preview)
+            .apply_remote_delete(
+                conv_id,
+                msg_id,
+                cli_msg_id,
+                update_conversation_preview,
+                persist_conversations,
+            )
             .await
     }
 
@@ -1873,6 +1890,7 @@ impl CoreEngine {
     pub async fn apply_preview_override(
         &self,
         override_rec: ConvPreviewOverrideRecord,
+        persist_conversations: bool,
     ) -> Result<u64, CoreError> {
         let handle = Arc::clone(&self.handle);
         let runner = Arc::clone(&self.runner);
@@ -1882,10 +1900,12 @@ impl CoreEngine {
                     applied_count: 0,
                     updates: Vec::new(),
                     preview_overrides: vec![override_rec.into()],
-                    persist_conversations: true,
+                    persist_conversations,
                 }))
                 .await;
-            runner.flush_store().await;
+            if persist_conversations {
+                runner.flush_store().await;
+            }
             handle.current_version()
         })
         .await
@@ -3075,6 +3095,7 @@ mod tests {
             _msg_id: String,
             _cli_msg_id: String,
             _update_conversation_preview: bool,
+            _persist_conversations: bool,
         ) -> bool {
             true
         }
@@ -3084,6 +3105,7 @@ mod tests {
             _msg_id: String,
             _cli_msg_id: String,
             _update_conversation_preview: bool,
+            _persist_conversations: bool,
         ) -> bool {
             true
         }

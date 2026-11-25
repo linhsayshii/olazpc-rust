@@ -396,6 +396,7 @@ pub trait Host: Send + Sync {
         _msg_id: String,
         _cli_msg_id: String,
         _update_conversation_preview: bool,
+        _persist_conversations: bool,
     ) -> bool {
         true
     }
@@ -405,6 +406,7 @@ pub trait Host: Send + Sync {
         _msg_id: String,
         _cli_msg_id: String,
         _update_conversation_preview: bool,
+        _persist_conversations: bool,
     ) -> bool {
         true
     }
@@ -3447,6 +3449,7 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                         msg_id.clone(),
                         cli_msg_id.clone(),
                         update_conversation_preview,
+                        persist_conversations,
                     )
                     .await;
                 if approved {
@@ -3481,6 +3484,7 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                         msg_id.clone(),
                         cli_msg_id.clone(),
                         update_conversation_preview,
+                        persist_conversations,
                     )
                     .await;
                 if approved {

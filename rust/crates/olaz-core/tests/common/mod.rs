@@ -2278,6 +2278,7 @@ impl Host for RecordingHost {
         msg_id: String,
         cli_msg_id: String,
         _update_conversation_preview: bool,
+        _persist_conversations: bool,
     ) -> bool {
         if self.is_u4 {
             self.record(
@@ -2298,6 +2299,7 @@ impl Host for RecordingHost {
         msg_id: String,
         cli_msg_id: String,
         _update_conversation_preview: bool,
+        _persist_conversations: bool,
     ) -> bool {
         if self.is_u4 {
             self.record(

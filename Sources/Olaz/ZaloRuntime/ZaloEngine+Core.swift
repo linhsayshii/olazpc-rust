@@ -424,7 +424,8 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         convId: String,
         msgId: String,
         cliMsgId: String,
-        updateConversationPreview: Bool
+        updateConversationPreview: Bool,
+        persistConversations: Bool
     ) async -> Bool {
         guard let engine else { return false }
         guard engine.hasU4HostTrace else { return true }
@@ -442,7 +443,8 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         convId: String,
         msgId: String,
         cliMsgId: String,
-        updateConversationPreview: Bool
+        updateConversationPreview: Bool,
+        persistConversations: Bool
     ) async -> Bool {
         guard let engine else { return false }
         guard engine.hasU4HostTrace else { return true }
@@ -1398,6 +1400,10 @@ extension ZaloEngine {
                     if changed {
                         messages[convId] = list
                     }
+                case .remove(let convId):
+                    if messages[convId] != nil {
+                        messages.removeValue(forKey: convId)
+                    }
                 }
             }
         }
@@ -1697,6 +1703,8 @@ extension ZaloEngine {
                 switch delta {
                 case .reset(let convId, _), .append(let convId, _), .patch(let convId, _, _):
                     touchedConvs.insert(convId)
+                case .remove:
+                    break
                 }
             }
         }
@@ -2130,15 +2138,14 @@ extension ZaloEngine {
             contacts = next
         }
 
-        if !cRec.groupDetailsJson.isEmpty {
-            var details = cachedGroupDetails
-            for pair in cRec.groupDetailsJson {
-                if let parsed = JSONLossless.parseObject(string: pair.value) {
-                    details[pair.key] = parsed
-                }
+        var details: [String: [String: Any]] = [:]
+        details.reserveCapacity(cRec.groupDetailsJson.count)
+        for pair in cRec.groupDetailsJson {
+            if let parsed = JSONLossless.parseObject(string: pair.value) {
+                details[pair.key] = parsed
             }
-            cachedGroupDetails = details
         }
+        cachedGroupDetails = details
         if let recRaw = cRec.receivedRawJson,
            let data = recRaw.data(using: .utf8),
            let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
@@ -2284,27 +2291,38 @@ extension ZaloEngine {
         return offline
     }
 
-    internal func commitPreviewOverrideToCore(_ overrideRec: ConvPreviewOverrideRecord) async {
+    internal func commitPreviewOverrideToCore(
+        _ overrideRec: ConvPreviewOverrideRecord,
+        persistConversations: Bool = true
+    ) async {
         if let core = coreLifecycle.core {
-            if let v = try? await core.applyPreviewOverride(overrideRec: overrideRec) {
+            if let v = try? await core.applyPreviewOverride(
+                overrideRec: overrideRec,
+                persistConversations: persistConversations
+            ) {
                 await waitForMirrorVersion(v)
             }
             return
         }
         let prevBefore = conversations.first(where: { $0.id == overrideRec.convId })?.preview
-        let batch = offlineConversationsCore().applyPreviewOverride(overrideRec: overrideRec)
+        let batch = offlineConversationsCore().applyPreviewOverride(
+            overrideRec: overrideRec,
+            persistConversations: persistConversations
+        )
         applyCoreChanges(batch)
-        await persistConversationsToSQLite()
-        if let conv = conversations.first(where: { $0.id == overrideRec.convId }), prevBefore != conv.preview {
-            let previewText = conv.preview?.text ?? ""
-            let previewTsMs = conv.preview?.date.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) } ?? 0
-            let previewFromMe = conv.preview?.fromMe ?? false
-            try? await sqliteStore?.setConversationPreview(
-                id: overrideRec.convId,
-                previewText: previewText,
-                previewTsMs: previewTsMs,
-                previewFromMe: previewFromMe
-            )
+        if persistConversations {
+            await persistConversationsToSQLite()
+            if let conv = conversations.first(where: { $0.id == overrideRec.convId }), prevBefore != conv.preview {
+                let previewText = conv.preview?.text ?? ""
+                let previewTsMs = conv.preview?.date.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) } ?? 0
+                let previewFromMe = conv.preview?.fromMe ?? false
+                try? await sqliteStore?.setConversationPreview(
+                    id: overrideRec.convId,
+                    previewText: previewText,
+                    previewTsMs: previewTsMs,
+                    previewFromMe: previewFromMe
+                )
+            }
         }
     }
 

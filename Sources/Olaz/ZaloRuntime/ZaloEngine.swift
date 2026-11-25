@@ -253,7 +253,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var groupMemberCache: [String: [MentionCandidate]] = [:]
     @ObservationIgnored internal var cachedSentRequestsRaw: [[String: Any]] = []
     @ObservationIgnored internal var cachedReceivedRequestsRaw: [[String: Any]] = []
-    @ObservationIgnored internal var cachedGroupDetails: [String: [String: Any]] = [:]
+    @ObservationIgnored internal var cachedGroupDetails: [String: [String: Any]] = [:] { didSet { pushCoreContactsIfRunning() } }
     @ObservationIgnored internal var cachedFriendGlobalIds: [String: String] = [:] { didSet { friendUidByGlobalId = nil; pushCoreIdentitiesIfRunning() } }
     /// `cachedFriendGlobalIds` reversed (global id → uid), built on first use: looking a sender up scanned the whole map for every
     /// message (50 per chat opened, ~25 ms of main thread).
@@ -1274,7 +1274,10 @@ final class ZaloEngine {
                 }
             }
             if listChanged {
+                let prevSuppress = isSuppressingDirectMessageSync
+                isSuppressingDirectMessageSync = true
                 messages[convId] = list
+                isSuppressingDirectMessageSync = prevSuppress
             }
         }
 
@@ -1610,7 +1613,8 @@ final class ZaloEngine {
         convId: String,
         msgId: String,
         cliMsgId: String,
-        updateConversationPreview: Bool = true
+        updateConversationPreview: Bool = true,
+        persistConversations: Bool = true
     ) async -> ConvPreviewOverrideRecord? {
         if let core = coreLifecycle.core {
             let ev: ParsedWireEvent = .undo(convId: convId, msgId: msgId, cliMsgId: cliMsgId)
@@ -1618,7 +1622,7 @@ final class ZaloEngine {
                 events: ZaloWireParser.wireEvents(from: [ev]),
                 incrementUnread: false,
                 notifyIncoming: false,
-                persistConversations: updateConversationPreview
+                persistConversations: updateConversationPreview && persistConversations
             )
             await waitForMirrorVersion(core.currentVersion())
             return nil
@@ -1691,7 +1695,7 @@ final class ZaloEngine {
             )
         }
         if updateConversationPreview, let override {
-            await commitPreviewOverrideToCore(override)
+            await commitPreviewOverrideToCore(override, persistConversations: persistConversations)
         }
         return override
     }
@@ -1701,7 +1705,8 @@ final class ZaloEngine {
         convId: String,
         msgId: String,
         cliMsgId: String,
-        updateConversationPreview: Bool = true
+        updateConversationPreview: Bool = true,
+        persistConversations: Bool = true
     ) async -> ConvPreviewOverrideRecord? {
         if let core = coreLifecycle.core {
             let ev: ParsedWireEvent = .delete(convId: convId, msgId: msgId, cliMsgId: cliMsgId)
@@ -1709,7 +1714,7 @@ final class ZaloEngine {
                 events: ZaloWireParser.wireEvents(from: [ev]),
                 incrementUnread: false,
                 notifyIncoming: false,
-                persistConversations: updateConversationPreview
+                persistConversations: updateConversationPreview && persistConversations
             )
             await waitForMirrorVersion(core.currentVersion())
             return nil
@@ -1812,7 +1817,7 @@ final class ZaloEngine {
             preview: bestRemaining
         )
         if updateConversationPreview {
-            await commitPreviewOverrideToCore(override)
+            await commitPreviewOverrideToCore(override, persistConversations: persistConversations)
         }
         return override
     }
