@@ -1076,6 +1076,8 @@ import Testing
                 people: 1
             )
         ]
+        // Core deltas from the reactions above must land before the mirror is overwritten by hand.
+        await engine.settleForRecording()
         engine.messages["201"] = [legacyMsg]
         await engine.applyRemoteReaction(convId: "201", msgId: "9002", cliMsgId: "", senderId: "201", rType: "-1", rIcon: "", eventId: "e4")
         #expect(engine.messages["201"]?.first?.reactions.isEmpty == true)
