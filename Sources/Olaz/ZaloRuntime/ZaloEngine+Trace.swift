@@ -52,7 +52,6 @@ extension ZaloEngine {
         stopCoreEngine()
         bootTask?.cancel()
         qrTask?.cancel()
-        bootstrapTask?.cancel()
         transferTask?.cancel()
         openConversationTask?.cancel()
         loadOlderTask?.cancel()

@@ -270,7 +270,9 @@ enum EngineProbe {
                     sampleGroupId = grp.id
                     break
                 }
-                _ = await engine.fetchAndMergeHistory(convId: grp.id, beforeMsgId: nil, isOld: nil, count: 30)
+                if let box = try? await engine.sessionClient.fetchHistory(convId: grp.id, lastMsgId: nil, count: 30, isOld: nil) {
+                    _ = await engine.applyBatchResponse(box.dict, fallbackConvId: grp.id, isGroupHint: true, incrementUnread: false)
+                }
                 let c = engine.messages[grp.id]?.count ?? 0
                 if c > totalGroupMsgs {
                     totalGroupMsgs = c
@@ -416,7 +418,9 @@ enum EngineProbe {
 
         // Clean any leftover probe messages from earlier runs in "Cloud của tôi"
         if let selfId = engine.selfConversationId {
-            _ = await engine.fetchAndMergeHistory(convId: selfId, beforeMsgId: nil, isOld: nil, count: 50)
+            if let box = try? await engine.sessionClient.fetchHistory(convId: selfId, lastMsgId: nil, count: 50, isOld: nil) {
+                _ = await engine.applyBatchResponse(box.dict, fallbackConvId: selfId, isGroupHint: false, incrementUnread: false)
+            }
             let staleProbes = (engine.messages[selfId] ?? []).filter { msg in
                 if msg.text == "probe.txt" || msg.text == "probe.png" || msg.text == "[olaz-selftest]" || msg.text.contains("Olaz Native") {
                     return true
