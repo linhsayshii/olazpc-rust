@@ -312,6 +312,65 @@ import Testing
         report("react-to-visible", reactSamplesMs)
         report("delete-to-hidden", deleteSamplesMs)
 
+        // 3. Burst of 200 remote reaction events in a row (direct + live batch).
+        let burstCount = ProcessInfo.processInfo.environment["OLAZ_BENCH_BURST"].flatMap(Int.init) ?? 200
+        let burstStartDirect = ContinuousClock.now
+        for i in 0..<burstCount {
+            let msgIdx = i % 50
+            let msgId = "\(8_100_000 + msgIdx)"
+            let rType = (i % 2 == 0) ? "5" : "3"
+            let rIcon = (i % 2 == 0) ? "/-heart" : "/-strong"
+            await engine.applyRemoteReaction(
+                convId: convId,
+                msgId: msgId,
+                cliMsgId: "seed_\(msgIdx)",
+                senderId: convId,
+                rType: rType,
+                rIcon: rIcon,
+                eventId: "burst_direct_\(i)",
+                reactClientId: "rcli_d_\(i)",
+                senderName: "Bench Peer"
+            )
+        }
+        let directElapsed = ContinuousClock.now - burstStartDirect
+        let directTotalMs = Double(directElapsed.components.seconds) * 1000.0
+            + Double(directElapsed.components.attoseconds) / 1e15
+        print(String(
+            format: "PERF remote-react-burst-direct (n=%d): total=%.2f ms  avg=%.3f ms/ev",
+            burstCount, directTotalMs, directTotalMs / Double(max(1, burstCount))
+        ))
+
+        var batchEvents: [ParsedWireEvent] = []
+        batchEvents.reserveCapacity(burstCount)
+        for i in 0..<burstCount {
+            let msgIdx = i % 50
+            let msgId = "\(8_100_000 + msgIdx)"
+            let rType = (i % 2 == 0) ? "5" : "3"
+            let rIcon = (i % 2 == 0) ? "/-heart" : "/-strong"
+            batchEvents.append(.reaction(
+                convId: convId,
+                msgId: msgId,
+                cliMsgId: "seed_\(msgIdx)",
+                senderId: convId,
+                rType: rType,
+                rIcon: rIcon,
+                eventId: "burst_batch_\(i)",
+                reactClientId: "rcli_b_\(i)",
+                tsMs: baseMs + 100_000 + Int64(i),
+                seqId: Int64(i + 1),
+                senderName: "Bench Peer"
+            ))
+        }
+        let burstStartBatch = ContinuousClock.now
+        _ = await engine.applyParsedEvents(batchEvents)
+        let batchElapsed = ContinuousClock.now - burstStartBatch
+        let batchTotalMs = Double(batchElapsed.components.seconds) * 1000.0
+            + Double(batchElapsed.components.attoseconds) / 1e15
+        print(String(
+            format: "PERF remote-react-burst-batch (n=%d): total=%.2f ms  avg=%.3f ms/ev",
+            burstCount, batchTotalMs, batchTotalMs / Double(max(1, burstCount))
+        ))
+
         engine.cancelTasksForRecording()
         await engine.finishTearDownForRecording()
     }

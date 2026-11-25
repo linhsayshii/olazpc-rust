@@ -665,6 +665,7 @@ extension ZaloEngine {
             let effectiveType = alreadyMine ? -1 : spec.rType
             let effectiveIcon = alreadyMine ? "" : spec.rIcon
             let myUid = profile?.userId ?? ""
+            var overlayToken: UUID?
             if var list = messages[conversationId],
                let idx = list.firstIndex(where: { $0.id == initialMsg.id }) {
                 var updated = list[idx]
@@ -679,6 +680,12 @@ extension ZaloEngine {
                     nameLookup: { _ in "Bạn" }
                 )
                 list[idx] = updated
+                overlayToken = beginOptimisticReactionOverlay(
+                    convId: conversationId,
+                    msgId: updated.id,
+                    clientId: updated.clientId,
+                    reactions: updated.reactions
+                )
                 isSuppressingDirectMessageSync = true
                 messages[conversationId] = list
                 isSuppressingDirectMessageSync = false
@@ -690,7 +697,12 @@ extension ZaloEngine {
                 removeAll: removeAll,
                 nowMs: nowMs()
             ) {
+                if let token = overlayToken {
+                    resolveOptimisticOverlay(token: token, targetVersion: v)
+                }
                 await waitForMirrorVersion(v)
+            } else if let token = overlayToken {
+                cancelOptimisticOverlay(token: token)
             }
             return
         }

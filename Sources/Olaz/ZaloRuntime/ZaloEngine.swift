@@ -177,9 +177,25 @@ final class ZaloEngine {
     @ObservationIgnored internal var mirrorVersionWaiters: [(target: UInt64, continuation: CheckedContinuation<Void, Never>)] = []
     @ObservationIgnored internal var cachedQRPayload: String?
     @ObservationIgnored internal var cachedQRPNG: Data?
-    @ObservationIgnored internal var hostTrace: ((String, [String: Any]) -> Bool)?
+    @ObservationIgnored private let u4HostTraceActive = OSAllocatedUnfairLock<Bool>(initialState: false)
+    nonisolated internal var hasU4HostTrace: Bool {
+        u4HostTraceActive.withLock { $0 }
+    }
+    @ObservationIgnored internal var hostTrace: ((String, [String: Any]) -> Bool)? {
+        didSet {
+            let active = (hostTrace != nil) && traceU4HostEnabled
+            u4HostTraceActive.withLock { $0 = active }
+        }
+    }
     @ObservationIgnored internal var sendE2EETextHostHandler: (([String: Any]) async throws -> SendMessageResult)?
-    @ObservationIgnored internal var traceU4HostEnabled: Bool = false
+    @ObservationIgnored internal var traceU4HostEnabled: Bool = false {
+        didSet {
+            let active = (hostTrace != nil) && traceU4HostEnabled
+            u4HostTraceActive.withLock { $0 = active }
+        }
+    }
+    @ObservationIgnored internal var optimisticMessageOverlays: [OptimisticMessageOverlay] = []
+    @ObservationIgnored internal var lastOptimisticDeletedMessages: [String: [ChatMessage]] = [:]
     @ObservationIgnored internal var stateTrace: (() -> Void)?
     @ObservationIgnored private let transportSettleTraceActive = OSAllocatedUnfairLock<Bool>(initialState: false)
     nonisolated internal var hasTransportSettleTrace: Bool {
@@ -687,9 +703,7 @@ final class ZaloEngine {
             probeFreshness: probeFreshness,
             nowMs: nowMs()
         )) ?? 0
-        if let v = try? await core.flushAll() {
-            await waitForMirrorVersion(v)
-        }
+        await waitForMirrorVersion(core.currentVersion())
         return Int(count)
     }
 
@@ -710,9 +724,7 @@ final class ZaloEngine {
             notifyIncoming: notifyIncoming,
             persistConversations: persistConversations
         )) ?? 0
-        if let v = try? await core.flushAll() {
-            await waitForMirrorVersion(v)
-        }
+        await waitForMirrorVersion(core.currentVersion())
         return Int(count)
     }
 
@@ -1419,9 +1431,7 @@ final class ZaloEngine {
                 notifyIncoming: false,
                 persistConversations: true
             )
-            if let v = try? await core.flushAll() {
-                await waitForMirrorVersion(v)
-            }
+            await waitForMirrorVersion(core.currentVersion())
             return
         }
         guard traceU4Host("apply_remote_reaction", args: [
@@ -1601,9 +1611,7 @@ final class ZaloEngine {
                 notifyIncoming: false,
                 persistConversations: updateConversationPreview
             )
-            if let v = try? await core.flushAll() {
-                await waitForMirrorVersion(v)
-            }
+            await waitForMirrorVersion(core.currentVersion())
             return nil
         }
         guard traceU4Host("apply_remote_recall", args: [
@@ -1694,9 +1702,7 @@ final class ZaloEngine {
                 notifyIncoming: false,
                 persistConversations: updateConversationPreview
             )
-            if let v = try? await core.flushAll() {
-                await waitForMirrorVersion(v)
-            }
+            await waitForMirrorVersion(core.currentVersion())
             return nil
         }
         guard traceU4Host("apply_remote_delete", args: [

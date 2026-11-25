@@ -509,9 +509,18 @@ extension ZaloEngine {
 
     // MARK: Xóa chỉ ở phía tôi
 
-    internal func applyOptimisticDeleteMirror(_ list: [ChatMessage], nowMs tsMs: Int64) {
-        guard let conversation = list.first?.conversationId else { return }
+    @discardableResult
+    internal func applyOptimisticDeleteMirror(_ list: [ChatMessage], nowMs tsMs: Int64) -> UUID? {
+        guard let conversation = list.first?.conversationId else { return nil }
         let ids = Set(list.map(\.id))
+        let deadline = Date(timeIntervalSince1970: Double(tsMs) / 1000.0).addingTimeInterval(5)
+        let undo = DeleteUndo(
+            id: deleteUndo?.id ?? UUID().uuidString,
+            conversationId: conversation,
+            count: list.count,
+            deadline: deadline
+        )
+        let token = beginOptimisticDeleteOverlay(convId: conversation, messages: list, undo: undo)
         if var current = messages[conversation] {
             let prevCount = current.count
             current.removeAll { ids.contains($0.id) }
@@ -521,19 +530,15 @@ extension ZaloEngine {
                 isSuppressingDirectMessageSync = false
             }
         }
-        let deadline = Date(timeIntervalSince1970: Double(tsMs) / 1000.0).addingTimeInterval(5)
-        deleteUndo = DeleteUndo(
-            id: deleteUndo?.id ?? UUID().uuidString,
-            conversationId: conversation,
-            count: list.count,
-            deadline: deadline
-        )
+        deleteUndo = undo
+        return token
     }
 
     func deleteForMe(_ message: ChatMessage, confirmed: Bool = false) {
         let conversation = message.conversationId
         if let core = coreLifecycle.core {
             let tsMs = nowMs()
+            var overlayToken: UUID?
             if !confirmed && message.menu.delete == .forMe {
                 if openConversationId == conversation, messageConfirm == nil {
                     mirroredMessageConfirmCoreId = nil
@@ -547,7 +552,7 @@ extension ZaloEngine {
                     )
                 }
             } else {
-                applyOptimisticDeleteMirror([message], nowMs: tsMs)
+                overlayToken = applyOptimisticDeleteMirror([message], nowMs: tsMs)
             }
             core.deleteForMe(
                 convId: conversation,
@@ -555,6 +560,9 @@ extension ZaloEngine {
                 confirmed: confirmed,
                 nowMs: tsMs
             )
+            if let token = overlayToken {
+                scheduleOptimisticOverlayFence(token: token, core: core)
+            }
             return
         }
         if !confirmed && message.menu.delete == .forMe {
@@ -576,13 +584,16 @@ extension ZaloEngine {
         guard let conversation = list.first?.conversationId else { return }
         if let core = coreLifecycle.core {
             let tsMs = nowMs()
-            applyOptimisticDeleteMirror(list, nowMs: tsMs)
+            let overlayToken = applyOptimisticDeleteMirror(list, nowMs: tsMs)
             core.deleteMany(
                 convId: conversation,
                 msgIds: list.map(\.id),
                 confirm: false,
                 nowMs: tsMs
             )
+            if let token = overlayToken {
+                scheduleOptimisticOverlayFence(token: token, core: core)
+            }
             return
         }
         let undoId = UUID().uuidString
@@ -622,8 +633,29 @@ extension ZaloEngine {
 
     func undoDelete() {
         if let core = coreLifecycle.core {
+            let convId = deleteUndo?.conversationId ?? ""
+            let restored = convId.isEmpty ? [] : (lastOptimisticDeletedMessages.removeValue(forKey: convId) ?? [])
+            var overlayToken: UUID?
+            if !convId.isEmpty {
+                overlayToken = beginOptimisticUndoDeleteOverlay(convId: convId, restored: restored)
+                if !restored.isEmpty {
+                    var current = messages[convId] ?? []
+                    let existingIds = Set(current.map(\.id))
+                    let toAdd = restored.filter { !existingIds.contains($0.id) }
+                    if !toAdd.isEmpty {
+                        current.append(contentsOf: toAdd)
+                        current.sort { a, b in a.date == b.date ? a.id < b.id : a.date < b.date }
+                        isSuppressingDirectMessageSync = true
+                        messages[convId] = current
+                        isSuppressingDirectMessageSync = false
+                    }
+                }
+            }
             deleteUndo = nil
             core.undoDelete()
+            if let token = overlayToken {
+                scheduleOptimisticOverlayFence(token: token, core: core)
+            }
             return
         }
         guard let undo = deleteUndo else { return }
@@ -638,6 +670,9 @@ extension ZaloEngine {
 
     func dismissDeleteUndo() {
         if let core = coreLifecycle.core {
+            if let convId = deleteUndo?.conversationId {
+                lastOptimisticDeletedMessages.removeValue(forKey: convId)
+            }
             deleteUndo = nil
             core.dismissDeleteUndo()
             return
@@ -670,9 +705,11 @@ extension ZaloEngine {
 
     func setStarred(_ message: ChatMessage, _ on: Bool) {
         if let core = coreLifecycle.core {
+            var overlayToken: UUID?
             if !(on && message.menu.star == .blocked) {
                 let conv = message.conversationId
                 if var list = messages[conv], let idx = list.firstIndex(where: { $0.id == message.id }) {
+                    overlayToken = beginOptimisticStarOverlay(convId: conv, msgId: message.id, on: on)
                     list[idx].menu.starred = on
                     list[idx].menu.star = on ? .unstar : .star
                     isSuppressingDirectMessageSync = true
@@ -682,6 +719,9 @@ extension ZaloEngine {
                 }
             }
             core.setStarred(convId: message.conversationId, msgId: message.id, on: on)
+            if let token = overlayToken {
+                scheduleOptimisticOverlayFence(token: token, core: core)
+            }
             return
         }
         if on, message.menu.star == .blocked {
@@ -807,13 +847,14 @@ extension ZaloEngine {
         mirroredMessageConfirmCoreId = nil
         if let core = coreLifecycle.core {
             let tsMs = nowMs()
+            var overlayToken: UUID?
             if ok {
                 switch confirm.action {
                 case .deleteForMe(let message):
-                    applyOptimisticDeleteMirror([message], nowMs: tsMs)
+                    overlayToken = applyOptimisticDeleteMirror([message], nowMs: tsMs)
                 case .deleteMany(let list):
                     endSelection()
-                    applyOptimisticDeleteMirror(list, nowMs: tsMs)
+                    overlayToken = applyOptimisticDeleteMirror(list, nowMs: tsMs)
                 case .recallMany:
                     endSelection()
                 case .pin(let message, let replacing):
@@ -827,6 +868,9 @@ extension ZaloEngine {
                 }
             }
             core.answerMessageConfirm(ok: ok, nowMs: tsMs)
+            if let token = overlayToken {
+                scheduleOptimisticOverlayFence(token: token, core: core)
+            }
             return
         }
         guard ok else { return }
@@ -895,6 +939,8 @@ extension ZaloEngine {
         pins = [:]
         messageActionsBusy = []
         pendingDeletedMessages = [:]
+        optimisticMessageOverlays.removeAll()
+        lastOptimisticDeletedMessages.removeAll()
     }
 }
 
