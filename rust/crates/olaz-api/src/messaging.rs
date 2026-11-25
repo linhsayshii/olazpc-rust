@@ -320,9 +320,14 @@ pub fn build_reaction_request(p: &ReactionParams<'_>) -> ReactionRequestSpec {
 impl<T: Transport> ZaloApi<T> {
     /// Swift `sendTextAPI`: plain text, optionally a quote/reply and @mentions (groups only).
     ///
-    /// A quote is tried on `/api/message/quote` / `/api/group/quote`; if that call fails for any
-    /// reason the message is sent as plain text instead (Swift `try?`). `msg_id` of the result is
-    /// the server id, or the client id when the answer has none.
+    /// Official routes:
+    /// - Quote: `/api/message/quote` (1-1) or `/api/group/quote` (group, carries `mentionInfo` when present);
+    ///   if that call fails for any reason, falls back to the non-quote route (Swift `try?`).
+    /// - Group with non-empty `mentions`: `sendMentionMessage` (cmd 11198) -> `POST group /api/group/mention`
+    ///   with `{grid, message, clientId, mentionInfo, language: "vi", visibility: 0, ttl}` plus optional
+    ///   `textProperties` and `metaData: {urgency}` (no `imei`).
+    /// - Group without `mentions`: `sendZText` (cmd 11163) -> `POST group /api/group/sendmsg`.
+    /// - 1-1 without quote: `sendZText` (cmd 11151) -> `POST chat /api/message/sms`.
     pub async fn send_text(&self, a: &SendTextArgs<'_>) -> Result<SendMessageResult, ApiError> {
         let (is_group, clean_id) = conv_target(a.conv_id);
         let cli_int = parse_i64(a.cli_msg_id).unwrap_or_else(|| self.client().next_client_id());
@@ -393,31 +398,58 @@ impl<T: Transport> ZaloApi<T> {
         let resp = match resp {
             Some(r) => r,
             None => {
-                let mut payload = json!({
-                    "message": a.text,
-                    "clientId": cli_int,
-                    "imei": imei,
-                    "ttl": a.ttl,
-                });
-                if let Some(tp) = a.text_properties.filter(|t| !t.is_empty()) {
-                    insert(&mut payload, "textProperties", Value::from(tp));
-                }
-                if a.urgency > 0 {
-                    insert(&mut payload, "metaData", json!({"urgency": a.urgency}));
-                }
-                if is_group {
-                    insert(&mut payload, "grid", Value::from(clean_id));
-                    insert(&mut payload, "visibility", Value::from(0));
+                let (path, payload) = if is_group {
                     if let Some(m) = mention_str {
-                        insert(&mut payload, "mentionInfo", m);
+                        // Official `sendMentionMessage` (cmd 11198):
+                        // {grid, message, clientId, mentionInfo, language, visibility}
+                        // + buildParams (textProperties, metaData) + w.f (ttl).
+                        let mut payload = Map::new();
+                        payload.insert("grid".to_owned(), Value::from(clean_id));
+                        payload.insert("message".to_owned(), Value::from(a.text));
+                        payload.insert("clientId".to_owned(), Value::from(cli_int));
+                        payload.insert("mentionInfo".to_owned(), m);
+                        payload.insert("language".to_owned(), Value::from("vi"));
+                        payload.insert("visibility".to_owned(), Value::from(0));
+                        if let Some(tp) = a.text_properties.filter(|t| !t.is_empty()) {
+                            payload.insert("textProperties".to_owned(), Value::from(tp));
+                        }
+                        if a.urgency > 0 {
+                            payload.insert("metaData".to_owned(), json!({"urgency": a.urgency}));
+                        }
+                        payload.insert("ttl".to_owned(), Value::from(a.ttl));
+                        ("/api/group/mention", Value::Object(payload))
+                    } else {
+                        let mut payload = json!({
+                            "message": a.text,
+                            "clientId": cli_int,
+                            "imei": imei,
+                            "ttl": a.ttl,
+                            "grid": clean_id,
+                            "visibility": 0,
+                        });
+                        if let Some(tp) = a.text_properties.filter(|t| !t.is_empty()) {
+                            insert(&mut payload, "textProperties", Value::from(tp));
+                        }
+                        if a.urgency > 0 {
+                            insert(&mut payload, "metaData", json!({"urgency": a.urgency}));
+                        }
+                        ("/api/group/sendmsg", payload)
                     }
                 } else {
-                    insert(&mut payload, "toid", Value::from(clean_id));
-                }
-                let path = if is_group {
-                    "/api/group/sendmsg"
-                } else {
-                    "/api/message/sms"
+                    let mut payload = json!({
+                        "message": a.text,
+                        "clientId": cli_int,
+                        "imei": imei,
+                        "ttl": a.ttl,
+                        "toid": clean_id,
+                    });
+                    if let Some(tp) = a.text_properties.filter(|t| !t.is_empty()) {
+                        insert(&mut payload, "textProperties", Value::from(tp));
+                    }
+                    if a.urgency > 0 {
+                        insert(&mut payload, "metaData", json!({"urgency": a.urgency}));
+                    }
+                    ("/api/message/sms", payload)
                 };
                 self.post(ApiRequest::new(service, path).payload(payload))
                     .await?
