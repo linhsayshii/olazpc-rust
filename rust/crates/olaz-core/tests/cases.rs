@@ -12,6 +12,13 @@ use std::process::ExitCode;
 
 use common::{Case, KnownDiff, canonical_json_string, compare_case, run_case};
 
+/// Domains whose `.jsonl` recordings are merged ahead of their `olaz-core` port.
+///
+/// Unfiltered runs (`cargo test -p olaz-core --test cases`) print each pending domain with its
+/// case count and skip execution; explicit `-- <domain>` runs (and `scripts/gate-core.sh`) refuse
+/// pending domains. Each port removes its domain from this list in the same PR.
+const PENDING_DOMAINS: &[&str] = &["contacts", "groups", "message_actions", "pins", "polls"];
+
 fn cases_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cases")
 }
@@ -39,14 +46,6 @@ fn load_known_diffs(dir: &Path) -> Result<Vec<KnownDiff>, String> {
     load_jsonl(&path)
 }
 
-/// Domains whose recorded cases are on disk (via stacked recorder branches)
-/// but whose Rust ports have not landed on this branch yet.
-const PENDING_DOMAINS: &[&str] = &["contacts", "groups", "message_actions", "pins", "polls"];
-
-fn is_pending_domain(domain: &str) -> bool {
-    PENDING_DOMAINS.contains(&domain)
-}
-
 fn discover_domains(dir: &Path, filter: Option<&str>) -> Result<Vec<(String, PathBuf)>, String> {
     if let Some(domain) = filter {
         let path = dir.join(format!("{domain}.jsonl"));
@@ -69,7 +68,7 @@ fn discover_domains(dir: &Path, filter: Option<&str>) -> Result<Vec<(String, Pat
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        if stem == "known-diffs" || is_pending_domain(stem) {
+        if stem == "known-diffs" {
             continue;
         }
         out.push((stem.to_owned(), path));
@@ -93,6 +92,19 @@ fn parse_domain_filter() -> Option<String> {
 fn main() -> ExitCode {
     let dir = cases_dir();
     let filter = parse_domain_filter();
+
+    if filter.is_none() {
+        for &pending in PENDING_DOMAINS {
+            let pending_path = dir.join(format!("{pending}.jsonl"));
+            if !pending_path.exists() {
+                eprintln!(
+                    "error: pending domain '{pending}' in PENDING_DOMAINS has no case file at {}",
+                    pending_path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     let domains = match discover_domains(&dir, filter.as_deref()) {
         Ok(d) => d,
@@ -119,6 +131,25 @@ fn main() -> ExitCode {
     let mut any_failure = false;
 
     for (domain, path) in &domains {
+        if PENDING_DOMAINS.contains(&domain.as_str()) {
+            let raw_cases: Vec<serde_json::Value> = match load_jsonl(path) {
+                Ok(c) => c,
+                Err(msg) => {
+                    eprintln!("error: {msg}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let total = raw_cases.len();
+            if filter.is_some() {
+                eprintln!(
+                    "error: domain '{domain}' is pending ({total} cases in PENDING_DOMAINS); remove it from PENDING_DOMAINS before gating"
+                );
+                return ExitCode::FAILURE;
+            }
+            println!("skipped pending domain: {domain} ({total} cases)");
+            continue;
+        }
+
         let cases: Vec<Case> = match load_jsonl(path) {
             Ok(c) => c,
             Err(msg) => {
