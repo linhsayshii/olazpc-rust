@@ -92,6 +92,8 @@ actor ZaloSQLiteStore {
     nonisolated(unsafe) private var db: OpaquePointer?
     /// Rust store on the same file (ADR-010: same system SQLite, WAL).
     private let core: CoreStore
+    /// Shared Rust store handle attached to `CoreEngine` (U3).
+    nonisolated var coreStoreHandle: CoreStore { core }
 
     init(path: String) throws {
         self.path = path
@@ -196,6 +198,24 @@ actor ZaloSQLiteStore {
     func setConversationPinned(id: String, pinned: Bool) async throws {
         do {
             try await core.setConversationPinned(id: id, pinned: pinned)
+        } catch { throw RustCore.mapError(error) }
+    }
+
+    func setConversationPreview(
+        id: String,
+        previewText: String,
+        previewTsMs: Int64,
+        previewFromMe: Bool,
+        updatedAtMs: Int64 = Int64((Date().timeIntervalSince1970 * 1000).rounded())
+    ) async throws {
+        do {
+            try await core.setConversationPreview(
+                id: id,
+                previewText: previewText,
+                previewTsMs: previewTsMs,
+                previewFromMe: previewFromMe,
+                updatedAtMs: updatedAtMs
+            )
         } catch { throw RustCore.mapError(error) }
     }
 

@@ -339,19 +339,23 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         incrementUnread: Bool,
         notifyIncoming: Bool,
         payloadJson: String
-    ) async -> UInt32 {
-        guard let engine else { return 0 }
+    ) async -> BatchApplyDeltaRecord {
+        guard let engine else {
+            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], previewOverrides: [], persistConversations: false)
+        }
         let box = ZaloJSONBox(JSONLossless.parseObject(string: payloadJson) ?? [:])
-        let count = await engine.hostApplyBatch(
+        let delta = await engine.hostApplyBatch(
             box: box,
             cmd: cmd,
             incrementUnread: incrementUnread,
             notifyIncoming: notifyIncoming
         )
-        await MainActor.run {
-            engine.transportSettleTrace?()
+        if engine.hasTransportSettleTrace {
+            await MainActor.run {
+                engine.transportSettleTrace?()
+            }
         }
-        return UInt32(max(0, count))
+        return delta
     }
 
     func applyParsedEvents(
@@ -361,8 +365,10 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         events: [WireEvent],
         uids: [String],
         payload: CoreWirePayload
-    ) async {
-        guard let engine else { return }
+    ) async -> BatchApplyDeltaRecord {
+        guard let engine else {
+            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], previewOverrides: [], persistConversations: false)
+        }
         let context = await engine.hostLookupNameContext(uids: uids)
         let resolvedWire = payload.resolve(
             myUid: context.myUid,
@@ -370,24 +376,18 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
             names: context.names
         ) ?? events
         let parsed = ZaloWireParser.parsedEvents(from: resolvedWire)
-        let allowApply = await MainActor.run {
-            engine.traceHost("apply_parsed_events", args: [
-                "cmd": Int(cmd),
-                "increment_unread": incrementUnread,
-                "notify_incoming": notifyIncoming,
-                "events": ZaloEngine.serializeParsedWireEvents(parsed),
-            ])
+        let delta = await engine.hostApplyParsedEvents(
+            cmd: cmd,
+            incrementUnread: incrementUnread,
+            notifyIncoming: notifyIncoming,
+            events: parsed
+        )
+        if engine.hasTransportSettleTrace {
+            await MainActor.run {
+                engine.transportSettleTrace?()
+            }
         }
-        if allowApply {
-            _ = await engine.applyParsedEvents(
-                parsed,
-                incrementUnread: incrementUnread,
-                notifyIncoming: notifyIncoming
-            )
-        }
-        await MainActor.run {
-            engine.transportSettleTrace?()
-        }
+        return delta
     }
 
     func mobileSync(events: [MobileSyncEventRecord]) async {
@@ -418,8 +418,10 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
     func e2eeConnected(uid: String) async {
         guard let engine else { return }
         await engine.hostHandleE2EEConnected(uid: uid)
-        await MainActor.run {
-            engine.transportSettleTrace?()
+        if engine.hasTransportSettleTrace {
+            await MainActor.run {
+                engine.transportSettleTrace?()
+            }
         }
     }
 
@@ -431,8 +433,10 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         if allowDisconnect {
             await engine.e2eeManager.markDisconnected()
         }
-        await MainActor.run {
-            engine.transportSettleTrace?()
+        if engine.hasTransportSettleTrace {
+            await MainActor.run {
+                engine.transportSettleTrace?()
+            }
         }
     }
 
@@ -550,6 +554,160 @@ extension ZaloLoginAccount {
     }
 }
 
+extension ZaloEngine.ConversationSummary {
+    nonisolated init(coreRecord record: ConversationSummaryRecord) {
+        let preview: Preview? = record.preview.map { p in
+            Preview(
+                text: p.text,
+                date: p.dateMs.map { Date(timeIntervalSince1970: Double($0) / 1000) },
+                fromMe: p.fromMe
+            )
+        }
+        self.init(
+            id: record.id,
+            isGroup: record.isGroup,
+            name: record.name,
+            avatar: record.avatar.flatMap { $0.isEmpty ? nil : URL(string: $0) },
+            pinned: record.pinned,
+            members: Int(record.members),
+            unread: Int(record.unread),
+            preview: preview
+        )
+    }
+
+    nonisolated var coreRecord: ConversationSummaryRecord {
+        let previewRecord: ConversationPreviewRecord? = preview.map { p in
+            ConversationPreviewRecord(
+                text: p.text,
+                dateMs: p.date.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) },
+                fromMe: p.fromMe
+            )
+        }
+        return ConversationSummaryRecord(
+            id: id,
+            isGroup: isGroup,
+            name: name,
+            avatar: avatar?.absoluteString,
+            pinned: pinned,
+            members: Int64(members),
+            unread: Int64(unread),
+            preview: previewRecord
+        )
+    }
+}
+
+extension ConversationActionsState {
+    init(coreRecord record: ConversationActionsRecord) {
+        var nextFlags: [String: ConversationActionFlags] = [:]
+        nextFlags.reserveCapacity(record.flags.count)
+        for entry in record.flags where entry.bits != 0 {
+            nextFlags[entry.id] = ConversationActionFlags(rawValue: Int(entry.bits))
+        }
+        var nextLeft: [String: ConversationLeaveType] = [:]
+        nextLeft.reserveCapacity(record.left.count)
+        for entry in record.left {
+            nextLeft[entry.id] = ConversationLeaveType(rawValue: entry.kind) ?? .kick
+        }
+        self.init(
+            loaded: record.loaded,
+            hiddenKnown: record.hiddenKnown,
+            flags: nextFlags,
+            left: nextLeft,
+            hiddenEnabled: record.hiddenEnabled,
+            hasHiddenPIN: record.hasHiddenPin,
+            hiddenIds: Set(record.hiddenIds),
+            markUnreadEnabled: record.markUnreadEnabled,
+            lateEpoch: record.lateEpoch,
+            lateSeq: Int(record.lateSeq)
+        )
+    }
+}
+
+extension ConversationExtras {
+    mutating func applyCoreRecord(_ record: ConversationExtrasRecord) {
+        loaded = record.loaded
+        labels = record.labels.map { l in
+            Label(id: l.id, name: l.name, colorHex: l.colorHex, convIds: l.convIds)
+        }
+        archivedEnabled = record.archivedEnabled
+        typeFilter = Int(record.typeFilter)
+        labelFilterIds = record.labelFilterIds
+        listIds = record.listIds
+        strangerIds = Set(record.strangerIds)
+        strangerFolderIds = record.strangerFolderIds
+        strangerBox = StrangerBox(
+            chats: Int(record.strangerBox.chats),
+            unreadChats: Int(record.strangerBox.unreadChats),
+            unreadMessages: Int(record.strangerBox.unreadMessages),
+            newestId: record.strangerBox.newestId
+        )
+        var map: [String: String] = [:]
+        map.reserveCapacity(record.labelByConversation.count)
+        for entry in record.labelByConversation {
+            map[entry.convId] = entry.labelId
+        }
+        labelByConversation = map
+    }
+}
+
+extension ConversationPrompt {
+    init(coreRecord record: ConversationPromptRecord) {
+        switch record {
+        case .delete(let id): self = .delete(id: id)
+        case .pinBoard(let id): self = .pinBoard(id: id)
+        case .hide(let id): self = .hide(id: id)
+        case .unhide(let id): self = .unhide(id: id)
+        case .unlock(let id): self = .unlock(id: id)
+        }
+    }
+
+    var coreRecord: ConversationPromptRecord {
+        switch self {
+        case .delete(let id): return .delete(id: id)
+        case .pinBoard(let id): return .pinBoard(id: id)
+        case .hide(let id): return .hide(id: id)
+        case .unhide(let id): return .unhide(id: id)
+        case .unlock(let id): return .unlock(id: id)
+        }
+    }
+}
+
+extension ConversationActionResult {
+    init(coreRecord record: ConversationActionResultRecord) {
+        self.init(
+            ok: record.ok,
+            text: record.text,
+            full: record.full,
+            badPIN: record.badPin,
+            pinExists: record.pinExists,
+            neutral: record.neutral
+        )
+    }
+
+    var coreRecord: ConversationActionResultRecord {
+        ConversationActionResultRecord(
+            ok: ok,
+            text: text,
+            full: full,
+            badPin: badPIN,
+            pinExists: pinExists,
+            neutral: neutral
+        )
+    }
+}
+
+extension PinBoard {
+    init(coreRecord record: PinBoardRecord) {
+        self.init(
+            tab: Int(record.tab),
+            limit: Int(record.limit),
+            total: Int(record.total),
+            need: Int(record.need),
+            items: record.items
+        )
+    }
+}
+
 extension ZaloEngine {
     /// Ensures the single `CoreEngine` actor and its `@MainActor` change-mirror task are running.
     internal func ensureCoreEngine() async -> CoreEngine? {
@@ -616,6 +774,17 @@ extension ZaloEngine {
                 self.failAllMirrorWaiters()
                 self.coreLifecycle.finishAllGates()
                 return nil
+            }
+
+            if let store = self.sqliteStore {
+                core.attachStore(store: store.coreStoreHandle)
+            }
+            core.updateIdentities(table: self.currentIdentityTableRecord())
+            if let openId = self.openConversationId {
+                core.setOpenConversation(id: openId)
+            }
+            if !self.conversations.isEmpty {
+                core.syncConversationsSnapshot(list: self.conversations.map(\.coreRecord))
             }
 
             let queued = self.pendingCoreCommands
@@ -739,7 +908,7 @@ extension ZaloEngine {
         cmd: UInt16?,
         incrementUnread: Bool,
         notifyIncoming: Bool
-    ) async -> Int {
+    ) async -> BatchApplyDeltaRecord {
         let cmdArg: Any = cmd.map { Int($0) } ?? NSNull()
         guard traceHost("apply_batch", args: [
             "cmd": cmdArg,
@@ -747,11 +916,32 @@ extension ZaloEngine {
             "notify_incoming": notifyIncoming,
             "payload": box.dict,
         ]) else {
-            return 0
+            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], previewOverrides: [], persistConversations: false)
         }
-        return await applyBatchResponse(
+        return await applyBatchResponseCollectingDelta(
             box.dict,
             defaultCmd: cmd ?? 0,
+            incrementUnread: incrementUnread,
+            notifyIncoming: notifyIncoming
+        )
+    }
+
+    internal func hostApplyParsedEvents(
+        cmd: UInt16,
+        incrementUnread: Bool,
+        notifyIncoming: Bool,
+        events: [ParsedWireEvent]
+    ) async -> BatchApplyDeltaRecord {
+        guard traceHost("apply_parsed_events", args: [
+            "cmd": Int(cmd),
+            "increment_unread": incrementUnread,
+            "notify_incoming": notifyIncoming,
+            "events": ZaloEngine.serializeParsedWireEvents(events),
+        ]) else {
+            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], previewOverrides: [], persistConversations: false)
+        }
+        return await applyParsedEventsCollectingDelta(
+            events,
             incrementUnread: incrementUnread,
             notifyIncoming: notifyIncoming
         )
@@ -920,10 +1110,161 @@ extension ZaloEngine {
             }
         }
 
+        isApplyingCoreMirror = true
+        defer { isApplyingCoreMirror = false }
+
+        if let convRecords = batch.conversations {
+            let mapped = convRecords.map(ConversationSummary.init(coreRecord:))
+            if mapped != conversations {
+                conversations = mapped
+            }
+        }
+        if let flagsRecord = batch.conversationFlags {
+            let mapped = ConversationActionsState(coreRecord: flagsRecord)
+            if mapped != conversationActions {
+                conversationActions = mapped
+            }
+            var pinned: Set<String> = []
+            var archived: Set<String> = []
+            var unreadMarks: Set<String> = []
+            for (id, flags) in mapped.flags {
+                if flags.contains(.pinned) { pinned.insert(id) }
+                if flags.contains(.archived) { archived.insert(id) }
+                if flags.contains(.unreadMark) { unreadMarks.insert(id) }
+            }
+            cachedPinnedIds = pinned
+            cachedArchivedIds = archived
+            cachedUnreadMarks = unreadMarks
+        }
+        if let extrasRecord = batch.conversationExtras {
+            var next = conversationExtras
+            next.applyCoreRecord(extrasRecord)
+            if next != conversationExtras {
+                conversationExtras = next
+            }
+        }
+        if let uiRecord = batch.conversationUi {
+            conversationUI.applyCoreMirror(uiRecord)
+        }
+        if let promptUpdate = batch.conversationPrompt {
+            let mapped = promptUpdate.prompt.map(ConversationPrompt.init(coreRecord:))
+            if mapped != conversationPrompt {
+                conversationPrompt = mapped
+            }
+        }
+
         if batch.version > appliedMirrorVersion {
             appliedMirrorVersion = batch.version
         }
         resumeMirrorWaiters(upTo: appliedMirrorVersion)
+    }
+
+    // MARK: - U3 Conversations Core Bridge Helpers
+
+    internal func currentIdentityTableRecord() -> IdentityTableRecord {
+        IdentityTableRecord(
+            friends: contacts.friends.map {
+                FriendIdentityRecord(id: $0.id, name: $0.name, avatar: $0.avatar?.absoluteString)
+            },
+            groups: contacts.groups.map {
+                GroupIdentityRecord(id: $0.id, name: $0.name, avatar: $0.avatar?.absoluteString, members: Int64($0.members))
+            },
+            friendsLoaded: contacts.friendsLoaded,
+            groupsLoaded: contacts.groupsLoaded,
+            aliases: cachedAliases.map { StringPairEntry(key: $0.key, value: $0.value) },
+            cachedProfiles: cachedProfiles.map { CachedProfileEntry(uid: $0.key, name: $0.value.name, avatar: $0.value.avatar) },
+            cachedGroups: cachedGroups.map {
+                CachedGroupEntry(gid: $0.key, name: $0.value.name, avatar: $0.value.avatar, members: Int64($0.value.members))
+            },
+            activityRanks: cachedActivityRanks.map { RankEntry(convId: $0.key, rank: $0.value) },
+            friendGlobalIds: cachedFriendGlobalIds.map { StringPairEntry(key: $0.key, value: $0.value) }
+        )
+    }
+
+    internal func pushCoreIdentitiesIfRunning() {
+        guard !isApplyingCoreMirror, let core = coreLifecycle.core else { return }
+        core.updateIdentities(table: currentIdentityTableRecord())
+    }
+
+    internal func offlineConversationsCore() -> CoreOfflineConversations {
+        let offline: CoreOfflineConversations
+        if let existing = offlineConvCore {
+            offline = existing
+        } else {
+            let created = CoreOfflineConversations()
+            offlineConvCore = created
+            offline = created
+        }
+        offline.syncContext(
+            identities: currentIdentityTableRecord(),
+            myUid: profile?.userId ?? "",
+            myAvatar: profile?.avatar?.absoluteString,
+            selfConvId: selfConversationId,
+            openConvId: openConversationId
+        )
+        offline.syncConversations(list: conversations.map(\.coreRecord))
+        return offline
+    }
+
+    internal func commitBatchDeltaToCore(_ delta: BatchApplyDeltaRecord) async {
+        guard delta.appliedCount > 0 || !delta.updates.isEmpty || !delta.previewOverrides.isEmpty else { return }
+        if let core = coreLifecycle.core {
+            if let v = try? await core.applyBatchDelta(delta: delta) {
+                await waitForMirrorVersion(v)
+            }
+            return
+        }
+        let overrideIds = Set(delta.previewOverrides.map(\.convId))
+        var beforePreviews: [String: ConversationSummary.Preview?] = [:]
+        if !overrideIds.isEmpty {
+            for conv in conversations where overrideIds.contains(conv.id) {
+                beforePreviews[conv.id] = conv.preview
+            }
+        }
+        let batch = offlineConversationsCore().applyBatchDelta(delta: delta)
+        applyCoreChanges(batch)
+        if delta.persistConversations {
+            await persistConversationsToSQLite()
+            for id in overrideIds {
+                guard let conv = conversations.first(where: { $0.id == id }) else { continue }
+                let prevBefore = beforePreviews[id] ?? nil
+                if prevBefore != conv.preview {
+                    let previewText = conv.preview?.text ?? ""
+                    let previewTsMs = conv.preview?.date.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) } ?? 0
+                    let previewFromMe = conv.preview?.fromMe ?? false
+                    try? await sqliteStore?.setConversationPreview(
+                        id: id,
+                        previewText: previewText,
+                        previewTsMs: previewTsMs,
+                        previewFromMe: previewFromMe
+                    )
+                }
+            }
+        }
+    }
+
+    internal func messagePreviewInputRecord(for msg: ChatMessage) -> MessagePreviewInputRecord {
+        MessagePreviewInputRecord(
+            convId: msg.conversationId,
+            text: msg.text,
+            mentions: msg.mentions.map {
+                MentionInputRecord(uid: $0.uid, pos: Int64($0.pos), len: Int64($0.len), isAll: $0.isAll)
+            },
+            previewLabel: Self.messagePreviewLabel(msg),
+            dateMs: Int64((msg.date.timeIntervalSince1970 * 1000).rounded()),
+            isMine: msg.isMine,
+            senderName: msg.senderName,
+            senderAvatar: msg.senderAvatar?.absoluteString
+        )
+    }
+
+    internal static func jsonString(for dict: [String: Any]) -> String {
+        guard JSONSerialization.isValidJSONObject(dict),
+              let data = try? JSONSerialization.data(withJSONObject: dict),
+              let str = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return str
     }
 
     private func mapPhase(_ record: PhaseRecord) -> Phase {

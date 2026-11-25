@@ -165,6 +165,8 @@ fn cmd(name: &str) -> Step {
     Step::Cmd {
         cmd: name.to_owned(),
         args: json!({}),
+        now_ms: None,
+        rand4: None,
     }
 }
 
@@ -799,6 +801,8 @@ async fn s17_and_s18_session_expired_mid_session_then_refresh_qr() -> Result<(),
             Step::Cmd {
                 cmd: "session_expired".to_owned(),
                 args: json!({ "reason": "Phiên hết hạn giữa chừng." }),
+                now_ms: None,
+                rand4: None,
             },
             await_phase("login", Some("waiting_scan")),
             snapshot("after_expired"),
@@ -838,6 +842,8 @@ async fn s19_profile_defaults() -> Result<(), String> {
                 "phone": "",
                 "send2MeId": ""
             }),
+            now_ms: None,
+            rand4: None,
         }],
     );
     let res = run_case(&case).await?;
@@ -891,6 +897,8 @@ async fn compare_case_detects_mismatches_and_applies_known_diffs() -> Result<(),
         vec![Step::Cmd {
             cmd: "apply_account_profile".to_owned(),
             args: json!({ "userId": "1", "displayName": "Minh" }),
+            now_ms: None,
+            rand4: None,
         }],
     );
     let res = run_case(&case).await?;
@@ -902,5 +910,43 @@ async fn compare_case_detects_mismatches_and_applies_known_diffs() -> Result<(),
     let diffs = compare_case(&case, &res, &[], &mut used);
     assert_eq!(diffs.len(), 1);
     assert_eq!(diffs[0].path, "final.profile.display_name");
+
+    // Exact-`actual` known diff suppresses the mismatch and marks itself used.
+    let exact_kd = common::KnownDiff {
+        domain: "session".to_owned(),
+        name: "diff_check".to_owned(),
+        path: "final.profile.display_name".to_owned(),
+        actual: json!("Minh"),
+        reason: "expected port divergence".to_owned(),
+    };
+    let mut used_exact = vec![false];
+    assert!(compare_case(&case, &res, &[exact_kd], &mut used_exact).is_empty());
+    assert_eq!(used_exact, vec![true]);
+
+    // Wrong-`actual` known diff does NOT suppress the mismatch and stays unused.
+    let wrong_kd = common::KnownDiff {
+        domain: "session".to_owned(),
+        name: "diff_check".to_owned(),
+        path: "final.profile.display_name".to_owned(),
+        actual: json!("SomeoneElse"),
+        reason: "wrong actual".to_owned(),
+    };
+    let mut used_wrong = vec![false];
+    let diffs_wrong = compare_case(&case, &res, &[wrong_kd], &mut used_wrong);
+    assert_eq!(diffs_wrong.len(), 1);
+    assert_eq!(used_wrong, vec![false]);
+
+    // Stale known diff (case no longer differs from recording) stays unused so the gate fails.
+    case.expect.final_state["profile"]["display_name"] = json!("Minh");
+    let stale_kd = common::KnownDiff {
+        domain: "session".to_owned(),
+        name: "diff_check".to_owned(),
+        path: "final.profile.display_name".to_owned(),
+        actual: json!("Minh"),
+        reason: "stale".to_owned(),
+    };
+    let mut used_stale = vec![false];
+    assert!(compare_case(&case, &res, &[stale_kd], &mut used_stale).is_empty());
+    assert_eq!(used_stale, vec![false]);
     Ok(())
 }

@@ -9,17 +9,23 @@
     reason = "shared test helper used selectively by each test binary"
 )]
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use olaz_api::PollState;
+use olaz_api::{PollState, ZaloApi};
 use olaz_core::actor::{ActorSink, CoreHandle};
-use olaz_core::input::{Command, Input, LegacyCookie};
+use olaz_core::conversations::{
+    BatchApplyDelta, CachedGroup, CachedProfile, ConvMessageDelta, ConvPreviewOverride,
+    ConversationPreview, FriendIdentity, GroupIdentity, IdentityTable, MessagePreviewInput,
+    message_preview_label, to_wire_stored,
+};
+use olaz_core::input::{Command, Input, LegacyCookie, SeenTarget};
 use olaz_core::reduce::classify::MobileSyncEvent;
-use olaz_core::runner::{Host, SessionEffectRunner, WsDriver, WsStartParams};
+use olaz_core::runner::{Host, SessionEffectRunner, SharedStoreSlot, WsDriver, WsStartParams};
 use olaz_core::state::{
     CoreFailKind, CoreState, LoginStep, PersistedTransportState, Phase, SessionSnapshot,
 };
@@ -31,7 +37,11 @@ use olaz_net::http::{DEFAULT_REQUEST_TIMEOUT, RawResponse, RequestSpec, Transpor
 use olaz_net::{
     LoginAccount, NetError, NetworkErrorKind, SessionClient, ZaloDomains, ZaloSessionError,
 };
-use olaz_wire::{NameLookup, ParsedWireEvent, WireParseOptions, extract_batch_events};
+use olaz_store::{Store, StoredConversation, StoredMessage};
+use olaz_wire::{
+    ChatMessage, Kind, NameLookup, ParsedWireEvent, WireParseOptions, decode_stored_message,
+    extract_batch_events,
+};
 use olaz_ws::consts::{CMD_AUTHEN, CMD_PING, CMD_PING_ACTIVE, DEFAULT_WS_ENDPOINTS, FRAME_VERSION};
 use olaz_ws::frame::encode_frame_json;
 use olaz_ws::{
@@ -125,6 +135,32 @@ pub struct Seed {
     pub ws_cursors: Option<Value>,
     #[serde(default)]
     pub suppress: Vec<String>,
+    #[serde(default)]
+    pub ws_auth: Option<String>,
+    #[serde(default)]
+    pub contacts: Option<Value>,
+    #[serde(default)]
+    pub pinned_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub archived_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub unread_marks: Option<Vec<String>>,
+    #[serde(default)]
+    pub hidden_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub hidden_pin_md5: Option<String>,
+    #[serde(default)]
+    pub hidden_pin_hash: Option<String>,
+    #[serde(default)]
+    pub labels_pref: Option<Value>,
+    #[serde(default)]
+    pub activity_ranks: Option<Value>,
+    #[serde(default)]
+    pub local_conversations: Option<Vec<Value>>,
+    #[serde(default)]
+    pub local_messages: Option<Vec<Value>>,
+    #[serde(default)]
+    pub open_conversation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -181,6 +217,10 @@ pub enum Step {
         cmd: String,
         #[serde(default)]
         args: Value,
+        #[serde(default)]
+        now_ms: Option<i64>,
+        #[serde(default)]
+        rand4: Option<String>,
     },
     Await {
         #[serde(rename = "await")]
@@ -674,6 +714,7 @@ impl Transport for ScriptedTransport {
 /// - strict event-before-cursors ordering per frame.
 pub struct ScriptedWsDriver {
     suppress: bool,
+    ws_auth_manual: bool,
     recorded: Arc<Mutex<Vec<Value>>>,
     ws_connects: Arc<Mutex<VecDeque<ServerEntry>>>,
     ws_events: Arc<Mutex<VecDeque<ServerEntry>>>,
@@ -689,6 +730,15 @@ struct ScriptedWsState {
 
 impl ScriptedWsDriver {
     pub fn new(entries: &[ServerEntry], recorded: Arc<Mutex<Vec<Value>>>, suppress: bool) -> Self {
+        Self::with_auth_mode(entries, recorded, suppress, false)
+    }
+
+    pub fn with_auth_mode(
+        entries: &[ServerEntry],
+        recorded: Arc<Mutex<Vec<Value>>>,
+        suppress: bool,
+        ws_auth_manual: bool,
+    ) -> Self {
         let mut ws_connects = VecDeque::new();
         let mut ws_events = VecDeque::new();
         for e in entries {
@@ -700,6 +750,7 @@ impl ScriptedWsDriver {
         }
         Self {
             suppress,
+            ws_auth_manual,
             recorded,
             ws_connects: Arc::new(Mutex::new(ws_connects)),
             ws_events: Arc::new(Mutex::new(ws_events)),
@@ -892,6 +943,7 @@ impl WsDriver for ScriptedWsDriver {
         let recorded = Arc::clone(&self.recorded);
         let ws_connects = Arc::clone(&self.ws_connects);
         let ws_events = Arc::clone(&self.ws_events);
+        let ws_auth_manual = self.ws_auth_manual;
         let parse_state = new_shared_parse(params.my_uid, params.self_conv_id);
 
         let handle = runtime
@@ -923,8 +975,10 @@ impl WsDriver for ScriptedWsDriver {
                         .unwrap_or_else(PoisonError::into_inner)
                         .on_connect();
 
-                    // Auto-deliver an immediate `cmd == 1` auth reply on connect if scripted next.
-                    let auth_entry = {
+                    // Auto-deliver an immediate `cmd == 1` auth reply on connect unless ws_auth is manual.
+                    let auth_entry = if ws_auth_manual {
+                        None
+                    } else {
                         let mut evs = ws_events.lock().unwrap_or_else(PoisonError::into_inner);
                         if evs
                             .front()
@@ -1148,10 +1202,21 @@ pub struct RecordingHost {
     self_profile: Mutex<Option<HostSelfProfile>>,
     calls: Mutex<Vec<Value>>,
     notify: Notify,
+    is_u3: bool,
+    data_dir: Option<PathBuf>,
+    shared_store_slot: Mutex<Option<SharedStoreSlot>>,
+    store: Mutex<Option<Arc<Mutex<Store>>>>,
+    messages: Mutex<HashMap<String, Vec<ChatMessage>>>,
+    open_conversation_id: Mutex<Option<String>>,
+    identities: Mutex<IdentityTable>,
 }
 
 impl RecordingHost {
     pub fn from_seed(seed: &Seed) -> Self {
+        Self::from_seed_with_u3(seed, false, None)
+    }
+
+    pub fn from_seed_with_u3(seed: &Seed, is_u3: bool, data_dir: Option<PathBuf>) -> Self {
         let saved_session = seed
             .saved_session
             .as_ref()
@@ -1196,6 +1261,14 @@ impl RecordingHost {
                 self_conv_id: send2me,
             })
         });
+        let mut identities = IdentityTable::default();
+        if let Some(contacts) = &seed.contacts {
+            apply_contacts_json(contacts, &mut identities);
+        }
+        let open_conv = seed
+            .open_conversation_id
+            .clone()
+            .filter(|id| !id.is_empty());
         Self {
             saved_session,
             legacy_cookie,
@@ -1206,7 +1279,496 @@ impl RecordingHost {
             self_profile: Mutex::new(self_profile),
             calls: Mutex::new(Vec::new()),
             notify: Notify::new(),
+            is_u3,
+            data_dir,
+            shared_store_slot: Mutex::new(None),
+            store: Mutex::new(None),
+            messages: Mutex::new(HashMap::new()),
+            open_conversation_id: Mutex::new(open_conv),
+            identities: Mutex::new(identities),
         }
+    }
+
+    pub fn bind_store_slot(&self, slot: SharedStoreSlot) {
+        *self
+            .shared_store_slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(slot);
+    }
+
+    pub fn attached_store(&self) -> Option<Arc<Mutex<Store>>> {
+        self.store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn set_open_conversation(&self, id: Option<String>) {
+        *self
+            .open_conversation_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = id;
+    }
+
+    pub fn update_contacts(&self, contacts: &Value) -> IdentityTable {
+        let mut guard = self
+            .identities
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        apply_contacts_json(contacts, &mut guard);
+        guard.clone()
+    }
+
+    pub fn current_identities(&self) -> IdentityTable {
+        self.identities
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn remove_messages(&self, conv_id: &str) {
+        self.messages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(conv_id);
+    }
+
+    pub fn last_message_id(&self, conv_id: &str) -> String {
+        self.messages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(conv_id)
+            .and_then(|list| list.last())
+            .map(|m| m.id.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn seen_target_for(&self, conv_id: &str) -> Option<SeenTarget> {
+        let msgs = self.messages.lock().unwrap_or_else(PoisonError::into_inner);
+        let list = msgs.get(conv_id)?;
+        let last = list.iter().rev().find(|m| !m.is_mine)?;
+        Some(SeenTarget {
+            conv_id: conv_id.to_owned(),
+            msg_id: last.id.clone(),
+            cli_msg_id: last.client_id.clone(),
+            sender_id: last.sender_id.clone(),
+        })
+    }
+
+    fn lookup_person(&self, uid: &str) -> Option<NameLookup> {
+        let ids = self
+            .identities
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(f) = ids.friends.iter().find(|f| f.id == uid) {
+            return Some(NameLookup {
+                name: f.name.clone(),
+                avatar: f.avatar.clone().unwrap_or_default(),
+            });
+        }
+        if let Some(alias) = ids.aliases.get(uid)
+            && !alias.is_empty()
+        {
+            let avt = ids
+                .cached_profiles
+                .get(uid)
+                .map(|p| p.avatar.clone())
+                .unwrap_or_default();
+            return Some(NameLookup {
+                name: alias.clone(),
+                avatar: avt,
+            });
+        }
+        if let Some(prof) = ids.cached_profiles.get(uid)
+            && (!prof.name.is_empty() || !prof.avatar.is_empty())
+        {
+            return Some(NameLookup {
+                name: prof.name.clone(),
+                avatar: prof.avatar.clone(),
+            });
+        }
+        drop(ids);
+        let profile = self
+            .self_profile
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(p) = profile.as_ref()
+            && p.user_id == uid
+        {
+            return Some(NameLookup {
+                name: "Bạn".to_owned(),
+                avatar: p.avatar.clone(),
+            });
+        }
+        drop(profile);
+        if let Some(store_arc) = self.attached_store() {
+            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Ok(convs) = store.load_conversations()
+                && let Some(conv) = convs.into_iter().find(|c| c.id == uid)
+            {
+                let trimmed = conv.name.trim();
+                let valid_name = if !trimmed.is_empty()
+                    && trimmed != conv.id
+                    && trimmed != olaz_wire::UNKNOWN_NAME
+                {
+                    trimmed.to_owned()
+                } else {
+                    String::new()
+                };
+                if !valid_name.is_empty() || !conv.avatar.is_empty() {
+                    return Some(NameLookup {
+                        name: valid_name,
+                        avatar: conv.avatar,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    fn merge_message_into_memory(
+        messages: &mut HashMap<String, Vec<ChatMessage>>,
+        msg: ChatMessage,
+        replacing_client_id: &str,
+    ) {
+        let list = messages.entry(msg.conversation_id.clone()).or_default();
+        if let Some(pos) = list.iter().position(|m| {
+            m.id == msg.id
+                || (!replacing_client_id.is_empty()
+                    && (m.id == replacing_client_id || m.client_id == replacing_client_id))
+        }) {
+            list[pos] = msg;
+        } else {
+            list.push(msg);
+        }
+        list.sort_by_key(|m| m.date_ms);
+    }
+
+    pub fn apply_events_pass1(
+        &self,
+        events: &[ParsedWireEvent],
+        increment_unread: bool,
+        persist_conversations: bool,
+    ) -> BatchApplyDelta {
+        if events.is_empty() {
+            return BatchApplyDelta::default();
+        }
+        let open_conv = self
+            .open_conversation_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let mut messages = self.messages.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut stored_batch: Vec<StoredMessage> = Vec::new();
+        let mut latest_by_conv: BTreeMap<String, ChatMessage> = BTreeMap::new();
+        let mut unread_delta_by_conv: HashMap<String, i64> = HashMap::new();
+
+        for ev in events {
+            if let ParsedWireEvent::Message(msg, stored) = ev {
+                let already_known = messages
+                    .get(&msg.conversation_id)
+                    .is_some_and(|list| list.iter().any(|m| m.id == msg.id));
+                stored_batch.push(StoredMessage {
+                    id: stored.id.clone(),
+                    conv_id: stored.conv_id.clone(),
+                    client_id: stored.client_id.clone(),
+                    sender_id: stored.sender_id.clone(),
+                    sender_name: stored.sender_name.clone(),
+                    sender_avatar: stored.sender_avatar.clone(),
+                    is_mine: stored.is_mine,
+                    text: stored.text.clone(),
+                    kind_tag: stored.kind_tag.clone(),
+                    ts_ms: stored.ts_ms,
+                    status: stored.status.clone(),
+                    raw_json_data: stored.raw_json_data.clone(),
+                });
+                Self::merge_message_into_memory(&mut messages, (**msg).clone(), &stored.client_id);
+                let replace = latest_by_conv
+                    .get(&msg.conversation_id)
+                    .is_none_or(|cur| msg.date_ms >= cur.date_ms);
+                if replace {
+                    latest_by_conv.insert(msg.conversation_id.clone(), (**msg).clone());
+                }
+                if increment_unread
+                    && !already_known
+                    && !msg.is_mine
+                    && open_conv.as_deref() != Some(msg.conversation_id.as_str())
+                {
+                    *unread_delta_by_conv
+                        .entry(msg.conversation_id.clone())
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+        drop(messages);
+
+        if !stored_batch.is_empty()
+            && let Some(store_arc) = self.attached_store()
+        {
+            let mut store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = store.save_messages(&stored_batch);
+        }
+
+        let mut preview_overrides: Vec<ConvPreviewOverride> = Vec::new();
+        for ev in events {
+            match ev {
+                ParsedWireEvent::Undo {
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                } => {
+                    let target_id = if !msg_id.is_empty() {
+                        msg_id.as_str()
+                    } else {
+                        cli_msg_id.as_str()
+                    };
+                    if conv_id.is_empty() || target_id.is_empty() {
+                        continue;
+                    }
+                    let mut found_in_memory = false;
+                    let mut recalled_last: Option<(i64, bool)> = None;
+                    {
+                        let mut messages =
+                            self.messages.lock().unwrap_or_else(PoisonError::into_inner);
+                        if let Some(list) = messages.get_mut(conv_id)
+                            && let Some(idx) = list.iter().position(|m| {
+                                m.id == target_id
+                                    || m.client_id == target_id
+                                    || (!cli_msg_id.is_empty()
+                                        && (m.id == *cli_msg_id || m.client_id == *cli_msg_id))
+                            })
+                        {
+                            found_in_memory = true;
+                            let was_last = idx + 1 == list.len();
+                            let msg = &mut list[idx];
+                            msg.kind = Kind::Recalled;
+                            msg.text.clear();
+                            msg.reactions.clear();
+                            msg.quote = None;
+                            msg.card_buttons.clear();
+                            if was_last {
+                                recalled_last = Some((msg.date_ms, msg.is_mine));
+                            }
+                        }
+                    }
+                    if let Some(store_arc) = self.attached_store() {
+                        let mut store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                        let _ = store.mark_recalled(conv_id, target_id, cli_msg_id);
+                        if !found_in_memory
+                            && let Ok(rows) = store.messages(conv_id, None, 1)
+                            && let Some(latest) = rows.last()
+                            && latest.kind_tag == "recalled"
+                            && (latest.id == target_id
+                                || latest.client_id == target_id
+                                || (!cli_msg_id.is_empty()
+                                    && (latest.id == *cli_msg_id
+                                        || latest.client_id == *cli_msg_id)))
+                        {
+                            recalled_last = Some((latest.ts_ms, latest.is_mine));
+                        }
+                    }
+                    if let Some((target_date_ms, from_me)) = recalled_last {
+                        preview_overrides.push(ConvPreviewOverride {
+                            conv_id: conv_id.clone(),
+                            target_date_ms,
+                            preview: Some(ConversationPreview {
+                                text: "Tin nhắn đã được thu hồi".to_owned(),
+                                date_ms: Some(target_date_ms),
+                                from_me,
+                            }),
+                        });
+                    }
+                }
+                ParsedWireEvent::Delete {
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                } => {
+                    let target_id = if !msg_id.is_empty() {
+                        msg_id.as_str()
+                    } else {
+                        cli_msg_id.as_str()
+                    };
+                    if conv_id.is_empty() || target_id.is_empty() {
+                        continue;
+                    }
+                    let mut deleted_ts_ms: Option<i64> = None;
+                    let mem_latest: Option<ConversationPreview> = {
+                        let mut messages =
+                            self.messages.lock().unwrap_or_else(PoisonError::into_inner);
+                        if let Some(list) = messages.get_mut(conv_id) {
+                            for m in list.iter() {
+                                if m.id == target_id
+                                    || m.client_id == target_id
+                                    || (!cli_msg_id.is_empty()
+                                        && (m.id == *cli_msg_id || m.client_id == *cli_msg_id))
+                                {
+                                    deleted_ts_ms = Some(
+                                        deleted_ts_ms.map_or(m.date_ms, |prev| prev.max(m.date_ms)),
+                                    );
+                                }
+                            }
+                            list.retain(|m| {
+                                !(m.id == target_id
+                                    || m.client_id == target_id
+                                    || (!cli_msg_id.is_empty()
+                                        && (m.id == *cli_msg_id || m.client_id == *cli_msg_id)))
+                            });
+                            list.last().map(|m| ConversationPreview {
+                                text: message_preview_label(m),
+                                date_ms: Some(m.date_ms),
+                                from_me: m.is_mine,
+                            })
+                        } else {
+                            None
+                        }
+                    };
+                    let mut store_latest: Option<ConversationPreview> = None;
+                    if let Some(store_arc) = self.attached_store() {
+                        let mut store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                        if deleted_ts_ms.is_none() {
+                            if let Ok(Some(row)) = store.message(conv_id, target_id) {
+                                deleted_ts_ms = Some(row.ts_ms);
+                            } else if !cli_msg_id.is_empty()
+                                && let Ok(Some(row)) = store.message(conv_id, cli_msg_id)
+                            {
+                                deleted_ts_ms = Some(row.ts_ms);
+                            }
+                        }
+                        let _ = store.delete_message(conv_id, target_id);
+                        if !cli_msg_id.is_empty() && cli_msg_id != target_id {
+                            let _ = store.delete_message(conv_id, cli_msg_id);
+                        }
+                        if let Ok(rows) = store.messages(conv_id, None, 1)
+                            && let Some(row) = rows.last()
+                        {
+                            store_latest = Some(Self::preview_from_stored_message(row));
+                        }
+                    }
+                    if let Some(target_date_ms) = deleted_ts_ms {
+                        let best_remaining = match (mem_latest, store_latest) {
+                            (Some(a), Some(b)) => {
+                                if a.date_ms.unwrap_or(0) >= b.date_ms.unwrap_or(0) {
+                                    Some(a)
+                                } else {
+                                    Some(b)
+                                }
+                            }
+                            (Some(a), None) => Some(a),
+                            (None, Some(b)) => Some(b),
+                            (None, None) => None,
+                        };
+                        let still_newer = best_remaining
+                            .as_ref()
+                            .and_then(|p| p.date_ms)
+                            .is_some_and(|d| d > target_date_ms);
+                        if !still_newer {
+                            preview_overrides.push(ConvPreviewOverride {
+                                conv_id: conv_id.clone(),
+                                target_date_ms,
+                                preview: best_remaining,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let updates: Vec<ConvMessageDelta> = latest_by_conv
+            .into_iter()
+            .map(|(conv_id, latest)| {
+                let delta = unread_delta_by_conv.get(&conv_id).copied().unwrap_or(0);
+                ConvMessageDelta {
+                    conv_id,
+                    preview_text: message_preview_label(&latest),
+                    preview_date_ms: latest.date_ms,
+                    preview_from_me: latest.is_mine,
+                    is_mine: latest.is_mine,
+                    sender_name: latest.sender_name,
+                    sender_avatar: latest.sender_avatar.filter(|s| !s.is_empty()),
+                    unread_delta: delta,
+                }
+            })
+            .collect();
+
+        BatchApplyDelta {
+            applied_count: u32::try_from(events.len()).unwrap_or(u32::MAX),
+            updates,
+            preview_overrides,
+            persist_conversations,
+        }
+    }
+
+    fn preview_from_stored_message(row: &StoredMessage) -> ConversationPreview {
+        if let Some(decoded) = decode_stored_message(&to_wire_stored(row)) {
+            ConversationPreview {
+                text: message_preview_label(&decoded),
+                date_ms: Some(decoded.date_ms),
+                from_me: decoded.is_mine,
+            }
+        } else {
+            let text = if row.kind_tag == "recalled" {
+                "Tin nhắn đã được thu hồi".to_owned()
+            } else {
+                row.text.clone()
+            };
+            ConversationPreview {
+                text,
+                date_ms: Some(row.ts_ms),
+                from_me: row.is_mine,
+            }
+        }
+    }
+
+    pub fn process_direct_batch(
+        &self,
+        payload: &Value,
+        default_cmd: u16,
+        fallback_conv_id: Option<&str>,
+        is_group_hint: Option<bool>,
+        increment_unread: bool,
+        persist_conversations: bool,
+    ) -> BatchApplyDelta {
+        let profile = self
+            .self_profile
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let my_uid = profile
+            .as_ref()
+            .map(|p| p.user_id.as_str())
+            .unwrap_or_default();
+        let self_conv = profile.as_ref().and_then(|p| p.self_conv_id.as_deref());
+        let lookup = |uid: &str| self.lookup_person(uid);
+        let opts = WireParseOptions {
+            cmd: default_cmd,
+            fallback_conv_id,
+            is_group_hint,
+            self_conv_id: self_conv,
+            name_lookup: Some(&lookup),
+        };
+        let events = extract_batch_events(payload, my_uid, &opts);
+        self.apply_events_pass1(&events, increment_unread, persist_conversations)
+    }
+
+    pub fn load_local_messages_for_open(&self, conv_id: &str) -> Option<ChatMessage> {
+        if let Some(store_arc) = self.attached_store() {
+            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Ok(rows) = store.messages(conv_id, None, 50) {
+                let mut messages = self.messages.lock().unwrap_or_else(PoisonError::into_inner);
+                for row in &rows {
+                    if let Some(msg) = decode_stored_message(&to_wire_stored(row)) {
+                        Self::merge_message_into_memory(&mut messages, msg, "");
+                    }
+                }
+            }
+        }
+        self.messages
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(conv_id)
+            .and_then(|list| list.last().cloned())
     }
 
     pub fn calls(&self) -> Vec<Value> {
@@ -1305,6 +1867,27 @@ impl Host for RecordingHost {
             avatar: account.avatar,
             self_conv_id,
         });
+        if self.is_u3
+            && let Some(dir) = &self.data_dir
+            && !user_id.is_empty()
+        {
+            let acc_dir = dir.join("accounts").join(&user_id);
+            let _ = std::fs::create_dir_all(&acc_dir);
+            let db_path = acc_dir.join("history.sqlite3");
+            if let Ok(store) = Store::open(&db_path) {
+                let shared = Arc::new(Mutex::new(store));
+                *self.store.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(Arc::clone(&shared));
+                if let Some(slot) = self
+                    .shared_store_slot
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(shared);
+                }
+            }
+        }
         self.record("prepare_store", json!({ "user_id": user_id }));
     }
 
@@ -1356,17 +1939,27 @@ impl Host for RecordingHost {
         increment_unread: bool,
         notify_incoming: bool,
         payload: Map<String, Value>,
-    ) -> u32 {
+    ) -> BatchApplyDelta {
         let root = Value::Object(payload.clone());
-        let opts = WireParseOptions {
-            cmd: cmd.unwrap_or(0),
-            fallback_conv_id: None,
-            is_group_hint: None,
-            self_conv_id: None,
-            name_lookup: None,
+        let delta = if self.is_u3 {
+            self.process_direct_batch(&root, cmd.unwrap_or(0), None, None, increment_unread, true)
+        } else {
+            let opts = WireParseOptions {
+                cmd: cmd.unwrap_or(0),
+                fallback_conv_id: None,
+                is_group_hint: None,
+                self_conv_id: None,
+                name_lookup: None,
+            };
+            let events = extract_batch_events(&root, "", &opts);
+            let count = u32::try_from(events.len()).unwrap_or(u32::MAX);
+            BatchApplyDelta {
+                applied_count: count,
+                updates: Vec::new(),
+                preview_overrides: Vec::new(),
+                persist_conversations: false,
+            }
         };
-        let events = extract_batch_events(&root, "", &opts);
-        let count = u32::try_from(events.len()).unwrap_or(u32::MAX);
         self.record(
             "apply_batch",
             json!({
@@ -1376,7 +1969,7 @@ impl Host for RecordingHost {
                 "payload": Value::Object(payload),
             }),
         );
-        count
+        delta
     }
 
     async fn apply_parsed_events(
@@ -1385,7 +1978,7 @@ impl Host for RecordingHost {
         increment_unread: bool,
         notify_incoming: bool,
         envelope: TypedChatEnvelope,
-    ) {
+    ) -> BatchApplyDelta {
         let profile = self
             .self_profile
             .lock()
@@ -1394,7 +1987,11 @@ impl Host for RecordingHost {
         let events = if let Some(p) = profile {
             let mut names = Vec::new();
             for uid in &envelope.uids {
-                if uid == &p.user_id {
+                if self.is_u3 {
+                    if let Some(info) = self.lookup_person(uid) {
+                        names.push((uid.clone(), info));
+                    }
+                } else if uid == &p.user_id {
                     names.push((
                         uid.clone(),
                         NameLookup {
@@ -1416,6 +2013,11 @@ impl Host for RecordingHost {
             .filter(|ev| !matches!(ev, ParsedWireEvent::Ignore))
             .map(serialize_parsed_wire_event)
             .collect();
+        let delta = if self.is_u3 {
+            self.apply_events_pass1(&events, increment_unread, true)
+        } else {
+            BatchApplyDelta::default()
+        };
         self.record(
             "apply_parsed_events",
             json!({
@@ -1425,6 +2027,7 @@ impl Host for RecordingHost {
                 "events": serialized,
             }),
         );
+        delta
     }
 
     async fn mobile_sync(&self, events: Vec<MobileSyncEvent>) {
@@ -1667,9 +2270,410 @@ fn parse_command(cmd: &str, args: &Value) -> Result<Command, String> {
     }
 }
 
+fn apply_contacts_json(contacts: &Value, table: &mut IdentityTable) {
+    if let Some(b) = contacts.get("friends_loaded").and_then(Value::as_bool) {
+        table.friends_loaded = b;
+    }
+    if let Some(b) = contacts.get("groups_loaded").and_then(Value::as_bool) {
+        table.groups_loaded = b;
+    }
+    if let Some(arr) = contacts.get("friends").and_then(Value::as_array) {
+        table.friends.clear();
+        for row in arr {
+            let Some(id) = row.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let name = row
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(id)
+                .to_owned();
+            let avatar = row
+                .get("avatar")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            table.friends.push(FriendIdentity {
+                id: id.to_owned(),
+                name,
+                avatar,
+            });
+        }
+    }
+    if let Some(arr) = contacts.get("groups").and_then(Value::as_array) {
+        table.groups.clear();
+        for row in arr {
+            let Some(id) = row.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let name = row
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(id)
+                .to_owned();
+            let avatar = row
+                .get("avatar")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let members = row.get("members").and_then(Value::as_i64).unwrap_or(0);
+            table.groups.push(GroupIdentity {
+                id: id.to_owned(),
+                name,
+                avatar,
+                members,
+            });
+        }
+    }
+    if let Some(obj) = contacts.get("aliases").and_then(Value::as_object) {
+        table.aliases.clear();
+        for (k, v) in obj {
+            if let Some(val) = v.as_str() {
+                table.aliases.insert(k.clone(), val.to_owned());
+            }
+        }
+    }
+    if let Some(obj) = contacts.get("cached_profiles").and_then(Value::as_object) {
+        table.cached_profiles.clear();
+        for (k, v) in obj {
+            let name = v
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let avatar = v
+                .get("avatar")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            table
+                .cached_profiles
+                .insert(k.clone(), CachedProfile { name, avatar });
+        }
+    }
+    if let Some(obj) = contacts.get("cached_groups").and_then(Value::as_object) {
+        table.cached_groups.clear();
+        for (k, v) in obj {
+            let name = v
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let avatar = v
+                .get("avatar")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let members = v.get("members").and_then(Value::as_i64).unwrap_or(0);
+            table.cached_groups.insert(
+                k.clone(),
+                CachedGroup {
+                    name,
+                    avatar,
+                    members,
+                },
+            );
+        }
+    }
+    if let Some(obj) = contacts.get("friend_global_ids").and_then(Value::as_object) {
+        for (gid, v) in obj {
+            if let Some(uid) = v.as_str()
+                && !gid.is_empty()
+                && !uid.is_empty()
+            {
+                table.friend_global_ids.insert(uid.to_owned(), gid.clone());
+            }
+        }
+    }
+}
+
+fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> Result<(), String> {
+    let acc_dir = data_dir.join("accounts").join(user_id);
+    std::fs::create_dir_all(&acc_dir).map_err(|e| format!("create accounts dir: {e}"))?;
+    let db_path = acc_dir.join("history.sqlite3");
+    let mut store = Store::open(&db_path).map_err(|e| format!("open sqlite store: {e}"))?;
+
+    if let Some(ids) = &seed.pinned_ids {
+        store
+            .set_preference_strings("pinnedIds", ids)
+            .map_err(|e| format!("seed pinnedIds: {e}"))?;
+    }
+    if let Some(ids) = &seed.archived_ids {
+        store
+            .set_preference_strings("archivedIds", ids)
+            .map_err(|e| format!("seed archivedIds: {e}"))?;
+    }
+    if let Some(ids) = &seed.unread_marks {
+        store
+            .set_preference_strings("unreadMarks", ids)
+            .map_err(|e| format!("seed unreadMarks: {e}"))?;
+    }
+    if let Some(ids) = &seed.hidden_ids {
+        store
+            .set_preference_strings("hiddenIds", ids)
+            .map_err(|e| format!("seed hiddenIds: {e}"))?;
+    }
+    if let Some(md5) = &seed.hidden_pin_md5
+        && !md5.is_empty()
+    {
+        store
+            .set_preference_string("hiddenPinMD5", md5)
+            .map_err(|e| format!("seed hiddenPinMD5: {e}"))?;
+    }
+    if let Some(sha) = &seed.hidden_pin_hash
+        && !sha.is_empty()
+    {
+        store
+            .set_preference_string("hiddenPinHash", sha)
+            .map_err(|e| format!("seed hiddenPinHash: {e}"))?;
+    }
+    if let Some(labels) = &seed.labels_pref
+        && !labels.is_null()
+    {
+        let bytes = canonical_json_string(labels).into_bytes();
+        store
+            .set_preference_data("labels", &bytes)
+            .map_err(|e| format!("seed labels: {e}"))?;
+    }
+    if let Some(ranks) = &seed.activity_ranks
+        && !ranks.is_null()
+    {
+        let bytes = canonical_json_string(ranks).into_bytes();
+        store
+            .set_preference_data("activityRanks", &bytes)
+            .map_err(|e| format!("seed activityRanks: {e}"))?;
+    }
+    if let Some(contacts) = &seed.contacts {
+        if let Some(v) = contacts.get("aliases")
+            && !v.is_null()
+        {
+            let _ = store.set_preference_data("aliases", canonical_json_string(v).as_bytes());
+        }
+        if let Some(v) = contacts.get("cached_profiles")
+            && !v.is_null()
+        {
+            let _ =
+                store.set_preference_data("cachedProfiles", canonical_json_string(v).as_bytes());
+        }
+        if let Some(v) = contacts.get("cached_groups")
+            && !v.is_null()
+        {
+            let _ = store.set_preference_data("cachedGroups", canonical_json_string(v).as_bytes());
+        }
+        if let Some(v) = contacts.get("friend_global_ids")
+            && !v.is_null()
+        {
+            let _ = store.set_preference_data("gidToUidMap", canonical_json_string(v).as_bytes());
+        }
+    }
+    if let Some(conv_rows) = &seed.local_conversations
+        && !conv_rows.is_empty()
+    {
+        let stored: Vec<StoredConversation> = conv_rows
+            .iter()
+            .filter_map(|row| {
+                let id = row.get("id").and_then(Value::as_str)?.to_owned();
+                Some(StoredConversation {
+                    id,
+                    is_group: row
+                        .get("is_group")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    name: row
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    avatar: row
+                        .get("avatar")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    pinned: row.get("pinned").and_then(Value::as_bool).unwrap_or(false),
+                    members: row.get("members").and_then(Value::as_i64).unwrap_or(0),
+                    unread: row.get("unread").and_then(Value::as_i64).unwrap_or(0),
+                    preview_text: row
+                        .get("preview_text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    preview_ts_ms: row
+                        .get("preview_ts_ms")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                    preview_from_me: row
+                        .get("preview_from_me")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    updated_at_ms: row
+                        .get("updated_at_ms")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(1_700_000_000_000),
+                })
+            })
+            .collect();
+        store
+            .save_conversations(&stored)
+            .map_err(|e| format!("seed local_conversations: {e}"))?;
+    }
+    if let Some(msg_rows) = &seed.local_messages
+        && !msg_rows.is_empty()
+    {
+        let stored: Vec<StoredMessage> = msg_rows
+            .iter()
+            .filter_map(|row| {
+                let id = row.get("id").and_then(Value::as_str)?.to_owned();
+                let conv_id = row.get("conv_id").and_then(Value::as_str)?.to_owned();
+                let client_id = row
+                    .get("client_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&id)
+                    .to_owned();
+                let sender_id = row
+                    .get("sender_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let sender_name = row
+                    .get("sender_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let sender_avatar = row
+                    .get("sender_avatar")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let is_mine = row.get("is_mine").and_then(Value::as_bool).unwrap_or(false);
+                let text = row
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let kind_tag = row
+                    .get("kind_tag")
+                    .and_then(Value::as_str)
+                    .unwrap_or("text")
+                    .to_owned();
+                let ts_ms = row.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
+                let status = row
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("sent")
+                    .to_owned();
+                let raw_json_data = if let Some(raw_obj) = row.get("raw_json")
+                    && !raw_obj.is_null()
+                {
+                    canonical_json_string(raw_obj).into_bytes()
+                } else {
+                    let fallback = json!({
+                        "id": id,
+                        "conversationId": conv_id,
+                        "clientId": client_id,
+                        "senderId": sender_id,
+                        "senderName": sender_name,
+                        "senderAvatar": sender_avatar,
+                        "isMine": is_mine,
+                        "text": text,
+                        "date": ts_ms,
+                        "kind": { "type": kind_tag },
+                    });
+                    canonical_json_string(&fallback).into_bytes()
+                };
+                Some(StoredMessage {
+                    id,
+                    conv_id,
+                    client_id,
+                    sender_id,
+                    sender_name,
+                    sender_avatar,
+                    is_mine,
+                    text,
+                    kind_tag,
+                    ts_ms,
+                    status,
+                    raw_json_data,
+                })
+            })
+            .collect();
+        store
+            .save_messages(&stored)
+            .map_err(|e| format!("seed local_messages: {e}"))?;
+    }
+    Ok(())
+}
+
+async fn capture_case_snapshot(
+    core: &CoreHandle,
+    host: &RecordingHost,
+    is_u3: bool,
+) -> Option<Value> {
+    if !is_u3 {
+        return core
+            .snapshot()
+            .await
+            .map(|s| s.to_case_json(&render_core_fail_en));
+    }
+    let full = core.full_snapshot().await?;
+    let mut obj = match full.session.to_case_json(&render_core_fail_en) {
+        Value::Object(m) => m,
+        _ => Map::new(),
+    };
+    let conv_fields = if let Some(store_arc) = host.attached_store() {
+        let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+        full.conversations.to_case_json_fields(Some(&store))
+    } else {
+        full.conversations.to_case_json_fields(None)
+    };
+    for (k, v) in conv_fields {
+        obj.insert(k, v);
+    }
+    Some(Value::Object(obj))
+}
+
+fn str_arg(args: &Value, key: &str) -> String {
+    args.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn str_vec_arg(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Runs a single Case format v1 [`Case`] under paused tokio time and returns the observed
 /// snapshots, final state, sorted canonical requests, and ordered host calls.
 pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
+    let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions";
+    let temp_dir = if is_u3 {
+        Some(tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?)
+    } else {
+        None
+    };
+
+    if is_u3
+        && let Some(dir) = temp_dir.as_ref()
+        && let Some(uid) = case
+            .seed
+            .saved_session
+            .as_ref()
+            .and_then(|s| s.get("plainAccount"))
+            .and_then(|a| a.get("userId"))
+            .and_then(Value::as_str)
+        && !uid.is_empty()
+    {
+        seed_sqlite_store(uid, dir.path(), &case.seed)?;
+    }
+
     let seed_domains = extract_seed_domains(&case.seed);
     let initial_key = extract_seed_secret_key(&case.seed);
     let recorded = Arc::new(Mutex::new(Vec::new()));
@@ -1684,11 +2688,13 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let suppress_ws = case.domain == "session" || case.seed.suppress.iter().any(|s| s == "ws");
     let suppress_lp =
         case.domain == "session" || case.seed.suppress.iter().any(|s| s == "long_poll");
+    let ws_auth_manual = case.seed.ws_auth.as_deref() == Some("manual");
 
-    let ws_driver = Arc::new(ScriptedWsDriver::new(
+    let ws_driver = Arc::new(ScriptedWsDriver::with_auth_mode(
         &case.server,
         Arc::clone(&recorded),
         suppress_ws,
+        ws_auth_manual,
     ));
 
     let client = Arc::new(SessionClient::new(
@@ -1700,7 +2706,11 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         client.with_session(|s| s.domains = d.clone());
     }
 
-    let host = Arc::new(RecordingHost::from_seed(&case.seed));
+    let host = Arc::new(RecordingHost::from_seed_with_u3(
+        &case.seed,
+        is_u3,
+        temp_dir.as_ref().map(|d| d.path().to_path_buf()),
+    ));
     let runner = Arc::new(SessionEffectRunner::with_options(
         Arc::clone(&client),
         Arc::clone(&host) as Arc<dyn Host>,
@@ -1709,9 +2719,18 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         seed_domains,
         suppress_lp,
     ));
+    host.bind_store_slot(runner.shared_store_slot());
 
     let mut initial_state = CoreState::default();
     initial_state.session.prefs = case.seed.prefs.clone();
+    if is_u3 {
+        initial_state.conversations.identities = host.current_identities();
+        initial_state.conversations.open_conversation_id = case
+            .seed
+            .open_conversation_id
+            .clone()
+            .filter(|id| !id.is_empty());
+    }
     let core = CoreHandle::start_with_state(initial_state, runner, Handle::current());
 
     let mut snapshots = BTreeMap::new();
@@ -1719,33 +2738,338 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
 
     for step in &case.steps {
         match step {
-            Step::Cmd { cmd, args } => {
-                let parsed = parse_command(cmd, args)?;
-                match parsed {
-                    Command::LogOut | Command::SessionExpired { .. } => {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        core.send(parsed);
-                    }
-                    Command::RefreshQr => {
-                        let _ = tokio::time::timeout(Duration::from_millis(500), core.wait_idle())
-                            .await;
-                        core.send(parsed);
-                    }
-                    Command::ApplyAccountProfile(_) => {
-                        let _ = core.send_and_ack(parsed).await;
-                    }
-                    Command::DrainChatPolling {
-                        max_batches,
-                        notify_incoming,
-                    } => {
-                        let _ = core.drain_chat_polling(max_batches, notify_incoming).await;
-                    }
-                    Command::Start => {
-                        core.send(parsed);
+            Step::Cmd {
+                cmd,
+                args,
+                now_ms,
+                rand4,
+            } => match cmd.as_str() {
+                "start"
+                | "refresh_qr"
+                | "log_out"
+                | "session_expired"
+                | "apply_account_profile"
+                | "drain_chat_polling" => {
+                    let parsed = parse_command(cmd, args)?;
+                    match parsed {
+                        Command::LogOut | Command::SessionExpired { .. } => {
+                            let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
+                                .await;
+                            core.send(parsed);
+                        }
+                        Command::RefreshQr => {
+                            let _ =
+                                tokio::time::timeout(Duration::from_millis(500), core.wait_idle())
+                                    .await;
+                            core.send(parsed);
+                        }
+                        Command::ApplyAccountProfile(_) => {
+                            let _ = core.send_and_ack(parsed).await;
+                        }
+                        Command::DrainChatPolling {
+                            max_batches,
+                            notify_incoming,
+                        } => {
+                            let _ = core.drain_chat_polling(max_batches, notify_incoming).await;
+                        }
+                        Command::Start => {
+                            core.send(parsed);
+                        }
+                        _ => {}
                     }
                 }
-            }
+                "apply_batch" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let payload = args.get("payload").cloned().unwrap_or_else(|| json!({}));
+                    let default_cmd = args
+                        .get("default_cmd")
+                        .and_then(Value::as_u64)
+                        .and_then(|v| u16::try_from(v).ok())
+                        .unwrap_or(0);
+                    let fallback_conv_id = args.get("fallback_conv_id").and_then(Value::as_str);
+                    let is_group_hint = args.get("is_group_hint").and_then(Value::as_bool);
+                    let increment_unread = args
+                        .get("increment_unread")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let persist_conversations = args
+                        .get("persist_conversations")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    let delta = host.process_direct_batch(
+                        &payload,
+                        default_cmd,
+                        fallback_conv_id,
+                        is_group_hint,
+                        increment_unread,
+                        persist_conversations,
+                    );
+                    core.request_unit(Command::ApplyBatchDelta(delta)).await;
+                }
+                "ensure_known_contacts" => {
+                    core.request_unit(Command::EnsureKnownContacts).await;
+                }
+                "resolve_missing_names" => {
+                    core.request_unit(Command::ResolveMissingNames).await;
+                }
+                "refresh_mention_previews" => {
+                    core.request_unit(Command::RefreshMentionPreviews).await;
+                }
+                "update_contacts" => {
+                    let table = host.update_contacts(args);
+                    core.request_unit(Command::UpdateIdentities(table)).await;
+                }
+                "open_conversation" => {
+                    let id_opt = args
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    let load = args.get("load").and_then(Value::as_bool).unwrap_or(false);
+                    host.set_open_conversation(id_opt.clone());
+                    core.request_unit(Command::SetOpenConversation { id: id_opt.clone() })
+                        .await;
+                    if load && let Some(conv_id) = id_opt {
+                        let local_latest = host.load_local_messages_for_open(&conv_id);
+                        let api = ZaloApi::from_shared(Arc::clone(&client));
+                        let mut fetched = 0usize;
+                        if let Ok(page) = api.fetch_history(&conv_id, None, 50, Some(false)).await {
+                            let delta = host.process_direct_batch(
+                                &Value::Object(page),
+                                0,
+                                Some(&conv_id),
+                                None,
+                                false,
+                                false,
+                            );
+                            fetched = delta.applied_count as usize;
+                        }
+                        let latest = host.load_local_messages_for_open(&conv_id).or(local_latest);
+                        let missing_preview = core.full_snapshot().await.is_some_and(|s| {
+                            s.conversations
+                                .conversations
+                                .iter()
+                                .find(|c| c.id == conv_id)
+                                .is_none_or(|c| c.preview.is_none())
+                        });
+                        if (fetched > 0 || missing_preview)
+                            && let Some(msg) = latest
+                        {
+                            core.request_unit(Command::UpdateConversationOnMessage {
+                                msg: MessagePreviewInput::from_chat_message(&msg),
+                                increment_unread: false,
+                            })
+                            .await;
+                        }
+                        let seen_target = host.seen_target_for(&conv_id);
+                        core.request_unit(Command::MarkConversationRead {
+                            id: conv_id,
+                            seen_target,
+                        })
+                        .await;
+                    }
+                }
+                "pin" => {
+                    let id = str_arg(args, "id");
+                    core.request_unit(Command::PinConversation { id }).await;
+                }
+                "unpin" => {
+                    let id = str_arg(args, "id");
+                    core.request_unit(Command::UnpinConversation { id }).await;
+                }
+                "pin_board" => {
+                    let id = str_arg(args, "id");
+                    let _ = core.request_pin_board(id).await;
+                }
+                "pin_replacing" => {
+                    let unpin_ids = str_vec_arg(args, "unpin");
+                    let pin_id = str_arg(args, "id");
+                    let _ = core
+                        .request_action(Command::PinReplacing { unpin_ids, pin_id })
+                        .await;
+                }
+                "move" => {
+                    let id = str_arg(args, "id");
+                    let to_other = args
+                        .get("to_other")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    core.request_unit(Command::MoveConversation { id, to_other })
+                        .await;
+                }
+                "request_delete" => {
+                    let id = str_arg(args, "id");
+                    core.request_unit(Command::RequestDeleteConversation { id })
+                        .await;
+                }
+                "confirm_delete" => {
+                    let id = str_arg(args, "id");
+                    let last_cli_msg_id = host.last_message_id(&id);
+                    core.request_unit(Command::ConfirmDeleteConversation {
+                        id: id.clone(),
+                        last_cli_msg_id,
+                    })
+                    .await;
+                    host.remove_messages(&id);
+                }
+                "mark_read" => {
+                    let id = str_arg(args, "id");
+                    let seen_target = host.seen_target_for(&id);
+                    core.request_unit(Command::MarkConversationRead { id, seen_target })
+                        .await;
+                }
+                "mark_unread" => {
+                    let id = str_arg(args, "id");
+                    core.request_unit(Command::MarkConversationUnread { id })
+                        .await;
+                }
+                "hide" => {
+                    let id = str_arg(args, "id");
+                    let pin = str_arg(args, "pin");
+                    let _ = core
+                        .request_action(Command::HideConversation { id, pin })
+                        .await;
+                }
+                "hide_new_pin" => {
+                    let id = str_arg(args, "id");
+                    let pin = str_arg(args, "pin");
+                    let _ = core
+                        .request_action(Command::HideConversationNewPin { id, pin })
+                        .await;
+                }
+                "unhide" => {
+                    let id = str_arg(args, "id");
+                    let pin = args.get("pin").and_then(Value::as_str).map(str::to_owned);
+                    let _ = core
+                        .request_action(Command::UnhideConversation { id, pin })
+                        .await;
+                }
+                "set_pin" => {
+                    let pin = str_arg(args, "pin");
+                    let changed = args
+                        .get("changed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let _ = core
+                        .request_action(Command::SetHiddenPin { pin, changed })
+                        .await;
+                }
+                "reset_pin" => {
+                    let _ = core.request_action(Command::ResetHiddenPin).await;
+                }
+                "sync_hidden" => {
+                    core.request_unit(Command::SyncHiddenConversations).await;
+                }
+                "apply_server_hidden" => {
+                    let pin = str_arg(args, "pin");
+                    let thread_ids = str_vec_arg(args, "thread_ids");
+                    core.request_unit(Command::ApplyServerHiddenConversations { pin, thread_ids })
+                        .await;
+                }
+                "hidden_search" => {
+                    let query = str_arg(args, "query");
+                    let _ = core.request_hidden_search(query).await;
+                }
+                "unlock_from_pin_search" => {
+                    let id = str_arg(args, "id");
+                    let _ = core.request_bool(Command::UnlockFromPinSearch { id }).await;
+                }
+                "relock_hidden" => {
+                    core.request_unit(Command::RelockHidden).await;
+                }
+                "handle_conversation_actions" => {
+                    let state = args
+                        .get("state")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    core.request_unit(Command::HandleConversationActions { state })
+                        .await;
+                }
+                "handle_conversation_extras" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let state = args
+                        .get("state")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    core.request_unit(Command::HandleConversationExtras { state })
+                        .await;
+                }
+                "label_create" => {
+                    let name = str_arg(args, "name");
+                    let color_hex = args
+                        .get("color_hex")
+                        .and_then(Value::as_str)
+                        .unwrap_or("#0068FF")
+                        .to_owned();
+                    let conversation_ids = str_vec_arg(args, "conversation_ids");
+                    let ms = now_ms.unwrap_or(1_700_000_000_000);
+                    let r4 = rand4.clone().unwrap_or_else(|| "0000".to_owned());
+                    core.request_unit(Command::CreateConversationLabel {
+                        name,
+                        color_hex,
+                        conversation_ids,
+                        now_ms: ms,
+                        rand4: r4,
+                    })
+                    .await;
+                }
+                "label_update" => {
+                    let id = str_arg(args, "id");
+                    let name = str_arg(args, "name");
+                    let color_hex = args
+                        .get("color_hex")
+                        .and_then(Value::as_str)
+                        .unwrap_or("#0068FF")
+                        .to_owned();
+                    core.request_unit(Command::UpdateConversationLabel {
+                        id,
+                        name,
+                        color_hex,
+                    })
+                    .await;
+                }
+                "label_delete" => {
+                    let id = str_arg(args, "id");
+                    core.request_unit(Command::DeleteConversationLabel { id })
+                        .await;
+                }
+                "label_assign" => {
+                    let conversation_id = str_arg(args, "conversation_id");
+                    let label_id = args
+                        .get("label_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    core.request_unit(Command::SetConversationLabel {
+                        conversation_id,
+                        label_id,
+                    })
+                    .await;
+                }
+                "label_reorder" => {
+                    let ids = str_vec_arg(args, "ids");
+                    core.request_unit(Command::ReorderConversationLabels { ids })
+                        .await;
+                }
+                "set_filter" => {
+                    let filter_type = args
+                        .get("type")
+                        .and_then(Value::as_i64)
+                        .and_then(|v| i32::try_from(v).ok())
+                        .unwrap_or(0);
+                    let label_ids = str_vec_arg(args, "label_ids");
+                    core.request_unit(Command::SetConversationFilter {
+                        filter_type,
+                        label_ids,
+                    })
+                    .await;
+                }
+                "sync_labels" => {
+                    core.request_unit(Command::SyncConversationLabels).await;
+                }
+                other => return Err(format!("unknown step cmd: {other}")),
+            },
             Step::Await {
                 predicate,
                 timeout_ms,
@@ -1767,13 +3091,19 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 tokio::time::timeout(dur, host.await_call(await_host, &mut host_cursor))
                     .await
                     .map_err(|_| format!("timed out awaiting host call `{await_host}`"))?;
+                if is_u3 && (await_host == "apply_parsed_events" || await_host == "apply_batch") {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
             }
             Step::WsPush { ws_push } => {
                 ws_driver.push(*ws_push);
             }
             Step::Snapshot { snapshot } => {
-                if let Some(snap) = core.snapshot().await {
-                    snapshots.insert(snapshot.clone(), snap.to_case_json(&render_core_fail_en));
+                if is_u3 {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                if let Some(snap) = capture_case_snapshot(&core, &host, is_u3).await {
+                    snapshots.insert(snapshot.clone(), snap);
                 }
             }
         }
@@ -1798,15 +3128,14 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         }
     }
 
-    let final_snap = core
-        .snapshot()
+    let final_state = capture_case_snapshot(&core, &host, is_u3)
         .await
         .ok_or_else(|| "actor stopped before final snapshot".to_owned())?;
     core.stop();
 
     Ok(CaseRunResult {
         snapshots,
-        final_state: final_snap.to_case_json(&render_core_fail_en),
+        final_state,
         requests: transport.recorded_requests_sorted(),
         host: host.calls(),
     })

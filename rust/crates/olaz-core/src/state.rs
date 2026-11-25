@@ -11,11 +11,25 @@ use olaz_net::NetworkErrorKind;
 use olaz_ws::CursorMap;
 use serde_json::{Map, Value, json};
 
-/// Top-level state owned by the single `olaz-core` actor. Future domains (U2+) add fields here.
+use crate::conversations::ConversationsState;
+
+/// Top-level state owned by the single `olaz-core` actor.
 #[derive(Clone, Default)]
 pub struct CoreState {
     pub session: SessionState,
     pub transport: TransportState,
+    pub conversations: ConversationsState,
+}
+
+impl CoreState {
+    /// Projects the observable state across all core-owned domains (tests / diagnostics).
+    #[must_use]
+    pub fn full_snapshot(&self) -> CoreSnapshot {
+        CoreSnapshot {
+            session: self.session.snapshot(),
+            conversations: self.conversations.clone(),
+        }
+    }
 }
 
 impl fmt::Debug for CoreState {
@@ -23,6 +37,23 @@ impl fmt::Debug for CoreState {
         f.debug_struct("CoreState")
             .field("session", &self.session)
             .field("transport", &self.transport)
+            .field("conversations", &self.conversations)
+            .finish()
+    }
+}
+
+/// Full observable snapshot across session + conversations domains (tests / diagnostics).
+#[derive(Clone, Default)]
+pub struct CoreSnapshot {
+    pub session: SessionSnapshot,
+    pub conversations: ConversationsState,
+}
+
+impl fmt::Debug for CoreSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CoreSnapshot")
+            .field("session", &self.session)
+            .field("conversations", &self.conversations)
             .finish()
     }
 }

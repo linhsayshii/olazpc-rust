@@ -43,6 +43,10 @@ final class ConversationRecorderTests: XCTestCase {
         }
         XCTAssertEqual(byName.count, scenarios.count, "\(domain).jsonl case count mismatch (run with OLAZ_RECORD=1 to regenerate)")
 
+        let knownDiffs = try CaseFile.loadKnownDiffs()
+        var usedKnownDiffs = Array(repeating: false, count: knownDiffs.count)
+        var executedNames: Set<String> = []
+
         for scenario in scenarios {
             if scenario.slow && !runSlow {
                 print("skipped slow: \(scenario.name)")
@@ -52,10 +56,28 @@ final class ConversationRecorderTests: XCTestCase {
                 XCTFail("Missing recorded case '\(scenario.name)' in \(url.path)")
                 continue
             }
+            executedNames.insert(scenario.name)
             let actual = try await Self.recordScenario(domain: domain, scenario)
-            if let diff = CaseJSON.firstDiff(expected: expected, actual: actual) {
+            let diffs = CaseFile.compareCase(
+                domain: domain,
+                name: scenario.name,
+                expected: expected,
+                actual: actual,
+                knownDiffs: knownDiffs,
+                usedKnownDiffs: &usedKnownDiffs
+            )
+            for diff in diffs {
                 XCTFail("\(scenario.name): \(diff)")
             }
+        }
+        for stale in CaseFile.staleKnownDiffs(
+            domain: domain,
+            executedNames: executedNames,
+            allCaseNames: Set(byName.keys),
+            knownDiffs: knownDiffs,
+            usedKnownDiffs: usedKnownDiffs
+        ) {
+            XCTFail(stale)
         }
     }
 

@@ -195,6 +195,13 @@ pub struct CoreStore {
     reader: Option<Mutex<ReadOnlyStore>>,
 }
 
+impl CoreStore {
+    /// Shares the underlying `Arc<Mutex<Store>>` handle with `CoreEngine` (U3).
+    pub(crate) fn shared_store(&self) -> Arc<Mutex<Store>> {
+        Arc::clone(&self.inner)
+    }
+}
+
 fn lock(m: &Mutex<Store>) -> MutexGuard<'_, Store> {
     // A panic while holding the lock cannot leave SQLite in a half state (transactions roll back).
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -528,6 +535,28 @@ impl CoreStore {
     pub async fn set_conversation_pinned(&self, id: String, pinned: bool) -> Result<(), CoreError> {
         let db = Arc::clone(&self.inner);
         blocking(move || lock(&db).set_conversation_pinned(&id, pinned)).await??;
+        Ok(())
+    }
+
+    pub async fn set_conversation_preview(
+        &self,
+        id: String,
+        preview_text: String,
+        preview_ts_ms: i64,
+        preview_from_me: bool,
+        updated_at_ms: i64,
+    ) -> Result<(), CoreError> {
+        let db = Arc::clone(&self.inner);
+        blocking(move || {
+            lock(&db).set_conversation_preview(
+                &id,
+                &preview_text,
+                preview_ts_ms,
+                preview_from_me,
+                updated_at_ms,
+            )
+        })
+        .await??;
         Ok(())
     }
 
