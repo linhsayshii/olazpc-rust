@@ -12,6 +12,7 @@ use olaz_ws::CursorMap;
 use serde_json::{Map, Value, json};
 
 use crate::conversations::ConversationsState;
+use crate::typing::{TypingState, TypingStatus};
 
 /// Top-level state owned by the single `olaz-core` actor.
 #[derive(Clone, Default)]
@@ -19,6 +20,8 @@ pub struct CoreState {
     pub session: SessionState,
     pub transport: TransportState,
     pub conversations: ConversationsState,
+    // U5
+    pub typing: TypingState,
 }
 
 impl CoreState {
@@ -28,6 +31,8 @@ impl CoreState {
         CoreSnapshot {
             session: self.session.snapshot(),
             conversations: self.conversations.clone(),
+            // U5
+            typing: self.typing.active.clone(),
         }
     }
 }
@@ -38,15 +43,19 @@ impl fmt::Debug for CoreState {
             .field("session", &self.session)
             .field("transport", &self.transport)
             .field("conversations", &self.conversations)
+            // U5
+            .field("typing", &self.typing)
             .finish()
     }
 }
 
-/// Full observable snapshot across session + conversations domains (tests / diagnostics).
+/// Full observable snapshot across session + conversations + typing domains (tests / diagnostics).
 #[derive(Clone, Default)]
 pub struct CoreSnapshot {
     pub session: SessionSnapshot,
     pub conversations: ConversationsState,
+    // U5
+    pub typing: BTreeMap<String, TypingStatus>,
 }
 
 impl fmt::Debug for CoreSnapshot {
@@ -54,6 +63,8 @@ impl fmt::Debug for CoreSnapshot {
         f.debug_struct("CoreSnapshot")
             .field("session", &self.session)
             .field("conversations", &self.conversations)
+            // U5
+            .field("typing_count", &self.typing.len())
             .finish()
     }
 }

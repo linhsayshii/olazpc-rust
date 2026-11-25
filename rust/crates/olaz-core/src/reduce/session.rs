@@ -318,6 +318,10 @@ fn reduce_command(state: &mut CoreState, cmd: Command, out: &mut ReduceOutput) {
             tracing::debug!("session: log out");
             reset_session_fields(&mut state.session);
             state.conversations.reset();
+            // U5
+            if state.typing.reset_session() {
+                out.dirty.insert(DirtyKey::Typing);
+            }
             state.session.sign_out_notice = None;
             state.session.qr_gen = state.session.qr_gen.saturating_add(1);
             state.session.phase = Phase::Login(LoginState::generating());
@@ -387,6 +391,10 @@ fn start_qr_login(state: &mut SessionState, out: &mut ReduceOutput) {
 pub(crate) fn enter_session_expired(state: &mut CoreState, reason: String, out: &mut ReduceOutput) {
     tracing::debug!("session: expired");
     reset_session_fields(&mut state.session);
+    // U5
+    if state.typing.reset_session() {
+        out.dirty.insert(DirtyKey::Typing);
+    }
     state.session.sign_out_notice = Some(reason);
     state.session.qr_gen = state.session.qr_gen.saturating_add(1);
     state.session.phase = Phase::Login(LoginState::generating());

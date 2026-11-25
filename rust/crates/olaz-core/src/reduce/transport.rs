@@ -458,6 +458,23 @@ fn emit_routes(
                 uid,
                 on_pc,
             } => {
+                // U5: typing state lives in core; keep HostCall::ShowTyping as one-way hook/trace.
+                let my_uid = state
+                    .session
+                    .profile
+                    .as_ref()
+                    .map_or("", |p| p.user_id.as_str());
+                let my_avatar = state
+                    .session
+                    .profile
+                    .as_ref()
+                    .and_then(|p| p.avatar.as_deref());
+                let name = state
+                    .conversations
+                    .lookup_person_info(&uid, my_uid, my_avatar)
+                    .map(|(n, _)| n)
+                    .unwrap_or_else(|| crate::typing::DEFAULT_TYPING_NAME.to_owned());
+                crate::typing::set_typing(&mut state.typing, conv_id.clone(), name, on_pc, out);
                 out.effects.push(Effect::Host(HostCall::ShowTyping {
                     conv_id,
                     uid,

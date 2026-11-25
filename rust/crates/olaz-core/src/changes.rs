@@ -5,7 +5,7 @@
 //! bounded queue (`MAX_SESSION_QUEUE`) with consecutive-duplicate coalescing so fast local or
 //! loopback servers never skip intermediate login/ready transitions before Swift pulls.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Mutex, PoisonError};
 
 use tokio::sync::Notify;
@@ -15,6 +15,7 @@ use crate::conversations::{
     ConversationSummary,
 };
 use crate::state::{CoreState, SessionSnapshot};
+use crate::typing::TypingStatus;
 
 /// Upper bound on queued distinct session transitions; keeps hub memory strictly `O(1)`.
 const MAX_SESSION_QUEUE: usize = 64;
@@ -28,6 +29,8 @@ pub enum DirtyKey {
     ConversationExtras,
     ConversationUi,
     ConversationPrompt,
+    // U5
+    Typing,
 }
 
 /// Set of keys dirtied by one `reduce` step.
@@ -45,6 +48,8 @@ pub struct CoreChanges {
     pub conversation_ui: Option<ConversationActionUI>,
     /// Outer `Some(...)` means the prompt changed; inner `Option` is the new prompt (`None` = cleared).
     pub conversation_prompt: Option<Option<ConversationPrompt>>,
+    // U5
+    pub typing: Option<BTreeMap<String, TypingStatus>>,
 }
 
 #[derive(Default)]
@@ -57,6 +62,8 @@ struct DirtyBuffer {
     conversation_extras: Option<ConversationExtras>,
     conversation_ui: Option<ConversationActionUI>,
     conversation_prompt: Option<Option<ConversationPrompt>>,
+    // U5
+    typing: Option<BTreeMap<String, TypingStatus>>,
     closed: bool,
 }
 
@@ -67,6 +74,7 @@ impl DirtyBuffer {
             || self.conversation_extras.is_some()
             || self.conversation_ui.is_some()
             || self.conversation_prompt.is_some()
+            || self.typing.is_some()
     }
 }
 
@@ -129,6 +137,10 @@ impl ChangeHub {
                 DirtyKey::ConversationPrompt => {
                     buf.conversation_prompt = Some(state.conversations.prompt.clone());
                 }
+                // U5
+                DirtyKey::Typing => {
+                    buf.typing = Some(state.typing.active.clone());
+                }
             }
             buf.dirty.insert(key);
         }
@@ -177,6 +189,8 @@ impl ChangeHub {
                             conversation_extras: None,
                             conversation_ui: None,
                             conversation_prompt: None,
+                            // U5
+                            typing: None,
                         });
                     }
                 }
@@ -197,6 +211,8 @@ impl ChangeHub {
                         conversation_extras: buf.conversation_extras.take(),
                         conversation_ui: buf.conversation_ui.take(),
                         conversation_prompt: buf.conversation_prompt.take(),
+                        // U5
+                        typing: buf.typing.take(),
                     });
                 }
                 if buf.closed {
@@ -295,5 +311,51 @@ mod tests {
         assert!(first.is_some());
         let second = hub.next_changes().await;
         assert!(second.is_none());
+    }
+
+    #[tokio::test]
+    async fn typing_changes_coalesce_in_place() {
+        let hub = ChangeHub::new();
+        let mut state = CoreState::default();
+        state.typing.active.insert(
+            "3000515".to_owned(),
+            TypingStatus {
+                name: "Alice".to_owned(),
+                on_pc: true,
+            },
+        );
+        hub.publish(&DirtySet::from([DirtyKey::Typing]), &state);
+        state.typing.active.insert(
+            "g500515".to_owned(),
+            TypingStatus {
+                name: "Bob".to_owned(),
+                on_pc: false,
+            },
+        );
+        hub.publish(&DirtySet::from([DirtyKey::Typing]), &state);
+
+        let Some(batch) = hub.next_changes().await else {
+            panic!("expected typing batch");
+        };
+        assert_eq!(batch.version, 2);
+        assert!(batch.session.is_none());
+        let Some(typing) = batch.typing else {
+            panic!("expected typing payload");
+        };
+        assert_eq!(typing.len(), 2);
+        assert_eq!(
+            typing.get("3000515"),
+            Some(&TypingStatus {
+                name: "Alice".to_owned(),
+                on_pc: true,
+            })
+        );
+        assert_eq!(
+            typing.get("g500515"),
+            Some(&TypingStatus {
+                name: "Bob".to_owned(),
+                on_pc: false,
+            })
+        );
     }
 }

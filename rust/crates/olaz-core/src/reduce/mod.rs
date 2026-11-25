@@ -51,6 +51,23 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::PollBatchFetched { .. }
         | Input::PollBatchApplied { .. } => transport::reduce_transport(state, input, &mut out),
 
+        // U5
+        Input::Command(
+            Command::HandleTyping { .. }
+            | Command::NotifyTyping { .. }
+            | Command::ResetOutgoingTyping { .. }
+            | Command::SetSendTypingEnabled { .. },
+        )
+        | Input::OpRequest {
+            cmd:
+                Command::HandleTyping { .. }
+                | Command::NotifyTyping { .. }
+                | Command::ResetOutgoingTyping { .. }
+                | Command::SetSendTypingEnabled { .. },
+            ..
+        }
+        | Input::TypingExpired { .. } => crate::typing::reduce_typing(state, input, &mut out),
+
         Input::Command(_)
         | Input::OpRequest { .. }
         | Input::BatchDeltaApplied { .. }

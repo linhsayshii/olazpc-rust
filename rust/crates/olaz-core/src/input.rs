@@ -184,6 +184,21 @@ pub enum Command {
     RemoveLocalConversation {
         id: String,
     },
+
+    // U5
+    HandleTyping {
+        state: Map<String, Value>,
+    },
+    NotifyTyping {
+        conv_id: String,
+        now_ms: i64,
+    },
+    ResetOutgoingTyping {
+        conv_id: String,
+    },
+    SetSendTypingEnabled {
+        enabled: bool,
+    },
 }
 
 impl fmt::Debug for Command {
@@ -327,6 +342,20 @@ impl fmt::Debug for Command {
                 .field("archived_count", &archived_ids.as_ref().map(Vec::len))
                 .finish(),
             Self::RemoveLocalConversation { .. } => f.write_str("RemoveLocalConversation"),
+            // U5
+            Self::HandleTyping { state } => f
+                .debug_struct("HandleTyping")
+                .field("keys", &state.len())
+                .finish(),
+            Self::NotifyTyping { now_ms, .. } => f
+                .debug_struct("NotifyTyping")
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::ResetOutgoingTyping { .. } => f.write_str("ResetOutgoingTyping"),
+            Self::SetSendTypingEnabled { enabled } => f
+                .debug_struct("SetSendTypingEnabled")
+                .field("enabled", enabled)
+                .finish(),
         }
     }
 }
@@ -603,6 +632,12 @@ pub enum Input {
         op_id: u64,
         result: OpResult,
     },
+
+    // U5
+    TypingExpired {
+        conv_id: String,
+        expiry_gen: u64,
+    },
 }
 
 impl fmt::Debug for Input {
@@ -826,6 +861,11 @@ impl fmt::Debug for Input {
                 .debug_struct("OpStoreFlushed")
                 .field("op_id", op_id)
                 .field("result", result)
+                .finish(),
+            // U5
+            Self::TypingExpired { expiry_gen, .. } => f
+                .debug_struct("TypingExpired")
+                .field("expiry_gen", expiry_gen)
                 .finish(),
         }
     }

@@ -586,6 +586,10 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
         }
 
         Command::SetOpenConversation { id } => {
+            // U5: opening a conversation clears any active incoming typing indicator for it.
+            if let Some(conv_id) = id.as_deref() {
+                crate::typing::clear_typing(&mut state.typing, conv_id, out);
+            }
             state.conversations.open_conversation_id = id;
             complete_op(op_id, OpResult::Unit, false, out);
         }
@@ -1245,7 +1249,12 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
         | Command::LogOut
         | Command::SessionExpired { .. }
         | Command::ApplyAccountProfile(_)
-        | Command::DrainChatPolling { .. } => {
+        | Command::DrainChatPolling { .. }
+        // U5
+        | Command::HandleTyping { .. }
+        | Command::NotifyTyping { .. }
+        | Command::ResetOutgoingTyping { .. }
+        | Command::SetSendTypingEnabled { .. } => {
             complete_op(op_id, OpResult::Unit, false, out);
         }
     }

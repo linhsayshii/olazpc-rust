@@ -788,6 +788,8 @@ impl CoreOfflineConversations {
                         prompt: state.conversations.prompt.clone().map(Into::into),
                     });
                 }
+                // U5 (wired to FFI once U4+U5 cut over Swift)
+                DirtyKey::Typing => {}
             }
         }
         rec
