@@ -10,10 +10,828 @@ final class ForwardRecorderTests: XCTestCase {
         )
     }
 
+    // MARK: - Helpers
+
+    private static func storedMsg(
+        id: String,
+        convId: String,
+        clientId: String? = nil,
+        senderId: String,
+        senderName: String = "Alice",
+        senderAvatar: String = "https://cdn.example.invalid/a.jpg",
+        isMine: Bool = false,
+        text: String,
+        kind: CaseJSON? = nil,
+        kindTag: String = "text",
+        tsMs: Int64,
+        status: String = "sent",
+        isE2EE: Bool = false,
+        menu: CaseJSON? = nil
+    ) -> CaseJSON {
+        let effectiveClientId = clientId ?? "cli_\(id)"
+        var rawObj: [String: CaseJSON] = [
+            "id": .string(id),
+            "conversationId": .string(convId),
+            "clientId": .string(effectiveClientId),
+            "senderId": .string(senderId),
+            "senderName": .string(senderName),
+            "senderAvatar": .string(senderAvatar),
+            "isMine": .bool(isMine),
+            "text": .string(text),
+            "date": .int(tsMs),
+            "status": .string(status),
+            "isE2EE": .bool(isE2EE),
+            "kind": kind ?? .object(["type": .string(kindTag)]),
+        ]
+        if let menu { rawObj["menu"] = menu }
+
+        return .object([
+            "id": .string(id),
+            "conv_id": .string(convId),
+            "client_id": .string(effectiveClientId),
+            "sender_id": .string(senderId),
+            "sender_name": .string(senderName),
+            "sender_avatar": .string(senderAvatar),
+            "is_mine": .bool(isMine),
+            "text": .string(text),
+            "kind_tag": .string(kindTag),
+            "ts_ms": .int(tsMs),
+            "status": .string(status),
+            "raw_json": .object(rawObj),
+        ])
+    }
+
+    private static func localConv(
+        id: String,
+        isGroup: Bool = false,
+        name: String,
+        avatar: String = "https://cdn.example.invalid/a.jpg",
+        members: Int64 = 0,
+        unread: Int64 = 0,
+        previewText: String = "",
+        previewTsMs: Int64 = 0,
+        previewFromMe: Bool = false
+    ) -> CaseJSON {
+        .object([
+            "id": .string(id),
+            "is_group": .bool(isGroup),
+            "name": .string(name),
+            "avatar": .string(avatar),
+            "pinned": .bool(false),
+            "members": .int(members),
+            "unread": .int(unread),
+            "preview_text": .string(previewText),
+            "preview_ts_ms": .int(previewTsMs),
+            "preview_from_me": .bool(previewFromMe),
+        ])
+    }
+
     // MARK: - Scenarios
 
     private static func forwardScenarios() -> [ForwardRecorderHarness.ScenarioDef] {
-        []
+        let baseTs: Int64 = 1700000800000
+        let okMenu = CaseJSON.object(["forward": .string("ok")])
+
+        return [
+            // 1. request_guards: forward available, blocked (card), unavailable (nothing).
+            ForwardRecorderHarness.ScenarioDef(
+                name: "request_guards",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000801",
+                    displayName: "Forward User 1",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "history_freshness": .object(["3000801": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000801", name: "Alice", previewText: "Available", previewTsMs: baseTs + 3_000),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(
+                                id: "9080101",
+                                convId: "3000801",
+                                senderId: "3000801",
+                                text: "Hidden forward",
+                                tsMs: baseTs + 1_000,
+                                menu: .object(["forward": .string("")])
+                            ),
+                            storedMsg(
+                                id: "9080102",
+                                convId: "3000801",
+                                senderId: "3000801",
+                                text: "Blocked forward",
+                                tsMs: baseTs + 2_000,
+                                menu: .object(["forward": .string("blocked")])
+                            ),
+                            storedMsg(
+                                id: "9080103",
+                                convId: "3000801",
+                                senderId: "3000801",
+                                text: "Available forward",
+                                tsMs: baseTs + 3_000,
+                                menu: okMenu
+                            ),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000801", displayName: "Forward User 1"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000801", displayName: "Forward User 1"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000801")])]),
+                    .object(["cmd": .string("request_forward"), "args": .object(["conv_id": .string("3000801"), "msg_id": .string("9080101")])]),
+                    .object(["snapshot": .string("after_hidden")]),
+                    .object(["cmd": .string("request_forward"), "args": .object(["conv_id": .string("3000801"), "msg_id": .string("9080102")])]),
+                    .object(["snapshot": .string("after_blocked")]),
+                    .object(["cmd": .string("request_forward"), "args": .object(["conv_id": .string("3000801"), "msg_id": .string("9080103")])]),
+                ]
+            ),
+
+            // 2. forward_text_link: text; link with url; link without url but text; link with only title;
+            // empty text skipped (counts as failure).
+            ForwardRecorderHarness.ScenarioDef(
+                name: "forward_text_link",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000802",
+                    displayName: "Forward User 2",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "next_client_id": .int(8000000000200),
+                        "history_freshness": .object(["3000802a": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000802a", name: "Source 2", previewText: "Empty", previewTsMs: baseTs + 5_000),
+                            localConv(id: "3000802b", name: "Target 2"),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(
+                                id: "9080201",
+                                convId: "3000802a",
+                                senderId: "3000802a",
+                                text: "Hello forward",
+                                tsMs: baseTs + 1_000,
+                                menu: okMenu
+                            ),
+                            storedMsg(
+                                id: "9080202",
+                                convId: "3000802a",
+                                senderId: "3000802a",
+                                text: "Ignored link text",
+                                kind: .object([
+                                    "type": .string("link"),
+                                    "title": .string("Example Page"),
+                                    "url": .string("https://example.invalid/article"),
+                                ]),
+                                kindTag: "link",
+                                tsMs: baseTs + 2_000,
+                                menu: okMenu
+                            ),
+                            storedMsg(
+                                id: "9080203",
+                                convId: "3000802a",
+                                senderId: "3000802a",
+                                text: "Link body text",
+                                kind: .object([
+                                    "type": .string("link"),
+                                    "title": .string("Title Fallback"),
+                                ]),
+                                kindTag: "link",
+                                tsMs: baseTs + 3_000,
+                                menu: okMenu
+                            ),
+                            storedMsg(
+                                id: "9080204",
+                                convId: "3000802a",
+                                senderId: "3000802a",
+                                text: "",
+                                kind: .object([
+                                    "type": .string("link"),
+                                    "title": .string("Only Title Link"),
+                                ]),
+                                kindTag: "link",
+                                tsMs: baseTs + 4_000,
+                                menu: okMenu
+                            ),
+                            storedMsg(
+                                id: "9080205",
+                                convId: "3000802a",
+                                senderId: "3000802a",
+                                text: "",
+                                tsMs: baseTs + 5_000,
+                                menu: okMenu
+                            ),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000802", displayName: "Forward User 2"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000802", displayName: "Forward User 2"),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/sms",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["msgId": .string("9002001")])])
+                    ),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/sms",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["msgId": .string("9002002")])])
+                    ),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/sms",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["msgId": .string("9002003")])])
+                    ),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/sms",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["msgId": .string("9002004")])])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000802a")])]),
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 10_000),
+                        "args": .object(["conv_id": .string("3000802a"), "msg_id": .string("9080201"), "targets": .array([.string("3000802b")])]),
+                    ]),
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 11_000),
+                        "args": .object(["conv_id": .string("3000802a"), "msg_id": .string("9080202"), "targets": .array([.string("3000802b")])]),
+                    ]),
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 12_000),
+                        "args": .object(["conv_id": .string("3000802a"), "msg_id": .string("9080203"), "targets": .array([.string("3000802b")])]),
+                    ]),
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 13_000),
+                        "args": .object(["conv_id": .string("3000802a"), "msg_id": .string("9080204"), "targets": .array([.string("3000802b")])]),
+                    ]),
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 14_000),
+                        "args": .object(["conv_id": .string("3000802a"), "msg_id": .string("9080205"), "targets": .array([.string("3000802b")])]),
+                    ]),
+                ]
+            ),
+
+            // 3. forward_contact_card: with and without phone; to a group, to a 1-1, to self (menu flags differ); API error.
+            ForwardRecorderHarness.ScenarioDef(
+                name: "forward_contact_card",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000803",
+                    displayName: "Forward User 3",
+                    send2MeId: "9200803",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "next_client_id": .int(8000000000300),
+                        "history_freshness": .object(["3000803a": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000803a", name: "Source 3", previewText: "[Danh thiếp] Card NoPhone", previewTsMs: baseTs + 2_000),
+                            localConv(id: "3000803b", name: "Target Peer 3"),
+                            localConv(id: "g500803", isGroup: true, name: "Target Group 3", members: 4),
+                            localConv(id: "9200803", name: "Cloud của tôi"),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(
+                                id: "9080301",
+                                convId: "3000803a",
+                                senderId: "3000803a",
+                                text: "[Danh thiếp] Card Phone",
+                                kind: .object([
+                                    "type": .string("contactCard"),
+                                    "name": .string("Card Phone"),
+                                    "uid": .string("4000801"),
+                                    "phone": .string("+84901234567"),
+                                ]),
+                                kindTag: "contactCard",
+                                tsMs: baseTs + 1_000,
+                                menu: okMenu
+                            ),
+                            storedMsg(
+                                id: "9080302",
+                                convId: "3000803a",
+                                senderId: "3000803a",
+                                text: "[Danh thiếp] Card NoPhone",
+                                kind: .object([
+                                    "type": .string("contactCard"),
+                                    "name": .string("Card NoPhone"),
+                                    "uid": .string("4000802"),
+                                ]),
+                                kindTag: "contactCard",
+                                tsMs: baseTs + 2_000,
+                                menu: okMenu
+                            ),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000803", displayName: "Forward User 3", send2MeId: "9200803"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000803", displayName: "Forward User 3"),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/contact",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["msgId": .string("9003001")])])
+                    ),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/group/contact",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["msgId": .string("9003002")])])
+                    ),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/contact",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["msgId": .string("9003003")])])
+                    ),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/contact",
+                        method: "POST",
+                        json: .object(["error_code": .int(500), "error_message": .string("contact error")])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000803a")])]),
+                    // With phone -> 1-1
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 10_000),
+                        "args": .object(["conv_id": .string("3000803a"), "msg_id": .string("9080301"), "targets": .array([.string("3000803b")])]),
+                    ]),
+                    // Without phone -> group
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 11_000),
+                        "args": .object(["conv_id": .string("3000803a"), "msg_id": .string("9080302"), "targets": .array([.string("g500803")])]),
+                    ]),
+                    // Without phone -> self
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 12_000),
+                        "args": .object(["conv_id": .string("3000803a"), "msg_id": .string("9080302"), "targets": .array([.string("9200803")])]),
+                    ]),
+                    // API error -> 1-1
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 13_000),
+                        "args": .object(["conv_id": .string("3000803a"), "msg_id": .string("9080301"), "targets": .array([.string("3000803b")])]),
+                    ]),
+                ]
+            ),
+
+            // 4. forward_media: photo with local file; photo via CDN; photo local send_media fail -> CDN fallback;
+            // photo with neither; file resolved and sent; file not resolved; host send failure.
+            ForwardRecorderHarness.ScenarioDef(
+                name: "forward_media",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000804",
+                    displayName: "Forward User 4",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "history_freshness": .object(["3000804a": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000804a", name: "Source 4", previewText: "[File] report.pdf", previewTsMs: baseTs + 2_000),
+                            localConv(id: "3000804b", name: "Target 4"),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(
+                                id: "9080401",
+                                convId: "3000804a",
+                                senderId: "3000804a",
+                                text: "[Hình ảnh]",
+                                kind: .object([
+                                    "type": .string("photo"),
+                                    "url": .string("https://cdn.example.invalid/fwd-photo.jpg"),
+                                    "width": .int(800),
+                                    "height": .int(600),
+                                ]),
+                                kindTag: "photo",
+                                tsMs: baseTs + 1_000,
+                                menu: okMenu
+                            ),
+                            storedMsg(
+                                id: "9080402",
+                                convId: "3000804a",
+                                senderId: "3000804a",
+                                text: "[File] report.pdf",
+                                kind: .object([
+                                    "type": .string("file"),
+                                    "name": .string("report.pdf"),
+                                    "size": .int(2048),
+                                    "url": .string("https://cdn.example.invalid/report.pdf"),
+                                ]),
+                                kindTag: "file",
+                                tsMs: baseTs + 2_000,
+                                menu: okMenu
+                            ),
+                        ]),
+                        "host_results": .object([
+                            "resolve_media": .array([
+                                .object(["state": .string("file"), "path": .string("/fake/local/photo1.jpg")]),
+                                .object(["state": .string("unavailable")]),
+                                .object(["state": .string("file"), "path": .string("/fake/local/photo3.jpg")]),
+                                .object(["state": .string("expired")]),
+                            ]),
+                            "fetch_media_data": .array([
+                                .object(["ok": .bool(true)]),
+                                .object(["ok": .bool(true)]),
+                                .object(["ok": .bool(false)]),
+                            ]),
+                            "send_media": .array([
+                                .object(["outcome": .string("done")]),
+                                .object(["outcome": .string("done")]),
+                                .object(["outcome": .string("failed"), "text": .string("local send failed")]),
+                                .object(["outcome": .string("done")]),
+                            ]),
+                            "resolve_file": .array([
+                                .object(["state": .string("ready"), "path": .string("/fake/staged/report.pdf")]),
+                                .object(["state": .string("expired")]),
+                                .object(["state": .string("ready"), "path": .string("/fake/staged/report.pdf")]),
+                            ]),
+                            "send_files": .array([
+                                .object(["outcome": .string("done")]),
+                                .object(["outcome": .string("failed"), "text": .string("file send failed")]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000804", displayName: "Forward User 4"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000804", displayName: "Forward User 4"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000804a")])]),
+                    // Photo 1: local file ok
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 10_000),
+                        "args": .object(["conv_id": .string("3000804a"), "msg_id": .string("9080401"), "targets": .array([.string("3000804b")])]),
+                    ]),
+                    // Photo 2: unavailable -> CDN download -> send_media ok
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 11_000),
+                        "args": .object(["conv_id": .string("3000804a"), "msg_id": .string("9080401"), "targets": .array([.string("3000804b")])]),
+                    ]),
+                    // Photo 3: local file resolves, send_media fails -> CDN fallback -> send_media ok
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 12_000),
+                        "args": .object(["conv_id": .string("3000804a"), "msg_id": .string("9080401"), "targets": .array([.string("3000804b")])]),
+                    ]),
+                    // Photo 4: expired + CDN fails -> failed
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 13_000),
+                        "args": .object(["conv_id": .string("3000804a"), "msg_id": .string("9080401"), "targets": .array([.string("3000804b")])]),
+                    ]),
+                    // File 1: resolved & sent ok
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 14_000),
+                        "args": .object(["conv_id": .string("3000804a"), "msg_id": .string("9080402"), "targets": .array([.string("3000804b")])]),
+                    ]),
+                    // File 2: not resolved (expired)
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 15_000),
+                        "args": .object(["conv_id": .string("3000804a"), "msg_id": .string("9080402"), "targets": .array([.string("3000804b")])]),
+                    ]),
+                    // File 3: resolved, send_files fails
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 16_000),
+                        "args": .object(["conv_id": .string("3000804a"), "msg_id": .string("9080402"), "targets": .array([.string("3000804b")])]),
+                    ]),
+                ]
+            ),
+
+            // 5. forward_other_kinds: location with text, and sticker with empty text.
+            ForwardRecorderHarness.ScenarioDef(
+                name: "forward_other_kinds",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000805",
+                    displayName: "Forward User 5",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "next_client_id": .int(8000000000500),
+                        "history_freshness": .object(["3000805a": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000805a", name: "Source 5", previewText: "Sticker", previewTsMs: baseTs + 2_000),
+                            localConv(id: "3000805b", name: "Target 5"),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(
+                                id: "9080501",
+                                convId: "3000805a",
+                                senderId: "3000805a",
+                                text: "Coffee House - 123 Le Loi",
+                                kind: .object([
+                                    "type": .string("location"),
+                                    "title": .string("Coffee House"),
+                                    "address": .string("123 Le Loi"),
+                                ]),
+                                kindTag: "location",
+                                tsMs: baseTs + 1_000,
+                                menu: okMenu
+                            ),
+                            storedMsg(
+                                id: "9080502",
+                                convId: "3000805a",
+                                senderId: "3000805a",
+                                text: "",
+                                kind: .object([
+                                    "type": .string("sticker"),
+                                    "url": .string("https://cdn.example.invalid/s1.webp"),
+                                ]),
+                                kindTag: "sticker",
+                                tsMs: baseTs + 2_000,
+                                menu: okMenu
+                            ),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000805", displayName: "Forward User 5"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000805", displayName: "Forward User 5"),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/sms",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["msgId": .string("9005001")])])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000805a")])]),
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 10_000),
+                        "args": .object(["conv_id": .string("3000805a"), "msg_id": .string("9080501"), "targets": .array([.string("3000805b")])]),
+                    ]),
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 11_000),
+                        "args": .object(["conv_id": .string("3000805a"), "msg_id": .string("9080502"), "targets": .array([.string("3000805b")])]),
+                    ]),
+                ]
+            ),
+
+            // 6. multi_target: three targets, one failing; all failing; empty target list.
+            ForwardRecorderHarness.ScenarioDef(
+                name: "multi_target",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000806",
+                    displayName: "Forward User 6",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "next_client_id": .int(8000000000600),
+                        "history_freshness": .object(["3000806a": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000806a", name: "Source 6", previewText: "Multi", previewTsMs: baseTs + 1_000),
+                            localConv(id: "3000806b", name: "Target 6B"),
+                            localConv(id: "3000806c", name: "Target 6C"),
+                            localConv(id: "g500806", isGroup: true, name: "Group 6", members: 3),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(
+                                id: "9080601",
+                                convId: "3000806a",
+                                senderId: "3000806a",
+                                text: "Broadcast forward",
+                                tsMs: baseTs + 1_000,
+                                menu: okMenu
+                            ),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000806", displayName: "Forward User 6"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000806", displayName: "Forward User 6"),
+                    // Partial success (2 of 3 succeed)
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/sms",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["msgId": .string("9006001")])])
+                    ),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/sms",
+                        method: "POST",
+                        json: .object(["error_code": .int(500), "error_message": .string("target 6C failed")])
+                    ),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/group/sendmsg",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["msgId": .string("9006002")])])
+                    ),
+                    // All failing
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/sms",
+                        method: "POST",
+                        json: .object(["error_code": .int(500), "error_message": .string("fail 1")])
+                    ),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/sms",
+                        method: "POST",
+                        json: .object(["error_code": .int(500), "error_message": .string("fail 2")])
+                    ),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/group/sendmsg",
+                        method: "POST",
+                        json: .object(["error_code": .int(500), "error_message": .string("fail 3")])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000806a")])]),
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 10_000),
+                        "args": .object(["conv_id": .string("3000806a"), "msg_id": .string("9080601"), "targets": .array([])]),
+                    ]),
+                    .object(["snapshot": .string("after_empty_targets")]),
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 11_000),
+                        "args": .object(["conv_id": .string("3000806a"), "msg_id": .string("9080601"), "targets": .array([.string("3000806b"), .string("3000806c"), .string("g500806")])]),
+                    ]),
+                    .object(["snapshot": .string("after_partial")]),
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 12_000),
+                        "args": .object(["conv_id": .string("3000806a"), "msg_id": .string("9080601"), "targets": .array([.string("3000806b"), .string("3000806c"), .string("g500806")])]),
+                    ]),
+                ]
+            ),
+
+            // 7. selection: two forwardable plus one blocked (card, no request); all forwardable (request with more in order);
+            // forward_all success ends the selection, failure keeps it.
+            ForwardRecorderHarness.ScenarioDef(
+                name: "selection",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000807",
+                    displayName: "Forward User 7",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "next_client_id": .int(8000000000700),
+                        "history_freshness": .object(["3000807a": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000807a", name: "Source 7", previewText: "Third", previewTsMs: baseTs + 3_000),
+                            localConv(id: "3000807b", name: "Target 7"),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(
+                                id: "9080701",
+                                convId: "3000807a",
+                                senderId: "3000807a",
+                                text: "First selectable",
+                                tsMs: baseTs + 1_000,
+                                menu: okMenu
+                            ),
+                            storedMsg(
+                                id: "9080702",
+                                convId: "3000807a",
+                                senderId: "3000807a",
+                                text: "Blocked selectable",
+                                tsMs: baseTs + 2_000,
+                                menu: .object(["forward": .string("blocked")])
+                            ),
+                            storedMsg(
+                                id: "9080703",
+                                convId: "3000807a",
+                                senderId: "3000807a",
+                                text: "Third selectable",
+                                tsMs: baseTs + 3_000,
+                                menu: okMenu
+                            ),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000807", displayName: "Forward User 7"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000807", displayName: "Forward User 7"),
+                    // First forward_all fails for both messages
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/sms",
+                        method: "POST",
+                        json: .object(["error_code": .int(500), "error_message": .string("sel fail 1")])
+                    ),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/sms",
+                        method: "POST",
+                        json: .object(["error_code": .int(500), "error_message": .string("sel fail 2")])
+                    ),
+                    // Second forward_all succeeds for both messages
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/sms",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["msgId": .string("9007001")])])
+                    ),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/sms",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["msgId": .string("9007002")])])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000807a")])]),
+                    .object(["cmd": .string("select"), "args": .object(["conv_id": .string("3000807a"), "ids": .array([.string("9080703"), .string("9080701"), .string("9080702")])])]),
+                    .object(["cmd": .string("forward_selection")]),
+                    .object(["snapshot": .string("after_blocked_selection")]),
+                    .object(["cmd": .string("select"), "args": .object(["conv_id": .string("3000807a"), "ids": .array([])])]),
+                    .object(["cmd": .string("select"), "args": .object(["conv_id": .string("3000807a"), "ids": .array([.string("9080703"), .string("9080701")])])]),
+                    .object(["cmd": .string("forward_selection")]),
+                    .object(["snapshot": .string("after_forward_selection")]),
+                    .object([
+                        "cmd": .string("forward_all"),
+                        "now_ms": .int(baseTs + 10_000),
+                        "args": .object(["targets": .array([.string("3000807b")])]),
+                    ]),
+                    .object(["snapshot": .string("after_forward_all_fail")]),
+                    .object([
+                        "cmd": .string("forward_all"),
+                        "now_ms": .int(baseTs + 11_000),
+                        "args": .object(["targets": .array([.string("3000807b")])]),
+                    ]),
+                ]
+            ),
+
+            // 8. e2ee_target: forward text into an E2EE 1-1 (goes through the U5 E2EE host call).
+            ForwardRecorderHarness.ScenarioDef(
+                name: "e2ee_target",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000808",
+                    displayName: "Forward User 8",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "next_client_id": .int(8000000000800),
+                        "e2ee_threads": .array([.string("3000808b")]),
+                        "history_freshness": .object(["3000808a": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000808a", name: "Source 8", previewText: "Secret text", previewTsMs: baseTs + 1_000),
+                            localConv(id: "3000808b", name: "E2EE Peer 8"),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(
+                                id: "9080801",
+                                convId: "3000808a",
+                                senderId: "3000808a",
+                                text: "Secret forward",
+                                tsMs: baseTs + 1_000,
+                                menu: okMenu
+                            ),
+                        ]),
+                        "host_results": .object([
+                            "send_e2ee_text": .array([
+                                .object([
+                                    "msg_id": .string("9008001"),
+                                    "cli_msg_id": .string("8000000000800"),
+                                    "ts_ms": .int(baseTs + 10_500),
+                                ]),
+                                .object([
+                                    "error": .object([
+                                        "code": .int(500),
+                                        "message": .string("Signal failure"),
+                                        "url": .string("/api/e2ee/pc/message/sms"),
+                                    ]),
+                                ]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000808", displayName: "Forward User 8"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000808", displayName: "Forward User 8"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000808a")])]),
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 10_000),
+                        "args": .object(["conv_id": .string("3000808a"), "msg_id": .string("9080801"), "targets": .array([.string("3000808b")])]),
+                    ]),
+                    .object(["snapshot": .string("after_e2ee_ok")]),
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 11_000),
+                        "args": .object(["conv_id": .string("3000808a"), "msg_id": .string("9080801"), "targets": .array([.string("3000808b")])]),
+                    ]),
+                ]
+            ),
+        ]
     }
 }
 
