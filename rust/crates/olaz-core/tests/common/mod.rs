@@ -9,6 +9,7 @@
     reason = "shared test helper used selectively by each test binary"
 )]
 
+use olaz_core::runner::{BatchHookOutcome, ParsedEventsHookOutcome};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
@@ -24,6 +25,7 @@ use olaz_core::conversations::{
     message_preview_label, to_wire_stored,
 };
 use olaz_core::input::{Command, Input, LegacyCookie, SeenTarget};
+use olaz_core::messages::{HistoryFreshness, MuteEntry};
 use olaz_core::reduce::classify::MobileSyncEvent;
 use olaz_core::runner::{Host, SessionEffectRunner, SharedStoreSlot, WsDriver, WsStartParams};
 use olaz_core::state::{
@@ -161,6 +163,11 @@ pub struct Seed {
     pub local_messages: Option<Vec<Value>>,
     #[serde(default)]
     pub open_conversation_id: Option<String>,
+    // U4-bootstrap
+    #[serde(default)]
+    pub history_full_refresh_at: Option<String>,
+    #[serde(default)]
+    pub history_freshness: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1203,6 +1210,7 @@ pub struct RecordingHost {
     calls: Mutex<Vec<Value>>,
     notify: Notify,
     is_u3: bool,
+    is_u4: bool,
     data_dir: Option<PathBuf>,
     shared_store_slot: Mutex<Option<SharedStoreSlot>>,
     store: Mutex<Option<Arc<Mutex<Store>>>>,
@@ -1217,6 +1225,15 @@ impl RecordingHost {
     }
 
     pub fn from_seed_with_u3(seed: &Seed, is_u3: bool, data_dir: Option<PathBuf>) -> Self {
+        Self::from_seed_with_modes(seed, is_u3, false, data_dir)
+    }
+
+    pub fn from_seed_with_modes(
+        seed: &Seed,
+        is_u3: bool,
+        is_u4: bool,
+        data_dir: Option<PathBuf>,
+    ) -> Self {
         let saved_session = seed
             .saved_session
             .as_ref()
@@ -1280,6 +1297,7 @@ impl RecordingHost {
             calls: Mutex::new(Vec::new()),
             notify: Notify::new(),
             is_u3,
+            is_u4,
             data_dir,
             shared_store_slot: Mutex::new(None),
             store: Mutex::new(None),
@@ -1905,6 +1923,29 @@ impl Host for RecordingHost {
         self.record("start_bootstrap", json!({}));
     }
 
+    async fn on_bootstrap_started(&self) -> bool {
+        self.start_bootstrap().await;
+        false
+    }
+
+    async fn apply_mutes(&self, mutes: Vec<MuteEntry>) {
+        let items: Vec<Value> = mutes
+            .iter()
+            .map(|m| {
+                json!({
+                    "conv_id": m.conv_id,
+                    "start": m.start,
+                    "duration": m.duration,
+                })
+            })
+            .collect();
+        self.record("apply_mutes", json!({ "mutes": items }));
+    }
+
+    async fn refresh_cloud(&self) {
+        self.record("refresh_cloud", json!({}));
+    }
+
     async fn offer_first_login_transfer(&self, force: bool) {
         self.record("offer_first_login_transfer", json!({ "force": force }));
     }
@@ -1922,6 +1963,7 @@ impl Host for RecordingHost {
     }
 
     async fn mark_expired(&self, _snapshot_json: String) {
+        *self.store.lock().unwrap_or_else(PoisonError::into_inner) = None;
         self.record("mark_expired", json!({}));
     }
 
@@ -1931,6 +1973,156 @@ impl Host for RecordingHost {
 
     async fn persist_ws_cursors(&self, cursors: CursorMap) {
         self.record("persist_ws_cursors", json!({ "cursors": cursors }));
+    }
+
+    async fn on_batch_received(
+        &self,
+        cmd: Option<u16>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        payload: Map<String, Value>,
+    ) -> BatchHookOutcome {
+        if self.is_u4 {
+            self.record(
+                "apply_batch",
+                json!({
+                    "cmd": cmd,
+                    "increment_unread": increment_unread,
+                    "notify_incoming": notify_incoming,
+                    "payload": Value::Object(payload.clone()),
+                }),
+            );
+            BatchHookOutcome::IngestInCore(payload)
+        } else {
+            BatchHookOutcome::DelegateToLegacy
+        }
+    }
+
+    async fn on_parsed_events_received(
+        &self,
+        cmd: u16,
+        increment_unread: bool,
+        notify_incoming: bool,
+        envelope: &TypedChatEnvelope,
+    ) -> ParsedEventsHookOutcome {
+        if self.is_u4 {
+            let profile = self
+                .self_profile
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            let events = if let Some(p) = profile {
+                let mut names = Vec::new();
+                for uid in &envelope.uids {
+                    if let Some(info) = self.lookup_person(uid) {
+                        names.push((uid.clone(), info));
+                    }
+                }
+                envelope
+                    .payload
+                    .resolve(&p.user_id, p.self_conv_id.as_deref(), &names)
+                    .unwrap_or_else(|| envelope.events.clone())
+            } else {
+                envelope.events.clone()
+            };
+            let serialized: Vec<Value> = events
+                .iter()
+                .filter(|ev| !matches!(ev, ParsedWireEvent::Ignore))
+                .map(serialize_parsed_wire_event)
+                .collect();
+            self.record(
+                "apply_parsed_events",
+                json!({
+                    "cmd": cmd,
+                    "increment_unread": increment_unread,
+                    "notify_incoming": notify_incoming,
+                    "events": serialized,
+                }),
+            );
+            ParsedEventsHookOutcome::IngestInCore
+        } else {
+            ParsedEventsHookOutcome::DelegateToLegacy
+        }
+    }
+
+    async fn refresh_board_pins(&self, conv_id: String) {
+        if self.is_u4 {
+            self.record("refresh_board_pins", json!({ "conv_id": conv_id }));
+        }
+    }
+
+    async fn mark_read_boundary(&self, conv_id: String, _seen_target: Option<SeenTarget>) {
+        if self.is_u4 {
+            self.record("mark_read", json!({ "conv_id": conv_id }));
+        }
+    }
+
+    async fn apply_remote_reaction(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        sender_id: String,
+        r_type: String,
+        r_icon: String,
+        event_id: String,
+        react_client_id: String,
+        sender_name: String,
+    ) {
+        if self.is_u4 {
+            self.record(
+                "apply_remote_reaction",
+                json!({
+                    "conv_id": conv_id,
+                    "msg_id": msg_id,
+                    "cli_msg_id": cli_msg_id,
+                    "sender_id": sender_id,
+                    "r_type": r_type,
+                    "r_icon": r_icon,
+                    "event_id": event_id,
+                    "react_client_id": react_client_id,
+                    "sender_name": sender_name,
+                }),
+            );
+        }
+    }
+
+    async fn apply_remote_recall(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        _update_conversation_preview: bool,
+    ) {
+        if self.is_u4 {
+            self.record(
+                "apply_remote_recall",
+                json!({
+                    "conv_id": conv_id,
+                    "msg_id": msg_id,
+                    "cli_msg_id": cli_msg_id,
+                }),
+            );
+        }
+    }
+
+    async fn apply_remote_delete(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        _update_conversation_preview: bool,
+    ) {
+        if self.is_u4 {
+            self.record(
+                "apply_remote_delete",
+                json!({
+                    "conv_id": conv_id,
+                    "msg_id": msg_id,
+                    "cli_msg_id": cli_msg_id,
+                }),
+            );
+        }
     }
 
     async fn apply_batch(
@@ -2443,6 +2635,14 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
             .set_preference_data("activityRanks", &bytes)
             .map_err(|e| format!("seed activityRanks: {e}"))?;
     }
+    // U4-bootstrap
+    if let Some(ts) = &seed.history_full_refresh_at
+        && !ts.is_empty()
+    {
+        store
+            .set_preference_string("historyFullRefreshAt", ts)
+            .map_err(|e| format!("seed historyFullRefreshAt: {e}"))?;
+    }
     if let Some(contacts) = &seed.contacts {
         if let Some(v) = contacts.get("aliases")
             && !v.is_null()
@@ -2566,7 +2766,8 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
                 {
                     canonical_json_string(raw_obj).into_bytes()
                 } else {
-                    let fallback = json!({
+                    let is_e2ee = row.get("is_e2ee").and_then(Value::as_bool).unwrap_or(false);
+                    let mut fallback = json!({
                         "id": id,
                         "conversationId": conv_id,
                         "clientId": client_id,
@@ -2576,8 +2777,16 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
                         "isMine": is_mine,
                         "text": text,
                         "date": ts_ms,
+                        "status": status,
+                        "isE2EE": is_e2ee,
                         "kind": { "type": kind_tag },
                     });
+                    if let Some(reactions) = row.get("reactions")
+                        && !reactions.is_null()
+                        && let Some(obj) = fallback.as_object_mut()
+                    {
+                        obj.insert("reactions".to_owned(), reactions.clone());
+                    }
                     canonical_json_string(&fallback).into_bytes()
                 };
                 Some(StoredMessage {
@@ -2607,6 +2816,7 @@ async fn capture_case_snapshot(
     core: &CoreHandle,
     host: &RecordingHost,
     is_u3: bool,
+    is_u4: bool,
 ) -> Option<Value> {
     if !is_u3 {
         return core
@@ -2619,14 +2829,52 @@ async fn capture_case_snapshot(
         Value::Object(m) => m,
         _ => Map::new(),
     };
-    let conv_fields = if let Some(store_arc) = host.attached_store() {
+    let (conv_fields, msg_fields) = if let Some(store_arc) = host.attached_store() {
         let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
-        full.conversations.to_case_json_fields(Some(&store))
+        let cf = full.conversations.to_case_json_fields(Some(&store));
+        let mf = if is_u4 {
+            Some(full.messages.to_case_json_fields(Some(&store)))
+        } else {
+            None
+        };
+        (cf, mf)
     } else {
-        full.conversations.to_case_json_fields(None)
+        let cf = full.conversations.to_case_json_fields(None);
+        let mf = if is_u4 {
+            Some(full.messages.to_case_json_fields(None))
+        } else {
+            None
+        };
+        (cf, mf)
     };
     for (k, v) in conv_fields {
         obj.insert(k, v);
+    }
+    if let Some(mut mf) = msg_fields {
+        obj.insert(
+            "open_conversation_id".to_owned(),
+            full.conversations
+                .open_conversation_id
+                .clone()
+                .map_or(Value::Null, Value::String),
+        );
+        let store_msgs = mf.remove("__store_messages");
+        let store_u4_prefs = mf.remove("__store_u4_prefs");
+        for (k, v) in mf {
+            obj.insert(k, v);
+        }
+        if let Some(Value::Object(store_obj)) = obj.get_mut("store") {
+            if let Some(msgs_val) = store_msgs {
+                store_obj.insert("messages".to_owned(), msgs_val);
+            }
+            if let Some(Value::Object(u4_prefs)) = store_u4_prefs
+                && let Some(Value::Object(prefs_obj)) = store_obj.get_mut("prefs")
+            {
+                for (pk, pv) in u4_prefs {
+                    prefs_obj.insert(pk, pv);
+                }
+            }
+        }
     }
     Some(Value::Object(obj))
 }
@@ -2653,7 +2901,8 @@ fn str_vec_arg(args: &Value, key: &str) -> Vec<String> {
 /// Runs a single Case format v1 [`Case`] under paused tokio time and returns the observed
 /// snapshots, final state, sorted canonical requests, and ordered host calls.
 pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
-    let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions";
+    let is_u4 = case.domain == "bootstrap" || case.domain == "messages";
+    let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions" || is_u4;
     let temp_dir = if is_u3 {
         Some(tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?)
     } else {
@@ -2706,9 +2955,10 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         client.with_session(|s| s.domains = d.clone());
     }
 
-    let host = Arc::new(RecordingHost::from_seed_with_u3(
+    let host = Arc::new(RecordingHost::from_seed_with_modes(
         &case.seed,
         is_u3,
+        is_u4,
         temp_dir.as_ref().map(|d| d.path().to_path_buf()),
     ));
     let runner = Arc::new(SessionEffectRunner::with_options(
@@ -2730,6 +2980,18 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             .open_conversation_id
             .clone()
             .filter(|id| !id.is_empty());
+    }
+    if is_u4 && !case.seed.history_freshness.is_empty() {
+        for (cid, raw_f) in &case.seed.history_freshness {
+            let f = match raw_f.as_str() {
+                "up_to_date" => HistoryFreshness::UpToDate,
+                _ => HistoryFreshness::Stale,
+            };
+            initial_state
+                .messages
+                .history_freshness
+                .insert(cid.clone(), f);
+        }
     }
     let core = CoreHandle::start_with_state(initial_state, runner, Handle::current());
 
@@ -2777,6 +3039,34 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         }
                         _ => {}
                     }
+                }
+                // U4-messages
+                "open" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    host.set_open_conversation(Some(id.clone()));
+                    core.request_unit(Command::OpenConversation {
+                        id,
+                        preloaded: Vec::new(),
+                        skip_local_read: false,
+                    })
+                    .await;
+                }
+                "close" => {
+                    host.set_open_conversation(None);
+                    core.request_unit(Command::CloseConversation).await;
+                }
+                "load_older" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    core.request_unit(Command::LoadOlderMessages { id }).await;
+                }
+                // U4-bootstrap
+                "bootstrap" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::Bootstrap { now_ms: ts_ms })
+                        .await;
                 }
                 "apply_batch" => {
                     let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
@@ -3102,7 +3392,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 if is_u3 {
                     let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
                 }
-                if let Some(snap) = capture_case_snapshot(&core, &host, is_u3).await {
+                if let Some(snap) = capture_case_snapshot(&core, &host, is_u3, is_u4).await {
                     snapshots.insert(snapshot.clone(), snap);
                 }
             }
@@ -3128,7 +3418,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         }
     }
 
-    let final_state = capture_case_snapshot(&core, &host, is_u3)
+    let final_state = capture_case_snapshot(&core, &host, is_u3, is_u4)
         .await
         .ok_or_else(|| "actor stopped before final snapshot".to_owned())?;
     core.stop();

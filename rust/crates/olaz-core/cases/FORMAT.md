@@ -6,7 +6,7 @@ The oracle is what can be observed from outside the engine: the domain state the
 
 ## Files
 
-- `rust/crates/olaz-core/cases/<domain>.jsonl`: one case per line, sorted by `name`. Domains: `session`, `transport`, `conversations`, `conversation_actions`.
+- `rust/crates/olaz-core/cases/<domain>.jsonl`: one case per line, sorted by `name`. Domains: `session`, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`.
 - `rust/crates/olaz-core/cases/known-diffs.jsonl`: intended differences, one line `{"domain", "name", "path", "actual", "reason"}` each. Only lines the user approved. A line whose case no longer differs fails the runner.
 - Data is synthetic. Never content from a real account, never a real token.
 
@@ -32,18 +32,20 @@ The oracle is what can be observed from outside the engine: the domain state the
 - `domains`: the service map used when no session is saved (QR login), pointing every service at the fake server. The fake server's port is not stable, so cases store the host as `"http://fake"`; both sides substitute the real `http://127.0.0.1:<port>` when they run. Every case sets `"isolated": true` so neither side ever fails over to live Zalo hosts.
 - `legacy_cookie`: `null`, or what `tryRestoreLegacyCookieSession` reads.
 - `prefs`: store preference strings present before the run.
-- `poll_state` *(optional, `transport`, `conversations`, `conversation_actions`)*: `null`, or `ZaloPollState` / `PollState` camelCase JSON (`{"lastActionId": "...", "lastActionIdOther": "...", "queues": {"1": {"lastId": "...", "ids": []}, ...}}`) seeded before long-polling starts.
-- `ws_cursors` *(optional, `transport`, `conversations`, `conversation_actions`)*: `null`, or a map of `"<cmd>_<subCmd>"` to `{"lastId": "...", "preIds": [...]}` (`ZaloWSQueueCursorSnapshot` / `WsQueueCursorSnapshot`) seeded before WebSocket connects.
-- `suppress` *(optional, runner metadata, `transport`, `conversations`, `conversation_actions`)*: array of transport names (`"ws"`, `"long_poll"`, or both) to suppress during the run. Both the recorder's `hostTrace` and the Rust replay obey it: `start_ws` / `start_long_poll` are still traced, `hostTrace` returns `false` for listed transports, a suppressed WS never connects, and a suppressed long-poll never ticks.
-- `ws_auth` *(optional, `conversations`, `conversation_actions`)*: `"manual"` (or omitted for auto-auth). When `"manual"`, the fake server does not send the initial `cmd == 1` auth reply automatically on WebSocket connect; instead, that `cmd == 1` `ws_frame` remains the first scripted `ws_frame` and is delivered by an explicit `ws_push` step (typically `await_host start_bootstrap` → `ws_push 1` → `await_host e2ee_connected`).
-- `contacts` *(optional, `conversations`, `conversation_actions`)*: `{"friends": [{"id", "name", "zalo_name", "avatar", "last_active_ms", "online", "section", "sort_key"}], "groups": [{"id", "name", "avatar", "members", "sort_key"}], "friends_loaded": <bool>, "groups_loaded": <bool>, "aliases": {"<uid>": "<alias>"}, "cached_profiles": {"<uid>": {"name", "avatar"}}, "cached_groups": {"<gid>": {"name", "avatar", "members"}}, "friend_global_ids": {"<uid>": "<gid>"}}`. Friends/groups populate `ContactsState`; aliases/profiles/groups/global-ids seed the corresponding store preferences before boot so `loadLocalAccountState` loads them.
-- `pinned_ids`, `archived_ids`, `unread_marks`, `hidden_ids` *(optional, `conversations`, `conversation_actions`)*: arrays of conversation ids seeded into SQLite `pinnedIds`, `archivedIds`, `unreadMarks`, `hiddenIds` preferences before boot.
+- `poll_state` *(optional, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`)*: `null`, or `ZaloPollState` / `PollState` camelCase JSON (`{"lastActionId": "...", "lastActionIdOther": "...", "queues": {"1": {"lastId": "...", "ids": []}, ...}}`) seeded before long-polling starts.
+- `ws_cursors` *(optional, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`)*: `null`, or a map of `"<cmd>_<subCmd>"` to `{"lastId": "...", "preIds": [...]}` (`ZaloWSQueueCursorSnapshot` / `WsQueueCursorSnapshot`) seeded before WebSocket connects.
+- `suppress` *(optional, runner metadata, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`)*: array of transport names (`"ws"`, `"long_poll"`, or both) to suppress during the run. Both the recorder's `hostTrace` and the Rust replay obey it: `start_ws` / `start_long_poll` are still traced, `hostTrace` returns `false` for listed transports, a suppressed WS never connects, and a suppressed long-poll never ticks.
+- `ws_auth` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`)*: `"manual"` (or omitted for auto-auth). When `"manual"`, the fake server does not send the initial `cmd == 1` auth reply automatically on WebSocket connect; instead, that `cmd == 1` `ws_frame` remains the first scripted `ws_frame` and is delivered by an explicit `ws_push` step (typically `await_host start_bootstrap` → `ws_push 1` → `await_host e2ee_connected`).
+- `contacts` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`)*: `{"friends": [{"id", "name", "zalo_name", "avatar", "last_active_ms", "online", "section", "sort_key"}], "groups": [{"id", "name", "avatar", "members", "sort_key"}], "friends_loaded": <bool>, "groups_loaded": <bool>, "aliases": {"<uid>": "<alias>"}, "cached_profiles": {"<uid>": {"name", "avatar"}}, "cached_groups": {"<gid>": {"name", "avatar", "members"}}, "friend_global_ids": {"<uid>": "<gid>"}}`. Friends/groups populate `ContactsState`; aliases/profiles/groups/global-ids seed the corresponding store preferences before boot so `loadLocalAccountState` loads them.
+- `pinned_ids`, `archived_ids`, `unread_marks`, `hidden_ids` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`)*: arrays of conversation ids seeded into SQLite `pinnedIds`, `archivedIds`, `unreadMarks`, `hiddenIds` preferences before boot.
 - `hidden_pin_md5`, `hidden_pin_hash` *(optional, `conversation_actions`)*: `null` or digest hex string seeded into SQLite `hiddenPinMD5` / `hiddenPinHash` preferences before boot.
 - `labels_pref` *(optional, `conversation_actions`)*: array of `{"id", "name", "color", "convIds"}` seeded into SQLite `labels` preference before boot.
-- `activity_ranks` *(optional, `conversations`, `conversation_actions`)*: map of `<convId>` to positive integer rank seeded into SQLite `activityRanks` preference before boot.
-- `local_conversations` *(optional, `conversations`, `conversation_actions`)*: array of `{"id", "is_group", "name", "avatar", "pinned", "members", "unread", "preview_text", "preview_ts_ms", "preview_from_me", "updated_at_ms"}` seeded into the SQLite `conversations` table before boot (`loadLocalAccountState` reads them before any network).
-- `local_messages` *(optional, `conversations`, `conversation_actions`)*: array of `{"id", "conv_id", "client_id", "sender_id", "sender_name", "sender_avatar", "is_mine", "text", "kind_tag", "ts_ms", "status", "raw_json"}` seeded into the SQLite `messages` table before boot.
-- `open_conversation_id` *(optional, `conversations`, `conversation_actions`)*: `null` or conversation id set as `openConversationId` before steps run.
+- `activity_ranks` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`)*: map of `<convId>` to positive integer rank seeded into SQLite `activityRanks` preference before boot.
+- `local_conversations` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`)*: array of `{"id", "is_group", "name", "avatar", "pinned", "members", "unread", "preview_text", "preview_ts_ms", "preview_from_me", "updated_at_ms"}` seeded into the SQLite `conversations` table before boot (`loadLocalAccountState` reads them before any network).
+- `local_messages` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`)*: array of `{"id", "conv_id", "client_id", "sender_id", "sender_name", "sender_avatar", "is_mine", "text", "kind_tag", "ts_ms", "status", "raw_json"}` seeded into the SQLite `messages` table before boot.
+- `open_conversation_id` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`)*: `null` or conversation id set as `openConversationId` before steps run.
+- `history_full_refresh_at` *(optional, `messages`, `bootstrap`)*: `null`, or string/number seeded into SQLite `historyFullRefreshAt` preference before boot (stored as stringified epoch seconds).
+- `history_freshness` *(optional, `messages`, `bootstrap`)*: `null`, or map of `<convId>` to `"up_to_date" | "stale"` pre-seeded into `ZaloEngine.historyFreshness` before steps run.
 
 ### server
 
@@ -61,7 +63,7 @@ Run in order:
 
 - Session / transport `cmd` steps: `{"cmd": "start" | "refresh_qr" | "log_out" | "session_expired" | "drain_chat_polling", "args": {...}}`.
   - `session_expired` takes `{"reason": "<text>"}`.
-  - `drain_chat_polling` (`transport`, `conversations`, `conversation_actions`) calls `drainChatPolling(maxBatches, notifyIncoming)` with `{"max_batches": <int>, "notify_incoming": <bool>}`.
+  - `drain_chat_polling` (`transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`) calls `drainChatPolling(maxBatches, notifyIncoming)` with `{"max_batches": <int>, "notify_incoming": <bool>}`.
 - Conversations `cmd` steps (`conversations` domain):
   - `apply_batch`: `{"payload": {...}, "default_cmd": <int>, "fallback_conv_id": <str|null>, "is_group_hint": <bool|null>, "increment_unread": <bool>, "notify_incoming": <bool>, "persist_conversations": <bool>}` — calls `applyBatchResponse`.
   - `ensure_known_contacts`: `{}` — calls `ensureKnownContactsInConversations()`, `rebuildConversationFlags()`, `rebuildConversationExtras()`.
@@ -99,6 +101,13 @@ Run in order:
   - `set_filter`: `{"type": <int>, "label_ids": [...]}` — calls `setConversationFilter(...)`.
   - `sync_labels`: `{}` — awaits `syncConversationLabelsFromServer()`.
   - `handle_conversation_extras`: `{"state": {...}}` — calls `handleConversationExtras(state: state)`.
+- Messages & bootstrap `cmd` steps (`messages` and `bootstrap` domains):
+  - Optional `"now_ms": <int64>` on `cmd` steps seeds `nowMs` for the duration of that step (used for daily full-refresh freshness checks and mute `startTime` fallback).
+  - `open`: `{"id": "<convId>"}` — calls `openConversation(id)` and awaits its async cache/history/profile/pins/mark-read task (and any triggered SQLite conversation persist) to finish.
+  - `close`: `{}` — calls `closeConversation()`.
+  - `load_older`: `{"id": "<convId>"}` — calls `loadOlderMessages(id)` and awaits its completion (`history_ticks` increment).
+  - `bootstrap`: `{}` — runs `performBootstrapSync()` and awaits completion (when `start_bootstrap` was suppressed or re-run after setup).
+  - `apply_batch`: same signature as `conversations` domain — calls `applyBatchResponse` directly (`probe_freshness: <bool, optional>`).
 - `{"await": {"phase": "<kind>", "step": "<login step, optional>"}, "timeout_ms": 5000}`: wait until the state matches. The Rust runner instead runs the core until no input or effect is pending, then checks the same predicate.
 - `{"await_host": "<call>", "timeout_ms": N}`: wait until the recorded `host` list contains `"<call>"` searching from the current host cursor, then advance the host cursor past that entry (`index + 1`). Used for deterministic ordering (for example awaiting `e2ee_connected` before `ws_push`).
 - `{"ws_push": k}` (optional `"timeout_ms": N`): instruct the fake server to send the next `k` scripted `ws_frame` or `ws_close` entries in script order.
@@ -112,7 +121,7 @@ Run in order:
   - HTTP: `{"kind": "http", "path", "method", "params": {...} | null, "query": {...}}`. `params` is the decrypted ParamCipher payload, keys sorted (`null` when absent or for unencrypted endpoints such as long-poll `GET /`). `query` is the plain query string, keys sorted. Signatures, encrypted blobs and the keys listed under Volatile become `"<volatile>"`.
   - WebSocket connect: `{"kind": "ws_connect", "path", "query": {...}}`.
   - WebSocket client→server frames (`ws_send`): `{"kind": "ws_send", "cmd": <int>, "sub_cmd": <int>, "payload": {...} | "<binary>"}`. `payload` is the decoded JSON body after the 4-byte binary header (`u8 version | u16 LE cmd | u8 sub_cmd`, `{}` when empty, `"<binary>"` when undecodable as UTF-8 JSON). Keepalive pings (`cmd == 2` and `cmd == 4`) are excluded because their count depends on wall time.
-- `host`: ordered list of activities handed to Swift-owned code, `{"call": "<name>", "args": {...}}`. While recording, the engine's trace hook records these and skips the real activity (except where a lifecycle hook in `transport` / `conversations` / `conversation_actions` must permit `prepare_store`, `apply_batch`, `apply_parsed_events`, or WS/long-poll startup so the domain under test runs).
+- `host`: ordered list of activities handed to Swift-owned code, `{"call": "<name>", "args": {...}}`. While recording, the engine's trace hook records these and skips the real activity (except where a lifecycle hook in `transport` / `conversations` / `conversation_actions` / `messages` / `bootstrap` must permit `prepare_store`, `apply_batch`, `apply_parsed_events`, or WS/long-poll startup so the domain under test runs).
   - Session domain names: `prepare_store {user_id}`, `start_ws {endpoints}`, `start_long_poll {}`, `start_bootstrap {}`, `offer_first_login_transfer {force}`, `reset_domains {}`, `persist_session {}`, `clear_session {}`, `mark_expired {}`.
   - Transport domain names:
     - `apply_batch {cmd, increment_unread, notify_incoming, payload}` *(`cmd` is an integer on the WS path and `null` on the long-poll path)*
@@ -130,6 +139,14 @@ Run in order:
     - `load_transport_state {}`
     - `persist_poll_state {state}`
     - `persist_ws_cursors {cursors}`
+  - Messages and bootstrap domain names (Swift-owned U5–U16 boundaries):
+    - `mark_read {conv_id}` *(U5 seen / unread handoff at the end of `openConversation`)*
+    - `refresh_board_pins {conv_id}` *(U7 board pins refresh during `openConversation`)*
+    - `apply_remote_reaction {conv_id, msg_id, cli_msg_id, sender_id, r_type, r_icon, event_id, react_client_id, sender_name}` *(U6 remote reaction handler)*
+    - `apply_remote_recall {conv_id, msg_id, cli_msg_id}` *(U6 remote recall handler)*
+    - `apply_remote_delete {conv_id, msg_id, cli_msg_id}` *(U6 remote delete handler)*
+    - `apply_mutes {mutes: [{"conv_id", "start", "duration"}]}` *(U16 mute list handoff during `performBootstrapSync`; `start` falls back to `now_ms / 1000` when `startTime` is absent)*
+    - `refresh_cloud {}` *(U11 cloud snapshot refresh at the end of `performBootstrapSync`)*
 
 ## Session domain state
 
@@ -234,6 +251,77 @@ Cases in `conversations` and `conversation_actions` extend the session domain st
 - `conversations` is in current `ZaloEngine.conversations` display order; `preview` is `null` when absent, otherwise `{"text", "date_ms", "from_me"}` (`date_ms` is `Int64?` rounded epoch milliseconds).
 - `flags.hidden_ids`, `flags.pin_search_ids`, `flags.removal.ids`, `labels.stranger_ids`, `store.prefs.pinned_ids`, `store.prefs.archived_ids`, `store.prefs.unread_marks`, and `store.prefs.hidden_ids` are sorted lexicographically so `Set` hash order never affects recordings.
 - `store` is read back directly from `ZaloSQLiteStore` at each snapshot and at `final` (`null` if no store has been opened); `store.conversations` is sorted by `id` (`utf8` scalar order). `hidden_pin_md5` and `hidden_pin_hash` hold digests only, never plaintext PINs.
+
+## Messages and bootstrap domain state
+
+Cases in `messages` and `bootstrap` extend the Conversations and conversation actions domain state with the following fields:
+
+```json
+{
+  "open_conversation_id": null,
+  "messages": {
+    "3000001": [
+      {
+        "id": "m1",
+        "client_id": "c1",
+        "conv_id": "3000001",
+        "sender_id": "3000001",
+        "sender_name": "Alice",
+        "sender_avatar": "https://cdn.example.invalid/a.jpg",
+        "date_ms": 1700000000000,
+        "is_mine": false,
+        "kind_tag": "text",
+        "text": "Hello",
+        "is_e2ee": false,
+        "reactions": [
+          { "icon": "❤️", "count": 1, "includes_me": false }
+        ]
+      }
+    ]
+  },
+  "has_more_history": { "3000001": true },
+  "history_ticks": { "3000001": 1 },
+  "history_freshness": { "3000001": "up_to_date" },
+  "bootstrap_logs": [],
+  "store": {
+    "conversations": [],
+    "messages": [
+      {
+        "id": "m1",
+        "conv_id": "3000001",
+        "client_id": "c1",
+        "sender_id": "3000001",
+        "sender_name": "Alice",
+        "sender_avatar": "",
+        "is_mine": false,
+        "text": "Hello",
+        "kind_tag": "text",
+        "ts_ms": 1700000000000,
+        "status": "sent"
+      }
+    ],
+    "prefs": {
+      "pinned_ids": [],
+      "archived_ids": [],
+      "unread_marks": [],
+      "hidden_ids": [],
+      "labels": [],
+      "cached_profiles": {},
+      "hidden_pin_md5": null,
+      "hidden_pin_hash": null,
+      "history_full_refresh_at": null,
+      "activity_ranks": {},
+      "aliases": {}
+    }
+  }
+}
+```
+
+- `messages` maps each conversation id to its in-memory `ZaloEngine.messages[convId]` window in order (`{id, client_id, conv_id, sender_id, sender_name, sender_avatar, date_ms, is_mine, kind_tag, text, is_e2ee, reactions}`; `sender_avatar` is a URL string or `null`).
+- `history_freshness` maps each conversation id to `"up_to_date"` or `"stale"`.
+- `bootstrap_logs` holds `"bootstrap: ..."` lines emitted via `EngineLog` (with the wall-clock `HH:mm:ss.SSS ` prefix stripped).
+- `store.messages` holds all rows read back from SQLite `messages` sorted by `conv_id` (`utf8`), then `ts_ms`, then `id` (`utf8`).
+- `store.prefs` adds `history_full_refresh_at` (string or `null`, from pref `historyFullRefreshAt`), `activity_ranks` (object map of `<convId>` to integer rank, from pref `activityRanks`), and `aliases` (object map of `<uid>` to alias string, from pref `aliases`).
 
 ## Volatile
 

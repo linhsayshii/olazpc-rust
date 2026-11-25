@@ -7,11 +7,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use olaz_core::conversations::{
-    BatchApplyDelta, CachedGroup, CachedProfile, ConvMessageDelta, ConvPreviewOverride,
-    ConversationActionResult, ConversationActionUI, ConversationActionsState, ConversationExtras,
-    ConversationLabel, ConversationLeaveType, ConversationPreview, ConversationPrompt,
-    ConversationRemoval, ConversationSummary, ConversationToast, FriendIdentity, GroupIdentity,
-    IdentityTable, MessagePreviewInput, PinBoard, StrangerBox,
+    CachedGroup, CachedProfile, ConvPreviewOverride, ConversationActionResult,
+    ConversationActionUI, ConversationActionsState, ConversationExtras, ConversationLabel,
+    ConversationLeaveType, ConversationPreview, ConversationPrompt, ConversationRemoval,
+    ConversationSummary, ConversationToast, FriendIdentity, GroupIdentity, IdentityTable,
+    MessagePreviewInput, PinBoard, StrangerBox,
 };
 use olaz_core::input::SeenTarget;
 use olaz_wire::Mention;
@@ -707,42 +707,6 @@ impl From<IdentityTableRecord> for IdentityTable {
 }
 
 #[derive(Clone, PartialEq, Eq, uniffi::Record)]
-pub struct ConvMessageDeltaRecord {
-    pub conv_id: String,
-    pub preview_text: String,
-    pub preview_date_ms: i64,
-    pub preview_from_me: bool,
-    pub is_mine: bool,
-    pub sender_name: String,
-    pub sender_avatar: Option<String>,
-    pub unread_delta: i64,
-}
-
-impl fmt::Debug for ConvMessageDeltaRecord {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ConvMessageDeltaRecord")
-            .field("preview_len", &self.preview_text.len())
-            .field("unread_delta", &self.unread_delta)
-            .finish()
-    }
-}
-
-impl From<ConvMessageDeltaRecord> for ConvMessageDelta {
-    fn from(d: ConvMessageDeltaRecord) -> Self {
-        Self {
-            conv_id: d.conv_id,
-            preview_text: d.preview_text,
-            preview_date_ms: d.preview_date_ms,
-            preview_from_me: d.preview_from_me,
-            is_mine: d.is_mine,
-            sender_name: d.sender_name,
-            sender_avatar: d.sender_avatar,
-            unread_delta: d.unread_delta,
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ConvPreviewOverrideRecord {
     pub conv_id: String,
     pub target_date_ms: i64,
@@ -764,36 +728,6 @@ impl From<ConvPreviewOverrideRecord> for ConvPreviewOverride {
             conv_id: o.conv_id,
             target_date_ms: o.target_date_ms,
             preview: o.preview.map(Into::into),
-        }
-    }
-}
-
-#[derive(Clone, Default, PartialEq, Eq, uniffi::Record)]
-pub struct BatchApplyDeltaRecord {
-    pub applied_count: u32,
-    pub updates: Vec<ConvMessageDeltaRecord>,
-    pub preview_overrides: Vec<ConvPreviewOverrideRecord>,
-    pub persist_conversations: bool,
-}
-
-impl fmt::Debug for BatchApplyDeltaRecord {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BatchApplyDeltaRecord")
-            .field("applied_count", &self.applied_count)
-            .field("updates", &self.updates.len())
-            .field("preview_overrides", &self.preview_overrides.len())
-            .field("persist_conversations", &self.persist_conversations)
-            .finish()
-    }
-}
-
-impl From<BatchApplyDeltaRecord> for BatchApplyDelta {
-    fn from(d: BatchApplyDeltaRecord) -> Self {
-        Self {
-            applied_count: d.applied_count,
-            updates: d.updates.into_iter().map(Into::into).collect(),
-            preview_overrides: d.preview_overrides.into_iter().map(Into::into).collect(),
-            persist_conversations: d.persist_conversations,
         }
     }
 }

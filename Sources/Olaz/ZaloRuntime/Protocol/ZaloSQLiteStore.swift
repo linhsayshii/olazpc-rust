@@ -538,6 +538,39 @@ actor ZaloSQLiteStore {
         return repaired
     }
 
+    /// Test-only read-back: loads every stored message row sorted deterministically for recorder snapshot verification.
+    func loadAllMessages() throws -> [StoredMessage] {
+        let stmt = try prepare("""
+        SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar,
+               is_mine, text, kind_tag, ts_ms, status, raw_json
+        FROM messages
+        ORDER BY conv_id ASC, ts_ms ASC, id ASC;
+        """)
+        defer { sqlite3_finalize(stmt) }
+        var out: [StoredMessage] = []
+        while true {
+            let rc = sqlite3_step(stmt)
+            if rc == SQLITE_DONE { break }
+            guard rc == SQLITE_ROW else { throw ZaloSQLiteError.stepFailed(lastError) }
+            let rawStr = columnText(stmt, 11)
+            out.append(StoredMessage(
+                id: columnText(stmt, 0),
+                convId: columnText(stmt, 1),
+                clientId: columnText(stmt, 2),
+                senderId: columnText(stmt, 3),
+                senderName: columnText(stmt, 4),
+                senderAvatar: columnText(stmt, 5),
+                isMine: sqlite3_column_int64(stmt, 6) != 0,
+                text: columnText(stmt, 7),
+                kindTag: columnText(stmt, 8),
+                tsMs: sqlite3_column_int64(stmt, 9),
+                status: columnText(stmt, 10),
+                rawJSONData: Data(rawStr.utf8)
+            ))
+        }
+        return out
+    }
+
     /// Loads messages for `convId` in chronological ascending order (oldest -> newest).
     /// When `beforeTsMs` is provided, fetches messages strictly older than `beforeTsMs`.
     func messages(convId: String, beforeTsMs: Int64? = nil, limit: Int = 50) async throws -> [StoredMessage] {

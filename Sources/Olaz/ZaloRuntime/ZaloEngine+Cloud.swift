@@ -169,6 +169,9 @@ extension ZaloEngine {
     // MARK: Actions
 
     func refreshCloud() {
+        guard traceU4Host("refresh_cloud") else {
+            return
+        }
         if sqliteStore == nil {
             applyCloudSnapshot(sqlSummaries: [], existingIdsByConv: [:])
             return
