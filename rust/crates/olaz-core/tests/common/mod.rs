@@ -9,6 +9,7 @@
     reason = "shared test helper used selectively by each test binary"
 )]
 
+use olaz_core::runner::{BatchHookOutcome, ParsedEventsHookOutcome};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
@@ -16,16 +17,20 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use olaz_api::{PollState, ZaloApi};
+use olaz_api::{PollState, SendMessageResult, ZaloApi};
 use olaz_core::actor::{ActorSink, CoreHandle};
 use olaz_core::conversations::{
     BatchApplyDelta, CachedGroup, CachedProfile, ConvMessageDelta, ConvPreviewOverride,
     ConversationPreview, FriendIdentity, GroupIdentity, IdentityTable, MessagePreviewInput,
     message_preview_label, to_wire_stored,
 };
-use olaz_core::input::{Command, Input, LegacyCookie, SeenTarget};
+use olaz_core::effect::Effect;
+use olaz_core::input::{Command, E2eeQuoteArg, Input, LegacyCookie, SeenTarget};
+use olaz_core::messages::{HistoryFreshness, MuteEntry};
 use olaz_core::reduce::classify::MobileSyncEvent;
-use olaz_core::runner::{Host, SessionEffectRunner, SharedStoreSlot, WsDriver, WsStartParams};
+use olaz_core::runner::{
+    EffectRunner, Host, SessionEffectRunner, SharedStoreSlot, WsDriver, WsStartParams,
+};
 use olaz_core::state::{
     CoreFailKind, CoreState, LoginStep, PersistedTransportState, Phase, SessionSnapshot,
 };
@@ -39,8 +44,8 @@ use olaz_net::{
 };
 use olaz_store::{Store, StoredConversation, StoredMessage};
 use olaz_wire::{
-    ChatMessage, Kind, NameLookup, ParsedWireEvent, WireParseOptions, decode_stored_message,
-    extract_batch_events,
+    Availability, ChatMessage, DeleteMode, Kind, Mention, NameLookup, ParsedWireEvent, StarMode,
+    TextStyle, WireParseOptions, decode_stored_message, extract_batch_events,
 };
 use olaz_ws::consts::{CMD_AUTHEN, CMD_PING, CMD_PING_ACTIVE, DEFAULT_WS_ENDPOINTS, FRAME_VERSION};
 use olaz_ws::frame::encode_frame_json;
@@ -51,7 +56,7 @@ use olaz_ws::{
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::runtime::Handle;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::AbortHandle;
 
 /// Sentinel wall-clock timestamp used by `ScriptedWsDriver` so `RecordingHost::mute` can mark
@@ -161,6 +166,20 @@ pub struct Seed {
     pub local_messages: Option<Vec<Value>>,
     #[serde(default)]
     pub open_conversation_id: Option<String>,
+    // U4-bootstrap
+    #[serde(default)]
+    pub history_full_refresh_at: Option<String>,
+    #[serde(default)]
+    pub history_freshness: BTreeMap<String, String>,
+    // U5
+    #[serde(default)]
+    pub next_client_id: Option<i64>,
+    #[serde(default)]
+    pub e2ee_threads: Vec<String>,
+    #[serde(default)]
+    pub auto_delete: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub host_results: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -172,6 +191,8 @@ pub struct ServerEntry {
     pub method: Option<String>,
     #[serde(default)]
     pub repeat: bool,
+    #[serde(default)]
+    pub hold: bool,
     #[serde(default)]
     pub response: Option<HttpResponseSpec>,
     #[serde(default)]
@@ -221,6 +242,8 @@ pub enum Step {
         now_ms: Option<i64>,
         #[serde(default)]
         rand4: Option<String>,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
     },
     Await {
         #[serde(rename = "await")]
@@ -235,6 +258,9 @@ pub enum Step {
     },
     WsPush {
         ws_push: usize,
+    },
+    HttpRelease {
+        http_release: usize,
     },
     Snapshot {
         snapshot: String,
@@ -334,11 +360,19 @@ enum ScriptDispatch {
 /// Scripted [`Transport`] that plugs directly into `olaz_net::SessionClient`, decrypts incoming
 /// `ParamCipher` or session-AES `params`, records canonical Case format v1 requests, and encrypts
 /// scripted JSON responses the way Zalo does.
+struct HoldGate {
+    waiters: VecDeque<oneshot::Sender<()>>,
+    credits: usize,
+    arrived: usize,
+}
+
 pub struct ScriptedTransport {
     state: Mutex<ScriptState>,
     recorded: Arc<Mutex<Vec<Value>>>,
     /// Session AES secret key (kept in sync from seed + `getLoginInfo` responses).
     secret_key: Mutex<Option<Vec<u8>>>,
+    hold_gate: Arc<Mutex<HoldGate>>,
+    hold_notify: Arc<Notify>,
 }
 
 impl ScriptedTransport {
@@ -370,6 +404,43 @@ impl ScriptedTransport {
             }),
             recorded,
             secret_key: Mutex::new(initial_secret_key),
+            hold_gate: Arc::new(Mutex::new(HoldGate {
+                waiters: VecDeque::new(),
+                credits: 0,
+                arrived: 0,
+            })),
+            hold_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    pub fn release_http(&self, count: usize) {
+        let mut gate = self
+            .hold_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for _ in 0..count {
+            if let Some(tx) = gate.waiters.pop_front() {
+                let _ = tx.send(());
+            } else {
+                gate.credits += 1;
+            }
+        }
+    }
+
+    pub fn held_arrived_count(&self) -> usize {
+        self.hold_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .arrived
+    }
+
+    pub async fn wait_for_held_arrival(&self, target: usize) {
+        loop {
+            let notified = self.hold_notify.notified();
+            if self.held_arrived_count() >= target {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -621,6 +692,7 @@ impl Transport for ScriptedTransport {
         let dispatch = self.dispatch_entry(&request.path(), request.method.as_str());
 
         let mut virtual_rtt = Duration::from_millis(10);
+        let mut hold_rx: Option<oneshot::Receiver<()>> = None;
         let result = match dispatch {
             ScriptDispatch::Refused => Err(NetError::network(
                 NetworkErrorKind::Other,
@@ -638,6 +710,22 @@ impl Transport for ScriptedTransport {
                 ))
             }
             ScriptDispatch::Matched(entry) => {
+                if entry.hold {
+                    let mut gate = self
+                        .hold_gate
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    gate.arrived += 1;
+                    if gate.credits > 0 {
+                        gate.credits -= 1;
+                    } else {
+                        let (tx, rx) = oneshot::channel();
+                        gate.waiters.push_back(tx);
+                        hold_rx = Some(rx);
+                    }
+                    drop(gate);
+                    self.hold_notify.notify_waiters();
+                }
                 let (canonical, param_cipher_key) =
                     canonical_http_request(&request, session_key.as_deref(), false);
                 let has_params = !canonical.get("params").is_none_or(Value::is_null);
@@ -698,6 +786,9 @@ impl Transport for ScriptedTransport {
         };
 
         async move {
+            if let Some(rx) = hold_rx {
+                let _ = rx.await;
+            }
             tokio::time::sleep(virtual_rtt).await;
             result
         }
@@ -1203,9 +1294,11 @@ pub struct RecordingHost {
     calls: Mutex<Vec<Value>>,
     notify: Notify,
     is_u3: bool,
+    is_u4: bool,
     data_dir: Option<PathBuf>,
     shared_store_slot: Mutex<Option<SharedStoreSlot>>,
     store: Mutex<Option<Arc<Mutex<Store>>>>,
+    e2ee_send_results: Mutex<VecDeque<Result<SendMessageResult, String>>>,
     messages: Mutex<HashMap<String, Vec<ChatMessage>>>,
     open_conversation_id: Mutex<Option<String>>,
     identities: Mutex<IdentityTable>,
@@ -1217,6 +1310,15 @@ impl RecordingHost {
     }
 
     pub fn from_seed_with_u3(seed: &Seed, is_u3: bool, data_dir: Option<PathBuf>) -> Self {
+        Self::from_seed_with_modes(seed, is_u3, false, data_dir)
+    }
+
+    pub fn from_seed_with_modes(
+        seed: &Seed,
+        is_u3: bool,
+        is_u4: bool,
+        data_dir: Option<PathBuf>,
+    ) -> Self {
         let saved_session = seed
             .saved_session
             .as_ref()
@@ -1269,6 +1371,47 @@ impl RecordingHost {
             .open_conversation_id
             .clone()
             .filter(|id| !id.is_empty());
+        let mut e2ee_send_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("send_e2ee_text"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                if let Some(err_obj) = item.get("error").and_then(Value::as_object) {
+                    let code = err_obj.get("code").and_then(Value::as_i64).unwrap_or(500);
+                    let msg = err_obj
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("E2EE error");
+                    let url = err_obj.get("url").and_then(Value::as_str).unwrap_or("");
+                    let formatted = if url.is_empty() {
+                        format!("Zalo error {code}: {msg}")
+                    } else {
+                        format!("Zalo error {code}: {msg} ({url})")
+                    };
+                    e2ee_send_results.push_back(Err(formatted));
+                } else {
+                    let msg_id = item
+                        .get("msg_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let cli_msg_id = item
+                        .get("cli_msg_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let ts_ms = item.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
+                    e2ee_send_results.push_back(Ok(SendMessageResult {
+                        msg_id,
+                        cli_msg_id,
+                        ts_ms,
+                    }));
+                }
+            }
+        }
         Self {
             saved_session,
             legacy_cookie,
@@ -1280,9 +1423,11 @@ impl RecordingHost {
             calls: Mutex::new(Vec::new()),
             notify: Notify::new(),
             is_u3,
+            is_u4,
             data_dir,
             shared_store_slot: Mutex::new(None),
             store: Mutex::new(None),
+            e2ee_send_results: Mutex::new(e2ee_send_results),
             messages: Mutex::new(HashMap::new()),
             open_conversation_id: Mutex::new(open_conv),
             identities: Mutex::new(identities),
@@ -1905,6 +2050,29 @@ impl Host for RecordingHost {
         self.record("start_bootstrap", json!({}));
     }
 
+    async fn on_bootstrap_started(&self) -> bool {
+        self.start_bootstrap().await;
+        false
+    }
+
+    async fn apply_mutes(&self, mutes: Vec<MuteEntry>) {
+        let items: Vec<Value> = mutes
+            .iter()
+            .map(|m| {
+                json!({
+                    "conv_id": m.conv_id,
+                    "start": m.start,
+                    "duration": m.duration,
+                })
+            })
+            .collect();
+        self.record("apply_mutes", json!({ "mutes": items }));
+    }
+
+    async fn refresh_cloud(&self) {
+        self.record("refresh_cloud", json!({}));
+    }
+
     async fn offer_first_login_transfer(&self, force: bool) {
         self.record("offer_first_login_transfer", json!({ "force": force }));
     }
@@ -1918,10 +2086,12 @@ impl Host for RecordingHost {
     }
 
     async fn clear_session(&self) {
+        *self.store.lock().unwrap_or_else(PoisonError::into_inner) = None;
         self.record("clear_session", json!({}));
     }
 
     async fn mark_expired(&self, _snapshot_json: String) {
+        *self.store.lock().unwrap_or_else(PoisonError::into_inner) = None;
         self.record("mark_expired", json!({}));
     }
 
@@ -1931,6 +2101,195 @@ impl Host for RecordingHost {
 
     async fn persist_ws_cursors(&self, cursors: CursorMap) {
         self.record("persist_ws_cursors", json!({ "cursors": cursors }));
+    }
+
+    async fn on_batch_received(
+        &self,
+        cmd: Option<u16>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        payload: Map<String, Value>,
+    ) -> BatchHookOutcome {
+        if self.is_u4 {
+            self.record(
+                "apply_batch",
+                json!({
+                    "cmd": cmd,
+                    "increment_unread": increment_unread,
+                    "notify_incoming": notify_incoming,
+                    "payload": Value::Object(payload.clone()),
+                }),
+            );
+            BatchHookOutcome::IngestInCore(payload)
+        } else {
+            BatchHookOutcome::DelegateToLegacy
+        }
+    }
+
+    async fn on_parsed_events_received(
+        &self,
+        cmd: u16,
+        increment_unread: bool,
+        notify_incoming: bool,
+        envelope: &TypedChatEnvelope,
+    ) -> ParsedEventsHookOutcome {
+        if self.is_u4 {
+            let profile = self
+                .self_profile
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            let events = if let Some(p) = profile {
+                let mut names = Vec::new();
+                for uid in &envelope.uids {
+                    if let Some(info) = self.lookup_person(uid) {
+                        names.push((uid.clone(), info));
+                    }
+                }
+                envelope
+                    .payload
+                    .resolve(&p.user_id, p.self_conv_id.as_deref(), &names)
+                    .unwrap_or_else(|| envelope.events.clone())
+            } else {
+                envelope.events.clone()
+            };
+            let serialized: Vec<Value> = events
+                .iter()
+                .filter(|ev| !matches!(ev, ParsedWireEvent::Ignore))
+                .map(serialize_parsed_wire_event)
+                .collect();
+            self.record(
+                "apply_parsed_events",
+                json!({
+                    "cmd": cmd,
+                    "increment_unread": increment_unread,
+                    "notify_incoming": notify_incoming,
+                    "events": serialized,
+                }),
+            );
+            ParsedEventsHookOutcome::IngestInCore
+        } else {
+            ParsedEventsHookOutcome::DelegateToLegacy
+        }
+    }
+
+    async fn refresh_board_pins(&self, conv_id: String) {
+        if self.is_u4 {
+            self.record("refresh_board_pins", json!({ "conv_id": conv_id }));
+        }
+    }
+
+    async fn mark_read_boundary(&self, conv_id: String, _seen_target: Option<SeenTarget>) {
+        if self.is_u4 {
+            self.record("mark_read", json!({ "conv_id": conv_id }));
+        }
+    }
+
+    async fn send_e2ee_text(
+        &self,
+        conv_id: String,
+        text: String,
+        client_id: String,
+        quote: Option<E2eeQuoteArg>,
+    ) -> Result<SendMessageResult, String> {
+        let quote_val = match quote {
+            Some(q) => json!({
+                "msg_id": q.msg_id,
+                "cli_msg_id": q.cli_msg_id,
+                "sender_id": q.sender_id,
+                "sender_name": q.sender_name,
+                "text": q.text,
+                "ts_ms": q.ts_ms,
+            }),
+            None => Value::Null,
+        };
+        self.record(
+            "send_e2ee_text",
+            json!({
+                "conv_id": conv_id,
+                "text": text,
+                "client_id": client_id,
+                "quote": quote_val,
+            }),
+        );
+        self.e2ee_send_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or_else(|| {
+                Err(
+                    "Zalo error 500: No scripted send_e2ee_text result (/api/e2ee/pc/message/sms)"
+                        .to_owned(),
+                )
+            })
+    }
+
+    async fn apply_remote_reaction(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        sender_id: String,
+        r_type: String,
+        r_icon: String,
+        event_id: String,
+        react_client_id: String,
+        sender_name: String,
+    ) {
+        if self.is_u4 {
+            self.record(
+                "apply_remote_reaction",
+                json!({
+                    "conv_id": conv_id,
+                    "msg_id": msg_id,
+                    "cli_msg_id": cli_msg_id,
+                    "sender_id": sender_id,
+                    "r_type": r_type,
+                    "r_icon": r_icon,
+                    "event_id": event_id,
+                    "react_client_id": react_client_id,
+                    "sender_name": sender_name,
+                }),
+            );
+        }
+    }
+
+    async fn apply_remote_recall(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        _update_conversation_preview: bool,
+    ) {
+        if self.is_u4 {
+            self.record(
+                "apply_remote_recall",
+                json!({
+                    "conv_id": conv_id,
+                    "msg_id": msg_id,
+                    "cli_msg_id": cli_msg_id,
+                }),
+            );
+        }
+    }
+
+    async fn apply_remote_delete(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        _update_conversation_preview: bool,
+    ) {
+        if self.is_u4 {
+            self.record(
+                "apply_remote_delete",
+                json!({
+                    "conv_id": conv_id,
+                    "msg_id": msg_id,
+                    "cli_msg_id": cli_msg_id,
+                }),
+            );
+        }
     }
 
     async fn apply_batch(
@@ -2443,6 +2802,14 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
             .set_preference_data("activityRanks", &bytes)
             .map_err(|e| format!("seed activityRanks: {e}"))?;
     }
+    // U4-bootstrap
+    if let Some(ts) = &seed.history_full_refresh_at
+        && !ts.is_empty()
+    {
+        store
+            .set_preference_string("historyFullRefreshAt", ts)
+            .map_err(|e| format!("seed historyFullRefreshAt: {e}"))?;
+    }
     if let Some(contacts) = &seed.contacts {
         if let Some(v) = contacts.get("aliases")
             && !v.is_null()
@@ -2566,7 +2933,8 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
                 {
                     canonical_json_string(raw_obj).into_bytes()
                 } else {
-                    let fallback = json!({
+                    let is_e2ee = row.get("is_e2ee").and_then(Value::as_bool).unwrap_or(false);
+                    let mut fallback = json!({
                         "id": id,
                         "conversationId": conv_id,
                         "clientId": client_id,
@@ -2576,8 +2944,16 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
                         "isMine": is_mine,
                         "text": text,
                         "date": ts_ms,
+                        "status": status,
+                        "isE2EE": is_e2ee,
                         "kind": { "type": kind_tag },
                     });
+                    if let Some(reactions) = row.get("reactions")
+                        && !reactions.is_null()
+                        && let Some(obj) = fallback.as_object_mut()
+                    {
+                        obj.insert("reactions".to_owned(), reactions.clone());
+                    }
                     canonical_json_string(&fallback).into_bytes()
                 };
                 Some(StoredMessage {
@@ -2603,10 +2979,115 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
     Ok(())
 }
 
+struct LogCapturingRunner<R> {
+    inner: Arc<R>,
+    send_logs: Arc<Mutex<Vec<String>>>,
+}
+
+impl<R: EffectRunner> EffectRunner for LogCapturingRunner<R> {
+    fn dispatch(&self, effects: Vec<Effect>, sink: ActorSink) {
+        {
+            let mut logs = self
+                .send_logs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for eff in &effects {
+                if let Effect::EngineLog(line) = eff
+                    && line.starts_with("sendText ")
+                {
+                    logs.push(line.clone());
+                }
+            }
+        }
+        self.inner.dispatch(effects, sink);
+    }
+
+    fn shutdown(&self) {
+        self.inner.shutdown();
+    }
+}
+
+fn enrich_send_message_json(m: &ChatMessage, base: &mut Map<String, Value>) {
+    base.insert(
+        "status".to_owned(),
+        Value::String(m.status.raw_value().to_owned()),
+    );
+    let quote_val = match &m.quote {
+        Some(q) => json!({
+            "sender_name": q.sender_name,
+            "text": q.text,
+            "msg_id": q.msg_id,
+            "cli_msg_id": q.cli_msg_id,
+        }),
+        None => Value::Null,
+    };
+    base.insert("quote".to_owned(), quote_val);
+    let mentions: Vec<Value> = m
+        .mentions
+        .iter()
+        .map(|mn| {
+            json!({
+                "uid": mn.uid,
+                "pos": mn.pos,
+                "len": mn.len,
+                "is_all": mn.is_all,
+            })
+        })
+        .collect();
+    base.insert("mentions".to_owned(), Value::Array(mentions));
+    let styles: Vec<Value> = m
+        .text_styles
+        .iter()
+        .map(|st| {
+            json!({
+                "start": st.start,
+                "len": st.len,
+                "st": st.st,
+            })
+        })
+        .collect();
+    base.insert("text_styles".to_owned(), Value::Array(styles));
+    base.insert("ttl_ms".to_owned(), json!(m.ttl_ms));
+    base.insert("urgency".to_owned(), json!(m.urgency));
+    let forward = match m.menu.forward {
+        Availability::Hidden => "hidden",
+        Availability::Available => "available",
+        Availability::Blocked => "blocked",
+    };
+    let delete_val = match m.menu.delete {
+        None => Value::Null,
+        Some(DeleteMode::Plain) => Value::String("plain".to_owned()),
+        Some(DeleteMode::ForMe) => Value::String("for_me".to_owned()),
+    };
+    let star_val = match m.menu.star {
+        None => Value::Null,
+        Some(StarMode::Star) => Value::String("star".to_owned()),
+        Some(StarMode::Unstar) => Value::String("unstar".to_owned()),
+        Some(StarMode::Blocked) => Value::String("blocked".to_owned()),
+    };
+    base.insert(
+        "menu".to_owned(),
+        json!({
+            "forward": forward,
+            "recall": m.menu.recall,
+            "delete": delete_val,
+            "pin": m.menu.pin,
+            "star": star_val,
+            "starred": m.menu.starred,
+            "pinned": m.menu.pinned,
+            "protected": m.menu.is_protected,
+        }),
+    );
+}
+
 async fn capture_case_snapshot(
     core: &CoreHandle,
     host: &RecordingHost,
     is_u3: bool,
+    is_u4: bool,
+    is_u5: bool,
+    last_send_result: Option<bool>,
+    send_logs: &Mutex<Vec<String>>,
 ) -> Option<Value> {
     if !is_u3 {
         return core
@@ -2619,14 +3100,90 @@ async fn capture_case_snapshot(
         Value::Object(m) => m,
         _ => Map::new(),
     };
-    let conv_fields = if let Some(store_arc) = host.attached_store() {
+    let (conv_fields, msg_fields) = if let Some(store_arc) = host.attached_store() {
         let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
-        full.conversations.to_case_json_fields(Some(&store))
+        let cf = full.conversations.to_case_json_fields(Some(&store));
+        let mf = if is_u4 {
+            Some(full.messages.to_case_json_fields(Some(&store)))
+        } else {
+            None
+        };
+        (cf, mf)
     } else {
-        full.conversations.to_case_json_fields(None)
+        let cf = full.conversations.to_case_json_fields(None);
+        let mf = if is_u4 {
+            Some(full.messages.to_case_json_fields(None))
+        } else {
+            None
+        };
+        (cf, mf)
     };
     for (k, v) in conv_fields {
         obj.insert(k, v);
+    }
+    if let Some(mut mf) = msg_fields {
+        obj.insert(
+            "open_conversation_id".to_owned(),
+            full.conversations
+                .open_conversation_id
+                .clone()
+                .map_or(Value::Null, Value::String),
+        );
+        let store_msgs = mf.remove("__store_messages");
+        let store_u4_prefs = mf.remove("__store_u4_prefs");
+        for (k, v) in mf {
+            obj.insert(k, v);
+        }
+        if let Some(Value::Object(store_obj)) = obj.get_mut("store") {
+            if let Some(msgs_val) = store_msgs {
+                store_obj.insert("messages".to_owned(), msgs_val);
+            }
+            if let Some(Value::Object(u4_prefs)) = store_u4_prefs
+                && let Some(Value::Object(prefs_obj)) = store_obj.get_mut("prefs")
+            {
+                for (pk, pv) in u4_prefs {
+                    prefs_obj.insert(pk, pv);
+                }
+            }
+        }
+    }
+    if is_u5 {
+        if let Some(Value::Object(msgs_obj)) = obj.get_mut("messages") {
+            for (conv_id, list) in &full.messages.windows {
+                if let Some(Value::Array(arr)) = msgs_obj.get_mut(conv_id)
+                    && arr.len() == list.len()
+                {
+                    for (m, item) in list.iter().zip(arr.iter_mut()) {
+                        if let Value::Object(map) = item {
+                            enrich_send_message_json(m, map);
+                        }
+                    }
+                }
+            }
+        }
+        let mut typing_obj = Map::new();
+        for (conv_id, t) in &full.typing {
+            typing_obj.insert(
+                conv_id.clone(),
+                json!({
+                    "name": t.name,
+                    "on_pc": t.on_pc,
+                }),
+            );
+        }
+        obj.insert("typing".to_owned(), Value::Object(typing_obj));
+        obj.insert(
+            "last_send_result".to_owned(),
+            last_send_result.map_or(Value::Null, Value::Bool),
+        );
+        let logs: Vec<Value> = send_logs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .map(Value::String)
+            .collect();
+        obj.insert("send_logs".to_owned(), Value::Array(logs));
     }
     Some(Value::Object(obj))
 }
@@ -2653,7 +3210,9 @@ fn str_vec_arg(args: &Value, key: &str) -> Vec<String> {
 /// Runs a single Case format v1 [`Case`] under paused tokio time and returns the observed
 /// snapshots, final state, sorted canonical requests, and ordered host calls.
 pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
-    let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions";
+    let is_u5 = case.domain == "send";
+    let is_u4 = case.domain == "bootstrap" || case.domain == "messages" || is_u5;
+    let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions" || is_u4;
     let temp_dir = if is_u3 {
         Some(tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?)
     } else {
@@ -2705,13 +3264,17 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     if let Some(d) = &seed_domains {
         client.with_session(|s| s.domains = d.clone());
     }
+    if let Some(next_cid) = case.seed.next_client_id {
+        client.seed_next_client_id(next_cid);
+    }
 
-    let host = Arc::new(RecordingHost::from_seed_with_u3(
+    let host = Arc::new(RecordingHost::from_seed_with_modes(
         &case.seed,
         is_u3,
+        is_u4,
         temp_dir.as_ref().map(|d| d.path().to_path_buf()),
     ));
-    let runner = Arc::new(SessionEffectRunner::with_options(
+    let inner_runner = Arc::new(SessionEffectRunner::with_options(
         Arc::clone(&client),
         Arc::clone(&host) as Arc<dyn Host>,
         Arc::clone(&ws_driver) as Arc<dyn WsDriver>,
@@ -2719,7 +3282,12 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         seed_domains,
         suppress_lp,
     ));
-    host.bind_store_slot(runner.shared_store_slot());
+    host.bind_store_slot(inner_runner.shared_store_slot());
+    let send_logs = Arc::new(Mutex::new(Vec::<String>::new()));
+    let runner: Arc<dyn EffectRunner> = Arc::new(LogCapturingRunner {
+        inner: Arc::clone(&inner_runner),
+        send_logs: Arc::clone(&send_logs),
+    });
 
     let mut initial_state = CoreState::default();
     initial_state.session.prefs = case.seed.prefs.clone();
@@ -2731,10 +3299,39 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             .clone()
             .filter(|id| !id.is_empty());
     }
-    let core = CoreHandle::start_with_state(initial_state, runner, Handle::current());
+    if is_u4 && !case.seed.history_freshness.is_empty() {
+        for (cid, raw_f) in &case.seed.history_freshness {
+            let f = match raw_f.as_str() {
+                "up_to_date" => HistoryFreshness::UpToDate,
+                _ => HistoryFreshness::Stale,
+            };
+            initial_state
+                .messages
+                .history_freshness
+                .insert(cid.clone(), f);
+        }
+    }
+    for tid in &case.seed.e2ee_threads {
+        initial_state.send.e2ee_threads.insert(tid.clone());
+    }
+    for (conv_id, ttl) in &case.seed.auto_delete {
+        if *ttl > 0 {
+            initial_state
+                .send
+                .auto_delete_ttl_ms
+                .insert(conv_id.clone(), *ttl);
+        }
+    }
+    let core = Arc::new(CoreHandle::start_with_state(
+        initial_state,
+        runner,
+        Handle::current(),
+    ));
 
     let mut snapshots = BTreeMap::new();
     let mut host_cursor = 0usize;
+    let mut last_send_result: Option<bool> = None;
+    let mut pending_send_task: Option<tokio::task::JoinHandle<bool>> = None;
 
     for step in &case.steps {
         match step {
@@ -2743,6 +3340,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 args,
                 now_ms,
                 rand4,
+                timeout_ms,
             } => match cmd.as_str() {
                 "start"
                 | "refresh_qr"
@@ -2777,6 +3375,34 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         }
                         _ => {}
                     }
+                }
+                // U4-messages
+                "open" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    host.set_open_conversation(Some(id.clone()));
+                    core.request_unit(Command::OpenConversation {
+                        id,
+                        preloaded: Vec::new(),
+                        skip_local_read: false,
+                    })
+                    .await;
+                }
+                "close" => {
+                    host.set_open_conversation(None);
+                    core.request_unit(Command::CloseConversation).await;
+                }
+                "load_older" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    core.request_unit(Command::LoadOlderMessages { id }).await;
+                }
+                // U4-bootstrap
+                "bootstrap" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::Bootstrap { now_ms: ts_ms })
+                        .await;
                 }
                 "apply_batch" => {
                     let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
@@ -2914,9 +3540,17 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 }
                 "mark_read" => {
                     let id = str_arg(args, "id");
-                    let seen_target = host.seen_target_for(&id);
-                    core.request_unit(Command::MarkConversationRead { id, seen_target })
-                        .await;
+                    if is_u5 {
+                        core.request_unit(Command::MarkRead { id }).await;
+                        if pending_send_task.is_none() {
+                            let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
+                                .await;
+                        }
+                    } else {
+                        let seen_target = host.seen_target_for(&id);
+                        core.request_unit(Command::MarkConversationRead { id, seen_target })
+                            .await;
+                    }
                 }
                 "mark_unread" => {
                     let id = str_arg(args, "id");
@@ -3068,6 +3702,155 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 "sync_labels" => {
                     core.request_unit(Command::SyncConversationLabels).await;
                 }
+                // U5 send domain commands
+                "send_text" => {
+                    let id = str_arg(args, "id");
+                    let text_arg = str_arg(args, "text");
+                    let quote_id = args
+                        .get("quote_id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    let mentions: Vec<Mention> = args
+                        .get("mentions")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|m| Mention {
+                                    uid: m
+                                        .get("uid")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                    pos: m.get("pos").and_then(Value::as_i64).unwrap_or(0),
+                                    len: m.get("len").and_then(Value::as_i64).unwrap_or(0),
+                                    is_all: m
+                                        .get("is_all")
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let styles: Vec<TextStyle> = args
+                        .get("styles")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|st| TextStyle {
+                                    start: st.get("start").and_then(Value::as_i64).unwrap_or(0),
+                                    len: st.get("len").and_then(Value::as_i64).unwrap_or(0),
+                                    st: st
+                                        .get("st")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let urgency = args.get("urgency").and_then(Value::as_i64).unwrap_or(0);
+                    let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    let client_id = if !text_arg.trim().is_empty() && !id.is_empty() {
+                        client.next_client_id()
+                    } else {
+                        0
+                    };
+                    let send_cmd = Command::SendText {
+                        conv_id: id,
+                        text: text_arg,
+                        quote_id,
+                        mentions,
+                        styles,
+                        urgency,
+                        client_id,
+                        now_ms: ts_ms,
+                        is_e2ee: None,
+                        ttl_ms: None,
+                    };
+                    if is_async {
+                        let target_held = transport.held_arrived_count() + 1;
+                        let core_bg = Arc::clone(&core);
+                        pending_send_task =
+                            Some(tokio::spawn(
+                                async move { core_bg.request_bool(send_cmd).await },
+                            ));
+                        let _ = core.settle().await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(200),
+                            transport.wait_for_held_arrival(target_held),
+                        )
+                        .await;
+                    } else {
+                        let ok = core.request_bool(send_cmd).await;
+                        last_send_result = Some(ok);
+                    }
+                }
+                "await_send" => {
+                    if let Some(handle) = pending_send_task.take() {
+                        let ok = handle
+                            .await
+                            .map_err(|e| format!("await_send join error: {e}"))?;
+                        last_send_result = Some(ok);
+                    }
+                }
+                "notify_typing" => {
+                    let id = str_arg(args, "id");
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::NotifyTyping {
+                        conv_id: id,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "handle_typing" => {
+                    let state_map = args
+                        .get("state")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    core.request_unit(Command::HandleTyping { state: state_map })
+                        .await;
+                }
+                "set_pref" => {
+                    let key = str_arg(args, "key");
+                    if key == "olaz.sendTyping" {
+                        let enabled = args.get("value").and_then(Value::as_bool).unwrap_or(true);
+                        core.request_unit(Command::SetSendTypingEnabled { enabled })
+                            .await;
+                    }
+                }
+                "clear_client_auth" => {
+                    client.with_session(|s| {
+                        s.zpw_sek = None;
+                        s.secret_key = None;
+                        s.account = None;
+                    });
+                }
+                "await_typing_expiry" => {
+                    let id = str_arg(args, "id");
+                    let dur = Duration::from_millis(timeout_ms.unwrap_or(15_000));
+                    let wait_fut = async {
+                        loop {
+                            if core
+                                .full_snapshot()
+                                .await
+                                .is_none_or(|snap| !snap.typing.contains_key(&id))
+                            {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    };
+                    tokio::time::timeout(dur, wait_fut)
+                        .await
+                        .map_err(|_| format!("timed out awaiting typing expiry for `{id}`"))?;
+                }
                 other => return Err(format!("unknown step cmd: {other}")),
             },
             Step::Await {
@@ -3092,17 +3875,46 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                     .await
                     .map_err(|_| format!("timed out awaiting host call `{await_host}`"))?;
                 if is_u3 && (await_host == "apply_parsed_events" || await_host == "apply_batch") {
-                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    if pending_send_task.is_some() {
+                        inner_runner.flush_host().await;
+                        let _ = core.settle().await;
+                        inner_runner.flush_store().await;
+                        let _ = core.settle().await;
+                    } else {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
                 }
             }
             Step::WsPush { ws_push } => {
                 ws_driver.push(*ws_push);
             }
+            Step::HttpRelease { http_release } => {
+                transport.release_http(*http_release);
+            }
             Step::Snapshot { snapshot } => {
                 if is_u3 {
-                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    if pending_send_task.is_some() {
+                        inner_runner.flush_host().await;
+                        let _ = core.settle().await;
+                        inner_runner.flush_store().await;
+                        let _ = core.settle().await;
+                    } else {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
                 }
-                if let Some(snap) = capture_case_snapshot(&core, &host, is_u3).await {
+                if let Some(snap) = capture_case_snapshot(
+                    &core,
+                    &host,
+                    is_u3,
+                    is_u4,
+                    is_u5,
+                    last_send_result,
+                    &send_logs,
+                )
+                .await
+                {
                     snapshots.insert(snapshot.clone(), snap);
                 }
             }
@@ -3128,9 +3940,23 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         }
     }
 
-    let final_state = capture_case_snapshot(&core, &host, is_u3)
-        .await
-        .ok_or_else(|| "actor stopped before final snapshot".to_owned())?;
+    if let Some(handle) = pending_send_task.take() {
+        let ok = handle
+            .await
+            .map_err(|e| format!("trailing send task join error: {e}"))?;
+        last_send_result = Some(ok);
+    }
+    let final_state = capture_case_snapshot(
+        &core,
+        &host,
+        is_u3,
+        is_u4,
+        is_u5,
+        last_send_result,
+        &send_logs,
+    )
+    .await
+    .ok_or_else(|| "actor stopped before final snapshot".to_owned())?;
     core.stop();
 
     Ok(CaseRunResult {

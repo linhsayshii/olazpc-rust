@@ -267,6 +267,13 @@ pub(crate) fn reduce_conversations(state: &mut CoreState, input: Input, out: &mu
                         values: sorted_set_vec(&state.conversations.unread_marks),
                     }));
             }
+            let (win_rm, meta_rm) = state.messages.remove_conversation_window(&id);
+            if win_rm {
+                out.dirty.insert(DirtyKey::Messages);
+            }
+            if meta_rm {
+                out.dirty.insert(DirtyKey::MessageMeta);
+            }
             state.conversations.ui.remove(BTreeSet::from([id]));
             out.dirty.insert(DirtyKey::ConversationUi);
             rebuild_flags_and_extras(state, out);
@@ -586,6 +593,10 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
         }
 
         Command::SetOpenConversation { id } => {
+            // U5: opening a conversation clears any active incoming typing indicator for it.
+            if let Some(conv_id) = id.as_deref() {
+                crate::typing::clear_typing(&mut state.typing, conv_id, out);
+            }
             state.conversations.open_conversation_id = id;
             complete_op(op_id, OpResult::Unit, false, out);
         }
@@ -684,58 +695,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
         }
 
         Command::MarkConversationRead { id, seen_target } => {
-            if id.is_empty() {
-                complete_op(op_id, OpResult::Unit, false, out);
-                return;
-            }
-            let self_conv_id = state.session.self_conversation_id.clone();
-            let mut extras_changed = false;
-            if let Some(conv) = state
-                .conversations
-                .conversations
-                .iter_mut()
-                .find(|c| c.id == id)
-                && conv.unread > 0
-            {
-                conv.unread = 0;
-                out.dirty.insert(DirtyKey::Conversations);
-                extras_changed = true;
-            }
-            let had_unread_mark = state.conversations.unread_marks.remove(&id);
-            if had_unread_mark {
-                if state
-                    .conversations
-                    .rebuild_conversation_flags(self_conv_id.as_deref())
-                {
-                    out.dirty.insert(DirtyKey::ConversationFlags);
-                }
-                extras_changed = true;
-                out.effects
-                    .push(Effect::Store(StoreOp::SetPreferenceStrings {
-                        key: "unreadMarks".to_owned(),
-                        values: sorted_set_vec(&state.conversations.unread_marks),
-                    }));
-                out.effects.push(Effect::SetUnreadMarkApi {
-                    conv_id: id.clone(),
-                    unread: false,
-                });
-            }
-            if extras_changed
-                && state
-                    .conversations
-                    .rebuild_conversation_extras(self_conv_id.as_deref())
-            {
-                out.dirty.insert(DirtyKey::ConversationExtras);
-            }
-            out.effects
-                .push(Effect::Store(StoreOp::SetConversationUnread {
-                    id,
-                    unread: 0,
-                }));
-            if let Some(target) = seen_target {
-                out.effects.push(Effect::SendSeenApi(target));
-            }
-            complete_op(op_id, OpResult::Unit, true, out);
+            mark_conversation_read(state, id, seen_target, op_id, out);
         }
 
         Command::MarkConversationUnread { id } => {
@@ -766,6 +726,13 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                     key: "hiddenIds".to_owned(),
                     values: sorted_set_vec(&state.conversations.actions.hidden_ids),
                 }));
+            let (win_rm, meta_rm) = state.messages.remove_conversation_window(&id);
+            if win_rm {
+                out.dirty.insert(DirtyKey::Messages);
+            }
+            if meta_rm {
+                out.dirty.insert(DirtyKey::MessageMeta);
+            }
             state.conversations.ui.remove(BTreeSet::from([id.clone()]));
             out.dirty.insert(DirtyKey::ConversationUi);
             rebuild_flags_and_extras(state, out);
@@ -1240,18 +1207,14 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
             complete_op(op_id, OpResult::Unit, true, out);
         }
 
-        Command::Start
-        | Command::RefreshQr
-        | Command::LogOut
-        | Command::SessionExpired { .. }
-        | Command::ApplyAccountProfile(_)
-        | Command::DrainChatPolling { .. } => {
+        _ => {
             complete_op(op_id, OpResult::Unit, false, out);
         }
     }
 }
 
-fn apply_server_hidden(
+// U4-bootstrap
+pub(crate) fn apply_server_hidden(
     state: &mut CoreState,
     pin: &str,
     thread_ids: &[String],
@@ -1337,7 +1300,8 @@ fn emit_save_labels(state: &CoreState, op_id: Option<u64>, out: &mut ReduceOutpu
     });
 }
 
-fn emit_save_conversations(state: &CoreState, out: &mut ReduceOutput) {
+// U4-bootstrap
+pub(crate) fn emit_save_conversations(state: &CoreState, out: &mut ReduceOutput) {
     // Timestamp is stamped by the store worker (`updated_at_ms`) when writing to SQLite so `reduce`
     // stays clock-free (D9).
     let rows = state.conversations.stored_conversation_rows(0);
@@ -1345,7 +1309,8 @@ fn emit_save_conversations(state: &CoreState, out: &mut ReduceOutput) {
         .push(Effect::Store(StoreOp::SaveConversations(rows)));
 }
 
-fn rebuild_flags_and_extras(state: &mut CoreState, out: &mut ReduceOutput) {
+// U4-bootstrap
+pub(crate) fn rebuild_flags_and_extras(state: &mut CoreState, out: &mut ReduceOutput) {
     let self_conv_id = state.session.self_conversation_id.clone();
     if state
         .conversations
@@ -1383,7 +1348,70 @@ fn complete_op(op_id: Option<u64>, result: OpResult, after_store: bool, out: &mu
     }
 }
 
-fn sorted_set_vec(set: &BTreeSet<String>) -> Vec<String> {
+// U5-send
+pub(crate) fn mark_conversation_read(
+    state: &mut CoreState,
+    id: String,
+    seen_target: Option<crate::input::SeenTarget>,
+    op_id: Option<u64>,
+    out: &mut ReduceOutput,
+) {
+    if id.is_empty() {
+        complete_op(op_id, OpResult::Unit, false, out);
+        return;
+    }
+    let self_conv_id = state.session.self_conversation_id.clone();
+    let mut extras_changed = false;
+    if let Some(conv) = state
+        .conversations
+        .conversations
+        .iter_mut()
+        .find(|c| c.id == id)
+        && conv.unread > 0
+    {
+        conv.unread = 0;
+        out.dirty.insert(DirtyKey::Conversations);
+        extras_changed = true;
+    }
+    let had_unread_mark = state.conversations.unread_marks.remove(&id);
+    if had_unread_mark {
+        if state
+            .conversations
+            .rebuild_conversation_flags(self_conv_id.as_deref())
+        {
+            out.dirty.insert(DirtyKey::ConversationFlags);
+        }
+        extras_changed = true;
+        out.effects
+            .push(Effect::Store(StoreOp::SetPreferenceStrings {
+                key: "unreadMarks".to_owned(),
+                values: sorted_set_vec(&state.conversations.unread_marks),
+            }));
+        out.effects.push(Effect::SetUnreadMarkApi {
+            conv_id: id.clone(),
+            unread: false,
+        });
+    }
+    if extras_changed
+        && state
+            .conversations
+            .rebuild_conversation_extras(self_conv_id.as_deref())
+    {
+        out.dirty.insert(DirtyKey::ConversationExtras);
+    }
+    out.effects
+        .push(Effect::Store(StoreOp::SetConversationUnread {
+            id,
+            unread: 0,
+        }));
+    if let Some(target) = seen_target {
+        out.effects.push(Effect::SendSeenApi(target));
+    }
+    complete_op(op_id, OpResult::Unit, true, out);
+}
+
+// U4-bootstrap
+pub(crate) fn sorted_set_vec(set: &BTreeSet<String>) -> Vec<String> {
     set.iter().cloned().collect()
 }
 

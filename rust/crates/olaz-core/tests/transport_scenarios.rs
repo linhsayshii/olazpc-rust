@@ -154,6 +154,7 @@ fn step_start() -> Step {
         args: json!({}),
         now_ms: None,
         rand4: None,
+        timeout_ms: None,
     }
 }
 
@@ -1190,6 +1191,7 @@ async fn t25_lp_stopped_on_logout() {
                 args: json!({}),
                 now_ms: None,
                 rand4: None,
+                timeout_ms: None,
             },
             step_await_host("reset_domains"),
         ],
@@ -1237,6 +1239,7 @@ async fn t26_drain_command_four_batches_flags_false_and_serialized() {
                 args: json!({ "max_batches": 4, "notify_incoming": false }),
                 now_ms: None,
                 rand4: None,
+                timeout_ms: None,
             },
         ],
     );

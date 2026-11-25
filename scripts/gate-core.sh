@@ -201,6 +201,9 @@ case "$DOMAIN" in
     conversation_actions)
         RECORDER_FILTER="ConversationRecorderTests/testConversationActionsCases"
         ;;
+    messages)
+        RECORDER_FILTER="MessageRecorderTests"
+        ;;
     *)
         RECORDER_FILTER="${DOMAIN_CAP}RecorderTests"
         ;;

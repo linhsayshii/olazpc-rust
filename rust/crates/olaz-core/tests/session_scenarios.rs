@@ -167,6 +167,7 @@ fn cmd(name: &str) -> Step {
         args: json!({}),
         now_ms: None,
         rand4: None,
+        timeout_ms: None,
     }
 }
 
@@ -803,6 +804,7 @@ async fn s17_and_s18_session_expired_mid_session_then_refresh_qr() -> Result<(),
                 args: json!({ "reason": "Phiên hết hạn giữa chừng." }),
                 now_ms: None,
                 rand4: None,
+                timeout_ms: None,
             },
             await_phase("login", Some("waiting_scan")),
             snapshot("after_expired"),
@@ -844,6 +846,7 @@ async fn s19_profile_defaults() -> Result<(), String> {
             }),
             now_ms: None,
             rand4: None,
+            timeout_ms: None,
         }],
     );
     let res = run_case(&case).await?;
@@ -899,6 +902,7 @@ async fn compare_case_detects_mismatches_and_applies_known_diffs() -> Result<(),
             args: json!({ "userId": "1", "displayName": "Minh" }),
             now_ms: None,
             rand4: None,
+            timeout_ms: None,
         }],
     );
     let res = run_case(&case).await?;

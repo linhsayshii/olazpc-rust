@@ -358,10 +358,13 @@ extension ZaloEngine {
             mergeMessageIntoMemory(optimistic)
 
             func removeOptimistic() {
+                var removed: [String] = [cliId]
                 if var list = messages[id] {
+                    removed.append(contentsOf: list.filter { $0.id == cliId || $0.clientId == cliId }.map(\.id))
                     list.removeAll { $0.id == cliId || $0.clientId == cliId }
                     messages[id] = list
                 }
+                coreLifecycle.core?.writeThroughRemoveMessages(convId: id, ids: Array(Set(removed)))
             }
 
             do {

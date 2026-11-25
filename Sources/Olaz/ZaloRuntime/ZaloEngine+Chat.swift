@@ -15,9 +15,11 @@ extension ZaloEngine {
         if messages[id] == nil {
             messages[id] = []
         }
+        var preloadedRecords: [ChatMessageRecord] = []
         // Synchronous WAL snapshot read (< 0.5ms) so synced local history appears on the very first frame.
         if let syncCached = sqliteStore?.readDecodedMessagesNow(convId: id, limit: 50) {
             let decoded = syncCached.map(\.message)
+            preloadedRecords = decoded.map { ChatMessageRecord(message: $0) }
             // One write for the whole page (a merge per row copied, sorted and published the list 50 times).
             mergeMessagesIntoMemory(decoded.map { (message: $0, clientId: nil) }, in: id)
             if decoded.count >= 45, hasMoreHistory[id] != true {
@@ -25,271 +27,35 @@ extension ZaloEngine {
             }
         }
 
-        let isGrp = ZaloWireParser.isGroupId(id)
         updateCallGateForConversation(id)
 
         openConversationTask = Task { [weak self] in
-            guard let self else { return }
-            // 1. Fallback async read for in-memory test DBs without a separate WAL handle.
-            if (self.messages[id]?.isEmpty ?? true),
-               let cached = try? await self.sqliteStore?.decodedMessages(convId: id, limit: 50) {
-                let decoded = cached.map(\.message)
-                for msg in decoded { self.mergeMessageIntoMemory(msg) }
-                if decoded.count >= 45 {
-                    self.hasMoreHistory[id] = true
-                }
+            guard let self, let core = await self.ensureCoreEngine() else { return }
+            self.pushCoreIdentitiesIfRunning()
+            self.pushCoreContactsIfRunning()
+            if let v = try? await core.openConversationAndWait(id: id, preloaded: preloadedRecords) {
+                await self.waitForMirrorVersion(v)
             }
-
-            // 2. Refresh recent history (and board pins) from server if authenticated. Skipped when this session already
-            // knows the store holds the newest message (launch preload probe, or an earlier open of this chat).
-            let fetched = self.isRecentHistoryUpToDate(id)
-                ? 0
-                : await self.fetchAndMergeHistory(convId: id, beforeMsgId: nil, isOld: false, count: 50)
-            await self.resolveMissingSenderProfiles(in: id)
-            if (fetched > 0 || self.conversations.first(where: { $0.id == id })?.preview == nil),
-               let latest = self.messages[id]?.last {
-                self.updateConversationOnMessage(latest, incrementUnread: false)
-            }
-            if isGrp || self.contacts.friends.contains(where: { $0.id == id }) {
-                await self.refreshBoardPins(for: id)
-            } else {
-                EngineLog.shared.write("pins: list skipped (1-1 not in friends)")
-            }
-
-            // 3. Mark read locally & remotely.
-            if self.traceU4Host("mark_read", args: ["conv_id": id]) {
-                self.markRead(id)
-            }
+            await self.syncCachedIdentityPreferencesFromStore()
         }
-    }
-
-    internal func resolveMissingSenderProfiles(in convId: String) async {
-        guard let list = messages[convId], !list.isEmpty else { return }
-        let cleanMyUid = ZaloWireParser.stripUserPrefix(profile?.userId ?? "")
-        let sanitizedMyUid = ZaloWireParser.sanitizeProfileUid(cleanMyUid) ?? cleanMyUid
-        let sentinelKeys: Set<String> = ["", "0", "me", "__legacy__", "unknown", "-1"]
-
-        var unknownUids: [String] = []
-        var seen: Set<String> = []
-
-        func considerUid(_ raw: String, existingName: String = "", hasAvatar: Bool = false) {
-            let trimmed = ZaloWireParser.stripUserPrefix(raw)
-            let clean = ZaloWireParser.sanitizeProfileUid(trimmed) ?? trimmed
-            guard !sentinelKeys.contains(clean),
-                  clean != cleanMyUid,
-                  clean != sanitizedMyUid,
-                  seen.insert(clean).inserted else { return }
-            let person = lookupPersonInfo(clean)
-            let bestName = (!existingName.isEmpty && existingName != clean && existingName != ReactionDetail.unknownName)
-                ? existingName
-                : (person?.name ?? "")
-            let needsName = bestName.isEmpty || bestName == clean || bestName == ReactionDetail.unknownName
-            let needsAvatar = !hasAvatar && (person?.avatar.isEmpty ?? true) && (cachedProfiles[clean]?.avatar.isEmpty ?? true)
-            if needsName || needsAvatar {
-                unknownUids.append(clean)
-            }
-        }
-
-        for msg in list {
-            if !msg.isMine && !msg.senderId.isEmpty && msg.senderId != "0" && msg.senderId != cleanMyUid {
-                considerUid(msg.senderId, existingName: msg.senderName, hasAvatar: msg.senderAvatar != nil)
-            }
-            for react in msg.reactions {
-                for rawUid in react.userCounts.keys {
-                    considerUid(rawUid)
-                }
-            }
-        }
-        guard !unknownUids.isEmpty else {
-            refreshReactionNames(in: convId)
-            return
-        }
-
-        var cacheUpdated = false
-        for offset in stride(from: 0, to: unknownUids.count, by: 50) {
-            let chunk = Array(unknownUids[offset..<min(offset + 50, unknownUids.count)])
-            guard let box = try? await sessionClient.fetchProfiles(uids: chunk) else { continue }
-            let profilesMap = ZaloWireParser.extractProfilesMap(box.dict)
-            for (uid, row) in profilesMap {
-                let trimmed = ZaloWireParser.stripUserPrefix(uid)
-                let clean = ZaloWireParser.sanitizeProfileUid(trimmed) ?? trimmed
-                let fetchedName = ZaloWireParser.preferredName(row)
-                let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
-                if !clean.isEmpty, (!fetchedName.isEmpty || !avt.isEmpty) {
-                    cachedProfiles[clean] = ZaloWebKitMigrator.CachedProfile(name: fetchedName, avatar: avt)
-                    cacheUpdated = true
-                }
-            }
-        }
-        guard cacheUpdated else {
-            refreshReactionNames(in: convId)
-            return
-        }
-        if let data = try? JSONEncoder().encode(cachedProfiles) {
-            try? await sqliteStore?.setPreferenceData(key: "cachedProfiles", data: data)
-        }
-
-        guard var updatedList = messages[convId] else { return }
-        var toPersist: [StoredMessage] = []
-        var modified = false
-        for i in updatedList.indices where !updatedList[i].isMine {
-            let clean = ZaloWireParser.stripUserPrefix(updatedList[i].senderId)
-            guard let info = lookupPersonInfo(clean) else { continue }
-            var rowChanged = false
-            if !info.name.isEmpty, info.name != clean, info.name != ReactionDetail.unknownName, updatedList[i].senderName != info.name {
-                updatedList[i].senderName = info.name
-                rowChanged = true
-            }
-            if updatedList[i].senderAvatar == nil, !info.avatar.isEmpty, let url = URL(string: info.avatar) {
-                updatedList[i].senderAvatar = url
-                rowChanged = true
-            }
-            if rowChanged {
-                modified = true
-                if let stored = ZaloWireParser.encodeChatMessage(updatedList[i]) {
-                    toPersist.append(stored)
-                }
-            }
-        }
-        if modified {
-            messages[convId] = updatedList
-            if !toPersist.isEmpty {
-                try? await sqliteStore?.saveMessages(toPersist, preserveExistingReactions: true)
-            }
-        }
-        refreshReactionNames(in: convId)
     }
 
     func closeConversation() {
         openConversationId = nil
         dropMessagePrompts()
+        coreLifecycle.core?.closeConversation()
     }
 
     func loadOlderMessages(_ id: String) {
         guard !id.isEmpty else { return }
         loadOlderTask = Task { [weak self] in
-            guard let self else { return }
-            let existing = self.messages[id] ?? []
-            let oldest = existing.first
-            let beforeTsMs = oldest.map { Int64(($0.date.timeIntervalSince1970 * 1000).rounded()) }
-
-            var addedCount = 0
-            if let beforeTsMs {
-                let cachedOlder: [DecodedMessageRow]?
-                if let syncOlder = self.sqliteStore?.readDecodedMessagesNow(convId: id, beforeTsMs: beforeTsMs, limit: 50) {
-                    cachedOlder = syncOlder
-                } else {
-                    cachedOlder = try? await self.sqliteStore?.decodedMessages(convId: id, beforeTsMs: beforeTsMs, limit: 50)
-                }
-                if let cachedOlder, !cachedOlder.isEmpty {
-                    let decoded = cachedOlder.map(\.message)
-                    for msg in decoded {
-                        if !(self.messages[id]?.contains(where: { $0.id == msg.id }) ?? false) {
-                            addedCount += 1
-                        }
-                        self.mergeMessageIntoMemory(msg)
-                    }
-                    if cachedOlder.count < 45 && !ZaloWireParser.isGroupId(id) && id != self.selfConversationId {
-                        self.hasMoreHistory[id] = false
-                    }
-                }
+            guard let self, let core = await self.ensureCoreEngine() else { return }
+            self.pushCoreIdentitiesIfRunning()
+            if let v = try? await core.loadOlderMessagesAndWait(id: id) {
+                await self.waitForMirrorVersion(v)
             }
-
-            if addedCount == 0 {
-                let cursor: String? = oldest.flatMap { msg in
-                    Int64(msg.id).map(String.init)
-                }
-                let fetched = await self.fetchAndMergeHistory(convId: id, beforeMsgId: cursor, isOld: nil, count: 50)
-                if fetched == 0 {
-                    self.hasMoreHistory[id] = false
-                }
-            }
-            await self.resolveMissingSenderProfiles(in: id)
-            self.historyTicks[id, default: 0] += 1
+            await self.syncCachedIdentityPreferencesFromStore()
         }
-    }
-
-    @discardableResult
-    internal func fetchAndMergeHistory(convId: String, beforeMsgId: String?, isOld: Bool? = nil, count: Int = 50) async -> Int {
-        guard let page = try? await sessionClient.fetchHistoryPage(convId: convId, lastMsgId: beforeMsgId, count: count, isOld: isOld) else {
-            if beforeMsgId == nil {
-                if messages[convId] == nil { messages[convId] = [] }
-                if messages[convId]?.isEmpty ?? true { hasMoreHistory[convId] = false }
-            }
-            return 0
-        }
-
-        if beforeMsgId == nil { historyFreshness[convId] = .upToDate }
-        let myUid = profile?.userId ?? ""
-        let isGrp = ZaloWireParser.isGroupId(convId)
-        let isSelf = (convId == selfConversationId)
-        let events = await ZaloWireParser.historyEventsAsync(
-            page,
-            myUid: myUid,
-            selfConvId: selfConversationId,
-            fallbackConvId: (isGrp || isSelf) ? convId : nil,
-            isGroupHint: isGrp ? true : (isSelf ? false : nil),
-            nameLookup: { [weak self] uid in self?.lookupPersonInfo(uid) }
-        )
-
-        var storedBatch: [StoredMessage] = []
-        var newVisibleCount = 0
-        var totalParsedMessages = 0
-
-        for ev in events {
-            if case .message(let msg, let stored) = ev {
-                if msg.conversationId == convId {
-                    totalParsedMessages += 1
-                    if !(messages[msg.conversationId]?.contains(where: { $0.id == msg.id }) ?? false) {
-                        newVisibleCount += 1
-                    }
-                }
-                storedBatch.append(stored)
-                mergeMessageIntoMemory(msg, replacingClientId: stored.clientId)
-            }
-        }
-        if messages[convId] == nil {
-            messages[convId] = []
-        }
-        if !storedBatch.isEmpty {
-            try? await sqliteStore?.saveMessages(storedBatch, preserveExistingReactions: true)
-        }
-        for ev in ZaloWireParser.sortReactionEventsChronologically(events) {
-            if case .reaction(let cId, let mid, let cid, let senderId, let rType, let rIcon, let eventId, let reactClientId, _, _, let senderName) = ev {
-                await applyRemoteReaction(
-                    convId: cId,
-                    msgId: mid,
-                    cliMsgId: cid,
-                    senderId: senderId,
-                    rType: rType,
-                    rIcon: rIcon,
-                    eventId: eventId,
-                    reactClientId: reactClientId,
-                    senderName: senderName
-                )
-            }
-        }
-        for ev in events {
-            switch ev {
-            case .undo(let cId, let mid, let cid):
-                await applyRemoteRecall(convId: cId, msgId: mid, cliMsgId: cid)
-            case .delete(let cId, let mid, let cid):
-                await applyRemoteDelete(convId: cId, msgId: mid, cliMsgId: cid)
-            case .message, .reaction, .typing, .ignore:
-                break
-            }
-        }
-        let isSelfCloud = convId == selfConversationId
-        if isGrp || isSelfCloud {
-            if totalParsedMessages >= max(10, count / 2) {
-                hasMoreHistory[convId] = true
-            } else if (messages[convId]?.count ?? 0) < 45 {
-                hasMoreHistory[convId] = false
-            }
-        } else if (messages[convId]?.count ?? 0) < 45 {
-            hasMoreHistory[convId] = false
-        }
-        return newVisibleCount
     }
 
     // MARK: - Send Text / Mentions
@@ -298,6 +64,86 @@ extension ZaloEngine {
                   styles: [TextStyle] = [], urgency: Int = 0) async -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !id.isEmpty else { return false }
+        if let core = coreLifecycle.core {
+            let cliInt = core.nextClientId()
+            let cliId = "\(cliInt)"
+            let isE2EE = ZaloWireParser.isGroupId(id) ? false : e2eeManager.isE2EEConversationSync(id)
+            let tsMs = nowMs()
+            let ttlMs = autoDeleteTTL(id)
+            let quote = quoteId.flatMap { qid in messages[id]?.first(where: { $0.id == qid }) }
+            let quoteBlock = quote.map {
+                ChatMessage.Quote(
+                    senderName: $0.isMine ? "Bạn" : $0.senderName,
+                    text: $0.text.isEmpty ? "[Tin nhắn]" : $0.text,
+                    msgId: $0.id,
+                    cliMsgId: $0.clientId
+                )
+            }
+            var optimistic = ChatMessage(
+                id: cliId,
+                conversationId: id,
+                senderId: profile?.userId ?? "",
+                senderName: profile?.displayName ?? "Bạn",
+                senderAvatar: profile?.avatar,
+                isMine: true,
+                kind: .text,
+                text: text,
+                date: Date(timeIntervalSince1970: Double(tsMs) / 1000.0),
+                status: .sending,
+                quote: quoteBlock,
+                reactions: [],
+                isE2EE: isE2EE,
+                mentions: mentions,
+                cardButtons: [],
+                suggestsStickers: false,
+                menu: MessageMenu(json: [
+                    "forward": "ok",
+                    "recall": id != selfConversationId,
+                    "delete": id == selfConversationId ? "plain" : "forMe",
+                    "pin": ZaloWireParser.isGroupId(id) && id != selfConversationId,
+                    "star": "star"
+                ]),
+                clientId: cliId
+            )
+            if !isE2EE { optimistic.textStyles = styles }
+            optimistic.ttlMs = isE2EE ? 0 : ttlMs
+            optimistic.urgency = isE2EE ? 0 : urgency
+            // Mirror optimistic row immediately on MainActor so composer-to-row-visible
+            // avoids the extra async FFI -> Tokio -> ChangeHub hop; Core's WindowDelta::Patch
+            // reconciles identical optimistic, ack, echo-first, or failure removal idempotently.
+            isSuppressingDirectMessageSync = true
+            mergeMessageIntoMemory(optimistic)
+            isSuppressingDirectMessageSync = false
+
+            let mentionRecords = mentions.map {
+                MessageMention(uid: $0.uid, pos: Int64($0.pos), len: Int64($0.len), isAll: $0.isAll)
+            }
+            let styleRecords = styles.map {
+                TextStyleRecord(start: Int64($0.start), len: Int64($0.len), st: $0.st)
+            }
+            guard let outcome = try? await core.sendText(
+                convId: id,
+                text: text,
+                quoteId: quoteId,
+                mentions: mentionRecords,
+                styles: styleRecords,
+                urgency: Int64(urgency),
+                clientId: cliInt,
+                nowMs: tsMs,
+                isE2ee: isE2EE,
+                ttlMs: ttlMs
+            ) else {
+                isSuppressingDirectMessageSync = true
+                if var list = messages[id] {
+                    list.removeAll { $0.id == cliId }
+                    messages[id] = list
+                }
+                isSuppressingDirectMessageSync = false
+                return false
+            }
+            await waitForMirrorVersion(outcome.version)
+            return outcome.ok
+        }
         resetOutgoingTyping(in: id)
 
         let quote = quoteId.flatMap { qid in messages[id]?.first(where: { $0.id == qid }) }
@@ -355,6 +201,7 @@ extension ZaloEngine {
                 list.removeAll { $0.id == cliId }
                 messages[id] = list
             }
+            coreLifecycle.core?.writeThroughRemoveMessages(convId: id, ids: [cliId])
         }
 
         do {
@@ -488,18 +335,20 @@ extension ZaloEngine {
                     list.removeAll { $0.id == cliId }
                     messages[id] = list
                 }
+                coreLifecycle.core?.writeThroughRemoveMessages(convId: id, ids: [cliId])
                 updateConversationOnMessage(echoed, incrementUnread: false)
                 return true
             }
+            optimistic.id = res.msgId
+            optimistic.clientId = finalCliId
+            optimistic.status = .sent
             if var list = messages[id] {
                 list.removeAll { $0.id == cliId || $0.id == res.msgId }
-                optimistic.id = res.msgId
-                optimistic.clientId = finalCliId
-                optimistic.status = .sent
                 list.append(optimistic)
                 list.sort { a, b in a.date == b.date ? a.id < b.id : a.date < b.date }
                 messages[id] = list
             }
+            coreLifecycle.core?.writeThroughUpsertMessage(msg: ChatMessageRecord(message: optimistic), replacingClientId: cliId)
             if let stored = ZaloWireParser.encodeChatMessage(optimistic, clientId: finalCliId) {
                 try? await sqliteStore?.saveMessages([stored])
             }
@@ -746,17 +595,41 @@ extension ZaloEngine {
 
     func markRead(_ id: String) {
         guard !id.isEmpty else { return }
-        let seenTarget: SeenTargetRecord? = {
-            guard let last = messages[id]?.last, !last.isMine else { return nil }
-            return SeenTargetRecord(convId: id, msgId: last.id, cliMsgId: last.id, senderId: last.senderId)
-        }()
         if let core = coreLifecycle.core {
-            core.markConversationRead(id: id, seenTarget: seenTarget)
+            core.markRead(id: id)
             return
         }
+        var extrasChanged = false
         if let idx = conversations.firstIndex(where: { $0.id == id }), conversations[idx].unread > 0 {
             conversations[idx].unread = 0
+            extrasChanged = true
         }
+        let hadUnreadMark = cachedUnreadMarks.remove(id) != nil
+        if hadUnreadMark {
+            rebuildConversationFlags()
+            extrasChanged = true
+            let key = UUID()
+            let t = Task { @MainActor [weak self] in
+                defer { self?.markReadTasks.removeValue(forKey: key) }
+                guard let self else { return }
+                try? await self.sqliteStore?.setPreferenceStrings(key: "unreadMarks", value: Array(self.cachedUnreadMarks))
+                try? await self.sessionClient.setUnreadMarkAPI(convId: id, unread: false)
+            }
+            markReadTasks[key] = t
+        }
+        if extrasChanged {
+            rebuildConversationExtras()
+        }
+        let key = UUID()
+        let t = Task { @MainActor [weak self] in
+            defer { self?.markReadTasks.removeValue(forKey: key) }
+            guard let self else { return }
+            try? await self.sqliteStore?.setConversationUnread(id: id, unread: 0)
+            if let last = self.messages[id]?.last, !last.isMine {
+                await self.sessionClient.sendSeenAPI(convId: id, msgId: last.id, cliMsgId: last.id, senderId: last.senderId)
+            }
+        }
+        markReadTasks[key] = t
     }
 
     func react(_ emoji: String, to messageId: String, in conversationId: String) {
@@ -819,6 +692,7 @@ extension ZaloEngine {
             )
             list[idx] = updated
             messages[conversationId] = list
+            coreLifecycle.core?.writeThroughUpsertMessage(msg: ChatMessageRecord(message: updated), replacingClientId: nil)
         }
 
         let pendingId = UUID()
@@ -840,6 +714,7 @@ extension ZaloEngine {
                }) {
                 list[idx].reactions = previousReactions
                 messages[conversationId] = list
+                coreLifecycle.core?.writeThroughUpsertMessage(msg: ChatMessageRecord(message: list[idx]), replacingClientId: nil)
             }
         }
 
@@ -902,6 +777,10 @@ extension ZaloEngine {
     }
 
     func handleTyping(state: [String: Any]) {
+        if let core = coreLifecycle.core {
+            core.handleTyping(stateJson: Self.jsonString(for: state))
+            return
+        }
         if let info = state["typing"] as? [String: Any],
            let convId = info["convId"] as? String,
            let name = info["name"] as? String {
@@ -911,6 +790,12 @@ extension ZaloEngine {
 
     @MainActor
     func notifyTyping(in convId: String) {
+        if let core = coreLifecycle.core {
+            let enabled = userDefaults.object(forKey: OlazPrefs.sendTyping) as? Bool ?? true
+            core.setSendTypingEnabled(enabled: enabled)
+            core.notifyTyping(convId: convId, nowMs: nowMs())
+            return
+        }
         let target = convId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !target.isEmpty, phase == .ready else { return }
         // Cài đặt ▸ Quyền riêng tư: "Hiển thị trạng thái đang soạn tin" off sends nothing.
@@ -926,6 +811,10 @@ extension ZaloEngine {
 
     @MainActor
     func resetOutgoingTyping(in convId: String) {
+        if let core = coreLifecycle.core {
+            core.resetOutgoingTyping(convId: convId)
+            return
+        }
         let target = convId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !target.isEmpty else { return }
         OutgoingTypingStore.throttle(for: self).reset(in: target)

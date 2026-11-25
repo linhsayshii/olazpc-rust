@@ -1260,3 +1260,56 @@ fn quote_keeps_the_quoted_message_ids() {
     .unwrap();
     assert_eq!(back.quote.unwrap().msg_id, "8521991431452");
 }
+
+#[test]
+fn text_properties_json_matches_swift_send_jsonl_shapes() {
+    // Empty styles produce None (plain messages omit textProperties).
+    assert_eq!(TextStyle::text_properties_json(&[]), None);
+    assert_eq!(crate::text_properties_json(&[]), None);
+
+    // Exact shapes recorded in send.jsonl (`send_mentions_styles_urgency`):
+    // keys sorted alphabetically at both top level (`styles`, `ver`) and entry level (`len`, `st`, `start`).
+    let bold_at_12 = vec![TextStyle {
+        start: 12,
+        len: 5,
+        st: "b".to_owned(),
+    }];
+    assert_eq!(
+        crate::text_properties_json(&bold_at_12).as_deref(),
+        Some(r#"{"styles":[{"len":5,"st":"b","start":12}],"ver":0}"#)
+    );
+
+    let italic_at_0 = vec![TextStyle {
+        start: 0,
+        len: 6,
+        st: "i".to_owned(),
+    }];
+    assert_eq!(
+        TextStyle::text_properties_json(&italic_at_0).as_deref(),
+        Some(r#"{"styles":[{"len":6,"st":"i","start":0}],"ver":0}"#)
+    );
+
+    // Multiple styled runs preserve array order and composite tokens.
+    let multi = vec![
+        TextStyle {
+            start: 0,
+            len: 4,
+            st: "b,i,c_db342e".to_owned(),
+        },
+        TextStyle {
+            start: 5,
+            len: 10,
+            st: "lst_1,f_18,ind_1".to_owned(),
+        },
+    ];
+    let serialized = crate::text_properties_json(&multi).unwrap();
+    assert_eq!(
+        serialized,
+        r#"{"styles":[{"len":4,"st":"b,i,c_db342e","start":0},{"len":10,"st":"lst_1,f_18,ind_1","start":5}],"ver":0}"#
+    );
+
+    // Round-trips back through TextStyle::list on the parsed `styles` array.
+    let parsed: Value = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(parsed["ver"], 0);
+    assert_eq!(TextStyle::list(parsed.get("styles")), multi);
+}

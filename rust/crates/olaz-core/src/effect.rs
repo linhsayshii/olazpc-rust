@@ -1,18 +1,28 @@
 //! Side effects returned by `reduce` and executed by [`crate::runner::EffectRunner`].
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
-use olaz_api::PollState;
+use olaz_api::{PollState, SendTextParams};
 use olaz_net::{LoginAccount, QrTicket};
-use olaz_store::StoredConversation;
+use olaz_store::{StoredConversation, StoredMessage};
+use olaz_wire::ChatMessage;
 use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
 use crate::conversations::{ConversationActionResult, IdentityTable, PinBoard};
-use crate::input::{HiddenPinSyncKind, SeenTarget, StoreToken};
+use crate::input::{E2eeQuoteArg, HiddenPinSyncKind, SeenTarget, StoreToken};
+use crate::messages::MuteEntry;
 use crate::reduce::classify::MobileSyncEvent;
 use crate::typed_chat::TypedChatEnvelope;
+
+/// Distinguishes which history-paging flow requested [`Effect::FetchHistoryPageApi`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryFetchPurpose {
+    Open { open_seq: u64, op_id: Option<u64> },
+    LoadOlder { load_seq: u64, op_id: Option<u64> },
+}
 
 /// Serial SQLite persistence operations executed by the core runner's store worker (U3).
 #[derive(Clone)]
@@ -54,6 +64,35 @@ pub enum StoreOp {
         op_id: Option<u64>,
         group_ids: Vec<String>,
         my_uid: String,
+    },
+
+    // --- Launch bootstrap & freshness persistence (U4-bootstrap) ---
+    LoadPreferenceString {
+        key: String,
+        boot_gen: u64,
+    },
+    ProbeAndSaveMessages {
+        probe_targets: BTreeMap<String, String>,
+        rows: Vec<StoredMessage>,
+        preserve_existing_reactions: bool,
+        reply_boot_gen: Option<u64>,
+    },
+    SaveMessages {
+        rows: Vec<StoredMessage>,
+        preserve_existing_reactions: bool,
+    },
+    LoadOpenLocalMessages {
+        open_seq: u64,
+        conv_id: String,
+        limit: usize,
+        op_id: Option<u64>,
+    },
+    LoadOlderStoreMessages {
+        load_seq: u64,
+        conv_id: String,
+        before_ts_ms: i64,
+        limit: usize,
+        op_id: Option<u64>,
     },
 }
 
@@ -106,6 +145,50 @@ impl fmt::Debug for StoreOp {
                 .debug_struct("LoadMentionPreviewMessages")
                 .field("group_count", &group_ids.len())
                 .finish(),
+            // U4-bootstrap
+            Self::LoadPreferenceString { key, boot_gen } => f
+                .debug_struct("LoadPreferenceString")
+                .field("key", key)
+                .field("boot_gen", boot_gen)
+                .finish(),
+            Self::ProbeAndSaveMessages {
+                probe_targets,
+                rows,
+                preserve_existing_reactions,
+                reply_boot_gen,
+            } => f
+                .debug_struct("ProbeAndSaveMessages")
+                .field("probe_count", &probe_targets.len())
+                .field("rows_count", &rows.len())
+                .field("preserve_existing_reactions", preserve_existing_reactions)
+                .field("reply_boot_gen", reply_boot_gen)
+                .finish(),
+            Self::SaveMessages {
+                rows,
+                preserve_existing_reactions,
+            } => f
+                .debug_struct("SaveMessages")
+                .field("count", &rows.len())
+                .field("preserve_reactions", preserve_existing_reactions)
+                .finish(),
+            Self::LoadOpenLocalMessages {
+                open_seq, limit, ..
+            } => f
+                .debug_struct("LoadOpenLocalMessages")
+                .field("open_seq", open_seq)
+                .field("limit", limit)
+                .finish(),
+            Self::LoadOlderStoreMessages {
+                load_seq,
+                before_ts_ms,
+                limit,
+                ..
+            } => f
+                .debug_struct("LoadOlderStoreMessages")
+                .field("load_seq", load_seq)
+                .field("before_ts_ms", before_ts_ms)
+                .field("limit", limit)
+                .finish(),
         }
     }
 }
@@ -118,6 +201,7 @@ pub enum OpResult {
     PinBoard(Option<PinBoard>),
     HiddenSearch(Option<Vec<String>>),
     Bool(bool),
+    Int(i64),
 }
 
 impl fmt::Debug for OpResult {
@@ -131,6 +215,7 @@ impl fmt::Debug for OpResult {
                 .field("count", &v.as_ref().map(Vec::len))
                 .finish(),
             Self::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
+            Self::Int(n) => f.debug_tuple("Int").field(n).finish(),
         }
     }
 }
@@ -220,6 +305,82 @@ pub enum HostCall {
         start_explicit: bool,
         duration: i64,
     },
+
+    // --- Launch bootstrap host calls (U4-bootstrap) ---
+    ApplyMutes {
+        mutes: Vec<MuteEntry>,
+    },
+    RefreshCloud,
+    OnOpenConversationSync {
+        conv_id: String,
+        changed: bool,
+    },
+    OnCloseConversation,
+    RefreshBoardPins {
+        conv_id: String,
+    },
+    MarkReadBoundary {
+        conv_id: String,
+        seen_target: Option<SeenTarget>,
+    },
+    ApplyRemoteReaction {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        sender_id: String,
+        r_type: String,
+        r_icon: String,
+        event_id: String,
+        react_client_id: String,
+        sender_name: String,
+    },
+    ApplyRemoteRecall {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        update_conversation_preview: bool,
+    },
+    ApplyRemoteDelete {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        update_conversation_preview: bool,
+    },
+    DecryptEnvelope {
+        payload: Map<String, Value>,
+        default_cmd: u16,
+        fallback_conv_id: Option<String>,
+        is_group_hint: Option<bool>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        persist_conversations: bool,
+        probe_freshness: bool,
+        poll_batch_done: Option<(u64, u64)>,
+        op_id: Option<u64>,
+    },
+    MarkE2eeConversations {
+        conv_ids: Vec<String>,
+    },
+    NotePollMessages {
+        messages: Vec<ChatMessage>,
+    },
+    NotifyIncomingMessages {
+        messages: Vec<ChatMessage>,
+    },
+    ShowBatchTyping {
+        conv_id: String,
+        sender_id: String,
+    },
+    /// Fires after a transport-originated batch/parsed-events ingestion and all Pass 2 host jobs complete.
+    TransportBatchSettled,
+    // U5-send
+    SendE2eeText {
+        send_id: u64,
+        conv_id: String,
+        text: String,
+        client_id: String,
+        quote: Option<E2eeQuoteArg>,
+    },
 }
 
 impl fmt::Debug for HostCall {
@@ -307,6 +468,52 @@ impl fmt::Debug for HostCall {
                 .debug_struct("Mute")
                 .field("set", set)
                 .field("duration", duration)
+                .finish(),
+            // U4-bootstrap
+            Self::ApplyMutes { mutes } => f
+                .debug_struct("ApplyMutes")
+                .field("count", &mutes.len())
+                .finish(),
+            Self::RefreshCloud => f.write_str("RefreshCloud"),
+            Self::OnOpenConversationSync { changed, .. } => f
+                .debug_struct("OnOpenConversationSync")
+                .field("changed", changed)
+                .finish(),
+            Self::OnCloseConversation => f.write_str("OnCloseConversation"),
+            Self::RefreshBoardPins { .. } => f.write_str("RefreshBoardPins"),
+            Self::MarkReadBoundary { seen_target, .. } => f
+                .debug_struct("MarkReadBoundary")
+                .field("has_seen", &seen_target.is_some())
+                .finish(),
+            Self::ApplyRemoteReaction { r_type, .. } => f
+                .debug_struct("ApplyRemoteReaction")
+                .field("r_type", r_type)
+                .finish(),
+            Self::ApplyRemoteRecall { .. } => f.write_str("ApplyRemoteRecall"),
+            Self::ApplyRemoteDelete { .. } => f.write_str("ApplyRemoteDelete"),
+            Self::DecryptEnvelope { default_cmd, .. } => f
+                .debug_struct("DecryptEnvelope")
+                .field("default_cmd", default_cmd)
+                .finish(),
+            Self::MarkE2eeConversations { conv_ids } => f
+                .debug_struct("MarkE2eeConversations")
+                .field("count", &conv_ids.len())
+                .finish(),
+            Self::NotePollMessages { messages } => f
+                .debug_struct("NotePollMessages")
+                .field("count", &messages.len())
+                .finish(),
+            Self::NotifyIncomingMessages { messages } => f
+                .debug_struct("NotifyIncomingMessages")
+                .field("count", &messages.len())
+                .finish(),
+            Self::ShowBatchTyping { .. } => f.write_str("ShowBatchTyping"),
+            Self::TransportBatchSettled => f.write_str("TransportBatchSettled"),
+            // U5-send
+            Self::SendE2eeText { send_id, quote, .. } => f
+                .debug_struct("SendE2eeText")
+                .field("send_id", send_id)
+                .field("has_quote", &quote.is_some())
                 .finish(),
         }
     }
@@ -445,6 +652,80 @@ pub enum Effect {
     },
     /// Calls `ZaloApi::fetch_conversation_labels`.
     FetchConversationLabelsApi { op_id: Option<u64> },
+
+    // --- Launch bootstrap network effects (U4-bootstrap) ---
+    /// Aborts any in-flight bootstrap HTTP tasks.
+    CancelBootstrapTasks,
+    /// Step 1: fetches `/api/alias/list` (distinguishes auth vs other errors).
+    BootstrapFetchAliasesApi { boot_gen: u64 },
+    /// Step 3: concurrently fetches pinned conversations, archived chats, and mute list.
+    BootstrapFetchPamApi { boot_gen: u64 },
+    /// Step 4a: fetches `/api/convlabel/get`.
+    BootstrapFetchLabelsApi { boot_gen: u64 },
+    /// Step 4b: fetches hidden conversations snapshot.
+    BootstrapFetchHiddenApi { boot_gen: u64 },
+    /// Step 4c: concurrently fetches friends, groups list, sent requests, and received requests.
+    BootstrapFetchContactsApi { boot_gen: u64 },
+    /// Step 5: fetches `/api/preloadconvers/get-last-msgs` (overview or 25-ID chunk).
+    BootstrapFetchPreloadApi {
+        boot_gen: u64,
+        thread_ids: Vec<String>,
+        is_overview: bool,
+    },
+    /// Step 6: fetches recent history for self-cloud (`is_old = Some(false)`).
+    BootstrapFetchHistoryApi {
+        boot_gen: u64,
+        conv_id: String,
+        count: i64,
+    },
+    /// Step 7: fetches one wave of up to 6 group histories concurrently, returning in `gids` order.
+    BootstrapFetchGroupWaveApi {
+        boot_gen: u64,
+        gids: Vec<String>,
+        count: i64,
+    },
+    /// Step 8: resolves one chunk of up to 50 missing-name UIDs during bootstrap finalize.
+    BootstrapFetchProfilesChunkApi {
+        boot_gen: u64,
+        chunk: Vec<String>,
+        remaining_chunks: Vec<Vec<String>>,
+        profiles_cache_changed: bool,
+    },
+
+    /// Calls `ZaloApi::fetch_history` for `Open` or `LoadOlder`.
+    FetchHistoryPageApi {
+        conv_id: String,
+        before_msg_id: Option<String>,
+        count: i64,
+        is_old: Option<bool>,
+        purpose: HistoryFetchPurpose,
+    },
+    /// Calls `ZaloApi::fetch_profiles` for one chunk of up to 50 sender/reactor UIDs.
+    FetchSenderProfilesChunkApi {
+        resolve_id: u64,
+        conv_id: String,
+        chunk: Vec<String>,
+        remaining_chunks: Vec<Vec<String>>,
+        cache_updated: bool,
+    },
+
+    // U5
+    /// Calls `ZaloApi::send_typing` when `SessionClient::is_authenticated()` is true.
+    SendTypingApi { conv_id: String },
+    /// Starts or resets the incoming typing expiry timer for `conv_id`.
+    StartTypingExpiry {
+        conv_id: String,
+        expiry_gen: u64,
+        delay: Duration,
+    },
+    /// Cancels any active incoming typing expiry timer for `conv_id`.
+    CancelTypingExpiry { conv_id: String },
+    // U5-send
+    /// Calls `ZaloApi::send_text` for a plain-text send and returns [`Input::SendTextDone`].
+    SendTextApi {
+        send_id: u64,
+        params: SendTextParams,
+    },
 
     /// Domain activity delegated to Swift via `CoreHost`.
     Host(HostCall),
@@ -589,6 +870,98 @@ impl fmt::Debug for Effect {
                 .finish(),
             Self::UpdateConversationLabelsApi { .. } => f.write_str("UpdateConversationLabelsApi"),
             Self::FetchConversationLabelsApi { .. } => f.write_str("FetchConversationLabelsApi"),
+            // U4-bootstrap
+            Self::CancelBootstrapTasks => f.write_str("CancelBootstrapTasks"),
+            Self::BootstrapFetchAliasesApi { boot_gen } => f
+                .debug_struct("BootstrapFetchAliasesApi")
+                .field("boot_gen", boot_gen)
+                .finish(),
+            Self::BootstrapFetchPamApi { boot_gen } => f
+                .debug_struct("BootstrapFetchPamApi")
+                .field("boot_gen", boot_gen)
+                .finish(),
+            Self::BootstrapFetchLabelsApi { boot_gen } => f
+                .debug_struct("BootstrapFetchLabelsApi")
+                .field("boot_gen", boot_gen)
+                .finish(),
+            Self::BootstrapFetchHiddenApi { boot_gen } => f
+                .debug_struct("BootstrapFetchHiddenApi")
+                .field("boot_gen", boot_gen)
+                .finish(),
+            Self::BootstrapFetchContactsApi { boot_gen } => f
+                .debug_struct("BootstrapFetchContactsApi")
+                .field("boot_gen", boot_gen)
+                .finish(),
+            Self::BootstrapFetchPreloadApi {
+                boot_gen,
+                thread_ids,
+                is_overview,
+            } => f
+                .debug_struct("BootstrapFetchPreloadApi")
+                .field("boot_gen", boot_gen)
+                .field("thread_count", &thread_ids.len())
+                .field("is_overview", is_overview)
+                .finish(),
+            Self::BootstrapFetchHistoryApi {
+                boot_gen, count, ..
+            } => f
+                .debug_struct("BootstrapFetchHistoryApi")
+                .field("boot_gen", boot_gen)
+                .field("count", count)
+                .finish(),
+            Self::BootstrapFetchGroupWaveApi {
+                boot_gen,
+                gids,
+                count,
+            } => f
+                .debug_struct("BootstrapFetchGroupWaveApi")
+                .field("boot_gen", boot_gen)
+                .field("gids_count", &gids.len())
+                .field("count", count)
+                .finish(),
+            Self::BootstrapFetchProfilesChunkApi {
+                boot_gen,
+                chunk,
+                remaining_chunks,
+                ..
+            } => f
+                .debug_struct("BootstrapFetchProfilesChunkApi")
+                .field("boot_gen", boot_gen)
+                .field("chunk_len", &chunk.len())
+                .field("remaining_chunks", &remaining_chunks.len())
+                .finish(),
+            Self::FetchHistoryPageApi { count, purpose, .. } => f
+                .debug_struct("FetchHistoryPageApi")
+                .field("count", count)
+                .field("purpose", purpose)
+                .finish(),
+            Self::FetchSenderProfilesChunkApi {
+                resolve_id,
+                chunk,
+                remaining_chunks,
+                ..
+            } => f
+                .debug_struct("FetchSenderProfilesChunkApi")
+                .field("resolve_id", resolve_id)
+                .field("chunk_len", &chunk.len())
+                .field("remaining", &remaining_chunks.len())
+                .finish(),
+            // U5
+            Self::SendTypingApi { .. } => f.write_str("SendTypingApi"),
+            Self::StartTypingExpiry {
+                expiry_gen, delay, ..
+            } => f
+                .debug_struct("StartTypingExpiry")
+                .field("expiry_gen", expiry_gen)
+                .field("delay_ms", &delay.as_millis())
+                .finish(),
+            Self::CancelTypingExpiry { .. } => f.write_str("CancelTypingExpiry"),
+            // U5-send
+            Self::SendTextApi { send_id, params } => f
+                .debug_struct("SendTextApi")
+                .field("send_id", send_id)
+                .field("params", params)
+                .finish(),
             Self::Host(call) => f.debug_tuple("Host").field(call).finish(),
         }
     }

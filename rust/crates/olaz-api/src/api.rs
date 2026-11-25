@@ -57,6 +57,12 @@ impl<T: Transport> ZaloApi<T> {
         Arc::try_unwrap(self.client)
     }
 
+    /// Resets per-session API state (`cloud_is_old_by_conv`, `archived_version`, `label_version`,
+    /// and global-id caches) on log out / session reset.
+    pub fn reset_state(&self) {
+        *self.state() = ApiState::default();
+    }
+
     pub(crate) fn state(&self) -> MutexGuard<'_, ApiState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
