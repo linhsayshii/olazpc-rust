@@ -1166,6 +1166,529 @@ final class PinRecorderTests: XCTestCase {
                     .object(["cmd": .string("request_unpin_message"), "args": .object(["conv_id": .string("g500708"), "msg_id": .string("90802")])]),
                 ]
             ),
+
+            // 9. can_pin_rules: board missing / not ready / cannot pin, E2EE, each excluded kind,
+            // sending / failed, normal message, plus is_pinned (message vs poll).
+            PinRecorderHarness.ScenarioDef(
+                name: "can_pin_rules",
+                seed: PinRecorderHarness.readySessionSeed(
+                    userId: "2000709",
+                    displayName: "Pin User 9",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "history_freshness": .object([
+                            "g500709": .string("up_to_date"),
+                        ]),
+                        "local_conversations": .array([
+                            localConv(id: "g500709", isGroup: true, name: "Nhóm CanPin", previewText: "Poll", previewTsMs: 1700000011000),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(id: "90901", convId: "g500709", senderId: "2000709", senderName: "Pin User 9", isMine: true, text: "Tin đã ghim", tsMs: 1700000001000),
+                            storedMsg(
+                                id: "90902",
+                                convId: "g500709",
+                                senderId: "2000709",
+                                senderName: "Pin User 9",
+                                isMine: true,
+                                text: "Ảnh thường",
+                                tsMs: 1700000002000,
+                                kindTag: "photo",
+                                kindObj: .object(["type": .string("photo"), "url": .string("https://cdn.example.invalid/p9.jpg"), "width": .int(80), "height": .int(80)])
+                            ),
+                            storedMsg(id: "90903", convId: "g500709", senderId: "2000709", senderName: "Pin User 9", isMine: true, text: "E2EE", tsMs: 1700000003000, isE2EE: true),
+                            storedMsg(id: "90904", convId: "g500709", senderId: "2000709", senderName: "Pin User 9", isMine: true, text: "", tsMs: 1700000004000, kindTag: "recalled"),
+                            storedMsg(
+                                id: "90905",
+                                convId: "g500709",
+                                senderId: "2000709",
+                                senderName: "Pin User 9",
+                                isMine: true,
+                                text: "",
+                                tsMs: 1700000005000,
+                                kindTag: "call",
+                                kindObj: .object(["type": .string("call"), "video": .bool(false), "missed": .bool(true), "duration": .int(0), "title": .string("Cuộc gọi nhỡ"), "detail": .string("")])
+                            ),
+                            storedMsg(
+                                id: "90906",
+                                convId: "g500709",
+                                senderId: "2000709",
+                                senderName: "Pin User 9",
+                                isMine: true,
+                                text: "",
+                                tsMs: 1700000006000,
+                                kindTag: "placeholder",
+                                kindObj: .object(["type": .string("placeholder"), "symbol": .string("lock"), "text": .string("Chờ giải mã")])
+                            ),
+                            storedMsg(id: "90907", convId: "g500709", senderId: "2000709", senderName: "Pin User 9", isMine: true, text: "Hệ thống", tsMs: 1700000007000, kindTag: "system"),
+                            storedMsg(
+                                id: "90908",
+                                convId: "g500709",
+                                senderId: "2000709",
+                                senderName: "Pin User 9",
+                                isMine: true,
+                                text: "",
+                                tsMs: 1700000008000,
+                                kindTag: "notice",
+                                kindObj: .object(["type": .string("notice"), "symbol": .string("info.circle"), "text": .string("Thông báo")])
+                            ),
+                            storedMsg(id: "90909", convId: "g500709", senderId: "2000709", senderName: "Pin User 9", isMine: true, text: "Đang gửi", tsMs: 1700000009000, status: "sending"),
+                            storedMsg(id: "90910", convId: "g500709", senderId: "2000709", senderName: "Pin User 9", isMine: true, text: "Gửi lỗi", tsMs: 1700000010000, status: "failed"),
+                            storedMsg(
+                                id: "90911",
+                                convId: "g500709",
+                                senderId: "2000709",
+                                senderName: "Pin User 9",
+                                isMine: true,
+                                text: "Bình chọn",
+                                tsMs: 1700000011000,
+                                kindTag: "poll",
+                                kindObj: .object(["type": .string("poll"), "question": .string("Bình chọn?"), "header": .string(""), "anonymous": .bool(false), "pollId": .string("p909"), "conversationId": .string("g500709")])
+                            ),
+                        ]),
+                        "pins": .object([
+                            "g_not_ready": .object([
+                                "convId": .string("g_not_ready"),
+                                "ready": .bool(false),
+                                "canPin": .bool(true),
+                                "limit": .int(3),
+                                "items": .array([]),
+                            ]),
+                            "g_cant_pin": .object([
+                                "convId": .string("g_cant_pin"),
+                                "ready": .bool(true),
+                                "canPin": .bool(false),
+                                "limit": .int(3),
+                                "items": .array([]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    PinRecorderHarness.loginInfoScript(uid: "2000709", displayName: "Pin User 9"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000709", displayName: "Pin User 9"),
+                    PinRecorderHarness.httpScript(
+                        path: "/api/board/pin/list",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "boardVersion": .int(1),
+                                "pinLimit": .int(3),
+                                "topics": .array([
+                                    .object(["id": .string("t_p1"), "type": .int(2), "params": .object(["global_msg_id": .string("90901"), "title": .string("Tin đã ghim")])]),
+                                    .object(["id": .string("t_poll"), "type": .int(3), "params": .object(["global_msg_id": .string("90911"), "title": .string("Bình chọn")])]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("g500709")])]),
+                    .object([
+                        "cmd": .string("apply_batch"),
+                        "args": .object([
+                            "payload": .object([
+                                "msgs": .array([
+                                    .object([
+                                        "msgId": .string("90920"),
+                                        "cliMsgId": .string("c90920"),
+                                        "uidFrom": .string("2000709"),
+                                        "idTo": .string("g_missing"),
+                                        "dName": .string("Pin User 9"),
+                                        "ts": .int(1700000012000),
+                                        "msgType": .string("webchat"),
+                                        "content": .string("Missing board"),
+                                    ]),
+                                    .object([
+                                        "msgId": .string("90921"),
+                                        "cliMsgId": .string("c90921"),
+                                        "uidFrom": .string("2000709"),
+                                        "idTo": .string("g_not_ready"),
+                                        "dName": .string("Pin User 9"),
+                                        "ts": .int(1700000013000),
+                                        "msgType": .string("webchat"),
+                                        "content": .string("Not ready"),
+                                    ]),
+                                    .object([
+                                        "msgId": .string("90922"),
+                                        "cliMsgId": .string("c90922"),
+                                        "uidFrom": .string("2000709"),
+                                        "idTo": .string("g_cant_pin"),
+                                        "dName": .string("Pin User 9"),
+                                        "ts": .int(1700000014000),
+                                        "msgType": .string("webchat"),
+                                        "content": .string("Cant pin"),
+                                    ]),
+                                ]),
+                            ]),
+                            "default_cmd": .int(502),
+                            "increment_unread": .bool(false),
+                            "notify_incoming": .bool(false),
+                            "persist_conversations": .bool(false),
+                        ]),
+                    ]),
+                    .object(["cmd": .string("can_pin"), "args": .object(["conv_id": .string("g_missing"), "msg_id": .string("90920")])]),
+                    .object(["cmd": .string("can_pin"), "args": .object(["conv_id": .string("g_not_ready"), "msg_id": .string("90921")])]),
+                    .object(["cmd": .string("can_pin"), "args": .object(["conv_id": .string("g_cant_pin"), "msg_id": .string("90922")])]),
+                    .object(["cmd": .string("can_pin"), "args": .object(["conv_id": .string("g500709"), "msg_id": .string("90901")])]),
+                    .object(["cmd": .string("can_pin"), "args": .object(["conv_id": .string("g500709"), "msg_id": .string("90902")])]),
+                    .object(["cmd": .string("can_pin"), "args": .object(["conv_id": .string("g500709"), "msg_id": .string("90903")])]),
+                    .object(["cmd": .string("can_pin"), "args": .object(["conv_id": .string("g500709"), "msg_id": .string("90904")])]),
+                    .object(["cmd": .string("can_pin"), "args": .object(["conv_id": .string("g500709"), "msg_id": .string("90905")])]),
+                    .object(["cmd": .string("can_pin"), "args": .object(["conv_id": .string("g500709"), "msg_id": .string("90906")])]),
+                    .object(["cmd": .string("can_pin"), "args": .object(["conv_id": .string("g500709"), "msg_id": .string("90907")])]),
+                    .object(["cmd": .string("can_pin"), "args": .object(["conv_id": .string("g500709"), "msg_id": .string("90908")])]),
+                    .object(["cmd": .string("can_pin"), "args": .object(["conv_id": .string("g500709"), "msg_id": .string("90909")])]),
+                    .object(["cmd": .string("can_pin"), "args": .object(["conv_id": .string("g500709"), "msg_id": .string("90910")])]),
+                    .object(["cmd": .string("can_pin"), "args": .object(["conv_id": .string("g500709"), "msg_id": .string("90911")])]),
+                    .object(["cmd": .string("is_pinned"), "args": .object(["conv_id": .string("g500709"), "msg_id": .string("90901")])]),
+                    .object(["cmd": .string("is_pinned"), "args": .object(["conv_id": .string("g500709"), "msg_id": .string("90902")])]),
+                    .object(["cmd": .string("is_pinned"), "args": .object(["conv_id": .string("g500709"), "msg_id": .string("90911")])]),
+                ]
+            ),
+
+            // 10. load_pinned: already in window, older only in SQLite loaded via ensureMessageLoaded
+            // (by msgId and by cliMsgId), not found, non-message kind.
+            PinRecorderHarness.ScenarioDef(
+                name: "load_pinned",
+                seed: PinRecorderHarness.readySessionSeed(
+                    userId: "2000710",
+                    displayName: "Pin User 10",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "open_conversation_id": .string("g500710"),
+                        "local_messages": .array([
+                            storedMsg(id: "91001", convId: "g500710", clientId: "c91001", senderId: "2000710", senderName: "Pin User 10", isMine: true, text: "Cũ 1", tsMs: 1700000001000),
+                            storedMsg(id: "91002", convId: "g500710", clientId: "c91002", senderId: "2000710", senderName: "Pin User 10", isMine: true, text: "Cũ 2 (msgId)", tsMs: 1700000002000),
+                            storedMsg(id: "91003", convId: "g500710", clientId: "c91003", senderId: "2000710", senderName: "Pin User 10", isMine: true, text: "Cũ 3", tsMs: 1700000003000),
+                            storedMsg(id: "91101", convId: "g500711", clientId: "c91101", senderId: "2000710", senderName: "Pin User 10", isMine: true, text: "Cũ 4 (cliMsgId)", tsMs: 1700000001000),
+                        ]),
+                        "pins": .object([
+                            "g500710": .object([
+                                "convId": .string("g500710"),
+                                "ready": .bool(true),
+                                "canPin": .bool(true),
+                                "limit": .int(5),
+                                "items": .array([
+                                    .object(["ref": .string("t_mem"), "kind": .string("message"), "title": .string("In window"), "msgId": .string("91010"), "cliMsgId": .string("c91010")]),
+                                    .object(["ref": .string("t_by_msg"), "kind": .string("message"), "title": .string("By msgId"), "msgId": .string("91002"), "cliMsgId": .string("")]),
+                                    .object(["ref": .string("t_missing"), "kind": .string("message"), "title": .string("Missing"), "msgId": .string("91999"), "cliMsgId": .string("c91999")]),
+                                    .object(["ref": .string("t_note"), "kind": .string("note"), "title": .string("Note"), "msgId": .string("91010"), "cliMsgId": .string("c91010")]),
+                                ]),
+                            ]),
+                            "g500711": .object([
+                                "convId": .string("g500711"),
+                                "ready": .bool(true),
+                                "canPin": .bool(true),
+                                "limit": .int(5),
+                                "items": .array([
+                                    .object(["ref": .string("t_by_cli"), "kind": .string("message"), "title": .string("By cliMsgId"), "msgId": .string(""), "cliMsgId": .string("c91101")]),
+                                ]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    PinRecorderHarness.loginInfoScript(uid: "2000710", displayName: "Pin User 10"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000710", displayName: "Pin User 10"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object([
+                        "cmd": .string("apply_batch"),
+                        "args": .object([
+                            "payload": .object([
+                                "msgs": .array([
+                                    .object([
+                                        "msgId": .string("91010"),
+                                        "cliMsgId": .string("c91010"),
+                                        "uidFrom": .string("2000710"),
+                                        "idTo": .string("g500710"),
+                                        "dName": .string("Pin User 10"),
+                                        "ts": .int(1700000010000),
+                                        "msgType": .string("webchat"),
+                                        "content": .string("Trong cửa sổ"),
+                                    ]),
+                                    .object([
+                                        "msgId": .string("91110"),
+                                        "cliMsgId": .string("c91110"),
+                                        "uidFrom": .string("2000710"),
+                                        "idTo": .string("g500711"),
+                                        "dName": .string("Pin User 10"),
+                                        "ts": .int(1700000010000),
+                                        "msgType": .string("webchat"),
+                                        "content": .string("Trong cửa sổ 2"),
+                                    ]),
+                                ]),
+                            ]),
+                            "default_cmd": .int(502),
+                            "increment_unread": .bool(false),
+                            "notify_incoming": .bool(false),
+                            "persist_conversations": .bool(false),
+                        ]),
+                    ]),
+                    .object(["snapshot": .string("before_load")]),
+                    .object(["cmd": .string("load_pinned"), "args": .object(["conv_id": .string("g500710"), "ref": .string("t_mem")])]),
+                    .object(["cmd": .string("load_pinned"), "args": .object(["conv_id": .string("g500710"), "ref": .string("t_by_msg")])]),
+                    .object(["snapshot": .string("after_by_msg")]),
+                    .object(["cmd": .string("load_pinned"), "args": .object(["conv_id": .string("g500711"), "ref": .string("t_by_cli")])]),
+                    .object(["cmd": .string("load_pinned"), "args": .object(["conv_id": .string("g500710"), "ref": .string("t_missing")])]),
+                    .object(["cmd": .string("load_pinned"), "args": .object(["conv_id": .string("g500710"), "ref": .string("t_note")])]),
+                ]
+            ),
+
+            // 11. pin_events: every group & fr act, conversationIds list, 0 / empty ids,
+            // acts not in sets, open conversation refreshed vs closed dropped, log shape.
+            PinRecorderHarness.ScenarioDef(
+                name: "pin_events",
+                seed: PinRecorderHarness.readySessionSeed(
+                    userId: "2000711",
+                    displayName: "Pin User 11",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "contacts": .object([
+                            "friends": .array([
+                                seedFriend(id: "3000711", name: "An Nguyễn", avatar: "https://cdn.example.invalid/an11.jpg"),
+                            ]),
+                        ]),
+                        "open_conversation_id": .string("g500711"),
+                        "history_freshness": .object([
+                            "g500711": .string("up_to_date"),
+                            "3000711": .string("up_to_date"),
+                        ]),
+                        "local_conversations": .array([
+                            localConv(id: "3000711", isGroup: false, name: "An Nguyễn", members: 2, previewText: "Hi", previewTsMs: 1700000001000),
+                        ]),
+                        "pins": .object([
+                            "g500711": .object(["convId": .string("g500711"), "ready": .bool(true), "canPin": .bool(true), "limit": .int(3), "items": .array([])]),
+                            "g500712": .object([
+                                "convId": .string("g500712"),
+                                "ready": .bool(true),
+                                "canPin": .bool(true),
+                                "limit": .int(3),
+                                "items": .array([.object(["ref": .string("t_old"), "kind": .string("note"), "title": .string("Old")])]),
+                            ]),
+                            "3000711": .object([
+                                "convId": .string("3000711"),
+                                "ready": .bool(true),
+                                "canPin": .bool(true),
+                                "limit": .int(3),
+                                "items": .array([.object(["ref": .string("ft_old"), "kind": .string("message"), "title": .string("Old 1-1")])]),
+                            ]),
+                            "3000712": .object([
+                                "convId": .string("3000712"),
+                                "ready": .bool(true),
+                                "canPin": .bool(true),
+                                "limit": .int(3),
+                                "items": .array([.object(["ref": .string("ft_old2"), "kind": .string("message"), "title": .string("Old 1-1 2")])]),
+                            ]),
+                        ]),
+                        "board_raw_topics": .object([
+                            "g500712": .object([
+                                "version": .int(2),
+                                "topics": .object([
+                                    "t_old": .object(["id": .string("t_old"), "type": .int(0)]),
+                                ]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    PinRecorderHarness.loginInfoScript(uid: "2000711", displayName: "Pin User 11"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000711", displayName: "Pin User 11"),
+                    // 1) new_pin_topic on open g500711
+                    PinRecorderHarness.httpScript(
+                        path: "/api/board/pin/list",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "boardVersion": .int(10),
+                                "pinLimit": .int(3),
+                                "topics": .array([
+                                    .object(["id": .string("t_ev1"), "type": .int(2), "params": .object(["title": .string("Ev 1")])]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    // 2) unpin_topic on open g500711
+                    PinRecorderHarness.httpScript(
+                        path: "/api/board/pin/list",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object(["boardVersion": .int(11), "pinLimit": .int(3), "topics": .array([])]),
+                        ])
+                    ),
+                    // 3) reorder_pin_topic on open g500711
+                    PinRecorderHarness.httpScript(
+                        path: "/api/board/pin/list",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "boardVersion": .int(12),
+                                "pinLimit": .int(3),
+                                "topics": .array([
+                                    .object(["id": .string("t_ev2"), "type": .int(0), "params": .object(["title": .string("Ev 2")])]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    // 4) open 3000711 -> initial friend board refresh
+                    PinRecorderHarness.httpScript(
+                        path: "/api/friendboard/list",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object(["version": .int(1), "pinLimit": .int(3), "data": .array([])]),
+                        ])
+                    ),
+                    // 5) fr pin_create on open 3000711 -> refresh
+                    PinRecorderHarness.httpScript(
+                        path: "/api/friendboard/list",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "version": .int(2),
+                                "pinLimit": .int(3),
+                                "data": .array([
+                                    .object(["id": .string("ft_ev1"), "type": .int(2), "params": .object(["title": .string("Friend Ev 1")])]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    // Group acts: open refreshed, closed dropped
+                    .object(["cmd": .string("pin_event"), "args": .object(["act_type": .string("group"), "act": .string("new_pin_topic"), "data": .object(["groupId": .string("500711")])])]),
+                    .object(["snapshot": .string("after_open_group_event")]),
+                    .object(["cmd": .string("pin_event"), "args": .object(["act_type": .string(""), "act": .string("update_pin_topic"), "data": .object(["grid": .string("g500712")])])]),
+                    .object(["snapshot": .string("after_closed_group_event")]),
+                    .object(["cmd": .string("pin_event"), "args": .object(["act_type": .string("group"), "act": .string("unpin_topic"), "data": .object(["gid": .string("500711")])])]),
+                    .object(["cmd": .string("pin_event"), "args": .object(["act_type": .string("group"), "act": .string("reorder_pin_topic"), "data": .object(["groupId": .string("500711")])])]),
+                    // fr acts on closed 1-1s + conversationIds list with "0" and ""
+                    .object(["cmd": .string("pin_event"), "args": .object(["act_type": .string("fr"), "act": .string("pin_create"), "data": .object(["conversationId": .string(" 3000711 ")])])]),
+                    .object(["cmd": .string("pin_event"), "args": .object(["act_type": .string("fr"), "act": .string("pin_unpin"), "data": .object(["conversationId": .string("3000712")])])]),
+                    .object(["cmd": .string("pin_event"), "args": .object(["act_type": .string("fr"), "act": .string("pin_reorder"), "data": .object(["conversationId": .string("3000711")])])]),
+                    .object(["cmd": .string("pin_event"), "args": .object(["act_type": .string("fr"), "act": .string("pin_force_sync"), "data": .object(["conversationIds": .array([.string("3000711"), .string("0"), .string(""), .string("3000712")])])])]),
+                    // Non-matching acts and invalid ids -> []
+                    .object(["cmd": .string("pin_event"), "args": .object(["act_type": .string("group"), "act": .string("join"), "data": .object(["groupId": .string("500711")])])]),
+                    .object(["cmd": .string("pin_event"), "args": .object(["act_type": .string("fr"), "act": .string("add"), "data": .object(["conversationId": .string("3000711")])])]),
+                    .object(["cmd": .string("pin_event"), "args": .object(["act_type": .string("other"), "act": .string("new_pin_topic"), "data": .object(["groupId": .string("500711")])])]),
+                    .object(["cmd": .string("pin_event"), "args": .object(["act_type": .string("group"), "act": .string("new_pin_topic"), "data": .object(["groupId": .string("0")])])]),
+                    .object(["cmd": .string("pin_event"), "args": .object(["act_type": .string("group"), "act": .string("new_pin_topic"), "data": .object(["groupId": .string("")])])]),
+                    .object(["cmd": .string("pin_event"), "args": .object(["act_type": .string("fr"), "act": .string("pin_create"), "data": .object(["conversationId": .string("0")])])]),
+                    // Open 1-1 and receive fr pin_create -> refreshed
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000711")])]),
+                    .object(["cmd": .string("pin_event"), "args": .object(["act_type": .string("fr"), "act": .string("pin_create"), "data": .object(["conversationId": .string("3000711")])])]),
+                ]
+            ),
+
+            // 12. pins_state: adapter state shape; invalid/empty ignored; same list twice -> no change; updated list applied.
+            PinRecorderHarness.ScenarioDef(
+                name: "pins_state",
+                seed: PinRecorderHarness.readySessionSeed(
+                    userId: "2000712",
+                    displayName: "Pin User 12",
+                    suppress: ["ws", "long_poll"]
+                ),
+                server: [
+                    PinRecorderHarness.loginInfoScript(uid: "2000712", displayName: "Pin User 12"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000712", displayName: "Pin User 12"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    // Invalid / empty convId -> ignored
+                    .object(["cmd": .string("pins_state"), "args": .object(["json": .object([:])])]),
+                    .object(["cmd": .string("pins_state"), "args": .object(["json": .object(["pins": .object(["convId": .string("")])])])]),
+                    .object([
+                        "cmd": .string("pins_state"),
+                        "args": .object([
+                            "json": .object([
+                                "pins": .object([
+                                    "convId": .string("g500712"),
+                                    "ready": .bool(true),
+                                    "canPin": .bool(true),
+                                    "limit": .int(4),
+                                    "items": .array([
+                                        .object([
+                                            "ref": .string("t_s1"),
+                                            "kind": .string("message"),
+                                            "title": .string("Tin adapter"),
+                                            "sender": .string("An"),
+                                            "thumb": .string("https://cdn.example.invalid/s1.jpg"),
+                                            "msgId": .string("91201"),
+                                            "cliMsgId": .string("c91201"),
+                                        ]),
+                                        .object([
+                                            "ref": .string("t_s2"),
+                                            "kind": .string("reminder"),
+                                            "title": .string("Nhắc hẹn"),
+                                            "sender": .string("Bình"),
+                                        ]),
+                                    ]),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                    .object(["snapshot": .string("after_first")]),
+                    // Exact same list again -> unchanged
+                    .object([
+                        "cmd": .string("pins_state"),
+                        "args": .object([
+                            "json": .object([
+                                "pins": .object([
+                                    "convId": .string("g500712"),
+                                    "ready": .bool(true),
+                                    "canPin": .bool(true),
+                                    "limit": .int(4),
+                                    "items": .array([
+                                        .object([
+                                            "ref": .string("t_s1"),
+                                            "kind": .string("message"),
+                                            "title": .string("Tin adapter"),
+                                            "sender": .string("An"),
+                                            "thumb": .string("https://cdn.example.invalid/s1.jpg"),
+                                            "msgId": .string("91201"),
+                                            "cliMsgId": .string("c91201"),
+                                        ]),
+                                        .object([
+                                            "ref": .string("t_s2"),
+                                            "kind": .string("reminder"),
+                                            "title": .string("Nhắc hẹn"),
+                                            "sender": .string("Bình"),
+                                        ]),
+                                    ]),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                    .object(["snapshot": .string("after_same")]),
+                    // Updated list
+                    .object([
+                        "cmd": .string("pins_state"),
+                        "args": .object([
+                            "json": .object([
+                                "pins": .object([
+                                    "convId": .string("g500712"),
+                                    "ready": .bool(true),
+                                    "canPin": .bool(false),
+                                    "limit": .int(2),
+                                    "items": .array([]),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                ]
+            ),
         ]
     }
 }
