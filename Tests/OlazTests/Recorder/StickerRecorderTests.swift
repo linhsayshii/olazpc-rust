@@ -716,6 +716,53 @@ final class StickerRecorderTests: XCTestCase {
                 ]
             ),
 
+            // 7c. my_card_e2ee: E2EE 1-1 thread, signed in, send with and without phone (today goes plain).
+            StickerRecorderHarness.ScenarioDef(
+                name: "my_card_e2ee",
+                seed: StickerRecorderHarness.readySessionSeed(
+                    userId: "2001327",
+                    displayName: "Card User E2EE",
+                    phone: "+84900001327",
+                    extras: [
+                        "next_client_id": .int(5000013270001),
+                        "e2ee_threads": .array([.string("3001327")]),
+                        "local_conversations": .array([
+                            localConv(id: "3001327", name: "Card E2EE Peer 7c"),
+                        ]),
+                    ]
+                ),
+                server: [
+                    StickerRecorderHarness.loginInfoScript(uid: "2001327", displayName: "Card User E2EE"),
+                    StickerRecorderHarness.profileMeScript(uid: "2001327", displayName: "Card User E2EE", phone: "+84900001327"),
+                    // With phone (plain path today)
+                    StickerRecorderHarness.httpScript(
+                        path: "/api/message/contact",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["msgId": .string("9013721")])])
+                    ),
+                    // Without phone (plain path today)
+                    StickerRecorderHarness.httpScript(
+                        path: "/api/message/contact",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["msgId": .string("9013722")])])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object([
+                        "cmd": .string("send_my_card"),
+                        "now_ms": .int(1700000721000),
+                        "args": .object(["conv_id": .string("3001327"), "with_phone": .bool(true)]),
+                    ]),
+                    .object([
+                        "cmd": .string("send_my_card"),
+                        "now_ms": .int(1700000722000),
+                        "args": .object(["conv_id": .string("3001327"), "with_phone": .bool(false)]),
+                    ]),
+                ]
+            ),
+
             // 8. reminders: info for 1-1, group, self; create ok with each repeat mode (0,1,2,3) and pin; failure text.
             StickerRecorderHarness.ScenarioDef(
                 name: "reminders",
