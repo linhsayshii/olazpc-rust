@@ -357,25 +357,15 @@ fn reduce_send_text_done(
             pending.optimistic.status = Status::Sent;
 
             if state.messages.windows.contains_key(&pending.conv_id) {
-                let remove_ids = if pending.cli_id == pending.optimistic.id {
-                    vec![pending.cli_id.clone()]
-                } else {
-                    vec![pending.cli_id.clone(), pending.optimistic.id.clone()]
-                };
-                let removed = matches!(
-                    state
-                        .messages
-                        .write_through_remove(&pending.conv_id, &remove_ids),
-                    WindowChange::Changed(_)
-                );
                 let snap = state.identity_snapshot();
-                let merged = matches!(
-                    state
-                        .messages
-                        .merge_message(pending.optimistic.clone(), None, &snap),
+                if matches!(
+                    state.messages.merge_message(
+                        pending.optimistic.clone(),
+                        Some(&pending.cli_id),
+                        &snap
+                    ),
                     WindowChange::Changed(_)
-                );
-                if removed || merged {
+                ) {
                     out.dirty.insert(DirtyKey::Messages);
                 }
             }
