@@ -341,7 +341,7 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         payloadJson: String
     ) async -> BatchApplyDeltaRecord {
         guard let engine else {
-            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], persistConversations: false)
+            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], previewOverrides: [], persistConversations: false)
         }
         let box = ZaloJSONBox(JSONLossless.parseObject(string: payloadJson) ?? [:])
         let delta = await engine.hostApplyBatch(
@@ -367,7 +367,7 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         payload: CoreWirePayload
     ) async -> BatchApplyDeltaRecord {
         guard let engine else {
-            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], persistConversations: false)
+            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], previewOverrides: [], persistConversations: false)
         }
         let context = await engine.hostLookupNameContext(uids: uids)
         let resolvedWire = payload.resolve(
@@ -916,7 +916,7 @@ extension ZaloEngine {
             "notify_incoming": notifyIncoming,
             "payload": box.dict,
         ]) else {
-            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], persistConversations: false)
+            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], previewOverrides: [], persistConversations: false)
         }
         return await applyBatchResponseCollectingDelta(
             box.dict,
@@ -938,7 +938,7 @@ extension ZaloEngine {
             "notify_incoming": notifyIncoming,
             "events": ZaloEngine.serializeParsedWireEvents(events),
         ]) else {
-            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], persistConversations: false)
+            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], previewOverrides: [], persistConversations: false)
         }
         return await applyParsedEventsCollectingDelta(
             events,
@@ -1207,15 +1207,40 @@ extension ZaloEngine {
     }
 
     internal func commitBatchDeltaToCore(_ delta: BatchApplyDeltaRecord) async {
-        guard delta.appliedCount > 0 || !delta.updates.isEmpty else { return }
+        guard delta.appliedCount > 0 || !delta.updates.isEmpty || !delta.previewOverrides.isEmpty else { return }
         if let core = coreLifecycle.core {
             if let v = try? await core.applyBatchDelta(delta: delta) {
                 await waitForMirrorVersion(v)
             }
             return
         }
+        let overrideIds = Set(delta.previewOverrides.map(\.convId))
+        var beforePreviews: [String: ConversationSummary.Preview?] = [:]
+        if !overrideIds.isEmpty {
+            for conv in conversations where overrideIds.contains(conv.id) {
+                beforePreviews[conv.id] = conv.preview
+            }
+        }
         let batch = offlineConversationsCore().applyBatchDelta(delta: delta)
         applyCoreChanges(batch)
+        if delta.persistConversations {
+            await persistConversationsToSQLite()
+            for id in overrideIds {
+                guard let conv = conversations.first(where: { $0.id == id }) else { continue }
+                let prevBefore = beforePreviews[id] ?? nil
+                if prevBefore != conv.preview {
+                    let previewText = conv.preview?.text ?? ""
+                    let previewTsMs = conv.preview?.date.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) } ?? 0
+                    let previewFromMe = conv.preview?.fromMe ?? false
+                    try? await sqliteStore?.setConversationPreview(
+                        id: id,
+                        previewText: previewText,
+                        previewTsMs: previewTsMs,
+                        previewFromMe: previewFromMe
+                    )
+                }
+            }
+        }
     }
 
     internal func messagePreviewInputRecord(for msg: ChatMessage) -> MessagePreviewInputRecord {

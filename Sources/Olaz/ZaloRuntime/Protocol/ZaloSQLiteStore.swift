@@ -201,6 +201,24 @@ actor ZaloSQLiteStore {
         } catch { throw RustCore.mapError(error) }
     }
 
+    func setConversationPreview(
+        id: String,
+        previewText: String,
+        previewTsMs: Int64,
+        previewFromMe: Bool,
+        updatedAtMs: Int64 = Int64((Date().timeIntervalSince1970 * 1000).rounded())
+    ) async throws {
+        do {
+            try await core.setConversationPreview(
+                id: id,
+                previewText: previewText,
+                previewTsMs: previewTsMs,
+                previewFromMe: previewFromMe,
+                updatedAtMs: updatedAtMs
+            )
+        } catch { throw RustCore.mapError(error) }
+    }
+
     func deleteConversation(id: String) async throws {
         do {
             try await core.deleteConversation(id: id)
