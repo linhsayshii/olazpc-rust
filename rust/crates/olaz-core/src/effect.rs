@@ -171,7 +171,9 @@ impl fmt::Debug for StoreOp {
                 .field("count", &rows.len())
                 .field("preserve_reactions", preserve_existing_reactions)
                 .finish(),
-            Self::LoadOpenLocalMessages { open_seq, limit, .. } => f
+            Self::LoadOpenLocalMessages {
+                open_seq, limit, ..
+            } => f
                 .debug_struct("LoadOpenLocalMessages")
                 .field("open_seq", open_seq)
                 .field("limit", limit)
@@ -369,6 +371,8 @@ pub enum HostCall {
         conv_id: String,
         sender_id: String,
     },
+    /// Fires after a transport-originated batch/parsed-events ingestion and all Pass 2 host jobs complete.
+    TransportBatchSettled,
 }
 
 impl fmt::Debug for HostCall {
@@ -496,6 +500,7 @@ impl fmt::Debug for HostCall {
                 .field("count", &messages.len())
                 .finish(),
             Self::ShowBatchTyping { .. } => f.write_str("ShowBatchTyping"),
+            Self::TransportBatchSettled => f.write_str("TransportBatchSettled"),
         }
     }
 }

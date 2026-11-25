@@ -15,9 +15,11 @@ extension ZaloEngine {
         if messages[id] == nil {
             messages[id] = []
         }
+        var preloadedRecords: [ChatMessageRecord] = []
         // Synchronous WAL snapshot read (< 0.5ms) so synced local history appears on the very first frame.
         if let syncCached = sqliteStore?.readDecodedMessagesNow(convId: id, limit: 50) {
             let decoded = syncCached.map(\.message)
+            preloadedRecords = decoded.map { ChatMessageRecord(message: $0) }
             // One write for the whole page (a merge per row copied, sorted and published the list 50 times).
             mergeMessagesIntoMemory(decoded.map { (message: $0, clientId: nil) }, in: id)
             if decoded.count >= 45, hasMoreHistory[id] != true {
@@ -27,6 +29,19 @@ extension ZaloEngine {
 
         let isGrp = ZaloWireParser.isGroupId(id)
         updateCallGateForConversation(id)
+
+        if let core = coreLifecycle.core {
+            pushCoreIdentitiesIfRunning()
+            pushCoreContactsIfRunning()
+            openConversationTask = Task { [weak self] in
+                guard let self else { return }
+                if let v = try? await core.openConversationAndWait(id: id, preloaded: preloadedRecords) {
+                    await self.waitForMirrorVersion(v)
+                }
+                await self.syncCachedIdentityPreferencesFromStore()
+            }
+            return
+        }
 
         openConversationTask = Task { [weak self] in
             guard let self else { return }
@@ -163,10 +178,22 @@ extension ZaloEngine {
     func closeConversation() {
         openConversationId = nil
         dropMessagePrompts()
+        coreLifecycle.core?.closeConversation()
     }
 
     func loadOlderMessages(_ id: String) {
         guard !id.isEmpty else { return }
+        if let core = coreLifecycle.core {
+            pushCoreIdentitiesIfRunning()
+            loadOlderTask = Task { [weak self] in
+                guard let self else { return }
+                if let v = try? await core.loadOlderMessagesAndWait(id: id) {
+                    await self.waitForMirrorVersion(v)
+                }
+                await self.syncCachedIdentityPreferencesFromStore()
+            }
+            return
+        }
         loadOlderTask = Task { [weak self] in
             guard let self else { return }
             let existing = self.messages[id] ?? []
@@ -355,6 +382,7 @@ extension ZaloEngine {
                 list.removeAll { $0.id == cliId }
                 messages[id] = list
             }
+            coreLifecycle.core?.writeThroughRemoveMessages(convId: id, ids: [cliId])
         }
 
         do {
@@ -467,18 +495,20 @@ extension ZaloEngine {
                     list.removeAll { $0.id == cliId }
                     messages[id] = list
                 }
+                coreLifecycle.core?.writeThroughRemoveMessages(convId: id, ids: [cliId])
                 updateConversationOnMessage(echoed, incrementUnread: false)
                 return true
             }
+            optimistic.id = res.msgId
+            optimistic.clientId = finalCliId
+            optimistic.status = .sent
             if var list = messages[id] {
                 list.removeAll { $0.id == cliId || $0.id == res.msgId }
-                optimistic.id = res.msgId
-                optimistic.clientId = finalCliId
-                optimistic.status = .sent
                 list.append(optimistic)
                 list.sort { a, b in a.date == b.date ? a.id < b.id : a.date < b.date }
                 messages[id] = list
             }
+            coreLifecycle.core?.writeThroughUpsertMessage(msg: ChatMessageRecord(message: optimistic), replacingClientId: cliId)
             if let stored = ZaloWireParser.encodeChatMessage(optimistic, clientId: finalCliId) {
                 try? await sqliteStore?.saveMessages([stored])
             }
@@ -798,6 +828,7 @@ extension ZaloEngine {
             )
             list[idx] = updated
             messages[conversationId] = list
+            coreLifecycle.core?.writeThroughUpsertMessage(msg: ChatMessageRecord(message: updated), replacingClientId: nil)
         }
 
         let pendingId = UUID()
@@ -819,6 +850,7 @@ extension ZaloEngine {
                }) {
                 list[idx].reactions = previousReactions
                 messages[conversationId] = list
+                coreLifecycle.core?.writeThroughUpsertMessage(msg: ChatMessageRecord(message: list[idx]), replacingClientId: nil)
             }
         }
 

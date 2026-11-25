@@ -52,6 +52,7 @@ extension ZaloEngine {
         if !expired.isEmpty {
             let ids = Set(expired.map(\.id))
             messages[convId] = list.filter { !ids.contains($0.id) }
+            coreLifecycle.core?.writeThroughRemoveMessages(convId: convId, ids: Array(ids))
             let store = sqliteStore
             Task {
                 for m in expired { try? await store?.deleteMessage(convId: convId, id: m.id) }

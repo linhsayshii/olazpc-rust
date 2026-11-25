@@ -82,8 +82,12 @@ final class ZaloEngine {
         }
     }
     var failedDrafts = FailedDraftStore()
+    @ObservationIgnored internal var isSuppressingDirectMessageSync = false
     var messages: [String: [ChatMessage]] = [:] {
-        didSet { messageSignal.changed(from: oldValue, to: messages) }
+        didSet {
+            messageSignal.changed(from: oldValue, to: messages)
+            syncDirectMessageChangesToCore(from: oldValue, to: messages)
+        }
     }
     /// Accounts I blocked (messages and calls), from `/api/friend/blocklistv2`; nil until loaded.
     var blockedUsers: [BlockedUser]?
@@ -125,7 +129,7 @@ final class ZaloEngine {
             }
         }
     }
-    var contacts = ContactsState() { didSet { pushCoreIdentitiesIfRunning() } }
+    var contacts = ContactsState() { didSet { pushCoreIdentitiesIfRunning(); pushCoreContactsIfRunning() } }
     var notificationSettings = NotificationSettingsState()
     var cloud = CloudState()
     var call = CallState()
@@ -238,7 +242,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var cachedGroups: [String: ZaloWebKitMigrator.CachedGroup] = [:] { didSet { pushCoreIdentitiesIfRunning() } }
     @ObservationIgnored internal var cachedActivityRanks: [String: Int64] = [:] { didSet { pushCoreIdentitiesIfRunning() } }
     /// Per-conversation result of the launch preload probe (see `ZaloEngine+HistoryFreshness.swift`).
-    @ObservationIgnored internal var historyFreshness: [String: HistoryFreshness] = [:]
+    @ObservationIgnored internal var historyFreshness: [String: HistoryFreshness] = [:] { didSet { pushCoreHistoryFreshnessIfRunning() } }
     @ObservationIgnored internal var historyFullRefreshDue = false
     @ObservationIgnored internal var cachedBoardRawTopics: [String: (version: Int64, topics: [String: [String: Any]])] = [:]
 
@@ -609,6 +613,17 @@ final class ZaloEngine {
     }
 
     func performBootstrapSync() async {
+        if let core = coreLifecycle.core {
+            pushCoreIdentitiesIfRunning()
+            pushCoreContactsIfRunning()
+            pushCoreHistoryFreshnessIfRunning()
+            let currentNowMs = nowMs()
+            if let v = try? await core.bootstrap(nowMs: currentNowMs) {
+                await waitForMirrorVersion(v)
+            }
+            await syncCachedIdentityPreferencesFromStore()
+            return
+        }
         // 1. Aliases, Pins, Archived, Mutes, Contacts (check auth error immediately on first call)
         do {
             let aliases = try await sessionClient.fetchAliases()
@@ -797,10 +812,14 @@ final class ZaloEngine {
     @discardableResult
     internal func drainChatPolling(maxBatches: Int = 3, notifyIncoming: Bool = false) async -> Int {
         guard maxBatches > 0, let core = await ensureCoreEngine() else { return 0 }
-        return Int((try? await core.drainChatPolling(
+        let applied = Int((try? await core.drainChatPolling(
             maxBatches: UInt32(maxBatches),
             notifyIncoming: notifyIncoming
         )) ?? 0)
+        if let v = try? await core.flushAll() {
+            await waitForMirrorVersion(v)
+        }
+        return applied
     }
 
     internal func resolveMissingConversationNames() async {
@@ -828,6 +847,35 @@ final class ZaloEngine {
         persistConversations: Bool = true,
         probeFreshness: Bool = false
     ) async -> Int {
+        if let core = coreLifecycle.core, let rootDict = root as? [String: Any] {
+            pushCoreIdentitiesIfRunning()
+            let myUid = profile?.userId ?? ""
+            let effectiveDict: [String: Any]
+            if !myUid.isEmpty {
+                effectiveDict = (await e2eeManager.decryptEnvelopeIfNeeded(
+                    ZaloJSONBox(rootDict),
+                    myUid: myUid,
+                    store: sqliteStore
+                )).dict
+            } else {
+                effectiveDict = rootDict
+            }
+            let payloadJson = Self.jsonString(for: effectiveDict)
+            let count = (try? await core.applyBatchDirect(
+                payloadJson: payloadJson,
+                defaultCmd: defaultCmd,
+                fallbackConvId: fallbackConvId,
+                isGroupHint: isGroupHint,
+                incrementUnread: incrementUnread,
+                notifyIncoming: notifyIncoming,
+                persistConversations: persistConversations,
+                probeFreshness: probeFreshness
+            )) ?? 0
+            if let v = try? await core.settle() {
+                await waitForMirrorVersion(v)
+            }
+            return Int(count)
+        }
         let delta = await applyBatchResponseCollectingDelta(
             root,
             defaultCmd: defaultCmd,
@@ -890,6 +938,20 @@ final class ZaloEngine {
         notifyIncoming: Bool = false,
         persistConversations: Bool = true
     ) async -> Int {
+        if let core = coreLifecycle.core {
+            pushCoreIdentitiesIfRunning()
+            let wireEvents = ZaloWireParser.wireEvents(from: events)
+            let count = (try? await core.applyParsedEventsDirect(
+                events: wireEvents,
+                incrementUnread: incrementUnread,
+                notifyIncoming: notifyIncoming,
+                persistConversations: persistConversations
+            )) ?? 0
+            if let v = try? await core.settle() {
+                await waitForMirrorVersion(v)
+            }
+            return Int(count)
+        }
         let delta = await applyParsedEventsCollectingDelta(
             events,
             incrementUnread: incrementUnread,
@@ -1033,6 +1095,18 @@ final class ZaloEngine {
         }
 
         if notifyIncoming {
+            await notifyIncomingBatchMessages(incomingForNotice)
+        }
+        return BatchApplyDeltaRecord(
+            appliedCount: UInt32(events.count),
+            updates: updates,
+            previewOverrides: previewOverrides,
+            persistConversations: persistConversations
+        )
+    }
+
+    internal func notifyIncomingBatchMessages(_ incomingForNotice: [ChatMessage]) async {
+        do {
             for msg in incomingForNotice where !isConversationMuted(msg.conversationId) && notificationSettings.enabled {
                 let convId = msg.conversationId
                 let isGroup = ZaloWireParser.isGroupId(convId)
@@ -1098,12 +1172,6 @@ final class ZaloEngine {
                 )
             }
         }
-        return BatchApplyDeltaRecord(
-            appliedCount: UInt32(events.count),
-            updates: updates,
-            previewOverrides: previewOverrides,
-            persistConversations: persistConversations
-        )
     }
 
     internal func ensureKnownContactsInConversations() {
@@ -1340,6 +1408,9 @@ final class ZaloEngine {
             messages[convId] = list
         }
         for row in colliding { mergeMessageIntoMemory(row.message, replacingClientId: row.clientId) }
+        if !isApplyingCoreMirror, let core = coreLifecycle.core, let current = messages[convId] {
+            core.writeThroughReplaceWindow(convId: convId, messages: current.map(ChatMessageRecord.init(message:)))
+        }
     }
 
     internal func mergeMessageIntoMemory(_ rawMsg: ChatMessage, replacingClientId clientId: String? = nil) {
@@ -1419,7 +1490,12 @@ final class ZaloEngine {
                 return a.id < b.id
             }
         }
+        isSuppressingDirectMessageSync = true
         messages[msg.conversationId] = list
+        isSuppressingDirectMessageSync = false
+        if !isApplyingCoreMirror, let core = coreLifecycle.core {
+            core.writeThroughUpsertMessage(msg: ChatMessageRecord(message: msg), replacingClientId: clientId)
+        }
     }
 
     internal func updateConversationOnMessage(_ msg: ChatMessage, incrementUnread: Bool) {
@@ -1566,9 +1642,12 @@ final class ZaloEngine {
             }
         }
 
-        if !changedRows.isEmpty, let store = sqliteStore {
-            Task {
-                try? await store.saveMessages(changedRows, preserveExistingReactions: false)
+        if !changedRows.isEmpty {
+            coreLifecycle.core?.refreshReactionNames(convId: targetConvId)
+            if let store = sqliteStore {
+                Task {
+                    try? await store.saveMessages(changedRows, preserveExistingReactions: false)
+                }
             }
         }
     }
@@ -1829,6 +1908,7 @@ final class ZaloEngine {
             )
             list[idx] = msg
             messages[convKey] = list
+            coreLifecycle.core?.writeThroughUpsertMessage(msg: ChatMessageRecord(message: msg), replacingClientId: nil)
             if let stored = ZaloWireParser.encodeChatMessage(msg) {
                 try? await sqliteStore?.saveMessages([stored], preserveExistingReactions: false)
             }
@@ -1907,6 +1987,7 @@ final class ZaloEngine {
             list[idx].menu.star = nil
             list[idx].menu.starred = false
             messages[convId] = list
+            coreLifecycle.core?.writeThroughUpsertMessage(msg: ChatMessageRecord(message: list[idx]), replacingClientId: nil)
 
             if cachedStarredIds.remove(recalledId) != nil {
                 try? await sqliteStore?.setPreferenceStrings(key: "starredIds", value: Array(cachedStarredIds))
@@ -1977,12 +2058,20 @@ final class ZaloEngine {
                 let ts = Int64((m.date.timeIntervalSince1970 * 1000).rounded())
                 deletedTsMs = deletedTsMs.map { max($0, ts) } ?? ts
             }
+            let removedIds = list.filter {
+                $0.id == targetId
+                    || $0.clientId == targetId
+                    || (!cliMsgId.isEmpty && ($0.id == cliMsgId || $0.clientId == cliMsgId))
+            }.map(\.id)
             list.removeAll {
                 $0.id == targetId
                     || $0.clientId == targetId
                     || (!cliMsgId.isEmpty && ($0.id == cliMsgId || $0.clientId == cliMsgId))
             }
             messages[convId] = list
+            if !removedIds.isEmpty {
+                coreLifecycle.core?.writeThroughRemoveMessages(convId: convId, ids: removedIds)
+            }
             if let last = list.last {
                 memLatest = ConversationPreviewRecord(
                     text: Self.messagePreviewLabel(last),

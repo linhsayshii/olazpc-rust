@@ -9,6 +9,7 @@
     reason = "shared test helper used selectively by each test binary"
 )]
 
+use olaz_core::runner::{BatchHookOutcome, ParsedEventsHookOutcome};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
@@ -1980,7 +1981,7 @@ impl Host for RecordingHost {
         increment_unread: bool,
         notify_incoming: bool,
         payload: Map<String, Value>,
-    ) -> Option<Map<String, Value>> {
+    ) -> BatchHookOutcome {
         if self.is_u4 {
             self.record(
                 "apply_batch",
@@ -1991,9 +1992,9 @@ impl Host for RecordingHost {
                     "payload": Value::Object(payload.clone()),
                 }),
             );
-            Some(payload)
+            BatchHookOutcome::IngestInCore(payload)
         } else {
-            None
+            BatchHookOutcome::DelegateToLegacy
         }
     }
 
@@ -2003,7 +2004,7 @@ impl Host for RecordingHost {
         increment_unread: bool,
         notify_incoming: bool,
         envelope: &TypedChatEnvelope,
-    ) -> bool {
+    ) -> ParsedEventsHookOutcome {
         if self.is_u4 {
             let profile = self
                 .self_profile
@@ -2038,9 +2039,9 @@ impl Host for RecordingHost {
                     "events": serialized,
                 }),
             );
-            true
+            ParsedEventsHookOutcome::IngestInCore
         } else {
-            false
+            ParsedEventsHookOutcome::DelegateToLegacy
         }
     }
 
@@ -2986,7 +2987,10 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 "up_to_date" => HistoryFreshness::UpToDate,
                 _ => HistoryFreshness::Stale,
             };
-            initial_state.messages.history_freshness.insert(cid.clone(), f);
+            initial_state
+                .messages
+                .history_freshness
+                .insert(cid.clone(), f);
         }
     }
     let core = CoreHandle::start_with_state(initial_state, runner, Handle::current());

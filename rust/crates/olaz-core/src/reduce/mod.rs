@@ -88,8 +88,7 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::BootstrapGroupWaveDone { .. }
         | Input::BootstrapResolveNamesChunkDone { .. }
         | Input::FreshnessProbed {
-            boot_gen: Some(_),
-            ..
+            boot_gen: Some(_), ..
         } => {
             bootstrap::reduce_bootstrap(state, input, &mut out);
         }

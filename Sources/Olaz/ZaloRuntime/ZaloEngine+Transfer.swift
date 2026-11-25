@@ -1,4 +1,5 @@
 import Foundation
+import OlazCore
 
 private actor SyncConcurrencyLimiter {
     private let maxConcurrent: Int
@@ -1210,8 +1211,13 @@ extension ZaloEngine {
                 }
                 messages[convId] = combined
                 historyTicks[convId, default: 0] += 1
+                coreLifecycle.core?.writeThroughReplaceWindow(convId: convId, messages: combined.map(ChatMessageRecord.init(message:)))
+                if hasMoreHistory[convId] == true {
+                    coreLifecycle.core?.writeThroughSetHasMore(convId: convId, hasMore: true)
+                }
             } else if incomingList.count >= 45 {
                 hasMoreHistory[convId] = true
+                coreLifecycle.core?.writeThroughSetHasMore(convId: convId, hasMore: true)
             }
         }
 

@@ -306,6 +306,28 @@ impl WsDriver for LiveWsDriver {
 /// Storage primitives (`load_saved_session`, `load_legacy_cookie`, `load_transport_state`,
 /// `set_pref`) live here alongside domain calls that still belong to Swift until later units
 /// (`prepare_store`, `start_bootstrap`, `apply_batch`, etc.).
+/// Outcome of [`Host::on_batch_received`].
+#[derive(Clone, Debug)]
+pub enum BatchHookOutcome {
+    /// Delegate to legacy `Host::apply_batch` (used by U2/U3 unit tests).
+    DelegateToLegacy,
+    /// Suppressed by `hostTrace` (skip ingestion, notify transport settle).
+    Suppressed,
+    /// Ingest natively in `olaz-core` using the (optionally decrypted) payload.
+    IngestInCore(Map<String, Value>),
+}
+
+/// Outcome of [`Host::on_parsed_events_received`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParsedEventsHookOutcome {
+    /// Delegate to legacy `Host::apply_parsed_events` (used by U2/U3 unit tests).
+    DelegateToLegacy,
+    /// Suppressed by `hostTrace` (skip ingestion, notify transport settle).
+    Suppressed,
+    /// Ingest natively in `olaz-core`.
+    IngestInCore,
+}
+
 #[async_trait]
 pub trait Host: Send + Sync {
     async fn load_saved_session(&self) -> Option<String>;
@@ -417,8 +439,8 @@ pub trait Host: Send + Sync {
         _increment_unread: bool,
         _notify_incoming: bool,
         _payload: Map<String, Value>,
-    ) -> Option<Map<String, Value>> {
-        None
+    ) -> BatchHookOutcome {
+        BatchHookOutcome::DelegateToLegacy
     }
     /// Host hook emitted when transport delivers a typed `ApplyParsedEvents` frame.
     /// Return `true` to have `olaz-core` ingest the typed envelope natively; return `false`
@@ -429,9 +451,11 @@ pub trait Host: Send + Sync {
         _increment_unread: bool,
         _notify_incoming: bool,
         _envelope: &TypedChatEnvelope,
-    ) -> bool {
-        false
+    ) -> ParsedEventsHookOutcome {
+        ParsedEventsHookOutcome::DelegateToLegacy
     }
+    async fn transport_batch_settled(&self) {}
+    async fn engine_log(&self, _message: String) {}
     async fn mobile_sync(&self, events: Vec<MobileSyncEvent>);
     async fn e2ee_signal(&self, cmd: u16, payload: Map<String, Value>);
     async fn e2ee_deliver_reports(&self, cmd: u16, payload: Map<String, Value>);
@@ -570,6 +594,13 @@ enum HostJob {
     ShowBatchTyping {
         conv_id: String,
         sender_id: String,
+        _guard: InFlightGuard,
+    },
+    TransportBatchSettled {
+        _guard: InFlightGuard,
+    },
+    EngineLog {
+        message: String,
         _guard: InFlightGuard,
     },
     OfferFirstLoginTransfer {
@@ -1227,7 +1258,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let handle = self
                         .runtime
                         .spawn(async move {
-                                                        let result = match api.fetch_chat_from_polling(&poll_state).await {
+                            let result = match api.fetch_chat_from_polling(&poll_state).await {
                                 Ok(outcome) => Ok(PollBatchOutcome {
                                     payload: outcome.response,
                                     next_state: outcome.next_state,
@@ -1255,6 +1286,10 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
                 Effect::EngineLog(msg) => {
                     tracing::info!(target: "olaz_core::engine_log", "{msg}");
+                    self.send_host(HostJob::EngineLog {
+                        message: msg,
+                        _guard: sink.track(),
+                    });
                 }
                 Effect::Store(op) => {
                     let guard = sink.track();
@@ -1292,7 +1327,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                                                let ok = api.update_pinned_conversation(&id, pinned).await.is_ok();
+                        let ok = api.update_pinned_conversation(&id, pinned).await.is_ok();
                         sink.send(Input::PinApiDone {
                             id,
                             pinned,
@@ -1314,7 +1349,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                                                let ok = api
+                        let ok = api
                             .update_pinned_conversation(&target_id, pinned)
                             .await
                             .is_ok();
@@ -1339,7 +1374,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                                                let ok = api.update_archived_chat(&id, archived).await.is_ok();
+                        let ok = api.update_archived_chat(&id, archived).await.is_ok();
                         sink.send(Input::MoveApiDone {
                             id,
                             to_other: archived,
@@ -1359,7 +1394,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                                                let _ = api.delete_conversation(&id, &last_cli_msg_id).await;
+                        let _ = api.delete_conversation(&id, &last_cli_msg_id).await;
                         sink.send(Input::DeleteApiDone { id, op_id });
                         drop(guard);
                     });
@@ -1369,7 +1404,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let api = Arc::clone(&self.api);
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                                                let _ = api.set_unread_mark(&conv_id, unread).await;
+                        let _ = api.set_unread_mark(&conv_id, unread).await;
                         drop(guard);
                     });
                 }
@@ -1378,7 +1413,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let api = Arc::clone(&self.api);
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                                                let _ = api
+                        let _ = api
                             .send_seen(
                                 &target.conv_id,
                                 &target.msg_id,
@@ -1400,7 +1435,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                                                let _ = api.set_hidden_conversation(&conv_id, hidden).await;
+                        let _ = api.set_hidden_conversation(&conv_id, hidden).await;
                         if let (Some(id), Some(res)) = (op_id, result) {
                             sink.send(Input::OpApiDone {
                                 op_id: id,
@@ -1417,7 +1452,6 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let guard = sink.track();
                     self.runtime.spawn(async move {
                         let md5 = if client.is_authenticated() {
-
                             if api.update_hidden_pin(&pin).await.is_err() {
                                 sink.send(Input::HiddenPinSyncDone {
                                     op_id,
@@ -1451,7 +1485,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let guard = sink.track();
                     self.runtime.spawn(async move {
                         let ok = if client.is_authenticated() {
-                                                        api.reset_hidden_pin().await.is_ok()
+                            api.reset_hidden_pin().await.is_ok()
                         } else {
                             true
                         };
@@ -1466,7 +1500,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let guard = sink.track();
                     self.runtime.spawn(async move {
                         let snapshot = if client.is_authenticated() {
-                                                        api.fetch_hidden_conversations().await.ok()
+                            api.fetch_hidden_conversations().await.ok()
                         } else {
                             None
                         };
@@ -1485,7 +1519,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                                                let profiles_map = match api.fetch_profiles(&chunk).await {
+                        let profiles_map = match api.fetch_profiles(&chunk).await {
                             Ok(raw) => extract_profiles_map(&raw),
                             Err(_) => Map::new(),
                         };
@@ -1507,7 +1541,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                                                let _ = api.update_conversation_labels(&label_data_json).await;
+                        let _ = api.update_conversation_labels(&label_data_json).await;
                         if let Some(id) = op_id {
                             sink.send(Input::OpApiDone {
                                 op_id: id,
@@ -1523,7 +1557,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                                                let payload = api.fetch_conversation_labels().await.ok();
+                        let payload = api.fetch_conversation_labels().await.ok();
                         sink.send(Input::SyncLabelsFetched { op_id, payload });
                         drop(guard);
                     });
@@ -1538,7 +1572,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.spawn_bootstrap(async move {
-                                                let result = match api.fetch_aliases().await {
+                        let result = match api.fetch_aliases().await {
                             Ok(aliases) => Ok(aliases),
                             Err(err) if err.is_auth_error() => Err(BootstrapAliasesError::Auth),
                             Err(_) => Err(BootstrapAliasesError::Other),
@@ -1553,7 +1587,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.spawn_bootstrap(async move {
-                                                let (pinned_res, archived_res, mute_res) = tokio::join!(
+                        let (pinned_res, archived_res, mute_res) = tokio::join!(
                             api.fetch_pinned_conversations(),
                             api.fetch_archived_chats(),
                             api.fetch_mute_list(),
@@ -1573,7 +1607,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.spawn_bootstrap(async move {
-                                                let payload = api.fetch_conversation_labels().await.ok();
+                        let payload = api.fetch_conversation_labels().await.ok();
                         sink.send(Input::BootstrapLabelsDone { boot_gen, payload });
                         drop(guard);
                     });
@@ -1585,7 +1619,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let guard = sink.track();
                     self.spawn_bootstrap(async move {
                         let snapshot = if client.is_authenticated() {
-                                                        api.fetch_hidden_conversations().await.ok()
+                            api.fetch_hidden_conversations().await.ok()
                         } else {
                             None
                         };
@@ -1599,7 +1633,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.spawn_bootstrap(async move {
-                                                let (friends_res, groups_res, sent_res, received_res) = tokio::join!(
+                        let (friends_res, groups_res, sent_res, received_res) = tokio::join!(
                             api.fetch_friends(1, 20000),
                             api.fetch_groups_list(),
                             api.fetch_sent_friend_requests(),
@@ -1625,7 +1659,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.spawn_bootstrap(async move {
-                                                let payload = api.fetch_preload_conversations(&thread_ids).await.ok();
+                        let payload = api.fetch_preload_conversations(&thread_ids).await.ok();
                         sink.send(Input::BootstrapPreloadDone {
                             boot_gen,
                             is_overview,
@@ -1644,7 +1678,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.spawn_bootstrap(async move {
-                                                let payload = api
+                        let payload = api
                             .fetch_history(&conv_id, None, count, Some(false))
                             .await
                             .ok();
@@ -1703,7 +1737,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.spawn_bootstrap(async move {
-                                                let profiles_map = match api.fetch_profiles(&chunk).await {
+                        let profiles_map = match api.fetch_profiles(&chunk).await {
                             Ok(raw) => extract_profiles_map(&raw),
                             Err(_) => Map::new(),
                         };
@@ -1729,7 +1763,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let guard = sink.track();
                     self.spawn_cancellable(async move {
                         let page = if client.is_authenticated() {
-                                                        api.fetch_history(&conv_id, before_msg_id.as_deref(), count, is_old)
+                            api.fetch_history(&conv_id, before_msg_id.as_deref(), count, is_old)
                                 .await
                                 .ok()
                         } else {
@@ -1770,7 +1804,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let guard = sink.track();
                     self.spawn_cancellable(async move {
                         let profiles_map = if client.is_authenticated() {
-                                                        match api.fetch_profiles(&chunk).await {
+                            match api.fetch_profiles(&chunk).await {
                                 Ok(raw) => extract_profiles_map(&raw),
                                 Err(_) => Map::new(),
                             }
@@ -2045,6 +2079,9 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                                 _guard: guard,
                             }
                         }
+                        HostCall::TransportBatchSettled => {
+                            HostJob::TransportBatchSettled { _guard: guard }
+                        }
                     };
                     self.send_host(job);
                 }
@@ -2140,7 +2177,11 @@ async fn run_store_worker(
                                     let store =
                                         store_arc.lock().unwrap_or_else(PoisonError::into_inner);
                                     store
-                                        .messages(&conv_clone, None, i64::try_from(limit).unwrap_or(50))
+                                        .messages(
+                                            &conv_clone,
+                                            None,
+                                            i64::try_from(limit).unwrap_or(50),
+                                        )
                                         .unwrap_or_default()
                                 })
                                 .await
@@ -2675,6 +2716,12 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
             } => {
                 host.show_batch_typing(conv_id, sender_id).await;
             }
+            HostJob::TransportBatchSettled { _guard } => {
+                host.transport_batch_settled().await;
+            }
+            HostJob::EngineLog { message, _guard } => {
+                host.engine_log(message).await;
+            }
             HostJob::OfferFirstLoginTransfer { force, _guard } => {
                 host.offer_first_login_transfer(force).await;
             }
@@ -2725,37 +2772,50 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 sink,
                 _guard,
             } => {
-                if let Some(decrypted) = host
+                match host
                     .on_batch_received(cmd, increment_unread, notify_incoming, payload.clone())
                     .await
                 {
-                    sink.send(Input::DecryptedEnvelopeReady {
-                        payload: decrypted,
-                        default_cmd: cmd.unwrap_or(0),
-                        fallback_conv_id: None,
-                        is_group_hint: None,
-                        increment_unread,
-                        notify_incoming,
-                        persist_conversations: true,
-                        probe_freshness: false,
-                        poll_batch_done,
-                        op_id: None,
-                    });
-                } else {
-                    let delta = host
-                        .apply_batch(cmd, increment_unread, notify_incoming, payload)
-                        .await;
-                    if let Some((lp_gen, drain_id)) = poll_batch_done {
-                        sink.send(Input::PollBatchApplied {
-                            lp_gen,
-                            drain_id,
-                            delta,
+                    BatchHookOutcome::IngestInCore(decrypted) => {
+                        sink.send(Input::DecryptedEnvelopeReady {
+                            payload: decrypted,
+                            default_cmd: cmd.unwrap_or(0),
+                            fallback_conv_id: None,
+                            is_group_hint: None,
+                            increment_unread,
+                            notify_incoming,
+                            persist_conversations: true,
+                            probe_freshness: false,
+                            poll_batch_done,
+                            op_id: None,
                         });
-                    } else if delta.applied_count > 0
-                        || !delta.updates.is_empty()
-                        || !delta.preview_overrides.is_empty()
-                    {
-                        sink.send(Input::BatchDeltaApplied { delta });
+                    }
+                    BatchHookOutcome::Suppressed => {
+                        host.transport_batch_settled().await;
+                        if let Some((lp_gen, drain_id)) = poll_batch_done {
+                            sink.send(Input::PollBatchApplied {
+                                lp_gen,
+                                drain_id,
+                                delta: crate::conversations::BatchApplyDelta::default(),
+                            });
+                        }
+                    }
+                    BatchHookOutcome::DelegateToLegacy => {
+                        let delta = host
+                            .apply_batch(cmd, increment_unread, notify_incoming, payload)
+                            .await;
+                        if let Some((lp_gen, drain_id)) = poll_batch_done {
+                            sink.send(Input::PollBatchApplied {
+                                lp_gen,
+                                drain_id,
+                                delta,
+                            });
+                        } else if delta.applied_count > 0
+                            || !delta.updates.is_empty()
+                            || !delta.preview_overrides.is_empty()
+                        {
+                            sink.send(Input::BatchDeltaApplied { delta });
+                        }
                     }
                 }
             }
@@ -2767,25 +2827,31 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 sink,
                 _guard,
             } => {
-                if host
+                match host
                     .on_parsed_events_received(cmd, increment_unread, notify_incoming, &envelope)
                     .await
                 {
-                    sink.send(Input::TypedEnvelopeReady {
-                        cmd,
-                        increment_unread,
-                        notify_incoming,
-                        envelope,
-                    });
-                } else {
-                    let delta = host
-                        .apply_parsed_events(cmd, increment_unread, notify_incoming, envelope)
-                        .await;
-                    if delta.applied_count > 0
-                        || !delta.updates.is_empty()
-                        || !delta.preview_overrides.is_empty()
-                    {
-                        sink.send(Input::BatchDeltaApplied { delta });
+                    ParsedEventsHookOutcome::IngestInCore => {
+                        sink.send(Input::TypedEnvelopeReady {
+                            cmd,
+                            increment_unread,
+                            notify_incoming,
+                            envelope,
+                        });
+                    }
+                    ParsedEventsHookOutcome::Suppressed => {
+                        host.transport_batch_settled().await;
+                    }
+                    ParsedEventsHookOutcome::DelegateToLegacy => {
+                        let delta = host
+                            .apply_parsed_events(cmd, increment_unread, notify_incoming, envelope)
+                            .await;
+                        if delta.applied_count > 0
+                            || !delta.updates.is_empty()
+                            || !delta.preview_overrides.is_empty()
+                        {
+                            sink.send(Input::BatchDeltaApplied { delta });
+                        }
                     }
                 }
             }
@@ -3012,8 +3078,8 @@ mod tests {
                 _increment_unread: bool,
                 _notify_incoming: bool,
                 _payload: Map<String, Value>,
-            ) -> Option<Map<String, Value>> {
-                None
+            ) -> BatchHookOutcome {
+                BatchHookOutcome::DelegateToLegacy
             }
             async fn apply_batch(
                 &self,

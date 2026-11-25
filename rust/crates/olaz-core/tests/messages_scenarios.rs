@@ -115,10 +115,12 @@ fn m01_open_twice_cancels_first_open_seq_and_ignores_stale_completions() {
         e,
         Effect::FetchHistoryPageApi { .. } | Effect::Host(HostCall::MarkReadBoundary { .. })
     )));
-    assert!(stale_out.effects.iter().any(|e| matches!(
-        e,
-        Effect::CompleteOp { op_id: 10, .. }
-    )));
+    assert!(
+        stale_out
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::CompleteOp { op_id: 10, .. }))
+    );
 }
 
 #[test]
@@ -128,15 +130,11 @@ fn m02_open_up_to_date_skips_history_fetch_and_emits_pins_and_mark_read() {
         .messages
         .history_freshness
         .insert("friend_1".to_owned(), HistoryFreshness::UpToDate);
-    state
-        .conversations
-        .identities
-        .friends
-        .push(FriendIdentity {
-            id: "friend_1".to_owned(),
-            name: "Alice".to_owned(),
-            avatar: Some("https://cdn.example.invalid/alice.jpg".to_owned()),
-        });
+    state.conversations.identities.friends.push(FriendIdentity {
+        id: "friend_1".to_owned(),
+        name: "Alice".to_owned(),
+        avatar: Some("https://cdn.example.invalid/alice.jpg".to_owned()),
+    });
 
     let preloaded = vec![make_msg(
         "101",
@@ -177,7 +175,10 @@ fn m02_open_up_to_date_skips_history_fetch_and_emits_pins_and_mark_read() {
 fn m03_write_through_hooks_produce_coalesced_window_deltas() {
     let mut state = ready_state();
     let hub = olaz_core::ChangeHub::new();
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("rt");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
 
     // Seed initial window for conv_1 with row "1" + temp optimistic row and drain initial Reset
     let existing1 = make_msg("1", "conv_1", "peer_1", 1800, "Existing");
@@ -194,7 +195,9 @@ fn m03_write_through_hooks_produce_coalesced_window_deltas() {
     hub.publish_with_window_ops(&init.dirty, &init_ops, &state);
 
     let first = rt.block_on(hub.next_changes()).expect("initial Reset");
-    assert!(matches!(&first.window_deltas[0], WindowDelta::Reset { conv_id, .. } if conv_id == "conv_1"));
+    assert!(
+        matches!(&first.window_deltas[0], WindowDelta::Reset { conv_id, .. } if conv_id == "conv_1")
+    );
 
     // Update existing message "1" (Patch) and ack optimistic "cli_temp" -> "2" (Patch)
     let m1 = make_msg("1", "conv_1", "peer_1", 1800, "Updated 1");
@@ -230,7 +233,6 @@ fn m03_write_through_hooks_produce_coalesced_window_deltas() {
     );
     let ops3 = state.messages.take_pending_window_ops();
     hub.publish_with_window_ops(&out3.dirty, &ops3, &state);
-
 
     let changes = rt
         .block_on(hub.next_changes())
@@ -309,8 +311,8 @@ fn m04_refresh_reaction_names_updates_in_memory_and_emits_save_messages() {
 #[test]
 fn m05_apply_batch_direct_detects_signal_cipher_and_delegates_to_decrypt_envelope() {
     let mut state = ready_state();
-    let cipher_payload = serde_json::from_value::<serde_json::Map<String, serde_json::Value>>(
-        json!({
+    let cipher_payload =
+        serde_json::from_value::<serde_json::Map<String, serde_json::Value>>(json!({
             "data": {
                 "msgs": [
                     {
@@ -323,9 +325,8 @@ fn m05_apply_batch_direct_detects_signal_cipher_and_delegates_to_decrypt_envelop
                     }
                 ]
             }
-        }),
-    )
-    .expect("map");
+        }))
+        .expect("map");
 
     let out = reduce(
         &mut state,
@@ -345,6 +346,10 @@ fn m05_apply_batch_direct_detects_signal_cipher_and_delegates_to_decrypt_envelop
     );
     assert!(out.effects.iter().any(|e| matches!(
         e,
-        Effect::Host(HostCall::DecryptEnvelope { op_id: Some(99), default_cmd: 501, .. })
+        Effect::Host(HostCall::DecryptEnvelope {
+            op_id: Some(99),
+            default_cmd: 501,
+            ..
+        })
     )));
 }
