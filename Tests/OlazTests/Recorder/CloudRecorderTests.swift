@@ -867,7 +867,7 @@ final class CloudRecorderTests: XCTestCase {
                         "args": .object([
                             "keys": .array([
                                 .string("3001171|del_1|photo"),
-                                .string("5001172|del_2|file"),
+                                .string("g5001172|del_2|file"),
                                 .string("badkey"),
                                 .string("3001171|missing_id|photo"),
                             ]),
