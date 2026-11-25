@@ -939,6 +939,8 @@ extension ZaloEngine {
         pins = [:]
         messageActionsBusy = []
         pendingDeletedMessages = [:]
+        optimisticOverlayFenceTasks.values.forEach { $0.cancel() }
+        optimisticOverlayFenceTasks.removeAll()
         optimisticMessageOverlays.removeAll()
         lastOptimisticDeletedMessages.removeAll()
     }

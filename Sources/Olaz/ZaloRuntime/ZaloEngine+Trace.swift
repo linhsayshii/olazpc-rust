@@ -64,6 +64,8 @@ extension ZaloEngine {
         deleteUndoTimerTask = nil
         messageActionTasks.values.forEach { $0.cancel() }
         messageActionTasks.removeAll()
+        optimisticOverlayFenceTasks.values.forEach { $0.cancel() }
+        optimisticOverlayFenceTasks.removeAll()
         typingResetTasks.values.forEach { $0.cancel() }
         typingResetTasks = [:]
     }
@@ -80,6 +82,19 @@ extension ZaloEngine {
         guard let core else { return }
         guard let version = try? await core.settle() else { return }
         await waitForMirrorVersion(version)
+        while !optimisticOverlayFenceTasks.isEmpty {
+            let pending = Array(optimisticOverlayFenceTasks.values)
+            for task in pending {
+                await task.value
+            }
+        }
+        if let maxResolved = optimisticMessageOverlays
+            .map(\.resolvedVersion)
+            .filter({ $0 != UInt64.max })
+            .max(),
+           appliedMirrorVersion < maxResolved {
+            await waitForMirrorVersion(maxResolved)
+        }
     }
 
     internal func awaitMarkReadTasksForRecording() async {

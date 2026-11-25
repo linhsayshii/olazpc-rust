@@ -195,6 +195,7 @@ final class ZaloEngine {
         }
     }
     @ObservationIgnored internal var optimisticMessageOverlays: [OptimisticMessageOverlay] = []
+    @ObservationIgnored internal var optimisticOverlayFenceTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var lastOptimisticDeletedMessages: [String: [ChatMessage]] = [:]
     @ObservationIgnored internal var stateTrace: (() -> Void)?
     @ObservationIgnored private let transportSettleTraceActive = OSAllocatedUnfairLock<Bool>(initialState: false)

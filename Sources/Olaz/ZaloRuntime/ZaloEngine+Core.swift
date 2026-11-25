@@ -1303,7 +1303,8 @@ extension ZaloEngine {
         defer { isApplyingCoreMirror = false }
 
         if !optimisticMessageOverlays.isEmpty {
-            optimisticMessageOverlays.removeAll { $0.resolvedVersion <= batch.version }
+            let effectiveVersion = max(batch.version, appliedMirrorVersion)
+            optimisticMessageOverlays.removeAll { $0.resolvedVersion <= effectiveVersion }
         }
 
         if let convRecords = batch.conversations {
@@ -1572,7 +1573,10 @@ extension ZaloEngine {
         lastOptimisticDeletedMessages[convId] = deleted
         optimisticMessageOverlays.removeAll { overlay in
             guard overlay.convId == convId else { return false }
-            if case .undoDelete = overlay.kind { return true }
+            if case .undoDelete = overlay.kind {
+                optimisticOverlayFenceTasks.removeValue(forKey: overlay.token)?.cancel()
+                return true
+            }
             return false
         }
         optimisticMessageOverlays.append(OptimisticMessageOverlay(
@@ -1591,7 +1595,10 @@ extension ZaloEngine {
         let token = UUID()
         optimisticMessageOverlays.removeAll { overlay in
             guard overlay.convId == convId else { return false }
-            if case .delete = overlay.kind { return true }
+            if case .delete = overlay.kind {
+                optimisticOverlayFenceTasks.removeValue(forKey: overlay.token)?.cancel()
+                return true
+            }
             return false
         }
         optimisticMessageOverlays.append(OptimisticMessageOverlay(
@@ -1618,16 +1625,19 @@ extension ZaloEngine {
     }
 
     internal func scheduleOptimisticOverlayFence(token: UUID, core: CoreEngine) {
-        Task { @MainActor [weak self, core] in
+        let task = Task { @MainActor [weak self, core] in
+            defer { self?.optimisticOverlayFenceTasks.removeValue(forKey: token) }
             if let v = try? await core.settle() {
                 self?.resolveOptimisticOverlay(token: token, targetVersion: v)
             } else {
                 self?.cancelOptimisticOverlay(token: token)
             }
         }
+        optimisticOverlayFenceTasks[token] = task
     }
 
     internal func cancelOptimisticOverlay(token: UUID) {
+        optimisticOverlayFenceTasks.removeValue(forKey: token)?.cancel()
         optimisticMessageOverlays.removeAll { $0.token == token }
     }
 
