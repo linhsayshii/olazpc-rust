@@ -89,6 +89,8 @@ struct ConversationListRow: View {
             }
         }
         .padding(.vertical, 2)
+        // The whole row takes the right-click, not only its text and avatar.
+        .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
     }
 
