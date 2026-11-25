@@ -6,7 +6,7 @@ The oracle is what can be observed from outside the engine: the domain state the
 
 ## Files
 
-- `rust/crates/olaz-core/cases/<domain>.jsonl`: one case per line, sorted by `name`. Domains: `session`, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`.
+- `rust/crates/olaz-core/cases/<domain>.jsonl`: one case per line, sorted by `name`. Domains: `session`, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`.
 - `rust/crates/olaz-core/cases/known-diffs.jsonl`: intended differences, one line `{"domain", "name", "path", "actual", "reason"}` each. Only lines the user approved. A line whose case no longer differs fails the runner.
 - Data is synthetic. Never content from a real account, never a real token.
 
@@ -38,21 +38,23 @@ The oracle is what can be observed from outside the engine: the domain state the
 - `ws_auth` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`)*: `"manual"` (or omitted for auto-auth). When `"manual"`, the fake server does not send the initial `cmd == 1` auth reply automatically on WebSocket connect; instead, that `cmd == 1` `ws_frame` remains the first scripted `ws_frame` and is delivered by an explicit `ws_push` step (typically `await_host start_bootstrap` → `ws_push 1` → `await_host e2ee_connected`).
 - `contacts` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`)*: `{"friends": [{"id", "name", "zalo_name", "avatar", "last_active_ms", "online", "section", "sort_key"}], "groups": [{"id", "name", "avatar", "members", "sort_key"}], "received": [{"id", "name", "avatar", "message", "date_ms"}], "sent": [{"id", "name", "avatar", "message", "date_ms"}], "pending_request_count": <int>, "loading_requests": <bool>, "search": {"status", "error", "user"}, "notice": {"seq", "ok", "text"}, "friends_loaded": <bool>, "groups_loaded": <bool>, "aliases": {"<uid>": "<alias>"}, "cached_profiles": {"<uid>": {"name", "avatar"}}, "cached_groups": {"<gid>": {"name", "avatar", "members"}}, "friend_global_ids": {"<uid>": "<gid>"}, "gid_to_uid_map": {"<gid>": "<uid>"}}`. Friends/groups/requests/search/notice populate `ContactsState`; aliases/profiles/groups/global-ids seed the corresponding store preferences before boot so `loadLocalAccountState` loads them (in `contacts`, `friend_global_ids` `{"<uid>": "<gid>"}` is inverted into SQLite `gidToUidMap` if `gid_to_uid_map` is omitted).
 - `blocked_users` *(optional, `contacts`)*: `null`, or array of `{"id": "<uid>", "name": "<str>", "avatar": <str|null>}` pre-seeding `ZaloEngine.blockedUsers` before steps run.
-- `pinned_ids`, `archived_ids`, `unread_marks`, `hidden_ids` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`)*: arrays of conversation ids seeded into SQLite `pinnedIds`, `archivedIds`, `unreadMarks`, `hiddenIds` preferences before boot.
+- `pinned_ids`, `archived_ids`, `unread_marks`, `hidden_ids` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`)*: arrays of conversation ids seeded into SQLite `pinnedIds`, `archivedIds`, `unreadMarks`, `hiddenIds` preferences before boot.
 - `starred_ids` *(optional, `message_actions`)*: array of message ids seeded into SQLite `starredIds` preference before boot (`loadLocalAccountState` loads them into `cachedStarredIds`).
 - `seen_reaction_event_ids` *(optional, `message_actions`)*: array of reaction dedupe keys seeded into SQLite `seenReactionEventIds` preference before boot (`loadLocalAccountState` loads them into `seenReactionEventIds` / `seenReactionEventOrder`).
 - `hidden_pin_md5`, `hidden_pin_hash` *(optional, `conversation_actions`)*: `null` or digest hex string seeded into SQLite `hiddenPinMD5` / `hiddenPinHash` preferences before boot.
 - `labels_pref` *(optional, `conversation_actions`)*: array of `{"id", "name", "color", "convIds"}` seeded into SQLite `labels` preference before boot.
-- `activity_ranks` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`)*: map of `<convId>` to positive integer rank seeded into SQLite `activityRanks` preference before boot.
-- `local_conversations` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`)*: array of `{"id", "is_group", "name", "avatar", "pinned", "members", "unread", "preview_text", "preview_ts_ms", "preview_from_me", "updated_at_ms"}` seeded into the SQLite `conversations` table before boot (`loadLocalAccountState` reads them before any network).
-- `local_messages` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`)*: array of `{"id", "conv_id", "client_id", "sender_id", "sender_name", "sender_avatar", "is_mine", "text", "kind_tag", "ts_ms", "status", "raw_json"}` seeded into the SQLite `messages` table before boot.
-- `open_conversation_id` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`)*: `null` or conversation id set as `openConversationId` before steps run.
+- `activity_ranks` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`)*: map of `<convId>` to positive integer rank seeded into SQLite `activityRanks` preference before boot.
+- `local_conversations` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`)*: array of `{"id", "is_group", "name", "avatar", "pinned", "members", "unread", "preview_text", "preview_ts_ms", "preview_from_me", "updated_at_ms"}` seeded into the SQLite `conversations` table before boot (`loadLocalAccountState` reads them before any network).
+- `local_messages` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`)*: array of `{"id", "conv_id", "client_id", "sender_id", "sender_name", "sender_avatar", "is_mine", "text", "kind_tag", "ts_ms", "status", "raw_json"}` seeded into the SQLite `messages` table before boot.
+- `open_conversation_id` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`)*: `null` or conversation id set as `openConversationId` before steps run.
 - `history_full_refresh_at` *(optional, `messages`, `bootstrap`)*: `null`, or string/number seeded into SQLite `historyFullRefreshAt` preference before boot (stored as stringified epoch seconds).
 - `history_freshness` *(optional, `messages`, `bootstrap`, `send`, `message_actions`)*: `null`, or map of `<convId>` to `"up_to_date" | "stale"` pre-seeded into `ZaloEngine.historyFreshness` before steps run.
 - `next_client_id` *(optional, `send`, `message_actions`)*: positive 64-bit integer seeding `nextClientId()` before steps run. Each `nextClientId()` call returns the current seeded value and increments it by 1.
 - `auto_delete` *(optional, `send`, `message_actions`)*: map of `<convId>` to positive integer TTL milliseconds pre-seeded into `ZaloEngine.autoDelete` before steps run.
 - `e2ee_threads` *(optional, `send`, `message_actions`)*: array of peer uid strings pre-seeded into SQLite `e2eeThreadsV1` preference before boot (`loadLocalAccountState` loads them into `e2eeManager`).
 - `host_results` *(optional, `send`, `message_actions`)*: map of host call name (e.g. `"send_e2ee_text"`) to an ordered queue of scripted outcomes: `{"msg_id": "<str>", "cli_msg_id": "<str>", "ts_ms": <int64>}` on success, or `{"error": {"code": <int>, "message": "<str>", "url": "<str>"}}` (or `{"error": "<message>"}`) on failure. Consumed in order when the host boundary runs.
+- `cached_group_details` *(optional, `groups`)*: map of `<cleanGrid>` to group detail dictionary pre-seeded into `ZaloEngine.cachedGroupDetails` before steps run.
+- `group_member_cache` *(optional, `groups`)*: map of `<gid>` to `[{"id", "name", "avatar", "is_all"}]` pre-seeded into `ZaloEngine.groupMemberCache` before steps run.
 
 ### server
 
@@ -157,6 +159,25 @@ Run in order:
   - `load_blocked`: `{}` — awaits `loadBlockedUsers()`.
   - `set_blocked`: `{"uid": "<str>", "blocked": <bool>, "name": "<str, optional>"}` — awaits `setBlocked(uid, blocked: blocked, name: name ?? "")`.
   - `save_alias`: `{"uid": "<str>", "name": "<str>"}` — awaits `saveAlias(uid: uid, name: name)` and records the returned `(ok, text)` in `last_alias_result`.
+- Groups `cmd` steps (`groups` domain):
+  - Optional `"now_ms": <int64>` on `cmd` steps seeds `nowMs` for the duration of that step (used for `persistSingleGroupConversation` `updated_at_ms` and `handleGroupEventNotice` `ts == 0` fallback).
+  - Inherits `start`, `open`, `close`.
+  - `create_group`: `{"name": "<str>", "members": ["<uid>", ...], "avatar": null | {"jpeg_b64": "<b64>", "side": <int>}}` — awaits `createGroup(name: name, members: members, avatar: avatar)` plus any triggered `contactsTasks` (contacts resync) / `persistConversationsTask`, and records the `GroupCreateOutcome` (`{"status": "created", "id": "<gid>", "failed": [...]}` or `{"status": "failed", "title": <str|null>, "message": "<str>", "closes": <bool>}`) in `results["<stepIndex>"]`.
+  - `rename_group`: `{"id": "<gid>", "name": "<str>"}` — awaits `renameGroup(id, to: name)`.
+  - `invite`: `{"id": "<gid>", "members": ["<uid>", ...]}` — awaits `inviteMembers(members, to: id)`.
+  - `kick`: `{"id": "<gid>", "member": "<uid>"}` — awaits `kickMember(member, from: id)`.
+  - `leave_group`: `{"id": "<gid>", "silent": <bool, optional>}` — awaits `leaveGroup(id, silent: silent ?? false)`.
+  - `refresh_group`: `{"id": "<gid>"}` — awaits `refreshGroupMetadata(id)`.
+  - `load_members`: `{"id": "<gid>"}` — awaits `loadGroupMembers(in: id)` and records `[{"id", "name", "avatar", "is_all"}, ...]` in `results["<stepIndex>"]`.
+  - `set_admin`: `{"id": "<gid>", "uid": "<uid>", "admin": <bool>}` — awaits `setGroupAdmin(id, uid: uid, admin: admin)`.
+  - `change_owner`: `{"id": "<gid>", "uid": "<uid>"}` — awaits `changeGroupOwner(id, uid: uid)`.
+  - `block_member`: `{"id": "<gid>", "uid": "<uid>"}` — awaits `blockGroupMember(id, uid: uid)`.
+  - `pending`: `{"id": "<gid>"}` — awaits `groupPendingMembers(id)` and records `null` or `[{"id", "name", "avatar"}, ...]` in `results["<stepIndex>"]`.
+  - `review_pending`: `{"id": "<gid>", "uids": ["<uid>", ...], "approve": <bool>}` — awaits `reviewGroupPending(id, uids: uids, approve: approve)`.
+  - `join_approval`: `{"id": "<gid>", "on": <bool>}` — awaits `setGroupJoinApproval(id, on: on)`.
+  - `group_link`: `{"id": "<gid>"}` — awaits `groupLink(id)` and records `null` or `{"link", "enabled"}` in `results["<stepIndex>"]`.
+  - `set_group_link`: `{"id": "<gid>", "renew": <bool>}` — awaits `setGroupLink(id, renew: renew)` and records `null` or `{"link", "enabled"}` in `results["<stepIndex>"]`.
+  - `group_notice`: `{"act": "<str>", "data": {...}, "ts": <int64>}` — awaits `handleGroupEventNotice(act: act, data: data, ts: ts)`.
 - `{"await": {"phase": "<kind>", "step": "<login step, optional>"}, "timeout_ms": 5000}`: wait until the state matches. The Rust runner instead runs the core until no input or effect is pending, then checks the same predicate.
 - `{"await_host": "<call>", "timeout_ms": N}`: wait until the recorded `host` list contains `"<call>"` searching from the current host cursor, then advance the host cursor past that entry (`index + 1`). Used for deterministic ordering (for example awaiting `e2ee_connected` before `ws_push`).
 - `{"ws_push": k}` (optional `"timeout_ms": N`): instruct the fake server to send the next `k` scripted `ws_frame` or `ws_close` entries in script order.
@@ -200,7 +221,7 @@ Run in order:
   - Send domain names (Swift-owned U0b boundaries):
     - `send_e2ee_text {conv_id, text, client_id, quote}` *(E2EE 1-1 send boundary in `sendText`, invoked after the optimistic row is merged; `quote` is `null` or `{"msg_id", "cli_msg_id", "sender_id", "sender_name", "text", "ts_ms"}`, and the result is supplied by `seed.host_results.send_e2ee_text`)*
   - Message actions domain names (Swift-owned UI boundaries):
-    - `show_card {conv_id, text}` *(banner notice shown via `CardActionCenter.shared.show(text, in: convId)` from U6 react, recall, delete undo, star, auto-delete, and U9 block/unblock flows; `conv_id` is `<str|null>`; traced and skipped during recording)*
+    - `show_card {conv_id, text}` *(banner notice shown via `CardActionCenter.shared.show(text, in: convId)` from U6 react, recall, delete undo, star, auto-delete, U9 block/unblock, and U10 group admin / group link flows; `conv_id` is `<str|null>`; traced and skipped during recording)*
 
 ## Session domain state
 
@@ -544,6 +565,52 @@ Cases in `contacts` extend the Message actions domain state, adding `names` to `
 - `lookups`: map of 0-based `steps` index string (`"0"`, `"1"`, ...) for each `lookup` or `mention_name` step executed so far to `{"name": <str>, "avatar": <str>}` or `null` (`mention_name` always records `avatar: ""` when non-`null`).
 - `last_alias_result`: `null` before `save_alias`, otherwise `{"ok": <bool>, "text": <str>}` from the most recent `save_alias` step.
 - `messages[convId][].reactions[]` and `store.messages[].reactions[]` add `"names": [<str>, ...]` (reactor display names refreshed by `refreshReactionNames()`).
+
+## Groups domain state
+
+Cases in `groups` extend the Contacts domain state (`cached_group_details` overrides the key-list array with the full detail dictionary map, and `store.prefs` adds `cached_groups`), adding group metadata, roles, navigation, and step results:
+
+```json
+{
+  "cached_group_details": {
+    "500901": { "name": "Nhóm A", "creatorId": "3000000" }
+  },
+  "group_member_cache": {
+    "g500901": [
+      { "id": "-1", "name": "All", "avatar": null, "is_all": true },
+      { "id": "3000901", "name": "An Nguyễn", "avatar": null, "is_all": false }
+    ]
+  },
+  "cached_groups": {
+    "g500901": { "name": "Nhóm A", "avatar": "", "members": 2 }
+  },
+  "group_roles": {
+    "g500901": { "owner": "3000000", "admins": ["3000901"], "join_approval": false }
+  },
+  "navigation_request": null | "g500901",
+  "results": {
+    "0": { "status": "created", "id": "g500901", "failed": [] },
+    "1": [{ "id": "3000901", "name": "An Nguyễn", "avatar": null, "is_all": false }]
+  },
+  "group_logs": [],
+  "store": {
+    "prefs": {
+      "cached_groups": {
+        "g500901": { "name": "Nhóm A", "avatar": "", "members": 2 }
+      }
+    }
+  }
+}
+```
+
+- `cached_group_details`: map of `<cleanGrid>` to the full `ZaloEngine.cachedGroupDetails[cleanGrid]` dictionary (keys sorted in canonical JSON, URLs normalized).
+- `group_member_cache`: map of `<gid>` to `ZaloEngine.groupMemberCache[gid]` (`[{"id", "name", "avatar", "is_all"}]`, preserving array order).
+- `cached_groups`: map of `<gid>` to `{"name", "avatar", "members"}` from `ZaloEngine.cachedGroups`.
+- `group_roles`: map of `<gid>` (all group ids present across `cached_group_details`, `contacts.groups`, `cached_groups`, `group_member_cache`, and group entries in `conversations`) to `{"owner": <str>, "admins": [<sorted str>], "join_approval": <bool>}` returned by `ZaloEngine.groupRoles(gid)`.
+- `navigation_request`: `ZaloEngine.navigationRequest` string or `null`.
+- `results`: map of 0-based `steps` index string (`"0"`, `"1"`, ...) for each `create_group`, `load_members`, `pending`, `group_link`, or `set_group_link` step executed so far.
+- `group_logs`: holds `"group create failed: ..."`, `"group avatar upload failed: ..."`, `"rename group failed: ..."`, `"invite group members failed: ..."`, `"kick group member failed: ..."`, `"leave group failed: ..."`, and `"group admin: failed code=..."` lines emitted via `EngineLog` (with the wall-clock `HH:mm:ss.SSS ` prefix stripped).
+- `store.prefs.cached_groups`: decoded JSON object from SQLite pref `"cachedGroups"` (`{}` when absent).
 
 ## Volatile
 

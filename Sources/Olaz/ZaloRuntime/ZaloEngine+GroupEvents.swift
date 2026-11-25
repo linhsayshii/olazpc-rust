@@ -18,7 +18,7 @@ extension ZaloEngine {
             self?.lookupPersonInfo(uid)?.name
         }) else { return }
         // Seconds or milliseconds on the wire; fall back to now.
-        let ms = ts > 100_000_000_000 ? ts : (ts > 0 ? ts * 1000 : Int64(Date().timeIntervalSince1970 * 1000))
+        let ms = ts > 100_000_000_000 ? ts : (ts > 0 ? ts * 1000 : nowMs())
         let members = ((data["updateMembers"] as? [[String: Any]]) ?? []).map { JSONLossless.string($0["id"]) }.joined(separator: ",")
         let id = "gevt-\(ZaloWireParser.cleanGroupId(rawGroupId))-\(act)-\(ms)-\(members)"
         if messages[convId]?.contains(where: { $0.id == id }) == true { return }
