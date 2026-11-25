@@ -1,3 +1,4 @@
+import OlazCore
 import Foundation
 
 extension ZaloEngine {
@@ -133,6 +134,7 @@ extension ZaloEngine {
                 in: convId)
             if window.hasMoreOlder {
                 hasMoreHistory[convId] = true
+                coreLifecycle.core?.writeThroughSetHasMore(convId: convId, hasMore: true)
             }
         }
 

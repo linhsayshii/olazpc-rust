@@ -258,16 +258,20 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
 
     func onBootstrapStarted() async -> Bool {
         guard let engine else { return false }
-        await MainActor.run {
-            engine.startBootstrapRefresh()
+        let allowBootstrap = await MainActor.run {
+            let allowed = engine.traceHost("start_bootstrap")
+            if allowed {
+                engine.pushCoreIdentitiesIfRunning()
+                engine.pushCoreContactsIfRunning()
+                engine.pushCoreHistoryFreshnessIfRunning()
+            }
+            return allowed
         }
         await engine.waitForCoreMirrorDrain()
         await MainActor.run {
             engine.noteCoreBootCompleted()
         }
-        // `startBootstrapRefresh()` spawns `bootstrapTask` -> `performBootstrapSync()` -> `core.bootstrap(nowMs:)`,
-        // so return `false` to prevent double-dispatching `Command::Bootstrap`.
-        return false
+        return allowBootstrap
     }
 
     func applyMutes(mutes: [MuteEntryRecord]) async {
@@ -277,6 +281,7 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
 
     func refreshCloud() async {
         guard let engine else { return }
+        await engine.syncCachedIdentityPreferencesFromStore()
         await MainActor.run {
             engine.refreshCloud()
         }
@@ -531,61 +536,6 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         await engine.persistWSQueueCursors(ZaloWebSocket.cursorSnapshots(from: cursors))
     }
 
-    func applyBatch(
-        cmd: UInt16?,
-        incrementUnread: Bool,
-        notifyIncoming: Bool,
-        payloadJson: String
-    ) async -> BatchApplyDeltaRecord {
-        guard let engine else {
-            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], previewOverrides: [], persistConversations: false)
-        }
-        let box = ZaloJSONBox(JSONLossless.parseObject(string: payloadJson) ?? [:])
-        let delta = await engine.hostApplyBatch(
-            box: box,
-            cmd: cmd,
-            incrementUnread: incrementUnread,
-            notifyIncoming: notifyIncoming
-        )
-        if engine.hasTransportSettleTrace {
-            await MainActor.run {
-                engine.transportSettleTrace?()
-            }
-        }
-        return delta
-    }
-
-    func applyParsedEvents(
-        cmd: UInt16,
-        incrementUnread: Bool,
-        notifyIncoming: Bool,
-        events: [WireEvent],
-        uids: [String],
-        payload: CoreWirePayload
-    ) async -> BatchApplyDeltaRecord {
-        guard let engine else {
-            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], previewOverrides: [], persistConversations: false)
-        }
-        let context = await engine.hostLookupNameContext(uids: uids)
-        let resolvedWire = payload.resolve(
-            myUid: context.myUid,
-            selfConvId: context.selfConvId,
-            names: context.names
-        ) ?? events
-        let parsed = ZaloWireParser.parsedEvents(from: resolvedWire)
-        let delta = await engine.hostApplyParsedEvents(
-            cmd: cmd,
-            incrementUnread: incrementUnread,
-            notifyIncoming: notifyIncoming,
-            events: parsed
-        )
-        if engine.hasTransportSettleTrace {
-            await MainActor.run {
-                engine.transportSettleTrace?()
-            }
-        }
-        return delta
-    }
 
     func mobileSync(events: [MobileSyncEventRecord]) async {
         guard let engine, !events.isEmpty else { return }
@@ -1137,49 +1087,6 @@ extension ZaloEngine {
         await persistPollState()
     }
 
-    internal func hostApplyBatch(
-        box: ZaloJSONBox,
-        cmd: UInt16?,
-        incrementUnread: Bool,
-        notifyIncoming: Bool
-    ) async -> BatchApplyDeltaRecord {
-        let cmdArg: Any = cmd.map { Int($0) } ?? NSNull()
-        guard traceHost("apply_batch", args: [
-            "cmd": cmdArg,
-            "increment_unread": incrementUnread,
-            "notify_incoming": notifyIncoming,
-            "payload": box.dict,
-        ]) else {
-            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], previewOverrides: [], persistConversations: false)
-        }
-        return await applyBatchResponseCollectingDelta(
-            box.dict,
-            defaultCmd: cmd ?? 0,
-            incrementUnread: incrementUnread,
-            notifyIncoming: notifyIncoming
-        )
-    }
-
-    internal func hostApplyParsedEvents(
-        cmd: UInt16,
-        incrementUnread: Bool,
-        notifyIncoming: Bool,
-        events: [ParsedWireEvent]
-    ) async -> BatchApplyDeltaRecord {
-        guard traceHost("apply_parsed_events", args: [
-            "cmd": Int(cmd),
-            "increment_unread": incrementUnread,
-            "notify_incoming": notifyIncoming,
-            "events": ZaloEngine.serializeParsedWireEvents(events),
-        ]) else {
-            return BatchApplyDeltaRecord(appliedCount: 0, updates: [], previewOverrides: [], persistConversations: false)
-        }
-        return await applyParsedEventsCollectingDelta(
-            events,
-            incrementUnread: incrementUnread,
-            notifyIncoming: notifyIncoming
-        )
-    }
 
     internal func hostLookupNameContext(uids: [String]) -> CoreNameContext {
         var names: [NameEntry] = []
@@ -1942,40 +1849,27 @@ extension ZaloEngine {
         return offline
     }
 
-    internal func commitBatchDeltaToCore(_ delta: BatchApplyDeltaRecord) async {
-        guard delta.appliedCount > 0 || !delta.updates.isEmpty || !delta.previewOverrides.isEmpty else { return }
+    internal func commitPreviewOverrideToCore(_ overrideRec: ConvPreviewOverrideRecord) async {
         if let core = coreLifecycle.core {
-            if let v = try? await core.applyBatchDelta(delta: delta) {
+            if let v = try? await core.applyPreviewOverride(overrideRec: overrideRec) {
                 await waitForMirrorVersion(v)
             }
             return
         }
-        let overrideIds = Set(delta.previewOverrides.map(\.convId))
-        var beforePreviews: [String: ConversationSummary.Preview?] = [:]
-        if !overrideIds.isEmpty {
-            for conv in conversations where overrideIds.contains(conv.id) {
-                beforePreviews[conv.id] = conv.preview
-            }
-        }
-        let batch = offlineConversationsCore().applyBatchDelta(delta: delta)
+        let prevBefore = conversations.first(where: { $0.id == overrideRec.convId })?.preview
+        let batch = offlineConversationsCore().applyPreviewOverride(overrideRec: overrideRec)
         applyCoreChanges(batch)
-        if delta.persistConversations {
-            await persistConversationsToSQLite()
-            for id in overrideIds {
-                guard let conv = conversations.first(where: { $0.id == id }) else { continue }
-                let prevBefore = beforePreviews[id] ?? nil
-                if prevBefore != conv.preview {
-                    let previewText = conv.preview?.text ?? ""
-                    let previewTsMs = conv.preview?.date.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) } ?? 0
-                    let previewFromMe = conv.preview?.fromMe ?? false
-                    try? await sqliteStore?.setConversationPreview(
-                        id: id,
-                        previewText: previewText,
-                        previewTsMs: previewTsMs,
-                        previewFromMe: previewFromMe
-                    )
-                }
-            }
+        await persistConversationsToSQLite()
+        if let conv = conversations.first(where: { $0.id == overrideRec.convId }), prevBefore != conv.preview {
+            let previewText = conv.preview?.text ?? ""
+            let previewTsMs = conv.preview?.date.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) } ?? 0
+            let previewFromMe = conv.preview?.fromMe ?? false
+            try? await sqliteStore?.setConversationPreview(
+                id: overrideRec.convId,
+                previewText: previewText,
+                previewTsMs: previewTsMs,
+                previewFromMe: previewFromMe
+            )
         }
     }
 

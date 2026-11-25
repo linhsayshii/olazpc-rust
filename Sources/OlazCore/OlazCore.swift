@@ -1261,11 +1261,6 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func applyAccountProfile(account: LoginAccountRecord) async throws  -> UInt64
     
-    /**
-     * Applies a Swift-computed [`BatchApplyDeltaRecord`] and awaits store persistence if requested.
-     */
-    func applyBatchDelta(delta: BatchApplyDeltaRecord) async throws  -> UInt64
-    
     func applyBatchDirect(payloadJson: String, defaultCmd: UInt16, fallbackConvId: String?, isGroupHint: Bool?, incrementUnread: Bool, notifyIncoming: Bool, persistConversations: Bool, probeFreshness: Bool) async throws  -> Int64
     
     /**
@@ -1274,6 +1269,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func applyBootstrapPinArchive(pinnedIds: [String]?, archivedIds: [String]?) async throws  -> UInt64
     
     func applyParsedEventsDirect(events: [WireEvent], incrementUnread: Bool, notifyIncoming: Bool, persistConversations: Bool) async throws  -> Int64
+    
+    /**
+     * Applies a standalone recall/delete [`ConvPreviewOverrideRecord`] and awaits store persistence.
+     */
+    func applyPreviewOverride(overrideRec: ConvPreviewOverrideRecord) async throws  -> UInt64
     
     /**
      * Applies an already-fetched server hidden-conversations snapshot.
@@ -1785,25 +1785,6 @@ open func applyAccountProfile(account: LoginAccountRecord)async throws  -> UInt6
         )
 }
     
-    /**
-     * Applies a Swift-computed [`BatchApplyDeltaRecord`] and awaits store persistence if requested.
-     */
-open func applyBatchDelta(delta: BatchApplyDeltaRecord)async throws  -> UInt64  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_olaz_ffi_fn_method_coreengine_apply_batch_delta(
-                        self.uniffiCloneHandle(),FfiConverterTypeBatchApplyDeltaRecord_lower(delta)
-                )
-            },
-            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
-            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
-            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
-            liftFunc: FfiConverterUInt64.lift,
-            errorHandler: FfiConverterTypeCoreError_lift
-        )
-}
-    
 open func applyBatchDirect(payloadJson: String, defaultCmd: UInt16, fallbackConvId: String?, isGroupHint: Bool?, incrementUnread: Bool, notifyIncoming: Bool, persistConversations: Bool, probeFreshness: Bool)async throws  -> Int64  {
     return
         try  await uniffiRustCallAsync(
@@ -1851,6 +1832,25 @@ open func applyParsedEventsDirect(events: [WireEvent], incrementUnread: Bool, no
             completeFunc: ffi_olaz_ffi_rust_future_complete_i64,
             freeFunc: ffi_olaz_ffi_rust_future_free_i64,
             liftFunc: FfiConverterInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Applies a standalone recall/delete [`ConvPreviewOverrideRecord`] and awaits store persistence.
+     */
+open func applyPreviewOverride(overrideRec: ConvPreviewOverrideRecord)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_apply_preview_override(
+                        self.uniffiCloneHandle(),FfiConverterTypeConvPreviewOverrideRecord_lower(overrideRec)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
 }
@@ -3263,10 +3263,6 @@ public protocol CoreHost: AnyObject, Sendable {
     
     func persistWsCursors(cursors: [CursorEntry]) async 
     
-    func applyBatch(cmd: UInt16?, incrementUnread: Bool, notifyIncoming: Bool, payloadJson: String) async  -> BatchApplyDeltaRecord
-    
-    func applyParsedEvents(cmd: UInt16, incrementUnread: Bool, notifyIncoming: Bool, events: [WireEvent], uids: [String], payload: CoreWirePayload) async  -> BatchApplyDeltaRecord
-    
     func mobileSync(events: [MobileSyncEventRecord]) async 
     
     func e2eeSignal(cmd: UInt16, payloadJson: String) async 
@@ -3912,40 +3908,6 @@ open func persistWsCursors(cursors: [CursorEntry])async   {
             completeFunc: ffi_olaz_ffi_rust_future_complete_void,
             freeFunc: ffi_olaz_ffi_rust_future_free_void,
             liftFunc: { $0 },
-            errorHandler: nil
-            
-        )
-}
-    
-open func applyBatch(cmd: UInt16?, incrementUnread: Bool, notifyIncoming: Bool, payloadJson: String)async  -> BatchApplyDeltaRecord  {
-    return
-        try!  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_olaz_ffi_fn_method_corehost_apply_batch(
-                        self.uniffiCloneHandle(),FfiConverterOptionUInt16.lower(cmd),FfiConverterBool.lower(incrementUnread),FfiConverterBool.lower(notifyIncoming),FfiConverterString.lower(payloadJson)
-                )
-            },
-            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeBatchApplyDeltaRecord_lift,
-            errorHandler: nil
-            
-        )
-}
-    
-open func applyParsedEvents(cmd: UInt16, incrementUnread: Bool, notifyIncoming: Bool, events: [WireEvent], uids: [String], payload: CoreWirePayload)async  -> BatchApplyDeltaRecord  {
-    return
-        try!  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_olaz_ffi_fn_method_corehost_apply_parsed_events(
-                        self.uniffiCloneHandle(),FfiConverterUInt16.lower(cmd),FfiConverterBool.lower(incrementUnread),FfiConverterBool.lower(notifyIncoming),FfiConverterSequenceTypeWireEvent.lower(events),FfiConverterSequenceString.lower(uids),FfiConverterTypeCoreWirePayload_lower(payload)
-                )
-            },
-            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeBatchApplyDeltaRecord_lift,
             errorHandler: nil
             
         )
@@ -5538,106 +5500,6 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                 droppedCallback: uniffiOutDroppedCallback
             )
         },
-        applyBatch: { (
-            uniffiHandle: UInt64,
-            cmd: RustBuffer,
-            incrementUnread: Int8,
-            notifyIncoming: Int8,
-            payloadJson: RustBuffer,
-            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
-            uniffiCallbackData: UInt64,
-            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
-        ) in
-            let makeCall = {
-                () async throws -> BatchApplyDeltaRecord in
-                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
-                    throw UniffiInternalError.unexpectedStaleHandle
-                }
-                return await uniffiObj.applyBatch(
-                     cmd: try FfiConverterOptionUInt16.lift(cmd),
-                     incrementUnread: try FfiConverterBool.lift(incrementUnread),
-                     notifyIncoming: try FfiConverterBool.lift(notifyIncoming),
-                     payloadJson: try FfiConverterString.lift(payloadJson)
-                )
-            }
-
-            let uniffiHandleSuccess = { (returnValue: BatchApplyDeltaRecord) in
-                uniffiFutureCallback(
-                    uniffiCallbackData,
-                    UniffiForeignFutureResultRustBuffer(
-                        returnValue: FfiConverterTypeBatchApplyDeltaRecord_lower(returnValue),
-                        callStatus: RustCallStatus()
-                    )
-                )
-            }
-            let uniffiHandleError = { (statusCode, errorBuf) in
-                uniffiFutureCallback(
-                    uniffiCallbackData,
-                    UniffiForeignFutureResultRustBuffer(
-                        returnValue: RustBuffer.empty(),
-                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
-                    )
-                )
-            }
-            uniffiTraitInterfaceCallAsync(
-                makeCall: makeCall,
-                handleSuccess: uniffiHandleSuccess,
-                handleError: uniffiHandleError,
-                droppedCallback: uniffiOutDroppedCallback
-            )
-        },
-        applyParsedEvents: { (
-            uniffiHandle: UInt64,
-            cmd: UInt16,
-            incrementUnread: Int8,
-            notifyIncoming: Int8,
-            events: RustBuffer,
-            uids: RustBuffer,
-            payload: UInt64,
-            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
-            uniffiCallbackData: UInt64,
-            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
-        ) in
-            let makeCall = {
-                () async throws -> BatchApplyDeltaRecord in
-                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
-                    throw UniffiInternalError.unexpectedStaleHandle
-                }
-                return await uniffiObj.applyParsedEvents(
-                     cmd: try FfiConverterUInt16.lift(cmd),
-                     incrementUnread: try FfiConverterBool.lift(incrementUnread),
-                     notifyIncoming: try FfiConverterBool.lift(notifyIncoming),
-                     events: try FfiConverterSequenceTypeWireEvent.lift(events),
-                     uids: try FfiConverterSequenceString.lift(uids),
-                     payload: try FfiConverterTypeCoreWirePayload_lift(payload)
-                )
-            }
-
-            let uniffiHandleSuccess = { (returnValue: BatchApplyDeltaRecord) in
-                uniffiFutureCallback(
-                    uniffiCallbackData,
-                    UniffiForeignFutureResultRustBuffer(
-                        returnValue: FfiConverterTypeBatchApplyDeltaRecord_lower(returnValue),
-                        callStatus: RustCallStatus()
-                    )
-                )
-            }
-            let uniffiHandleError = { (statusCode, errorBuf) in
-                uniffiFutureCallback(
-                    uniffiCallbackData,
-                    UniffiForeignFutureResultRustBuffer(
-                        returnValue: RustBuffer.empty(),
-                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
-                    )
-                )
-            }
-            uniffiTraitInterfaceCallAsync(
-                makeCall: makeCall,
-                handleSuccess: uniffiHandleSuccess,
-                handleError: uniffiHandleError,
-                droppedCallback: uniffiOutDroppedCallback
-            )
-        },
         mobileSync: { (
             uniffiHandle: UInt64,
             events: RustBuffer,
@@ -6650,7 +6512,7 @@ public func FfiConverterTypeCoreMedia_lower(_ value: CoreMedia) -> UInt64 {
  */
 public protocol CoreOfflineConversationsProtocol: AnyObject, Sendable {
     
-    func applyBatchDelta(delta: BatchApplyDeltaRecord)  -> CoreChangesRecord
+    func applyPreviewOverride(overrideRec: ConvPreviewOverrideRecord)  -> CoreChangesRecord
     
     func ensureKnownContacts()  -> CoreChangesRecord
     
@@ -6742,12 +6604,12 @@ public convenience init() {
     
 
     
-open func applyBatchDelta(delta: BatchApplyDeltaRecord) -> CoreChangesRecord  {
+open func applyPreviewOverride(overrideRec: ConvPreviewOverrideRecord) -> CoreChangesRecord  {
     return try!  FfiConverterTypeCoreChangesRecord_lift(try! rustCall() {
         uniffiCallStatus in
-    uniffi_olaz_ffi_fn_method_coreofflineconversations_apply_batch_delta(
+    uniffi_olaz_ffi_fn_method_coreofflineconversations_apply_preview_override(
             self.uniffiCloneHandle(),
-        FfiConverterTypeBatchApplyDeltaRecord_lower(delta),uniffiCallStatus
+        FfiConverterTypeConvPreviewOverrideRecord_lower(overrideRec),uniffiCallStatus
     )
 })
 }
@@ -10747,68 +10609,6 @@ public func FfiConverterTypeWsSession_lower(_ value: WsSession) -> UInt64 {
 
 
 
-public struct BatchApplyDeltaRecord: Equatable, Hashable {
-    public var appliedCount: UInt32
-    public var updates: [ConvMessageDeltaRecord]
-    public var previewOverrides: [ConvPreviewOverrideRecord]
-    public var persistConversations: Bool
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(appliedCount: UInt32, updates: [ConvMessageDeltaRecord], previewOverrides: [ConvPreviewOverrideRecord], persistConversations: Bool) {
-        self.appliedCount = appliedCount
-        self.updates = updates
-        self.previewOverrides = previewOverrides
-        self.persistConversations = persistConversations
-    }
-
-    
-
-    
-}
-
-#if compiler(>=6)
-extension BatchApplyDeltaRecord: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeBatchApplyDeltaRecord: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BatchApplyDeltaRecord {
-        return
-            try BatchApplyDeltaRecord(
-                appliedCount: FfiConverterUInt32.read(from: &buf), 
-                updates: FfiConverterSequenceTypeConvMessageDeltaRecord.read(from: &buf), 
-                previewOverrides: FfiConverterSequenceTypeConvPreviewOverrideRecord.read(from: &buf), 
-                persistConversations: FfiConverterBool.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: BatchApplyDeltaRecord, into buf: inout [UInt8]) {
-        FfiConverterUInt32.write(value.appliedCount, into: &buf)
-        FfiConverterSequenceTypeConvMessageDeltaRecord.write(value.updates, into: &buf)
-        FfiConverterSequenceTypeConvPreviewOverrideRecord.write(value.previewOverrides, into: &buf)
-        FfiConverterBool.write(value.persistConversations, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeBatchApplyDeltaRecord_lift(_ buf: RustBuffer) throws -> BatchApplyDeltaRecord {
-    return try FfiConverterTypeBatchApplyDeltaRecord.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeBatchApplyDeltaRecord_lower(_ value: BatchApplyDeltaRecord) -> RustBuffer {
-    return FfiConverterTypeBatchApplyDeltaRecord.lower(value)
-}
-
-
 public struct BoolMapEntry: Equatable, Hashable {
     public var convId: String
     public var value: Bool
@@ -11350,84 +11150,6 @@ public func FfiConverterTypeContactsStateRecord_lift(_ buf: RustBuffer) throws -
 #endif
 public func FfiConverterTypeContactsStateRecord_lower(_ value: ContactsStateRecord) -> RustBuffer {
     return FfiConverterTypeContactsStateRecord.lower(value)
-}
-
-
-public struct ConvMessageDeltaRecord: Equatable, Hashable {
-    public var convId: String
-    public var previewText: String
-    public var previewDateMs: Int64
-    public var previewFromMe: Bool
-    public var isMine: Bool
-    public var senderName: String
-    public var senderAvatar: String?
-    public var unreadDelta: Int64
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(convId: String, previewText: String, previewDateMs: Int64, previewFromMe: Bool, isMine: Bool, senderName: String, senderAvatar: String?, unreadDelta: Int64) {
-        self.convId = convId
-        self.previewText = previewText
-        self.previewDateMs = previewDateMs
-        self.previewFromMe = previewFromMe
-        self.isMine = isMine
-        self.senderName = senderName
-        self.senderAvatar = senderAvatar
-        self.unreadDelta = unreadDelta
-    }
-
-    
-
-    
-}
-
-#if compiler(>=6)
-extension ConvMessageDeltaRecord: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeConvMessageDeltaRecord: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConvMessageDeltaRecord {
-        return
-            try ConvMessageDeltaRecord(
-                convId: FfiConverterString.read(from: &buf), 
-                previewText: FfiConverterString.read(from: &buf), 
-                previewDateMs: FfiConverterInt64.read(from: &buf), 
-                previewFromMe: FfiConverterBool.read(from: &buf), 
-                isMine: FfiConverterBool.read(from: &buf), 
-                senderName: FfiConverterString.read(from: &buf), 
-                senderAvatar: FfiConverterOptionString.read(from: &buf), 
-                unreadDelta: FfiConverterInt64.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: ConvMessageDeltaRecord, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.convId, into: &buf)
-        FfiConverterString.write(value.previewText, into: &buf)
-        FfiConverterInt64.write(value.previewDateMs, into: &buf)
-        FfiConverterBool.write(value.previewFromMe, into: &buf)
-        FfiConverterBool.write(value.isMine, into: &buf)
-        FfiConverterString.write(value.senderName, into: &buf)
-        FfiConverterOptionString.write(value.senderAvatar, into: &buf)
-        FfiConverterInt64.write(value.unreadDelta, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeConvMessageDeltaRecord_lift(_ buf: RustBuffer) throws -> ConvMessageDeltaRecord {
-    return try FfiConverterTypeConvMessageDeltaRecord.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeConvMessageDeltaRecord_lower(_ value: ConvMessageDeltaRecord) -> RustBuffer {
-    return FfiConverterTypeConvMessageDeltaRecord.lower(value)
 }
 
 
@@ -21425,56 +21147,6 @@ fileprivate struct FfiConverterSequenceTypeChatMessageRecord: FfiConverterRustBu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterSequenceTypeConvMessageDeltaRecord: FfiConverterRustBuffer {
-    typealias SwiftType = [ConvMessageDeltaRecord]
-
-    public static func write(_ value: [ConvMessageDeltaRecord], into buf: inout [UInt8]) {
-        let len = Int32(value.count)
-        writeInt(&buf, len)
-        for item in value {
-            FfiConverterTypeConvMessageDeltaRecord.write(item, into: &buf)
-        }
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ConvMessageDeltaRecord] {
-        let len: Int32 = try readInt(&buf)
-        var seq = [ConvMessageDeltaRecord]()
-        seq.reserveCapacity(Int(len))
-        for _ in 0 ..< len {
-            seq.append(try FfiConverterTypeConvMessageDeltaRecord.read(from: &buf))
-        }
-        return seq
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterSequenceTypeConvPreviewOverrideRecord: FfiConverterRustBuffer {
-    typealias SwiftType = [ConvPreviewOverrideRecord]
-
-    public static func write(_ value: [ConvPreviewOverrideRecord], into buf: inout [UInt8]) {
-        let len = Int32(value.count)
-        writeInt(&buf, len)
-        for item in value {
-            FfiConverterTypeConvPreviewOverrideRecord.write(item, into: &buf)
-        }
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ConvPreviewOverrideRecord] {
-        let len: Int32 = try readInt(&buf)
-        var seq = [ConvPreviewOverrideRecord]()
-        seq.reserveCapacity(Int(len))
-        for _ in 0 ..< len {
-            seq.append(try FfiConverterTypeConvPreviewOverrideRecord.read(from: &buf))
-        }
-        return seq
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterSequenceTypeConversationLabelRecord: FfiConverterRustBuffer {
     typealias SwiftType = [ConversationLabelRecord]
 
@@ -22895,9 +22567,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_apply_account_profile() != 24350) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_coreengine_apply_batch_delta() != 26127) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_apply_batch_direct() != 3697) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -22905,6 +22574,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_apply_parsed_events_direct() != 64846) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_apply_preview_override() != 9988) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_apply_server_hidden_conversations() != 4274) {
@@ -23279,46 +22951,40 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_corehost_persist_ws_cursors() != 25143) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_apply_batch() != 64441) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_mobile_sync() != 65010) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_apply_parsed_events() != 62312) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_e2ee_signal() != 43733) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_mobile_sync() != 17978) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_e2ee_deliver_reports() != 960) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_e2ee_signal() != 65346) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_e2ee_connected() != 47680) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_e2ee_deliver_reports() != 18305) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_e2ee_disconnected() != 47415) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_e2ee_connected() != 12943) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_voip_control() != 635) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_e2ee_disconnected() != 28153) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_show_typing() != 5771) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_voip_control() != 59623) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_pin_topic() != 20520) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_show_typing() != 17560) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_group_notice() != 57748) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_pin_topic() != 36318) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_mute() != 61694) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_group_notice() != 4415) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_send_e2ee_text() != 23388) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_mute() != 59631) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_olaz_ffi_checksum_method_corehost_send_e2ee_text() != 12893) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_olaz_ffi_checksum_method_coreofflineconversations_apply_batch_delta() != 33957) {
+    if (uniffi_olaz_ffi_checksum_method_coreofflineconversations_apply_preview_override() != 46636) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreofflineconversations_ensure_known_contacts() != 38713) {

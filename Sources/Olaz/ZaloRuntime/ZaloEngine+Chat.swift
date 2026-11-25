@@ -27,152 +27,17 @@ extension ZaloEngine {
             }
         }
 
-        let isGrp = ZaloWireParser.isGroupId(id)
         updateCallGateForConversation(id)
 
-        if let core = coreLifecycle.core {
-            pushCoreIdentitiesIfRunning()
-            pushCoreContactsIfRunning()
-            openConversationTask = Task { [weak self] in
-                guard let self else { return }
-                if let v = try? await core.openConversationAndWait(id: id, preloaded: preloadedRecords) {
-                    await self.waitForMirrorVersion(v)
-                }
-                await self.syncCachedIdentityPreferencesFromStore()
-            }
-            return
-        }
-
         openConversationTask = Task { [weak self] in
-            guard let self else { return }
-            // 1. Fallback async read for in-memory test DBs without a separate WAL handle.
-            if (self.messages[id]?.isEmpty ?? true),
-               let cached = try? await self.sqliteStore?.decodedMessages(convId: id, limit: 50) {
-                let decoded = cached.map(\.message)
-                for msg in decoded { self.mergeMessageIntoMemory(msg) }
-                if decoded.count >= 45 {
-                    self.hasMoreHistory[id] = true
-                }
+            guard let self, let core = await self.ensureCoreEngine() else { return }
+            self.pushCoreIdentitiesIfRunning()
+            self.pushCoreContactsIfRunning()
+            if let v = try? await core.openConversationAndWait(id: id, preloaded: preloadedRecords) {
+                await self.waitForMirrorVersion(v)
             }
-
-            // 2. Refresh recent history (and board pins) from server if authenticated. Skipped when this session already
-            // knows the store holds the newest message (launch preload probe, or an earlier open of this chat).
-            let fetched = self.isRecentHistoryUpToDate(id)
-                ? 0
-                : await self.fetchAndMergeHistory(convId: id, beforeMsgId: nil, isOld: false, count: 50)
-            await self.resolveMissingSenderProfiles(in: id)
-            if (fetched > 0 || self.conversations.first(where: { $0.id == id })?.preview == nil),
-               let latest = self.messages[id]?.last {
-                self.updateConversationOnMessage(latest, incrementUnread: false)
-            }
-            if isGrp || self.contacts.friends.contains(where: { $0.id == id }) {
-                await self.refreshBoardPins(for: id)
-            } else {
-                EngineLog.shared.write("pins: list skipped (1-1 not in friends)")
-            }
-
-            // 3. Mark read locally & remotely.
-            if self.traceU4Host("mark_read", args: ["conv_id": id]) {
-                self.markRead(id)
-            }
+            await self.syncCachedIdentityPreferencesFromStore()
         }
-    }
-
-    internal func resolveMissingSenderProfiles(in convId: String) async {
-        guard let list = messages[convId], !list.isEmpty else { return }
-        let cleanMyUid = ZaloWireParser.stripUserPrefix(profile?.userId ?? "")
-        let sanitizedMyUid = ZaloWireParser.sanitizeProfileUid(cleanMyUid) ?? cleanMyUid
-        let sentinelKeys: Set<String> = ["", "0", "me", "__legacy__", "unknown", "-1"]
-
-        var unknownUids: [String] = []
-        var seen: Set<String> = []
-
-        func considerUid(_ raw: String, existingName: String = "", hasAvatar: Bool = false) {
-            let trimmed = ZaloWireParser.stripUserPrefix(raw)
-            let clean = ZaloWireParser.sanitizeProfileUid(trimmed) ?? trimmed
-            guard !sentinelKeys.contains(clean),
-                  clean != cleanMyUid,
-                  clean != sanitizedMyUid,
-                  seen.insert(clean).inserted else { return }
-            let person = lookupPersonInfo(clean)
-            let bestName = (!existingName.isEmpty && existingName != clean && existingName != ReactionDetail.unknownName)
-                ? existingName
-                : (person?.name ?? "")
-            let needsName = bestName.isEmpty || bestName == clean || bestName == ReactionDetail.unknownName
-            let needsAvatar = !hasAvatar && (person?.avatar.isEmpty ?? true) && (cachedProfiles[clean]?.avatar.isEmpty ?? true)
-            if needsName || needsAvatar {
-                unknownUids.append(clean)
-            }
-        }
-
-        for msg in list {
-            if !msg.isMine && !msg.senderId.isEmpty && msg.senderId != "0" && msg.senderId != cleanMyUid {
-                considerUid(msg.senderId, existingName: msg.senderName, hasAvatar: msg.senderAvatar != nil)
-            }
-            for react in msg.reactions {
-                for rawUid in react.userCounts.keys {
-                    considerUid(rawUid)
-                }
-            }
-        }
-        guard !unknownUids.isEmpty else {
-            refreshReactionNames(in: convId)
-            return
-        }
-
-        var cacheUpdated = false
-        for offset in stride(from: 0, to: unknownUids.count, by: 50) {
-            let chunk = Array(unknownUids[offset..<min(offset + 50, unknownUids.count)])
-            guard let box = try? await sessionClient.fetchProfiles(uids: chunk) else { continue }
-            let profilesMap = ZaloWireParser.extractProfilesMap(box.dict)
-            for (uid, row) in profilesMap {
-                let trimmed = ZaloWireParser.stripUserPrefix(uid)
-                let clean = ZaloWireParser.sanitizeProfileUid(trimmed) ?? trimmed
-                let fetchedName = ZaloWireParser.preferredName(row)
-                let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
-                if !clean.isEmpty, (!fetchedName.isEmpty || !avt.isEmpty) {
-                    cachedProfiles[clean] = ZaloWebKitMigrator.CachedProfile(name: fetchedName, avatar: avt)
-                    cacheUpdated = true
-                }
-            }
-        }
-        guard cacheUpdated else {
-            refreshReactionNames(in: convId)
-            return
-        }
-        if let data = try? JSONEncoder().encode(cachedProfiles) {
-            try? await sqliteStore?.setPreferenceData(key: "cachedProfiles", data: data)
-        }
-
-        guard var updatedList = messages[convId] else { return }
-        var toPersist: [StoredMessage] = []
-        var modified = false
-        for i in updatedList.indices where !updatedList[i].isMine {
-            let clean = ZaloWireParser.stripUserPrefix(updatedList[i].senderId)
-            guard let info = lookupPersonInfo(clean) else { continue }
-            var rowChanged = false
-            if !info.name.isEmpty, info.name != clean, info.name != ReactionDetail.unknownName, updatedList[i].senderName != info.name {
-                updatedList[i].senderName = info.name
-                rowChanged = true
-            }
-            if updatedList[i].senderAvatar == nil, !info.avatar.isEmpty, let url = URL(string: info.avatar) {
-                updatedList[i].senderAvatar = url
-                rowChanged = true
-            }
-            if rowChanged {
-                modified = true
-                if let stored = ZaloWireParser.encodeChatMessage(updatedList[i]) {
-                    toPersist.append(stored)
-                }
-            }
-        }
-        if modified {
-            messages[convId] = updatedList
-            if !toPersist.isEmpty {
-                try? await sqliteStore?.saveMessages(toPersist, preserveExistingReactions: true)
-            }
-        }
-        refreshReactionNames(in: convId)
     }
 
     func closeConversation() {
@@ -183,140 +48,14 @@ extension ZaloEngine {
 
     func loadOlderMessages(_ id: String) {
         guard !id.isEmpty else { return }
-        if let core = coreLifecycle.core {
-            pushCoreIdentitiesIfRunning()
-            loadOlderTask = Task { [weak self] in
-                guard let self else { return }
-                if let v = try? await core.loadOlderMessagesAndWait(id: id) {
-                    await self.waitForMirrorVersion(v)
-                }
-                await self.syncCachedIdentityPreferencesFromStore()
-            }
-            return
-        }
         loadOlderTask = Task { [weak self] in
-            guard let self else { return }
-            let existing = self.messages[id] ?? []
-            let oldest = existing.first
-            let beforeTsMs = oldest.map { Int64(($0.date.timeIntervalSince1970 * 1000).rounded()) }
-
-            var addedCount = 0
-            if let beforeTsMs {
-                let cachedOlder: [DecodedMessageRow]?
-                if let syncOlder = self.sqliteStore?.readDecodedMessagesNow(convId: id, beforeTsMs: beforeTsMs, limit: 50) {
-                    cachedOlder = syncOlder
-                } else {
-                    cachedOlder = try? await self.sqliteStore?.decodedMessages(convId: id, beforeTsMs: beforeTsMs, limit: 50)
-                }
-                if let cachedOlder, !cachedOlder.isEmpty {
-                    let decoded = cachedOlder.map(\.message)
-                    for msg in decoded {
-                        if !(self.messages[id]?.contains(where: { $0.id == msg.id }) ?? false) {
-                            addedCount += 1
-                        }
-                        self.mergeMessageIntoMemory(msg)
-                    }
-                    if cachedOlder.count < 45 && !ZaloWireParser.isGroupId(id) && id != self.selfConversationId {
-                        self.hasMoreHistory[id] = false
-                    }
-                }
+            guard let self, let core = await self.ensureCoreEngine() else { return }
+            self.pushCoreIdentitiesIfRunning()
+            if let v = try? await core.loadOlderMessagesAndWait(id: id) {
+                await self.waitForMirrorVersion(v)
             }
-
-            if addedCount == 0 {
-                let cursor: String? = oldest.flatMap { msg in
-                    Int64(msg.id).map(String.init)
-                }
-                let fetched = await self.fetchAndMergeHistory(convId: id, beforeMsgId: cursor, isOld: nil, count: 50)
-                if fetched == 0 {
-                    self.hasMoreHistory[id] = false
-                }
-            }
-            await self.resolveMissingSenderProfiles(in: id)
-            self.historyTicks[id, default: 0] += 1
+            await self.syncCachedIdentityPreferencesFromStore()
         }
-    }
-
-    @discardableResult
-    internal func fetchAndMergeHistory(convId: String, beforeMsgId: String?, isOld: Bool? = nil, count: Int = 50) async -> Int {
-        guard let page = try? await sessionClient.fetchHistoryPage(convId: convId, lastMsgId: beforeMsgId, count: count, isOld: isOld) else {
-            if beforeMsgId == nil {
-                if messages[convId] == nil { messages[convId] = [] }
-                if messages[convId]?.isEmpty ?? true { hasMoreHistory[convId] = false }
-            }
-            return 0
-        }
-
-        if beforeMsgId == nil { historyFreshness[convId] = .upToDate }
-        let myUid = profile?.userId ?? ""
-        let isGrp = ZaloWireParser.isGroupId(convId)
-        let isSelf = (convId == selfConversationId)
-        let events = await ZaloWireParser.historyEventsAsync(
-            page,
-            myUid: myUid,
-            selfConvId: selfConversationId,
-            fallbackConvId: (isGrp || isSelf) ? convId : nil,
-            isGroupHint: isGrp ? true : (isSelf ? false : nil),
-            nameLookup: { [weak self] uid in self?.lookupPersonInfo(uid) }
-        )
-
-        var storedBatch: [StoredMessage] = []
-        var newVisibleCount = 0
-        var totalParsedMessages = 0
-
-        for ev in events {
-            if case .message(let msg, let stored) = ev {
-                if msg.conversationId == convId {
-                    totalParsedMessages += 1
-                    if !(messages[msg.conversationId]?.contains(where: { $0.id == msg.id }) ?? false) {
-                        newVisibleCount += 1
-                    }
-                }
-                storedBatch.append(stored)
-                mergeMessageIntoMemory(msg, replacingClientId: stored.clientId)
-            }
-        }
-        if messages[convId] == nil {
-            messages[convId] = []
-        }
-        if !storedBatch.isEmpty {
-            try? await sqliteStore?.saveMessages(storedBatch, preserveExistingReactions: true)
-        }
-        for ev in ZaloWireParser.sortReactionEventsChronologically(events) {
-            if case .reaction(let cId, let mid, let cid, let senderId, let rType, let rIcon, let eventId, let reactClientId, _, _, let senderName) = ev {
-                await applyRemoteReaction(
-                    convId: cId,
-                    msgId: mid,
-                    cliMsgId: cid,
-                    senderId: senderId,
-                    rType: rType,
-                    rIcon: rIcon,
-                    eventId: eventId,
-                    reactClientId: reactClientId,
-                    senderName: senderName
-                )
-            }
-        }
-        for ev in events {
-            switch ev {
-            case .undo(let cId, let mid, let cid):
-                await applyRemoteRecall(convId: cId, msgId: mid, cliMsgId: cid)
-            case .delete(let cId, let mid, let cid):
-                await applyRemoteDelete(convId: cId, msgId: mid, cliMsgId: cid)
-            case .message, .reaction, .typing, .ignore:
-                break
-            }
-        }
-        let isSelfCloud = convId == selfConversationId
-        if isGrp || isSelfCloud {
-            if totalParsedMessages >= max(10, count / 2) {
-                hasMoreHistory[convId] = true
-            } else if (messages[convId]?.count ?? 0) < 45 {
-                hasMoreHistory[convId] = false
-            }
-        } else if (messages[convId]?.count ?? 0) < 45 {
-            hasMoreHistory[convId] = false
-        }
-        return newVisibleCount
     }
 
     // MARK: - Send Text / Mentions
