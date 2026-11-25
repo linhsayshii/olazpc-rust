@@ -1307,16 +1307,20 @@ enum ForwardRecorderHarness {
         var lastSendResult: Bool?
         var results: [String: CaseJSON] = [:]
 
-        EngineLog.shared.onAppend = { rawLine in
-            if let sp = rawLine.firstIndex(of: " ") {
-                let msg = String(rawLine[rawLine.index(after: sp)...])
-                if msg.hasPrefix("bootstrap: ") { bootstrapLogs.append(msg) }
-                if msg.hasPrefix("sendText ") { sendLogs.append(msg) }
-                if msg.hasPrefix("recall failed:") || msg.hasPrefix("react failed:") {
-                    actionLogs.append(msg)
+        func installLogHooks(forwardingTo existing: ((String) -> Void)?) {
+            EngineLog.shared.onAppend = { rawLine in
+                existing?(rawLine)
+                if let sp = rawLine.firstIndex(of: " ") {
+                    let msg = String(rawLine[rawLine.index(after: sp)...])
+                    if msg.hasPrefix("bootstrap: ") { bootstrapLogs.append(msg) }
+                    if msg.hasPrefix("sendText ") { sendLogs.append(msg) }
+                    if msg.hasPrefix("recall failed:") || msg.hasPrefix("react failed:") {
+                        actionLogs.append(msg)
+                    }
                 }
             }
         }
+        installLogHooks(forwardingTo: nil)
 
         let suppressedTransports = Set(
             scenario.seed["suppress"]?.arrayValue?.compactMap(\.stringValue) ?? []
@@ -1416,6 +1420,8 @@ enum ForwardRecorderHarness {
                     switch cmd {
                     case "start":
                         engine.start()
+                        let engineAppend = EngineLog.shared.onAppend
+                        installLogHooks(forwardingTo: engineAppend)
                     case "open":
                         _ = await engine.bootTask?.value
                         let id = args?["id"]?.stringValue ?? ""
