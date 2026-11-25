@@ -1745,16 +1745,36 @@ impl CoreEngine {
         self.handle.current_version()
     }
 
-    /// Enqueues a barrier on the actor mailbox, flushes any queued serial SQLite writes, and
-    /// returns the change revision once every input enqueued before this call has been reduced
-    /// and published (`0` if already stopped).
+    /// Enqueues barriers across the actor mailbox, serial host worker, and serial SQLite store
+    /// worker until all pending host/store jobs and the inputs they feed back into the actor have
+    /// been reduced and published (`0` if already stopped).
     pub async fn settle(&self) -> Result<u64, CoreError> {
         let handle = Arc::clone(&self.handle);
         let runner = Arc::clone(&self.runner);
         let version = run(async move {
-            let _ = handle.settle().await;
-            runner.flush_store().await;
-            handle.settle().await.unwrap_or(0)
+            let mut version = 0;
+            for _ in 0..8 {
+                if handle.settle().await.is_none() {
+                    return 0;
+                }
+                let host_before = runner.host_dispatched();
+                runner.flush_host().await;
+                if handle.settle().await.is_none() {
+                    return 0;
+                }
+                let store_before = runner.store_dispatched();
+                runner.flush_store().await;
+                let Some(v) = handle.settle().await else {
+                    return 0;
+                };
+                version = v;
+                if runner.host_dispatched() == host_before
+                    && runner.store_dispatched() == store_before
+                {
+                    break;
+                }
+            }
+            version
         })
         .await?;
         Ok(version)

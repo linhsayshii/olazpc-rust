@@ -224,6 +224,7 @@ struct SessionRecorderTests {
                     let timeoutMs = Int(step["timeout_ms"]?.int64Value ?? 5000)
                     try await transitionRecorder.awaitPredicate(pred, timeoutMs: timeoutMs)
                 } else if let label = step["snapshot"]?.stringValue {
+                    await engine.settleForRecording()
                     snapshots[label] = transitionRecorder.currentCursorSnapshot()
                 } else {
                     throw RecorderError.invalidStep(scenario: scenario.name, detail: "Unknown step: \(step.canonicalString())")

@@ -1494,9 +1494,9 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func setOpenConversation(id: String?) 
     
     /**
-     * Enqueues a barrier on the actor mailbox, flushes any queued serial SQLite writes, and
-     * returns the change revision once every input enqueued before this call has been reduced
-     * and published (`0` if already stopped).
+     * Enqueues barriers across the actor mailbox, serial host worker, and serial SQLite store
+     * worker until all pending host/store jobs and the inputs they feed back into the actor have
+     * been reduced and published (`0` if already stopped).
      */
     func settle() async throws  -> UInt64
     
@@ -2370,9 +2370,9 @@ open func setOpenConversation(id: String?)  {try! rustCall() {
 }
     
     /**
-     * Enqueues a barrier on the actor mailbox, flushes any queued serial SQLite writes, and
-     * returns the change revision once every input enqueued before this call has been reduced
-     * and published (`0` if already stopped).
+     * Enqueues barriers across the actor mailbox, serial host worker, and serial SQLite store
+     * worker until all pending host/store jobs and the inputs they feed back into the actor have
+     * been reduced and published (`0` if already stopped).
      */
 open func settle()async throws  -> UInt64  {
     return
@@ -19936,7 +19936,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_set_open_conversation() != 4090) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_coreengine_settle() != 4929) {
+    if (uniffi_olaz_ffi_checksum_method_coreengine_settle() != 26622) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_start() != 22299) {

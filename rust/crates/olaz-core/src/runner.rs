@@ -3,6 +3,7 @@
 //! and `olaz_ws::WsClient`.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -503,6 +504,7 @@ enum HostJob {
         duration: i64,
         _guard: InFlightGuard,
     },
+    Drain(oneshot::Sender<()>),
 }
 
 /// Shared SQLite store slot attached during `prepare_store` and detached before `reset_domains`.
@@ -537,6 +539,8 @@ pub struct SessionEffectRunner<T: Transport + 'static> {
     shared_store: SharedStoreSlot,
     host_tx: mpsc::UnboundedSender<HostJob>,
     store_tx: mpsc::UnboundedSender<StoreJob>,
+    host_dispatched: AtomicU64,
+    store_dispatched: AtomicU64,
     active_tasks: Arc<Mutex<Vec<AbortHandle>>>,
     lp_timer_abort: Arc<Mutex<Option<AbortHandle>>>,
     lp_fetch_abort: Mutex<Option<AbortHandle>>,
@@ -625,6 +629,8 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
             shared_store,
             host_tx,
             store_tx,
+            host_dispatched: AtomicU64::new(0),
+            store_dispatched: AtomicU64::new(0),
             active_tasks,
             lp_timer_abort,
             lp_fetch_abort: Mutex::new(None),
@@ -647,6 +653,37 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
             .shared_store
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(store);
+    }
+
+    fn send_host(&self, job: HostJob) {
+        self.host_dispatched.fetch_add(1, Ordering::AcqRel);
+        let _ = self.host_tx.send(job);
+    }
+
+    fn send_store(&self, job: StoreJob) {
+        self.store_dispatched.fetch_add(1, Ordering::AcqRel);
+        let _ = self.store_tx.send(job);
+    }
+
+    /// Monotonic count of real host jobs dispatched to the serial host worker.
+    #[must_use]
+    pub fn host_dispatched(&self) -> u64 {
+        self.host_dispatched.load(Ordering::Acquire)
+    }
+
+    /// Monotonic count of real store jobs dispatched to the serial SQLite store worker.
+    #[must_use]
+    pub fn store_dispatched(&self) -> u64 {
+        self.store_dispatched.load(Ordering::Acquire)
+    }
+
+    /// Waits until all previously queued serial host worker jobs have completed and posted any
+    /// resulting inputs back to the actor.
+    pub async fn flush_host(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.host_tx.send(HostJob::Drain(tx)).is_ok() {
+            let _ = rx.await;
+        }
     }
 
     /// Waits until all previously queued serial SQLite store jobs have completed.
@@ -748,7 +785,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
                 Effect::LoadSavedSession { boot_gen } => {
                     let guard = sink.track();
-                    let _ = self.host_tx.send(HostJob::LoadSavedSession {
+                    self.send_host(HostJob::LoadSavedSession {
                         boot_gen,
                         sink: sink.clone(),
                         _guard: guard,
@@ -756,7 +793,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
                 Effect::LoadLegacyCookie { boot_gen } => {
                     let guard = sink.track();
-                    let _ = self.host_tx.send(HostJob::LoadLegacyCookie {
+                    self.send_host(HostJob::LoadLegacyCookie {
                         boot_gen,
                         sink: sink.clone(),
                         _guard: guard,
@@ -864,7 +901,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
                 Effect::SetPref { key, value } => {
                     let guard = sink.track();
-                    let _ = self.host_tx.send(HostJob::SetPref {
+                    self.send_host(HostJob::SetPref {
                         key,
                         value,
                         _guard: guard,
@@ -883,7 +920,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         .unwrap_or_else(PoisonError::into_inner) = Some(ws_gen);
                     let zpw_sek = self.client.zpw_sek().unwrap_or_default();
                     let guard = sink.track();
-                    let _ = self.host_tx.send(HostJob::StartWs {
+                    self.send_host(HostJob::StartWs {
                         params: WsStartParams {
                             ws_gen,
                             endpoints,
@@ -925,7 +962,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner) = Some(lp_gen);
                         let guard = sink.track();
-                        let _ = self.host_tx.send(HostJob::StartLpInitial {
+                        self.send_host(HostJob::StartLpInitial {
                             lp_gen,
                             delay,
                             sink: sink.clone(),
@@ -1010,7 +1047,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
                 Effect::Store(op) => {
                     let guard = sink.track();
-                    let _ = self.store_tx.send(StoreJob::Op {
+                    self.send_store(StoreJob::Op {
                         op,
                         sink: sink.clone(),
                         _guard: guard,
@@ -1018,7 +1055,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
                 Effect::DetachStore => {
                     let guard = sink.track();
-                    let _ = self.host_tx.send(HostJob::DetachStore { _guard: guard });
+                    self.send_host(HostJob::DetachStore { _guard: guard });
                 }
                 Effect::CompleteOp {
                     op_id,
@@ -1026,7 +1063,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     after_store: true,
                 } => {
                     let guard = sink.track();
-                    let _ = self.store_tx.send(StoreJob::FlushOp {
+                    self.send_store(StoreJob::FlushOp {
                         op_id,
                         result,
                         sink: sink.clone(),
@@ -1413,7 +1450,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             _guard: guard,
                         },
                     };
-                    let _ = self.host_tx.send(job);
+                    self.send_host(job);
                 }
             }
         }
@@ -1893,6 +1930,9 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 host.mute(conv_id, set, start, start_explicit, duration)
                     .await;
             }
+            HostJob::Drain(tx) => {
+                let _ = tx.send(());
+            }
         }
     }
 }
@@ -2017,6 +2057,198 @@ mod tests {
         assert_eq!(
             *host.log.lock().unwrap_or_else(PoisonError::into_inner),
             vec!["clear_session", "reset_domains"]
+        );
+        core.stop();
+    }
+
+    #[tokio::test]
+    async fn flush_host_waits_for_returned_batch_delta_to_reach_actor() {
+        struct DelayedDeltaHost {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait]
+        impl Host for DelayedDeltaHost {
+            async fn load_saved_session(&self) -> Option<String> {
+                None
+            }
+            async fn load_legacy_cookie(&self) -> Option<LegacyCookie> {
+                None
+            }
+            async fn set_pref(&self, _key: String, _value: String) {}
+            async fn prepare_store(&self, _user_id: String, _account: LoginAccount) {}
+            async fn start_bootstrap(&self) {}
+            async fn offer_first_login_transfer(&self, _force: bool) {}
+            async fn reset_domains(&self) {}
+            async fn persist_session(&self, _snapshot_json: String) {}
+            async fn clear_session(&self) {}
+            async fn mark_expired(&self, _snapshot_json: String) {}
+            async fn persist_poll_state(&self, _state: PollState) {}
+            async fn persist_ws_cursors(&self, _cursors: CursorMap) {}
+            async fn apply_batch(
+                &self,
+                _cmd: Option<u16>,
+                _increment_unread: bool,
+                _notify_incoming: bool,
+                _payload: Map<String, Value>,
+            ) -> BatchApplyDelta {
+                self.entered.notify_waiters();
+                self.release.notified().await;
+                BatchApplyDelta {
+                    applied_count: 1,
+                    updates: vec![crate::conversations::ConvMessageDelta {
+                        conv_id: "u42".to_owned(),
+                        preview_text: "hello".to_owned(),
+                        preview_date_ms: 1_700_000_000_000,
+                        preview_from_me: false,
+                        is_mine: false,
+                        sender_name: "Peer 42".to_owned(),
+                        sender_avatar: None,
+                        unread_delta: 1,
+                    }],
+                    persist_conversations: false,
+                }
+            }
+            async fn apply_parsed_events(
+                &self,
+                _cmd: u16,
+                _increment_unread: bool,
+                _notify_incoming: bool,
+                _envelope: TypedChatEnvelope,
+            ) -> BatchApplyDelta {
+                BatchApplyDelta::default()
+            }
+            async fn mobile_sync(&self, _events: Vec<MobileSyncEvent>) {}
+            async fn e2ee_signal(&self, _cmd: u16, _payload: Map<String, Value>) {}
+            async fn e2ee_deliver_reports(&self, _cmd: u16, _payload: Map<String, Value>) {}
+            async fn e2ee_connected(&self, _uid: String) {}
+            async fn e2ee_disconnected(&self) {}
+            async fn voip_control(
+                &self,
+                _act: String,
+                _raw_data: Value,
+                _data: Map<String, Value>,
+            ) {
+            }
+            async fn show_typing(&self, _conv_id: String, _uid: String, _on_pc: bool) {}
+            async fn pin_topic(&self, _conv_id: String) {}
+            async fn group_notice(&self, _act: String, _data: Map<String, Value>, _ts: i64) {}
+            async fn mute(
+                &self,
+                _conv_id: String,
+                _set: bool,
+                _start: i64,
+                _start_explicit: bool,
+                _duration: i64,
+            ) {
+            }
+        }
+
+        struct SinkCaptureRunner<T: Transport + 'static> {
+            inner: Arc<SessionEffectRunner<T>>,
+            sink: Mutex<Option<ActorSink>>,
+        }
+
+        impl<T: Transport + 'static> EffectRunner for SinkCaptureRunner<T> {
+            fn dispatch(&self, effects: Vec<Effect>, sink: ActorSink) {
+                *self.sink.lock().unwrap_or_else(PoisonError::into_inner) = Some(sink.clone());
+                self.inner.dispatch(effects, sink);
+            }
+
+            fn shutdown(&self) {
+                self.inner.shutdown();
+            }
+        }
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let host = Arc::new(DelayedDeltaHost {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let client = Arc::new(SessionClient::new(
+            MockTransport::scripted(vec![]),
+            "imei-2".to_owned(),
+            "Mac".to_owned(),
+        ));
+        let runner = Arc::new(SessionEffectRunner::new(client, host, Handle::current()));
+        let wrapper = Arc::new(SinkCaptureRunner {
+            inner: Arc::clone(&runner),
+            sink: Mutex::new(None),
+        });
+        let core = CoreHandle::start(
+            Arc::clone(&wrapper) as Arc<dyn EffectRunner>,
+            Handle::current(),
+        );
+        // Trigger a StoreOp effect to capture the actor's real sink.
+        core.send(Command::UpdateConversationOnMessage {
+            msg: MessagePreviewInput {
+                conv_id: "u_seed".to_owned(),
+                text: "seed".to_owned(),
+                mentions: Vec::new(),
+                preview_label: "seed".to_owned(),
+                date_ms: 1_700_000_000_000,
+                is_mine: false,
+                sender_name: "Seed".to_owned(),
+                sender_avatar: None,
+            },
+            increment_unread: false,
+        });
+        let _ = core.settle().await;
+        let Some(sink) = wrapper
+            .sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
+            panic!("actor sink captured");
+        };
+
+        // Dispatch a host ApplyBatch whose delta is delayed until `release` fires.
+        let entered_fut = entered.notified();
+        tokio::pin!(entered_fut);
+        entered_fut.as_mut().enable();
+        runner.dispatch(
+            vec![Effect::Host(HostCall::ApplyBatch {
+                cmd: Some(501),
+                increment_unread: true,
+                notify_incoming: false,
+                payload: Map::new(),
+                poll_batch_done: None,
+            })],
+            sink,
+        );
+        entered_fut.await;
+
+        let settle_task = tokio::spawn({
+            let runner = Arc::clone(&runner);
+            async move {
+                runner.flush_host().await;
+            }
+        });
+        // Give flush_host a chance to enqueue behind the blocked ApplyBatch.
+        tokio::task::yield_now().await;
+        assert!(!settle_task.is_finished());
+
+        release.notify_waiters();
+        assert!(settle_task.await.is_ok(), "flush_host task succeeded");
+
+        // After flush_host + actor settle, the returned delta MUST already be reduced.
+        let Some(version) = core.settle().await else {
+            panic!("actor running");
+        };
+        assert!(version >= 2);
+        let Some(snap) = core.full_snapshot().await else {
+            panic!("snapshot available");
+        };
+        assert!(
+            snap.conversations
+                .conversations
+                .iter()
+                .any(|c| c.id == "u42" && c.unread == 1),
+            "expected u42 from returned ApplyBatch delta, got {:?}",
+            snap.conversations
         );
         core.stop();
     }
