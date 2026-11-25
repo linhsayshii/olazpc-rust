@@ -5,6 +5,8 @@ use std::fmt;
 
 use olaz_api::{HiddenConversationsSnapshot, PollState};
 use olaz_net::{LoginAccount, NetError, QrScanResult, QrTicket, SessionStatus};
+use olaz_store::StoredMessage;
+use olaz_wire::{ChatMessage, ParsedWireEvent};
 use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
@@ -13,6 +15,7 @@ use crate::conversations::{
     LocalAccountHydration, MessagePreviewInput,
 };
 use crate::effect::OpResult;
+use crate::messages::{ContactsState, HistoryFreshness};
 use crate::state::{CoreFailKind, FailReason, PersistedTransportState};
 use crate::typed_chat::TypedChatEnvelope;
 
@@ -184,6 +187,60 @@ pub enum Command {
     RemoveLocalConversation {
         id: String,
     },
+
+    // --- Messages & bootstrap domain (U4) ---
+    OpenConversation {
+        id: String,
+        preloaded: Vec<ChatMessage>,
+        skip_local_read: bool,
+    },
+    CloseConversation,
+    LoadOlderMessages {
+        id: String,
+    },
+    Bootstrap {
+        now_ms: i64,
+    },
+    ApplyBatchDirect {
+        payload: Map<String, Value>,
+        default_cmd: u16,
+        fallback_conv_id: Option<String>,
+        is_group_hint: Option<bool>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        persist_conversations: bool,
+        probe_freshness: bool,
+    },
+    ApplyParsedEventsDirect {
+        events: Vec<ParsedWireEvent>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        persist_conversations: bool,
+    },
+    WriteThroughUpsertMessage {
+        msg: Box<ChatMessage>,
+        replacing_client_id: Option<String>,
+    },
+    WriteThroughRemoveMessages {
+        conv_id: String,
+        ids: Vec<String>,
+    },
+    WriteThroughReplaceWindow {
+        conv_id: String,
+        messages: Vec<ChatMessage>,
+    },
+    WriteThroughSetHasMore {
+        conv_id: String,
+        has_more: bool,
+    },
+    WriteThroughRemoveWindow {
+        conv_id: String,
+    },
+    RefreshReactionNames {
+        conv_id: Option<String>,
+    },
+    SeedHistoryFreshness(BTreeMap<String, HistoryFreshness>),
+    SeedContacts(Box<ContactsState>),
 }
 
 impl fmt::Debug for Command {
@@ -327,6 +384,44 @@ impl fmt::Debug for Command {
                 .field("archived_count", &archived_ids.as_ref().map(Vec::len))
                 .finish(),
             Self::RemoveLocalConversation { .. } => f.write_str("RemoveLocalConversation"),
+            Self::OpenConversation { preloaded, .. } => f
+                .debug_struct("OpenConversation")
+                .field("preloaded", &preloaded.len())
+                .finish(),
+            Self::CloseConversation => f.write_str("CloseConversation"),
+            Self::LoadOlderMessages { .. } => f.write_str("LoadOlderMessages"),
+            Self::Bootstrap { now_ms } => f
+                .debug_struct("Bootstrap")
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::ApplyBatchDirect { default_cmd, .. } => f
+                .debug_struct("ApplyBatchDirect")
+                .field("default_cmd", default_cmd)
+                .finish(),
+            Self::ApplyParsedEventsDirect { events, .. } => f
+                .debug_struct("ApplyParsedEventsDirect")
+                .field("count", &events.len())
+                .finish(),
+            Self::WriteThroughUpsertMessage { .. } => f.write_str("WriteThroughUpsertMessage"),
+            Self::WriteThroughRemoveMessages { ids, .. } => f
+                .debug_struct("WriteThroughRemoveMessages")
+                .field("count", &ids.len())
+                .finish(),
+            Self::WriteThroughReplaceWindow { messages, .. } => f
+                .debug_struct("WriteThroughReplaceWindow")
+                .field("count", &messages.len())
+                .finish(),
+            Self::WriteThroughSetHasMore { has_more, .. } => f
+                .debug_struct("WriteThroughSetHasMore")
+                .field("has_more", has_more)
+                .finish(),
+            Self::WriteThroughRemoveWindow { .. } => f.write_str("WriteThroughRemoveWindow"),
+            Self::RefreshReactionNames { .. } => f.write_str("RefreshReactionNames"),
+            Self::SeedHistoryFreshness(m) => f
+                .debug_struct("SeedHistoryFreshness")
+                .field("count", &m.len())
+                .finish(),
+            Self::SeedContacts(c) => f.debug_tuple("SeedContacts").field(c).finish(),
         }
     }
 }
@@ -603,6 +698,61 @@ pub enum Input {
         op_id: u64,
         result: OpResult,
     },
+
+    // --- Messages & bootstrap domain completions (U4) ---
+    OpenLocalMessagesLoaded {
+        open_seq: u64,
+        conv_id: String,
+        rows: Vec<StoredMessage>,
+        op_id: Option<u64>,
+    },
+    OpenHistoryPageFetched {
+        open_seq: u64,
+        conv_id: String,
+        page: Option<Map<String, Value>>,
+        op_id: Option<u64>,
+    },
+    LoadOlderStoreRead {
+        load_seq: u64,
+        conv_id: String,
+        rows: Vec<StoredMessage>,
+        had_before_cursor: bool,
+        op_id: Option<u64>,
+    },
+    LoadOlderPageFetched {
+        load_seq: u64,
+        conv_id: String,
+        before_msg_id: Option<String>,
+        page: Option<Map<String, Value>>,
+        op_id: Option<u64>,
+    },
+    SenderProfilesChunkDone {
+        resolve_id: u64,
+        conv_id: String,
+        remaining_chunks: Vec<Vec<String>>,
+        profiles_map: Map<String, Value>,
+        cache_updated: bool,
+    },
+    BootstrapFreshnessLoaded {
+        boot_gen: u64,
+        last_refresh_pref: Option<String>,
+    },
+    FreshnessProbed {
+        boot_gen: Option<u64>,
+        probes: Vec<(String, bool)>,
+    },
+    DecryptedEnvelopeReady {
+        payload: Map<String, Value>,
+        default_cmd: u16,
+        fallback_conv_id: Option<String>,
+        is_group_hint: Option<bool>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        persist_conversations: bool,
+        probe_freshness: bool,
+        poll_batch_done: Option<(u64, u64)>,
+        op_id: Option<u64>,
+    },
 }
 
 impl fmt::Debug for Input {
@@ -826,6 +976,56 @@ impl fmt::Debug for Input {
                 .debug_struct("OpStoreFlushed")
                 .field("op_id", op_id)
                 .field("result", result)
+                .finish(),
+            Self::OpenLocalMessagesLoaded { open_seq, rows, .. } => f
+                .debug_struct("OpenLocalMessagesLoaded")
+                .field("open_seq", open_seq)
+                .field("rows", &rows.len())
+                .finish(),
+            Self::OpenHistoryPageFetched { open_seq, page, .. } => f
+                .debug_struct("OpenHistoryPageFetched")
+                .field("open_seq", open_seq)
+                .field("has_page", &page.is_some())
+                .finish(),
+            Self::LoadOlderStoreRead { load_seq, rows, .. } => f
+                .debug_struct("LoadOlderStoreRead")
+                .field("load_seq", load_seq)
+                .field("rows", &rows.len())
+                .finish(),
+            Self::LoadOlderPageFetched { load_seq, page, .. } => f
+                .debug_struct("LoadOlderPageFetched")
+                .field("load_seq", load_seq)
+                .field("has_page", &page.is_some())
+                .finish(),
+            Self::SenderProfilesChunkDone {
+                resolve_id,
+                remaining_chunks,
+                profiles_map,
+                cache_updated,
+                ..
+            } => f
+                .debug_struct("SenderProfilesChunkDone")
+                .field("resolve_id", resolve_id)
+                .field("remaining", &remaining_chunks.len())
+                .field("profiles", &profiles_map.len())
+                .field("cache_updated", cache_updated)
+                .finish(),
+            Self::BootstrapFreshnessLoaded {
+                boot_gen,
+                last_refresh_pref,
+            } => f
+                .debug_struct("BootstrapFreshnessLoaded")
+                .field("boot_gen", boot_gen)
+                .field("has_pref", &last_refresh_pref.is_some())
+                .finish(),
+            Self::FreshnessProbed { boot_gen, probes } => f
+                .debug_struct("FreshnessProbed")
+                .field("boot_gen", boot_gen)
+                .field("probes", &probes.len())
+                .finish(),
+            Self::DecryptedEnvelopeReady { default_cmd, .. } => f
+                .debug_struct("DecryptedEnvelopeReady")
+                .field("default_cmd", default_cmd)
                 .finish(),
         }
     }

@@ -28,7 +28,7 @@ pub use conversations::{
     FriendIdentity, GroupIdentity, IdentityTable, LocalAccountHydration, MessagePreviewInput,
     PinBoard, StrangerBox, ToastKind, message_preview_label, to_wire_stored,
 };
-pub use effect::{Effect, HostCall, OpResult, StoreOp};
+pub use effect::{Effect, HistoryFetchPurpose, HostCall, OpResult, StoreOp};
 pub use input::{
     Command, CompletedLogin, HiddenPinSyncKind, Input, LegacyCookie, PollBatchError,
     PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,

@@ -288,22 +288,7 @@ pub(crate) fn reduce_transport(state: &mut CoreState, input: Input, out: &mut Re
             }
             let applied_count = delta.applied_count;
             conversations::apply_batch_delta(state, delta, out);
-            let should_continue = match state.transport.active_drain.as_mut() {
-                Some(active) if active.drain_id == drain_id && active.lp_gen == lp_gen => {
-                    active.total_events = active.total_events.saturating_add(applied_count);
-                    active.more_after_current && active.remaining_batches > 0
-                }
-                _ => return,
-            };
-            if should_continue {
-                out.effects.push(Effect::FetchPollBatch {
-                    lp_gen,
-                    drain_id,
-                    poll_state: state.transport.poll_state.clone(),
-                });
-            } else {
-                complete_active_drain(state, out);
-            }
+            finish_poll_batch_in_core(state, lp_gen, drain_id, applied_count, out);
         }
 
         _ => {}
@@ -504,4 +489,33 @@ fn emit_routes(
         }
     }
     false
+}
+
+/// Advances or finishes an active long-poll drain after one batch has been applied.
+pub(crate) fn finish_poll_batch_in_core(
+    state: &mut CoreState,
+    lp_gen: u64,
+    drain_id: u64,
+    applied_count: u32,
+    out: &mut ReduceOutput,
+) {
+    if lp_gen != state.transport.lp_gen || !state.transport.lp_running {
+        return;
+    }
+    let should_continue = match state.transport.active_drain.as_mut() {
+        Some(active) if active.drain_id == drain_id && active.lp_gen == lp_gen => {
+            active.total_events = active.total_events.saturating_add(applied_count);
+            active.more_after_current && active.remaining_batches > 0
+        }
+        _ => return,
+    };
+    if should_continue {
+        out.effects.push(Effect::FetchPollBatch {
+            lp_gen,
+            drain_id,
+            poll_state: state.transport.poll_state.clone(),
+        });
+    } else {
+        complete_active_drain(state, out);
+    }
 }

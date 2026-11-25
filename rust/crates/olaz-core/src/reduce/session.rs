@@ -318,6 +318,8 @@ fn reduce_command(state: &mut CoreState, cmd: Command, out: &mut ReduceOutput) {
             tracing::debug!("session: log out");
             reset_session_fields(&mut state.session);
             state.conversations.reset();
+            state.messages.reset();
+            state.contacts.reset();
             state.session.sign_out_notice = None;
             state.session.qr_gen = state.session.qr_gen.saturating_add(1);
             state.session.phase = Phase::Login(LoginState::generating());
@@ -327,6 +329,8 @@ fn reduce_command(state: &mut CoreState, cmd: Command, out: &mut ReduceOutput) {
             out.dirty.insert(DirtyKey::ConversationExtras);
             out.dirty.insert(DirtyKey::ConversationUi);
             out.dirty.insert(DirtyKey::ConversationPrompt);
+            out.dirty.insert(DirtyKey::MessagesResetAll);
+            out.dirty.insert(DirtyKey::Contacts);
 
             // Order matches Swift `logOut`: cancel tasks, stop transport, clear session,
             // detach SQLite store, reset domains, start QR.

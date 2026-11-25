@@ -12,8 +12,8 @@ use olaz_api::{PollState, ZaloApi};
 use olaz_net::{
     LoginAccount, SessionClient, SessionSnapshot as NetSessionSnapshot, Transport, ZaloDomains,
 };
-use olaz_store::Store;
-use olaz_wire::{decode_stored_message, extract_profiles_map};
+use olaz_store::{SaveOptions, Store};
+use olaz_wire::{ChatMessage, decode_stored_message, extract_profiles_map};
 use olaz_ws::{CryptoDecryptor, CursorMap, WsClient, WsConfig, WsHandle};
 use serde_json::{Map, Value};
 use tokio::runtime::Handle;
@@ -25,11 +25,12 @@ use crate::conversations::{
     BatchApplyDelta, IdentityTable, MessagePreviewInput, hidden_pin_md5, hidden_pin_sha256,
     load_local_account_from_store, to_wire_stored,
 };
-use crate::effect::{Effect, HostCall, OpResult, StoreOp};
+use crate::effect::{Effect, HistoryFetchPurpose, HostCall, OpResult, StoreOp};
 use crate::input::{
-    CompletedLogin, Input, LegacyCookie, PollBatchError, PollBatchOutcome, SessionFailure,
-    StoreToken,
+    CompletedLogin, Input, LegacyCookie, PollBatchError, PollBatchOutcome, SeenTarget,
+    SessionFailure, StoreToken,
 };
+use crate::messages::MuteEntry;
 use crate::reduce::classify::MobileSyncEvent;
 use crate::state::PersistedTransportState;
 use crate::typed_chat::{
@@ -367,6 +368,58 @@ pub trait Host: Send + Sync {
         start_explicit: bool,
         duration: i64,
     );
+
+    // --- Messages & bootstrap domain callbacks (U4) ---
+    async fn on_bootstrap_started(&self) -> bool {
+        self.start_bootstrap().await;
+        true
+    }
+    async fn on_open_conversation_sync(&self, _conv_id: String, _changed: bool) {}
+    async fn on_close_conversation(&self) {}
+    async fn refresh_board_pins(&self, _conv_id: String) {}
+    async fn mark_read_boundary(&self, _conv_id: String, _seen_target: Option<SeenTarget>) {}
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Matches apply_remote_reaction case schema fields 1-for-1"
+    )]
+    async fn apply_remote_reaction(
+        &self,
+        _conv_id: String,
+        _msg_id: String,
+        _cli_msg_id: String,
+        _sender_id: String,
+        _r_type: String,
+        _r_icon: String,
+        _event_id: String,
+        _react_client_id: String,
+        _sender_name: String,
+    ) {
+    }
+    async fn apply_remote_recall(
+        &self,
+        _conv_id: String,
+        _msg_id: String,
+        _cli_msg_id: String,
+        _update_conversation_preview: bool,
+    ) {
+    }
+    async fn apply_remote_delete(
+        &self,
+        _conv_id: String,
+        _msg_id: String,
+        _cli_msg_id: String,
+        _update_conversation_preview: bool,
+    ) {
+    }
+    async fn apply_mutes(&self, _mutes: Vec<MuteEntry>) {}
+    async fn refresh_cloud(&self) {}
+    async fn decrypt_envelope(&self, payload: Map<String, Value>) -> Map<String, Value> {
+        payload
+    }
+    async fn mark_e2ee_conversations(&self, _conv_ids: Vec<String>) {}
+    async fn note_poll_messages(&self, _messages: Vec<ChatMessage>) {}
+    async fn notify_incoming_messages(&self, _messages: Vec<ChatMessage>) {}
+    async fn show_batch_typing(&self, _conv_id: String, _sender_id: String) {}
 }
 
 enum HostJob {
@@ -502,6 +555,87 @@ enum HostJob {
         start: i64,
         start_explicit: bool,
         duration: i64,
+        _guard: InFlightGuard,
+    },
+    OnOpenConversationSync {
+        conv_id: String,
+        changed: bool,
+        _guard: InFlightGuard,
+    },
+    OnCloseConversation {
+        _guard: InFlightGuard,
+    },
+    RefreshBoardPins {
+        conv_id: String,
+        _guard: InFlightGuard,
+    },
+    MarkReadBoundary {
+        conv_id: String,
+        seen_target: Option<SeenTarget>,
+        _guard: InFlightGuard,
+    },
+    ApplyRemoteReaction {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        sender_id: String,
+        r_type: String,
+        r_icon: String,
+        event_id: String,
+        react_client_id: String,
+        sender_name: String,
+        _guard: InFlightGuard,
+    },
+    ApplyRemoteRecall {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        update_conversation_preview: bool,
+        _guard: InFlightGuard,
+    },
+    ApplyRemoteDelete {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        update_conversation_preview: bool,
+        _guard: InFlightGuard,
+    },
+    ApplyMutes {
+        mutes: Vec<MuteEntry>,
+        _guard: InFlightGuard,
+    },
+    RefreshCloud {
+        _guard: InFlightGuard,
+    },
+    DecryptEnvelope {
+        payload: Map<String, Value>,
+        default_cmd: u16,
+        fallback_conv_id: Option<String>,
+        is_group_hint: Option<bool>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        persist_conversations: bool,
+        probe_freshness: bool,
+        poll_batch_done: Option<(u64, u64)>,
+        op_id: Option<u64>,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    MarkE2eeConversations {
+        conv_ids: Vec<String>,
+        _guard: InFlightGuard,
+    },
+    NotePollMessages {
+        messages: Vec<ChatMessage>,
+        _guard: InFlightGuard,
+    },
+    NotifyIncomingMessages {
+        messages: Vec<ChatMessage>,
+        _guard: InFlightGuard,
+    },
+    ShowBatchTyping {
+        conv_id: String,
+        sender_id: String,
         _guard: InFlightGuard,
     },
     Drain(oneshot::Sender<()>),
@@ -1316,6 +1450,77 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         drop(guard);
                     });
                 }
+                Effect::FetchHistoryPageApi {
+                    conv_id,
+                    before_msg_id,
+                    count,
+                    is_old,
+                    purpose,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                            let page = if client.is_authenticated() {
+                                let api = ZaloApi::from_shared(client);
+                                api.fetch_history(&conv_id, before_msg_id.as_deref(), count, is_old)
+                                    .await
+                                    .ok()
+                            } else {
+                                None
+                            };
+                            match purpose {
+                                HistoryFetchPurpose::Open { open_seq, op_id } => {
+                                    sink.send(Input::OpenHistoryPageFetched {
+                                        open_seq,
+                                        conv_id,
+                                        page,
+                                        op_id,
+                                    });
+                                }
+                                HistoryFetchPurpose::LoadOlder { load_seq, op_id } => {
+                                    sink.send(Input::LoadOlderPageFetched {
+                                        load_seq,
+                                        conv_id,
+                                        before_msg_id,
+                                        page,
+                                        op_id,
+                                    });
+                                }
+                            }
+                            drop(guard);
+                    });
+                }
+                Effect::FetchSenderProfilesChunkApi {
+                    resolve_id,
+                    conv_id,
+                    chunk,
+                    remaining_chunks,
+                    cache_updated,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                            let profiles_map = if client.is_authenticated() {
+                                let api = ZaloApi::from_shared(client);
+                                match api.fetch_profiles(&chunk).await {
+                                    Ok(raw) => extract_profiles_map(&raw),
+                                    Err(_) => Map::new(),
+                                }
+                            } else {
+                                Map::new()
+                            };
+                            sink.send(Input::SenderProfilesChunkDone {
+                                resolve_id,
+                                conv_id,
+                                remaining_chunks,
+                                profiles_map,
+                                cache_updated,
+                            });
+                            drop(guard);
+                    });
+                }
                 Effect::Host(call) => {
                     let guard = sink.track();
                     let job = match call {
@@ -1449,6 +1654,127 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             duration,
                             _guard: guard,
                         },
+                        HostCall::OnOpenConversationSync { conv_id, changed } => {
+                            HostJob::OnOpenConversationSync {
+                                conv_id,
+                                changed,
+                                _guard: guard,
+                            }
+                        }
+                        HostCall::OnCloseConversation => {
+                            HostJob::OnCloseConversation { _guard: guard }
+                        }
+                        HostCall::RefreshBoardPins { conv_id } => HostJob::RefreshBoardPins {
+                            conv_id,
+                            _guard: guard,
+                        },
+                        HostCall::MarkReadBoundary {
+                            conv_id,
+                            seen_target,
+                        } => HostJob::MarkReadBoundary {
+                            conv_id,
+                            seen_target,
+                            _guard: guard,
+                        },
+                        HostCall::ApplyRemoteReaction {
+                            conv_id,
+                            msg_id,
+                            cli_msg_id,
+                            sender_id,
+                            r_type,
+                            r_icon,
+                            event_id,
+                            react_client_id,
+                            sender_name,
+                        } => HostJob::ApplyRemoteReaction {
+                            conv_id,
+                            msg_id,
+                            cli_msg_id,
+                            sender_id,
+                            r_type,
+                            r_icon,
+                            event_id,
+                            react_client_id,
+                            sender_name,
+                            _guard: guard,
+                        },
+                        HostCall::ApplyRemoteRecall {
+                            conv_id,
+                            msg_id,
+                            cli_msg_id,
+                            update_conversation_preview,
+                        } => HostJob::ApplyRemoteRecall {
+                            conv_id,
+                            msg_id,
+                            cli_msg_id,
+                            update_conversation_preview,
+                            _guard: guard,
+                        },
+                        HostCall::ApplyRemoteDelete {
+                            conv_id,
+                            msg_id,
+                            cli_msg_id,
+                            update_conversation_preview,
+                        } => HostJob::ApplyRemoteDelete {
+                            conv_id,
+                            msg_id,
+                            cli_msg_id,
+                            update_conversation_preview,
+                            _guard: guard,
+                        },
+                        HostCall::ApplyMutes { mutes } => HostJob::ApplyMutes {
+                            mutes,
+                            _guard: guard,
+                        },
+                        HostCall::RefreshCloud => HostJob::RefreshCloud { _guard: guard },
+                        HostCall::DecryptEnvelope {
+                            payload,
+                            default_cmd,
+                            fallback_conv_id,
+                            is_group_hint,
+                            increment_unread,
+                            notify_incoming,
+                            persist_conversations,
+                            probe_freshness,
+                            poll_batch_done,
+                            op_id,
+                        } => HostJob::DecryptEnvelope {
+                            payload,
+                            default_cmd,
+                            fallback_conv_id,
+                            is_group_hint,
+                            increment_unread,
+                            notify_incoming,
+                            persist_conversations,
+                            probe_freshness,
+                            poll_batch_done,
+                            op_id,
+                            sink: sink.clone(),
+                            _guard: guard,
+                        },
+                        HostCall::MarkE2eeConversations { conv_ids } => {
+                            HostJob::MarkE2eeConversations {
+                                conv_ids,
+                                _guard: guard,
+                            }
+                        }
+                        HostCall::NotePollMessages { messages } => HostJob::NotePollMessages {
+                            messages,
+                            _guard: guard,
+                        },
+                        HostCall::NotifyIncomingMessages { messages } => {
+                            HostJob::NotifyIncomingMessages {
+                                messages,
+                                _guard: guard,
+                            }
+                        }
+                        HostCall::ShowBatchTyping { conv_id, sender_id } => {
+                            HostJob::ShowBatchTyping {
+                                conv_id,
+                                sender_id,
+                                _guard: guard,
+                            }
+                        }
                     };
                     self.send_host(job);
                 }
@@ -1530,6 +1856,128 @@ async fn run_store_worker(
                         };
                         sink.send(Input::MentionPreviewsLoaded { op_id, messages });
                     }
+                    StoreOp::ProbeAndSaveMessages {
+                        probe_targets,
+                        rows,
+                        preserve_existing_reactions,
+                        reply_boot_gen,
+                    } => {
+                        let probes = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let mut store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let mut out_probes = Vec::with_capacity(probe_targets.len());
+                                    for (conv_id, msg_id) in &probe_targets {
+                                        let exists = store
+                                            .existing_message_ids(conv_id, std::slice::from_ref(msg_id))
+                                            .is_ok_and(|set| !set.is_empty());
+                                        out_probes.push((conv_id.clone(), exists));
+                                    }
+                                    if !rows.is_empty() {
+                                        let _ = store.save_messages_with(
+                                            &rows,
+                                            SaveOptions {
+                                                skip_twin_checks: false,
+                                                preserve_existing_reactions,
+                                            },
+                                        );
+                                    }
+                                    out_probes
+                                })
+                                .await
+                                .unwrap_or_default()
+                        } else {
+                            probe_targets.into_keys().map(|c| (c, false)).collect()
+                        };
+                        if !probes.is_empty() {
+                            sink.send(Input::FreshnessProbed {
+                                boot_gen: reply_boot_gen,
+                                probes,
+                            });
+                        }
+                    }
+                    StoreOp::LoadOpenLocalMessages {
+                        open_seq,
+                        conv_id,
+                        limit,
+                        op_id,
+                    } => {
+                        let conv_clone = conv_id.clone();
+                        let rows = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    store
+                                        .messages(&conv_clone, None, i64::try_from(limit).unwrap_or(50))
+                                        .unwrap_or_default()
+                                })
+                                .await
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        sink.send(Input::OpenLocalMessagesLoaded {
+                            open_seq,
+                            conv_id,
+                            rows,
+                            op_id,
+                        });
+                    }
+                    StoreOp::LoadOlderStoreMessages {
+                        load_seq,
+                        conv_id,
+                        before_ts_ms,
+                        limit,
+                        op_id,
+                    } => {
+                        let conv_clone = conv_id.clone();
+                        let rows = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    store
+                                        .messages(
+                                            &conv_clone,
+                                            Some(before_ts_ms),
+                                            i64::try_from(limit).unwrap_or(50),
+                                        )
+                                        .unwrap_or_default()
+                                })
+                                .await
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        sink.send(Input::LoadOlderStoreRead {
+                            load_seq,
+                            conv_id,
+                            rows,
+                            had_before_cursor: true,
+                            op_id,
+                        });
+                    }
+                    StoreOp::LoadPreferenceString { key, boot_gen } => {
+                        let last_refresh_pref = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    store.get_preference_string(&key).ok().flatten()
+                                })
+                                .await
+                                .ok()
+                                .flatten()
+                        } else {
+                            None
+                        };
+                        sink.send(Input::BootstrapFreshnessLoaded {
+                            boot_gen,
+                            last_refresh_pref,
+                        });
+                    }
                     other => {
                         if let Some(store_arc) = store_opt {
                             let _ = runtime
@@ -1579,7 +2027,23 @@ async fn run_store_worker(
                                         StoreOp::DeletePreference { key } => {
                                             let _ = store.delete_preference(&key);
                                         }
-                                        StoreOp::LoadMentionPreviewMessages { .. } => {}
+                                        StoreOp::SaveMessages {
+                                            rows,
+                                            preserve_existing_reactions,
+                                        } => {
+                                            let _ = store.save_messages_with(
+                                                &rows,
+                                                SaveOptions {
+                                                    skip_twin_checks: false,
+                                                    preserve_existing_reactions,
+                                                },
+                                            );
+                                        }
+                                        StoreOp::LoadMentionPreviewMessages { .. }
+                                        | StoreOp::ProbeAndSaveMessages { .. }
+                                        | StoreOp::LoadOpenLocalMessages { .. }
+                                        | StoreOp::LoadOlderStoreMessages { .. }
+                                        | StoreOp::LoadPreferenceString { .. } => {}
                                     }
                                 })
                                 .await;
@@ -1949,6 +2413,121 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
             } => {
                 host.mute(conv_id, set, start, start_explicit, duration)
                     .await;
+            }
+            HostJob::OnOpenConversationSync {
+                conv_id,
+                changed,
+                _guard,
+            } => {
+                host.on_open_conversation_sync(conv_id, changed).await;
+            }
+            HostJob::OnCloseConversation { _guard } => {
+                host.on_close_conversation().await;
+            }
+            HostJob::RefreshBoardPins { conv_id, _guard } => {
+                host.refresh_board_pins(conv_id).await;
+            }
+            HostJob::MarkReadBoundary {
+                conv_id,
+                seen_target,
+                _guard,
+            } => {
+                host.mark_read_boundary(conv_id, seen_target).await;
+            }
+            HostJob::ApplyRemoteReaction {
+                conv_id,
+                msg_id,
+                cli_msg_id,
+                sender_id,
+                r_type,
+                r_icon,
+                event_id,
+                react_client_id,
+                sender_name,
+                _guard,
+            } => {
+                host.apply_remote_reaction(
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                    sender_id,
+                    r_type,
+                    r_icon,
+                    event_id,
+                    react_client_id,
+                    sender_name,
+                )
+                .await;
+            }
+            HostJob::ApplyRemoteRecall {
+                conv_id,
+                msg_id,
+                cli_msg_id,
+                update_conversation_preview,
+                _guard,
+            } => {
+                host.apply_remote_recall(conv_id, msg_id, cli_msg_id, update_conversation_preview)
+                    .await;
+            }
+            HostJob::ApplyRemoteDelete {
+                conv_id,
+                msg_id,
+                cli_msg_id,
+                update_conversation_preview,
+                _guard,
+            } => {
+                host.apply_remote_delete(conv_id, msg_id, cli_msg_id, update_conversation_preview)
+                    .await;
+            }
+            HostJob::ApplyMutes { mutes, _guard } => {
+                host.apply_mutes(mutes).await;
+            }
+            HostJob::RefreshCloud { _guard } => {
+                host.refresh_cloud().await;
+            }
+            HostJob::DecryptEnvelope {
+                payload,
+                default_cmd,
+                fallback_conv_id,
+                is_group_hint,
+                increment_unread,
+                notify_incoming,
+                persist_conversations,
+                probe_freshness,
+                poll_batch_done,
+                op_id,
+                sink,
+                _guard,
+            } => {
+                let decrypted = host.decrypt_envelope(payload).await;
+                sink.send(Input::DecryptedEnvelopeReady {
+                    payload: decrypted,
+                    default_cmd,
+                    fallback_conv_id,
+                    is_group_hint,
+                    increment_unread,
+                    notify_incoming,
+                    persist_conversations,
+                    probe_freshness,
+                    poll_batch_done,
+                    op_id,
+                });
+            }
+            HostJob::MarkE2eeConversations { conv_ids, _guard } => {
+                host.mark_e2ee_conversations(conv_ids).await;
+            }
+            HostJob::NotePollMessages { messages, _guard } => {
+                host.note_poll_messages(messages).await;
+            }
+            HostJob::NotifyIncomingMessages { messages, _guard } => {
+                host.notify_incoming_messages(messages).await;
+            }
+            HostJob::ShowBatchTyping {
+                conv_id,
+                sender_id,
+                _guard,
+            } => {
+                host.show_batch_typing(conv_id, sender_id).await;
             }
             HostJob::Drain(tx) => {
                 let _ = tx.send(());

@@ -49,6 +49,12 @@ fn looks_like_control(item: &Map<String, Value>) -> bool {
     }
 }
 
+/// True when `v` contains a Signal ciphertext prefix anywhere inside strings, arrays, or objects.
+#[must_use]
+pub fn envelope_contains_signal_cipher(v: &Value) -> bool {
+    contains_signal_cipher(v, 0)
+}
+
 fn contains_signal_cipher(v: &Value, depth: usize) -> bool {
     if depth > 64 {
         return true;

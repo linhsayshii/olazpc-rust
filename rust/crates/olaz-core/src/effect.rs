@@ -1,20 +1,30 @@
 //! Side effects returned by `reduce` and executed by [`crate::runner::EffectRunner`].
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
 use olaz_api::PollState;
 use olaz_net::{LoginAccount, QrTicket};
-use olaz_store::StoredConversation;
+use olaz_store::{StoredConversation, StoredMessage};
+use olaz_wire::ChatMessage;
 use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
 use crate::conversations::{ConversationActionResult, IdentityTable, PinBoard};
 use crate::input::{HiddenPinSyncKind, SeenTarget, StoreToken};
+use crate::messages::MuteEntry;
 use crate::reduce::classify::MobileSyncEvent;
 use crate::typed_chat::TypedChatEnvelope;
 
-/// Serial SQLite persistence operations executed by the core runner's store worker (U3).
+/// Distinguishes which history-paging flow requested [`Effect::FetchHistoryPageApi`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryFetchPurpose {
+    Open { open_seq: u64, op_id: Option<u64> },
+    LoadOlder { load_seq: u64, op_id: Option<u64> },
+}
+
+/// Serial SQLite persistence operations executed by the core runner's store worker (U3/U4).
 #[derive(Clone)]
 pub enum StoreOp {
     SaveConversations(Vec<StoredConversation>),
@@ -54,6 +64,35 @@ pub enum StoreOp {
         op_id: Option<u64>,
         group_ids: Vec<String>,
         my_uid: String,
+    },
+
+    // --- Messages & bootstrap domain (U4) ---
+    SaveMessages {
+        rows: Vec<StoredMessage>,
+        preserve_existing_reactions: bool,
+    },
+    ProbeAndSaveMessages {
+        probe_targets: BTreeMap<String, String>,
+        rows: Vec<StoredMessage>,
+        preserve_existing_reactions: bool,
+        reply_boot_gen: Option<u64>,
+    },
+    LoadOpenLocalMessages {
+        open_seq: u64,
+        conv_id: String,
+        limit: usize,
+        op_id: Option<u64>,
+    },
+    LoadOlderStoreMessages {
+        load_seq: u64,
+        conv_id: String,
+        before_ts_ms: i64,
+        limit: usize,
+        op_id: Option<u64>,
+    },
+    LoadPreferenceString {
+        key: String,
+        boot_gen: u64,
     },
 }
 
@@ -106,6 +145,44 @@ impl fmt::Debug for StoreOp {
                 .debug_struct("LoadMentionPreviewMessages")
                 .field("group_count", &group_ids.len())
                 .finish(),
+            Self::SaveMessages {
+                rows,
+                preserve_existing_reactions,
+            } => f
+                .debug_struct("SaveMessages")
+                .field("count", &rows.len())
+                .field("preserve_reactions", preserve_existing_reactions)
+                .finish(),
+            Self::ProbeAndSaveMessages {
+                probe_targets,
+                rows,
+                ..
+            } => f
+                .debug_struct("ProbeAndSaveMessages")
+                .field("probes", &probe_targets.len())
+                .field("rows", &rows.len())
+                .finish(),
+            Self::LoadOpenLocalMessages { open_seq, limit, .. } => f
+                .debug_struct("LoadOpenLocalMessages")
+                .field("open_seq", open_seq)
+                .field("limit", limit)
+                .finish(),
+            Self::LoadOlderStoreMessages {
+                load_seq,
+                before_ts_ms,
+                limit,
+                ..
+            } => f
+                .debug_struct("LoadOlderStoreMessages")
+                .field("load_seq", load_seq)
+                .field("before_ts_ms", before_ts_ms)
+                .field("limit", limit)
+                .finish(),
+            Self::LoadPreferenceString { key, boot_gen } => f
+                .debug_struct("LoadPreferenceString")
+                .field("key", key)
+                .field("boot_gen", boot_gen)
+                .finish(),
         }
     }
 }
@@ -118,6 +195,7 @@ pub enum OpResult {
     PinBoard(Option<PinBoard>),
     HiddenSearch(Option<Vec<String>>),
     Bool(bool),
+    Int(i64),
 }
 
 impl fmt::Debug for OpResult {
@@ -131,6 +209,7 @@ impl fmt::Debug for OpResult {
                 .field("count", &v.as_ref().map(Vec::len))
                 .finish(),
             Self::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
+            Self::Int(n) => f.debug_tuple("Int").field(n).finish(),
         }
     }
 }
@@ -220,6 +299,72 @@ pub enum HostCall {
         start_explicit: bool,
         duration: i64,
     },
+
+    // --- Messages & bootstrap domain boundaries (U4) ---
+    OnOpenConversationSync {
+        conv_id: String,
+        changed: bool,
+    },
+    OnCloseConversation,
+    RefreshBoardPins {
+        conv_id: String,
+    },
+    MarkReadBoundary {
+        conv_id: String,
+        seen_target: Option<SeenTarget>,
+    },
+    ApplyRemoteReaction {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        sender_id: String,
+        r_type: String,
+        r_icon: String,
+        event_id: String,
+        react_client_id: String,
+        sender_name: String,
+    },
+    ApplyRemoteRecall {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        update_conversation_preview: bool,
+    },
+    ApplyRemoteDelete {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        update_conversation_preview: bool,
+    },
+    ApplyMutes {
+        mutes: Vec<MuteEntry>,
+    },
+    RefreshCloud,
+    DecryptEnvelope {
+        payload: Map<String, Value>,
+        default_cmd: u16,
+        fallback_conv_id: Option<String>,
+        is_group_hint: Option<bool>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        persist_conversations: bool,
+        probe_freshness: bool,
+        poll_batch_done: Option<(u64, u64)>,
+        op_id: Option<u64>,
+    },
+    MarkE2eeConversations {
+        conv_ids: Vec<String>,
+    },
+    NotePollMessages {
+        messages: Vec<ChatMessage>,
+    },
+    NotifyIncomingMessages {
+        messages: Vec<ChatMessage>,
+    },
+    ShowBatchTyping {
+        conv_id: String,
+        sender_id: String,
+    },
 }
 
 impl fmt::Debug for HostCall {
@@ -308,6 +453,44 @@ impl fmt::Debug for HostCall {
                 .field("set", set)
                 .field("duration", duration)
                 .finish(),
+            Self::OnOpenConversationSync { changed, .. } => f
+                .debug_struct("OnOpenConversationSync")
+                .field("changed", changed)
+                .finish(),
+            Self::OnCloseConversation => f.write_str("OnCloseConversation"),
+            Self::RefreshBoardPins { .. } => f.write_str("RefreshBoardPins"),
+            Self::MarkReadBoundary { seen_target, .. } => f
+                .debug_struct("MarkReadBoundary")
+                .field("has_seen", &seen_target.is_some())
+                .finish(),
+            Self::ApplyRemoteReaction { r_type, .. } => f
+                .debug_struct("ApplyRemoteReaction")
+                .field("r_type", r_type)
+                .finish(),
+            Self::ApplyRemoteRecall { .. } => f.write_str("ApplyRemoteRecall"),
+            Self::ApplyRemoteDelete { .. } => f.write_str("ApplyRemoteDelete"),
+            Self::ApplyMutes { mutes } => f
+                .debug_struct("ApplyMutes")
+                .field("count", &mutes.len())
+                .finish(),
+            Self::RefreshCloud => f.write_str("RefreshCloud"),
+            Self::DecryptEnvelope { default_cmd, .. } => f
+                .debug_struct("DecryptEnvelope")
+                .field("default_cmd", default_cmd)
+                .finish(),
+            Self::MarkE2eeConversations { conv_ids } => f
+                .debug_struct("MarkE2eeConversations")
+                .field("count", &conv_ids.len())
+                .finish(),
+            Self::NotePollMessages { messages } => f
+                .debug_struct("NotePollMessages")
+                .field("count", &messages.len())
+                .finish(),
+            Self::NotifyIncomingMessages { messages } => f
+                .debug_struct("NotifyIncomingMessages")
+                .field("count", &messages.len())
+                .finish(),
+            Self::ShowBatchTyping { .. } => f.write_str("ShowBatchTyping"),
         }
     }
 }
@@ -445,6 +628,24 @@ pub enum Effect {
     },
     /// Calls `ZaloApi::fetch_conversation_labels`.
     FetchConversationLabelsApi { op_id: Option<u64> },
+
+    // --- Messages domain (U4) ---
+    /// Calls `ZaloApi::fetch_history` for `Open` or `LoadOlder`.
+    FetchHistoryPageApi {
+        conv_id: String,
+        before_msg_id: Option<String>,
+        count: i64,
+        is_old: Option<bool>,
+        purpose: HistoryFetchPurpose,
+    },
+    /// Calls `ZaloApi::fetch_profiles` for one chunk of up to 50 sender/reactor UIDs.
+    FetchSenderProfilesChunkApi {
+        resolve_id: u64,
+        conv_id: String,
+        chunk: Vec<String>,
+        remaining_chunks: Vec<Vec<String>>,
+        cache_updated: bool,
+    },
 
     /// Domain activity delegated to Swift via `CoreHost`.
     Host(HostCall),
@@ -589,6 +790,22 @@ impl fmt::Debug for Effect {
                 .finish(),
             Self::UpdateConversationLabelsApi { .. } => f.write_str("UpdateConversationLabelsApi"),
             Self::FetchConversationLabelsApi { .. } => f.write_str("FetchConversationLabelsApi"),
+            Self::FetchHistoryPageApi { count, purpose, .. } => f
+                .debug_struct("FetchHistoryPageApi")
+                .field("count", count)
+                .field("purpose", purpose)
+                .finish(),
+            Self::FetchSenderProfilesChunkApi {
+                resolve_id,
+                chunk,
+                remaining_chunks,
+                ..
+            } => f
+                .debug_struct("FetchSenderProfilesChunkApi")
+                .field("resolve_id", resolve_id)
+                .field("chunk_len", &chunk.len())
+                .field("remaining", &remaining_chunks.len())
+                .finish(),
             Self::Host(call) => f.debug_tuple("Host").field(call).finish(),
         }
     }

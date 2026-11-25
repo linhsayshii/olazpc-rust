@@ -267,6 +267,13 @@ pub(crate) fn reduce_conversations(state: &mut CoreState, input: Input, out: &mu
                         values: sorted_set_vec(&state.conversations.unread_marks),
                     }));
             }
+            let (win_rm, meta_rm) = state.messages.remove_conversation_window(&id);
+            if win_rm {
+                out.dirty.insert(DirtyKey::Messages);
+            }
+            if meta_rm {
+                out.dirty.insert(DirtyKey::MessageMeta);
+            }
             state.conversations.ui.remove(BTreeSet::from([id]));
             out.dirty.insert(DirtyKey::ConversationUi);
             rebuild_flags_and_extras(state, out);
@@ -766,6 +773,13 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                     key: "hiddenIds".to_owned(),
                     values: sorted_set_vec(&state.conversations.actions.hidden_ids),
                 }));
+            let (win_rm, meta_rm) = state.messages.remove_conversation_window(&id);
+            if win_rm {
+                out.dirty.insert(DirtyKey::Messages);
+            }
+            if meta_rm {
+                out.dirty.insert(DirtyKey::MessageMeta);
+            }
             state.conversations.ui.remove(BTreeSet::from([id.clone()]));
             out.dirty.insert(DirtyKey::ConversationUi);
             rebuild_flags_and_extras(state, out);
@@ -1240,12 +1254,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
             complete_op(op_id, OpResult::Unit, true, out);
         }
 
-        Command::Start
-        | Command::RefreshQr
-        | Command::LogOut
-        | Command::SessionExpired { .. }
-        | Command::ApplyAccountProfile(_)
-        | Command::DrainChatPolling { .. } => {
+        _ => {
             complete_op(op_id, OpResult::Unit, false, out);
         }
     }
