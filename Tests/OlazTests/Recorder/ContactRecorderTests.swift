@@ -12,101 +12,592 @@ final class ContactRecorderTests: XCTestCase {
 
     // MARK: - Helpers
 
+    private static func emptySyncScripts(
+        friends: [CaseJSON]? = nil,
+        friendsError: Int? = nil,
+        groupsVerMap: [String: CaseJSON]? = nil,
+        removedGroups: [String] = [],
+        groupsInfoMap: [String: CaseJSON]? = nil,
+        groupsListError: Int? = nil,
+        sentRows: [CaseJSON]? = nil,
+        sentError: Int? = nil,
+        recommItems: [CaseJSON]? = nil,
+        receivedError: Int? = nil
+    ) -> [CaseJSON] {
+        var scripts: [CaseJSON] = []
+        if let err = friendsError {
+            scripts.append(ContactRecorderHarness.httpScript(
+                path: "/api/social/friend/getfriends",
+                method: "GET",
+                status: err,
+                json: .object(["error_code": .int(Int64(err)), "error_message": .string("Sync friends error")])
+            ))
+        } else {
+            scripts.append(ContactRecorderHarness.httpScript(
+                path: "/api/social/friend/getfriends",
+                method: "GET",
+                json: .object([
+                    "error_code": .int(0),
+                    "data": .object(["list": .array(friends ?? [])]),
+                ])
+            ))
+        }
+
+        if let err = groupsListError {
+            scripts.append(ContactRecorderHarness.httpScript(
+                path: "/api/group/getlg/v4",
+                method: "GET",
+                status: err,
+                json: .object(["error_code": .int(Int64(err)), "error_message": .string("Sync groups error")])
+            ))
+        } else {
+            let verMap = groupsVerMap ?? [:]
+            var dataObj: [String: CaseJSON] = ["gridVerMap": .object(verMap)]
+            if !removedGroups.isEmpty {
+                dataObj["removedsGroup"] = .array(removedGroups.map(CaseJSON.string))
+            }
+            scripts.append(ContactRecorderHarness.httpScript(
+                path: "/api/group/getlg/v4",
+                method: "GET",
+                json: .object(["error_code": .int(0), "data": .object(dataObj)])
+            ))
+            let activeIds = verMap.keys.filter { !removedGroups.contains($0) }
+            if !activeIds.isEmpty {
+                scripts.append(ContactRecorderHarness.httpScript(
+                    path: "/api/group/getmg-v2",
+                    method: "POST",
+                    json: .object([
+                        "error_code": .int(0),
+                        "data": .object(["gridInfoMap": .object(groupsInfoMap ?? [:])]),
+                    ])
+                ))
+            }
+        }
+
+        if let err = sentError {
+            scripts.append(ContactRecorderHarness.httpScript(
+                path: "/api/friend/requested/list",
+                method: "GET",
+                status: err,
+                json: .object(["error_code": .int(Int64(err)), "error_message": .string("Sync sent error")])
+            ))
+        } else {
+            scripts.append(ContactRecorderHarness.httpScript(
+                path: "/api/friend/requested/list",
+                method: "GET",
+                json: .object([
+                    "error_code": .int(0),
+                    "data": .object(["list": .array(sentRows ?? [])]),
+                ])
+            ))
+        }
+
+        if let err = receivedError {
+            scripts.append(ContactRecorderHarness.httpScript(
+                path: "/api/friend/recommendsv2/list",
+                method: "GET",
+                status: err,
+                json: .object(["error_code": .int(Int64(err)), "error_message": .string("Sync received error")])
+            ))
+        } else {
+            scripts.append(ContactRecorderHarness.httpScript(
+                path: "/api/friend/recommendsv2/list",
+                method: "GET",
+                json: .object([
+                    "error_code": .int(0),
+                    "data": .object(["recommItems": .array(recommItems ?? [])]),
+                ])
+            ))
+        }
+        return scripts
+    }
+
+    private static func localConv(
+        id: String,
+        isGroup: Bool = false,
+        name: String,
+        avatar: String = "",
+        members: Int64 = 0,
+        unread: Int64 = 0,
+        previewText: String = "",
+        previewTsMs: Int64 = 0,
+        previewFromMe: Bool = false
+    ) -> CaseJSON {
+        .object([
+            "id": .string(id),
+            "is_group": .bool(isGroup),
+            "name": .string(name),
+            "avatar": .string(avatar),
+            "pinned": .bool(false),
+            "members": .int(members),
+            "unread": .int(unread),
+            "preview_text": .string(previewText),
+            "preview_ts_ms": .int(previewTsMs),
+            "preview_from_me": .bool(previewFromMe),
+        ])
+    }
+
     private static func contactScenarios() -> [ContactRecorderHarness.ScenarioDef] {
-        []
+        [
+            // 1. sync_full
+            ContactRecorderHarness.ScenarioDef(
+                name: "sync_full",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000901",
+                    displayName: "Contacts User 1",
+                    suppress: ["ws", "long_poll"]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000901", displayName: "Contacts User 1"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000901", displayName: "Contacts User 1"),
+                ] + emptySyncScripts(
+                    friends: [
+                        .object([
+                            "userId": .string("u3000901"),
+                            "zaloName": .string("Đào Anh"),
+                            "displayName": .string("Phone Đào"),
+                            "avatar": .string("https://cdn.example.invalid/f1.jpg"),
+                            "lastActionTime": .int(1700000001000),
+                            "isActivePC": .int(1),
+                            "globalId": .string("gid_3000901"),
+                        ]),
+                        .object([
+                            "uid": .string("3000902"),
+                            "displayName": .string("Ánh Tuyết"),
+                            "zaloName": .string(""),
+                            "avt": .string("https://cdn.example.invalid/f2.jpg"),
+                            "lastActionTime": .int(0),
+                            "online": .bool(true),
+                            "globalId": .string("gid_3000902"),
+                        ]),
+                        .object([
+                            "id": .string("3000903"),
+                            "zaloName": .string("Dương Bình"),
+                            "displayName": .string(""),
+                            "avatar": .string(""),
+                            "isActivePC": .int(0),
+                        ]),
+                        .object([
+                            "userId": .string("3000904"),
+                            "zaloName": .string("99Shop"),
+                            "displayName": .string(""),
+                            "avatar": .string(""),
+                        ]),
+                        .object([
+                            "userId": .string("3000905"),
+                            "zaloName": .string("🎉 Party"),
+                            "avatar": .string(""),
+                        ]),
+                        .object([
+                            "userId": .string("3000906"),
+                            "zaloName": .string(""),
+                            "displayName": .string(""),
+                            "avatar": .string(""),
+                        ]),
+                    ],
+                    groupsVerMap: [
+                        "500901": .int(1),
+                        "g500902": .int(1),
+                        "group_500903": .int(1),
+                        "500904": .int(1),
+                        "500905": .int(1),
+                        "500999": .int(1),
+                    ],
+                    removedGroups: ["500999"],
+                    groupsInfoMap: [
+                        "500901": .object([
+                            "name": .string("Nhóm Đỏ"),
+                            "avt": .string("https://cdn.example.invalid/g1.jpg"),
+                            "totalMember": .int(12),
+                        ]),
+                        "g500902": .object([
+                            "name": .string("Nhóm Áo"),
+                            "fullAvt": .string("https://cdn.example.invalid/g2.jpg"),
+                            "total": .int(8),
+                        ]),
+                        "group_500903": .object([
+                            "name": .string("Nhóm Bầu"),
+                            "memVerList": .array([.string("1"), .string("2"), .string("3")]),
+                        ]),
+                        "500904": .object([
+                            "name": .string("Nhóm Cúc"),
+                            "memIds": .array([.string("1"), .string("2")]),
+                        ]),
+                        "500905": .object([
+                            "name": .string("Nhóm Dừa"),
+                        ]),
+                    ],
+                    sentRows: [
+                        .object([
+                            "toUid": .string("u3000911"),
+                            "displayName": .string("Sent One"),
+                            "avt": .string("https://cdn.example.invalid/s1.jpg"),
+                            "msg": .string("Xin chào 1"),
+                            "ts": .int(1700000005000),
+                        ]),
+                        .object([
+                            "uid": .string("3000912"),
+                            "zaloName": .string("Sent Two"),
+                            "avatar": .string(""),
+                            "message": .string("Xin chào 2"),
+                            "time": .int(0),
+                        ]),
+                    ],
+                    recommItems: [
+                        .object([
+                            "dataInfo": .object([
+                                "recommType": .int(1),
+                                "userId": .string("3000999"),
+                                "displayName": .string("Ignored Suggestion"),
+                                "recommTime": .int(1700000009000),
+                            ]),
+                        ]),
+                        .object([
+                            "dataInfo": .object([
+                                "recommType": .int(2),
+                                "userId": .string("3000913"),
+                                "displayName": .string("Rec Older"),
+                                "avatar": .string("https://cdn.example.invalid/r1.jpg"),
+                                "recommInfo": .object(["message": .string("Kết bạn nhé")]),
+                                "friendRequestFetchTime": .int(1700000003000),
+                            ]),
+                        ]),
+                        .object([
+                            "dataInfo": .object([
+                                "recommType": .int(2),
+                                "uid": .string("u3000914"),
+                                "zaloName": .string("Rec Newer"),
+                                "avt": .string("https://cdn.example.invalid/r2.jpg"),
+                                "message": .string("Mình là Rec"),
+                                "recommTime": .int(1700000007000),
+                            ]),
+                        ]),
+                    ]
+                ),
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("contacts_sync")]),
+                ]
+            ),
+
+            // 2. sync_partial_failures
+            ContactRecorderHarness.ScenarioDef(
+                name: "sync_partial_failures",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000902",
+                    displayName: "Contacts User 2",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "contacts": .object([
+                            "friends_loaded": .bool(true),
+                            "groups_loaded": .bool(true),
+                            "friends": .array([
+                                .object([
+                                    "id": .string("3000920"),
+                                    "name": .string("Seed Friend"),
+                                    "zalo_name": .string("Seed Friend"),
+                                    "section": .string("S"),
+                                    "sort_key": .string("seed friend"),
+                                ]),
+                            ]),
+                            "groups": .array([
+                                .object([
+                                    "id": .string("g500920"),
+                                    "name": .string("Seed Group"),
+                                    "members": .int(4),
+                                    "sort_key": .string("seed group"),
+                                ]),
+                            ]),
+                            "received": .array([
+                                .object(["id": .string("3000921"), "name": .string("Seed Rec"), "message": .string("Hi")]),
+                            ]),
+                            "sent": .array([
+                                .object(["id": .string("3000922"), "name": .string("Seed Sent"), "message": .string("Yo")]),
+                            ]),
+                            "pending_request_count": .int(1),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000902", displayName: "Contacts User 2"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000902", displayName: "Contacts User 2"),
+                ]
+                + emptySyncScripts(
+                    friendsError: 500,
+                    groupsVerMap: ["500921": .int(1)],
+                    groupsInfoMap: ["500921": .object(["name": .string("Group Step 1"), "totalMember": .int(5)])],
+                    sentRows: [.object(["userId": .string("3000923"), "zaloName": .string("Sent Step 1"), "message": .string("S1"), "time": .int(1700000010000)])],
+                    recommItems: [.object(["dataInfo": .object(["recommType": .int(2), "userId": .string("3000924"), "zaloName": .string("Rec Step 1"), "message": .string("R1"), "recommTime": .int(1700000011000)])])]
+                )
+                + emptySyncScripts(
+                    friends: [.object(["userId": .string("3000925"), "zaloName": .string("Friend Step 2")])],
+                    groupsListError: 500,
+                    sentRows: [.object(["userId": .string("3000926"), "zaloName": .string("Sent Step 2"), "message": .string("S2"), "time": .int(1700000012000)])],
+                    recommItems: [.object(["dataInfo": .object(["recommType": .int(2), "userId": .string("3000927"), "zaloName": .string("Rec Step 2"), "message": .string("R2"), "recommTime": .int(1700000013000)])])]
+                )
+                + emptySyncScripts(
+                    friends: [.object(["userId": .string("3000928"), "zaloName": .string("Friend Step 3")])],
+                    groupsVerMap: ["500922": .int(1)],
+                    groupsInfoMap: ["500922": .object(["name": .string("Group Step 3"), "totalMember": .int(6)])],
+                    sentError: 500,
+                    recommItems: [.object(["dataInfo": .object(["recommType": .int(2), "userId": .string("3000929"), "zaloName": .string("Rec Step 3"), "message": .string("R3"), "recommTime": .int(1700000014000)])])]
+                )
+                + emptySyncScripts(
+                    friends: [.object(["userId": .string("3000930"), "zaloName": .string("Friend Step 4")])],
+                    groupsVerMap: ["500923": .int(1)],
+                    groupsInfoMap: ["500923": .object(["name": .string("Group Step 4"), "totalMember": .int(7)])],
+                    sentRows: [.object(["userId": .string("3000931"), "zaloName": .string("Sent Step 4"), "message": .string("S4"), "time": .int(1700000015000)])],
+                    receivedError: 500
+                ),
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("contacts_sync")]),
+                    .object(["snapshot": .string("friends_failed")]),
+                    .object(["cmd": .string("contacts_sync")]),
+                    .object(["snapshot": .string("groups_failed")]),
+                    .object(["cmd": .string("contacts_sync")]),
+                    .object(["snapshot": .string("sent_failed")]),
+                    .object(["cmd": .string("contacts_sync")]),
+                ]
+            ),
+
+            // 3. sync_followups
+            ContactRecorderHarness.ScenarioDef(
+                name: "sync_followups",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000903",
+                    displayName: "Contacts User 3",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "open_conversation_id": .string("3000901"),
+                        "history_freshness": .object(["3000901": .string("up_to_date")]),
+                        "contacts": .object([
+                            "cached_profiles": .object([
+                                "3000901": .object(["name": .string("Old Alice"), "avatar": .string("")]),
+                            ]),
+                        ]),
+                        "pinned_ids": .array([.string("3000901")]),
+                        "activity_ranks": .object(["3000902": .int(100)]),
+                        "local_conversations": .array([
+                            localConv(
+                                id: "3000901",
+                                name: "Old Alice",
+                                unread: 0,
+                                previewText: "Hello",
+                                previewTsMs: 1700000001000
+                            ),
+                            localConv(
+                                id: "3000999",
+                                name: "Stranger X",
+                                unread: 2,
+                                previewText: "Ping",
+                                previewTsMs: 1700000002000,
+                                previewFromMe: false
+                            ),
+                        ]),
+                        "local_messages": .array([
+                            .object([
+                                "id": .string("9100001"),
+                                "conv_id": .string("3000901"),
+                                "client_id": .string("c9100001"),
+                                "sender_id": .string("3000901"),
+                                "sender_name": .string("Old Alice"),
+                                "is_mine": .bool(false),
+                                "text": .string("Hello"),
+                                "ts_ms": .int(1700000001000),
+                                "reactions": .array([
+                                    .object([
+                                        "emoji": .string("❤️"),
+                                        "key": .string("/-heart"),
+                                        "type": .string("5"),
+                                        "count": .int(2),
+                                        "includesMe": .bool(true),
+                                        "names": .array([]),
+                                        "people": .int(2),
+                                        "userCounts": .object([
+                                            "2000903": .int(1),
+                                            "3000902": .int(1),
+                                        ]),
+                                    ]),
+                                ]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000903", displayName: "Contacts User 3"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000903", displayName: "Contacts User 3"),
+                    ContactRecorderHarness.httpScript(
+                        path: "/api/social/group/members",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "changed_profiles": .object([
+                                    "3000901": .object([
+                                        "userId": .string("3000901"),
+                                        "displayName": .string("Old Alice"),
+                                        "zaloName": .string("Old Alice"),
+                                        "avatar": .string(""),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                ] + emptySyncScripts(
+                    friends: [
+                        .object([
+                            "userId": .string("3000901"),
+                            "zaloName": .string("New Alice"),
+                            "avatar": .string("https://cdn.example.invalid/alice_new.jpg"),
+                        ]),
+                        .object([
+                            "userId": .string("3000902"),
+                            "zaloName": .string("New Bob"),
+                            "avatar": .string("https://cdn.example.invalid/bob_new.jpg"),
+                        ]),
+                    ],
+                    groupsVerMap: ["500930": .int(1)],
+                    groupsInfoMap: [
+                        "500930": .object([
+                            "name": .string("Followup Group"),
+                            "avt": .string("https://cdn.example.invalid/grp_new.jpg"),
+                            "totalMember": .int(9),
+                        ]),
+                    ]
+                ),
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000901")])]),
+                    .object(["snapshot": .string("before_sync")]),
+                    .object(["cmd": .string("contacts_sync")]),
+                ]
+            ),
+
+            // 4. sync_global_ids
+            ContactRecorderHarness.ScenarioDef(
+                name: "sync_global_ids",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000904",
+                    displayName: "Contacts User 4",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "contacts": .object([
+                            "friend_global_ids": .object(["3000900": .string("gid_old_3000900")]),
+                            "cached_profiles": .object([
+                                "3000900": .object(["name": .string("Pre Existing"), "avatar": .string("")]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000904", displayName: "Contacts User 4"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000904", displayName: "Contacts User 4"),
+                ] + emptySyncScripts(
+                    friends: [
+                        .object([
+                            "userId": .string("3000900"),
+                            "zaloName": .string("Updated Global Zero"),
+                            "globalId": .string("gid_new_3000900"),
+                        ]),
+                        .object([
+                            "userId": .string("3000901"),
+                            "zaloName": .string("Global Friend One"),
+                            "avatar": .string("https://cdn.example.invalid/gfriend1.jpg"),
+                            "globalId": .string("gid_3000901"),
+                        ]),
+                    ]
+                ),
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("contacts_sync")]),
+                    .object(["snapshot": .string("after_sync")]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("gid_3000901")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("gid_new_3000900")])]),
+                    .object(["cmd": .string("lookup"), "args": .object(["uid": .string("gid_old_3000900")])]),
+                ]
+            ),
+        ]
     }
 }
 
 // MARK: - ContactRecorderHarness
 
+@MainActor
 private final class ContactTransitionRecorder {
     private let scenarioName: String
-    private let capture: @MainActor () -> CaseJSON
+    private let capture: () -> CaseJSON
     private var history: [CaseJSON] = []
-    private var waiters: [(UUID, CaseJSON, CheckedContinuation<Void, Error>)] = []
+    private var searchFromIndex = 0
+    private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
 
-    init(scenarioName: String, capture: @escaping @MainActor () -> CaseJSON) {
+    init(scenarioName: String, capture: @escaping () -> CaseJSON) {
         self.scenarioName = scenarioName
         self.capture = capture
     }
 
-    @MainActor
     func recordTransition() {
-        let state = capture()
-        history.append(state)
-        var remaining: [(UUID, CaseJSON, CheckedContinuation<Void, Error>)] = []
-        for entry in waiters {
-            if Self.matches(state: state, predicate: entry.1) {
-                entry.2.resume()
-            } else {
-                remaining.append(entry)
-            }
+        let snap = capture()
+        if history.last != snap {
+            history.append(snap)
         }
-        waiters = remaining
-    }
-
-    @MainActor
-    func awaitPredicate(_ pred: CaseJSON, timeoutMs: Int) async throws {
-        let current = capture()
-        if Self.matches(state: current, predicate: pred)
-            || history.contains(where: { Self.matches(state: $0, predicate: pred) }) {
-            return
-        }
-        let id = UUID()
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            let deadline = Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .milliseconds(timeoutMs))
-                guard let self else { return }
-                if let idx = self.waiters.firstIndex(where: { $0.0 == id }) {
-                    let item = self.waiters.remove(at: idx)
-                    item.2.resume(
-                        throwing: ContactRecorderHarness.RecorderError.timeout(
-                            scenario: self.scenarioName,
-                            detail: "Timed out after \(timeoutMs)ms waiting for \(pred.canonicalString()); current=\(self.capture().canonicalString())"
-                        )
-                    )
-                }
-            }
-            waiters.append((id, pred, cont))
-            _ = deadline
+        let pending = waiters
+        waiters.removeAll()
+        for cont in pending.values {
+            cont.resume()
         }
     }
 
-    @MainActor
     func cancelWaiters() {
         let pending = waiters
         waiters.removeAll()
-        for entry in pending {
-            entry.2.resume(
-                throwing: ContactRecorderHarness.RecorderError.timeout(
-                    scenario: scenarioName,
-                    detail: "Cancelled"
-                )
-            )
+        for cont in pending.values {
+            cont.resume()
         }
     }
 
-    private static func matches(state: CaseJSON, predicate: CaseJSON) -> Bool {
-        guard let predPhase = predicate["phase"]?.objectValue else {
-            return matchesObjectSubset(state: state, subset: predicate)
-        }
-        guard let curPhase = state["phase"]?.objectValue else { return false }
-        return predPhase.allSatisfy { key, val in curPhase[key] == val }
-    }
+    func awaitPredicate(_ pred: CaseJSON, timeoutMs: Int) async throws {
+        let deadline = ContinuousClock.now + .milliseconds(timeoutMs)
+        let targetKind = pred["phase"]?.stringValue
+        let targetStep = pred["step"]?.stringValue
 
-    private static func matchesObjectSubset(state: CaseJSON, subset: CaseJSON) -> Bool {
-        guard let subObj = subset.objectValue, let stateObj = state.objectValue else {
-            return state == subset
+        func matches(_ state: CaseJSON) -> Bool {
+            guard let phase = state["phase"],
+                  let kind = phase["kind"]?.stringValue else { return false }
+            if let targetKind, kind != targetKind { return false }
+            if let targetStep, phase["step"]?.stringValue != targetStep { return false }
+            return true
         }
-        for (k, v) in subObj {
-            guard let sv = stateObj[k] else { return false }
-            if v.objectValue != nil {
-                if !matchesObjectSubset(state: sv, subset: v) { return false }
-            } else if sv != v {
-                return false
+
+        while true {
+            recordTransition()
+            if let hit = (searchFromIndex..<history.count).first(where: { matches(history[$0]) }) {
+                searchFromIndex = hit + 1
+                return
             }
+            let remaining = deadline - ContinuousClock.now
+            if remaining <= .zero {
+                throw ContactRecorderHarness.RecorderError.timeout(
+                    scenario: scenarioName,
+                    detail: "timed out awaiting \(pred.canonicalString()); latest phase: \(history.last?["phase"]?.canonicalString() ?? "none")"
+                )
+            }
+            let waiterId = UUID()
+            let timeoutTask = Task { @MainActor in
+                try? await Task.sleep(for: min(remaining, .milliseconds(50)))
+                if let cont = self.waiters.removeValue(forKey: waiterId) {
+                    cont.resume()
+                }
+            }
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                waiters[waiterId] = cont
+            }
+            timeoutTask.cancel()
         }
-        return true
     }
 }
 
