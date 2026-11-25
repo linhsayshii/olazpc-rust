@@ -611,39 +611,40 @@ extension ZaloEngine {
         let key = "\(conversation)|\(message.id)|pin"
         guard messageActionsBusy.insert(key).inserted else { return }
         insertPinOptimistically(message, replacing: ref)
-        Task {
-            defer { messageActionsBusy.remove(key) }
+        trackMessageActionTask { [weak self] in
+            guard let self else { return }
+            defer { self.messageActionsBusy.remove(key) }
             do {
                 if let ref, !ref.isEmpty {
-                    let boardCache = cachedBoardRawTopics[conversation]
-                    try await sessionClient.unpinBoardTopic(
+                    let boardCache = self.cachedBoardRawTopics[conversation]
+                    try await self.sessionClient.unpinBoardTopic(
                         convId: conversation,
                         topicId: ref,
                         rawTopic: boardCache?.topics[ref].map { ZaloJSONBox($0) },
                         boardVersion: boardCache?.version ?? 0
                     )
-                    await refreshBoardPins(for: conversation)
+                    await self.refreshBoardPins(for: conversation)
                 }
                 // Official `getTopicDataFromMessage`: the real server/client id pair (own messages are not keyed by msgId).
-                let ids = await resolveServerAndClientIds(for: message)
-                let me = profile?.userId ?? ""
+                let ids = await self.resolveServerAndClientIds(for: message)
+                let me = self.profile?.userId ?? ""
                 let senderUid = message.isMine || message.senderId.isEmpty || message.senderId == "0" ? me : message.senderId
                 let senderName = message.isMine
-                    ? (profile?.displayName ?? "")
-                    : (lookupPersonInfo(message.senderId)?.name ?? message.senderName)
+                    ? (self.profile?.displayName ?? "")
+                    : (self.lookupPersonInfo(message.senderId)?.name ?? message.senderName)
                 let params = ZaloWireParser.pinTopicParams(
                     msgId: ids.msgId, cliMsgId: ids.cliMsgId.isEmpty ? ids.msgId : ids.cliMsgId,
                     senderUid: senderUid, senderName: senderName, kind: message.kind, title: message.text)
-                _ = try await sessionClient.pinBoardMessage(
+                _ = try await self.sessionClient.pinBoardMessage(
                     convId: conversation,
                     params: params,
-                    boardVersion: cachedBoardRawTopics[conversation]?.version ?? 0
+                    boardVersion: self.cachedBoardRawTopics[conversation]?.version ?? 0
                 )
-                await refreshBoardPins(for: conversation)
+                await self.refreshBoardPins(for: conversation)
             } catch {
                 EngineLog.shared.write("pins: pin failed group=\(ZaloWireParser.isGroupId(conversation)) replacing=\(ref != nil) \(Self.pinErrorShape(error))")
-                await refreshBoardPins(for: conversation)
-                CardActionCenter.shared.show("Ghim tin nhắn không thành công.", in: conversation)
+                await self.refreshBoardPins(for: conversation)
+                self.showActionCard("Ghim tin nhắn không thành công.", in: conversation)
             }
         }
     }
@@ -676,20 +677,21 @@ extension ZaloEngine {
         guard messageActionsBusy.insert(key).inserted else { return }
         let rawTopic = cachedBoardRawTopics[conversationId]?.topics[ref]
         removePinOptimistically(ref, in: conversationId)
-        Task {
-            defer { messageActionsBusy.remove(key) }
+        trackMessageActionTask { [weak self] in
+            guard let self else { return }
+            defer { self.messageActionsBusy.remove(key) }
             do {
-                let boardCache = cachedBoardRawTopics[conversationId]
-                try await sessionClient.unpinBoardTopic(
+                let boardCache = self.cachedBoardRawTopics[conversationId]
+                try await self.sessionClient.unpinBoardTopic(
                     convId: conversationId,
                     topicId: ref,
                     rawTopic: rawTopic.map { ZaloJSONBox($0) },
                     boardVersion: boardCache?.version ?? 0
                 )
-                await refreshBoardPins(for: conversationId)
+                await self.refreshBoardPins(for: conversationId)
             } catch {
-                await refreshBoardPins(for: conversationId)
-                CardActionCenter.shared.show("Yêu cầu thực hiện không thành công", in: conversationId)
+                await self.refreshBoardPins(for: conversationId)
+                self.showActionCard("Yêu cầu thực hiện không thành công", in: conversationId)
             }
         }
     }
@@ -744,7 +746,9 @@ extension ZaloEngine {
 
     func rewatchPins() {
         guard let id = openConversationId else { return }
-        Task { await refreshBoardPins(for: id) }
+        trackMessageActionTask { [weak self] in
+            await self?.refreshBoardPins(for: id)
+        }
     }
 
     func dropMessagePrompts() {

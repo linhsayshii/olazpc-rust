@@ -186,7 +186,7 @@ extension ZaloEngine {
                 ok: "Xác nhận"
             )
         case .chooseMany(let need):
-            CardActionCenter.shared.show(
+            showActionCard(
                 "Đã đạt giới hạn \(limit) ghim. Vui lòng chọn ít nhất \(need) ghim cần bỏ để cập nhật ghim mới.",
                 in: conversation
             )
@@ -229,7 +229,9 @@ extension ZaloEngine {
     func handlePinTopicEvent(conversationId: String) {
         EngineLog.shared.write("pins: event group=\(ZaloWireParser.isGroupId(conversationId)) open=\(openConversationId == conversationId)")
         if openConversationId == conversationId {
-            Task { await refreshBoardPins(for: conversationId) }
+            trackMessageActionTask { [weak self] in
+                await self?.refreshBoardPins(for: conversationId)
+            }
         } else {
             pins[conversationId] = nil
         }

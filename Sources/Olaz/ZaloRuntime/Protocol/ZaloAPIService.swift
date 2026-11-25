@@ -1490,7 +1490,7 @@ extension ZaloSessionClient {
     /// Pins a message topic. `params` = `ZaloWireParser.pinTopicParams` (official `getTopicDataFromMessage`).
     /// Group: `group_board /api/board/topic/createv2`; 1-1: `friend_board /api/friendboard/create` (cmd 12067).
     func pinBoardMessage(convId: String, params: [String: Any], boardVersion: Int64 = 0) async throws -> ZaloJSONBox {
-        let paramsStr = (try? JSONSerialization.data(withJSONObject: params)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        let paramsStr = (try? JSONSerialization.data(withJSONObject: params, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
         let isGroup = ZaloWireParser.isGroupId(convId)
         if !isGroup {
             let topic: [String: Any] = [
