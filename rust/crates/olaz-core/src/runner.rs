@@ -12,7 +12,7 @@ use olaz_api::{PollState, ZaloApi};
 use olaz_net::{
     LoginAccount, SessionClient, SessionSnapshot as NetSessionSnapshot, Transport, ZaloDomains,
 };
-use olaz_store::Store;
+use olaz_store::{SaveOptions, Store};
 use olaz_wire::{decode_stored_message, extract_profiles_map};
 use olaz_ws::{CryptoDecryptor, CursorMap, WsClient, WsConfig, WsHandle};
 use serde_json::{Map, Value};
@@ -27,9 +27,10 @@ use crate::conversations::{
 };
 use crate::effect::{Effect, HostCall, OpResult, StoreOp};
 use crate::input::{
-    CompletedLogin, Input, LegacyCookie, PollBatchError, PollBatchOutcome, SessionFailure,
-    StoreToken,
+    BootstrapAliasesError, Command, CompletedLogin, Input, LegacyCookie, PollBatchError,
+    PollBatchOutcome, SessionFailure, StoreToken,
 };
+use crate::messages::MuteEntry;
 use crate::reduce::classify::MobileSyncEvent;
 use crate::state::PersistedTransportState;
 use crate::typed_chat::{
@@ -332,6 +333,18 @@ pub trait Host: Send + Sync {
     async fn on_long_poll_started(&self) -> bool {
         true
     }
+    // U4-bootstrap
+    /// Host hook emitted when the core signals launch bootstrap. Return `false` to suppress
+    /// auto-dispatching `Command::Bootstrap` (used by case recorders that trigger `bootstrap`
+    /// explicitly or test earlier domains in isolation). Production returns `true`.
+    async fn on_bootstrap_started(&self) -> bool {
+        self.start_bootstrap().await;
+        true
+    }
+    /// Applies server mute entries fetched during launch bootstrap step 3.
+    async fn apply_mutes(&self, _mutes: Vec<MuteEntry>) {}
+    /// Requests the host to refresh cloud data once launch bootstrap finalizes.
+    async fn refresh_cloud(&self) {}
 
     // --- Transport domain callbacks (U2) ---
     async fn persist_poll_state(&self, state: PollState);
@@ -405,6 +418,15 @@ enum HostJob {
         _guard: InFlightGuard,
     },
     StartBootstrap {
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    // U4-bootstrap
+    ApplyMutes {
+        mutes: Vec<MuteEntry>,
+        _guard: InFlightGuard,
+    },
+    RefreshCloud {
         _guard: InFlightGuard,
     },
     OfferFirstLoginTransfer {
@@ -542,6 +564,7 @@ pub struct SessionEffectRunner<T: Transport + 'static> {
     host_dispatched: AtomicU64,
     store_dispatched: AtomicU64,
     active_tasks: Arc<Mutex<Vec<AbortHandle>>>,
+    bootstrap_tasks: Arc<Mutex<Vec<AbortHandle>>>,
     lp_timer_abort: Arc<Mutex<Option<AbortHandle>>>,
     lp_fetch_abort: Mutex<Option<AbortHandle>>,
     host_worker_abort: AbortHandle,
@@ -597,6 +620,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         let (store_tx, store_rx) = mpsc::unbounded_channel();
         let shared_store: SharedStoreSlot = Arc::new(Mutex::new(None));
         let active_tasks: Arc<Mutex<Vec<AbortHandle>>> = Arc::new(Mutex::new(Vec::new()));
+        let bootstrap_tasks: Arc<Mutex<Vec<AbortHandle>>> = Arc::new(Mutex::new(Vec::new()));
         let ws_active_gen: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let lp_active_gen: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let lp_timer_abort: Arc<Mutex<Option<AbortHandle>>> = Arc::new(Mutex::new(None));
@@ -632,6 +656,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
             host_dispatched: AtomicU64::new(0),
             store_dispatched: AtomicU64::new(0),
             active_tasks,
+            bootstrap_tasks,
             lp_timer_abort,
             lp_fetch_abort: Mutex::new(None),
             host_worker_abort: worker_handle.abort_handle(),
@@ -753,6 +778,33 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         list.push(handle);
     }
 
+    // U4-bootstrap
+    fn cancel_bootstrap_tasks(&self) {
+        let handles = {
+            let mut list = self
+                .bootstrap_tasks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            std::mem::take(&mut *list)
+        };
+        for handle in handles {
+            handle.abort();
+        }
+    }
+
+    fn spawn_bootstrap<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let handle = self.runtime.spawn(fut).abort_handle();
+        let mut list = self
+            .bootstrap_tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        list.retain(|h| !h.is_finished());
+        list.push(handle);
+    }
+
     fn snapshot_json(&self) -> String {
         serde_json::to_string(&self.client.snapshot()).unwrap_or_default()
     }
@@ -764,6 +816,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
             match effect {
                 Effect::CancelSessionTasks => {
                     self.cancel_active_tasks();
+                    self.cancel_bootstrap_tasks();
                 }
                 Effect::ClearCoreSession => {
                     let pre_clear_domains = self.client.domains();
@@ -1316,6 +1369,193 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         drop(guard);
                     });
                 }
+                // --- Launch bootstrap network effects (U4-bootstrap) ---
+                Effect::CancelBootstrapTasks => {
+                    self.cancel_bootstrap_tasks();
+                }
+                Effect::BootstrapFetchAliasesApi { boot_gen } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let result = match api.fetch_aliases().await {
+                            Ok(aliases) => Ok(aliases),
+                            Err(err) if err.is_auth_error() => Err(BootstrapAliasesError::Auth),
+                            Err(_) => Err(BootstrapAliasesError::Other),
+                        };
+                        sink.send(Input::BootstrapAliasesDone { boot_gen, result });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchPamApi { boot_gen } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let (pinned_res, archived_res, mute_res) = tokio::join!(
+                            api.fetch_pinned_conversations(),
+                            api.fetch_archived_chats(),
+                            api.fetch_mute_list(),
+                        );
+                        sink.send(Input::BootstrapPamDone {
+                            boot_gen,
+                            pinned_ids: pinned_res.ok(),
+                            archived_ids: archived_res.ok(),
+                            mute_rows: mute_res.ok(),
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchLabelsApi { boot_gen } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let payload = api.fetch_conversation_labels().await.ok();
+                        sink.send(Input::BootstrapLabelsDone { boot_gen, payload });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchHiddenApi { boot_gen } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        let snapshot = if client.is_authenticated() {
+                            let api = ZaloApi::from_shared(client);
+                            api.fetch_hidden_conversations().await.ok()
+                        } else {
+                            None
+                        };
+                        sink.send(Input::BootstrapHiddenDone { boot_gen, snapshot });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchContactsApi { boot_gen } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let (friends_res, groups_res, sent_res, received_res) = tokio::join!(
+                            api.fetch_friends(1, 20000),
+                            api.fetch_groups_list(),
+                            api.fetch_sent_friend_requests(),
+                            api.fetch_received_friend_requests(),
+                        );
+                        sink.send(Input::BootstrapContactsDone {
+                            boot_gen,
+                            friends_rows: friends_res.ok(),
+                            groups_dict: groups_res.ok(),
+                            sent_rows: sent_res.ok(),
+                            received_rows: received_res.ok(),
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchPreloadApi {
+                    boot_gen,
+                    thread_ids,
+                    is_overview,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let payload = api.fetch_preload_conversations(&thread_ids).await.ok();
+                        sink.send(Input::BootstrapPreloadDone {
+                            boot_gen,
+                            is_overview,
+                            payload,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchHistoryApi {
+                    boot_gen,
+                    conv_id,
+                    count,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let payload = api
+                            .fetch_history(&conv_id, None, count, Some(false))
+                            .await
+                            .ok();
+                        sink.send(Input::BootstrapSelfCloudDone {
+                            boot_gen,
+                            conv_id,
+                            payload,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchGroupWaveApi {
+                    boot_gen,
+                    gids,
+                    count,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        type WaveEntry = (String, Option<Map<String, Value>>);
+                        let len = gids.len();
+                        let mut set: tokio::task::JoinSet<(usize, WaveEntry)> =
+                            tokio::task::JoinSet::new();
+                        for (idx, gid) in gids.into_iter().enumerate() {
+                            let task_client = Arc::clone(&client);
+                            set.spawn(async move {
+                                let api = ZaloApi::from_shared(task_client);
+                                let payload =
+                                    api.fetch_history(&gid, None, count, Some(false)).await.ok();
+                                (idx, (gid, payload))
+                            });
+                        }
+                        let mut slots: Vec<Option<WaveEntry>> = vec![None; len];
+                        while let Some(joined) = set.join_next().await {
+                            if let Ok((idx, entry)) = joined
+                                && let Some(slot) = slots.get_mut(idx)
+                            {
+                                *slot = Some(entry);
+                            }
+                        }
+                        let results: Vec<WaveEntry> = slots.into_iter().flatten().collect();
+                        sink.send(Input::BootstrapGroupWaveDone { boot_gen, results });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchProfilesChunkApi {
+                    boot_gen,
+                    chunk,
+                    remaining_chunks,
+                    profiles_cache_changed,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let profiles_map = match api.fetch_profiles(&chunk).await {
+                            Ok(raw) => extract_profiles_map(&raw),
+                            Err(_) => Map::new(),
+                        };
+                        sink.send(Input::BootstrapResolveNamesChunkDone {
+                            boot_gen,
+                            remaining_chunks,
+                            profiles_map,
+                            profiles_cache_changed,
+                        });
+                        drop(guard);
+                    });
+                }
                 Effect::Host(call) => {
                     let guard = sink.track();
                     let job = match call {
@@ -1332,7 +1572,10 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             sink: sink.clone(),
                             _guard: guard,
                         },
-                        HostCall::StartBootstrap => HostJob::StartBootstrap { _guard: guard },
+                        HostCall::StartBootstrap => HostJob::StartBootstrap {
+                            sink: sink.clone(),
+                            _guard: guard,
+                        },
                         HostCall::OfferFirstLoginTransfer { force } => {
                             HostJob::OfferFirstLoginTransfer {
                                 force,
@@ -1449,6 +1692,12 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             duration,
                             _guard: guard,
                         },
+                        // U4-bootstrap
+                        HostCall::ApplyMutes { mutes } => HostJob::ApplyMutes {
+                            mutes,
+                            _guard: guard,
+                        },
+                        HostCall::RefreshCloud => HostJob::RefreshCloud { _guard: guard },
                     };
                     self.send_host(job);
                 }
@@ -1466,6 +1715,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
         self.cancel_active_tasks();
+        self.cancel_bootstrap_tasks();
         self.cancel_long_poll();
         self.ws_driver.stop(false);
         self.host_worker_abort.abort();
@@ -1530,6 +1780,74 @@ async fn run_store_worker(
                         };
                         sink.send(Input::MentionPreviewsLoaded { op_id, messages });
                     }
+                    // U4-bootstrap
+                    StoreOp::LoadPreferenceString { key, boot_gen } => {
+                        let last_refresh_pref = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    store.get_preference_string(&key).ok().flatten()
+                                })
+                                .await
+                                .ok()
+                                .flatten()
+                        } else {
+                            None
+                        };
+                        sink.send(Input::BootstrapFreshnessLoaded {
+                            boot_gen,
+                            last_refresh_pref,
+                        });
+                    }
+                    StoreOp::ProbeAndSaveMessages {
+                        probe_targets,
+                        rows,
+                        preserve_existing_reactions,
+                        reply_boot_gen,
+                    } => {
+                        let probes = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let mut store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let mut out = Vec::with_capacity(probe_targets.len());
+                                    for (conv_id, msg_id) in probe_targets {
+                                        let exists = store
+                                            .existing_message_ids(
+                                                &conv_id,
+                                                std::slice::from_ref(&msg_id),
+                                            )
+                                            .map(|set| set.contains(&msg_id))
+                                            .unwrap_or(false);
+                                        out.push((conv_id, exists));
+                                    }
+                                    if !rows.is_empty() {
+                                        let _ = store.save_messages_with(
+                                            &rows,
+                                            SaveOptions {
+                                                skip_twin_checks: false,
+                                                preserve_existing_reactions,
+                                            },
+                                        );
+                                    }
+                                    out
+                                })
+                                .await
+                                .unwrap_or_default()
+                        } else {
+                            probe_targets
+                                .into_keys()
+                                .map(|conv_id| (conv_id, false))
+                                .collect()
+                        };
+                        if !probes.is_empty() || reply_boot_gen.is_some() {
+                            sink.send(Input::FreshnessProbed {
+                                boot_gen: reply_boot_gen,
+                                probes,
+                            });
+                        }
+                    }
                     other => {
                         if let Some(store_arc) = store_opt {
                             let _ = runtime
@@ -1579,7 +1897,9 @@ async fn run_store_worker(
                                         StoreOp::DeletePreference { key } => {
                                             let _ = store.delete_preference(&key);
                                         }
-                                        StoreOp::LoadMentionPreviewMessages { .. } => {}
+                                        StoreOp::LoadMentionPreviewMessages { .. }
+                                        | StoreOp::LoadPreferenceString { .. }
+                                        | StoreOp::ProbeAndSaveMessages { .. } => {}
                                     }
                                 })
                                 .await;
@@ -1809,8 +2129,19 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                     }
                 }
             }
-            HostJob::StartBootstrap { _guard } => {
-                host.start_bootstrap().await;
+            HostJob::StartBootstrap { sink, _guard } => {
+                if host.on_bootstrap_started().await {
+                    sink.send(Input::Command(Command::Bootstrap {
+                        now_ms: unix_now_ms(),
+                    }));
+                }
+            }
+            // U4-bootstrap
+            HostJob::ApplyMutes { mutes, _guard } => {
+                host.apply_mutes(mutes).await;
+            }
+            HostJob::RefreshCloud { _guard } => {
+                host.refresh_cloud().await;
             }
             HostJob::OfferFirstLoginTransfer { force, _guard } => {
                 host.offer_first_login_transfer(force).await;
@@ -1838,6 +2169,13 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 snapshot_json,
                 _guard,
             } => {
+                // U4-bootstrap: Swift `markExpired` calls `hostResetDomains` and closes SQLite,
+                // so drain pending store ops and detach the shared store handle first.
+                let (tx, rx) = oneshot::channel();
+                if store_tx.send(StoreJob::Drain(tx)).is_ok() {
+                    let _ = rx.await;
+                }
+                *shared_store.lock().unwrap_or_else(PoisonError::into_inner) = None;
                 host.mark_expired(snapshot_json).await;
             }
             HostJob::PersistPollState { state, _guard } => {

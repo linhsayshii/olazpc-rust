@@ -2,6 +2,8 @@
 //!
 //! No I/O, no clock, and no randomness may live inside `reduce`.
 
+// U4-bootstrap
+pub mod bootstrap;
 pub mod classify;
 pub mod conversations;
 pub mod session;
@@ -50,6 +52,26 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::LpTick { .. }
         | Input::PollBatchFetched { .. }
         | Input::PollBatchApplied { .. } => transport::reduce_transport(state, input, &mut out),
+
+        // U4-bootstrap
+        Input::Command(Command::Bootstrap { .. })
+        | Input::OpRequest {
+            cmd: Command::Bootstrap { .. },
+            ..
+        }
+        | Input::BootstrapAliasesDone { .. }
+        | Input::BootstrapFreshnessLoaded { .. }
+        | Input::BootstrapPamDone { .. }
+        | Input::BootstrapLabelsDone { .. }
+        | Input::BootstrapHiddenDone { .. }
+        | Input::BootstrapContactsDone { .. }
+        | Input::BootstrapPreloadDone { .. }
+        | Input::FreshnessProbed { .. }
+        | Input::BootstrapSelfCloudDone { .. }
+        | Input::BootstrapGroupWaveDone { .. }
+        | Input::BootstrapResolveNamesChunkDone { .. } => {
+            bootstrap::reduce_bootstrap(state, input, &mut out);
+        }
 
         Input::Command(_)
         | Input::OpRequest { .. }
