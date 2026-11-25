@@ -326,6 +326,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, out: &mut ReduceOutput) {
             if state.typing.reset_session() {
                 out.dirty.insert(DirtyKey::Typing);
             }
+            state.send.reset(out);
             state.session.sign_out_notice = None;
             state.session.qr_gen = state.session.qr_gen.saturating_add(1);
             state.session.phase = Phase::Login(LoginState::generating());
@@ -406,6 +407,7 @@ pub(crate) fn enter_session_expired(state: &mut CoreState, reason: String, out: 
     if state.typing.reset_session() {
         out.dirty.insert(DirtyKey::Typing);
     }
+    state.send.reset(out);
     state.session.sign_out_notice = Some(reason);
     state.session.qr_gen = state.session.qr_gen.saturating_add(1);
     state.session.phase = Phase::Login(LoginState::generating());

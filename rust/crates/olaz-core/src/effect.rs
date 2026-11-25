@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
-use olaz_api::PollState;
+use olaz_api::{PollState, SendTextParams};
 use olaz_net::{LoginAccount, QrTicket};
 use olaz_store::{StoredConversation, StoredMessage};
 use olaz_wire::ChatMessage;
@@ -12,7 +12,7 @@ use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
 use crate::conversations::{ConversationActionResult, IdentityTable, PinBoard};
-use crate::input::{HiddenPinSyncKind, SeenTarget, StoreToken};
+use crate::input::{E2eeQuoteArg, HiddenPinSyncKind, SeenTarget, StoreToken};
 use crate::messages::MuteEntry;
 use crate::reduce::classify::MobileSyncEvent;
 use crate::typed_chat::TypedChatEnvelope;
@@ -162,7 +162,9 @@ impl fmt::Debug for StoreOp {
                 .field("probes", &probe_targets.len())
                 .field("rows", &rows.len())
                 .finish(),
-            Self::LoadOpenLocalMessages { open_seq, limit, .. } => f
+            Self::LoadOpenLocalMessages {
+                open_seq, limit, ..
+            } => f
                 .debug_struct("LoadOpenLocalMessages")
                 .field("open_seq", open_seq)
                 .field("limit", limit)
@@ -365,6 +367,14 @@ pub enum HostCall {
         conv_id: String,
         sender_id: String,
     },
+    // U5-send
+    SendE2eeText {
+        send_id: u64,
+        conv_id: String,
+        text: String,
+        client_id: String,
+        quote: Option<E2eeQuoteArg>,
+    },
 }
 
 impl fmt::Debug for HostCall {
@@ -491,6 +501,12 @@ impl fmt::Debug for HostCall {
                 .field("count", &messages.len())
                 .finish(),
             Self::ShowBatchTyping { .. } => f.write_str("ShowBatchTyping"),
+            // U5-send
+            Self::SendE2eeText { send_id, quote, .. } => f
+                .debug_struct("SendE2eeText")
+                .field("send_id", send_id)
+                .field("has_quote", &quote.is_some())
+                .finish(),
         }
     }
 }
@@ -688,6 +704,12 @@ pub enum Effect {
     // U5
     /// Calls `ZaloApi::send_typing` when `SessionClient::is_authenticated()` is true.
     SendTypingApi { conv_id: String },
+    // U5-send
+    /// Calls `ZaloApi::send_text` for a plain-text send and returns [`Input::SendTextDone`].
+    SendTextApi {
+        send_id: u64,
+        params: SendTextParams,
+    },
     /// Starts or resets the incoming typing expiry timer for `conv_id`.
     StartTypingExpiry {
         conv_id: String,
@@ -918,6 +940,12 @@ impl fmt::Debug for Effect {
                 .finish(),
             // U5
             Self::SendTypingApi { .. } => f.write_str("SendTypingApi"),
+            // U5-send
+            Self::SendTextApi { send_id, params } => f
+                .debug_struct("SendTextApi")
+                .field("send_id", send_id)
+                .field("params", params)
+                .finish(),
             Self::StartTypingExpiry {
                 expiry_gen, delay, ..
             } => f

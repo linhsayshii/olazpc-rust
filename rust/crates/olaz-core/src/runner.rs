@@ -27,8 +27,8 @@ use crate::conversations::{
 };
 use crate::effect::{Effect, HistoryFetchPurpose, HostCall, OpResult, StoreOp};
 use crate::input::{
-    BootstrapAliasesError, Command, CompletedLogin, Input, LegacyCookie, PollBatchError,
-    PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
+    BootstrapAliasesError, Command, CompletedLogin, E2eeQuoteArg, Input, LegacyCookie,
+    PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
 };
 use crate::messages::MuteEntry;
 use crate::reduce::classify::MobileSyncEvent;
@@ -420,6 +420,17 @@ pub trait Host: Send + Sync {
     async fn note_poll_messages(&self, _messages: Vec<ChatMessage>) {}
     async fn notify_incoming_messages(&self, _messages: Vec<ChatMessage>) {}
     async fn show_batch_typing(&self, _conv_id: String, _sender_id: String) {}
+
+    // --- Send domain callbacks (U5-send) ---
+    async fn send_e2ee_text(
+        &self,
+        _conv_id: String,
+        _text: String,
+        _client_id: String,
+        _quote: Option<E2eeQuoteArg>,
+    ) -> Result<olaz_api::SendMessageResult, String> {
+        Err("send_e2ee_text not implemented by host".to_owned())
+    }
 }
 
 enum HostJob {
@@ -666,6 +677,7 @@ enum StoreJob {
 /// in a scripted `Transport` over the exact same request-building code.
 pub struct SessionEffectRunner<T: Transport + 'static> {
     client: Arc<SessionClient<T>>,
+    host: Arc<dyn Host>,
     ws_driver: Arc<dyn WsDriver>,
     default_domains: Option<ZaloDomains>,
     suppress_long_poll: bool,
@@ -747,7 +759,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         let worker_handle = runtime.spawn(run_host_worker(HostWorkerDeps {
             rx: host_rx,
             client: Arc::clone(&client),
-            host,
+            host: Arc::clone(&host),
             shared_store: Arc::clone(&shared_store),
             store_tx: store_tx.clone(),
             ws_driver: Arc::clone(&ws_driver),
@@ -760,6 +772,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         }));
         Self {
             client,
+            host,
             ws_driver,
             default_domains,
             suppress_long_poll,
@@ -1552,6 +1565,21 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         drop(guard);
                     });
                 }
+                // U5-send
+                Effect::SendTextApi { send_id, params } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let result = api
+                            .send_text(&params.as_args())
+                            .await
+                            .map_err(|err| err.display_without_url());
+                        sink.send(Input::SendTextDone { send_id, result });
+                        drop(guard);
+                    });
+                }
                 Effect::FetchSenderProfilesChunkApi {
                     resolve_id,
                     conv_id,
@@ -1815,6 +1843,23 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         prev_handle.abort();
                     }
                 }
+                // U5-send
+                Effect::Host(HostCall::SendE2eeText {
+                    send_id,
+                    conv_id,
+                    text,
+                    client_id,
+                    quote,
+                }) => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = host.send_e2ee_text(conv_id, text, client_id, quote).await;
+                        sink.send(Input::SendTextDone { send_id, result });
+                        drop(guard);
+                    });
+                }
                 Effect::Host(call) => {
                     let guard = sink.track();
                     let job = match call {
@@ -2072,6 +2117,10 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                                 _guard: guard,
                             }
                         }
+                        HostCall::SendE2eeText { .. } => {
+                            // Handled directly above so slow E2EE sends do not block the serial host queue.
+                            continue;
+                        }
                     };
                     self.send_host(job);
                 }
@@ -2168,7 +2217,10 @@ async fn run_store_worker(
                                     let mut out_probes = Vec::with_capacity(probe_targets.len());
                                     for (conv_id, msg_id) in &probe_targets {
                                         let exists = store
-                                            .existing_message_ids(conv_id, std::slice::from_ref(msg_id))
+                                            .existing_message_ids(
+                                                conv_id,
+                                                std::slice::from_ref(msg_id),
+                                            )
                                             .is_ok_and(|set| !set.is_empty());
                                         out_probes.push((conv_id.clone(), exists));
                                     }
@@ -2208,7 +2260,11 @@ async fn run_store_worker(
                                     let store =
                                         store_arc.lock().unwrap_or_else(PoisonError::into_inner);
                                     store
-                                        .messages(&conv_clone, None, i64::try_from(limit).unwrap_or(50))
+                                        .messages(
+                                            &conv_clone,
+                                            None,
+                                            i64::try_from(limit).unwrap_or(50),
+                                        )
                                         .unwrap_or_default()
                                 })
                                 .await

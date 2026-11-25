@@ -1,12 +1,12 @@
 //! Inputs to the pure reducer: external commands and effect completions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use olaz_api::{HiddenConversationsSnapshot, PollState};
+use olaz_api::{HiddenConversationsSnapshot, PollState, SendMessageResult};
 use olaz_net::{LoginAccount, NetError, QrScanResult, QrTicket, SessionStatus};
 use olaz_store::StoredMessage;
-use olaz_wire::{ChatMessage, ParsedWireEvent};
+use olaz_wire::{ChatMessage, Mention, ParsedWireEvent, TextStyle};
 use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
@@ -18,6 +18,27 @@ use crate::effect::OpResult;
 use crate::messages::{ContactsState, HistoryFreshness};
 use crate::state::{CoreFailKind, FailReason, PersistedTransportState};
 use crate::typed_chat::TypedChatEnvelope;
+
+// U5-send
+/// Quote metadata passed across the `send_e2ee_text` host boundary.
+#[derive(Clone, PartialEq, Eq)]
+pub struct E2eeQuoteArg {
+    pub msg_id: String,
+    pub cli_msg_id: String,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub text: String,
+    pub ts_ms: i64,
+}
+
+impl fmt::Debug for E2eeQuoteArg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("E2eeQuoteArg")
+            .field("ts_ms", &self.ts_ms)
+            .field("has_text", &!self.text.is_empty())
+            .finish()
+    }
+}
 
 /// Message metadata needed to send a read receipt (`sendSeenAPI`) on `mark_read`.
 #[derive(Clone, PartialEq, Eq)]
@@ -265,6 +286,31 @@ pub enum Command {
     SetSendTypingEnabled {
         enabled: bool,
     },
+    // U5-send
+    /// Sends a text message (plain API or E2EE host boundary) with optimistic row insertion.
+    SendText {
+        conv_id: String,
+        text: String,
+        quote_id: Option<String>,
+        mentions: Vec<Mention>,
+        styles: Vec<TextStyle>,
+        urgency: i64,
+        client_id: i64,
+        now_ms: i64,
+        is_e2ee: Option<bool>,
+        ttl_ms: Option<i64>,
+    },
+    /// Marks a conversation read using the core-owned message window for `seen_target`.
+    MarkRead {
+        id: String,
+    },
+    /// Replaces the set of 1-1 peer UIDs with active E2EE sessions.
+    SetE2eeThreads(BTreeSet<String>),
+    /// Updates a single conversation's auto-delete TTL in milliseconds (`0` disables).
+    SetAutoDeleteTtl {
+        conv_id: String,
+        ttl_ms: i64,
+    },
 }
 
 impl fmt::Debug for Command {
@@ -414,10 +460,9 @@ impl fmt::Debug for Command {
                 .finish(),
             Self::CloseConversation => f.write_str("CloseConversation"),
             Self::LoadOlderMessages { .. } => f.write_str("LoadOlderMessages"),
-            Self::Bootstrap { now_ms } => f
-                .debug_struct("Bootstrap")
-                .field("now_ms", now_ms)
-                .finish(),
+            Self::Bootstrap { now_ms } => {
+                f.debug_struct("Bootstrap").field("now_ms", now_ms).finish()
+            }
             Self::ApplyBatchDirect { default_cmd, .. } => f
                 .debug_struct("ApplyBatchDirect")
                 .field("default_cmd", default_cmd)
@@ -459,6 +504,35 @@ impl fmt::Debug for Command {
             Self::SetSendTypingEnabled { enabled } => f
                 .debug_struct("SetSendTypingEnabled")
                 .field("enabled", enabled)
+                .finish(),
+            // U5-send
+            Self::SendText {
+                quote_id,
+                mentions,
+                styles,
+                urgency,
+                now_ms,
+                is_e2ee,
+                ttl_ms,
+                ..
+            } => f
+                .debug_struct("SendText")
+                .field("has_quote", &quote_id.is_some())
+                .field("mentions_count", &mentions.len())
+                .field("styles_count", &styles.len())
+                .field("urgency", urgency)
+                .field("now_ms", now_ms)
+                .field("is_e2ee_override", is_e2ee)
+                .field("ttl_ms_override", ttl_ms)
+                .finish(),
+            Self::MarkRead { .. } => f.write_str("MarkRead"),
+            Self::SetE2eeThreads(threads) => f
+                .debug_struct("SetE2eeThreads")
+                .field("count", &threads.len())
+                .finish(),
+            Self::SetAutoDeleteTtl { ttl_ms, .. } => f
+                .debug_struct("SetAutoDeleteTtl")
+                .field("ttl_ms", ttl_ms)
                 .finish(),
         }
     }
@@ -843,6 +917,11 @@ pub enum Input {
         conv_id: String,
         expiry_gen: u64,
     },
+    // U5-send
+    SendTextDone {
+        send_id: u64,
+        result: Result<SendMessageResult, String>,
+    },
 }
 
 impl fmt::Debug for Input {
@@ -1198,6 +1277,12 @@ impl fmt::Debug for Input {
             Self::TypingExpired { expiry_gen, .. } => f
                 .debug_struct("TypingExpired")
                 .field("expiry_gen", expiry_gen)
+                .finish(),
+            // U5-send
+            Self::SendTextDone { send_id, result } => f
+                .debug_struct("SendTextDone")
+                .field("send_id", send_id)
+                .field("ok", &result.is_ok())
                 .finish(),
         }
     }

@@ -7,6 +7,7 @@ pub mod bootstrap;
 pub mod classify;
 pub mod conversations;
 pub mod messages;
+pub mod send;
 pub mod session;
 pub mod transport;
 
@@ -123,6 +124,22 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
             ..
         }
         | Input::TypingExpired { .. } => crate::typing::reduce_typing(state, input, &mut out),
+        // U5-send
+        Input::Command(
+            Command::SendText { .. }
+            | Command::MarkRead { .. }
+            | Command::SetE2eeThreads(_)
+            | Command::SetAutoDeleteTtl { .. },
+        )
+        | Input::OpRequest {
+            cmd:
+                Command::SendText { .. }
+                | Command::MarkRead { .. }
+                | Command::SetE2eeThreads(_)
+                | Command::SetAutoDeleteTtl { .. },
+            ..
+        }
+        | Input::SendTextDone { .. } => send::reduce_send(state, input, &mut out),
 
         Input::Command(_)
         | Input::OpRequest { .. }

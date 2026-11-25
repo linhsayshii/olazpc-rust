@@ -20,7 +20,9 @@ pub mod typed_chat;
 pub mod typing;
 
 pub use actor::{ActorSink, CoreHandle};
-pub use changes::{ChangeHub, CoreChanges, DirtyKey, DirtySet, MessageMetaSnapshot, snapshot_message_meta};
+pub use changes::{
+    ChangeHub, CoreChanges, DirtyKey, DirtySet, MessageMetaSnapshot, snapshot_message_meta,
+};
 pub use conversations::{
     BatchApplyDelta, CachedGroup, CachedProfile, ConvMessageDelta, ConvPreviewOverride,
     ConversationActionResult, ConversationActionUI, ConversationActionsState, ConversationExtras,
@@ -31,8 +33,8 @@ pub use conversations::{
 };
 pub use effect::{Effect, HistoryFetchPurpose, HostCall, OpResult, StoreOp};
 pub use input::{
-    BootstrapAliasesError, Command, CompletedLogin, HiddenPinSyncKind, Input, LegacyCookie,
-    PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
+    BootstrapAliasesError, Command, CompletedLogin, E2eeQuoteArg, HiddenPinSyncKind, Input,
+    LegacyCookie, PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
 };
 pub use messages::{
     BatchPass1Outcome, BootstrapFlowState, ContactsState, DeleteWindowOutcome,
@@ -47,6 +49,7 @@ pub use messages::{
     to_db_stored,
 };
 pub use reduce::classify::{MobileSyncEvent, Route, classify, classify_poll};
+pub use reduce::send::SendState;
 pub use reduce::{ReduceOutput, reduce};
 pub use runner::{
     EffectRunner, Host, LiveWsDriver, SessionEffectRunner, SharedStoreSlot, WsDriver, WsStartParams,

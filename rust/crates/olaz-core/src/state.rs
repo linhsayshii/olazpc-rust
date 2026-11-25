@@ -27,6 +27,8 @@ pub struct CoreState {
     pub(crate) bootstrap: crate::reduce::bootstrap::BootstrapRuntimeState,
     // U5
     pub typing: TypingState,
+    // U5-send
+    pub send: crate::reduce::send::SendState,
 }
 
 impl CoreState {
@@ -71,6 +73,8 @@ impl fmt::Debug for CoreState {
             .field("bootstrap", &self.bootstrap)
             // U5
             .field("typing", &self.typing)
+            // U5-send
+            .field("send", &self.send)
             .finish()
     }
 }

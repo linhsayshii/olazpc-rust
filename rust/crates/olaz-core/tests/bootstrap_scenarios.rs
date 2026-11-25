@@ -322,6 +322,7 @@ async fn b01_full_bootstrap_and_second_run_probe_before_save_skips_up_to_date() 
                 args: Value::Null,
                 now_ms: None,
                 rand4: None,
+                timeout_ms: None,
             },
             Step::Await {
                 predicate: AwaitPredicate {
@@ -335,6 +336,7 @@ async fn b01_full_bootstrap_and_second_run_probe_before_save_skips_up_to_date() 
                 args: Value::Null,
                 now_ms: Some(1_700_100_000_000),
                 rand4: None,
+                timeout_ms: None,
             },
             Step::Snapshot {
                 snapshot: "after_first".to_owned(),
@@ -345,6 +347,7 @@ async fn b01_full_bootstrap_and_second_run_probe_before_save_skips_up_to_date() 
                 args: Value::Null,
                 now_ms: Some(1_700_100_100_000),
                 rand4: None,
+                timeout_ms: None,
             },
         ],
         expect: Expect {
@@ -481,6 +484,7 @@ async fn b02_aliases_auth_error_aborts_and_expires_session() {
                 args: Value::Null,
                 now_ms: None,
                 rand4: None,
+                timeout_ms: None,
             },
             Step::Await {
                 predicate: AwaitPredicate {
@@ -494,6 +498,7 @@ async fn b02_aliases_auth_error_aborts_and_expires_session() {
                 args: Value::Null,
                 now_ms: Some(1_700_100_000_000),
                 rand4: None,
+                timeout_ms: None,
             },
             Step::Await {
                 predicate: AwaitPredicate {
