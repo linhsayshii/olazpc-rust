@@ -76,7 +76,10 @@ struct ConversationListColumn: View {
             return (byPIN + byName).map(ListItem.conversation)
         }
         if destination == .hidden {
-            return (shell.unlockedHiddenIds ?? []).compactMap { id in all.first { $0.id == id } }.map(ListItem.conversation)
+            // The unlocked snapshot drops a chat as soon as it is unhidden.
+            let hidden = engine.conversationActions.hiddenIds
+            return (shell.unlockedHiddenIds ?? []).filter(hidden.contains)
+                .compactMap { id in all.first { $0.id == id } }.map(ListItem.conversation)
         }
         // Hidden chats are removed in every mode (the controller may still list one right after a local hide).
         let visible = all.filter { !engine.conversationActions.isHidden($0.id) }
