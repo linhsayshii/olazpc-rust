@@ -339,12 +339,14 @@ pub enum HostCall {
         msg_id: String,
         cli_msg_id: String,
         update_conversation_preview: bool,
+        persist_conversations: bool,
     },
     ApplyRemoteDelete {
         conv_id: String,
         msg_id: String,
         cli_msg_id: String,
         update_conversation_preview: bool,
+        persist_conversations: bool,
     },
     DecryptEnvelope {
         payload: Map<String, Value>,
