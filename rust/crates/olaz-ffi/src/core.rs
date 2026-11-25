@@ -29,7 +29,7 @@ use serde_json::{Map, Value};
 use crate::api::PollStateRecord;
 use crate::chat::ChatMessageRecord;
 use crate::conversations::{
-    BatchApplyDeltaRecord, ConversationActionResultRecord, ConversationActionUiRecord,
+    ConvPreviewOverrideRecord, ConversationActionResultRecord, ConversationActionUiRecord,
     ConversationActionsRecord, ConversationExtrasRecord, ConversationPromptRecord,
     ConversationSummaryRecord, IdentityTableRecord, MessagePreviewInputRecord, PinBoardRecord,
     PromptUpdateRecord, RankEntry, SeenTargetRecord,
@@ -873,8 +873,16 @@ impl CoreOfflineConversations {
         })
     }
 
-    pub fn apply_batch_delta(&self, delta: BatchApplyDeltaRecord) -> CoreChangesRecord {
-        self.apply_cmd(Command::ApplyBatchDelta(delta.into()))
+    pub fn apply_preview_override(
+        &self,
+        override_rec: ConvPreviewOverrideRecord,
+    ) -> CoreChangesRecord {
+        self.apply_cmd(Command::ApplyBatchDelta(BatchApplyDelta {
+            applied_count: 0,
+            updates: Vec::new(),
+            preview_overrides: vec![override_rec.into()],
+            persist_conversations: true,
+        }))
     }
 
     pub fn ensure_known_contacts(&self) -> CoreChangesRecord {
@@ -1015,22 +1023,6 @@ pub trait CoreHost: Send + Sync {
     // --- Transport domain callbacks (U2 / U3) ---
     async fn persist_poll_state(&self, state: PollStateRecord);
     async fn persist_ws_cursors(&self, cursors: Vec<CursorEntry>);
-    async fn apply_batch(
-        &self,
-        cmd: Option<u16>,
-        increment_unread: bool,
-        notify_incoming: bool,
-        payload_json: String,
-    ) -> BatchApplyDeltaRecord;
-    async fn apply_parsed_events(
-        &self,
-        cmd: u16,
-        increment_unread: bool,
-        notify_incoming: bool,
-        events: Vec<WireEvent>,
-        uids: Vec<String>,
-        payload: Arc<CoreWirePayload>,
-    ) -> BatchApplyDeltaRecord;
     async fn mobile_sync(&self, events: Vec<MobileSyncEventRecord>);
     async fn e2ee_signal(&self, cmd: u16, payload_json: String);
     async fn e2ee_deliver_reports(&self, cmd: u16, payload_json: String);
@@ -1299,44 +1291,22 @@ impl Host for FfiHostBridge {
 
     async fn apply_batch(
         &self,
-        cmd: Option<u16>,
-        increment_unread: bool,
-        notify_incoming: bool,
-        payload: Map<String, Value>,
+        _cmd: Option<u16>,
+        _increment_unread: bool,
+        _notify_incoming: bool,
+        _payload: Map<String, Value>,
     ) -> BatchApplyDelta {
-        let payload_json = to_swift_json_string(&Value::Object(payload));
-        self.0
-            .apply_batch(cmd, increment_unread, notify_incoming, payload_json)
-            .await
-            .into()
+        BatchApplyDelta::default()
     }
 
     async fn apply_parsed_events(
         &self,
-        cmd: u16,
-        increment_unread: bool,
-        notify_incoming: bool,
-        envelope: TypedChatEnvelope,
+        _cmd: u16,
+        _increment_unread: bool,
+        _notify_incoming: bool,
+        _envelope: TypedChatEnvelope,
     ) -> BatchApplyDelta {
-        let events = envelope
-            .events
-            .into_iter()
-            .map(convert_wire_event)
-            .collect();
-        let payload = Arc::new(CoreWirePayload {
-            inner: envelope.payload,
-        });
-        self.0
-            .apply_parsed_events(
-                cmd,
-                increment_unread,
-                notify_incoming,
-                events,
-                envelope.uids,
-                payload,
-            )
-            .await
-            .into()
+        BatchApplyDelta::default()
     }
 
     async fn mobile_sync(&self, events: Vec<MobileSyncEvent>) {
@@ -1530,13 +1500,23 @@ impl CoreEngine {
         ));
     }
 
-    /// Applies a Swift-computed [`BatchApplyDeltaRecord`] and awaits store persistence if requested.
-    pub async fn apply_batch_delta(&self, delta: BatchApplyDeltaRecord) -> Result<u64, CoreError> {
+    /// Applies a standalone recall/delete [`ConvPreviewOverrideRecord`] and awaits store persistence.
+    pub async fn apply_preview_override(
+        &self,
+        override_rec: ConvPreviewOverrideRecord,
+    ) -> Result<u64, CoreError> {
         let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
         run(async move {
             handle
-                .request_unit(Command::ApplyBatchDelta(delta.into()))
+                .request_unit(Command::ApplyBatchDelta(BatchApplyDelta {
+                    applied_count: 0,
+                    updates: Vec::new(),
+                    preview_overrides: vec![override_rec.into()],
+                    persist_conversations: true,
+                }))
                 .await;
+            runner.flush_store().await;
             handle.current_version()
         })
         .await
@@ -2378,26 +2358,6 @@ mod tests {
         async fn mark_expired(&self, _snapshot_json: String) {}
         async fn persist_poll_state(&self, _state: PollStateRecord) {}
         async fn persist_ws_cursors(&self, _cursors: Vec<CursorEntry>) {}
-        async fn apply_batch(
-            &self,
-            _cmd: Option<u16>,
-            _increment_unread: bool,
-            _notify_incoming: bool,
-            _payload_json: String,
-        ) -> BatchApplyDeltaRecord {
-            BatchApplyDeltaRecord::default()
-        }
-        async fn apply_parsed_events(
-            &self,
-            _cmd: u16,
-            _increment_unread: bool,
-            _notify_incoming: bool,
-            _events: Vec<WireEvent>,
-            _uids: Vec<String>,
-            _payload: Arc<CoreWirePayload>,
-        ) -> BatchApplyDeltaRecord {
-            BatchApplyDeltaRecord::default()
-        }
         async fn mobile_sync(&self, _events: Vec<MobileSyncEventRecord>) {}
         async fn e2ee_signal(&self, _cmd: u16, _payload_json: String) {}
         async fn e2ee_deliver_reports(&self, _cmd: u16, _payload_json: String) {}

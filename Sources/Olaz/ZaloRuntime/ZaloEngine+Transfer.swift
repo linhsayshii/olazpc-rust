@@ -532,7 +532,9 @@ extension ZaloEngine {
             }
 
             if let selfId = self.selfConversationId, !selfId.isEmpty {
-                received += await self.fetchAndMergeHistory(convId: selfId, beforeMsgId: nil, isOld: false, count: 50)
+                if let selfHist = try? await self.sessionClient.fetchHistory(convId: selfId, lastMsgId: nil, count: 50, isOld: false) {
+                    received += await self.applyBatchResponse(selfHist.dict, fallbackConvId: selfId, isGroupHint: false, incrementUnread: false)
+                }
             }
 
             let allGroups = self.contacts.groups.map(\.id)
