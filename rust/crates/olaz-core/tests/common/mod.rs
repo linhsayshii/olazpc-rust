@@ -177,9 +177,14 @@ pub struct Seed {
     #[serde(default)]
     pub e2ee_threads: Vec<String>,
     #[serde(default)]
-    pub auto_delete: BTreeMap<String, i64>,
+    pub auto_delete: Option<BTreeMap<String, i64>>,
     #[serde(default)]
     pub host_results: Option<Value>,
+    // U6
+    #[serde(default)]
+    pub starred_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub seen_reaction_event_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1295,6 +1300,7 @@ pub struct RecordingHost {
     notify: Notify,
     is_u3: bool,
     is_u4: bool,
+    is_u6: bool,
     data_dir: Option<PathBuf>,
     shared_store_slot: Mutex<Option<SharedStoreSlot>>,
     store: Mutex<Option<Arc<Mutex<Store>>>>,
@@ -1317,6 +1323,16 @@ impl RecordingHost {
         seed: &Seed,
         is_u3: bool,
         is_u4: bool,
+        data_dir: Option<PathBuf>,
+    ) -> Self {
+        Self::from_seed_with_all_modes(seed, is_u3, is_u4, false, data_dir)
+    }
+
+    pub fn from_seed_with_all_modes(
+        seed: &Seed,
+        is_u3: bool,
+        is_u4: bool,
+        is_u6: bool,
         data_dir: Option<PathBuf>,
     ) -> Self {
         let saved_session = seed
@@ -1424,6 +1440,7 @@ impl RecordingHost {
             notify: Notify::new(),
             is_u3,
             is_u4,
+            is_u6,
             data_dir,
             shared_store_slot: Mutex::new(None),
             store: Mutex::new(None),
@@ -2235,7 +2252,7 @@ impl Host for RecordingHost {
         event_id: String,
         react_client_id: String,
         sender_name: String,
-    ) {
+    ) -> bool {
         if self.is_u4 {
             self.record(
                 "apply_remote_reaction",
@@ -2252,6 +2269,7 @@ impl Host for RecordingHost {
                 }),
             );
         }
+        self.is_u6
     }
 
     async fn apply_remote_recall(
@@ -2260,7 +2278,7 @@ impl Host for RecordingHost {
         msg_id: String,
         cli_msg_id: String,
         _update_conversation_preview: bool,
-    ) {
+    ) -> bool {
         if self.is_u4 {
             self.record(
                 "apply_remote_recall",
@@ -2271,6 +2289,7 @@ impl Host for RecordingHost {
                 }),
             );
         }
+        self.is_u6
     }
 
     async fn apply_remote_delete(
@@ -2279,7 +2298,7 @@ impl Host for RecordingHost {
         msg_id: String,
         cli_msg_id: String,
         _update_conversation_preview: bool,
-    ) {
+    ) -> bool {
         if self.is_u4 {
             self.record(
                 "apply_remote_delete",
@@ -2287,6 +2306,19 @@ impl Host for RecordingHost {
                     "conv_id": conv_id,
                     "msg_id": msg_id,
                     "cli_msg_id": cli_msg_id,
+                }),
+            );
+        }
+        self.is_u6
+    }
+
+    async fn show_card(&self, conv_id: String, text: String) {
+        if self.is_u6 {
+            self.record(
+                "show_card",
+                json!({
+                    "conv_id": conv_id,
+                    "text": text,
                 }),
             );
         }
@@ -2772,6 +2804,21 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
             .set_preference_strings("hiddenIds", ids)
             .map_err(|e| format!("seed hiddenIds: {e}"))?;
     }
+    if let Some(ids) = &seed.starred_ids {
+        store
+            .set_preference_strings("starredIds", ids)
+            .map_err(|e| format!("seed starredIds: {e}"))?;
+    }
+    if let Some(ids) = &seed.seen_reaction_event_ids {
+        store
+            .set_preference_strings("seenReactionEventIds", ids)
+            .map_err(|e| format!("seed seenReactionEventIds: {e}"))?;
+    }
+    if !seed.e2ee_threads.is_empty() {
+        store
+            .set_preference_strings("e2eeThreadsV1", &seed.e2ee_threads)
+            .map_err(|e| format!("seed e2eeThreadsV1: {e}"))?;
+    }
     if let Some(md5) = &seed.hidden_pin_md5
         && !md5.is_empty()
     {
@@ -2982,20 +3029,31 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
 struct LogCapturingRunner<R> {
     inner: Arc<R>,
     send_logs: Arc<Mutex<Vec<String>>>,
+    action_logs: Arc<Mutex<Vec<String>>>,
 }
 
 impl<R: EffectRunner> EffectRunner for LogCapturingRunner<R> {
     fn dispatch(&self, effects: Vec<Effect>, sink: ActorSink) {
         {
-            let mut logs = self
+            let mut s_logs = self
                 .send_logs
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            let mut a_logs = self
+                .action_logs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             for eff in &effects {
-                if let Effect::EngineLog(line) = eff
-                    && line.starts_with("sendText ")
-                {
-                    logs.push(line.clone());
+                if let Effect::EngineLog(line) = eff {
+                    if line.starts_with("sendText ") {
+                        s_logs.push(line.clone());
+                    }
+                    if line.starts_with("react failed")
+                        || line.starts_with("recall failed")
+                        || line.starts_with("autodelete: ")
+                    {
+                        a_logs.push(line.clone());
+                    }
                 }
             }
         }
@@ -3080,15 +3138,32 @@ fn enrich_send_message_json(m: &ChatMessage, base: &mut Map<String, Value>) {
     );
 }
 
-async fn capture_case_snapshot(
-    core: &CoreHandle,
-    host: &RecordingHost,
+struct SnapshotOpts<'a> {
     is_u3: bool,
     is_u4: bool,
     is_u5: bool,
+    is_u6: bool,
     last_send_result: Option<bool>,
-    send_logs: &Mutex<Vec<String>>,
+    send_logs: &'a Mutex<Vec<String>>,
+    prune_next_expiry_ms: Option<i64>,
+    action_logs: &'a Mutex<Vec<String>>,
+}
+
+async fn capture_case_snapshot(
+    core: &CoreHandle,
+    host: &RecordingHost,
+    opts: &SnapshotOpts<'_>,
 ) -> Option<Value> {
+    let SnapshotOpts {
+        is_u3,
+        is_u4,
+        is_u5,
+        is_u6,
+        last_send_result,
+        send_logs,
+        prune_next_expiry_ms,
+        action_logs,
+    } = *opts;
     if !is_u3 {
         return core
             .snapshot()
@@ -3185,6 +3260,166 @@ async fn capture_case_snapshot(
             .collect();
         obj.insert("send_logs".to_owned(), Value::Array(logs));
     }
+    if is_u6 {
+        if let Some(Value::Object(msgs_obj)) = obj.get_mut("messages") {
+            for (conv_id, list) in &full.messages.windows {
+                if let Some(Value::Array(arr)) = msgs_obj.get_mut(conv_id)
+                    && arr.len() == list.len()
+                {
+                    for (m, item) in list.iter().zip(arr.iter_mut()) {
+                        if let Value::Object(map) = item {
+                            let buttons: Vec<Value> = m
+                                .card_buttons
+                                .iter()
+                                .map(|b| {
+                                    json!({
+                                        "ref": b.r#ref,
+                                        "label": b.label,
+                                        "enabled": b.enabled,
+                                        "help": b.help,
+                                    })
+                                })
+                                .collect();
+                            map.insert("buttons".to_owned(), Value::Array(buttons));
+                        }
+                    }
+                }
+            }
+        }
+        let undo_val = match &full.delete_undo {
+            Some(u) => json!({
+                "conv_id": u.conv_id,
+                "count": u.count,
+                "deadline_ms": u.deadline_ms,
+            }),
+            None => Value::Null,
+        };
+        obj.insert("delete_undo".to_owned(), undo_val);
+
+        let confirm_val = match &full.message_confirm {
+            Some(c) => json!({
+                "conv_id": c.conv_id,
+                "action": c.action.kind_name(),
+                "title": c.title,
+                "message": c.message,
+                "ok": c.ok,
+                "destructive": c.destructive,
+            }),
+            None => Value::Null,
+        };
+        obj.insert("message_confirm".to_owned(), confirm_val);
+
+        let auto_del_val = match &full.auto_delete {
+            Some(map) => {
+                let m: Map<String, Value> = map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Value::from(*v)))
+                    .collect();
+                Value::Object(m)
+            }
+            None => Value::Null,
+        };
+        obj.insert("auto_delete".to_owned(), auto_del_val);
+
+        let mut starred_sorted: Vec<String> = full.starred_ids.iter().cloned().collect();
+        starred_sorted.sort();
+        obj.insert(
+            "starred_ids".to_owned(),
+            Value::Array(starred_sorted.into_iter().map(Value::String).collect()),
+        );
+        obj.insert(
+            "prune_next_expiry_ms".to_owned(),
+            prune_next_expiry_ms.map_or(Value::Null, Value::from),
+        );
+        let mut profiles_obj = Map::new();
+        for (uid, prof) in &full.cached_profiles {
+            profiles_obj.insert(
+                uid.clone(),
+                json!({
+                    "name": prof.name,
+                    "avatar": prof.avatar,
+                }),
+            );
+        }
+        obj.insert("cached_profiles".to_owned(), Value::Object(profiles_obj));
+
+        let a_logs: Vec<Value> = action_logs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .map(Value::String)
+            .collect();
+        obj.insert("action_logs".to_owned(), Value::Array(a_logs));
+
+        if let Some(store_arc) = host.attached_store()
+            && let Some(Value::Object(store_obj)) = obj.get_mut("store")
+        {
+            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Ok(mut stored_msgs) = store.load_all_messages() {
+                stored_msgs.sort_by(|a, b| {
+                    a.conv_id
+                        .as_bytes()
+                        .cmp(b.conv_id.as_bytes())
+                        .then_with(|| a.ts_ms.cmp(&b.ts_ms))
+                        .then_with(|| a.id.as_bytes().cmp(b.id.as_bytes()))
+                });
+                if let Some(Value::Array(existing_arr)) = store_obj.get_mut("messages")
+                    && existing_arr.len() == stored_msgs.len()
+                {
+                    for (row, base) in stored_msgs.iter().zip(existing_arr.iter_mut()) {
+                        if let Value::Object(dict) = base {
+                            let decoded = decode_stored_message(&to_wire_stored(row));
+                            let reactions_json: Vec<Value> = decoded
+                                .as_ref()
+                                .map(|m| {
+                                    m.reactions
+                                        .iter()
+                                        .map(|r| {
+                                            let icon = if !r.icon.emoji.is_empty() {
+                                                r.icon.emoji.clone()
+                                            } else if !r.icon.key.is_empty() {
+                                                r.icon.key.clone()
+                                            } else {
+                                                r.icon.r#type.clone()
+                                            };
+                                            json!({
+                                                "icon": icon,
+                                                "count": r.count,
+                                                "includes_me": r.includes_me,
+                                            })
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            dict.insert("reactions".to_owned(), Value::Array(reactions_json));
+                            dict.insert(
+                                "starred".to_owned(),
+                                Value::Bool(decoded.as_ref().is_some_and(|m| m.menu.starred)),
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some(Value::Object(prefs_obj)) = store_obj.get_mut("prefs") {
+                let mut starred_pref = store
+                    .get_preference_strings("starredIds")
+                    .unwrap_or_default();
+                starred_pref.sort();
+                prefs_obj.insert(
+                    "starred_ids".to_owned(),
+                    Value::Array(starred_pref.into_iter().map(Value::String).collect()),
+                );
+                let seen_pref = store
+                    .get_preference_strings("seenReactionEventIds")
+                    .unwrap_or_default();
+                prefs_obj.insert(
+                    "seen_reaction_event_ids".to_owned(),
+                    Value::Array(seen_pref.into_iter().map(Value::String).collect()),
+                );
+            }
+        }
+    }
     Some(Value::Object(obj))
 }
 
@@ -3210,7 +3445,8 @@ fn str_vec_arg(args: &Value, key: &str) -> Vec<String> {
 /// Runs a single Case format v1 [`Case`] under paused tokio time and returns the observed
 /// snapshots, final state, sorted canonical requests, and ordered host calls.
 pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
-    let is_u5 = case.domain == "send";
+    let is_u6 = case.domain == "message_actions";
+    let is_u5 = case.domain == "send" || is_u6;
     let is_u4 = case.domain == "bootstrap" || case.domain == "messages" || is_u5;
     let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions" || is_u4;
     let temp_dir = if is_u3 {
@@ -3268,10 +3504,11 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         client.seed_next_client_id(next_cid);
     }
 
-    let host = Arc::new(RecordingHost::from_seed_with_modes(
+    let host = Arc::new(RecordingHost::from_seed_with_all_modes(
         &case.seed,
         is_u3,
         is_u4,
+        is_u6,
         temp_dir.as_ref().map(|d| d.path().to_path_buf()),
     ));
     let inner_runner = Arc::new(SessionEffectRunner::with_options(
@@ -3284,9 +3521,11 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     ));
     host.bind_store_slot(inner_runner.shared_store_slot());
     let send_logs = Arc::new(Mutex::new(Vec::<String>::new()));
+    let action_logs = Arc::new(Mutex::new(Vec::<String>::new()));
     let runner: Arc<dyn EffectRunner> = Arc::new(LogCapturingRunner {
         inner: Arc::clone(&inner_runner),
         send_logs: Arc::clone(&send_logs),
+        action_logs: Arc::clone(&action_logs),
     });
 
     let mut initial_state = CoreState::default();
@@ -3314,13 +3553,18 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     for tid in &case.seed.e2ee_threads {
         initial_state.send.e2ee_threads.insert(tid.clone());
     }
-    for (conv_id, ttl) in &case.seed.auto_delete {
-        if *ttl > 0 {
-            initial_state
-                .send
-                .auto_delete_ttl_ms
-                .insert(conv_id.clone(), *ttl);
+    if let Some(auto_del) = &case.seed.auto_delete {
+        let mut map = BTreeMap::new();
+        for (conv_id, ttl) in auto_del {
+            if *ttl > 0 {
+                initial_state
+                    .send
+                    .auto_delete_ttl_ms
+                    .insert(conv_id.clone(), *ttl);
+                map.insert(conv_id.clone(), *ttl);
+            }
         }
+        initial_state.actions.auto_delete = Some(map);
     }
     let core = Arc::new(CoreHandle::start_with_state(
         initial_state,
@@ -3331,7 +3575,9 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let mut snapshots = BTreeMap::new();
     let mut host_cursor = 0usize;
     let mut last_send_result: Option<bool> = None;
+    let mut prune_next_expiry_ms: Option<i64> = None;
     let mut pending_send_task: Option<tokio::task::JoinHandle<bool>> = None;
+    let mut pending_action_task: Option<tokio::task::JoinHandle<()>> = None;
 
     for step in &case.steps {
         match step {
@@ -3422,15 +3668,44 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         .get("persist_conversations")
                         .and_then(Value::as_bool)
                         .unwrap_or(true);
-                    let delta = host.process_direct_batch(
-                        &payload,
-                        default_cmd,
-                        fallback_conv_id,
-                        is_group_hint,
-                        increment_unread,
-                        persist_conversations,
-                    );
-                    core.request_unit(Command::ApplyBatchDelta(delta)).await;
+                    if is_u6 {
+                        let notify_incoming = args
+                            .get("notify_incoming")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let probe_freshness = args
+                            .get("probe_freshness")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let payload_map = payload.as_object().cloned().unwrap_or_default();
+                        let _ = core
+                            .request(Command::ApplyBatchDirect {
+                                payload: payload_map,
+                                default_cmd,
+                                fallback_conv_id: fallback_conv_id.map(str::to_owned),
+                                is_group_hint,
+                                increment_unread,
+                                notify_incoming,
+                                persist_conversations,
+                                probe_freshness,
+                                now_ms: *now_ms,
+                            })
+                            .await;
+                        if pending_send_task.is_none() && pending_action_task.is_none() {
+                            let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
+                                .await;
+                        }
+                    } else {
+                        let delta = host.process_direct_batch(
+                            &payload,
+                            default_cmd,
+                            fallback_conv_id,
+                            is_group_hint,
+                            increment_unread,
+                            persist_conversations,
+                        );
+                        core.request_unit(Command::ApplyBatchDelta(delta)).await;
+                    }
                 }
                 "ensure_known_contacts" => {
                     core.request_unit(Command::EnsureKnownContacts).await;
@@ -3851,6 +4126,234 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         .await
                         .map_err(|_| format!("timed out awaiting typing expiry for `{id}`"))?;
                 }
+                // U6 message_actions domain commands
+                "react" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let emoji = str_arg(args, "emoji");
+                    let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    let react_cmd = Command::React {
+                        conv_id,
+                        msg_id,
+                        emoji,
+                        remove_all: false,
+                        now_ms: ts_ms,
+                    };
+                    if is_async {
+                        let target_held = transport.held_arrived_count() + 1;
+                        let core_bg = Arc::clone(&core);
+                        pending_action_task = Some(tokio::spawn(async move {
+                            core_bg.request_unit(react_cmd).await;
+                        }));
+                        let _ = core.settle().await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(200),
+                            transport.wait_for_held_arrival(target_held),
+                        )
+                        .await;
+                    } else {
+                        core.request_unit(react_cmd).await;
+                        if pending_send_task.is_none() {
+                            let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
+                                .await;
+                        }
+                    }
+                }
+                "await_action" => {
+                    if let Some(handle) = pending_action_task.take() {
+                        handle
+                            .await
+                            .map_err(|e| format!("await_action join error: {e}"))?;
+                    }
+                    if pending_send_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "remove_my_reactions" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::React {
+                        conv_id,
+                        msg_id,
+                        emoji: String::new(),
+                        remove_all: true,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "recall" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::Recall {
+                        conv_id,
+                        msg_id,
+                        is_e2ee_thread: None,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "recall_many" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_ids = str_vec_arg(args, "msg_ids");
+                    let use_confirm = args.get("confirm").and_then(Value::as_bool).unwrap_or(true);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::RecallMany {
+                        conv_id,
+                        msg_ids,
+                        confirm: use_confirm,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "delete_for_me" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let confirmed = args
+                        .get("confirmed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::DeleteForMe {
+                        conv_id,
+                        msg_id,
+                        confirmed,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "delete_many" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_ids = str_vec_arg(args, "msg_ids");
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::DeleteMany {
+                        conv_id,
+                        msg_ids,
+                        confirm: true,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "undo_delete" => {
+                    core.request_unit(Command::UndoDelete).await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "dismiss_delete_undo" => {
+                    core.request_unit(Command::DismissDeleteUndo).await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "await_delete_undo_expiry" => {
+                    let dur = Duration::from_millis(timeout_ms.unwrap_or(8_000));
+                    let wait_fut = async {
+                        loop {
+                            if core
+                                .full_snapshot()
+                                .await
+                                .is_none_or(|snap| snap.delete_undo.is_none())
+                            {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    };
+                    tokio::time::timeout(dur, wait_fut)
+                        .await
+                        .map_err(|_| "timed out awaiting deleteUndo expiry".to_owned())?;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "answer_confirm" => {
+                    let ok = args.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::AnswerMessageConfirm { ok, now_ms: ts_ms })
+                        .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "star" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let on = args.get("on").and_then(Value::as_bool).unwrap_or(true);
+                    core.request_unit(Command::SetStarred {
+                        conv_id,
+                        msg_id,
+                        on,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "load_auto_delete" => {
+                    core.request_unit(Command::LoadAutoDelete).await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "set_auto_delete" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let ttl = args.get("ttl").and_then(Value::as_i64).unwrap_or(0);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::SetAutoDelete {
+                        conv_id,
+                        ttl,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "prune_expired" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    prune_next_expiry_ms = core
+                        .request_opt_i64(Command::PruneExpiredMessages {
+                            conv_id,
+                            now_ms: ts_ms,
+                        })
+                        .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
                 other => return Err(format!("unknown step cmd: {other}")),
             },
             Step::Await {
@@ -3894,7 +4397,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             }
             Step::Snapshot { snapshot } => {
                 if is_u3 {
-                    if pending_send_task.is_some() {
+                    if pending_send_task.is_some() || pending_action_task.is_some() {
                         inner_runner.flush_host().await;
                         let _ = core.settle().await;
                         inner_runner.flush_store().await;
@@ -3907,11 +4410,16 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 if let Some(snap) = capture_case_snapshot(
                     &core,
                     &host,
-                    is_u3,
-                    is_u4,
-                    is_u5,
-                    last_send_result,
-                    &send_logs,
+                    &SnapshotOpts {
+                        is_u3,
+                        is_u4,
+                        is_u5,
+                        is_u6,
+                        last_send_result,
+                        send_logs: &send_logs,
+                        prune_next_expiry_ms,
+                        action_logs: &action_logs,
+                    },
                 )
                 .await
                 {
@@ -3946,14 +4454,24 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             .map_err(|e| format!("trailing send task join error: {e}"))?;
         last_send_result = Some(ok);
     }
+    if let Some(handle) = pending_action_task.take() {
+        handle
+            .await
+            .map_err(|e| format!("trailing action task join error: {e}"))?;
+    }
     let final_state = capture_case_snapshot(
         &core,
         &host,
-        is_u3,
-        is_u4,
-        is_u5,
-        last_send_result,
-        &send_logs,
+        &SnapshotOpts {
+            is_u3,
+            is_u4,
+            is_u5,
+            is_u6,
+            last_send_result,
+            send_logs: &send_logs,
+            prune_next_expiry_ms,
+            action_logs: &action_logs,
+        },
     )
     .await
     .ok_or_else(|| "actor stopped before final snapshot".to_owned())?;

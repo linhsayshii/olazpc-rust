@@ -276,6 +276,13 @@ impl CoreHandle {
         matches!(self.request(command).await, Some(OpResult::Bool(true)))
     }
 
+    pub async fn request_opt_i64(&self, command: Command) -> Option<i64> {
+        match self.request(command).await {
+            Some(OpResult::OptI64(v)) => v,
+            _ => None,
+        }
+    }
+
     /// Drains up to `max_batches` long-poll batches serialized behind any in-flight drain
     /// (ADR-018) and returns the total applied event count (`0` if long-poll or actor is stopped).
     pub async fn drain_chat_polling(&self, max_batches: u32, notify_incoming: bool) -> u32 {

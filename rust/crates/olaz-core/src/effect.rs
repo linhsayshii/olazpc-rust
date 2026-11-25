@@ -12,9 +12,11 @@ use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
 use crate::actions::DeleteUndoItem;
-use crate::conversations::{ConversationActionResult, IdentityTable, PinBoard};
+use crate::conversations::{
+    ConversationActionResult, ConversationPreview, IdentityTable, PinBoard,
+};
 use crate::input::{E2eeQuoteArg, HiddenPinSyncKind, SeenTarget, StoreToken};
-use crate::messages::MuteEntry;
+use crate::messages::{IdentitySnapshot, MuteEntry};
 use crate::reduce::classify::MobileSyncEvent;
 use crate::typed_chat::TypedChatEnvelope;
 
@@ -94,10 +96,43 @@ pub enum StoreOp {
         before_ts_ms: i64,
         limit: usize,
         op_id: Option<u64>,
+    },
     // U6
     DeleteMessage {
         conv_id: String,
         id: String,
+    },
+    ApplyRemoteReactionInStore {
+        conv_candidates: Vec<String>,
+        msg_id: String,
+        cli_msg_id: String,
+        actor_uid: String,
+        my_uid: String,
+        is_me: bool,
+        r_type: String,
+        r_icon: String,
+        allow_duplicate_same_user: bool,
+        snap: Box<IdentitySnapshot>,
+    },
+    MarkRecalledAndCheckLatest {
+        conv_id: String,
+        target_id: String,
+        cli_msg_id: String,
+        found_in_memory: bool,
+        recalled_last: Option<(i64, bool)>,
+        update_conversation_preview: bool,
+        persist_conversations: bool,
+        op_id: Option<u64>,
+        recall_many_id: Option<u64>,
+    },
+    DeleteMessageAndCheckLatest {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        deleted_ts_ms: Option<i64>,
+        mem_latest: Option<ConversationPreview>,
+        update_conversation_preview: bool,
+        persist_conversations: bool,
     },
 }
 
@@ -196,6 +231,30 @@ impl fmt::Debug for StoreOp {
                 .finish(),
             // U6
             Self::DeleteMessage { .. } => f.write_str("DeleteMessage"),
+            Self::ApplyRemoteReactionInStore { r_type, .. } => f
+                .debug_struct("ApplyRemoteReactionInStore")
+                .field("r_type", r_type)
+                .finish(),
+            Self::MarkRecalledAndCheckLatest {
+                found_in_memory,
+                update_conversation_preview,
+                persist_conversations,
+                ..
+            } => f
+                .debug_struct("MarkRecalledAndCheckLatest")
+                .field("found_in_memory", found_in_memory)
+                .field("update_conversation_preview", update_conversation_preview)
+                .field("persist_conversations", persist_conversations)
+                .finish(),
+            Self::DeleteMessageAndCheckLatest {
+                update_conversation_preview,
+                persist_conversations,
+                ..
+            } => f
+                .debug_struct("DeleteMessageAndCheckLatest")
+                .field("update_conversation_preview", update_conversation_preview)
+                .field("persist_conversations", persist_conversations)
+                .finish(),
         }
     }
 }
@@ -209,6 +268,7 @@ pub enum OpResult {
     HiddenSearch(Option<Vec<String>>),
     Bool(bool),
     Int(i64),
+    OptI64(Option<i64>),
 }
 
 impl fmt::Debug for OpResult {
@@ -223,6 +283,7 @@ impl fmt::Debug for OpResult {
                 .finish(),
             Self::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
             Self::Int(n) => f.debug_tuple("Int").field(n).finish(),
+            Self::OptI64(n) => f.debug_tuple("OptI64").field(n).finish(),
         }
     }
 }
@@ -340,18 +401,23 @@ pub enum HostCall {
         event_id: String,
         react_client_id: String,
         sender_name: String,
+        now_ms: i64,
     },
     ApplyRemoteRecall {
         conv_id: String,
         msg_id: String,
         cli_msg_id: String,
         update_conversation_preview: bool,
+        persist_conversations: bool,
+        op_id: Option<u64>,
+        recall_many_id: Option<u64>,
     },
     ApplyRemoteDelete {
         conv_id: String,
         msg_id: String,
         cli_msg_id: String,
         update_conversation_preview: bool,
+        persist_conversations: bool,
     },
     DecryptEnvelope {
         payload: Map<String, Value>,
@@ -387,6 +453,7 @@ pub enum HostCall {
         text: String,
         client_id: String,
         quote: Option<E2eeQuoteArg>,
+    },
     // U6
     ShowCard {
         conv_id: String,
@@ -525,6 +592,7 @@ impl fmt::Debug for HostCall {
                 .debug_struct("SendE2eeText")
                 .field("send_id", send_id)
                 .field("has_quote", &quote.is_some())
+                .finish(),
             // U6
             Self::ShowCard { text, .. } => f
                 .debug_struct("ShowCard")
@@ -743,6 +811,32 @@ pub enum Effect {
     },
 
     // U6
+    /// Resolves server `msg_id` and `cli_msg_id` via SQLite + `fetch_history(count=30)`.
+    ResolveMessageIds {
+        resolve_id: u64,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+    },
+    /// Calls `ZaloApi::send_reaction` (with non-auth `msg_type != 1` retry) and reports `Input::ReactDone`.
+    SendReactionApi {
+        react_id: u64,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        r_icon: String,
+        r_type: i64,
+        msg_type: i64,
+    },
+    /// Calls `ZaloApi::recall_message` (with `code == 112` alt-route retry) and reports `Input::RecallDone`.
+    RecallMessageApi {
+        recall_id: u64,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        primary_is_e2ee: bool,
+        can_try_alt: bool,
+    },
     /// Arms the 5 s delete-for-me undo expiry timer.
     StartDeleteUndoExpiry { undo_gen: u64, delay: Duration },
     /// Cancels any active delete-for-me undo expiry timer.
@@ -993,7 +1087,34 @@ impl fmt::Debug for Effect {
                 .debug_struct("SendTextApi")
                 .field("send_id", send_id)
                 .field("params", params)
+                .finish(),
             // U6
+            Self::ResolveMessageIds { resolve_id, .. } => f
+                .debug_struct("ResolveMessageIds")
+                .field("resolve_id", resolve_id)
+                .finish(),
+            Self::SendReactionApi {
+                react_id,
+                r_type,
+                msg_type,
+                ..
+            } => f
+                .debug_struct("SendReactionApi")
+                .field("react_id", react_id)
+                .field("r_type", r_type)
+                .field("msg_type", msg_type)
+                .finish(),
+            Self::RecallMessageApi {
+                recall_id,
+                primary_is_e2ee,
+                can_try_alt,
+                ..
+            } => f
+                .debug_struct("RecallMessageApi")
+                .field("recall_id", recall_id)
+                .field("primary_is_e2ee", primary_is_e2ee)
+                .field("can_try_alt", can_try_alt)
+                .finish(),
             Self::StartDeleteUndoExpiry { undo_gen, delay } => f
                 .debug_struct("StartDeleteUndoExpiry")
                 .field("undo_gen", undo_gen)

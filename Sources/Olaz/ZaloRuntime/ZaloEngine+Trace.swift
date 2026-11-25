@@ -118,10 +118,20 @@ extension ZaloEngine {
     }
 
     internal func awaitMessageActionTasksForRecording() async {
+        await settleForRecording()
         while !messageActionTasks.isEmpty {
             let tasks = Array(messageActionTasks.values)
             messageActionTasks.removeAll()
             for task in tasks { _ = await task.value }
+        }
+        if let core = coreLifecycle.core {
+            if phase == .ready, activeSendTask == nil {
+                if let v = try? await core.waitIdle() {
+                    await waitForMirrorVersion(v)
+                }
+            } else if let v = try? await core.settle() {
+                await waitForMirrorVersion(v)
+            }
         }
         _ = await persistConversationsTask?.value
     }

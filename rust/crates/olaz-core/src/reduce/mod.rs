@@ -41,6 +41,25 @@ fn is_message_command(cmd: &Command) -> bool {
     )
 }
 
+fn is_action_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::React { .. }
+            | Command::Recall { .. }
+            | Command::RecallMany { .. }
+            | Command::DeleteForMe { .. }
+            | Command::DeleteMany { .. }
+            | Command::AnswerMessageConfirm { .. }
+            | Command::AskMessageConfirm { .. }
+            | Command::UndoDelete
+            | Command::DismissDeleteUndo
+            | Command::SetStarred { .. }
+            | Command::LoadAutoDelete
+            | Command::SetAutoDelete { .. }
+            | Command::PruneExpiredMessages { .. }
+    )
+}
+
 /// Pure transition function for the entire core state.
 pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
     let mut out = ReduceOutput::default();
@@ -144,20 +163,21 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::SendTextDone { .. } => send::reduce_send(state, input, &mut out),
 
         // U6
-        Input::Command(
-            Command::UndoDelete
-            | Command::DismissDeleteUndo
-            | Command::LoadAutoDelete
-            | Command::SetAutoDelete { .. },
-        )
-        | Input::OpRequest {
-            cmd:
-                Command::UndoDelete
-                | Command::DismissDeleteUndo
-                | Command::LoadAutoDelete
-                | Command::SetAutoDelete { .. },
-            ..
+        Input::Command(ref cmd) if is_action_command(cmd) => {
+            crate::actions::reduce_actions(state, input, &mut out);
         }
+        Input::OpRequest { ref cmd, .. } if is_action_command(cmd) => {
+            crate::actions::reduce_actions(state, input, &mut out);
+        }
+        Input::MessageIdsResolved { .. }
+        | Input::ReactDone { .. }
+        | Input::RecallDone { .. }
+        | Input::RemoteReactionApproved { .. }
+        | Input::RemoteRecallApproved { .. }
+        | Input::RemoteRecallSkipped { .. }
+        | Input::RemoteRecallStoreDone { .. }
+        | Input::RemoteDeleteApproved { .. }
+        | Input::RemoteDeleteStoreDone { .. }
         | Input::DeleteUndoExpired { .. }
         | Input::AutoDeleteLoaded { .. }
         | Input::AutoDeleteUpdated { .. } => crate::actions::reduce_actions(state, input, &mut out),

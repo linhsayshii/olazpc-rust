@@ -919,6 +919,43 @@ extension ZaloEngine {
         guard reactionBusyKeys.insert(busyKey).inserted else { return }
         defer { reactionBusyKeys.remove(busyKey) }
 
+        if let core = coreLifecycle.core {
+            let spec = ZaloWireParser.reactionSpec(forEmoji: emoji)
+            if removeAll && !initialMsg.reactions.contains(where: \.includesMe) { return }
+            let alreadyMine = removeAll || initialMsg.reactions.contains(where: { $0.includesMe && $0.icon.type == "\(spec.rType)" })
+            let effectiveType = alreadyMine ? -1 : spec.rType
+            let effectiveIcon = alreadyMine ? "" : spec.rIcon
+            let myUid = profile?.userId ?? ""
+            if var list = messages[conversationId],
+               let idx = list.firstIndex(where: { $0.id == initialMsg.id }) {
+                var updated = list[idx]
+                Self.mutateReactions(
+                    &updated.reactions,
+                    actorUid: myUid,
+                    myUid: myUid,
+                    isMe: true,
+                    rType: "\(effectiveType)",
+                    rIcon: effectiveIcon,
+                    allowDuplicateSameUser: true,
+                    nameLookup: { _ in "Bạn" }
+                )
+                list[idx] = updated
+                isSuppressingDirectMessageSync = true
+                messages[conversationId] = list
+                isSuppressingDirectMessageSync = false
+            }
+            if let v = try? await core.react(
+                convId: conversationId,
+                msgId: messageId,
+                emoji: emoji,
+                removeAll: removeAll,
+                nowMs: nowMs()
+            ) {
+                await waitForMirrorVersion(v)
+            }
+            return
+        }
+
         let spec = ZaloWireParser.reactionSpec(forEmoji: emoji)
         if removeAll && !initialMsg.reactions.contains(where: \.includesMe) { return }
         let alreadyMine = removeAll || initialMsg.reactions.contains(where: { $0.includesMe && $0.icon.type == "\(spec.rType)" })

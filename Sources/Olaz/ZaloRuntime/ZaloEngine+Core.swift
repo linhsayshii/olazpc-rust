@@ -368,20 +368,22 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         eventId: String,
         reactClientId: String,
         senderName: String
-    ) async {
-        guard let engine else { return }
+    ) async -> Bool {
+        guard let engine else { return false }
         await engine.waitForCoreMirrorDrain()
-        await engine.applyRemoteReaction(
-            convId: convId,
-            msgId: msgId,
-            cliMsgId: cliMsgId,
-            senderId: senderId,
-            rType: rType,
-            rIcon: rIcon,
-            eventId: eventId,
-            reactClientId: reactClientId,
-            senderName: senderName
-        )
+        return await MainActor.run {
+            engine.traceU4Host("apply_remote_reaction", args: [
+                "conv_id": convId,
+                "msg_id": msgId,
+                "cli_msg_id": cliMsgId,
+                "sender_id": senderId,
+                "r_type": rType,
+                "r_icon": rIcon,
+                "event_id": eventId,
+                "react_client_id": reactClientId,
+                "sender_name": senderName,
+            ])
+        }
     }
 
     func applyRemoteRecall(
@@ -389,15 +391,16 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         msgId: String,
         cliMsgId: String,
         updateConversationPreview: Bool
-    ) async {
-        guard let engine else { return }
+    ) async -> Bool {
+        guard let engine else { return false }
         await engine.waitForCoreMirrorDrain()
-        _ = await engine.applyRemoteRecall(
-            convId: convId,
-            msgId: msgId,
-            cliMsgId: cliMsgId,
-            updateConversationPreview: updateConversationPreview
-        )
+        return await MainActor.run {
+            engine.traceU4Host("apply_remote_recall", args: [
+                "conv_id": convId,
+                "msg_id": msgId,
+                "cli_msg_id": cliMsgId,
+            ])
+        }
     }
 
     func applyRemoteDelete(
@@ -405,15 +408,16 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         msgId: String,
         cliMsgId: String,
         updateConversationPreview: Bool
-    ) async {
-        guard let engine else { return }
+    ) async -> Bool {
+        guard let engine else { return false }
         await engine.waitForCoreMirrorDrain()
-        _ = await engine.applyRemoteDelete(
-            convId: convId,
-            msgId: msgId,
-            cliMsgId: cliMsgId,
-            updateConversationPreview: updateConversationPreview
-        )
+        return await MainActor.run {
+            engine.traceU4Host("apply_remote_delete", args: [
+                "conv_id": convId,
+                "msg_id": msgId,
+                "cli_msg_id": cliMsgId,
+            ])
+        }
     }
 
     func decryptEnvelope(payloadJson: String) async -> String {
@@ -694,6 +698,14 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
             clientId: clientId,
             quote: quote
         )
+    }
+
+    func showCard(convId: String, text: String) async {
+        guard let engine else { return }
+        await engine.waitForCoreMirrorDrain()
+        await MainActor.run {
+            engine.showActionCard(text, in: convId)
+        }
     }
 }
 
@@ -1490,6 +1502,87 @@ extension ZaloEngine {
             }
         }
 
+        if let undoUpdate = batch.deleteUndo {
+            if let rec = undoUpdate.undo {
+                let next = DeleteUndo(
+                    id: deleteUndo?.id ?? UUID().uuidString,
+                    conversationId: rec.convId,
+                    count: Int(rec.count),
+                    deadline: Date(timeIntervalSince1970: Double(rec.deadlineMs) / 1000.0)
+                )
+                if deleteUndo != next {
+                    deleteUndo = next
+                }
+            } else if deleteUndo != nil {
+                deleteUndo = nil
+            }
+        }
+
+        if let confirmUpdate = batch.messageConfirm {
+            if let rec = confirmUpdate.confirm {
+                if mirroredMessageConfirmCoreId != rec.id {
+                    if let mappedAction = mapMessageConfirmAction(rec.action, convId: rec.convId) {
+                        if let existing = messageConfirm,
+                           mirroredMessageConfirmCoreId == nil,
+                           existing.conversationId == rec.convId,
+                           existing.action == mappedAction,
+                           existing.title == rec.title,
+                           existing.message == rec.message,
+                           existing.ok == rec.ok,
+                           existing.destructive == rec.destructive {
+                            mirroredMessageConfirmCoreId = rec.id
+                        } else {
+                            mirroredMessageConfirmCoreId = rec.id
+                            messageConfirm = MessageActionConfirm(
+                                conversationId: rec.convId,
+                                action: mappedAction,
+                                title: rec.title,
+                                message: rec.message,
+                                ok: rec.ok,
+                                destructive: rec.destructive
+                            )
+                        }
+                    }
+                }
+            } else {
+                mirroredMessageConfirmCoreId = nil
+                if messageConfirm != nil {
+                    messageConfirm = nil
+                }
+            }
+        }
+
+        if let autoDelUpdate = batch.autoDelete {
+            if let entries = autoDelUpdate.entries {
+                var next: [String: Int64] = [:]
+                next.reserveCapacity(entries.count)
+                for entry in entries {
+                    next[entry.convId] = entry.ttlMs
+                }
+                if autoDelete != next {
+                    autoDelete = next
+                }
+            } else if autoDelete != nil {
+                autoDelete = nil
+            }
+        }
+
+        if let starred = batch.starredIds {
+            let next = Set(starred)
+            if cachedStarredIds != next {
+                cachedStarredIds = next
+            }
+        }
+
+        if let profiles = batch.cachedProfiles {
+            var next: [String: ZaloWebKitMigrator.CachedProfile] = [:]
+            next.reserveCapacity(profiles.count)
+            for entry in profiles {
+                next[entry.uid] = ZaloWebKitMigrator.CachedProfile(name: entry.name, avatar: entry.avatar)
+            }
+            cachedProfiles = next
+        }
+
         if batch.version > appliedMirrorVersion {
             appliedMirrorVersion = batch.version
         }
@@ -1519,8 +1612,54 @@ extension ZaloEngine {
     }
 
 
+    internal func mapMessageConfirmAction(_ action: MessageConfirmActionRecord, convId: String) -> MessageActionConfirm.Action? {
+        let list = messages[convId] ?? []
+        func find(_ id: String) -> ChatMessage? {
+            list.first { $0.id == id || $0.clientId == id }
+        }
+        switch action {
+        case .deleteForMe(let msgId):
+            return find(msgId).map(MessageActionConfirm.Action.deleteForMe)
+        case .deleteMany(let msgIds):
+            let resolved = msgIds.compactMap(find)
+            return resolved.isEmpty ? nil : .deleteMany(resolved)
+        case .recallMany(let msgIds):
+            let resolved = msgIds.compactMap(find)
+            return resolved.isEmpty ? nil : .recallMany(resolved)
+        case .pin(let msgId, let replacingRef):
+            return find(msgId).map { .pin($0, replacing: replacingRef ?? "") }
+        case .unpin(let topicRef):
+            return .unpin(ref: topicRef)
+        }
+    }
+
+    internal func messageConfirmRecord(for confirm: MessageActionConfirm) -> MessageConfirmRecord {
+        let actionRecord: MessageConfirmActionRecord
+        switch confirm.action {
+        case .deleteForMe(let msg):
+            actionRecord = .deleteForMe(msgId: msg.id)
+        case .deleteMany(let list):
+            actionRecord = .deleteMany(msgIds: list.map(\.id))
+        case .recallMany(let list):
+            actionRecord = .recallMany(msgIds: list.map(\.id))
+        case .pin(let msg, let replacing):
+            actionRecord = .pin(msgId: msg.id, replacingRef: replacing.isEmpty ? nil : replacing)
+        case .unpin(let ref):
+            actionRecord = .unpin(topicRef: ref)
+        }
+        return MessageConfirmRecord(
+            id: 0,
+            convId: confirm.conversationId,
+            action: actionRecord,
+            title: confirm.title,
+            message: confirm.message,
+            ok: confirm.ok,
+            destructive: confirm.destructive
+        )
+    }
+
     internal func syncAutoDeleteToCore(from oldValue: [String: Int64]?, to newValue: [String: Int64]?) {
-        guard let core = coreLifecycle.core else { return }
+        guard !isApplyingCoreMirror, let core = coreLifecycle.core else { return }
         let oldMap = oldValue ?? [:]
         let newMap = newValue ?? [:]
         for convId in oldMap.keys where newMap[convId] == nil {

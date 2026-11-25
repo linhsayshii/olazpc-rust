@@ -387,7 +387,8 @@ pub trait Host: Send + Sync {
         _event_id: String,
         _react_client_id: String,
         _sender_name: String,
-    ) {
+    ) -> bool {
+        true
     }
     async fn apply_remote_recall(
         &self,
@@ -395,7 +396,8 @@ pub trait Host: Send + Sync {
         _msg_id: String,
         _cli_msg_id: String,
         _update_conversation_preview: bool,
-    ) {
+    ) -> bool {
+        true
     }
     async fn apply_remote_delete(
         &self,
@@ -403,7 +405,8 @@ pub trait Host: Send + Sync {
         _msg_id: String,
         _cli_msg_id: String,
         _update_conversation_preview: bool,
-    ) {
+    ) -> bool {
+        true
     }
     async fn decrypt_envelope(&self, payload: Map<String, Value>) -> Map<String, Value> {
         payload
@@ -564,6 +567,8 @@ enum HostJob {
         event_id: String,
         react_client_id: String,
         sender_name: String,
+        now_ms: i64,
+        sink: ActorSink,
         _guard: InFlightGuard,
     },
     ApplyRemoteRecall {
@@ -571,6 +576,10 @@ enum HostJob {
         msg_id: String,
         cli_msg_id: String,
         update_conversation_preview: bool,
+        persist_conversations: bool,
+        op_id: Option<u64>,
+        recall_many_id: Option<u64>,
+        sink: ActorSink,
         _guard: InFlightGuard,
     },
     ApplyRemoteDelete {
@@ -578,6 +587,8 @@ enum HostJob {
         msg_id: String,
         cli_msg_id: String,
         update_conversation_preview: bool,
+        persist_conversations: bool,
+        sink: ActorSink,
         _guard: InFlightGuard,
     },
     DecryptEnvelope {
@@ -731,6 +742,19 @@ enum StoreJob {
     Op {
         op: StoreOp,
         sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    ResolveMessageIdsLookup {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        reply: oneshot::Sender<(String, String, bool)>,
+    },
+    UpgradeMessageId {
+        conv_id: String,
+        old_id: String,
+        new_id: String,
+        client_id: String,
         _guard: InFlightGuard,
     },
     FlushOp {
@@ -955,7 +979,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         for handle in handles {
             handle.abort();
         }
-        self.cancel_typing_expiry_timers();
+        self.cancel_typing_expiry(None);
         self.cancel_delete_undo_timer();
     }
 
@@ -1987,6 +2011,168 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         prev_handle.abort();
                     }
                 }
+                Effect::ResolveMessageIds {
+                    resolve_id,
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let store_tx = self.store_tx.clone();
+                    let sink_inner = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let (tx, rx) = oneshot::channel();
+                        let _ = store_tx.send(StoreJob::ResolveMessageIdsLookup {
+                            conv_id: conv_id.clone(),
+                            msg_id: msg_id.clone(),
+                            cli_msg_id: cli_msg_id.clone(),
+                            reply: tx,
+                        });
+                        let (mut effective_msg_id, resolved_cli_id, need_history) =
+                            rx.await.unwrap_or_else(|_| {
+                                let cli = cli_msg_id.trim();
+                                let resolved_cli = if cli.is_empty() {
+                                    msg_id.trim().to_owned()
+                                } else {
+                                    cli.to_owned()
+                                };
+                                let eff = msg_id.trim().to_owned();
+                                let need = eff.is_empty() || eff == resolved_cli;
+                                (eff, resolved_cli, need)
+                            });
+                        let mut upgraded_from_history = false;
+                        if need_history
+                            && let Ok(root_map) = api.fetch_history(&conv_id, None, 30, None).await
+                            && let Some(resolved) = crate::actions::find_server_msg_id(
+                                &Value::Object(root_map),
+                                &resolved_cli_id,
+                            )
+                        {
+                            effective_msg_id = resolved.clone();
+                            upgraded_from_history = true;
+                            let upgrade_guard = sink_inner.track();
+                            let _ = store_tx.send(StoreJob::UpgradeMessageId {
+                                conv_id: conv_id.clone(),
+                                old_id: msg_id.clone(),
+                                new_id: resolved,
+                                client_id: resolved_cli_id.clone(),
+                                _guard: upgrade_guard,
+                            });
+                        }
+                        if effective_msg_id.is_empty() {
+                            effective_msg_id = resolved_cli_id.clone();
+                        }
+                        sink_inner.send(Input::MessageIdsResolved {
+                            resolve_id,
+                            effective_msg_id,
+                            resolved_cli_id,
+                            upgraded_from_history,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::SendReactionApi {
+                    react_id,
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                    r_icon,
+                    r_type,
+                    msg_type,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let client = Arc::clone(&self.client);
+                    let sink_inner = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let first_cli = client.next_client_id();
+                        let mut final_cli = first_cli.to_string();
+                        let res = match api
+                            .send_reaction(
+                                &conv_id,
+                                &msg_id,
+                                &cli_msg_id,
+                                &r_icon,
+                                r_type,
+                                msg_type,
+                                Some(first_cli),
+                            )
+                            .await
+                        {
+                            Ok(_) => Ok(()),
+                            Err(err)
+                                if matches!(
+                                    err,
+                                    olaz_api::ApiError::Net(olaz_net::NetError::Session(_))
+                                ) && !err.is_auth_error()
+                                    && msg_type != 1 =>
+                            {
+                                let retry_cli = client.next_client_id();
+                                final_cli = retry_cli.to_string();
+                                api.send_reaction(
+                                    &conv_id,
+                                    &msg_id,
+                                    &cli_msg_id,
+                                    &r_icon,
+                                    r_type,
+                                    1,
+                                    Some(retry_cli),
+                                )
+                                .await
+                                .map(|_| ())
+                            }
+                            Err(err) => Err(err),
+                        };
+                        let error = res
+                            .err()
+                            .map(|e| crate::actions::ReactFailure::from_api_error(&e));
+                        sink_inner.send(Input::ReactDone {
+                            react_id,
+                            final_react_client_id: final_cli,
+                            error,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::RecallMessageApi {
+                    recall_id,
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                    primary_is_e2ee,
+                    can_try_alt,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink_inner = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let mut retried_alt = false;
+                        let res = match api
+                            .recall_message(&conv_id, &msg_id, &cli_msg_id, primary_is_e2ee)
+                            .await
+                        {
+                            Ok(()) => Ok(()),
+                            Err(olaz_api::ApiError::Net(olaz_net::NetError::Session(ref se)))
+                                if se.code == 112 && can_try_alt =>
+                            {
+                                retried_alt = true;
+                                api.recall_message(&conv_id, &msg_id, &cli_msg_id, !primary_is_e2ee)
+                                    .await
+                            }
+                            Err(err) => Err(err),
+                        };
+                        let error = res
+                            .err()
+                            .map(|e| crate::actions::RecallFailure::from_api_error(&e));
+                        sink_inner.send(Input::RecallDone {
+                            recall_id,
+                            retried_alt,
+                            error,
+                        });
+                        drop(guard);
+                    });
+                }
                 Effect::CancelDeleteUndoExpiry => {
                     self.cancel_delete_undo_timer();
                 }
@@ -2234,6 +2420,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             event_id,
                             react_client_id,
                             sender_name,
+                            now_ms,
                         } => HostJob::ApplyRemoteReaction {
                             conv_id,
                             msg_id,
@@ -2244,6 +2431,8 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             event_id,
                             react_client_id,
                             sender_name,
+                            now_ms,
+                            sink: sink.clone(),
                             _guard: guard,
                         },
                         HostCall::ApplyRemoteRecall {
@@ -2251,11 +2440,18 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             msg_id,
                             cli_msg_id,
                             update_conversation_preview,
+                            persist_conversations,
+                            op_id,
+                            recall_many_id,
                         } => HostJob::ApplyRemoteRecall {
                             conv_id,
                             msg_id,
                             cli_msg_id,
                             update_conversation_preview,
+                            persist_conversations,
+                            op_id,
+                            recall_many_id,
+                            sink: sink.clone(),
                             _guard: guard,
                         },
                         HostCall::ApplyRemoteDelete {
@@ -2263,11 +2459,14 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             msg_id,
                             cli_msg_id,
                             update_conversation_preview,
+                            persist_conversations,
                         } => HostJob::ApplyRemoteDelete {
                             conv_id,
                             msg_id,
                             cli_msg_id,
                             update_conversation_preview,
+                            persist_conversations,
+                            sink: sink.clone(),
                             _guard: guard,
                         },
                         HostCall::DecryptEnvelope {
@@ -2547,6 +2746,140 @@ async fn run_store_worker(
                             });
                         }
                     }
+                    StoreOp::MarkRecalledAndCheckLatest {
+                        conv_id,
+                        target_id,
+                        cli_msg_id,
+                        found_in_memory,
+                        recalled_last,
+                        update_conversation_preview,
+                        persist_conversations,
+                        op_id,
+                        recall_many_id,
+                    } => {
+                        let conv_c = conv_id.clone();
+                        let target_c = target_id.clone();
+                        let cli_c = cli_msg_id.clone();
+                        let recalled_last_final = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let mut store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let _ = store.mark_recalled(&conv_c, &target_c, &cli_c);
+                                    let mut rl = recalled_last;
+                                    if !found_in_memory
+                                        && let Ok(rows) = store.messages(&conv_c, None, 1)
+                                        && let Some(latest) = rows.last()
+                                        && latest.kind_tag == "recalled"
+                                        && ((!target_c.is_empty()
+                                            && (latest.id == target_c
+                                                || latest.client_id == target_c))
+                                            || (!cli_c.is_empty()
+                                                && (latest.id == cli_c
+                                                    || latest.client_id == cli_c)))
+                                    {
+                                        rl = Some((latest.ts_ms, latest.is_mine));
+                                    }
+                                    rl
+                                })
+                                .await
+                                .unwrap_or(recalled_last)
+                        } else {
+                            recalled_last
+                        };
+                        sink.send(Input::RemoteRecallStoreDone {
+                            conv_id,
+                            recalled_last: recalled_last_final,
+                            update_conversation_preview,
+                            persist_conversations,
+                            op_id,
+                            recall_many_id,
+                        });
+                    }
+                    StoreOp::DeleteMessageAndCheckLatest {
+                        conv_id,
+                        msg_id,
+                        cli_msg_id,
+                        deleted_ts_ms,
+                        mem_latest,
+                        update_conversation_preview,
+                        persist_conversations,
+                    } => {
+                        let conv_c = conv_id.clone();
+                        let msg_c = msg_id.clone();
+                        let cli_c = cli_msg_id.clone();
+                        let (resolved_deleted_ts_ms, store_latest) = if let Some(store_arc) =
+                            store_opt
+                        {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let mut store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let target_id = if !msg_c.is_empty() {
+                                        msg_c.as_str()
+                                    } else {
+                                        cli_c.as_str()
+                                    };
+                                    let mut del_ts = deleted_ts_ms;
+                                    if del_ts.is_none() {
+                                        let mut existing = if !target_id.is_empty() {
+                                            store.message(&conv_c, target_id).ok().flatten()
+                                        } else {
+                                            None
+                                        };
+                                        if existing.is_none() && !cli_c.is_empty() {
+                                            existing =
+                                                store.message(&conv_c, &cli_c).ok().flatten();
+                                        }
+                                        if let Some(row) = existing {
+                                            del_ts = Some(row.ts_ms);
+                                        }
+                                    }
+                                    for id in crate::actions::remote_delete_store_ids(
+                                        crate::actions::REMOTE_DELETE_MATCH_POLICY,
+                                        &msg_c,
+                                        &cli_c,
+                                    ) {
+                                        let _ = store.delete_message(&conv_c, &id);
+                                    }
+                                    let latest_preview = store
+                                        .messages(&conv_c, None, 1)
+                                        .ok()
+                                        .and_then(|rows| rows.into_iter().last())
+                                        .map(|latest| {
+                                            let text = if let Some(decoded) =
+                                                crate::messages::decode_db_stored(&latest)
+                                            {
+                                                crate::conversations::message_preview_label(
+                                                    &decoded,
+                                                )
+                                            } else if latest.kind_tag == "recalled" {
+                                                "Tin nhắn đã được thu hồi".to_owned()
+                                            } else {
+                                                latest.text.clone()
+                                            };
+                                            crate::conversations::ConversationPreview {
+                                                text,
+                                                date_ms: Some(latest.ts_ms),
+                                                from_me: latest.is_mine,
+                                            }
+                                        });
+                                    (del_ts, latest_preview)
+                                })
+                                .await
+                                .unwrap_or((deleted_ts_ms, None))
+                        } else {
+                            (deleted_ts_ms, None)
+                        };
+                        sink.send(Input::RemoteDeleteStoreDone {
+                            conv_id,
+                            deleted_ts_ms: resolved_deleted_ts_ms,
+                            mem_latest,
+                            store_latest,
+                            update_conversation_preview,
+                            persist_conversations,
+                        });
+                    }
                     other => {
                         if let Some(store_arc) = store_opt {
                             let _ = runtime
@@ -2612,16 +2945,190 @@ async fn run_store_worker(
                                         StoreOp::DeleteMessage { conv_id, id } => {
                                             let _ = store.delete_message(&conv_id, &id);
                                         }
+                                        StoreOp::ApplyRemoteReactionInStore {
+                                            conv_candidates,
+                                            msg_id,
+                                            cli_msg_id,
+                                            actor_uid,
+                                            my_uid,
+                                            is_me,
+                                            r_type,
+                                            r_icon,
+                                            allow_duplicate_same_user,
+                                            snap,
+                                        } => {
+                                            let mut found = None;
+                                            for candidate in &conv_candidates {
+                                                if found.is_some() {
+                                                    break;
+                                                }
+                                                if !msg_id.is_empty() {
+                                                    found = store
+                                                        .message(candidate, &msg_id)
+                                                        .ok()
+                                                        .flatten();
+                                                }
+                                                if found.is_none() && !cli_msg_id.is_empty() {
+                                                    found = store
+                                                        .message(candidate, &cli_msg_id)
+                                                        .ok()
+                                                        .flatten();
+                                                }
+                                            }
+                                            if let Some(row) = found
+                                                && let Some(mut msg) =
+                                                    crate::messages::decode_db_stored(&row)
+                                            {
+                                                crate::actions::mutate_reactions(
+                                                    &mut msg.reactions,
+                                                    &crate::actions::ReactionMutation {
+                                                        actor_uid: &actor_uid,
+                                                        my_uid: &my_uid,
+                                                        is_me,
+                                                        r_type: &r_type,
+                                                        r_icon: &r_icon,
+                                                        allow_duplicate_same_user,
+                                                    },
+                                                    |uid| {
+                                                        snap.lookup_person(uid)
+                                                            .map(|p| p.name)
+                                                            .unwrap_or_default()
+                                                    },
+                                                );
+                                                if let Some(wire_stored) =
+                                                    olaz_wire::encode_chat_message(
+                                                        &msg,
+                                                        &msg.client_id,
+                                                    )
+                                                {
+                                                    let _ = store.save_messages_with(
+                                                        &[crate::messages::to_db_stored(
+                                                            &wire_stored,
+                                                        )],
+                                                        SaveOptions {
+                                                            skip_twin_checks: false,
+                                                            preserve_existing_reactions: false,
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                        }
                                         StoreOp::LoadMentionPreviewMessages { .. }
                                         | StoreOp::LoadPreferenceString { .. }
                                         | StoreOp::ProbeAndSaveMessages { .. }
                                         | StoreOp::LoadOpenLocalMessages { .. }
-                                        | StoreOp::LoadOlderStoreMessages { .. } => {}
+                                        | StoreOp::LoadOlderStoreMessages { .. }
+                                        | StoreOp::MarkRecalledAndCheckLatest { .. }
+                                        | StoreOp::DeleteMessageAndCheckLatest { .. } => {}
                                     }
                                 })
                                 .await;
                         }
                     }
+                }
+            }
+            StoreJob::ResolveMessageIdsLookup {
+                conv_id,
+                msg_id,
+                cli_msg_id,
+                reply,
+            } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let msg_id_fb = msg_id.clone();
+                let cli_msg_id_fb = cli_msg_id.clone();
+                let res = if let Some(store_arc) = store_opt {
+                    runtime
+                        .spawn_blocking(move || {
+                            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                            let mut resolved_cli = cli_msg_id.trim().to_owned();
+                            if resolved_cli.is_empty()
+                                && let Ok(Some(stored)) = store.message(&conv_id, &msg_id)
+                            {
+                                let col_cli = stored.client_id.trim();
+                                if !col_cli.is_empty() {
+                                    resolved_cli = col_cli.to_owned();
+                                } else if let Ok(Value::Object(map)) =
+                                    serde_json::from_slice::<Value>(&stored.raw_json_data)
+                                {
+                                    let raw_cli = map
+                                        .get("clientId")
+                                        .or_else(|| map.get("cliMsgId"))
+                                        .and_then(|v| match v {
+                                            Value::String(s) => Some(s.trim().to_owned()),
+                                            Value::Number(n) => Some(n.to_string()),
+                                            _ => None,
+                                        })
+                                        .unwrap_or_default();
+                                    if !raw_cli.is_empty() {
+                                        resolved_cli = raw_cli;
+                                    }
+                                }
+                            }
+                            if resolved_cli.is_empty() {
+                                resolved_cli = msg_id.clone();
+                            }
+                            let mut effective_msg_id = msg_id.trim().to_owned();
+                            let mut need_history = false;
+                            if effective_msg_id.is_empty() || effective_msg_id == resolved_cli {
+                                if let Ok(Some(stored)) = store.message(&conv_id, &resolved_cli)
+                                    && !stored.id.is_empty()
+                                    && stored.id != resolved_cli
+                                {
+                                    effective_msg_id = stored.id;
+                                } else {
+                                    need_history = true;
+                                }
+                            }
+                            (effective_msg_id, resolved_cli, need_history)
+                        })
+                        .await
+                        .unwrap_or_else(|_| {
+                            let cli = cli_msg_id_fb.trim();
+                            let r = if cli.is_empty() {
+                                msg_id_fb.clone()
+                            } else {
+                                cli.to_owned()
+                            };
+                            let eff = msg_id_fb.trim().to_owned();
+                            let need = eff.is_empty() || eff == r;
+                            (eff, r, need)
+                        })
+                } else {
+                    let cli = cli_msg_id_fb.trim();
+                    let r = if cli.is_empty() {
+                        msg_id_fb.clone()
+                    } else {
+                        cli.to_owned()
+                    };
+                    let eff = msg_id_fb.trim().to_owned();
+                    let need = eff.is_empty() || eff == r;
+                    (eff, r, need)
+                };
+                let _ = reply.send(res);
+            }
+            StoreJob::UpgradeMessageId {
+                conv_id,
+                old_id,
+                new_id,
+                client_id,
+                _guard,
+            } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                if let Some(store_arc) = store_opt {
+                    let _ = runtime
+                        .spawn_blocking(move || {
+                            let mut store =
+                                store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                            let _ =
+                                store.upgrade_message_id(&conv_id, &old_id, &new_id, &client_id);
+                        })
+                        .await;
                 }
             }
             StoreJob::FlushOp {
@@ -2890,40 +3397,101 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 event_id,
                 react_client_id,
                 sender_name,
+                now_ms,
+                sink,
                 _guard,
             } => {
-                host.apply_remote_reaction(
-                    conv_id,
-                    msg_id,
-                    cli_msg_id,
-                    sender_id,
-                    r_type,
-                    r_icon,
-                    event_id,
-                    react_client_id,
-                    sender_name,
-                )
-                .await;
+                let approved = host
+                    .apply_remote_reaction(
+                        conv_id.clone(),
+                        msg_id.clone(),
+                        cli_msg_id.clone(),
+                        sender_id.clone(),
+                        r_type.clone(),
+                        r_icon.clone(),
+                        event_id.clone(),
+                        react_client_id.clone(),
+                        sender_name.clone(),
+                    )
+                    .await;
+                if approved {
+                    let effective_now = if now_ms > 0 { now_ms } else { unix_now_ms() };
+                    sink.send(Input::RemoteReactionApproved {
+                        conv_id,
+                        msg_id,
+                        cli_msg_id,
+                        sender_id,
+                        r_type,
+                        r_icon,
+                        event_id,
+                        react_client_id,
+                        sender_name,
+                        now_ms: effective_now,
+                    });
+                }
             }
             HostJob::ApplyRemoteRecall {
                 conv_id,
                 msg_id,
                 cli_msg_id,
                 update_conversation_preview,
+                persist_conversations,
+                op_id,
+                recall_many_id,
+                sink,
                 _guard,
             } => {
-                host.apply_remote_recall(conv_id, msg_id, cli_msg_id, update_conversation_preview)
+                let approved = host
+                    .apply_remote_recall(
+                        conv_id.clone(),
+                        msg_id.clone(),
+                        cli_msg_id.clone(),
+                        update_conversation_preview,
+                    )
                     .await;
+                if approved {
+                    sink.send(Input::RemoteRecallApproved {
+                        conv_id,
+                        msg_id,
+                        cli_msg_id,
+                        update_conversation_preview,
+                        persist_conversations,
+                        op_id,
+                        recall_many_id,
+                    });
+                } else if op_id.is_some() || recall_many_id.is_some() {
+                    sink.send(Input::RemoteRecallSkipped {
+                        op_id,
+                        recall_many_id,
+                    });
+                }
             }
             HostJob::ApplyRemoteDelete {
                 conv_id,
                 msg_id,
                 cli_msg_id,
                 update_conversation_preview,
+                persist_conversations,
+                sink,
                 _guard,
             } => {
-                host.apply_remote_delete(conv_id, msg_id, cli_msg_id, update_conversation_preview)
+                let approved = host
+                    .apply_remote_delete(
+                        conv_id.clone(),
+                        msg_id.clone(),
+                        cli_msg_id.clone(),
+                        update_conversation_preview,
+                    )
                     .await;
+                if approved {
+                    sink.send(Input::RemoteDeleteApproved {
+                        conv_id,
+                        msg_id,
+                        cli_msg_id,
+                        update_conversation_preview,
+                        persist_conversations,
+                    });
+                }
             }
             HostJob::DecryptEnvelope {
                 payload,
@@ -4046,6 +4614,7 @@ mod tests {
                 msg_id: "9020001".to_owned(),
                 cli_msg_id: "c9020001".to_owned(),
                 sender_id: "2000620".to_owned(),
+                message: None,
             }],
             1_700_000_011_000,
             &mut out,
@@ -4074,6 +4643,7 @@ mod tests {
                 msg_id: "9020001".to_owned(),
                 cli_msg_id: "c9020001".to_owned(),
                 sender_id: "2000620".to_owned(),
+                message: None,
             }],
             1_700_000_011_000,
             &mut out2,
@@ -4116,6 +4686,7 @@ mod tests {
                 msg_id: "9020002".to_owned(),
                 cli_msg_id: "c9020002".to_owned(),
                 sender_id: "2000620".to_owned(),
+                message: None,
             }],
             1_700_000_020_000,
             &mut out3,

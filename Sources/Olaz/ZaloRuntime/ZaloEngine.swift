@@ -143,6 +143,7 @@ final class ZaloEngine {
     /// "Chọn nhiều tin nhắn" in progress (one conversation at a time).
     var messageSelection: MessageSelection?
     var messageConfirm: MessageActionConfirm?
+    @ObservationIgnored internal var mirroredMessageConfirmCoreId: UInt64?
     var deleteUndo: DeleteUndo?
     var pins: [String: PinnedList] = [:]
     @ObservationIgnored internal var messageActionsBusy: Set<String> = []
@@ -879,7 +880,8 @@ final class ZaloEngine {
                 incrementUnread: incrementUnread,
                 notifyIncoming: notifyIncoming,
                 persistConversations: persistConversations,
-                probeFreshness: probeFreshness
+                probeFreshness: probeFreshness,
+                nowMs: nowMs()
             )) ?? 0
             if let v = try? await core.settle() {
                 await waitForMirrorVersion(v)

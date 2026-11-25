@@ -427,6 +427,20 @@ extension ZaloEngine {
 
     internal func performRecall(_ message: ChatMessage) async {
         let conv = message.conversationId
+        if let core = coreLifecycle.core {
+            let isE2eeThread: Bool? = (message.isE2EE || ZaloWireParser.isGroupId(conv))
+                ? nil
+                : e2eeManager.isE2EEConversationSync(conv)
+            if let v = try? await core.recall(
+                convId: conv,
+                msgId: message.id,
+                isE2eeThread: isE2eeThread,
+                nowMs: nowMs()
+            ) {
+                await waitForMirrorVersion(v)
+            }
+            return
+        }
         guard !conv.isEmpty,
               conv != selfConversationId,
               message.isMine,
@@ -495,8 +509,54 @@ extension ZaloEngine {
 
     // MARK: Xóa chỉ ở phía tôi
 
+    internal func applyOptimisticDeleteMirror(_ list: [ChatMessage], nowMs tsMs: Int64) {
+        guard let conversation = list.first?.conversationId else { return }
+        let ids = Set(list.map(\.id))
+        if var current = messages[conversation] {
+            let prevCount = current.count
+            current.removeAll { ids.contains($0.id) }
+            if current.count != prevCount {
+                isSuppressingDirectMessageSync = true
+                messages[conversation] = current
+                isSuppressingDirectMessageSync = false
+            }
+        }
+        let deadline = Date(timeIntervalSince1970: Double(tsMs) / 1000.0).addingTimeInterval(5)
+        deleteUndo = DeleteUndo(
+            id: deleteUndo?.id ?? UUID().uuidString,
+            conversationId: conversation,
+            count: list.count,
+            deadline: deadline
+        )
+    }
+
     func deleteForMe(_ message: ChatMessage, confirmed: Bool = false) {
         let conversation = message.conversationId
+        if let core = coreLifecycle.core {
+            let tsMs = nowMs()
+            if !confirmed && message.menu.delete == .forMe {
+                if openConversationId == conversation, messageConfirm == nil {
+                    mirroredMessageConfirmCoreId = nil
+                    messageConfirm = MessageActionConfirm(
+                        conversationId: conversation,
+                        action: .deleteForMe(message),
+                        title: "Xóa tin nhắn",
+                        message: "Tin nhắn sẽ chỉ bị xóa ở phía bạn.",
+                        ok: "Xóa",
+                        destructive: true
+                    )
+                }
+            } else {
+                applyOptimisticDeleteMirror([message], nowMs: tsMs)
+            }
+            core.deleteForMe(
+                convId: conversation,
+                msgId: message.id,
+                confirmed: confirmed,
+                nowMs: tsMs
+            )
+            return
+        }
         if !confirmed && message.menu.delete == .forMe {
             ask(MessageActionConfirm(
                 conversationId: conversation,
@@ -514,6 +574,17 @@ extension ZaloEngine {
     /// Hides the messages at once and deletes them on the server when the undo bar times out (one bar for the batch).
     func deleteMessages(_ list: [ChatMessage]) {
         guard let conversation = list.first?.conversationId else { return }
+        if let core = coreLifecycle.core {
+            let tsMs = nowMs()
+            applyOptimisticDeleteMirror(list, nowMs: tsMs)
+            core.deleteMany(
+                convId: conversation,
+                msgIds: list.map(\.id),
+                confirm: false,
+                nowMs: tsMs
+            )
+            return
+        }
         let undoId = UUID().uuidString
         pendingDeletedMessages[undoId] = list
         let ids = Set(list.map(\.id))
@@ -550,6 +621,11 @@ extension ZaloEngine {
     }
 
     func undoDelete() {
+        if let core = coreLifecycle.core {
+            deleteUndo = nil
+            core.undoDelete()
+            return
+        }
         guard let undo = deleteUndo else { return }
         deleteUndoTimerTask?.cancel()
         deleteUndoTimerTask = nil
@@ -561,6 +637,11 @@ extension ZaloEngine {
     }
 
     func dismissDeleteUndo() {
+        if let core = coreLifecycle.core {
+            deleteUndo = nil
+            core.dismissDeleteUndo()
+            return
+        }
         guard let undo = deleteUndo else { return }
         deleteUndoTimerTask?.cancel()
         deleteUndoTimerTask = nil
@@ -588,6 +669,21 @@ extension ZaloEngine {
     // MARK: Đánh dấu tin nhắn
 
     func setStarred(_ message: ChatMessage, _ on: Bool) {
+        if let core = coreLifecycle.core {
+            if !(on && message.menu.star == .blocked) {
+                let conv = message.conversationId
+                if var list = messages[conv], let idx = list.firstIndex(where: { $0.id == message.id }) {
+                    list[idx].menu.starred = on
+                    list[idx].menu.star = on ? .unstar : .star
+                    isSuppressingDirectMessageSync = true
+                    messages[conv] = list
+                    isSuppressingDirectMessageSync = false
+                    if on { cachedStarredIds.insert(message.id) } else { cachedStarredIds.remove(message.id) }
+                }
+            }
+            core.setStarred(convId: message.conversationId, msgId: message.id, on: on)
+            return
+        }
         if on, message.menu.star == .blocked {
             showActionCard("Trò chuyện này đã bật Chặn chia sẻ", in: message.conversationId)
             return
@@ -670,7 +766,11 @@ extension ZaloEngine {
         guard openConversationId == confirm.conversationId, messageConfirm == nil else {
             return
         }
+        mirroredMessageConfirmCoreId = nil
         messageConfirm = confirm
+        if let core = coreLifecycle.core {
+            core.askMessageConfirm(confirm: messageConfirmRecord(for: confirm))
+        }
     }
 
     func requestUnpin(_ message: ChatMessage) {
@@ -704,6 +804,31 @@ extension ZaloEngine {
     func answerMessageConfirm(_ confirm: MessageActionConfirm, ok: Bool) {
         guard messageConfirm?.id == confirm.id else { return }
         messageConfirm = nil
+        mirroredMessageConfirmCoreId = nil
+        if let core = coreLifecycle.core {
+            let tsMs = nowMs()
+            if ok {
+                switch confirm.action {
+                case .deleteForMe(let message):
+                    applyOptimisticDeleteMirror([message], nowMs: tsMs)
+                case .deleteMany(let list):
+                    endSelection()
+                    applyOptimisticDeleteMirror(list, nowMs: tsMs)
+                case .recallMany:
+                    endSelection()
+                case .pin(let message, let replacing):
+                    core.answerMessageConfirm(ok: ok, nowMs: tsMs)
+                    pin(message, replacing: replacing)
+                    return
+                case .unpin(let ref):
+                    core.answerMessageConfirm(ok: ok, nowMs: tsMs)
+                    unpin(ref, in: confirm.conversationId)
+                    return
+                }
+            }
+            core.answerMessageConfirm(ok: ok, nowMs: tsMs)
+            return
+        }
         guard ok else { return }
         switch confirm.action {
         case .deleteForMe(let message): deleteForMe(message, confirmed: true)
@@ -757,6 +882,7 @@ extension ZaloEngine {
     func dropMessagePrompts() {
         forwardRequest = nil
         messageConfirm = nil
+        mirroredMessageConfirmCoreId = nil
     }
 
     func resetMessageActions() {
@@ -764,6 +890,7 @@ extension ZaloEngine {
         deleteUndoTimerTask = nil
         forwardRequest = nil
         messageConfirm = nil
+        mirroredMessageConfirmCoreId = nil
         deleteUndo = nil
         pins = [:]
         messageActionsBusy = []
