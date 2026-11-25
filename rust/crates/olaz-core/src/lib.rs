@@ -12,6 +12,7 @@ pub mod changes;
 pub mod conversations;
 pub mod effect;
 pub mod input;
+pub mod messages;
 pub mod reduce;
 pub mod runner;
 pub mod state;
@@ -31,6 +32,17 @@ pub use effect::{Effect, HostCall, OpResult, StoreOp};
 pub use input::{
     Command, CompletedLogin, HiddenPinSyncKind, Input, LegacyCookie, PollBatchError,
     PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
+};
+pub use messages::{
+    BatchPass1Outcome, BootstrapFlowState, ContactsState, DeleteWindowOutcome, FriendEntry,
+    FriendRequestEntry, FULL_HISTORY_REFRESH_INTERVAL_SECS, FULL_HISTORY_REFRESH_PREF_KEY,
+    GroupEntry, HistoryFreshness, HistoryPagePass1Outcome, IdentitySnapshot, LoadOlderFlowState,
+    MessagesState, MuteEntry, OpenFlowState, PendingWindowOp, RecallWindowOutcome,
+    SenderResolveFollowup, WindowChange, WindowDelta, apply_batch_pass1, apply_fetched_contacts,
+    coalesce_window_op, collect_missing_sender_uids, contact_fold, decode_db_stored,
+    fold_contact_str, format_swift_double, is_valid_url_str, localized_standard_cmp,
+    newest_message_ids, numeric_msg_cursor, parse_batch_events, preferred_contact_name,
+    serialize_cached_groups_json, serialize_cached_profiles_json, to_db_stored,
 };
 pub use reduce::classify::{MobileSyncEvent, Route, classify, classify_poll};
 pub use reduce::{ReduceOutput, reduce};
