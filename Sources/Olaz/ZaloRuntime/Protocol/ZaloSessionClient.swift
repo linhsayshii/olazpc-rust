@@ -274,6 +274,9 @@ actor ZaloSessionClient {
         ) else {
             return nil
         }
+        if let seeded = seededNextClientId {
+            created.seedNextClientId(next: seeded)
+        }
         coreSession = created
         coreApiHandle = CoreApi(session: created)
         coreHttpHandle = CoreHttp(session: created)
@@ -316,6 +319,9 @@ actor ZaloSessionClient {
         guard let data = try? JSONEncoder().encode(snapshot), let json = String(data: data, encoding: .utf8) else { return false }
         if coreSession == nil {
             guard let created = try? CoreSession(computerName: computerName) else { return false }
+            if let seeded = seededNextClientId {
+                created.seedNextClientId(next: seeded)
+            }
             coreSession = created
             coreApiHandle = CoreApi(session: created)
             coreHttpHandle = CoreHttp(session: created)
@@ -336,6 +342,7 @@ actor ZaloSessionClient {
     func seedNextClientId(_ next: Int64) {
         seededNextClientId = next
         lastClientIdMs = next - 1
+        coreSession?.seedNextClientId(next: next)
     }
 
     func clearAuthForTesting() {
@@ -349,6 +356,9 @@ actor ZaloSessionClient {
     }
 
     func nextClientId() -> Int64 {
+        if let coreSession {
+            return coreSession.nextClientId()
+        }
         if let seeded = seededNextClientId {
             seededNextClientId = seeded + 1
             lastClientIdMs = seeded

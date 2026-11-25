@@ -87,6 +87,7 @@ pub struct SessionState {
     pub server_qr_form: i64,
     pub needs_pc_type_upgrade: bool,
     pub last_client_id_ms: i64,
+    pub seeded_next_client_id: Option<i64>,
     pub cloud_viewer_key: Option<String>,
     pub cloud_enk: Option<String>,
 }
@@ -105,6 +106,7 @@ impl SessionState {
             server_qr_form: 0,
             needs_pc_type_upgrade: false,
             last_client_id_ms: 0,
+            seeded_next_client_id: None,
             cloud_viewer_key: None,
             cloud_enk: None,
         }
@@ -121,8 +123,19 @@ impl SessionState {
         has_account && has_sek && has_key
     }
 
+    /// Seeds the deterministic client id sequence (test recorder).
+    pub fn seed_next_client_id(&mut self, next: i64) {
+        self.seeded_next_client_id = Some(next);
+        self.last_client_id_ms = next - 1;
+    }
+
     /// Swift `nextClientId`: epoch ms, strictly increasing.
     pub fn next_client_id(&mut self, now_ms: i64) -> i64 {
+        if let Some(seeded) = self.seeded_next_client_id {
+            self.seeded_next_client_id = Some(seeded + 1);
+            self.last_client_id_ms = seeded;
+            return seeded;
+        }
         let next = if now_ms > self.last_client_id_ms {
             now_ms
         } else {
