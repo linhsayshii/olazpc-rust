@@ -1241,7 +1241,7 @@ enum SendRecorderHarness {
         if shouldRecord {
             var recorded: [CaseJSON] = []
             for scenario in scenarios {
-                let c = try await recordScenario(domain: domain, scenario)
+                let c = try await recordScenario(domain: domain, scenario, shouldRecord: true)
                 recorded.append(c)
             }
             try CaseFile.write(recorded, to: url)
@@ -1257,6 +1257,10 @@ enum SendRecorderHarness {
         }
         XCTAssertEqual(byName.count, scenarios.count, "\(domain).jsonl case count mismatch (run with OLAZ_RECORD=1 to regenerate)")
 
+        let knownDiffs = try CaseFile.loadKnownDiffs()
+        var usedKnownDiffs = Array(repeating: false, count: knownDiffs.count)
+        var executedNames: Set<String> = []
+
         for scenario in scenarios {
             if scenario.slow && !runSlow {
                 print("skipped slow: \(scenario.name)")
@@ -1266,22 +1270,40 @@ enum SendRecorderHarness {
                 XCTFail("Missing recorded case '\(scenario.name)' in \(url.path)")
                 continue
             }
+            executedNames.insert(scenario.name)
             let actual = try await recordScenario(domain: domain, scenario)
-            if let diff = CaseJSON.firstDiff(expected: expected, actual: actual) {
+            let diffs = CaseFile.compareCase(
+                domain: domain,
+                name: scenario.name,
+                expected: expected,
+                actual: actual,
+                knownDiffs: knownDiffs,
+                usedKnownDiffs: &usedKnownDiffs
+            )
+            for diff in diffs {
                 XCTFail("\(scenario.name): \(diff)")
             }
         }
-    }
-
-    @MainActor
-    static func recordScenario(domain: String, _ scenario: ScenarioDef) async throws -> CaseJSON {
-        try await RecorderSuiteLock.shared.withLock {
-            try await recordScenarioLocked(domain: domain, scenario)
+        for stale in CaseFile.staleKnownDiffs(
+            domain: domain,
+            executedNames: executedNames,
+            allCaseNames: Set(byName.keys),
+            knownDiffs: knownDiffs,
+            usedKnownDiffs: usedKnownDiffs
+        ) {
+            XCTFail(stale)
         }
     }
 
     @MainActor
-    private static func recordScenarioLocked(domain: String, _ scenario: ScenarioDef) async throws -> CaseJSON {
+    static func recordScenario(domain: String, _ scenario: ScenarioDef, shouldRecord: Bool = false) async throws -> CaseJSON {
+        try await RecorderSuiteLock.shared.withLock {
+            try await recordScenarioLocked(domain: domain, scenario, shouldRecord: shouldRecord)
+        }
+    }
+
+    @MainActor
+    private static func recordScenarioLocked(domain: String, _ scenario: ScenarioDef, shouldRecord: Bool = false) async throws -> CaseJSON {
         let dataDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("olaz-send-recorder-\(scenario.name)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
@@ -1781,7 +1803,7 @@ enum SendRecorderHarness {
             server.stop()
             await engine.finishTearDownForRecording()
 
-            if server.hadUnscriptedRequest {
+            if shouldRecord && server.hadUnscriptedRequest {
                 let unscripted = requests.filter { $0["unscripted"]?.boolValue == true }
                 throw RecorderError.unscriptedRequest(scenario: scenario.name, detail: CaseJSON.array(unscripted).canonicalString())
             }
