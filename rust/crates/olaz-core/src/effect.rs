@@ -871,10 +871,7 @@ pub enum Effect {
         now_ms: i64,
     },
     /// Calls `ZaloApi::share_poll_api`.
-    SharePollApi {
-        op_id: Option<u64>,
-        poll_id: String,
-    },
+    SharePollApi { op_id: Option<u64>, poll_id: String },
     /// Calls `ZaloApi::create_poll_api`.
     CreatePollApi {
         op_id: Option<u64>,

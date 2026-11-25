@@ -375,6 +375,7 @@ pub enum Command {
     NotePollMessages {
         notices: Vec<crate::polls::PollMessageNotice>,
         now_ms: i64,
+        host_already_armed: bool,
     },
     FirePollDebounce {
         poll_id: String,
@@ -384,7 +385,9 @@ pub enum Command {
     HandlePollState {
         state: Map<String, Value>,
     },
-    ResetPolls,
+    ResetPolls {
+        sync_epoch: u64,
+    },
     SeedPolls {
         polls: Box<crate::polls::PollsState>,
     },
@@ -671,10 +674,15 @@ impl fmt::Debug for Command {
                 .field("config", config)
                 .field("can_pin", can_pin)
                 .finish(),
-            Self::NotePollMessages { notices, now_ms } => f
+            Self::NotePollMessages {
+                notices,
+                now_ms,
+                host_already_armed,
+            } => f
                 .debug_struct("NotePollMessages")
                 .field("count", &notices.len())
                 .field("now_ms", now_ms)
+                .field("host_already_armed", host_already_armed)
                 .finish(),
             Self::FirePollDebounce { seq, now_ms, .. } => f
                 .debug_struct("FirePollDebounce")
@@ -685,7 +693,10 @@ impl fmt::Debug for Command {
                 .debug_struct("HandlePollState")
                 .field("keys", &state.len())
                 .finish(),
-            Self::ResetPolls => f.write_str("ResetPolls"),
+            Self::ResetPolls { sync_epoch } => f
+                .debug_struct("ResetPolls")
+                .field("sync_epoch", sync_epoch)
+                .finish(),
             Self::SeedPolls { polls } => f.debug_tuple("SeedPolls").field(polls).finish(),
             Self::SyncBoardPins { list, .. } => f
                 .debug_struct("SyncBoardPins")

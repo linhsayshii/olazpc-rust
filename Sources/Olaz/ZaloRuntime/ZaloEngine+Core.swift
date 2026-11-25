@@ -649,6 +649,26 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
             quote: quote
         )
     }
+
+    func armPollDebounce(pollId: String, seq: UInt64, delayMs: UInt64) async -> Bool {
+        guard let engine else { return false }
+        await MainActor.run {
+            PollClock.pendingRefresh[pollId] = seq
+            if seq > PollClock.nextDebounceSeq {
+                PollClock.nextDebounceSeq = seq
+            }
+            engine.armLocalPollDebounceTask(pollId: pollId, seq: seq, delayMs: delayMs)
+        }
+        return true
+    }
+
+    func cancelAllPollDebounces() async {
+        await MainActor.run {
+            PollClock.refreshTasks.values.forEach { $0.cancel() }
+            PollClock.refreshTasks = [:]
+            PollClock.pendingRefresh = [:]
+        }
+    }
 }
 
 extension ZaloPollState {
@@ -973,6 +993,30 @@ extension ZaloEngine {
                 for (convId, ttl) in autoDel where ttl > 0 {
                     core.setAutoDeleteTtl(convId: convId, ttlMs: ttl)
                 }
+            }
+            let initialPolls = self.currentPollsMirrorRecord()
+            if !initialPolls.details.isEmpty
+                || !initialPolls.pins.isEmpty
+                || !initialPolls.failed.isEmpty
+                || !initialPolls.watched.isEmpty
+                || !initialPolls.lastAttemptMs.isEmpty
+                || !initialPolls.seenMessages.isEmpty
+                || initialPolls.didEvictWatched
+                || !initialPolls.pendingRefresh.isEmpty
+                || initialPolls.syncEpoch > 0
+            {
+                core.seedPolls(polls: initialPolls)
+            }
+            // U7: seed temporary read-only board caches into core until U7 owns board pins.
+            for (convId, list) in self.pins {
+                core.syncBoardPins(convId: convId, list: list.boardPinListRecord)
+            }
+            for (convId, entry) in self.cachedBoardRawTopics {
+                core.syncBoardRawTopics(
+                    convId: convId,
+                    version: entry.version,
+                    topicsJson: Self.jsonString(for: entry.topics)
+                )
             }
 
             let queued = self.pendingCoreCommands
@@ -1392,6 +1436,10 @@ extension ZaloEngine {
 
         if let cRec = batch.contacts {
             applyContactsMirror(cRec)
+        }
+
+        if let pRec = batch.polls {
+            applyPollsMirror(pRec, fromLocalPlan: false)
         }
 
         if let typingEntries = batch.typing {
@@ -2024,5 +2072,127 @@ extension ZaloEngine {
         for waiter in waiters {
             waiter.continuation.resume()
         }
+    }
+
+    // MARK: - U12 Group Polls Mirror & Temporary U7 Board Write-Through Helpers
+
+    internal func currentPollsMirrorRecord() -> PollsMirrorRecord {
+        var orderedSeen = PollClock.seenMessagesOrder.filter { PollClock.seenMessages.contains($0) }
+        let inOrder = Set(orderedSeen)
+        if inOrder.count < PollClock.seenMessages.count {
+            let missing = PollClock.seenMessages.subtracting(inOrder)
+                .sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
+            orderedSeen.append(contentsOf: missing)
+        }
+        PollClock.seenMessagesOrder = orderedSeen
+
+        return PollsMirrorRecord(
+            details: polls.details.keys.sorted().compactMap { id in
+                polls.details[id].map { PollDetailEntryRecord(id: id, detail: $0.coreRecord) }
+            },
+            pins: polls.pins.keys.sorted().compactMap { id in
+                polls.pins[id].map { PollPinEntryRecord(id: id, state: $0.coreRecord) }
+            },
+            failed: polls.failed.sorted(),
+            watched: PollClock.watched.keys.sorted().compactMap { pid in
+                PollClock.watched[pid].map { PollWatchedEntryRecord(pollId: pid, convId: $0) }
+            },
+            lastAttemptMs: PollClock.lastAttempt.keys.sorted().compactMap { pid in
+                PollClock.lastAttempt[pid].map {
+                    PollAttemptEntryRecord(
+                        pollId: pid,
+                        lastAttemptMs: Int64(($0.timeIntervalSince1970 * 1000.0).rounded())
+                    )
+                }
+            },
+            seenMessages: orderedSeen,
+            didEvictWatched: PollClock.didEvictWatched,
+            pendingRefresh: PollClock.pendingRefresh.keys.sorted().compactMap { pid in
+                PollClock.pendingRefresh[pid].map { PollPendingRefreshEntryRecord(pollId: pid, seq: $0) }
+            },
+            nextDebounceSeq: PollClock.nextDebounceSeq,
+            syncEpoch: localPollSyncEpoch
+        )
+    }
+
+    internal func applyPollsMirror(_ rec: PollsMirrorRecord, fromLocalPlan: Bool = true) {
+        guard rec.syncEpoch >= localPollSyncEpoch else { return }
+        let epochAdvanced = rec.syncEpoch > localPollSyncEpoch
+        localPollSyncEpoch = rec.syncEpoch
+
+        let nextStore = PollStore(
+            details: Dictionary(uniqueKeysWithValues: rec.details.map { ($0.id, PollDetail(coreRecord: $0.detail)) }),
+            pins: Dictionary(uniqueKeysWithValues: rec.pins.map { ($0.id, PollPinState(coreRecord: $0.state)) }),
+            failed: Set(rec.failed)
+        )
+        if nextStore != polls {
+            polls = nextStore
+        }
+
+        PollClock.watched = Dictionary(uniqueKeysWithValues: rec.watched.map { ($0.pollId, $0.convId) })
+        PollClock.lastAttempt = Dictionary(uniqueKeysWithValues: rec.lastAttemptMs.map {
+            ($0.pollId, Date(timeIntervalSince1970: Double($0.lastAttemptMs) / 1000.0))
+        })
+        PollClock.didEvictWatched = rec.didEvictWatched
+
+        if epochAdvanced || fromLocalPlan || rec.nextDebounceSeq >= PollClock.nextDebounceSeq {
+            PollClock.seenMessagesOrder = rec.seenMessages
+            PollClock.seenMessages = Set(rec.seenMessages)
+            PollClock.nextDebounceSeq = rec.nextDebounceSeq
+
+            let nextPending = Dictionary(uniqueKeysWithValues: rec.pendingRefresh.map { ($0.pollId, $0.seq) })
+            for pid in Array(PollClock.refreshTasks.keys) where nextPending[pid] == nil {
+                PollClock.refreshTasks[pid]?.cancel()
+                PollClock.refreshTasks.removeValue(forKey: pid)
+            }
+            if fromLocalPlan || epochAdvanced {
+                PollClock.pendingRefresh = nextPending
+            } else {
+                PollClock.pendingRefresh = nextPending.filter { PollClock.refreshTasks[$0.key] != nil }
+            }
+        }
+    }
+
+    // U7: push Swift's board pins for one conversation into core's read-only board mirror.
+    internal func pushCoreBoardPinsIfRunning(for convId: String) {
+        guard let core = coreLifecycle.core else { return }
+        core.syncBoardPins(convId: convId, list: pins[convId]?.boardPinListRecord)
+    }
+
+    // U7: push Swift's board pins & raw topics for one conversation into core's read-only board mirror.
+    internal func pushCoreBoardStateIfRunning(for convId: String) {
+        guard let core = coreLifecycle.core else { return }
+        core.syncBoardPins(convId: convId, list: pins[convId]?.boardPinListRecord)
+        if let raw = cachedBoardRawTopics[convId] {
+            core.syncBoardRawTopics(
+                convId: convId,
+                version: raw.version,
+                topicsJson: Self.jsonString(for: raw.topics)
+            )
+        } else {
+            core.syncBoardRawTopics(convId: convId, version: 0, topicsJson: nil)
+        }
+    }
+}
+
+// U7: temporary conversion into `BoardPinListRecord` until U7 owns board pins.
+extension PinnedList {
+    var boardPinListRecord: BoardPinListRecord {
+        BoardPinListRecord(
+            ready: ready,
+            canPin: canPin,
+            limit: Int64(limit),
+            items: items.map { item in
+                BoardPinItemRecord(
+                    refId: item.ref,
+                    kind: item.kind.rawValue,
+                    title: item.title,
+                    sender: item.sender,
+                    thumbnail: item.thumbnail?.absoluteString,
+                    msgId: item.msgId,
+                    cliMsgId: item.cliMsgId
+                )
+            }
+        )
     }
 }

@@ -1666,6 +1666,10 @@ enum PollRecorderHarness {
         }
         XCTAssertEqual(byName.count, sorted.count, "\(domain).jsonl case count mismatch (run with OLAZ_RECORD=1 to regenerate)")
 
+        let knownDiffs = try CaseFile.loadKnownDiffs()
+        var usedKnownDiffs = Array(repeating: false, count: knownDiffs.count)
+        var executedNames: Set<String> = []
+
         for scenario in sorted {
             if scenario.slow && !shouldRunSlowCases {
                 print("skipped slow: \(scenario.name)")
@@ -1675,10 +1679,30 @@ enum PollRecorderHarness {
                 XCTFail("Missing recorded case '\(scenario.name)' in \(url.path)")
                 continue
             }
+            executedNames.insert(scenario.name)
             let actual = try await recordScenario(domain: domain, scenario)
-            if let diff = CaseJSON.firstDiff(expected: expected, actual: actual) {
+            let diffs = CaseFile.compareCase(
+                domain: domain,
+                name: scenario.name,
+                expected: expected,
+                actual: actual,
+                knownDiffs: knownDiffs,
+                usedKnownDiffs: &usedKnownDiffs
+            )
+            for diff in diffs {
                 XCTFail("\(scenario.name): \(diff)")
             }
+        }
+
+        let stale = CaseFile.staleKnownDiffs(
+            domain: domain,
+            executedNames: executedNames,
+            allCaseNames: Set(byName.keys),
+            knownDiffs: knownDiffs,
+            usedKnownDiffs: usedKnownDiffs
+        )
+        for msg in stale {
+            XCTFail(msg)
         }
     }
 

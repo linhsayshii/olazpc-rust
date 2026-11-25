@@ -208,6 +208,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var contactsTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var pollRefreshTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var pollDebounceSleep: (@MainActor (Int) async -> Bool)?
+    @ObservationIgnored internal var localPollSyncEpoch: UInt64 = 0
     @ObservationIgnored internal var activeSendTask: Task<Bool, Never>?
     @ObservationIgnored internal var batchImportTask: Task<Void, Never>?
     @ObservationIgnored internal var activeSyncBatchTasks: [UUID: Task<Void, Never>] = [:]
@@ -461,6 +462,8 @@ final class ZaloEngine {
         cachedUnreadMarks = []
         cachedAliases = [:]
         cachedBoardRawTopics = [:]
+        // U7: clear core's temporary board caches until U7 owns board pins.
+        coreLifecycle.core?.clearBoardCaches()
         failedDrafts = FailedDraftStore()
     }
 

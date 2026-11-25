@@ -31,7 +31,7 @@ pub fn default_service_hosts(service: &str) -> Option<&'static [&'static str]> {
         "group_board" => &["https://groupboard-wpa.api.zaloapp.com"],
         "group_cloud_message" => &["https://tt-group-cm.api.zaloapp.com"],
         "sticker" => &["https://tt-sticker-wpa.zaloapp.com"],
-        "alias" => &["https://tt-alias-wpa.zaloapp.com"],
+        "alias" => &["https://tt-alias-wpa.api.zaloapp.com"],
         "label" => &["https://label-wpa.api.zaloapp.com"],
         "reaction" => &["https://reaction.api.zaloapp.com"],
         "emoji_status" => &["https://emoji-status.api.zaloapp.com"],
@@ -170,10 +170,12 @@ fn first_url(raw: Option<&Value>) -> Option<String> {
 
 impl ZaloDomains {
     /// Clears stale `.chat.zalo.me` HTTP preferred hosts left over from legacy `zpw_type=30`
-    /// sessions (except `zcloud`) and rewrites old `-msg.zaloapp.com` WebSocket hosts.
+    /// sessions (except `zcloud` and `friend_board`) and rewrites old `-msg.zaloapp.com`
+    /// WebSocket hosts.
     pub fn heal_from_verified(&mut self) {
-        self.preferred_hosts
-            .retain(|key, current| !(current.contains(".chat.zalo.me") && key != "zcloud"));
+        self.preferred_hosts.retain(|key, current| {
+            !(current.contains(".chat.zalo.me") && key != "zcloud" && key != "friend_board")
+        });
         for host in &mut self.ws {
             *host = host.replace("-msg.zaloapp.com", "-msg.chat.zalo.me");
         }
@@ -294,11 +296,19 @@ mod tests {
 
     #[test]
     fn friend_board_default_host_is_present_when_not_isolated() {
-        let d = ZaloDomains::default();
+        let mut d = ZaloDomains::default();
         assert_eq!(
             d.candidates("friend_board"),
             vec!["https://friendboard-wpa.chat.zalo.me".to_owned()]
         );
+        d.remember_winner("friend_board", "https://friendboard-wpa.chat.zalo.me");
+        d.remember_winner("chat", "https://tt-chat3-wpa.chat.zalo.me");
+        d.heal_from_verified();
+        assert_eq!(
+            d.preferred_hosts.get("friend_board"),
+            Some(&"https://friendboard-wpa.chat.zalo.me".to_owned())
+        );
+        assert!(!d.preferred_hosts.contains_key("chat"));
 
         let isolated = ZaloDomains {
             isolated: true,

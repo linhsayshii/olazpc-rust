@@ -1079,6 +1079,8 @@ pub struct PollClock {
     /// `poll_id -> active debounce sequence number`.
     pub pending_refresh: BTreeMap<String, u64>,
     pub next_debounce_seq: u64,
+    /// Monotonic reset epoch preventing pre-reset mirror deltas from resurrecting cleared state.
+    pub sync_epoch: u64,
 }
 
 impl fmt::Debug for PollClock {
@@ -1101,6 +1103,11 @@ impl PollClock {
     #[must_use]
     pub fn seen_messages_count(&self) -> usize {
         self.seen_messages_order.len()
+    }
+
+    #[must_use]
+    pub fn seen_message_ids(&self) -> Vec<String> {
+        self.seen_messages_order.iter().cloned().collect()
     }
 
     #[must_use]
@@ -1166,7 +1173,15 @@ impl fmt::Debug for PollsState {
 
 impl PollsState {
     pub fn reset(&mut self) {
+        let next_epoch = self.clock.sync_epoch.saturating_add(1);
         *self = Self::default();
+        self.clock.sync_epoch = next_epoch;
+    }
+
+    pub fn reset_to_epoch(&mut self, min_epoch: u64) {
+        let next_epoch = self.clock.sync_epoch.saturating_add(1).max(min_epoch);
+        *self = Self::default();
+        self.clock.sync_epoch = next_epoch;
     }
 
     /// Pure `watchPoll` transition: returns `true` when a `RefreshPoll` effect should run.

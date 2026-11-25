@@ -2229,8 +2229,9 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let handle = self
                         .runtime
                         .spawn(async move {
-                            let handled =
-                                host.arm_poll_debounce(poll_key.clone(), seq, delay_ms).await;
+                            let handled = host
+                                .arm_poll_debounce(poll_key.clone(), seq, delay_ms)
+                                .await;
                             drop(arm_guard);
                             if handled {
                                 return;
@@ -4209,6 +4210,7 @@ mod tests {
                 date_ms: now_ms,
             }],
             now_ms,
+            host_already_armed: false,
         });
         core.wait_idle().await;
         tokio::task::yield_now().await;
@@ -4223,6 +4225,7 @@ mod tests {
                 date_ms: now_ms + 500,
             }],
             now_ms: now_ms + 500,
+            host_already_armed: false,
         });
         core.wait_idle().await;
         tokio::task::yield_now().await;
@@ -4254,10 +4257,11 @@ mod tests {
                 date_ms: now_ms + 2_000,
             }],
             now_ms: now_ms + 2_000,
+            host_already_armed: false,
         });
         core.wait_idle().await;
         tokio::task::yield_now().await;
-        core.send(Command::ResetPolls);
+        core.send(Command::ResetPolls { sync_epoch: 0 });
         core.wait_idle().await;
 
         tokio::time::advance(Duration::from_secs(2)).await;

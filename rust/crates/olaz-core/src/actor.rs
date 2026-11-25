@@ -328,7 +328,10 @@ impl CoreHandle {
     }
 
     /// Awaits [`Command::PollCapabilities`].
-    pub async fn request_poll_capabilities(&self, conv_id: String) -> crate::polls::PollCapabilities {
+    pub async fn request_poll_capabilities(
+        &self,
+        conv_id: String,
+    ) -> crate::polls::PollCapabilities {
         match self.request(Command::PollCapabilities { conv_id }).await {
             Some(OpResult::PollCapabilities(c)) => c,
             _ => crate::polls::PollCapabilities::default(),

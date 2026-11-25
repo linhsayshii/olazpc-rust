@@ -163,6 +163,9 @@ extension ZaloEngine {
             pollRefreshTasks.removeAll()
             for task in tasks { _ = await task.value }
         }
+        if let core = coreLifecycle.core {
+            await drainCorePollWork(core)
+        }
         _ = await persistConversationsTask?.value
     }
 

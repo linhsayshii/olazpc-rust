@@ -1293,6 +1293,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func checkHiddenPin(pin: String) async throws  -> Bool
     
+    func clearBoardCaches() 
+    
     func closeConversation() 
     
     /**
@@ -1304,6 +1306,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Creates a new conversation label using caller-supplied `now_ms` and `rand4` for deterministic IDs.
      */
     func createConversationLabel(name: String, colorHex: String, conversationIds: [String], nowMs: Int64, rand4: String) 
+    
+    func createPoll(convId: String, draft: PollCreateDraftRecord, config: PollConfigRecord, canPin: Bool) async throws  -> PollActionOutcomeRecord
     
     /**
      * Returns the latest monotonic revision published to the change stream.
@@ -1341,6 +1345,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func ensureKnownContacts() 
     
+    func firePollDebounce(pollId: String, seq: UInt64, nowMs: Int64) 
+    
     func flushAll() async throws  -> UInt64
     
     /**
@@ -1352,6 +1358,10 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Applies a `conversationExtras` JSON state payload.
      */
     func handleConversationExtras(stateJson: String) 
+    
+    func handlePinsState(stateJson: String) 
+    
+    func handlePollState(stateJson: String) 
     
     /**
      * Handles a server-reported session expiry (`600` / `-102`) from any domain.
@@ -1381,6 +1391,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func loadOlderMessages(id: String) 
     
     func loadOlderMessagesAndWait(id: String) async throws  -> UInt64
+    
+    func lockPoll(id: String, convId: String, nowMs: Int64) async throws  -> PollActionOutcomeRecord
     
     /**
      * Clears session credentials, resets Swift domains, and starts fresh QR login.
@@ -1417,6 +1429,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func nextClientId()  -> Int64
     
+    func notePollMessages(notices: [PollMessageNoticeRecord], nowMs: Int64, hostAlreadyArmed: Bool) 
+    
     /**
      * Triggers an outgoing typing ping subject to core's 10 s per-conversation throttle,
      * `Phase::Ready` gate, and `olaz.sendTyping` preference.
@@ -1437,10 +1451,16 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func pinConversation(id: String) 
     
+    func pinPoll(id: String, convId: String, confirming: String?) async throws  -> PollPinActionOutcomeRecord
+    
     /**
      * Unpins `unpin_ids` in order, then pins `pin_id`.
      */
     func pinReplacing(unpinIds: [String], pinId: String) async throws  -> ConversationActionResultRecord
+    
+    func pollCapabilities(convId: String) async throws  -> PollCapabilitiesOutcomeRecord
+    
+    func pollVoters(id: String) async throws  -> PollVotersOutcomeRecord
     
     /**
      * Rebuilds conversation extras (`stranger_box`, `list_ids`, etc.) using latest identities.
@@ -1451,6 +1471,10 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Refreshes group `@mention` previews from the attached SQLite store.
      */
     func refreshMentionPreviews() async throws  -> UInt64
+    
+    func refreshPoll(id: String, nowMs: Int64) 
+    
+    func refreshPollPin(id: String, convId: String) async throws  -> PollPinStateOutcomeRecord
     
     /**
      * Cancels any active QR attempt and requests a fresh QR code.
@@ -1509,14 +1533,22 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func resetOutgoingTyping(convId: String) 
     
+    func resetPolls(syncEpoch: UInt64) 
+    
     /**
      * Resolves missing conversation display names in 50-UID chunks via `get_profiles`.
      */
     func resolveMissingNames() async throws  -> UInt64
     
+    func retryPoll(id: String, convId: String, nowMs: Int64) 
+    
+    func rewatchPolls(nowMs: Int64) 
+    
     func seedContacts(contacts: ContactsStateRecord) 
     
     func seedHistoryFreshness(entries: [FreshnessMapEntry]) 
+    
+    func seedPolls(polls: PollsMirrorRecord) 
     
     /**
      * Sends a text message (plain API or E2EE host boundary) with core-owned optimistic row,
@@ -1571,6 +1603,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func settle() async throws  -> UInt64
     
+    func sharePoll(id: String, convId: String) async throws  -> PollActionOutcomeRecord
+    
     func sharedApi()  -> CoreApi
     
     /**
@@ -1587,6 +1621,10 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Stops the actor, aborts in-flight session & transport tasks, and closes `next_changes()`.
      */
     func stop() 
+    
+    func syncBoardPins(convId: String, list: BoardPinListRecord?) 
+    
+    func syncBoardRawTopics(convId: String, version: Int64, topicsJson: String?) 
     
     /**
      * Fetches and applies conversation labels from the server.
@@ -1623,6 +1661,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func unpinConversation(id: String) 
     
+    func unpinPoll(id: String, convId: String) async throws  -> PollActionOutcomeRecord
+    
     /**
      * Renames or recolors an existing conversation label.
      */
@@ -1638,11 +1678,15 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func updateIdentities(table: IdentityTableRecord) 
     
+    func votePoll(id: String, convId: String, draft: PollVoteDraftRecord, detail: PollDetailRecord?, nowMs: Int64) async throws  -> PollActionOutcomeRecord
+    
     /**
      * Waits until no actor inputs or tracked effects (including serial SQLite writes and API
      * requests) remain in flight, then returns the latest change revision.
      */
     func waitIdle() async throws  -> UInt64
+    
+    func watchPoll(id: String, convId: String, nowMs: Int64) 
     
     func writeThroughRemoveMessages(convId: String, ids: [String]) 
     
@@ -1922,6 +1966,14 @@ open func checkHiddenPin(pin: String)async throws  -> Bool  {
         )
 }
     
+open func clearBoardCaches()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_clear_board_caches(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
 open func closeConversation()  {try! rustCall() {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_method_coreengine_close_conversation(
@@ -1957,6 +2009,22 @@ open func createConversationLabel(name: String, colorHex: String, conversationId
         FfiConverterString.lower(rand4),uniffiCallStatus
     )
 }
+}
+    
+open func createPoll(convId: String, draft: PollCreateDraftRecord, config: PollConfigRecord, canPin: Bool)async throws  -> PollActionOutcomeRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_create_poll(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterTypePollCreateDraftRecord_lower(draft),FfiConverterTypePollConfigRecord_lower(config),FfiConverterBool.lower(canPin)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePollActionOutcomeRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -2047,6 +2115,17 @@ open func ensureKnownContacts()  {try! rustCall() {
 }
 }
     
+open func firePollDebounce(pollId: String, seq: UInt64, nowMs: Int64)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_fire_poll_debounce(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(pollId),
+        FfiConverterUInt64.lower(seq),
+        FfiConverterInt64.lower(nowMs),uniffiCallStatus
+    )
+}
+}
+    
 open func flushAll()async throws  -> UInt64  {
     return
         try  await uniffiRustCallAsync(
@@ -2081,6 +2160,24 @@ open func handleConversationActions(stateJson: String)  {try! rustCall() {
 open func handleConversationExtras(stateJson: String)  {try! rustCall() {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_method_coreengine_handle_conversation_extras(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(stateJson),uniffiCallStatus
+    )
+}
+}
+    
+open func handlePinsState(stateJson: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_handle_pins_state(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(stateJson),uniffiCallStatus
+    )
+}
+}
+    
+open func handlePollState(stateJson: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_handle_poll_state(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(stateJson),uniffiCallStatus
     )
@@ -2193,6 +2290,22 @@ open func loadOlderMessagesAndWait(id: String)async throws  -> UInt64  {
         )
 }
     
+open func lockPoll(id: String, convId: String, nowMs: Int64)async throws  -> PollActionOutcomeRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_lock_poll(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(id),FfiConverterString.lower(convId),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePollActionOutcomeRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
     /**
      * Clears session credentials, resets Swift domains, and starts fresh QR login.
      */
@@ -2285,6 +2398,17 @@ open func nextClientId() -> Int64  {
 })
 }
     
+open func notePollMessages(notices: [PollMessageNoticeRecord], nowMs: Int64, hostAlreadyArmed: Bool)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_note_poll_messages(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceTypePollMessageNoticeRecord.lower(notices),
+        FfiConverterInt64.lower(nowMs),
+        FfiConverterBool.lower(hostAlreadyArmed),uniffiCallStatus
+    )
+}
+}
+    
     /**
      * Triggers an outgoing typing ping subject to core's 10 s per-conversation throttle,
      * `Phase::Ready` gate, and `olaz.sendTyping` preference.
@@ -2356,6 +2480,22 @@ open func pinConversation(id: String)  {try! rustCall() {
 }
 }
     
+open func pinPoll(id: String, convId: String, confirming: String?)async throws  -> PollPinActionOutcomeRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_pin_poll(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(id),FfiConverterString.lower(convId),FfiConverterOptionString.lower(confirming)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePollPinActionOutcomeRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
     /**
      * Unpins `unpin_ids` in order, then pins `pin_id`.
      */
@@ -2371,6 +2511,38 @@ open func pinReplacing(unpinIds: [String], pinId: String)async throws  -> Conver
             completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeConversationActionResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func pollCapabilities(convId: String)async throws  -> PollCapabilitiesOutcomeRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_poll_capabilities(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePollCapabilitiesOutcomeRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func pollVoters(id: String)async throws  -> PollVotersOutcomeRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_poll_voters(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(id)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePollVotersOutcomeRecord_lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
 }
@@ -2401,6 +2573,32 @@ open func refreshMentionPreviews()async throws  -> UInt64  {
             completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
             freeFunc: ffi_olaz_ffi_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func refreshPoll(id: String, nowMs: Int64)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_refresh_poll(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(id),
+        FfiConverterInt64.lower(nowMs),uniffiCallStatus
+    )
+}
+}
+    
+open func refreshPollPin(id: String, convId: String)async throws  -> PollPinStateOutcomeRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_refresh_poll_pin(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(id),FfiConverterString.lower(convId)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePollPinStateOutcomeRecord_lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
 }
@@ -2563,6 +2761,15 @@ open func resetOutgoingTyping(convId: String)  {try! rustCall() {
 }
 }
     
+open func resetPolls(syncEpoch: UInt64)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_reset_polls(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt64.lower(syncEpoch),uniffiCallStatus
+    )
+}
+}
+    
     /**
      * Resolves missing conversation display names in 50-UID chunks via `get_profiles`.
      */
@@ -2582,6 +2789,26 @@ open func resolveMissingNames()async throws  -> UInt64  {
         )
 }
     
+open func retryPoll(id: String, convId: String, nowMs: Int64)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_retry_poll(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(id),
+        FfiConverterString.lower(convId),
+        FfiConverterInt64.lower(nowMs),uniffiCallStatus
+    )
+}
+}
+    
+open func rewatchPolls(nowMs: Int64)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_rewatch_polls(
+            self.uniffiCloneHandle(),
+        FfiConverterInt64.lower(nowMs),uniffiCallStatus
+    )
+}
+}
+    
 open func seedContacts(contacts: ContactsStateRecord)  {try! rustCall() {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_method_coreengine_seed_contacts(
@@ -2596,6 +2823,15 @@ open func seedHistoryFreshness(entries: [FreshnessMapEntry])  {try! rustCall() {
     uniffi_olaz_ffi_fn_method_coreengine_seed_history_freshness(
             self.uniffiCloneHandle(),
         FfiConverterSequenceTypeFreshnessMapEntry.lower(entries),uniffiCallStatus
+    )
+}
+}
+    
+open func seedPolls(polls: PollsMirrorRecord)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_seed_polls(
+            self.uniffiCloneHandle(),
+        FfiConverterTypePollsMirrorRecord_lower(polls),uniffiCallStatus
     )
 }
 }
@@ -2747,6 +2983,22 @@ open func settle()async throws  -> UInt64  {
         )
 }
     
+open func sharePoll(id: String, convId: String)async throws  -> PollActionOutcomeRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_share_poll(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(id),FfiConverterString.lower(convId)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePollActionOutcomeRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
 open func sharedApi() -> CoreApi  {
     return try!  FfiConverterTypeCoreApi_lift(try! rustCall() {
         uniffiCallStatus in
@@ -2788,6 +3040,27 @@ open func stop()  {try! rustCall() {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_method_coreengine_stop(
             self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
+open func syncBoardPins(convId: String, list: BoardPinListRecord?)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_sync_board_pins(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(convId),
+        FfiConverterOptionTypeBoardPinListRecord.lower(list),uniffiCallStatus
+    )
+}
+}
+    
+open func syncBoardRawTopics(convId: String, version: Int64, topicsJson: String?)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_sync_board_raw_topics(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(convId),
+        FfiConverterInt64.lower(version),
+        FfiConverterOptionString.lower(topicsJson),uniffiCallStatus
     )
 }
 }
@@ -2897,6 +3170,22 @@ open func unpinConversation(id: String)  {try! rustCall() {
 }
 }
     
+open func unpinPoll(id: String, convId: String)async throws  -> PollActionOutcomeRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_unpin_poll(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(id),FfiConverterString.lower(convId)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePollActionOutcomeRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
     /**
      * Renames or recolors an existing conversation label.
      */
@@ -2936,6 +3225,22 @@ open func updateIdentities(table: IdentityTableRecord)  {try! rustCall() {
 }
 }
     
+open func votePoll(id: String, convId: String, draft: PollVoteDraftRecord, detail: PollDetailRecord?, nowMs: Int64)async throws  -> PollActionOutcomeRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_vote_poll(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(id),FfiConverterString.lower(convId),FfiConverterTypePollVoteDraftRecord_lower(draft),FfiConverterOptionTypePollDetailRecord.lower(detail),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePollActionOutcomeRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
     /**
      * Waits until no actor inputs or tracked effects (including serial SQLite writes and API
      * requests) remain in flight, then returns the latest change revision.
@@ -2954,6 +3259,17 @@ open func waitIdle()async throws  -> UInt64  {
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
+}
+    
+open func watchPoll(id: String, convId: String, nowMs: Int64)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_watch_poll(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(id),
+        FfiConverterString.lower(convId),
+        FfiConverterInt64.lower(nowMs),uniffiCallStatus
+    )
+}
 }
     
 open func writeThroughRemoveMessages(convId: String, ids: [String])  {try! rustCall() {
@@ -3284,6 +3600,10 @@ public protocol CoreHost: AnyObject, Sendable {
     func mute(convId: String, set: Bool, start: Int64, startExplicit: Bool, duration: Int64) async 
     
     func sendE2eeText(convId: String, text: String, clientId: String, quote: E2eeQuoteArgRecord?) async  -> E2eeSendOutcomeRecord
+    
+    func armPollDebounce(pollId: String, seq: UInt64, delayMs: UInt64) async  -> Bool
+    
+    func cancelAllPollDebounces() async 
     
 }
 /**
@@ -4095,6 +4415,40 @@ open func sendE2eeText(convId: String, text: String, clientId: String, quote: E2
             completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeE2eeSendOutcomeRecord_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func armPollDebounce(pollId: String, seq: UInt64, delayMs: UInt64)async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_arm_poll_debounce(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(pollId),FfiConverterUInt64.lower(seq),FfiConverterUInt64.lower(delayMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_i8,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_i8,
+            freeFunc: ffi_olaz_ffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func cancelAllPollDebounces()async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_cancel_all_poll_debounces(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
+            freeFunc: ffi_olaz_ffi_rust_future_free_void,
+            liftFunc: { $0 },
             errorHandler: nil
             
         )
@@ -5963,6 +6317,90 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                     uniffiCallbackData,
                     UniffiForeignFutureResultRustBuffer(
                         returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        armPollDebounce: { (
+            uniffiHandle: UInt64,
+            pollId: RustBuffer,
+            seq: UInt64,
+            delayMs: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteI8,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> Bool in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.armPollDebounce(
+                     pollId: try FfiConverterString.lift(pollId),
+                     seq: try FfiConverterUInt64.lift(seq),
+                     delayMs: try FfiConverterUInt64.lift(delayMs)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: Bool) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultI8(
+                        returnValue: FfiConverterBool.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultI8(
+                        returnValue: 0,
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        cancelAllPollDebounces: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.cancelAllPollDebounces(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
                         callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
                     )
                 )
@@ -10614,6 +11052,209 @@ public func FfiConverterTypeWsSession_lower(_ value: WsSession) -> UInt64 {
 
 
 
+/**
+ * One newly added option row inside [`PollVoteDraftRecord`].
+ */
+public struct AddedPollOptionRecord: Equatable, Hashable {
+    public var id: String
+    public var text: String
+    public var voted: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, text: String, voted: Bool) {
+        self.id = id
+        self.text = text
+        self.voted = voted
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension AddedPollOptionRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAddedPollOptionRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AddedPollOptionRecord {
+        return
+            try AddedPollOptionRecord(
+                id: FfiConverterString.read(from: &buf), 
+                text: FfiConverterString.read(from: &buf), 
+                voted: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AddedPollOptionRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.text, into: &buf)
+        FfiConverterBool.write(value.voted, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAddedPollOptionRecord_lift(_ buf: RustBuffer) throws -> AddedPollOptionRecord {
+    return try FfiConverterTypeAddedPollOptionRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAddedPollOptionRecord_lower(_ value: AddedPollOptionRecord) -> RustBuffer {
+    return FfiConverterTypeAddedPollOptionRecord.lower(value)
+}
+
+
+/**
+ * Temporary U7 board pin item record (`// U7:`).
+ */
+public struct BoardPinItemRecord: Equatable, Hashable {
+    public var refId: String
+    public var kind: String
+    public var title: String
+    public var sender: String
+    public var thumbnail: String?
+    public var msgId: String
+    public var cliMsgId: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(refId: String, kind: String, title: String, sender: String, thumbnail: String?, msgId: String, cliMsgId: String) {
+        self.refId = refId
+        self.kind = kind
+        self.title = title
+        self.sender = sender
+        self.thumbnail = thumbnail
+        self.msgId = msgId
+        self.cliMsgId = cliMsgId
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension BoardPinItemRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBoardPinItemRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BoardPinItemRecord {
+        return
+            try BoardPinItemRecord(
+                refId: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterString.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                sender: FfiConverterString.read(from: &buf), 
+                thumbnail: FfiConverterOptionString.read(from: &buf), 
+                msgId: FfiConverterString.read(from: &buf), 
+                cliMsgId: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BoardPinItemRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.refId, into: &buf)
+        FfiConverterString.write(value.kind, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterString.write(value.sender, into: &buf)
+        FfiConverterOptionString.write(value.thumbnail, into: &buf)
+        FfiConverterString.write(value.msgId, into: &buf)
+        FfiConverterString.write(value.cliMsgId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBoardPinItemRecord_lift(_ buf: RustBuffer) throws -> BoardPinItemRecord {
+    return try FfiConverterTypeBoardPinItemRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBoardPinItemRecord_lower(_ value: BoardPinItemRecord) -> RustBuffer {
+    return FfiConverterTypeBoardPinItemRecord.lower(value)
+}
+
+
+/**
+ * Temporary U7 board pin list record (`// U7:`).
+ */
+public struct BoardPinListRecord: Equatable, Hashable {
+    public var ready: Bool
+    public var canPin: Bool
+    public var limit: Int64
+    public var items: [BoardPinItemRecord]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(ready: Bool, canPin: Bool, limit: Int64, items: [BoardPinItemRecord]) {
+        self.ready = ready
+        self.canPin = canPin
+        self.limit = limit
+        self.items = items
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension BoardPinListRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBoardPinListRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BoardPinListRecord {
+        return
+            try BoardPinListRecord(
+                ready: FfiConverterBool.read(from: &buf), 
+                canPin: FfiConverterBool.read(from: &buf), 
+                limit: FfiConverterInt64.read(from: &buf), 
+                items: FfiConverterSequenceTypeBoardPinItemRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BoardPinListRecord, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.ready, into: &buf)
+        FfiConverterBool.write(value.canPin, into: &buf)
+        FfiConverterInt64.write(value.limit, into: &buf)
+        FfiConverterSequenceTypeBoardPinItemRecord.write(value.items, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBoardPinListRecord_lift(_ buf: RustBuffer) throws -> BoardPinListRecord {
+    return try FfiConverterTypeBoardPinListRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBoardPinListRecord_lower(_ value: BoardPinListRecord) -> RustBuffer {
+    return FfiConverterTypeBoardPinListRecord.lower(value)
+}
+
+
 public struct BoolMapEntry: Equatable, Hashable {
     public var convId: String
     public var value: Bool
@@ -11881,10 +12522,11 @@ public struct CoreChangesRecord: Equatable, Hashable {
     public var messageMeta: MessageMetaRecord?
     public var contacts: ContactsStateRecord?
     public var typing: [TypingEntryRecord]?
+    public var polls: PollsMirrorRecord?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, typing: [TypingEntryRecord]?) {
+    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, typing: [TypingEntryRecord]?, polls: PollsMirrorRecord? = nil) {
         self.version = version
         self.session = session
         self.conversations = conversations
@@ -11897,6 +12539,7 @@ public struct CoreChangesRecord: Equatable, Hashable {
         self.messageMeta = messageMeta
         self.contacts = contacts
         self.typing = typing
+        self.polls = polls
     }
 
     
@@ -11926,7 +12569,8 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
                 messagesResetAll: FfiConverterBool.read(from: &buf), 
                 messageMeta: FfiConverterOptionTypeMessageMetaRecord.read(from: &buf), 
                 contacts: FfiConverterOptionTypeContactsStateRecord.read(from: &buf), 
-                typing: FfiConverterOptionSequenceTypeTypingEntryRecord.read(from: &buf)
+                typing: FfiConverterOptionSequenceTypeTypingEntryRecord.read(from: &buf), 
+                polls: FfiConverterOptionTypePollsMirrorRecord.read(from: &buf)
         )
     }
 
@@ -11943,6 +12587,7 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
         FfiConverterOptionTypeMessageMetaRecord.write(value.messageMeta, into: &buf)
         FfiConverterOptionTypeContactsStateRecord.write(value.contacts, into: &buf)
         FfiConverterOptionSequenceTypeTypingEntryRecord.write(value.typing, into: &buf)
+        FfiConverterOptionTypePollsMirrorRecord.write(value.polls, into: &buf)
     }
 }
 
@@ -14586,6 +15231,63 @@ public func FfiConverterTypeNameEntry_lower(_ value: NameEntry) -> RustBuffer {
 }
 
 
+/**
+ * Output of [`apply_note_poll_messages_ffi`].
+ */
+public struct NotePollMessagesPlanRecord: Equatable, Hashable {
+    public var mirror: PollsMirrorRecord
+    public var armed: [PollDebounceArmRecord]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(mirror: PollsMirrorRecord, armed: [PollDebounceArmRecord]) {
+        self.mirror = mirror
+        self.armed = armed
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension NotePollMessagesPlanRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNotePollMessagesPlanRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NotePollMessagesPlanRecord {
+        return
+            try NotePollMessagesPlanRecord(
+                mirror: FfiConverterTypePollsMirrorRecord.read(from: &buf), 
+                armed: FfiConverterSequenceTypePollDebounceArmRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NotePollMessagesPlanRecord, into buf: inout [UInt8]) {
+        FfiConverterTypePollsMirrorRecord.write(value.mirror, into: &buf)
+        FfiConverterSequenceTypePollDebounceArmRecord.write(value.armed, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNotePollMessagesPlanRecord_lift(_ buf: RustBuffer) throws -> NotePollMessagesPlanRecord {
+    return try FfiConverterTypeNotePollMessagesPlanRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNotePollMessagesPlanRecord_lower(_ value: NotePollMessagesPlanRecord) -> RustBuffer {
+    return FfiConverterTypeNotePollMessagesPlanRecord.lower(value)
+}
+
+
 public struct OaPartRecord: Equatable, Hashable {
     public var isHeader: Bool
     public var title: String
@@ -14780,6 +15482,883 @@ public func FfiConverterTypePinBoardRecord_lower(_ value: PinBoardRecord) -> Rus
 
 
 /**
+ * Versioned return of `CoreEngine::vote_poll` / `lock_poll` / `share_poll` / `create_poll` / `unpin_poll`.
+ */
+public struct PollActionOutcomeRecord: Equatable, Hashable {
+    public var result: PollActionResultRecord
+    public var version: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(result: PollActionResultRecord, version: UInt64) {
+        self.result = result
+        self.version = version
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollActionOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollActionOutcomeRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollActionOutcomeRecord {
+        return
+            try PollActionOutcomeRecord(
+                result: FfiConverterTypePollActionResultRecord.read(from: &buf), 
+                version: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollActionOutcomeRecord, into buf: inout [UInt8]) {
+        FfiConverterTypePollActionResultRecord.write(value.result, into: &buf)
+        FfiConverterUInt64.write(value.version, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollActionOutcomeRecord_lift(_ buf: RustBuffer) throws -> PollActionOutcomeRecord {
+    return try FfiConverterTypePollActionOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollActionOutcomeRecord_lower(_ value: PollActionOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypePollActionOutcomeRecord.lower(value)
+}
+
+
+/**
+ * Outcome of a poll mutation (`PollActionResult`).
+ */
+public struct PollActionResultRecord: Equatable, Hashable {
+    public var ok: Bool
+    public var error: String?
+    public var pinSkipped: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(ok: Bool, error: String?, pinSkipped: Bool) {
+        self.ok = ok
+        self.error = error
+        self.pinSkipped = pinSkipped
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollActionResultRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollActionResultRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollActionResultRecord {
+        return
+            try PollActionResultRecord(
+                ok: FfiConverterBool.read(from: &buf), 
+                error: FfiConverterOptionString.read(from: &buf), 
+                pinSkipped: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollActionResultRecord, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.ok, into: &buf)
+        FfiConverterOptionString.write(value.error, into: &buf)
+        FfiConverterBool.write(value.pinSkipped, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollActionResultRecord_lift(_ buf: RustBuffer) throws -> PollActionResultRecord {
+    return try FfiConverterTypePollActionResultRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollActionResultRecord_lower(_ value: PollActionResultRecord) -> RustBuffer {
+    return FfiConverterTypePollActionResultRecord.lower(value)
+}
+
+
+/**
+ * Key/value entry for `PollsMirrorRecord.last_attempt_ms`.
+ */
+public struct PollAttemptEntryRecord: Equatable, Hashable {
+    public var pollId: String
+    public var lastAttemptMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(pollId: String, lastAttemptMs: Int64) {
+        self.pollId = pollId
+        self.lastAttemptMs = lastAttemptMs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollAttemptEntryRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollAttemptEntryRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollAttemptEntryRecord {
+        return
+            try PollAttemptEntryRecord(
+                pollId: FfiConverterString.read(from: &buf), 
+                lastAttemptMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollAttemptEntryRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.pollId, into: &buf)
+        FfiConverterInt64.write(value.lastAttemptMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollAttemptEntryRecord_lift(_ buf: RustBuffer) throws -> PollAttemptEntryRecord {
+    return try FfiConverterTypePollAttemptEntryRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollAttemptEntryRecord_lower(_ value: PollAttemptEntryRecord) -> RustBuffer {
+    return FfiConverterTypePollAttemptEntryRecord.lower(value)
+}
+
+
+/**
+ * Versioned return of `CoreEngine::poll_capabilities`.
+ */
+public struct PollCapabilitiesOutcomeRecord: Equatable, Hashable {
+    public var capabilities: PollCapabilitiesRecord
+    public var version: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(capabilities: PollCapabilitiesRecord, version: UInt64) {
+        self.capabilities = capabilities
+        self.version = version
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollCapabilitiesOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollCapabilitiesOutcomeRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollCapabilitiesOutcomeRecord {
+        return
+            try PollCapabilitiesOutcomeRecord(
+                capabilities: FfiConverterTypePollCapabilitiesRecord.read(from: &buf), 
+                version: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollCapabilitiesOutcomeRecord, into buf: inout [UInt8]) {
+        FfiConverterTypePollCapabilitiesRecord.write(value.capabilities, into: &buf)
+        FfiConverterUInt64.write(value.version, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollCapabilitiesOutcomeRecord_lift(_ buf: RustBuffer) throws -> PollCapabilitiesOutcomeRecord {
+    return try FfiConverterTypePollCapabilitiesOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollCapabilitiesOutcomeRecord_lower(_ value: PollCapabilitiesOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypePollCapabilitiesOutcomeRecord.lower(value)
+}
+
+
+/**
+ * Conversation poll capabilities (`PollCapabilities`).
+ */
+public struct PollCapabilitiesRecord: Equatable, Hashable {
+    public var ready: Bool
+    public var canCreate: Bool
+    public var canPin: Bool
+    public var config: PollConfigRecord
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(ready: Bool, canCreate: Bool, canPin: Bool, config: PollConfigRecord) {
+        self.ready = ready
+        self.canCreate = canCreate
+        self.canPin = canPin
+        self.config = config
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollCapabilitiesRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollCapabilitiesRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollCapabilitiesRecord {
+        return
+            try PollCapabilitiesRecord(
+                ready: FfiConverterBool.read(from: &buf), 
+                canCreate: FfiConverterBool.read(from: &buf), 
+                canPin: FfiConverterBool.read(from: &buf), 
+                config: FfiConverterTypePollConfigRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollCapabilitiesRecord, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.ready, into: &buf)
+        FfiConverterBool.write(value.canCreate, into: &buf)
+        FfiConverterBool.write(value.canPin, into: &buf)
+        FfiConverterTypePollConfigRecord.write(value.config, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollCapabilitiesRecord_lift(_ buf: RustBuffer) throws -> PollCapabilitiesRecord {
+    return try FfiConverterTypePollCapabilitiesRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollCapabilitiesRecord_lower(_ value: PollCapabilitiesRecord) -> RustBuffer {
+    return FfiConverterTypePollCapabilitiesRecord.lower(value)
+}
+
+
+/**
+ * Official `groupPoll` limits (`PollConfig`).
+ */
+public struct PollConfigRecord: Equatable, Hashable {
+    public var minOptions: Int64
+    public var maxOptions: Int64
+    public var maxQuestion: Int64
+    public var maxOption: Int64
+    public var enableAnonymous: Bool
+    public var enableHidePreview: Bool
+    public var displayOptions: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(minOptions: Int64, maxOptions: Int64, maxQuestion: Int64, maxOption: Int64, enableAnonymous: Bool, enableHidePreview: Bool, displayOptions: Int64) {
+        self.minOptions = minOptions
+        self.maxOptions = maxOptions
+        self.maxQuestion = maxQuestion
+        self.maxOption = maxOption
+        self.enableAnonymous = enableAnonymous
+        self.enableHidePreview = enableHidePreview
+        self.displayOptions = displayOptions
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollConfigRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollConfigRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollConfigRecord {
+        return
+            try PollConfigRecord(
+                minOptions: FfiConverterInt64.read(from: &buf), 
+                maxOptions: FfiConverterInt64.read(from: &buf), 
+                maxQuestion: FfiConverterInt64.read(from: &buf), 
+                maxOption: FfiConverterInt64.read(from: &buf), 
+                enableAnonymous: FfiConverterBool.read(from: &buf), 
+                enableHidePreview: FfiConverterBool.read(from: &buf), 
+                displayOptions: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollConfigRecord, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.minOptions, into: &buf)
+        FfiConverterInt64.write(value.maxOptions, into: &buf)
+        FfiConverterInt64.write(value.maxQuestion, into: &buf)
+        FfiConverterInt64.write(value.maxOption, into: &buf)
+        FfiConverterBool.write(value.enableAnonymous, into: &buf)
+        FfiConverterBool.write(value.enableHidePreview, into: &buf)
+        FfiConverterInt64.write(value.displayOptions, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollConfigRecord_lift(_ buf: RustBuffer) throws -> PollConfigRecord {
+    return try FfiConverterTypePollConfigRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollConfigRecord_lower(_ value: PollConfigRecord) -> RustBuffer {
+    return FfiConverterTypePollConfigRecord.lower(value)
+}
+
+
+/**
+ * Create-poll form model (`PollCreateDraft`).
+ */
+public struct PollCreateDraftRecord: Equatable, Hashable {
+    public var question: String
+    public var options: [String]
+    public var hasDeadline: Bool
+    public var deadlineMs: Int64
+    public var pin: Bool
+    public var multi: Bool
+    public var allowAdd: Bool
+    public var hidePreview: Bool
+    public var anonymous: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(question: String, options: [String], hasDeadline: Bool, deadlineMs: Int64, pin: Bool, multi: Bool, allowAdd: Bool, hidePreview: Bool, anonymous: Bool) {
+        self.question = question
+        self.options = options
+        self.hasDeadline = hasDeadline
+        self.deadlineMs = deadlineMs
+        self.pin = pin
+        self.multi = multi
+        self.allowAdd = allowAdd
+        self.hidePreview = hidePreview
+        self.anonymous = anonymous
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollCreateDraftRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollCreateDraftRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollCreateDraftRecord {
+        return
+            try PollCreateDraftRecord(
+                question: FfiConverterString.read(from: &buf), 
+                options: FfiConverterSequenceString.read(from: &buf), 
+                hasDeadline: FfiConverterBool.read(from: &buf), 
+                deadlineMs: FfiConverterInt64.read(from: &buf), 
+                pin: FfiConverterBool.read(from: &buf), 
+                multi: FfiConverterBool.read(from: &buf), 
+                allowAdd: FfiConverterBool.read(from: &buf), 
+                hidePreview: FfiConverterBool.read(from: &buf), 
+                anonymous: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollCreateDraftRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.question, into: &buf)
+        FfiConverterSequenceString.write(value.options, into: &buf)
+        FfiConverterBool.write(value.hasDeadline, into: &buf)
+        FfiConverterInt64.write(value.deadlineMs, into: &buf)
+        FfiConverterBool.write(value.pin, into: &buf)
+        FfiConverterBool.write(value.multi, into: &buf)
+        FfiConverterBool.write(value.allowAdd, into: &buf)
+        FfiConverterBool.write(value.hidePreview, into: &buf)
+        FfiConverterBool.write(value.anonymous, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollCreateDraftRecord_lift(_ buf: RustBuffer) throws -> PollCreateDraftRecord {
+    return try FfiConverterTypePollCreateDraftRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollCreateDraftRecord_lower(_ value: PollCreateDraftRecord) -> RustBuffer {
+    return FfiConverterTypePollCreateDraftRecord.lower(value)
+}
+
+
+/**
+ * Debounce timer instruction produced synchronously for `@MainActor` `notePollMessages`.
+ */
+public struct PollDebounceArmRecord: Equatable, Hashable {
+    public var pollId: String
+    public var seq: UInt64
+    public var delayMs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(pollId: String, seq: UInt64, delayMs: UInt64) {
+        self.pollId = pollId
+        self.seq = seq
+        self.delayMs = delayMs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollDebounceArmRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollDebounceArmRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollDebounceArmRecord {
+        return
+            try PollDebounceArmRecord(
+                pollId: FfiConverterString.read(from: &buf), 
+                seq: FfiConverterUInt64.read(from: &buf), 
+                delayMs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollDebounceArmRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.pollId, into: &buf)
+        FfiConverterUInt64.write(value.seq, into: &buf)
+        FfiConverterUInt64.write(value.delayMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollDebounceArmRecord_lift(_ buf: RustBuffer) throws -> PollDebounceArmRecord {
+    return try FfiConverterTypePollDebounceArmRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollDebounceArmRecord_lower(_ value: PollDebounceArmRecord) -> RustBuffer {
+    return FfiConverterTypePollDebounceArmRecord.lower(value)
+}
+
+
+/**
+ * Key/value entry for `PollsMirrorRecord.details`.
+ */
+public struct PollDetailEntryRecord: Equatable, Hashable {
+    public var id: String
+    public var detail: PollDetailRecord
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, detail: PollDetailRecord) {
+        self.id = id
+        self.detail = detail
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollDetailEntryRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollDetailEntryRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollDetailEntryRecord {
+        return
+            try PollDetailEntryRecord(
+                id: FfiConverterString.read(from: &buf), 
+                detail: FfiConverterTypePollDetailRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollDetailEntryRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterTypePollDetailRecord.write(value.detail, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollDetailEntryRecord_lift(_ buf: RustBuffer) throws -> PollDetailEntryRecord {
+    return try FfiConverterTypePollDetailEntryRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollDetailEntryRecord_lower(_ value: PollDetailEntryRecord) -> RustBuffer {
+    return FfiConverterTypePollDetailEntryRecord.lower(value)
+}
+
+
+/**
+ * Normalized group poll detail (`PollDetail`).
+ */
+public struct PollDetailRecord: Equatable, Hashable {
+    public var id: String
+    public var groupId: String
+    public var question: String
+    public var creator: String
+    public var creatorName: String
+    public var createdMs: Int64?
+    public var expiresMs: Int64?
+    public var closed: Bool
+    public var joined: Bool
+    public var multi: Bool
+    public var allowAdd: Bool
+    public var anonymous: Bool
+    public var hidePreview: Bool
+    public var voterCount: Int64
+    public var canClose: Bool
+    public var options: [PollOptionRecord]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, groupId: String, question: String, creator: String, creatorName: String, createdMs: Int64?, expiresMs: Int64?, closed: Bool, joined: Bool, multi: Bool, allowAdd: Bool, anonymous: Bool, hidePreview: Bool, voterCount: Int64, canClose: Bool, options: [PollOptionRecord]) {
+        self.id = id
+        self.groupId = groupId
+        self.question = question
+        self.creator = creator
+        self.creatorName = creatorName
+        self.createdMs = createdMs
+        self.expiresMs = expiresMs
+        self.closed = closed
+        self.joined = joined
+        self.multi = multi
+        self.allowAdd = allowAdd
+        self.anonymous = anonymous
+        self.hidePreview = hidePreview
+        self.voterCount = voterCount
+        self.canClose = canClose
+        self.options = options
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollDetailRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollDetailRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollDetailRecord {
+        return
+            try PollDetailRecord(
+                id: FfiConverterString.read(from: &buf), 
+                groupId: FfiConverterString.read(from: &buf), 
+                question: FfiConverterString.read(from: &buf), 
+                creator: FfiConverterString.read(from: &buf), 
+                creatorName: FfiConverterString.read(from: &buf), 
+                createdMs: FfiConverterOptionInt64.read(from: &buf), 
+                expiresMs: FfiConverterOptionInt64.read(from: &buf), 
+                closed: FfiConverterBool.read(from: &buf), 
+                joined: FfiConverterBool.read(from: &buf), 
+                multi: FfiConverterBool.read(from: &buf), 
+                allowAdd: FfiConverterBool.read(from: &buf), 
+                anonymous: FfiConverterBool.read(from: &buf), 
+                hidePreview: FfiConverterBool.read(from: &buf), 
+                voterCount: FfiConverterInt64.read(from: &buf), 
+                canClose: FfiConverterBool.read(from: &buf), 
+                options: FfiConverterSequenceTypePollOptionRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollDetailRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.groupId, into: &buf)
+        FfiConverterString.write(value.question, into: &buf)
+        FfiConverterString.write(value.creator, into: &buf)
+        FfiConverterString.write(value.creatorName, into: &buf)
+        FfiConverterOptionInt64.write(value.createdMs, into: &buf)
+        FfiConverterOptionInt64.write(value.expiresMs, into: &buf)
+        FfiConverterBool.write(value.closed, into: &buf)
+        FfiConverterBool.write(value.joined, into: &buf)
+        FfiConverterBool.write(value.multi, into: &buf)
+        FfiConverterBool.write(value.allowAdd, into: &buf)
+        FfiConverterBool.write(value.anonymous, into: &buf)
+        FfiConverterBool.write(value.hidePreview, into: &buf)
+        FfiConverterInt64.write(value.voterCount, into: &buf)
+        FfiConverterBool.write(value.canClose, into: &buf)
+        FfiConverterSequenceTypePollOptionRecord.write(value.options, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollDetailRecord_lift(_ buf: RustBuffer) throws -> PollDetailRecord {
+    return try FfiConverterTypePollDetailRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollDetailRecord_lower(_ value: PollDetailRecord) -> RustBuffer {
+    return FfiConverterTypePollDetailRecord.lower(value)
+}
+
+
+/**
+ * Minimal poll message notice passed into `notePollMessages`.
+ */
+public struct PollMessageNoticeRecord: Equatable, Hashable {
+    public var msgId: String
+    public var pollId: String
+    public var convId: String
+    public var dateMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(msgId: String, pollId: String, convId: String, dateMs: Int64) {
+        self.msgId = msgId
+        self.pollId = pollId
+        self.convId = convId
+        self.dateMs = dateMs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollMessageNoticeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollMessageNoticeRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollMessageNoticeRecord {
+        return
+            try PollMessageNoticeRecord(
+                msgId: FfiConverterString.read(from: &buf), 
+                pollId: FfiConverterString.read(from: &buf), 
+                convId: FfiConverterString.read(from: &buf), 
+                dateMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollMessageNoticeRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.msgId, into: &buf)
+        FfiConverterString.write(value.pollId, into: &buf)
+        FfiConverterString.write(value.convId, into: &buf)
+        FfiConverterInt64.write(value.dateMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollMessageNoticeRecord_lift(_ buf: RustBuffer) throws -> PollMessageNoticeRecord {
+    return try FfiConverterTypePollMessageNoticeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollMessageNoticeRecord_lower(_ value: PollMessageNoticeRecord) -> RustBuffer {
+    return FfiConverterTypePollMessageNoticeRecord.lower(value)
+}
+
+
+/**
+ * New option payload entry in [`PollVoteRequestRecord`].
+ */
+public struct PollNewOptionPayloadRecord: Equatable, Hashable {
+    public var content: String
+    public var voted: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(content: String, voted: Bool) {
+        self.content = content
+        self.voted = voted
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollNewOptionPayloadRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollNewOptionPayloadRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollNewOptionPayloadRecord {
+        return
+            try PollNewOptionPayloadRecord(
+                content: FfiConverterString.read(from: &buf), 
+                voted: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollNewOptionPayloadRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.content, into: &buf)
+        FfiConverterBool.write(value.voted, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollNewOptionPayloadRecord_lift(_ buf: RustBuffer) throws -> PollNewOptionPayloadRecord {
+    return try FfiConverterTypePollNewOptionPayloadRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollNewOptionPayloadRecord_lower(_ value: PollNewOptionPayloadRecord) -> RustBuffer {
+    return FfiConverterTypePollNewOptionPayloadRecord.lower(value)
+}
+
+
+/**
+ * One option row inside [`PollDetailRecord`].
+ */
+public struct PollOptionRecord: Equatable, Hashable {
+    public var id: String
+    public var content: String
+    public var votes: Int64
+    public var voted: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, content: String, votes: Int64, voted: Bool) {
+        self.id = id
+        self.content = content
+        self.votes = votes
+        self.voted = voted
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollOptionRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollOptionRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollOptionRecord {
+        return
+            try PollOptionRecord(
+                id: FfiConverterString.read(from: &buf), 
+                content: FfiConverterString.read(from: &buf), 
+                votes: FfiConverterInt64.read(from: &buf), 
+                voted: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollOptionRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.content, into: &buf)
+        FfiConverterInt64.write(value.votes, into: &buf)
+        FfiConverterBool.write(value.voted, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollOptionRecord_lift(_ buf: RustBuffer) throws -> PollOptionRecord {
+    return try FfiConverterTypePollOptionRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollOptionRecord_lower(_ value: PollOptionRecord) -> RustBuffer {
+    return FfiConverterTypePollOptionRecord.lower(value)
+}
+
+
+/**
  * One long-poll answer.
  */
 public struct PollOutcomeRecord: Equatable, Hashable {
@@ -14849,6 +16428,364 @@ public func FfiConverterTypePollOutcomeRecord_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypePollOutcomeRecord_lower(_ value: PollOutcomeRecord) -> RustBuffer {
     return FfiConverterTypePollOutcomeRecord.lower(value)
+}
+
+
+/**
+ * Key/value entry for `PollsMirrorRecord.pending_refresh`.
+ */
+public struct PollPendingRefreshEntryRecord: Equatable, Hashable {
+    public var pollId: String
+    public var seq: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(pollId: String, seq: UInt64) {
+        self.pollId = pollId
+        self.seq = seq
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollPendingRefreshEntryRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollPendingRefreshEntryRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollPendingRefreshEntryRecord {
+        return
+            try PollPendingRefreshEntryRecord(
+                pollId: FfiConverterString.read(from: &buf), 
+                seq: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollPendingRefreshEntryRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.pollId, into: &buf)
+        FfiConverterUInt64.write(value.seq, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollPendingRefreshEntryRecord_lift(_ buf: RustBuffer) throws -> PollPendingRefreshEntryRecord {
+    return try FfiConverterTypePollPendingRefreshEntryRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollPendingRefreshEntryRecord_lower(_ value: PollPendingRefreshEntryRecord) -> RustBuffer {
+    return FfiConverterTypePollPendingRefreshEntryRecord.lower(value)
+}
+
+
+/**
+ * Versioned return of `CoreEngine::pin_poll`.
+ */
+public struct PollPinActionOutcomeRecord: Equatable, Hashable {
+    public var outcome: PollPinOutcomeRecord
+    public var version: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(outcome: PollPinOutcomeRecord, version: UInt64) {
+        self.outcome = outcome
+        self.version = version
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollPinActionOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollPinActionOutcomeRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollPinActionOutcomeRecord {
+        return
+            try PollPinActionOutcomeRecord(
+                outcome: FfiConverterTypePollPinOutcomeRecord.read(from: &buf), 
+                version: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollPinActionOutcomeRecord, into buf: inout [UInt8]) {
+        FfiConverterTypePollPinOutcomeRecord.write(value.outcome, into: &buf)
+        FfiConverterUInt64.write(value.version, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollPinActionOutcomeRecord_lift(_ buf: RustBuffer) throws -> PollPinActionOutcomeRecord {
+    return try FfiConverterTypePollPinActionOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollPinActionOutcomeRecord_lower(_ value: PollPinActionOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypePollPinActionOutcomeRecord.lower(value)
+}
+
+
+/**
+ * Replace-oldest-pin confirmation payload (`PollPinConfirm`).
+ */
+public struct PollPinConfirmRecord: Equatable, Hashable {
+    public var refId: String
+    public var limit: Int64
+    public var kind: String
+    public var title: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(refId: String, limit: Int64, kind: String, title: String) {
+        self.refId = refId
+        self.limit = limit
+        self.kind = kind
+        self.title = title
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollPinConfirmRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollPinConfirmRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollPinConfirmRecord {
+        return
+            try PollPinConfirmRecord(
+                refId: FfiConverterString.read(from: &buf), 
+                limit: FfiConverterInt64.read(from: &buf), 
+                kind: FfiConverterString.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollPinConfirmRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.refId, into: &buf)
+        FfiConverterInt64.write(value.limit, into: &buf)
+        FfiConverterString.write(value.kind, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollPinConfirmRecord_lift(_ buf: RustBuffer) throws -> PollPinConfirmRecord {
+    return try FfiConverterTypePollPinConfirmRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollPinConfirmRecord_lower(_ value: PollPinConfirmRecord) -> RustBuffer {
+    return FfiConverterTypePollPinConfirmRecord.lower(value)
+}
+
+
+/**
+ * Key/value entry for `PollsMirrorRecord.pins`.
+ */
+public struct PollPinEntryRecord: Equatable, Hashable {
+    public var id: String
+    public var state: PollPinStateRecord
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, state: PollPinStateRecord) {
+        self.id = id
+        self.state = state
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollPinEntryRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollPinEntryRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollPinEntryRecord {
+        return
+            try PollPinEntryRecord(
+                id: FfiConverterString.read(from: &buf), 
+                state: FfiConverterTypePollPinStateRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollPinEntryRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterTypePollPinStateRecord.write(value.state, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollPinEntryRecord_lift(_ buf: RustBuffer) throws -> PollPinEntryRecord {
+    return try FfiConverterTypePollPinEntryRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollPinEntryRecord_lower(_ value: PollPinEntryRecord) -> RustBuffer {
+    return FfiConverterTypePollPinEntryRecord.lower(value)
+}
+
+
+/**
+ * Versioned return of `CoreEngine::refresh_poll_pin`.
+ */
+public struct PollPinStateOutcomeRecord: Equatable, Hashable {
+    public var state: PollPinStateRecord
+    public var version: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(state: PollPinStateRecord, version: UInt64) {
+        self.state = state
+        self.version = version
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollPinStateOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollPinStateOutcomeRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollPinStateOutcomeRecord {
+        return
+            try PollPinStateOutcomeRecord(
+                state: FfiConverterTypePollPinStateRecord.read(from: &buf), 
+                version: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollPinStateOutcomeRecord, into buf: inout [UInt8]) {
+        FfiConverterTypePollPinStateRecord.write(value.state, into: &buf)
+        FfiConverterUInt64.write(value.version, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollPinStateOutcomeRecord_lift(_ buf: RustBuffer) throws -> PollPinStateOutcomeRecord {
+    return try FfiConverterTypePollPinStateOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollPinStateOutcomeRecord_lower(_ value: PollPinStateOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypePollPinStateOutcomeRecord.lower(value)
+}
+
+
+/**
+ * Per-poll pin state on the group board (`PollPinState`).
+ */
+public struct PollPinStateRecord: Equatable, Hashable {
+    public var ready: Bool
+    public var canPin: Bool
+    public var pinned: Bool
+    public var limit: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(ready: Bool, canPin: Bool, pinned: Bool, limit: Int64) {
+        self.ready = ready
+        self.canPin = canPin
+        self.pinned = pinned
+        self.limit = limit
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollPinStateRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollPinStateRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollPinStateRecord {
+        return
+            try PollPinStateRecord(
+                ready: FfiConverterBool.read(from: &buf), 
+                canPin: FfiConverterBool.read(from: &buf), 
+                pinned: FfiConverterBool.read(from: &buf), 
+                limit: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollPinStateRecord, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.ready, into: &buf)
+        FfiConverterBool.write(value.canPin, into: &buf)
+        FfiConverterBool.write(value.pinned, into: &buf)
+        FfiConverterInt64.write(value.limit, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollPinStateRecord_lift(_ buf: RustBuffer) throws -> PollPinStateRecord {
+    return try FfiConverterTypePollPinStateRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollPinStateRecord_lower(_ value: PollPinStateRecord) -> RustBuffer {
+    return FfiConverterTypePollPinStateRecord.lower(value)
 }
 
 
@@ -15038,6 +16975,518 @@ public func FfiConverterTypePollStateRecord_lift(_ buf: RustBuffer) throws -> Po
 #endif
 public func FfiConverterTypePollStateRecord_lower(_ value: PollStateRecord) -> RustBuffer {
     return FfiConverterTypePollStateRecord.lower(value)
+}
+
+
+/**
+ * Vote form state (`PollVoteDraft`).
+ */
+public struct PollVoteDraftRecord: Equatable, Hashable {
+    public var selected: [String]
+    public var original: [String]
+    public var multi: Bool
+    public var added: [AddedPollOptionRecord]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(selected: [String], original: [String], multi: Bool, added: [AddedPollOptionRecord]) {
+        self.selected = selected
+        self.original = original
+        self.multi = multi
+        self.added = added
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollVoteDraftRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollVoteDraftRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollVoteDraftRecord {
+        return
+            try PollVoteDraftRecord(
+                selected: FfiConverterSequenceString.read(from: &buf), 
+                original: FfiConverterSequenceString.read(from: &buf), 
+                multi: FfiConverterBool.read(from: &buf), 
+                added: FfiConverterSequenceTypeAddedPollOptionRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollVoteDraftRecord, into buf: inout [UInt8]) {
+        FfiConverterSequenceString.write(value.selected, into: &buf)
+        FfiConverterSequenceString.write(value.original, into: &buf)
+        FfiConverterBool.write(value.multi, into: &buf)
+        FfiConverterSequenceTypeAddedPollOptionRecord.write(value.added, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollVoteDraftRecord_lift(_ buf: RustBuffer) throws -> PollVoteDraftRecord {
+    return try FfiConverterTypePollVoteDraftRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollVoteDraftRecord_lower(_ value: PollVoteDraftRecord) -> RustBuffer {
+    return FfiConverterTypePollVoteDraftRecord.lower(value)
+}
+
+
+/**
+ * Request arguments built by `PollVoteDraft.request(for:)`.
+ */
+public struct PollVoteRequestRecord: Equatable, Hashable {
+    public var newOptions: [PollNewOptionPayloadRecord]
+    public var votedIds: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(newOptions: [PollNewOptionPayloadRecord], votedIds: [String]) {
+        self.newOptions = newOptions
+        self.votedIds = votedIds
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollVoteRequestRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollVoteRequestRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollVoteRequestRecord {
+        return
+            try PollVoteRequestRecord(
+                newOptions: FfiConverterSequenceTypePollNewOptionPayloadRecord.read(from: &buf), 
+                votedIds: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollVoteRequestRecord, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypePollNewOptionPayloadRecord.write(value.newOptions, into: &buf)
+        FfiConverterSequenceString.write(value.votedIds, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollVoteRequestRecord_lift(_ buf: RustBuffer) throws -> PollVoteRequestRecord {
+    return try FfiConverterTypePollVoteRequestRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollVoteRequestRecord_lower(_ value: PollVoteRequestRecord) -> RustBuffer {
+    return FfiConverterTypePollVoteRequestRecord.lower(value)
+}
+
+
+/**
+ * Per-option voter breakdown in [`PollVotersRecord`].
+ */
+public struct PollVoterGroupRecord: Equatable, Hashable {
+    public var id: String
+    public var content: String
+    public var votes: Int64
+    public var users: [PollVoterUserRecord]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, content: String, votes: Int64, users: [PollVoterUserRecord]) {
+        self.id = id
+        self.content = content
+        self.votes = votes
+        self.users = users
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollVoterGroupRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollVoterGroupRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollVoterGroupRecord {
+        return
+            try PollVoterGroupRecord(
+                id: FfiConverterString.read(from: &buf), 
+                content: FfiConverterString.read(from: &buf), 
+                votes: FfiConverterInt64.read(from: &buf), 
+                users: FfiConverterSequenceTypePollVoterUserRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollVoterGroupRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.content, into: &buf)
+        FfiConverterInt64.write(value.votes, into: &buf)
+        FfiConverterSequenceTypePollVoterUserRecord.write(value.users, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollVoterGroupRecord_lift(_ buf: RustBuffer) throws -> PollVoterGroupRecord {
+    return try FfiConverterTypePollVoterGroupRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollVoterGroupRecord_lower(_ value: PollVoterGroupRecord) -> RustBuffer {
+    return FfiConverterTypePollVoterGroupRecord.lower(value)
+}
+
+
+/**
+ * One voter entry in [`PollVoterGroupRecord`].
+ */
+public struct PollVoterUserRecord: Equatable, Hashable {
+    public var uid: String
+    public var name: String
+    public var avatar: String?
+    public var isMe: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(uid: String, name: String, avatar: String?, isMe: Bool) {
+        self.uid = uid
+        self.name = name
+        self.avatar = avatar
+        self.isMe = isMe
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollVoterUserRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollVoterUserRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollVoterUserRecord {
+        return
+            try PollVoterUserRecord(
+                uid: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                avatar: FfiConverterOptionString.read(from: &buf), 
+                isMe: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollVoterUserRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.uid, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterOptionString.write(value.avatar, into: &buf)
+        FfiConverterBool.write(value.isMe, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollVoterUserRecord_lift(_ buf: RustBuffer) throws -> PollVoterUserRecord {
+    return try FfiConverterTypePollVoterUserRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollVoterUserRecord_lower(_ value: PollVoterUserRecord) -> RustBuffer {
+    return FfiConverterTypePollVoterUserRecord.lower(value)
+}
+
+
+/**
+ * Versioned return of `CoreEngine::poll_voters`.
+ */
+public struct PollVotersOutcomeRecord: Equatable, Hashable {
+    public var voters: PollVotersRecord?
+    public var version: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(voters: PollVotersRecord?, version: UInt64) {
+        self.voters = voters
+        self.version = version
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollVotersOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollVotersOutcomeRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollVotersOutcomeRecord {
+        return
+            try PollVotersOutcomeRecord(
+                voters: FfiConverterOptionTypePollVotersRecord.read(from: &buf), 
+                version: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollVotersOutcomeRecord, into buf: inout [UInt8]) {
+        FfiConverterOptionTypePollVotersRecord.write(value.voters, into: &buf)
+        FfiConverterUInt64.write(value.version, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollVotersOutcomeRecord_lift(_ buf: RustBuffer) throws -> PollVotersOutcomeRecord {
+    return try FfiConverterTypePollVotersOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollVotersOutcomeRecord_lower(_ value: PollVotersOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypePollVotersOutcomeRecord.lower(value)
+}
+
+
+/**
+ * Full voter list for a poll (`PollVoters`).
+ */
+public struct PollVotersRecord: Equatable, Hashable {
+    public var restricted: Bool
+    public var groups: [PollVoterGroupRecord]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(restricted: Bool, groups: [PollVoterGroupRecord]) {
+        self.restricted = restricted
+        self.groups = groups
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollVotersRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollVotersRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollVotersRecord {
+        return
+            try PollVotersRecord(
+                restricted: FfiConverterBool.read(from: &buf), 
+                groups: FfiConverterSequenceTypePollVoterGroupRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollVotersRecord, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.restricted, into: &buf)
+        FfiConverterSequenceTypePollVoterGroupRecord.write(value.groups, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollVotersRecord_lift(_ buf: RustBuffer) throws -> PollVotersRecord {
+    return try FfiConverterTypePollVotersRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollVotersRecord_lower(_ value: PollVotersRecord) -> RustBuffer {
+    return FfiConverterTypePollVotersRecord.lower(value)
+}
+
+
+/**
+ * Key/value entry for `PollsMirrorRecord.watched` (and group window poll hints).
+ */
+public struct PollWatchedEntryRecord: Equatable, Hashable {
+    public var pollId: String
+    public var convId: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(pollId: String, convId: String) {
+        self.pollId = pollId
+        self.convId = convId
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollWatchedEntryRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollWatchedEntryRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollWatchedEntryRecord {
+        return
+            try PollWatchedEntryRecord(
+                pollId: FfiConverterString.read(from: &buf), 
+                convId: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollWatchedEntryRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.pollId, into: &buf)
+        FfiConverterString.write(value.convId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollWatchedEntryRecord_lift(_ buf: RustBuffer) throws -> PollWatchedEntryRecord {
+    return try FfiConverterTypePollWatchedEntryRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollWatchedEntryRecord_lower(_ value: PollWatchedEntryRecord) -> RustBuffer {
+    return FfiConverterTypePollWatchedEntryRecord.lower(value)
+}
+
+
+/**
+ * Coalesced mirror snapshot of `CoreState.polls` (`PollStore` + `PollClock`).
+ */
+public struct PollsMirrorRecord: Equatable, Hashable {
+    public var details: [PollDetailEntryRecord]
+    public var pins: [PollPinEntryRecord]
+    public var failed: [String]
+    public var watched: [PollWatchedEntryRecord]
+    public var lastAttemptMs: [PollAttemptEntryRecord]
+    public var seenMessages: [String]
+    public var didEvictWatched: Bool
+    public var pendingRefresh: [PollPendingRefreshEntryRecord]
+    public var nextDebounceSeq: UInt64
+    public var syncEpoch: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(details: [PollDetailEntryRecord], pins: [PollPinEntryRecord], failed: [String], watched: [PollWatchedEntryRecord], lastAttemptMs: [PollAttemptEntryRecord], seenMessages: [String], didEvictWatched: Bool, pendingRefresh: [PollPendingRefreshEntryRecord], nextDebounceSeq: UInt64, syncEpoch: UInt64) {
+        self.details = details
+        self.pins = pins
+        self.failed = failed
+        self.watched = watched
+        self.lastAttemptMs = lastAttemptMs
+        self.seenMessages = seenMessages
+        self.didEvictWatched = didEvictWatched
+        self.pendingRefresh = pendingRefresh
+        self.nextDebounceSeq = nextDebounceSeq
+        self.syncEpoch = syncEpoch
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PollsMirrorRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollsMirrorRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollsMirrorRecord {
+        return
+            try PollsMirrorRecord(
+                details: FfiConverterSequenceTypePollDetailEntryRecord.read(from: &buf), 
+                pins: FfiConverterSequenceTypePollPinEntryRecord.read(from: &buf), 
+                failed: FfiConverterSequenceString.read(from: &buf), 
+                watched: FfiConverterSequenceTypePollWatchedEntryRecord.read(from: &buf), 
+                lastAttemptMs: FfiConverterSequenceTypePollAttemptEntryRecord.read(from: &buf), 
+                seenMessages: FfiConverterSequenceString.read(from: &buf), 
+                didEvictWatched: FfiConverterBool.read(from: &buf), 
+                pendingRefresh: FfiConverterSequenceTypePollPendingRefreshEntryRecord.read(from: &buf), 
+                nextDebounceSeq: FfiConverterUInt64.read(from: &buf), 
+                syncEpoch: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PollsMirrorRecord, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypePollDetailEntryRecord.write(value.details, into: &buf)
+        FfiConverterSequenceTypePollPinEntryRecord.write(value.pins, into: &buf)
+        FfiConverterSequenceString.write(value.failed, into: &buf)
+        FfiConverterSequenceTypePollWatchedEntryRecord.write(value.watched, into: &buf)
+        FfiConverterSequenceTypePollAttemptEntryRecord.write(value.lastAttemptMs, into: &buf)
+        FfiConverterSequenceString.write(value.seenMessages, into: &buf)
+        FfiConverterBool.write(value.didEvictWatched, into: &buf)
+        FfiConverterSequenceTypePollPendingRefreshEntryRecord.write(value.pendingRefresh, into: &buf)
+        FfiConverterUInt64.write(value.nextDebounceSeq, into: &buf)
+        FfiConverterUInt64.write(value.syncEpoch, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollsMirrorRecord_lift(_ buf: RustBuffer) throws -> PollsMirrorRecord {
+    return try FfiConverterTypePollsMirrorRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollsMirrorRecord_lower(_ value: PollsMirrorRecord) -> RustBuffer {
+    return FfiConverterTypePollsMirrorRecord.lower(value)
 }
 
 
@@ -19587,6 +22036,271 @@ public func FfiConverterTypePhaseRecord_lower(_ value: PhaseRecord) -> RustBuffe
 
 
 
+/**
+ * Poll action kind (`PollAction`).
+ */
+
+public enum PollActionRecord: Equatable, Hashable {
+    
+    case vote
+    case lock
+    case share
+    case create
+    case pin
+    case unpin
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PollActionRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollActionRecord: FfiConverterRustBuffer {
+    typealias SwiftType = PollActionRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollActionRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .vote
+        
+        case 2: return .lock
+        
+        case 3: return .share
+        
+        case 4: return .create
+        
+        case 5: return .pin
+        
+        case 6: return .unpin
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PollActionRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .vote:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .lock:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .share:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .create:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .pin:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .unpin:
+            writeInt(&buf, Int32(6))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollActionRecord_lift(_ buf: RustBuffer) throws -> PollActionRecord {
+    return try FfiConverterTypePollActionRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollActionRecord_lower(_ value: PollActionRecord) -> RustBuffer {
+    return FfiConverterTypePollActionRecord.lower(value)
+}
+
+
+
+/**
+ * Validation failure reason for [`PollCreateDraftRecord`].
+ */
+
+public enum PollCreateIssueRecord: Equatable, Hashable {
+    
+    case emptyQuestion
+    case tooFewOptions(min: Int64
+    )
+    case duplicate
+    case pastDeadline
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PollCreateIssueRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollCreateIssueRecord: FfiConverterRustBuffer {
+    typealias SwiftType = PollCreateIssueRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollCreateIssueRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .emptyQuestion
+        
+        case 2: return .tooFewOptions(min: try FfiConverterInt64.read(from: &buf)
+        )
+        
+        case 3: return .duplicate
+        
+        case 4: return .pastDeadline
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PollCreateIssueRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .emptyQuestion:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .tooFewOptions(min):
+            writeInt(&buf, Int32(2))
+            FfiConverterInt64.write(min, into: &buf)
+            
+        
+        case .duplicate:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .pastDeadline:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollCreateIssueRecord_lift(_ buf: RustBuffer) throws -> PollCreateIssueRecord {
+    return try FfiConverterTypePollCreateIssueRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollCreateIssueRecord_lower(_ value: PollCreateIssueRecord) -> RustBuffer {
+    return FfiConverterTypePollCreateIssueRecord.lower(value)
+}
+
+
+
+/**
+ * Outcome of `pinPoll` (`PollPinOutcome`).
+ */
+
+public enum PollPinOutcomeRecord: Equatable, Hashable {
+    
+    case done
+    case needsConfirmation(confirm: PollPinConfirmRecord
+    )
+    case failed(result: PollActionResultRecord
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PollPinOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePollPinOutcomeRecord: FfiConverterRustBuffer {
+    typealias SwiftType = PollPinOutcomeRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PollPinOutcomeRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .done
+        
+        case 2: return .needsConfirmation(confirm: try FfiConverterTypePollPinConfirmRecord.read(from: &buf)
+        )
+        
+        case 3: return .failed(result: try FfiConverterTypePollActionResultRecord.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PollPinOutcomeRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .done:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .needsConfirmation(confirm):
+            writeInt(&buf, Int32(2))
+            FfiConverterTypePollPinConfirmRecord.write(confirm, into: &buf)
+            
+        
+        case let .failed(result):
+            writeInt(&buf, Int32(3))
+            FfiConverterTypePollActionResultRecord.write(result, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollPinOutcomeRecord_lift(_ buf: RustBuffer) throws -> PollPinOutcomeRecord {
+    return try FfiConverterTypePollPinOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePollPinOutcomeRecord_lower(_ value: PollPinOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypePollPinOutcomeRecord.lower(value)
+}
+
+
+
 
 public enum StarModeRecord: Equatable, Hashable {
     
@@ -20244,6 +22958,30 @@ fileprivate struct FfiConverterOptionTypeQrListener: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeBoardPinListRecord: FfiConverterRustBuffer {
+    typealias SwiftType = BoardPinListRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeBoardPinListRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeBoardPinListRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeContactsStateRecord: FfiConverterRustBuffer {
     typealias SwiftType = ContactsStateRecord?
 
@@ -20580,6 +23318,54 @@ fileprivate struct FfiConverterOptionTypePinBoardRecord: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypePollDetailRecord: FfiConverterRustBuffer {
+    typealias SwiftType = PollDetailRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePollDetailRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePollDetailRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypePollPinConfirmRecord: FfiConverterRustBuffer {
+    typealias SwiftType = PollPinConfirmRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePollPinConfirmRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePollPinConfirmRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypePollStateRecord: FfiConverterRustBuffer {
     typealias SwiftType = PollStateRecord?
 
@@ -20596,6 +23382,54 @@ fileprivate struct FfiConverterOptionTypePollStateRecord: FfiConverterRustBuffer
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypePollStateRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypePollVotersRecord: FfiConverterRustBuffer {
+    typealias SwiftType = PollVotersRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePollVotersRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePollVotersRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypePollsMirrorRecord: FfiConverterRustBuffer {
+    typealias SwiftType = PollsMirrorRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePollsMirrorRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePollsMirrorRecord.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -20868,6 +23702,30 @@ fileprivate struct FfiConverterOptionTypeDeleteModeRecord: FfiConverterRustBuffe
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypePollCreateIssueRecord: FfiConverterRustBuffer {
+    typealias SwiftType = PollCreateIssueRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePollCreateIssueRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePollCreateIssueRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeStarModeRecord: FfiConverterRustBuffer {
     typealias SwiftType = StarModeRecord?
 
@@ -21029,6 +23887,56 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeAddedPollOptionRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [AddedPollOptionRecord]
+
+    public static func write(_ value: [AddedPollOptionRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeAddedPollOptionRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [AddedPollOptionRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [AddedPollOptionRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeAddedPollOptionRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeBoardPinItemRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [BoardPinItemRecord]
+
+    public static func write(_ value: [BoardPinItemRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeBoardPinItemRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [BoardPinItemRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [BoardPinItemRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeBoardPinItemRecord.read(from: &buf))
         }
         return seq
     }
@@ -21662,6 +24570,206 @@ fileprivate struct FfiConverterSequenceTypeOaPartRecord: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypePollAttemptEntryRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [PollAttemptEntryRecord]
+
+    public static func write(_ value: [PollAttemptEntryRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePollAttemptEntryRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PollAttemptEntryRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PollAttemptEntryRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePollAttemptEntryRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePollDebounceArmRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [PollDebounceArmRecord]
+
+    public static func write(_ value: [PollDebounceArmRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePollDebounceArmRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PollDebounceArmRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PollDebounceArmRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePollDebounceArmRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePollDetailEntryRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [PollDetailEntryRecord]
+
+    public static func write(_ value: [PollDetailEntryRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePollDetailEntryRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PollDetailEntryRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PollDetailEntryRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePollDetailEntryRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePollMessageNoticeRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [PollMessageNoticeRecord]
+
+    public static func write(_ value: [PollMessageNoticeRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePollMessageNoticeRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PollMessageNoticeRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PollMessageNoticeRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePollMessageNoticeRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePollNewOptionPayloadRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [PollNewOptionPayloadRecord]
+
+    public static func write(_ value: [PollNewOptionPayloadRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePollNewOptionPayloadRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PollNewOptionPayloadRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PollNewOptionPayloadRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePollNewOptionPayloadRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePollOptionRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [PollOptionRecord]
+
+    public static func write(_ value: [PollOptionRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePollOptionRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PollOptionRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PollOptionRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePollOptionRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePollPendingRefreshEntryRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [PollPendingRefreshEntryRecord]
+
+    public static func write(_ value: [PollPendingRefreshEntryRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePollPendingRefreshEntryRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PollPendingRefreshEntryRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PollPendingRefreshEntryRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePollPendingRefreshEntryRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePollPinEntryRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [PollPinEntryRecord]
+
+    public static func write(_ value: [PollPinEntryRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePollPinEntryRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PollPinEntryRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PollPinEntryRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePollPinEntryRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypePollQueueRecord: FfiConverterRustBuffer {
     typealias SwiftType = [PollQueueRecord]
 
@@ -21679,6 +24787,81 @@ fileprivate struct FfiConverterSequenceTypePollQueueRecord: FfiConverterRustBuff
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypePollQueueRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePollVoterGroupRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [PollVoterGroupRecord]
+
+    public static func write(_ value: [PollVoterGroupRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePollVoterGroupRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PollVoterGroupRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PollVoterGroupRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePollVoterGroupRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePollVoterUserRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [PollVoterUserRecord]
+
+    public static func write(_ value: [PollVoterUserRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePollVoterUserRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PollVoterUserRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PollVoterUserRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePollVoterUserRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePollWatchedEntryRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [PollWatchedEntryRecord]
+
+    public static func write(_ value: [PollWatchedEntryRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePollWatchedEntryRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PollWatchedEntryRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PollWatchedEntryRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePollWatchedEntryRecord.read(from: &buf))
         }
         return seq
     }
@@ -22348,6 +25531,329 @@ public func mediaStableHash(text: String) -> String  {
     )
 })
 }
+public func applyNotePollMessagesFfi(mirror: PollsMirrorRecord, notices: [PollMessageNoticeRecord], nowMs: Int64) -> NotePollMessagesPlanRecord  {
+    return try!  FfiConverterTypeNotePollMessagesPlanRecord_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_apply_note_poll_messages_ffi(
+        FfiConverterTypePollsMirrorRecord_lower(mirror),
+        FfiConverterSequenceTypePollMessageNoticeRecord.lower(notices),
+        FfiConverterInt64.lower(nowMs),uniffiCallStatus
+    )
+})
+}
+public func applyPollStateEventFfi(mirror: PollsMirrorRecord, stateJson: String) -> PollsMirrorRecord?  {
+    return try!  FfiConverterOptionTypePollsMirrorRecord.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_apply_poll_state_event_ffi(
+        FfiConverterTypePollsMirrorRecord_lower(mirror),
+        FfiConverterString.lower(stateJson),uniffiCallStatus
+    )
+})
+}
+public func isGroupAdminOrCreatorFfi(uid: String, groupId: String, contacts: ContactsStateRecord) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_is_group_admin_or_creator_ffi(
+        FfiConverterString.lower(uid),
+        FfiConverterString.lower(groupId),
+        FfiConverterTypeContactsStateRecord_lower(contacts),uniffiCallStatus
+    )
+})
+}
+public func mapPollPinSessionErrorFfi(code: Int64, message: String, partial: Bool) -> PollActionResultRecord  {
+    return try!  FfiConverterTypePollActionResultRecord_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_map_poll_pin_session_error_ffi(
+        FfiConverterInt64.lower(code),
+        FfiConverterString.lower(message),
+        FfiConverterBool.lower(partial),uniffiCallStatus
+    )
+})
+}
+public func mapPollPinTransportErrorFfi(isNetworkOrTransport: Bool, partial: Bool) -> PollActionResultRecord  {
+    return try!  FfiConverterTypePollActionResultRecord_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_map_poll_pin_transport_error_ffi(
+        FfiConverterBool.lower(isNetworkOrTransport),
+        FfiConverterBool.lower(partial),uniffiCallStatus
+    )
+})
+}
+public func normalizePollDetailFfi(payloadJson: String, pollId: String, resolvedGroupId: String, myUid: String, myAvatar: String?, contacts: ContactsStateRecord, identities: IdentityTableRecord) -> PollDetailRecord?  {
+    return try!  FfiConverterOptionTypePollDetailRecord.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_normalize_poll_detail_ffi(
+        FfiConverterString.lower(payloadJson),
+        FfiConverterString.lower(pollId),
+        FfiConverterString.lower(resolvedGroupId),
+        FfiConverterString.lower(myUid),
+        FfiConverterOptionString.lower(myAvatar),
+        FfiConverterTypeContactsStateRecord_lower(contacts),
+        FfiConverterTypeIdentityTableRecord_lower(identities),uniffiCallStatus
+    )
+})
+}
+public func pollActionResultMessage(result: PollActionResultRecord, action: PollActionRecord) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_action_result_message(
+        FfiConverterTypePollActionResultRecord_lower(result),
+        FfiConverterTypePollActionRecord_lower(action),uniffiCallStatus
+    )
+})
+}
+public func pollCapabilitiesForConversation(convId: String) -> PollCapabilitiesRecord  {
+    return try!  FfiConverterTypePollCapabilitiesRecord_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_capabilities_for_conversation(
+        FfiConverterString.lower(convId),uniffiCallStatus
+    )
+})
+}
+public func pollCapabilitiesFromJson(json: String?) -> PollCapabilitiesRecord  {
+    return try!  FfiConverterTypePollCapabilitiesRecord_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_capabilities_from_json(
+        FfiConverterOptionString.lower(json),uniffiCallStatus
+    )
+})
+}
+public func pollConfigDefault() -> PollConfigRecord  {
+    return try!  FfiConverterTypePollConfigRecord_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_config_default(uniffiCallStatus
+    )
+})
+}
+public func pollConfigFromJson(json: String?) -> PollConfigRecord  {
+    return try!  FfiConverterTypePollConfigRecord_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_config_from_json(
+        FfiConverterOptionString.lower(json),uniffiCallStatus
+    )
+})
+}
+public func pollCreateDraftIsDuplicate(draft: PollCreateDraftRecord, index: UInt64) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_create_draft_is_duplicate(
+        FfiConverterTypePollCreateDraftRecord_lower(draft),
+        FfiConverterUInt64.lower(index),uniffiCallStatus
+    )
+})
+}
+public func pollCreateDraftIssue(draft: PollCreateDraftRecord, config: PollConfigRecord, nowMs: Int64) -> PollCreateIssueRecord?  {
+    return try!  FfiConverterOptionTypePollCreateIssueRecord.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_create_draft_issue(
+        FfiConverterTypePollCreateDraftRecord_lower(draft),
+        FfiConverterTypePollConfigRecord_lower(config),
+        FfiConverterInt64.lower(nowMs),uniffiCallStatus
+    )
+})
+}
+public func pollCreateDraftSpecJson(draft: PollCreateDraftRecord, config: PollConfigRecord, canPin: Bool) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_create_draft_spec_json(
+        FfiConverterTypePollCreateDraftRecord_lower(draft),
+        FfiConverterTypePollConfigRecord_lower(config),
+        FfiConverterBool.lower(canPin),uniffiCallStatus
+    )
+})
+}
+public func pollDetailFromJson(json: String) -> PollDetailRecord?  {
+    return try!  FfiConverterOptionTypePollDetailRecord.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_detail_from_json(
+        FfiConverterString.lower(json),uniffiCallStatus
+    )
+})
+}
+public func pollDetailIsExpired(detail: PollDetailRecord, nowMs: Int64) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_detail_is_expired(
+        FfiConverterTypePollDetailRecord_lower(detail),
+        FfiConverterInt64.lower(nowMs),uniffiCallStatus
+    )
+})
+}
+public func pollDetailIsVotingLocked(detail: PollDetailRecord, nowMs: Int64) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_detail_is_voting_locked(
+        FfiConverterTypePollDetailRecord_lower(detail),
+        FfiConverterInt64.lower(nowMs),uniffiCallStatus
+    )
+})
+}
+public func pollDetailOptionWeight(detail: PollDetailRecord, option: PollOptionRecord) -> Double  {
+    return try!  FfiConverterDouble.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_detail_option_weight(
+        FfiConverterTypePollDetailRecord_lower(detail),
+        FfiConverterTypePollOptionRecord_lower(option),uniffiCallStatus
+    )
+})
+}
+public func pollDetailResultsHidden(detail: PollDetailRecord) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_detail_results_hidden(
+        FfiConverterTypePollDetailRecord_lower(detail),uniffiCallStatus
+    )
+})
+}
+public func pollDetailToJson(detail: PollDetailRecord) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_detail_to_json(
+        FfiConverterTypePollDetailRecord_lower(detail),uniffiCallStatus
+    )
+})
+}
+public func pollDetailTotalVotes(detail: PollDetailRecord) -> Int64  {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_detail_total_votes(
+        FfiConverterTypePollDetailRecord_lower(detail),uniffiCallStatus
+    )
+})
+}
+public func pollDetailVotersVisible(detail: PollDetailRecord) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_detail_voters_visible(
+        FfiConverterTypePollDetailRecord_lower(detail),uniffiCallStatus
+    )
+})
+}
+public func pollPinConfirmFromJson(json: String?) -> PollPinConfirmRecord?  {
+    return try!  FfiConverterOptionTypePollPinConfirmRecord.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_pin_confirm_from_json(
+        FfiConverterOptionString.lower(json),uniffiCallStatus
+    )
+})
+}
+public func pollPinConfirmMessage(confirm: PollPinConfirmRecord) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_pin_confirm_message(
+        FfiConverterTypePollPinConfirmRecord_lower(confirm),uniffiCallStatus
+    )
+})
+}
+public func pollPinStateFromJson(json: String?) -> PollPinStateRecord  {
+    return try!  FfiConverterTypePollPinStateRecord_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_pin_state_from_json(
+        FfiConverterOptionString.lower(json),uniffiCallStatus
+    )
+})
+}
+public func pollVoteDraftApplied(draft: PollVoteDraftRecord, detail: PollDetailRecord) -> PollDetailRecord  {
+    return try!  FfiConverterTypePollDetailRecord_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_vote_draft_applied(
+        FfiConverterTypePollVoteDraftRecord_lower(draft),
+        FfiConverterTypePollDetailRecord_lower(detail),uniffiCallStatus
+    )
+})
+}
+public func pollVoteDraftHasChanges(draft: PollVoteDraftRecord) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_vote_draft_has_changes(
+        FfiConverterTypePollVoteDraftRecord_lower(draft),uniffiCallStatus
+    )
+})
+}
+public func pollVoteDraftHasDuplicates(draft: PollVoteDraftRecord, detail: PollDetailRecord) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_vote_draft_has_duplicates(
+        FfiConverterTypePollVoteDraftRecord_lower(draft),
+        FfiConverterTypePollDetailRecord_lower(detail),uniffiCallStatus
+    )
+})
+}
+public func pollVoteDraftIsDuplicate(draft: PollVoteDraftRecord, id: String, detail: PollDetailRecord) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_vote_draft_is_duplicate(
+        FfiConverterTypePollVoteDraftRecord_lower(draft),
+        FfiConverterString.lower(id),
+        FfiConverterTypePollDetailRecord_lower(detail),uniffiCallStatus
+    )
+})
+}
+public func pollVoteDraftNew(detail: PollDetailRecord) -> PollVoteDraftRecord  {
+    return try!  FfiConverterTypePollVoteDraftRecord_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_vote_draft_new(
+        FfiConverterTypePollDetailRecord_lower(detail),uniffiCallStatus
+    )
+})
+}
+public func pollVoteDraftRequest(draft: PollVoteDraftRecord, detail: PollDetailRecord) -> PollVoteRequestRecord  {
+    return try!  FfiConverterTypePollVoteRequestRecord_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_vote_draft_request(
+        FfiConverterTypePollVoteDraftRecord_lower(draft),
+        FfiConverterTypePollDetailRecord_lower(detail),uniffiCallStatus
+    )
+})
+}
+public func pollVoteDraftSetAddedVoted(draft: PollVoteDraftRecord, id: String, voted: Bool) -> PollVoteDraftRecord  {
+    return try!  FfiConverterTypePollVoteDraftRecord_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_vote_draft_set_added_voted(
+        FfiConverterTypePollVoteDraftRecord_lower(draft),
+        FfiConverterString.lower(id),
+        FfiConverterBool.lower(voted),uniffiCallStatus
+    )
+})
+}
+public func pollVoteDraftToggle(draft: PollVoteDraftRecord, optionId: String) -> PollVoteDraftRecord  {
+    return try!  FfiConverterTypePollVoteDraftRecord_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_vote_draft_toggle(
+        FfiConverterTypePollVoteDraftRecord_lower(draft),
+        FfiConverterString.lower(optionId),uniffiCallStatus
+    )
+})
+}
+public func pollVoteDraftVotesNothing(draft: PollVoteDraftRecord) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_vote_draft_votes_nothing(
+        FfiConverterTypePollVoteDraftRecord_lower(draft),uniffiCallStatus
+    )
+})
+}
+public func pollVotersFromJson(json: String) -> PollVotersRecord?  {
+    return try!  FfiConverterOptionTypePollVotersRecord.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_poll_voters_from_json(
+        FfiConverterString.lower(json),uniffiCallStatus
+    )
+})
+}
+public func resolvePollGroupIdFfi(pollId: String, payloadJson: String, explicitGroupId: String?, watchedGroupId: String?, previousDetailGroupId: String?, groupWindowPollHits: [PollWatchedEntryRecord]) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_resolve_poll_group_id_ffi(
+        FfiConverterString.lower(pollId),
+        FfiConverterString.lower(payloadJson),
+        FfiConverterOptionString.lower(explicitGroupId),
+        FfiConverterOptionString.lower(watchedGroupId),
+        FfiConverterOptionString.lower(previousDetailGroupId),
+        FfiConverterSequenceTypePollWatchedEntryRecord.lower(groupWindowPollHits),uniffiCallStatus
+    )
+})
+}
 /**
  * `initOrRestore`: loads the saved `zaloE2EEPCStoreV1` JSON (`""` for none, which generates a
  * fresh identity, signed prekey and 25 one-time prekeys). A non-empty value that does not parse
@@ -22492,6 +25998,114 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_func_media_stable_hash() != 42448) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_func_apply_note_poll_messages_ffi() != 34924) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_apply_poll_state_event_ffi() != 41521) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_is_group_admin_or_creator_ffi() != 62175) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_map_poll_pin_session_error_ffi() != 33117) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_map_poll_pin_transport_error_ffi() != 12308) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_normalize_poll_detail_ffi() != 52802) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_action_result_message() != 23919) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_capabilities_for_conversation() != 25405) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_capabilities_from_json() != 29760) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_config_default() != 61750) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_config_from_json() != 40010) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_create_draft_is_duplicate() != 53289) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_create_draft_issue() != 40953) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_create_draft_spec_json() != 47681) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_detail_from_json() != 30392) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_detail_is_expired() != 53666) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_detail_is_voting_locked() != 20342) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_detail_option_weight() != 38795) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_detail_results_hidden() != 21809) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_detail_to_json() != 38406) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_detail_total_votes() != 48584) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_detail_voters_visible() != 6978) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_pin_confirm_from_json() != 42202) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_pin_confirm_message() != 9784) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_pin_state_from_json() != 45587) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_vote_draft_applied() != 55287) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_vote_draft_has_changes() != 59817) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_vote_draft_has_duplicates() != 27302) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_vote_draft_is_duplicate() != 9073) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_vote_draft_new() != 39944) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_vote_draft_request() != 47233) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_vote_draft_set_added_voted() != 15851) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_vote_draft_toggle() != 48336) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_vote_draft_votes_nothing() != 39763) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_poll_voters_from_json() != 36580) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_resolve_poll_group_id_ffi() != 3608) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_func_signal_init_or_restore() != 8413) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -22606,6 +26220,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_check_hidden_pin() != 2625) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_clear_board_caches() != 46184) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_close_conversation() != 59647) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -22613,6 +26230,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_create_conversation_label() != 13560) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_create_poll() != 685) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_current_version() != 33807) {
@@ -22636,6 +26256,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_ensure_known_contacts() != 6914) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_fire_poll_debounce() != 19532) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_flush_all() != 42808) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -22643,6 +26266,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_handle_conversation_extras() != 26322) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_handle_pins_state() != 64079) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_handle_poll_state() != 31987) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_handle_session_expired_notice() != 44648) {
@@ -22666,6 +26295,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_load_older_messages_and_wait() != 36746) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_lock_poll() != 8377) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_log_out() != 29389) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -22687,6 +26319,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_next_client_id() != 14242) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_note_poll_messages() != 7581) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_notify_typing() != 21975) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -22702,13 +26337,28 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_pin_conversation() != 58464) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_pin_poll() != 18803) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_pin_replacing() != 26531) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_poll_capabilities() != 270) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_poll_voters() != 40523) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_rebuild_conversation_extras() != 60933) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_refresh_mention_previews() != 8415) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_refresh_poll() != 3730) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_refresh_poll_pin() != 22175) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_refresh_qr() != 24041) {
@@ -22747,13 +26397,25 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_reset_outgoing_typing() != 50171) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_reset_polls() != 6526) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_resolve_missing_names() != 34703) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_retry_poll() != 26921) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_rewatch_polls() != 35928) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_seed_contacts() != 13201) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_seed_history_freshness() != 1024) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_seed_polls() != 61605) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_send_text() != 59517) {
@@ -22786,6 +26448,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_settle() != 26622) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_share_poll() != 1930) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_shared_api() != 19658) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -22796,6 +26461,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_stop() != 37332) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_sync_board_pins() != 22175) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_sync_board_raw_topics() != 33854) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_sync_conversation_labels() != 43591) {
@@ -22819,6 +26490,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_unpin_conversation() != 51397) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_unpin_poll() != 42028) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_update_conversation_label() != 62821) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -22828,7 +26502,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_update_identities() != 18128) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_vote_poll() != 42955) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_wait_idle() != 39497) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_watch_poll() != 36175) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_write_through_remove_messages() != 30454) {
@@ -22997,6 +26677,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_corehost_send_e2ee_text() != 23388) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_arm_poll_debounce() != 35013) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_cancel_all_poll_debounces() != 51257) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreofflineconversations_apply_preview_override() != 60866) {

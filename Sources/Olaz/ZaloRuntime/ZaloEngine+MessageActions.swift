@@ -717,6 +717,8 @@ extension ZaloEngine {
     // MARK: Pins of the open conversation
 
     internal func refreshBoardPins(for convId: String) async {
+        // U7: push current Swift board pins & raw topics into core before tracing/fetching.
+        pushCoreBoardStateIfRunning(for: convId)
         guard traceU4Host("refresh_board_pins", args: ["conv_id": convId]) else {
             return
         }
@@ -734,6 +736,8 @@ extension ZaloEngine {
         EngineLog.shared.write("pins: list ok group=\(group) rows=\((box.dict["items"] as? [Any])?.count ?? -1) items=\(parsed.list.items.count)")
         cachedBoardRawTopics[convId] = (version: parsed.version, topics: parsed.raw)
         if pins[convId] != parsed.list { pins[convId] = parsed.list }
+        // U7: write-through fetched board pins & raw topics into core before returning to CoreHost.
+        pushCoreBoardStateIfRunning(for: convId)
     }
 
     /// Log shape of a board request error: the server code and the API path, never ids or text.
@@ -747,6 +751,8 @@ extension ZaloEngine {
         guard let json = state["pins"] as? [String: Any], let conversation = json["convId"] as? String, !conversation.isEmpty else { return }
         let list = PinnedList(json: json)
         if pins[conversation] != list { pins[conversation] = list }
+        // U7: write-through pins_state event into core until U7 owns board pins.
+        pushCoreBoardPinsIfRunning(for: conversation)
     }
 
     func rewatchPins() {
@@ -766,6 +772,8 @@ extension ZaloEngine {
         messageConfirm = nil
         deleteUndo = nil
         pins = [:]
+        // U7: clear core's temporary board caches until U7 owns board pins.
+        coreLifecycle.core?.clearBoardCaches()
         messageActionsBusy = []
         pendingDeletedMessages = [:]
     }

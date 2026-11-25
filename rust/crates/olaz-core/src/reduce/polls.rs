@@ -32,7 +32,9 @@ fn json_bool(val: Option<&Value>) -> bool {
 
 fn json_i64(val: Option<&Value>) -> i64 {
     match val {
-        Some(Value::Number(n)) => n.as_i64().unwrap_or_else(|| clamped_int64(n.as_f64().unwrap_or(0.0))),
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .unwrap_or_else(|| clamped_int64(n.as_f64().unwrap_or(0.0))),
         _ => 0,
     }
 }
@@ -276,7 +278,7 @@ pub(crate) fn is_poll_command(cmd: &Command) -> bool {
             | Command::NotePollMessages { .. }
             | Command::FirePollDebounce { .. }
             | Command::HandlePollState { .. }
-            | Command::ResetPolls
+            | Command::ResetPolls { .. }
             | Command::SeedPolls { .. }
             | Command::SyncBoardPins { .. }
             | Command::SyncBoardRawTopics { .. }
@@ -384,13 +386,7 @@ pub fn reduce_polls(state: &mut CoreState, input: Input, out: &mut ReduceOutput)
                 }
             }
             finish_poll_refresh(
-                state,
-                &poll_id,
-                &data_node,
-                &group_id,
-                op_id,
-                had_store,
-                out,
+                state, &poll_id, &data_node, &group_id, op_id, had_store, out,
             );
         }
 
@@ -444,11 +440,11 @@ pub fn reduce_polls(state: &mut CoreState, input: Input, out: &mut ReduceOutput)
                     );
                     return;
                 }
-                let outcome = match build_pin_limit_confirm(&poll_id, state.board_pins.get(&conv_id))
-                {
-                    Some(confirm) => PollPinOutcome::NeedsConfirmation(confirm),
-                    None => PollPinOutcome::Failed(mapped),
-                };
+                let outcome =
+                    match build_pin_limit_confirm(&poll_id, state.board_pins.get(&conv_id)) {
+                        Some(confirm) => PollPinOutcome::NeedsConfirmation(confirm),
+                        None => PollPinOutcome::Failed(mapped),
+                    };
                 complete_op(out, op_id, OpResult::PollPinOutcome(outcome), false);
             }
             PollBoardContinuation::AfterUnpinSuccess { op_id, poll_id } => {
@@ -838,7 +834,8 @@ fn reduce_poll_command(
         }
 
         Command::SharePoll { id, conv_id: _ } => {
-            out.effects.push(Effect::SharePollApi { op_id, poll_id: id });
+            out.effects
+                .push(Effect::SharePollApi { op_id, poll_id: id });
         }
 
         Command::CreatePoll {
@@ -873,18 +870,24 @@ fn reduce_poll_command(
             });
         }
 
-        Command::NotePollMessages { notices, now_ms } => {
+        Command::NotePollMessages {
+            notices,
+            now_ms,
+            host_already_armed,
+        } => {
             let prev_seen = state.polls.clock.seen_messages_count();
             let armed = state.polls.note_poll_messages(&notices, now_ms);
             if !armed.is_empty() || state.polls.clock.seen_messages_count() != prev_seen {
                 out.dirty.insert(DirtyKey::Polls);
             }
-            for (poll_id, seq) in armed {
-                out.effects.push(Effect::ArmPollDebounce {
-                    poll_id,
-                    seq,
-                    delay: Duration::from_millis(POLL_DEBOUNCE_DELAY_MS),
-                });
+            if !host_already_armed {
+                for (poll_id, seq) in armed {
+                    out.effects.push(Effect::ArmPollDebounce {
+                        poll_id,
+                        seq,
+                        delay: Duration::from_millis(POLL_DEBOUNCE_DELAY_MS),
+                    });
+                }
             }
             complete_op(out, op_id, OpResult::Unit, false);
         }
@@ -904,8 +907,8 @@ fn reduce_poll_command(
             complete_op(out, op_id, OpResult::Unit, false);
         }
 
-        Command::ResetPolls => {
-            state.polls.reset();
+        Command::ResetPolls { sync_epoch } => {
+            state.polls.reset_to_epoch(sync_epoch);
             out.dirty.insert(DirtyKey::Polls);
             out.effects.push(Effect::CancelAllPollDebounces);
             complete_op(out, op_id, OpResult::Unit, false);
