@@ -49,7 +49,7 @@ extension ZaloEngine {
             selection.anchor = id
         } else {
             guard selection.ids.count < MessageSelection.limit else {
-                CardActionCenter.shared.show("Bạn chỉ có thể chọn tối đa \(MessageSelection.limit) tin nhắn", in: selection.conversationId)
+                showActionCard("Bạn chỉ có thể chọn tối đa \(MessageSelection.limit) tin nhắn", in: selection.conversationId)
                 return
             }
             selection.ids.append(id)
@@ -81,7 +81,7 @@ extension ZaloEngine {
         let list = selectedMessages()
         guard let first = list.first else { return }
         guard selectionCanForward(list) else {
-            CardActionCenter.shared.show("Có tin nhắn không thể chia sẻ", in: first.conversationId)
+            showActionCard("Có tin nhắn không thể chia sẻ", in: first.conversationId)
             return
         }
         forwardRequest = ForwardRequest(conversationId: first.conversationId, message: first, more: Array(list.dropFirst()))
