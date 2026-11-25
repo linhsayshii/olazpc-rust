@@ -1163,6 +1163,712 @@ final class GroupRecorderTests: XCTestCase {
                     .object(["cmd": .string("load_members"), "args": .object(["id": .string("g500903")])]),
                 ]
             ),
+
+            // 10. admin_actions
+            GroupRecorderHarness.ScenarioDef(
+                name: "admin_actions",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2001001",
+                    displayName: "Groups User",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "local_conversations": .array([
+                            localConv(id: "g501001", name: "Nhóm Admin OK", members: 3),
+                            localConv(id: "g501002", name: "Nhóm Admin Fail", members: 3),
+                        ]),
+                        "contacts": .object([
+                            "groups": .array([
+                                seedGroup(id: "g501001", name: "Nhóm Admin OK", members: 3),
+                                seedGroup(id: "g501002", name: "Nhóm Admin Fail", members: 3),
+                            ]),
+                            "friends_loaded": .bool(true),
+                            "groups_loaded": .bool(true),
+                        ]),
+                        "cached_group_details": .object([
+                            "501001": .object([
+                                "groupId": .string("501001"),
+                                "name": .string("Nhóm Admin OK"),
+                                "creatorId": .string("2001001"),
+                                "adminIds": .array([]),
+                                "memIds": .array([.string("2001001"), .string("3001001"), .string("3001002")]),
+                                "totalMember": .int(3),
+                            ]),
+                            "501002": .object([
+                                "groupId": .string("501002"),
+                                "name": .string("Nhóm Admin Fail"),
+                                "creatorId": .string("3001009"),
+                                "adminIds": .array([]),
+                                "memIds": .array([.string("3001009"), .string("2001001"), .string("3001001")]),
+                                "totalMember": .int(3),
+                            ]),
+                        ]),
+                        "group_member_cache": .object([
+                            "g501001": .array([
+                                .object(["id": .string("-1"), "name": .string("All"), "avatar": .null, "is_all": .bool(true)]),
+                                .object(["id": .string("3001001"), "name": .string("An"), "avatar": .null, "is_all": .bool(false)]),
+                            ]),
+                            "g501002": .array([
+                                .object(["id": .string("-1"), "name": .string("All"), "avatar": .null, "is_all": .bool(true)]),
+                                .object(["id": .string("3001001"), "name": .string("An"), "avatar": .null, "is_all": .bool(false)]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2001001", displayName: "Groups User"),
+                    MessageRecorderHarness.profileMeScript(uid: "2001001", displayName: "Groups User"),
+                    // 1. set_admin add ok
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/admins/add",
+                        method: "GET",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "gridInfoMap": .object([
+                                    "501001": .object([
+                                        "groupId": .string("501001"),
+                                        "name": .string("Nhóm Admin OK"),
+                                        "creatorId": .string("2001001"),
+                                        "adminIds": .array([.string("3001001")]),
+                                        "memIds": .array([.string("2001001"), .string("3001001"), .string("3001002")]),
+                                        "totalMember": .int(3),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    // 2. set_admin remove ok
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/admins/remove",
+                        method: "GET",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "gridInfoMap": .object([
+                                    "501001": .object([
+                                        "groupId": .string("501001"),
+                                        "name": .string("Nhóm Admin OK"),
+                                        "creatorId": .string("2001001"),
+                                        "adminIds": .array([]),
+                                        "memIds": .array([.string("2001001"), .string("3001001"), .string("3001002")]),
+                                        "totalMember": .int(3),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    // 3. set_admin add code 166 on g501002 (no refresh)
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/admins/add",
+                        method: "GET",
+                        json: .object(["error_code": .int(166), "error_message": .string("No permission")])
+                    ),
+                    // 4. set_admin add non-166 failure
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/admins/add",
+                        method: "GET",
+                        json: .object(["error_code": .int(500), "error_message": .string("Failed")])
+                    ),
+                    // 5. set_admin remove non-166 failure
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/admins/remove",
+                        method: "GET",
+                        json: .object(["error_code": .int(500), "error_message": .string("Failed")])
+                    ),
+                    // 6. change_owner failure
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/change-owner",
+                        method: "POST",
+                        json: .object(["error_code": .int(500), "error_message": .string("Failed")])
+                    ),
+                    // 7. block_member failure
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/blockedmems/add",
+                        method: "GET",
+                        json: .object(["error_code": .int(500), "error_message": .string("Failed")])
+                    ),
+                    // 8. block_member ok on g501001
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/blockedmems/add",
+                        method: "GET",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "gridInfoMap": .object([
+                                    "501001": .object([
+                                        "groupId": .string("501001"),
+                                        "name": .string("Nhóm Admin OK"),
+                                        "creatorId": .string("2001001"),
+                                        "adminIds": .array([]),
+                                        "memIds": .array([.string("2001001"), .string("3001001")]),
+                                        "totalMember": .int(2),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    // 9. change_owner ok on g501001
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/change-owner",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "gridInfoMap": .object([
+                                    "501001": .object([
+                                        "groupId": .string("501001"),
+                                        "name": .string("Nhóm Admin OK"),
+                                        "creatorId": .string("3001001"),
+                                        "adminIds": .array([]),
+                                        "memIds": .array([.string("2001001"), .string("3001001")]),
+                                        "totalMember": .int(2),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")])]),
+                    .object(["cmd": .string("set_admin"), "now_ms": .int(1700010101000), "args": .object(["id": .string("g501001"), "uid": .string("u3001001"), "admin": .bool(true)])]),
+                    .object(["snapshot": .string("after_add_admin")]),
+                    .object(["cmd": .string("set_admin"), "now_ms": .int(1700010102000), "args": .object(["id": .string("g501001"), "uid": .string("3001001"), "admin": .bool(false)])]),
+                    .object(["snapshot": .string("after_remove_admin")]),
+                    .object(["cmd": .string("set_admin"), "args": .object(["id": .string("g501002"), "uid": .string("3001001"), "admin": .bool(true)])]),
+                    .object(["cmd": .string("set_admin"), "args": .object(["id": .string("g501002"), "uid": .string("3001001"), "admin": .bool(true)])]),
+                    .object(["cmd": .string("set_admin"), "args": .object(["id": .string("g501002"), "uid": .string("3001001"), "admin": .bool(false)])]),
+                    .object(["cmd": .string("change_owner"), "args": .object(["id": .string("g501002"), "uid": .string("3001001")])]),
+                    .object(["cmd": .string("block_member"), "args": .object(["id": .string("g501002"), "uid": .string("3001001")])]),
+                    .object(["snapshot": .string("after_admin_failures")]),
+                    .object(["cmd": .string("block_member"), "now_ms": .int(1700010103000), "args": .object(["id": .string("g501001"), "uid": .string("u3001002")])]),
+                    .object(["cmd": .string("change_owner"), "now_ms": .int(1700010104000), "args": .object(["id": .string("g501001"), "uid": .string("3001001")])]),
+                ]
+            ),
+
+            // 11. pending_and_review
+            GroupRecorderHarness.ScenarioDef(
+                name: "pending_and_review",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2001001",
+                    displayName: "Groups User",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "local_conversations": .array([
+                            localConv(id: "g501101", name: "Nhóm Duyệt", members: 2),
+                        ]),
+                        "contacts": .object([
+                            "groups": .array([
+                                seedGroup(id: "g501101", name: "Nhóm Duyệt", members: 2),
+                            ]),
+                            "friends_loaded": .bool(true),
+                            "groups_loaded": .bool(true),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2001001", displayName: "Groups User"),
+                    MessageRecorderHarness.profileMeScript(uid: "2001001", displayName: "Groups User"),
+                    // 1. pending list ok
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/pending-mems/list",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "users": .array([
+                                    .object(["uid": .string("u3001001"), "dpn": .string("An"), "avatar": .string("https://cdn.example.invalid/p1.jpg")]),
+                                    .object(["id": .string("3001002"), "zaloName": .string("Bình"), "avatar": .string("")]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    // 2. pending list fail
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/pending-mems/list",
+                        method: "GET",
+                        status: 500,
+                        json: .object(["error_code": .int(500), "error_message": .string("Failed")])
+                    ),
+                    // 3. approve ok + refresh
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/pending-mems/review",
+                        method: "GET",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "gridInfoMap": .object([
+                                    "501101": .object([
+                                        "groupId": .string("501101"),
+                                        "name": .string("Nhóm Duyệt"),
+                                        "memIds": .array([.string("2001001"), .string("3001001")]),
+                                        "totalMember": .int(2),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    // 4. reject ok + refresh
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/pending-mems/review",
+                        method: "GET",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "gridInfoMap": .object([
+                                    "501101": .object([
+                                        "groupId": .string("501101"),
+                                        "name": .string("Nhóm Duyệt"),
+                                        "memIds": .array([.string("2001001"), .string("3001001")]),
+                                        "totalMember": .int(2),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    // 5. review fail (no refresh)
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/pending-mems/review",
+                        method: "GET",
+                        json: .object(["error_code": .int(500), "error_message": .string("Review failed")])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")])]),
+                    .object(["cmd": .string("pending"), "args": .object(["id": .string("g501101")])]),
+                    .object(["cmd": .string("pending"), "args": .object(["id": .string("g501101")])]),
+                    .object(["snapshot": .string("after_pending_calls")]),
+                    .object(["cmd": .string("review_pending"), "now_ms": .int(1700010111000), "args": .object(["id": .string("g501101"), "uids": .array([.string("u3001001")]), "approve": .bool(true)])]),
+                    .object(["cmd": .string("review_pending"), "now_ms": .int(1700010112000), "args": .object(["id": .string("g501101"), "uids": .array([.string("3001002")]), "approve": .bool(false)])]),
+                    .object(["cmd": .string("review_pending"), "args": .object(["id": .string("g501101"), "uids": .array([.string("3001003")]), "approve": .bool(true)])]),
+                ]
+            ),
+
+            // 12. join_approval
+            GroupRecorderHarness.ScenarioDef(
+                name: "join_approval",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2001001",
+                    displayName: "Groups User",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "local_conversations": .array([
+                            localConv(id: "g501201", name: "Nhóm Settings Cached", members: 3),
+                            localConv(id: "g501202", name: "Nhóm No Settings", members: 2),
+                        ]),
+                        "contacts": .object([
+                            "groups": .array([
+                                seedGroup(id: "g501201", name: "Nhóm Settings Cached", members: 3),
+                                seedGroup(id: "g501202", name: "Nhóm No Settings", members: 2),
+                            ]),
+                            "friends_loaded": .bool(true),
+                            "groups_loaded": .bool(true),
+                        ]),
+                        "cached_group_details": .object([
+                            "501201": .object([
+                                "groupId": .string("501201"),
+                                "name": .string("Nhóm Settings Cached"),
+                                "creatorId": .string("2001001"),
+                                "setting": .object([
+                                    "lockSendMsg": .int(1),
+                                    "signAdminMsg": .int(1),
+                                    "joinAppr": .int(0),
+                                ]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2001001", displayName: "Groups User"),
+                    MessageRecorderHarness.profileMeScript(uid: "2001001", displayName: "Groups User"),
+                    // 1. joinAppr on=true with existing settings kept
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/setting/update",
+                        method: "GET",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "gridInfoMap": .object([
+                                    "501201": .object([
+                                        "groupId": .string("501201"),
+                                        "name": .string("Nhóm Settings Cached"),
+                                        "creatorId": .string("2001001"),
+                                        "setting": .object([
+                                            "lockSendMsg": .int(1),
+                                            "signAdminMsg": .int(1),
+                                            "joinAppr": .int(1),
+                                        ]),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    // 2. joinAppr on=false with existing settings kept
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/setting/update",
+                        method: "GET",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "gridInfoMap": .object([
+                                    "501201": .object([
+                                        "groupId": .string("501201"),
+                                        "name": .string("Nhóm Settings Cached"),
+                                        "creatorId": .string("2001001"),
+                                        "setting": .object([
+                                            "lockSendMsg": .int(1),
+                                            "signAdminMsg": .int(1),
+                                            "joinAppr": .int(0),
+                                        ]),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    // 3. No settings cached for g501202
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/setting/update",
+                        method: "GET",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/getmg-v2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "gridInfoMap": .object([
+                                    "501202": .object([
+                                        "groupId": .string("501202"),
+                                        "name": .string("Nhóm No Settings"),
+                                        "creatorId": .string("2001001"),
+                                        "setting": .object(["joinAppr": .int(1)]),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")])]),
+                    .object(["cmd": .string("join_approval"), "now_ms": .int(1700010121000), "args": .object(["id": .string("g501201"), "on": .bool(true)])]),
+                    .object(["snapshot": .string("after_join_appr_on")]),
+                    .object(["cmd": .string("join_approval"), "now_ms": .int(1700010122000), "args": .object(["id": .string("g501201"), "on": .bool(false)])]),
+                    .object(["snapshot": .string("after_join_appr_off")]),
+                    .object(["cmd": .string("join_approval"), "now_ms": .int(1700010123000), "args": .object(["id": .string("g501202"), "on": .bool(true)])]),
+                ]
+            ),
+
+            // 13. group_link
+            GroupRecorderHarness.ScenarioDef(
+                name: "group_link",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2001001",
+                    displayName: "Groups User",
+                    suppress: ["ws", "long_poll"]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2001001", displayName: "Groups User"),
+                    MessageRecorderHarness.profileMeScript(uid: "2001001", displayName: "Groups User"),
+                    // 1. read ok
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/link/detail",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object(["link": .string("https://zalo.me/g/abc123"), "enabled": .int(1)]),
+                        ])
+                    ),
+                    // 2. read fail
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/link/detail",
+                        method: "GET",
+                        status: 500,
+                        json: .object(["error_code": .int(500), "error_message": .string("Failed")])
+                    ),
+                    // 3. disable (renew: false)
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/link/disable",
+                        method: "GET",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    // 4. renew ok
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/link/new",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object(["link": .string("https://zalo.me/g/new456"), "enabled": .int(1)]),
+                        ])
+                    ),
+                    // 5. renew fail -> show_card
+                    GroupRecorderHarness.httpScript(
+                        path: "/api/group/link/new",
+                        method: "GET",
+                        json: .object(["error_code": .int(500), "error_message": .string("Failed")])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")])]),
+                    .object(["cmd": .string("group_link"), "args": .object(["id": .string("g501301")])]),
+                    .object(["cmd": .string("group_link"), "args": .object(["id": .string("g501301")])]),
+                    .object(["cmd": .string("set_group_link"), "args": .object(["id": .string("g501301"), "renew": .bool(false)])]),
+                    .object(["cmd": .string("set_group_link"), "args": .object(["id": .string("g501301"), "renew": .bool(true)])]),
+                    .object(["cmd": .string("set_group_link"), "args": .object(["id": .string("g501301"), "renew": .bool(true)])]),
+                ]
+            ),
+
+            // 14. group_notice_acts
+            GroupRecorderHarness.ScenarioDef(
+                name: "group_notice_acts",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2001001",
+                    displayName: "Groups User",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "local_conversations": .array([
+                            localConv(id: "g501401", name: "Nhóm Notice Members", members: 3),
+                            localConv(id: "g501402", name: "Nhóm Notice Meta", members: 3),
+                        ]),
+                        "contacts": .object([
+                            "friends": .array([
+                                seedFriend(id: "3001001", name: "An"),
+                                seedFriend(id: "3001002", name: "Bình"),
+                            ]),
+                            "groups": .array([
+                                seedGroup(id: "g501401", name: "Nhóm Notice Members", members: 3),
+                                seedGroup(id: "g501402", name: "Nhóm Notice Meta", members: 3),
+                            ]),
+                            "friends_loaded": .bool(true),
+                            "groups_loaded": .bool(true),
+                        ]),
+                        "cached_group_details": .object([
+                            "501401": .object(["groupId": .string("501401"), "name": .string("Nhóm Notice Members"), "creatorId": .string("2001001")]),
+                            "501402": .object(["groupId": .string("501402"), "name": .string("Nhóm Notice Meta"), "creatorId": .string("2001001")]),
+                        ]),
+                        "group_member_cache": .object([
+                            "g501401": .array([
+                                .object(["id": .string("-1"), "name": .string("All"), "avatar": .null, "is_all": .bool(true)]),
+                                .object(["id": .string("3001001"), "name": .string("An"), "avatar": .null, "is_all": .bool(false)]),
+                            ]),
+                            "g501402": .array([
+                                .object(["id": .string("-1"), "name": .string("All"), "avatar": .null, "is_all": .bool(true)]),
+                                .object(["id": .string("3001001"), "name": .string("An"), "avatar": .null, "is_all": .bool(false)]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2001001", displayName: "Groups User"),
+                    MessageRecorderHarness.profileMeScript(uid: "2001001", displayName: "Groups User"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")])]),
+                    // Non-member acts on g501402 (must NOT drop cachedGroupDetails or groupMemberCache)
+                    .object([
+                        "cmd": .string("group_notice"),
+                        "args": .object([
+                            "act": .string("update"),
+                            "ts": .int(1700000100), // seconds
+                            "data": .object([
+                                "groupId": .string("501402"),
+                                "sourceId": .string("2001001"),
+                                "groupName": .string("Nhóm Đổi Tên"),
+                            ]),
+                        ]),
+                    ]),
+                    .object([
+                        "cmd": .string("group_notice"),
+                        "now_ms": .int(1700000200000),
+                        "args": .object([
+                            "act": .string("update_avatar"),
+                            "ts": .int(0), // falls back to nowMs
+                            "data": .object([
+                                "groupId": .string("501402"),
+                                "sourceId": .string("3001001"),
+                            ]),
+                        ]),
+                    ]),
+                    .object(["snapshot": .string("after_non_member_acts")]),
+                    // Member acts on g501401 (MUST drop caches on first member act)
+                    .object([
+                        "cmd": .string("group_notice"),
+                        "args": .object([
+                            "act": .string("join"),
+                            "ts": .int(1700000301000), // ms
+                            "data": .object([
+                                "groupId": .string("501401"),
+                                "sourceId": .string("2001001"),
+                                "creatorId": .string(""),
+                                "updateMembers": .array([.object(["id": .string("2001001"), "dName": .string("Me")])]),
+                            ]),
+                        ]),
+                    ]),
+                    .object(["snapshot": .string("after_first_member_act")]),
+                    // join: added by known friend, me + unknown member
+                    .object([
+                        "cmd": .string("group_notice"),
+                        "args": .object([
+                            "act": .string("join"),
+                            "ts": .int(1700000302), // seconds
+                            "data": .object([
+                                "groupId": .string("501401"),
+                                "sourceId": .string("3001001"),
+                                "updateMembers": .array([
+                                    .object(["id": .string("3001099"), "dName": .string("Khách")]),
+                                    .object(["id": .string("2001001"), "dName": .string("Me")]),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                    // join: creator self-join -> nil (no row)
+                    .object([
+                        "cmd": .string("group_notice"),
+                        "args": .object([
+                            "act": .string("join"),
+                            "ts": .int(1700000303000),
+                            "data": .object([
+                                "groupId": .string("501401"),
+                                "sourceId": .string("3001001"),
+                                "creatorId": .string("3001001"),
+                                "updateMembers": .array([.object(["id": .string("3001001"), "dName": .string("An")])]),
+                            ]),
+                        ]),
+                    ]),
+                    // leave (known)
+                    .object([
+                        "cmd": .string("group_notice"),
+                        "args": .object([
+                            "act": .string("leave"),
+                            "ts": .int(1700000304000),
+                            "data": .object([
+                                "groupId": .string("501401"),
+                                "updateMembers": .array([.object(["id": .string("3001001"), "dName": .string("Ignore")])]),
+                            ]),
+                        ]),
+                    ]),
+                    // remove_member (by me, unknown member dName)
+                    .object([
+                        "cmd": .string("group_notice"),
+                        "args": .object([
+                            "act": .string("remove_member"),
+                            "ts": .int(1700000305000),
+                            "data": .object([
+                                "groupId": .string("501401"),
+                                "sourceId": .string("2001001"),
+                                "updateMembers": .array([.object(["id": .string("3001099"), "dName": .string("Khách")])]),
+                            ]),
+                        ]),
+                    ]),
+                    // block_member (by known, known member)
+                    .object([
+                        "cmd": .string("group_notice"),
+                        "args": .object([
+                            "act": .string("block_member"),
+                            "ts": .int(1700000306000),
+                            "data": .object([
+                                "groupId": .string("501401"),
+                                "sourceId": .string("3001002"),
+                                "updateMembers": .array([.object(["id": .string("3001001"), "dName": .string("An")])]),
+                            ]),
+                        ]),
+                    ]),
+                    // add_admin (me)
+                    .object([
+                        "cmd": .string("group_notice"),
+                        "args": .object([
+                            "act": .string("add_admin"),
+                            "ts": .int(1700000307000),
+                            "data": .object([
+                                "groupId": .string("501401"),
+                                "updateMembers": .array([.object(["id": .string("2001001"), "dName": .string("Me")])]),
+                            ]),
+                        ]),
+                    ]),
+                    // remove_admin (unknown)
+                    .object([
+                        "cmd": .string("group_notice"),
+                        "args": .object([
+                            "act": .string("remove_admin"),
+                            "ts": .int(1700000308000),
+                            "data": .object([
+                                "groupId": .string("501401"),
+                                "updateMembers": .array([.object(["id": .string("3001099"), "dName": .string("Khách")])]),
+                            ]),
+                        ]),
+                    ]),
+                    // change_owner (me, ts=0 fallback to nowMs)
+                    .object([
+                        "cmd": .string("group_notice"),
+                        "now_ms": .int(1700000309000),
+                        "args": .object([
+                            "act": .string("change_owner"),
+                            "ts": .int(0),
+                            "data": .object([
+                                "groupId": .string("501401"),
+                                "updateMembers": .array([.object(["id": .string("2001001"), "dName": .string("Me")])]),
+                            ]),
+                        ]),
+                    ]),
+                    // duplicate of same event -> deduped (still one row)
+                    .object([
+                        "cmd": .string("group_notice"),
+                        "now_ms": .int(1700000309000),
+                        "args": .object([
+                            "act": .string("change_owner"),
+                            "ts": .int(0),
+                            "data": .object([
+                                "groupId": .string("501401"),
+                                "updateMembers": .array([.object(["id": .string("2001001"), "dName": .string("Me")])]),
+                            ]),
+                        ]),
+                    ]),
+                ]
+            ),
         ]
     }
 }
