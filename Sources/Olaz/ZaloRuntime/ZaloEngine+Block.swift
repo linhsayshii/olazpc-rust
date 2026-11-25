@@ -31,9 +31,9 @@ extension ZaloEngine {
                 list.insert(BlockedUser(id: clean, name: shown, avatar: info.flatMap { URL(string: $0.avatar) }), at: 0)
             }
             blockedUsers = list
-            CardActionCenter.shared.show(blocked ? "Bạn đã chặn tin nhắn và cuộc gọi từ người này" : "Bỏ chặn thành công", in: conversation)
+            showActionCard(blocked ? "Bạn đã chặn tin nhắn và cuộc gọi từ người này" : "Bỏ chặn thành công", in: conversation)
         } catch {
-            CardActionCenter.shared.show(
+            showActionCard(
                 blocked ? "Chặn bạn không thành công. Vui lòng thử lại sau" : "Bỏ chặn bạn không thành công. Vui lòng thử lại sau",
                 in: conversation)
         }
