@@ -75,12 +75,19 @@ struct DeleteUndo: Identifiable, Equatable {
 
 /// "Chia sẻ": the message waiting for the conversations to forward it to.
 struct ForwardRequest: Identifiable, Equatable {
-    let id = UUID()
+    let id: UUID
     var conversationId: String
     var message: ChatMessage
     /// "Chọn nhiều tin nhắn": the other selected messages, oldest first, forwarded after `message`.
     var more: [ChatMessage] = []
     var all: [ChatMessage] { [message] + more }
+
+    init(id: UUID = UUID(), conversationId: String, message: ChatMessage, more: [ChatMessage] = []) {
+        self.id = id
+        self.conversationId = conversationId
+        self.message = message
+        self.more = more
+    }
 }
 
 /// One pin of a conversation (official group board topic / 1:1 pin topic), newest first.
@@ -253,14 +260,23 @@ extension ZaloEngine {
         return try? await MediaLoader.shared.data(for: url)
     }
 
-    private func makeForwardTempPhotoURL() -> URL {
+    internal func makeForwardTempPhotoURL() -> URL {
         if let forwardTempPhotoURL {
             return forwardTempPhotoURL()
         }
         return FileManager.default.temporaryDirectory.appendingPathComponent("fwd-\(UUID().uuidString.prefix(8)).jpg")
     }
 
+    internal func dismissForwardRequest() {
+        forwardRequest = nil
+        coreLifecycle.core?.clearForwardRequest()
+    }
+
     func requestForward(_ message: ChatMessage) {
+        if let core = coreLifecycle.core {
+            core.requestForward(message: ChatMessageRecord(message: message))
+            return
+        }
         guard message.menu.forward == .available else {
             if message.menu.forward == .blocked { showActionCard("Trò chuyện này đã bật Chặn chia sẻ", in: message.conversationId) }
             return
@@ -269,6 +285,20 @@ extension ZaloEngine {
     }
 
     func forward(_ message: ChatMessage, to targets: [String]) async -> MessageActionOutcome {
+        if let core = coreLifecycle.core {
+            core.setE2eeThreads(threads: e2eeManager.e2eeThreadIdsSync())
+            do {
+                let res = try await core.forward(
+                    message: ChatMessageRecord(message: message),
+                    targets: targets,
+                    nowMs: nowMs()
+                )
+                await waitForMirrorVersion(res.version)
+                return MessageActionOutcome(forwardRecord: res.outcome)
+            } catch {
+                return .failed("Có lỗi khi chia sẻ tin nhắn")
+            }
+        }
         guard !targets.isEmpty else { return .failed("Chưa chọn cuộc trò chuyện.") }
         var succeeded = 0
         for target in targets {
@@ -326,6 +356,16 @@ extension ZaloEngine {
     }
 
     func forwardAll(to targets: [String]) async -> MessageActionOutcome {
+        if let core = coreLifecycle.core {
+            core.setE2eeThreads(threads: e2eeManager.e2eeThreadIdsSync())
+            do {
+                let res = try await core.forwardAll(targets: targets, nowMs: nowMs())
+                await waitForMirrorVersion(res.version)
+                return MessageActionOutcome(forwardRecord: res.outcome)
+            } catch {
+                return .failed("Có lỗi khi chia sẻ tin nhắn")
+            }
+        }
         guard let request = forwardRequest else {
             return .failed("Có lỗi khi chia sẻ tin nhắn")
         }

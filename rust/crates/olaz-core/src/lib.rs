@@ -11,6 +11,7 @@ pub mod actor;
 pub mod changes;
 pub mod conversations;
 pub mod effect;
+pub mod forward;
 pub mod input;
 pub mod messages;
 pub mod reduce;
@@ -32,6 +33,10 @@ pub use conversations::{
     PinBoard, StrangerBox, ToastKind, message_preview_label, to_wire_stored,
 };
 pub use effect::{Effect, HistoryFetchPurpose, HostCall, OpResult, StoreOp};
+pub use forward::{
+    ComposerSendOutcome, FileResolutionOutcome, ForwardOutcome, ForwardRequest, ForwardState,
+    MediaResolutionOutcome,
+};
 pub use input::{
     BootstrapAliasesError, Command, CompletedLogin, E2eeQuoteArg, HiddenPinSyncKind, Input,
     LegacyCookie, PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,

@@ -17,10 +17,18 @@ use crate::messages::{WindowChange, is_valid_url_str, to_db_stored};
 use crate::reduce::{ReduceOutput, conversations};
 use crate::state::CoreState;
 
+/// How a `send_text` transaction reports completion when `Input::SendTextDone` arrives.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendCompletion {
+    None,
+    Op(u64),
+    Forward(u64),
+}
+
 /// In-flight `sendText` transaction tracked until `Input::SendTextDone` arrives.
 #[derive(Clone, PartialEq)]
 struct PendingSend {
-    op_id: Option<u64>,
+    completion: SendCompletion,
     conv_id: String,
     cli_id: String,
     optimistic: ChatMessage,
@@ -52,7 +60,9 @@ impl SendState {
         self.auto_delete_ttl_ms.clear();
         let pending = std::mem::take(&mut self.in_flight);
         for (_, send) in pending {
-            complete_op(send.op_id, OpResult::Bool(false), false, out);
+            if let SendCompletion::Op(op_id) = send.completion {
+                complete_op(Some(op_id), OpResult::Bool(false), false, out);
+            }
         }
     }
 }
@@ -92,7 +102,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
             now_ms,
             is_e2ee,
             ttl_ms,
-        } => reduce_send_text(
+        } => start_send_text(
             state,
             SendTextRequest {
                 conv_id,
@@ -105,7 +115,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                 now_ms,
                 is_e2ee_override: is_e2ee,
                 ttl_ms_override: ttl_ms,
-                op_id,
+                completion: op_id.map_or(SendCompletion::None, SendCompletion::Op),
             },
             out,
         ),
@@ -129,23 +139,23 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
     }
 }
 
-struct SendTextRequest {
-    conv_id: String,
-    text: String,
-    quote_id: Option<String>,
-    mentions: Vec<Mention>,
-    styles: Vec<TextStyle>,
-    urgency: i64,
-    client_id: i64,
-    now_ms: i64,
-    is_e2ee_override: Option<bool>,
-    ttl_ms_override: Option<i64>,
-    op_id: Option<u64>,
+pub(crate) struct SendTextRequest {
+    pub conv_id: String,
+    pub text: String,
+    pub quote_id: Option<String>,
+    pub mentions: Vec<Mention>,
+    pub styles: Vec<TextStyle>,
+    pub urgency: i64,
+    pub client_id: i64,
+    pub now_ms: i64,
+    pub is_e2ee_override: Option<bool>,
+    pub ttl_ms_override: Option<i64>,
+    pub completion: SendCompletion,
 }
 
-fn reduce_send_text(state: &mut CoreState, req: SendTextRequest, out: &mut ReduceOutput) {
+pub(crate) fn start_send_text(state: &mut CoreState, req: SendTextRequest, out: &mut ReduceOutput) {
     if req.text.trim().is_empty() || req.conv_id.is_empty() {
-        complete_op(req.op_id, OpResult::Bool(false), false, out);
+        finish_send_completion(state, req.completion, false, false, out);
         return;
     }
 
@@ -264,7 +274,7 @@ fn reduce_send_text(state: &mut CoreState, req: SendTextRequest, out: &mut Reduc
     state.send.in_flight.insert(
         send_id,
         PendingSend {
-            op_id: req.op_id,
+            completion: req.completion,
             conv_id: req.conv_id.clone(),
             cli_id: cli_id.clone(),
             optimistic,
@@ -348,7 +358,7 @@ fn reduce_send_text_done(
                     out.dirty.insert(DirtyKey::Messages);
                 }
                 update_conversation_after_send(state, &echoed, out);
-                complete_op(pending.op_id, OpResult::Bool(true), true, out);
+                finish_send_completion(state, pending.completion, true, true, out);
                 return;
             }
 
@@ -377,7 +387,7 @@ fn reduce_send_text_done(
                 }));
             }
             update_conversation_after_send(state, &pending.optimistic, out);
-            complete_op(pending.op_id, OpResult::Bool(true), true, out);
+            finish_send_completion(state, pending.completion, true, true, out);
         }
         Err(err_msg) => {
             if !err_msg.is_empty() {
@@ -392,12 +402,30 @@ fn reduce_send_text_done(
             ) {
                 out.dirty.insert(DirtyKey::Messages);
             }
-            complete_op(pending.op_id, OpResult::Bool(false), false, out);
+            finish_send_completion(state, pending.completion, false, false, out);
         }
     }
 }
 
-fn update_conversation_after_send(
+fn finish_send_completion(
+    state: &mut CoreState,
+    completion: SendCompletion,
+    ok: bool,
+    after_store: bool,
+    out: &mut ReduceOutput,
+) {
+    match completion {
+        SendCompletion::None => {}
+        SendCompletion::Op(op_id) => {
+            complete_op(Some(op_id), OpResult::Bool(ok), after_store, out);
+        }
+        SendCompletion::Forward(forward_id) => {
+            crate::reduce::forward::on_send_text_done(state, forward_id, ok, out);
+        }
+    }
+}
+
+pub(crate) fn update_conversation_after_send(
     state: &mut CoreState,
     msg: &ChatMessage,
     out: &mut ReduceOutput,

@@ -18,8 +18,9 @@ use olaz_core::runner::{BatchHookOutcome, ParsedEventsHookOutcome, SharedStoreSl
 use olaz_core::state::PersistedTransportState;
 use olaz_core::typed_chat::{TypedChatEnvelope, WirePayloadHandle};
 use olaz_core::{
-    Command, CoreChanges, CoreFailKind, CoreHandle, CoreState, FailReason, Host, Input,
-    LegacyCookie, LoginState, LoginStep, Phase, Profile, SessionEffectRunner, SessionSnapshot,
+    Command, ComposerSendOutcome, CoreChanges, CoreFailKind, CoreHandle, CoreState, FailReason,
+    FileResolutionOutcome, ForwardOutcome, ForwardRequest, Host, Input, LegacyCookie, LoginState,
+    LoginStep, MediaResolutionOutcome, Phase, Profile, SessionEffectRunner, SessionSnapshot,
 };
 use olaz_json::to_swift_json_string;
 use olaz_net::{LoginAccount, NetworkErrorKind, ReqwestTransport, SessionClient};
@@ -463,6 +464,169 @@ pub struct SendTextOutcomeRecord {
     pub version: u64,
 }
 
+/// Active forward picker request mirrored from `olaz-core` (U8).
+#[derive(Clone, PartialEq, uniffi::Record)]
+pub struct ForwardRequestRecord {
+    pub id: u64,
+    pub conversation_id: String,
+    pub message: ChatMessageRecord,
+    pub more: Vec<ChatMessageRecord>,
+}
+
+impl fmt::Debug for ForwardRequestRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ForwardRequestRecord")
+            .field("id", &self.id)
+            .field("more_count", &self.more.len())
+            .finish()
+    }
+}
+
+impl From<ForwardRequest> for ForwardRequestRecord {
+    fn from(r: ForwardRequest) -> Self {
+        Self {
+            id: r.id,
+            conversation_id: r.conversation_id,
+            message: ChatMessageRecord::from(r.message),
+            more: r.more.into_iter().map(ChatMessageRecord::from).collect(),
+        }
+    }
+}
+
+/// Optional wrapper so UniFFI can distinguish "unchanged" from "cleared to None" (U8).
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct ForwardRequestUpdateRecord {
+    pub request: Option<ForwardRequestRecord>,
+}
+
+/// Outcome of `forward` / `forward_all` (U8).
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum ForwardOutcomeRecord {
+    Done { text: Option<String> },
+    Pending { text: String },
+    Failed { text: String },
+}
+
+impl fmt::Debug for ForwardOutcomeRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Done { text } => f
+                .debug_struct("Done")
+                .field("has_text", &text.is_some())
+                .finish(),
+            Self::Pending { .. } => f.write_str("Pending"),
+            Self::Failed { .. } => f.write_str("Failed"),
+        }
+    }
+}
+
+impl From<ForwardOutcome> for ForwardOutcomeRecord {
+    fn from(o: ForwardOutcome) -> Self {
+        match o {
+            ForwardOutcome::Done(text) => Self::Done { text },
+            ForwardOutcome::Pending(text) => Self::Pending { text },
+            ForwardOutcome::Failed(text) => Self::Failed { text },
+        }
+    }
+}
+
+/// Return value of [`CoreEngine::forward`] and [`CoreEngine::forward_all`] (U8).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ForwardOpResultRecord {
+    pub outcome: ForwardOutcomeRecord,
+    pub version: u64,
+}
+
+/// Host return value for `resolve_media` (U8).
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum MediaResolutionRecord {
+    File { path: String },
+    Expired,
+    Unsupported,
+    Unavailable,
+}
+
+impl fmt::Debug for MediaResolutionRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File { .. } => f.write_str("File"),
+            Self::Expired => f.write_str("Expired"),
+            Self::Unsupported => f.write_str("Unsupported"),
+            Self::Unavailable => f.write_str("Unavailable"),
+        }
+    }
+}
+
+impl From<MediaResolutionRecord> for MediaResolutionOutcome {
+    fn from(r: MediaResolutionRecord) -> Self {
+        match r {
+            MediaResolutionRecord::File { path } => Self::File(path),
+            MediaResolutionRecord::Expired => Self::Expired,
+            MediaResolutionRecord::Unsupported => Self::Unsupported,
+            MediaResolutionRecord::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+/// Host return value for `resolve_file` (U8).
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FileResolutionRecord {
+    Ready { path: String },
+    Expired,
+    Failed { message: String },
+}
+
+impl fmt::Debug for FileResolutionRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ready { .. } => f.write_str("Ready"),
+            Self::Expired => f.write_str("Expired"),
+            Self::Failed { .. } => f.write_str("Failed"),
+        }
+    }
+}
+
+impl From<FileResolutionRecord> for FileResolutionOutcome {
+    fn from(r: FileResolutionRecord) -> Self {
+        match r {
+            FileResolutionRecord::Ready { path } => Self::Ready(path),
+            FileResolutionRecord::Expired => Self::Expired,
+            FileResolutionRecord::Failed { message } => Self::Failed(message),
+        }
+    }
+}
+
+/// Host return value for `send_media` / `send_files` (U8).
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum ComposerSendOutcomeRecord {
+    Done,
+    Cancelled,
+    Pending { text: String },
+    Failed { text: String },
+}
+
+impl fmt::Debug for ComposerSendOutcomeRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Done => f.write_str("Done"),
+            Self::Cancelled => f.write_str("Cancelled"),
+            Self::Pending { .. } => f.write_str("Pending"),
+            Self::Failed { .. } => f.write_str("Failed"),
+        }
+    }
+}
+
+impl From<ComposerSendOutcomeRecord> for ComposerSendOutcome {
+    fn from(r: ComposerSendOutcomeRecord) -> Self {
+        match r {
+            ComposerSendOutcomeRecord::Done => Self::Done,
+            ComposerSendOutcomeRecord::Cancelled => Self::Cancelled,
+            ComposerSendOutcomeRecord::Pending { text } => Self::Pending(text),
+            ComposerSendOutcomeRecord::Failed { text } => Self::Failed(text),
+        }
+    }
+}
+
 /// Coalesced dirty-key change batch returned by [`CoreEngine::next_changes`].
 #[derive(Clone, PartialEq, uniffi::Record)]
 pub struct CoreChangesRecord {
@@ -478,6 +642,8 @@ pub struct CoreChangesRecord {
     pub message_meta: Option<MessageMetaRecord>,
     pub contacts: Option<ContactsStateRecord>,
     pub typing: Option<Vec<TypingEntryRecord>>,
+    pub forward_request: Option<ForwardRequestUpdateRecord>,
+    pub clear_selection: bool,
 }
 
 impl fmt::Debug for CoreChangesRecord {
@@ -494,6 +660,8 @@ impl fmt::Debug for CoreChangesRecord {
             .field("conversation_ui", &self.conversation_ui)
             .field("conversation_prompt", &self.conversation_prompt)
             .field("typing_count", &self.typing.as_ref().map(Vec::len))
+            .field("has_forward_request", &self.forward_request.is_some())
+            .field("clear_selection", &self.clear_selection)
             .finish()
     }
 }
@@ -525,6 +693,10 @@ impl From<CoreChanges> for CoreChangesRecord {
                     })
                     .collect()
             }),
+            forward_request: c.forward_request.map(|req| ForwardRequestUpdateRecord {
+                request: req.map(Into::into),
+            }),
+            clear_selection: c.clear_selection,
         }
     }
 }
@@ -878,6 +1050,8 @@ impl CoreOfflineConversations {
             message_meta: None,
             contacts: None,
             typing: None,
+            forward_request: None,
+            clear_selection: false,
         };
         for key in out.dirty {
             match key {
@@ -930,6 +1104,14 @@ impl CoreOfflineConversations {
                             })
                             .collect(),
                     );
+                }
+                DirtyKey::ForwardRequest => {
+                    rec.forward_request = Some(ForwardRequestUpdateRecord {
+                        request: state.forward.request.clone().map(Into::into),
+                    });
+                }
+                DirtyKey::ForwardClearSelection => {
+                    rec.clear_selection = true;
                 }
             }
         }
@@ -1162,6 +1344,30 @@ pub trait CoreHost: Send + Sync {
         client_id: String,
         quote: Option<E2eeQuoteArgRecord>,
     ) -> E2eeSendOutcomeRecord;
+
+    // --- Forward domain callbacks (U8) ---
+    async fn show_card(&self, conv_id: Option<String>, text: String);
+    async fn resolve_media(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        kind: String,
+    ) -> MediaResolutionRecord;
+    async fn resolve_file(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        name: String,
+        url: Option<String>,
+    ) -> FileResolutionRecord;
+    async fn fetch_media_data(&self, url: String) -> Option<String>;
+    async fn send_media(
+        &self,
+        conv_id: String,
+        paths: Vec<String>,
+        cleanup_after: bool,
+    ) -> ComposerSendOutcomeRecord;
+    async fn send_files(&self, conv_id: String, paths: Vec<String>) -> ComposerSendOutcomeRecord;
 }
 
 struct FfiHostBridge(Arc<dyn CoreHost>);
@@ -1525,6 +1731,49 @@ impl Host for FfiHostBridge {
             E2eeSendOutcomeRecord::Failed { message } => Err(message),
             E2eeSendOutcomeRecord::Aborted => Err(String::new()),
         }
+    }
+
+    async fn show_card(&self, conv_id: Option<String>, text: String) {
+        self.0.show_card(conv_id, text).await;
+    }
+
+    async fn resolve_media(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        kind: String,
+    ) -> MediaResolutionOutcome {
+        self.0.resolve_media(conv_id, msg_id, kind).await.into()
+    }
+
+    async fn resolve_file(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        name: String,
+        url: Option<String>,
+    ) -> FileResolutionOutcome {
+        self.0.resolve_file(conv_id, msg_id, name, url).await.into()
+    }
+
+    async fn fetch_media_data(&self, url: String) -> Option<String> {
+        self.0.fetch_media_data(url).await
+    }
+
+    async fn send_media(
+        &self,
+        conv_id: String,
+        paths: Vec<String>,
+        cleanup_after: bool,
+    ) -> ComposerSendOutcome {
+        self.0
+            .send_media(conv_id, paths, cleanup_after)
+            .await
+            .into()
+    }
+
+    async fn send_files(&self, conv_id: String, paths: Vec<String>) -> ComposerSendOutcome {
+        self.0.send_files(conv_id, paths).await.into()
     }
 }
 
@@ -2355,6 +2604,83 @@ impl CoreEngine {
         .await
     }
 
+    /// Opens the forward picker for a single message (or emits a blocked `show_card`).
+    pub fn request_forward(&self, message: ChatMessageRecord) {
+        let chat: ChatMessage = (&message).into();
+        self.handle.send(Command::RequestForward {
+            message: Box::new(chat),
+        });
+    }
+
+    /// Opens the forward picker for Swift's current multi-message selection (oldest first).
+    pub fn forward_selection(&self, messages: Vec<ChatMessageRecord>) {
+        self.handle.send(Command::ForwardSelection {
+            messages: records_to_chat_messages(messages),
+        });
+    }
+
+    /// Dismisses the active forward picker request (e.g. sheet closed by user).
+    pub fn clear_forward_request(&self) {
+        self.handle.send(Command::ClearForwardRequest);
+    }
+
+    /// Forwards one message to `targets`, returning the outcome and settled mirror revision.
+    pub async fn forward(
+        &self,
+        message: ChatMessageRecord,
+        targets: Vec<String>,
+        now_ms: i64,
+    ) -> Result<ForwardOpResultRecord, CoreError> {
+        let chat: ChatMessage = (&message).into();
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let outcome = handle
+                .request_forward_outcome(Command::Forward {
+                    message: Box::new(chat),
+                    targets,
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            ForwardOpResultRecord {
+                outcome: outcome.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    /// Forwards all messages in the active `forward_request` to `targets`, returning the outcome
+    /// and settled mirror revision (after `show_card`, request clear, and `clear_selection`).
+    pub async fn forward_all(
+        &self,
+        targets: Vec<String>,
+        now_ms: i64,
+    ) -> Result<ForwardOpResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let outcome = handle
+                .request_forward_outcome(Command::ForwardAll { targets, now_ms })
+                .await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            ForwardOpResultRecord {
+                outcome: outcome.into(),
+                version,
+            }
+        })
+        .await
+    }
+
     /// Marks a conversation read using core's own message window for the `send_seen` target.
     pub fn mark_read(&self, id: String) {
         self.handle.send(Command::MarkRead { id });
@@ -2677,6 +3003,42 @@ mod tests {
             _quote: Option<E2eeQuoteArgRecord>,
         ) -> E2eeSendOutcomeRecord {
             E2eeSendOutcomeRecord::Aborted
+        }
+        async fn show_card(&self, _conv_id: Option<String>, _text: String) {}
+        async fn resolve_media(
+            &self,
+            _conv_id: String,
+            _msg_id: String,
+            _kind: String,
+        ) -> MediaResolutionRecord {
+            MediaResolutionRecord::Unavailable
+        }
+        async fn resolve_file(
+            &self,
+            _conv_id: String,
+            _msg_id: String,
+            _name: String,
+            _url: Option<String>,
+        ) -> FileResolutionRecord {
+            FileResolutionRecord::Expired
+        }
+        async fn fetch_media_data(&self, _url: String) -> Option<String> {
+            None
+        }
+        async fn send_media(
+            &self,
+            _conv_id: String,
+            _paths: Vec<String>,
+            _cleanup_after: bool,
+        ) -> ComposerSendOutcomeRecord {
+            ComposerSendOutcomeRecord::Cancelled
+        }
+        async fn send_files(
+            &self,
+            _conv_id: String,
+            _paths: Vec<String>,
+        ) -> ComposerSendOutcomeRecord {
+            ComposerSendOutcomeRecord::Cancelled
         }
     }
 

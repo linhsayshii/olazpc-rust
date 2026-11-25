@@ -49,7 +49,9 @@ import Testing
             messagesResetAll: messagesResetAll,
             messageMeta: messageMeta,
             contacts: contacts,
-            typing: nil
+            typing: nil,
+            forwardRequest: nil,
+            clearSelection: false
         )
     }
 

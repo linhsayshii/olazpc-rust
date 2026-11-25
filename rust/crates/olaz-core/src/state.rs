@@ -12,6 +12,7 @@ use olaz_ws::CursorMap;
 use serde_json::{Map, Value, json};
 
 use crate::conversations::ConversationsState;
+use crate::forward::{ForwardRequest, ForwardState};
 use crate::messages::{ContactsState, IdentitySnapshot, MessagesState};
 use crate::typing::{TypingState, TypingStatus};
 
@@ -29,6 +30,8 @@ pub struct CoreState {
     pub typing: TypingState,
     // U5-send
     pub send: crate::reduce::send::SendState,
+    // U8
+    pub forward: ForwardState,
 }
 
 impl CoreState {
@@ -42,6 +45,9 @@ impl CoreState {
             contacts: self.contacts.clone(),
             // U5
             typing: self.typing.active.clone(),
+            // U8
+            forward_request: self.forward.request.clone(),
+            send_auto_delete: self.send.auto_delete_ttl_ms.clone(),
         }
     }
 
@@ -75,6 +81,8 @@ impl fmt::Debug for CoreState {
             .field("typing", &self.typing)
             // U5-send
             .field("send", &self.send)
+            // U8
+            .field("forward", &self.forward)
             .finish()
     }
 }
@@ -88,6 +96,9 @@ pub struct CoreSnapshot {
     pub contacts: ContactsState,
     // U5
     pub typing: BTreeMap<String, TypingStatus>,
+    // U8
+    pub forward_request: Option<ForwardRequest>,
+    pub send_auto_delete: BTreeMap<String, i64>,
 }
 
 impl fmt::Debug for CoreSnapshot {
@@ -99,6 +110,8 @@ impl fmt::Debug for CoreSnapshot {
             .field("contacts", &self.contacts)
             // U5
             .field("typing_count", &self.typing.len())
+            // U8
+            .field("has_forward_request", &self.forward_request.is_some())
             .finish()
     }
 }
