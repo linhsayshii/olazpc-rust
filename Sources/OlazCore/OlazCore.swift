@@ -16059,7 +16059,8 @@ public func FfiConverterTypePollDetailEntryRecord_lower(_ value: PollDetailEntry
 
 
 /**
- * Normalized group poll detail (`PollDetail`).
+ * Normalized group poll detail (`PollDetail`), including derived render fields computed once per
+ * detail update in core so SwiftUI views do not cross FFI per getter.
  */
 public struct PollDetailRecord: Equatable, Hashable {
     public var id: String
@@ -16077,11 +16078,16 @@ public struct PollDetailRecord: Equatable, Hashable {
     public var hidePreview: Bool
     public var voterCount: Int64
     public var canClose: Bool
+    public var totalVotes: Int64
+    public var resultsHidden: Bool
+    public var votersVisible: Bool
+    public var lockedWithoutExpiry: Bool
+    public var hasDuplicateOptions: Bool
     public var options: [PollOptionRecord]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: String, groupId: String, question: String, creator: String, creatorName: String, createdMs: Int64?, expiresMs: Int64?, closed: Bool, joined: Bool, multi: Bool, allowAdd: Bool, anonymous: Bool, hidePreview: Bool, voterCount: Int64, canClose: Bool, options: [PollOptionRecord]) {
+    public init(id: String, groupId: String, question: String, creator: String, creatorName: String, createdMs: Int64?, expiresMs: Int64?, closed: Bool, joined: Bool, multi: Bool, allowAdd: Bool, anonymous: Bool, hidePreview: Bool, voterCount: Int64, canClose: Bool, totalVotes: Int64 = Int64(0), resultsHidden: Bool = false, votersVisible: Bool = false, lockedWithoutExpiry: Bool = false, hasDuplicateOptions: Bool = false, options: [PollOptionRecord]) {
         self.id = id
         self.groupId = groupId
         self.question = question
@@ -16097,6 +16103,11 @@ public struct PollDetailRecord: Equatable, Hashable {
         self.hidePreview = hidePreview
         self.voterCount = voterCount
         self.canClose = canClose
+        self.totalVotes = totalVotes
+        self.resultsHidden = resultsHidden
+        self.votersVisible = votersVisible
+        self.lockedWithoutExpiry = lockedWithoutExpiry
+        self.hasDuplicateOptions = hasDuplicateOptions
         self.options = options
     }
 
@@ -16131,6 +16142,11 @@ public struct FfiConverterTypePollDetailRecord: FfiConverterRustBuffer {
                 hidePreview: FfiConverterBool.read(from: &buf), 
                 voterCount: FfiConverterInt64.read(from: &buf), 
                 canClose: FfiConverterBool.read(from: &buf), 
+                totalVotes: FfiConverterInt64.read(from: &buf), 
+                resultsHidden: FfiConverterBool.read(from: &buf), 
+                votersVisible: FfiConverterBool.read(from: &buf), 
+                lockedWithoutExpiry: FfiConverterBool.read(from: &buf), 
+                hasDuplicateOptions: FfiConverterBool.read(from: &buf), 
                 options: FfiConverterSequenceTypePollOptionRecord.read(from: &buf)
         )
     }
@@ -16151,6 +16167,11 @@ public struct FfiConverterTypePollDetailRecord: FfiConverterRustBuffer {
         FfiConverterBool.write(value.hidePreview, into: &buf)
         FfiConverterInt64.write(value.voterCount, into: &buf)
         FfiConverterBool.write(value.canClose, into: &buf)
+        FfiConverterInt64.write(value.totalVotes, into: &buf)
+        FfiConverterBool.write(value.resultsHidden, into: &buf)
+        FfiConverterBool.write(value.votersVisible, into: &buf)
+        FfiConverterBool.write(value.lockedWithoutExpiry, into: &buf)
+        FfiConverterBool.write(value.hasDuplicateOptions, into: &buf)
         FfiConverterSequenceTypePollOptionRecord.write(value.options, into: &buf)
     }
 }
@@ -16301,14 +16322,22 @@ public struct PollOptionRecord: Equatable, Hashable {
     public var content: String
     public var votes: Int64
     public var voted: Bool
+    /**
+     * Precomputed share of `total_votes` (`0.0..=1.0`), computed once per detail update in core.
+     */
+    public var weight: Double
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: String, content: String, votes: Int64, voted: Bool) {
+    public init(id: String, content: String, votes: Int64, voted: Bool, 
+        /**
+         * Precomputed share of `total_votes` (`0.0..=1.0`), computed once per detail update in core.
+         */weight: Double = Double(0.0)) {
         self.id = id
         self.content = content
         self.votes = votes
         self.voted = voted
+        self.weight = weight
     }
 
     
@@ -16330,7 +16359,8 @@ public struct FfiConverterTypePollOptionRecord: FfiConverterRustBuffer {
                 id: FfiConverterString.read(from: &buf), 
                 content: FfiConverterString.read(from: &buf), 
                 votes: FfiConverterInt64.read(from: &buf), 
-                voted: FfiConverterBool.read(from: &buf)
+                voted: FfiConverterBool.read(from: &buf), 
+                weight: FfiConverterDouble.read(from: &buf)
         )
     }
 
@@ -16339,6 +16369,7 @@ public struct FfiConverterTypePollOptionRecord: FfiConverterRustBuffer {
         FfiConverterString.write(value.content, into: &buf)
         FfiConverterInt64.write(value.votes, into: &buf)
         FfiConverterBool.write(value.voted, into: &buf)
+        FfiConverterDouble.write(value.weight, into: &buf)
     }
 }
 
@@ -16979,21 +17010,26 @@ public func FfiConverterTypePollStateRecord_lower(_ value: PollStateRecord) -> R
 
 
 /**
- * Vote form state (`PollVoteDraft`).
+ * Vote form state (`PollVoteDraft`), with precomputed selection flags so untouched / tick-only
+ * drafts do not cross FFI per render getter.
  */
 public struct PollVoteDraftRecord: Equatable, Hashable {
     public var selected: [String]
     public var original: [String]
     public var multi: Bool
     public var added: [AddedPollOptionRecord]
+    public var selectionChanged: Bool
+    public var selectionEmpty: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(selected: [String], original: [String], multi: Bool, added: [AddedPollOptionRecord]) {
+    public init(selected: [String], original: [String], multi: Bool, added: [AddedPollOptionRecord], selectionChanged: Bool = false, selectionEmpty: Bool = true) {
         self.selected = selected
         self.original = original
         self.multi = multi
         self.added = added
+        self.selectionChanged = selectionChanged
+        self.selectionEmpty = selectionEmpty
     }
 
     
@@ -17015,7 +17051,9 @@ public struct FfiConverterTypePollVoteDraftRecord: FfiConverterRustBuffer {
                 selected: FfiConverterSequenceString.read(from: &buf), 
                 original: FfiConverterSequenceString.read(from: &buf), 
                 multi: FfiConverterBool.read(from: &buf), 
-                added: FfiConverterSequenceTypeAddedPollOptionRecord.read(from: &buf)
+                added: FfiConverterSequenceTypeAddedPollOptionRecord.read(from: &buf), 
+                selectionChanged: FfiConverterBool.read(from: &buf), 
+                selectionEmpty: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -17024,6 +17062,8 @@ public struct FfiConverterTypePollVoteDraftRecord: FfiConverterRustBuffer {
         FfiConverterSequenceString.write(value.original, into: &buf)
         FfiConverterBool.write(value.multi, into: &buf)
         FfiConverterSequenceTypeAddedPollOptionRecord.write(value.added, into: &buf)
+        FfiConverterBool.write(value.selectionChanged, into: &buf)
+        FfiConverterBool.write(value.selectionEmpty, into: &buf)
     }
 }
 

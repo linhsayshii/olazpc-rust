@@ -27,12 +27,15 @@ use crate::messages::ContactsStateRecord;
 // ---------------------------------------------------------------------------
 
 /// One option row inside [`PollDetailRecord`].
-#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, PartialEq, uniffi::Record)]
 pub struct PollOptionRecord {
     pub id: String,
     pub content: String,
     pub votes: i64,
     pub voted: bool,
+    /// Precomputed share of `total_votes` (`0.0..=1.0`), computed once per detail update in core.
+    #[uniffi(default = 0.0)]
+    pub weight: f64,
 }
 
 impl fmt::Debug for PollOptionRecord {
@@ -51,6 +54,7 @@ impl From<PollOption> for PollOptionRecord {
             content: o.content,
             votes: o.votes,
             voted: o.voted,
+            weight: 0.0,
         }
     }
 }
@@ -66,8 +70,9 @@ impl From<PollOptionRecord> for PollOption {
     }
 }
 
-/// Normalized group poll detail (`PollDetail`).
-#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+/// Normalized group poll detail (`PollDetail`), including derived render fields computed once per
+/// detail update in core so SwiftUI views do not cross FFI per getter.
+#[derive(Clone, PartialEq, uniffi::Record)]
 pub struct PollDetailRecord {
     pub id: String,
     pub group_id: String,
@@ -84,6 +89,16 @@ pub struct PollDetailRecord {
     pub hide_preview: bool,
     pub voter_count: i64,
     pub can_close: bool,
+    #[uniffi(default = 0)]
+    pub total_votes: i64,
+    #[uniffi(default = false)]
+    pub results_hidden: bool,
+    #[uniffi(default = false)]
+    pub voters_visible: bool,
+    #[uniffi(default = false)]
+    pub locked_without_expiry: bool,
+    #[uniffi(default = false)]
+    pub has_duplicate_options: bool,
     pub options: Vec<PollOptionRecord>,
 }
 
@@ -101,6 +116,22 @@ impl fmt::Debug for PollDetailRecord {
 
 impl From<PollDetail> for PollDetailRecord {
     fn from(d: PollDetail) -> Self {
+        let total_votes = d.total_votes();
+        let results_hidden = d.results_hidden();
+        let voters_visible = d.voters_visible();
+        let locked_without_expiry = d.closed || (d.hide_preview && d.joined);
+        let has_duplicate_options = PollVoteDraft::new(&d).has_duplicates(&d);
+        let options = d
+            .options
+            .iter()
+            .map(|o| PollOptionRecord {
+                id: o.id.clone(),
+                content: o.content.clone(),
+                votes: o.votes,
+                voted: o.voted,
+                weight: d.weight(o),
+            })
+            .collect();
         Self {
             id: d.id,
             group_id: d.group_id,
@@ -117,7 +148,12 @@ impl From<PollDetail> for PollDetailRecord {
             hide_preview: d.hide_preview,
             voter_count: d.voter_count,
             can_close: d.can_close,
-            options: d.options.into_iter().map(Into::into).collect(),
+            total_votes,
+            results_hidden,
+            voters_visible,
+            locked_without_expiry,
+            has_duplicate_options,
+            options,
         }
     }
 }
@@ -177,7 +213,7 @@ impl From<PollPinStateRecord> for PollPinState {
 }
 
 /// Key/value entry for `PollsMirrorRecord.details`.
-#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, PartialEq, uniffi::Record)]
 pub struct PollDetailEntryRecord {
     pub id: String,
     pub detail: PollDetailRecord,
@@ -253,7 +289,7 @@ impl fmt::Debug for PollPendingRefreshEntryRecord {
 }
 
 /// Coalesced mirror snapshot of `CoreState.polls` (`PollStore` + `PollClock`).
-#[derive(Clone, Default, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, Default, PartialEq, uniffi::Record)]
 pub struct PollsMirrorRecord {
     pub details: Vec<PollDetailEntryRecord>,
     pub pins: Vec<PollPinEntryRecord>,
@@ -614,13 +650,18 @@ impl From<AddedPollOptionRecord> for AddedPollOption {
     }
 }
 
-/// Vote form state (`PollVoteDraft`).
+/// Vote form state (`PollVoteDraft`), with precomputed selection flags so untouched / tick-only
+/// drafts do not cross FFI per render getter.
 #[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct PollVoteDraftRecord {
     pub selected: Vec<String>,
     pub original: Vec<String>,
     pub multi: bool,
     pub added: Vec<AddedPollOptionRecord>,
+    #[uniffi(default = false)]
+    pub selection_changed: bool,
+    #[uniffi(default = true)]
+    pub selection_empty: bool,
 }
 
 impl fmt::Debug for PollVoteDraftRecord {
@@ -635,6 +676,8 @@ impl fmt::Debug for PollVoteDraftRecord {
 
 impl From<PollVoteDraft> for PollVoteDraftRecord {
     fn from(d: PollVoteDraft) -> Self {
+        let selection_changed = d.selected() != d.original();
+        let selection_empty = d.selected().is_empty();
         let selected = d.selected().iter().cloned().collect();
         let original = d.original().iter().cloned().collect();
         let multi = d.multi();
@@ -644,6 +687,8 @@ impl From<PollVoteDraft> for PollVoteDraftRecord {
             original,
             multi,
             added,
+            selection_changed,
+            selection_empty,
         }
     }
 }
@@ -850,7 +895,7 @@ impl fmt::Debug for PollDebounceArmRecord {
 }
 
 /// Output of [`apply_note_poll_messages_ffi`].
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct NotePollMessagesPlanRecord {
     pub mirror: PollsMirrorRecord,
     pub armed: Vec<PollDebounceArmRecord>,
@@ -1448,6 +1493,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn poll_detail_record_precomputes_derived_render_fields() {
+        let raw = json!({
+            "id": "p1",
+            "groupId": "g1",
+            "question": "Ăn gì?",
+            "creator": "5",
+            "creatorName": "Lan",
+            "created": 1_700_000_000_000_i64,
+            "expired": 1_900_000_000_000_i64,
+            "closed": false,
+            "joined": true,
+            "multi": true,
+            "allowAdd": true,
+            "anonymous": false,
+            "hidePreview": true,
+            "voters": 3,
+            "canClose": true,
+            "options": [
+                {"id": "1", "content": "Phở", "votes": 2, "voted": true},
+                {"id": "2", "content": "Bún", "votes": 1, "voted": false},
+                {"id": "3", "content": "Cơm", "votes": 0, "voted": false}
+            ]
+        });
+        let maybe_detail = raw.as_object().and_then(PollDetail::from_json);
+        assert!(maybe_detail.is_some());
+        let Some(detail) = maybe_detail else {
+            return;
+        };
+        let rec = PollDetailRecord::from(detail);
+        assert_eq!(rec.total_votes, 3);
+        assert!(!rec.results_hidden);
+        assert!(rec.voters_visible);
+        assert!(rec.locked_without_expiry);
+        assert!(!rec.has_duplicate_options);
+        assert!((rec.options[0].weight - 2.0 / 3.0).abs() < 1e-9);
+        assert!((rec.options[1].weight - 1.0 / 3.0).abs() < 1e-9);
+        assert!(rec.options[2].weight.abs() < 1e-9);
+    }
+
+    #[test]
     fn poll_ffi_records_redact_sensitive_fields_in_debug() {
         let detail = PollDetailRecord {
             id: "SECRET_POLL_ID".to_owned(),
@@ -1465,11 +1550,17 @@ mod tests {
             hide_preview: false,
             voter_count: 1,
             can_close: true,
+            total_votes: 1,
+            results_hidden: false,
+            voters_visible: true,
+            locked_without_expiry: false,
+            has_duplicate_options: false,
             options: vec![PollOptionRecord {
                 id: "SECRET_OPT_ID".to_owned(),
                 content: "SECRET_OPT_TEXT".to_owned(),
                 votes: 1,
                 voted: true,
+                weight: 1.0,
             }],
         };
         let voters = PollVotersRecord {

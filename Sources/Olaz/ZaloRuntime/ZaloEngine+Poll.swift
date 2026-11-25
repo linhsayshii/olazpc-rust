@@ -21,12 +21,14 @@ struct PollDetail: Equatable, Sendable, Identifiable {
         var content: String
         var votes: Int
         var voted: Bool
+        fileprivate var cachedWeight: Double
 
-        init(id: String, content: String, votes: Int, voted: Bool) {
+        init(id: String, content: String, votes: Int, voted: Bool, weight: Double = 0) {
             self.id = id
             self.content = content
             self.votes = votes
             self.voted = voted
+            self.cachedWeight = weight
         }
 
         init(coreRecord r: PollOptionRecord) {
@@ -34,10 +36,15 @@ struct PollDetail: Equatable, Sendable, Identifiable {
             self.content = r.content
             self.votes = Int(r.votes)
             self.voted = r.voted
+            self.cachedWeight = r.weight
         }
 
         var coreRecord: PollOptionRecord {
-            PollOptionRecord(id: id, content: content, votes: Int64(votes), voted: voted)
+            PollOptionRecord(id: id, content: content, votes: Int64(votes), voted: voted, weight: cachedWeight)
+        }
+
+        static func == (lhs: Option, rhs: Option) -> Bool {
+            lhs.id == rhs.id && lhs.content == rhs.content && lhs.votes == rhs.votes && lhs.voted == rhs.voted
         }
     }
 
@@ -49,6 +56,7 @@ struct PollDetail: Equatable, Sendable, Identifiable {
     var creatorName: String
     var created: Date?
     var expires: Date?
+    private let expiresMs: Int64?
     var closed: Bool
     /// I have voted (official `joined`).
     var joined: Bool
@@ -60,6 +68,14 @@ struct PollDetail: Equatable, Sendable, Identifiable {
     var voterCount: Int
     /// Owner / deputy / creator (official `isEnableClose`).
     var canClose: Bool
+    /// Precomputed in core once per detail update.
+    let totalVotes: Int
+    /// "Ẩn kết quả khi chưa bình chọn": the numbers are only meaningful after I voted.
+    let resultsHidden: Bool
+    /// Official `isEnableViewDetail`: voter list is offered when the poll is not anonymous and results are visible.
+    let votersVisible: Bool
+    private let lockedWithoutExpiry: Bool
+    fileprivate let hasDuplicateOptions: Bool
     var options: [Option]
 
     init(coreRecord r: PollDetailRecord) {
@@ -70,6 +86,7 @@ struct PollDetail: Equatable, Sendable, Identifiable {
         self.creatorName = r.creatorName
         self.created = r.createdMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) }
         self.expires = r.expiresMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) }
+        self.expiresMs = r.expiresMs
         self.closed = r.closed
         self.joined = r.joined
         self.multi = r.multi
@@ -78,6 +95,11 @@ struct PollDetail: Equatable, Sendable, Identifiable {
         self.hidePreview = r.hidePreview
         self.voterCount = Int(r.voterCount)
         self.canClose = r.canClose
+        self.totalVotes = Int(r.totalVotes)
+        self.resultsHidden = r.resultsHidden
+        self.votersVisible = r.votersVisible
+        self.lockedWithoutExpiry = r.lockedWithoutExpiry
+        self.hasDuplicateOptions = r.hasDuplicateOptions
         self.options = r.options.map(Option.init(coreRecord:))
     }
 
@@ -106,31 +128,47 @@ struct PollDetail: Equatable, Sendable, Identifiable {
             hidePreview: hidePreview,
             voterCount: Int64(voterCount),
             canClose: canClose,
+            totalVotes: Int64(totalVotes),
+            resultsHidden: resultsHidden,
+            votersVisible: votersVisible,
+            lockedWithoutExpiry: lockedWithoutExpiry,
+            hasDuplicateOptions: hasDuplicateOptions,
             options: options.map(\.coreRecord)
         )
     }
 
-    var totalVotes: Int { Int(pollDetailTotalVotes(detail: coreRecord)) }
+    static func == (lhs: PollDetail, rhs: PollDetail) -> Bool {
+        lhs.id == rhs.id
+            && lhs.groupId == rhs.groupId
+            && lhs.question == rhs.question
+            && lhs.creator == rhs.creator
+            && lhs.creatorName == rhs.creatorName
+            && lhs.created == rhs.created
+            && lhs.expires == rhs.expires
+            && lhs.closed == rhs.closed
+            && lhs.joined == rhs.joined
+            && lhs.multi == rhs.multi
+            && lhs.allowAdd == rhs.allowAdd
+            && lhs.anonymous == rhs.anonymous
+            && lhs.hidePreview == rhs.hidePreview
+            && lhs.voterCount == rhs.voterCount
+            && lhs.canClose == rhs.canClose
+            && lhs.options == rhs.options
+    }
 
     func isExpired(at now: Date = .now) -> Bool {
+        guard let expiresMs else { return false }
         let nowMs = Int64((now.timeIntervalSince1970 * 1000.0).rounded())
-        return pollDetailIsExpired(detail: coreRecord, nowMs: nowMs)
+        return expiresMs < nowMs
     }
 
     /// Votes cannot change any more: closed, expired, or (results hidden until voting) already voted.
     func isVotingLocked(at now: Date = .now) -> Bool {
-        let nowMs = Int64((now.timeIntervalSince1970 * 1000.0).rounded())
-        return pollDetailIsVotingLocked(detail: coreRecord, nowMs: nowMs)
+        lockedWithoutExpiry || isExpired(at: now)
     }
 
-    /// "Ẩn kết quả khi chưa bình chọn": the numbers are only meaningful after I voted.
-    var resultsHidden: Bool { pollDetailResultsHidden(detail: coreRecord) }
-
-    /// Official `isEnableViewDetail`: voter list is offered when the poll is not anonymous and results are visible.
-    var votersVisible: Bool { pollDetailVotersVisible(detail: coreRecord) }
-
     func weight(of option: Option) -> Double {
-        pollDetailOptionWeight(detail: coreRecord, option: option.coreRecord)
+        option.cachedWeight
     }
 }
 
@@ -146,6 +184,8 @@ struct PollVoteDraft: Equatable {
     private(set) var selected: Set<String>
     private let original: Set<String>
     private let multi: Bool
+    private var selectionChanged: Bool
+    private var selectionEmpty: Bool
     var added: [Added] = []
 
     init(_ detail: PollDetail) {
@@ -153,6 +193,15 @@ struct PollVoteDraft: Equatable {
         selected = Set(rec.selected)
         original = Set(rec.original)
         multi = rec.multi
+        selectionChanged = rec.selectionChanged
+        selectionEmpty = rec.selectionEmpty
+    }
+
+    static func == (lhs: PollVoteDraft, rhs: PollVoteDraft) -> Bool {
+        lhs.selected == rhs.selected
+            && lhs.original == rhs.original
+            && lhs.multi == rhs.multi
+            && lhs.added == rhs.added
     }
 
     var coreRecord: PollVoteDraftRecord {
@@ -160,12 +209,16 @@ struct PollVoteDraft: Equatable {
             selected: selected.sorted(),
             original: original.sorted(),
             multi: multi,
-            added: added.map { AddedPollOptionRecord(id: $0.id.uuidString, text: $0.text, voted: $0.voted) }
+            added: added.map { AddedPollOptionRecord(id: $0.id.uuidString, text: $0.text, voted: $0.voted) },
+            selectionChanged: selectionChanged,
+            selectionEmpty: selectionEmpty
         )
     }
 
     private mutating func applyCoreRecord(_ rec: PollVoteDraftRecord) {
         selected = Set(rec.selected)
+        selectionChanged = rec.selectionChanged
+        selectionEmpty = rec.selectionEmpty
         added = rec.added.map { row in
             Added(id: UUID(uuidString: row.id) ?? UUID(), text: row.text, voted: row.voted)
         }
@@ -183,14 +236,18 @@ struct PollVoteDraft: Equatable {
     mutating func removeAdded(_ id: UUID) { added.removeAll { $0.id == id } }
 
     /// Anything to send: a changed tick or a new option (official confirm button state).
-    var hasChanges: Bool { pollVoteDraftHasChanges(draft: coreRecord) }
+    var hasChanges: Bool {
+        added.isEmpty ? selectionChanged : pollVoteDraftHasChanges(draft: coreRecord)
+    }
 
     /// Nothing is ticked (existing or added): the official "hide results" confirmation is skipped for this.
-    var votesNothing: Bool { pollVoteDraftVotesNothing(draft: coreRecord) }
+    var votesNothing: Bool {
+        added.isEmpty ? selectionEmpty : pollVoteDraftVotesNothing(draft: coreRecord)
+    }
 
     /// Same trimmed text used twice among the existing and the added options.
     func hasDuplicates(in detail: PollDetail) -> Bool {
-        pollVoteDraftHasDuplicates(draft: coreRecord, detail: detail.coreRecord)
+        added.isEmpty ? detail.hasDuplicateOptions : pollVoteDraftHasDuplicates(draft: coreRecord, detail: detail.coreRecord)
     }
 
     func isDuplicate(_ id: UUID, in detail: PollDetail) -> Bool {

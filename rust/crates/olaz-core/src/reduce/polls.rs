@@ -916,7 +916,6 @@ fn reduce_poll_command(
 
         Command::SeedPolls { polls } => {
             state.polls = *polls;
-            out.dirty.insert(DirtyKey::Polls);
             complete_op(out, op_id, OpResult::Unit, false);
         }
 

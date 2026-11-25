@@ -220,4 +220,161 @@ import Testing
         print(Self.row("(d) load 700 conversations", ms: rust))
         #expect(b == 700)
     }
+
+    // MARK: (e) poll detail render path: 10 options, 200 voters, 1,000 iterations
+
+    private struct OriginMainPollDetail {
+        struct Option {
+            var id: String
+            var content: String
+            var votes: Int
+            var voted: Bool
+        }
+        var id: String
+        var groupId: String
+        var question: String
+        var creator: String
+        var creatorName: String
+        var created: Date?
+        var expires: Date?
+        var closed: Bool
+        var joined: Bool
+        var multi: Bool
+        var allowAdd: Bool
+        var anonymous: Bool
+        var hidePreview: Bool
+        var voterCount: Int
+        var canClose: Bool
+        var options: [Option]
+
+        var totalVotes: Int { options.reduce(0) { $0 + $1.votes } }
+        func isExpired(at now: Date) -> Bool { expires.map { $0 < now } ?? false }
+        func isVotingLocked(at now: Date) -> Bool { closed || isExpired(at: now) || (hidePreview && joined) }
+        var resultsHidden: Bool { hidePreview && !joined }
+        var votersVisible: Bool { !anonymous && !resultsHidden && totalVotes > 0 }
+        func weight(of option: Option) -> Double { totalVotes > 0 ? Double(option.votes) / Double(totalVotes) : 0 }
+    }
+
+    @Test func pollRender10Options200Voters() throws {
+        let rawOptions: [[String: Any]] = (0..<10).map { i in
+            [
+                "id": "opt_\(i + 1)",
+                "content": "Phương án lựa chọn số \(i + 1) cho cuộc họp nhóm tuần này",
+                "votes": 16 + i,
+                "voted": i < 2
+            ]
+        }
+        let rawJson: [String: Any] = [
+            "id": "poll_9001",
+            "groupId": "g_8800112233",
+            "question": "Tuần này nhóm mình họp offline ở địa điểm nào thuận tiện nhất?",
+            "creator": "1000000001",
+            "creatorName": "Nguyễn Thị Lan",
+            "created": 1_700_000_000_000,
+            "expired": 1_900_000_000_000,
+            "closed": false,
+            "joined": true,
+            "multi": true,
+            "allowAdd": true,
+            "anonymous": false,
+            "hidePreview": false,
+            "voters": 200,
+            "canClose": true,
+            "options": rawOptions
+        ]
+        let detail = try #require(PollDetail(json: rawJson))
+        let baseline = OriginMainPollDetail(
+            id: detail.id, groupId: detail.groupId, question: detail.question,
+            creator: detail.creator, creatorName: detail.creatorName,
+            created: detail.created, expires: detail.expires,
+            closed: detail.closed, joined: detail.joined, multi: detail.multi,
+            allowAdd: detail.allowAdd, anonymous: detail.anonymous, hidePreview: detail.hidePreview,
+            voterCount: detail.voterCount, canClose: detail.canClose,
+            options: detail.options.map { .init(id: $0.id, content: $0.content, votes: $0.votes, voted: $0.voted) }
+        )
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+        var draft = PollVoteDraft(detail)
+        draft.toggle("opt_3")
+
+        let iterations = 1_000
+        var coreAcc = 0.0
+        var coreFlags = 0
+        let coreDetailMs = Self.median {
+            var acc = 0.0
+            var flags = 0
+            for _ in 0..<iterations {
+                for opt in detail.options {
+                    acc += detail.weight(of: opt)
+                }
+                acc += Double(detail.totalVotes)
+                if detail.isVotingLocked(at: fixedNow) { flags &+= 1 }
+                if detail.resultsHidden { flags &+= 2 }
+                if detail.votersVisible { flags &+= 4 }
+            }
+            coreAcc = acc
+            coreFlags = flags
+        }
+
+        var perGetterAcc = 0.0
+        var perGetterFlags = 0
+        let perGetterFfiMs = Self.median {
+            var acc = 0.0
+            var flags = 0
+            for _ in 0..<iterations {
+                for opt in detail.options {
+                    acc += pollDetailOptionWeight(detail: detail.coreRecord, option: opt.coreRecord)
+                }
+                acc += Double(pollDetailTotalVotes(detail: detail.coreRecord))
+                let nowMs = Int64((fixedNow.timeIntervalSince1970 * 1000.0).rounded())
+                if pollDetailIsVotingLocked(detail: detail.coreRecord, nowMs: nowMs) { flags &+= 1 }
+                if pollDetailResultsHidden(detail: detail.coreRecord) { flags &+= 2 }
+                if pollDetailVotersVisible(detail: detail.coreRecord) { flags &+= 4 }
+            }
+            perGetterAcc = acc
+            perGetterFlags = flags
+        }
+
+        var baseAcc = 0.0
+        var baseFlags = 0
+        let baseDetailMs = Self.median {
+            var acc = 0.0
+            var flags = 0
+            for _ in 0..<iterations {
+                for opt in baseline.options {
+                    acc += baseline.weight(of: opt)
+                }
+                acc += Double(baseline.totalVotes)
+                if baseline.isVotingLocked(at: fixedNow) { flags &+= 1 }
+                if baseline.resultsHidden { flags &+= 2 }
+                if baseline.votersVisible { flags &+= 4 }
+            }
+            baseAcc = acc
+            baseFlags = flags
+        }
+
+        var sheetAcc = 0.0
+        let coreVoteSheetMs = Self.median {
+            var acc = 0.0
+            for _ in 0..<iterations {
+                let preview = draft.applied(to: detail)
+                for opt in detail.options {
+                    let shown = preview.options.first { $0.id == opt.id } ?? opt
+                    acc += preview.weight(of: shown)
+                }
+                if detail.isVotingLocked(at: fixedNow) { acc += 1 }
+                if detail.resultsHidden { acc += 1 }
+                if detail.votersVisible { acc += 1 }
+                if draft.canSubmit && !draft.hasDuplicates(in: detail) { acc += 1 }
+            }
+            sheetAcc = acc
+        }
+
+        // 1,000 iterations in `ms` == per-render `µs` (`ms * 1000 / 1000 == ms`).
+        print(Self.row("(e) 1000x PollDetail render (core record fields)", ms: coreDetailMs, note: String(format: "%.3f µs/render", coreDetailMs)))
+        print(Self.row("(e) .. before (25658d9 per-getter FFI)", ms: perGetterFfiMs, note: String(format: "%.3f µs/render", perGetterFfiMs)))
+        print(Self.row("(e) .. origin/main PollDetail baseline", ms: baseDetailMs, note: String(format: "%.3f µs/render", baseDetailMs)))
+        print(Self.row("(e') 1000x PollVoteDraft + PollDetail votePage render", ms: coreVoteSheetMs, note: String(format: "%.3f µs/render", coreVoteSheetMs)))
+        #expect(abs(coreAcc - baseAcc) < 1e-6 && abs(perGetterAcc - baseAcc) < 1e-6)
+        #expect(coreFlags == baseFlags && perGetterFlags == baseFlags && sheetAcc > 0)
+    }
 }
