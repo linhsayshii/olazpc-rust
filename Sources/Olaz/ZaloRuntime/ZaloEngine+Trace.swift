@@ -13,6 +13,13 @@ extension ZaloEngine {
         return traceHost(name, args: args())
     }
 
+    internal func traceNotifyHost(_ name: String, args: @autoclosure () -> [String: Any] = [:]) -> Bool {
+        guard traceNotifyHostEnabled else {
+            return hostTrace == nil
+        }
+        return traceHost(name, args: args())
+    }
+
     internal func showActionCard(_ text: String, in conversationId: String?) {
         if traceHost("show_card", args: ["conv_id": conversationId ?? NSNull(), "text": text]) {
             CardActionCenter.shared.show(text, in: conversationId)
@@ -46,6 +53,15 @@ extension ZaloEngine {
         pollRefreshTasks[key] = task
     }
 
+    internal func trackNotificationTask(_ body: @escaping @MainActor () async -> Void) {
+        let key = UUID()
+        let task = Task { @MainActor [weak self] in
+            defer { self?.notificationTasks.removeValue(forKey: key) }
+            await body()
+        }
+        notificationTasks[key] = task
+    }
+
     internal func syncSessionClientTrace() async {
         guard hostTrace != nil else {
             await sessionClient.setSessionTrace(nil)
@@ -72,6 +88,7 @@ extension ZaloEngine {
         sendFilesHostHandler = nil
         forwardTempPhotoURL = nil
         traceU4HostEnabled = false
+        traceNotifyHostEnabled = false
         stateTrace = nil
         EngineLog.shared.onAppend = nil
         stopCoreEngine()
@@ -99,6 +116,13 @@ extension ZaloEngine {
         pollRefreshTasks.values.forEach { $0.cancel() }
         cloudRefreshTask?.cancel()
         cloudRefreshTask = nil
+        notifyBannerHook = nil
+        requestNotifAuthHostHandler = nil
+        notificationCalendar = .current
+        reminderWatchSleep = nil
+        notificationTasks.values.forEach { $0.cancel() }
+        notificationTasks.removeAll()
+        resetCardState()
         typingResetTasks.values.forEach { $0.cancel() }
         typingResetTasks = [:]
     }
@@ -186,6 +210,15 @@ extension ZaloEngine {
         _ = await persistConversationsTask?.value
     }
 
+    internal func awaitNotificationTasksForRecording() async {
+        while !notificationTasks.isEmpty {
+            let tasks = Array(notificationTasks.values)
+            notificationTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
+        _ = await persistConversationsTask?.value
+    }
+
     internal func finishTearDownForRecording() async {
         await sessionClient.setSessionTrace(nil)
         _ = await bootTask?.value
@@ -215,6 +248,11 @@ extension ZaloEngine {
             for task in tasks { _ = await task.value }
         }
         _ = await cloudRefreshTask?.value
+        while !notificationTasks.isEmpty {
+            let tasks = Array(notificationTasks.values)
+            notificationTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
         _ = await persistConversationsTask?.value
         _ = await pendingCleanupTask?.value
     }

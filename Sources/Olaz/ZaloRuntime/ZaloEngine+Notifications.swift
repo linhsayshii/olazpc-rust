@@ -87,6 +87,17 @@ struct MuteInfo: Equatable, Sendable {
     }
 }
 
+internal struct NotifyBannerRecord: Equatable, Sendable {
+    var title: String
+    var body: String
+    var convId: String
+    var senderId: String
+    var senderName: String
+    var isGroup: Bool
+    var avatarURL: String?
+    var silent: Bool
+}
+
 /// Notification preferences mirrored from the official client.
 struct NotificationSettingsState: Equatable {
     enum Authorization: String, Equatable, Sendable {
@@ -151,47 +162,76 @@ extension ZaloEngine {
         notificationSettings.enabled = enabled
         notificationSettings.sound = enabled
         notificationSettings.hasSoundSetting = true
-        if enabled { Task { await requestNotificationAuthorization() } }
-        Task { await saveNotificationPreferences() }
+        if enabled {
+            trackNotificationTask { [weak self] in
+                await self?.requestNotificationAuthorization()
+            }
+        }
+        trackNotificationTask { [weak self] in
+            await self?.saveNotificationPreferences()
+        }
     }
 
     func setNotificationSound(_ enabled: Bool) {
         notificationSettings.sound = enabled
         notificationSettings.hasSoundSetting = true
-        Task { await saveNotificationPreferences() }
+        trackNotificationTask { [weak self] in
+            await self?.saveNotificationPreferences()
+        }
     }
 
     func setMessagePreview(_ shown: Bool) {
         notificationSettings.showsPreview = shown
-        UserDefaults.standard.set(shown, forKey: NotificationSettingsState.previewDefaultsKey)
+        userDefaults.set(shown, forKey: NotificationSettingsState.previewDefaultsKey)
     }
 
     func notificationSettingsDidAppear() {
-        Task { await refreshNotificationAuthorization() }
+        trackNotificationTask { [weak self] in
+            await self?.refreshNotificationAuthorization()
+        }
     }
 
     // MARK: Actions — per-conversation mute
 
-    func isConversationMuted(_ id: String) -> Bool { notificationSettings.isMuted(id) }
+    func isConversationMuted(_ id: String) -> Bool {
+        notificationSettings.isMuted(id, now: Date(timeIntervalSince1970: Double(nowMs()) / 1000.0))
+    }
 
     func muteConversation(_ id: String, _ duration: MuteDuration) {
-        let now = Date.now
-        let until = duration.expiry(from: now)
+        let currentMs = nowMs()
+        let now = Date(timeIntervalSince1970: Double(currentMs) / 1000.0)
+        let until = duration.expiry(from: now, calendar: notificationCalendar)
         let sec = until.map { Int($0.timeIntervalSince(now)) } ?? -1
         notificationSettings.mutes[id] = MuteInfo(startTime: now.timeIntervalSince1970, duration: sec < 0 ? -1 : Double(sec))
         let isGroup = ZaloWireParser.isGroupId(id)
-        Task {
-            try? await sessionClient.setMuteAPI(convId: id, isGroup: isGroup, durationSeconds: sec, unmute: false)
-            await saveNotificationPreferences()
+        let startTimeSec = currentMs / 1000
+        trackNotificationTask { [weak self] in
+            guard let self else { return }
+            try? await self.sessionClient.setMuteAPI(
+                convId: id,
+                isGroup: isGroup,
+                durationSeconds: sec,
+                unmute: false,
+                startTimeSec: startTimeSec
+            )
+            await self.saveNotificationPreferences()
         }
     }
 
     func unmuteConversation(_ id: String) {
         notificationSettings.mutes[id] = nil
         let isGroup = ZaloWireParser.isGroupId(id)
-        Task {
-            try? await sessionClient.setMuteAPI(convId: id, isGroup: isGroup, durationSeconds: 0, unmute: true)
-            await saveNotificationPreferences()
+        let startTimeSec = nowMs() / 1000
+        trackNotificationTask { [weak self] in
+            guard let self else { return }
+            try? await self.sessionClient.setMuteAPI(
+                convId: id,
+                isGroup: isGroup,
+                durationSeconds: 0,
+                unmute: true,
+                startTimeSec: startTimeSec
+            )
+            await self.saveNotificationPreferences()
         }
     }
 
@@ -230,6 +270,13 @@ extension ZaloEngine {
 
     @discardableResult
     func requestNotificationAuthorization() async -> NotificationSettingsState.Authorization {
+        if !traceNotifyHost("request_notif_auth"), let handler = requestNotifAuthHostHandler {
+            let auth = await handler()
+            if notificationSettings.authorization != auth {
+                notificationSettings.authorization = auth
+            }
+            return notificationSettings.authorization
+        }
         let result = await NativeNotifier.shared.requestAuthorization()
         applyAuthorization(result)
         return notificationSettings.authorization

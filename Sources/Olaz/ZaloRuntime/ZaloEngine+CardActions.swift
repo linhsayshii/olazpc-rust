@@ -191,13 +191,22 @@ extension ZaloEngine {
                 let gate = OnceGate<Bool>(continuation)
                 let wake: @Sendable () -> Void = { gate.resume(true) }
                 reminderWatchWaiters[key, default: [:]][waiterId] = wake
-                Task {
-                    try? await Task.sleep(for: .seconds(timeoutSeconds))
-                    await MainActor.run {
-                        self.reminderWatchWaiters[key]?.removeValue(forKey: waiterId)
-                        if self.reminderWatchWaiters[key]?.isEmpty == true {
-                            self.reminderWatchWaiters.removeValue(forKey: key)
+                Task { @MainActor in
+                    let completed: Bool
+                    if let sleepHook = self.reminderWatchSleep {
+                        completed = await sleepHook(timeoutSeconds)
+                    } else {
+                        do {
+                            try await Task.sleep(for: .seconds(timeoutSeconds))
+                            completed = true
+                        } catch {
+                            completed = false
                         }
+                    }
+                    guard completed else { return }
+                    self.reminderWatchWaiters[key]?.removeValue(forKey: waiterId)
+                    if self.reminderWatchWaiters[key]?.isEmpty == true {
+                        self.reminderWatchWaiters.removeValue(forKey: key)
                     }
                     gate.resume(nil)
                 }
@@ -524,7 +533,7 @@ extension ZaloEngine {
             let missingUids = Array(Set(allEntries.compactMap { entry -> String? in
                 guard lookupPersonInfo(entry.uid) == nil, entry.name.isEmpty else { return nil }
                 return entry.uid
-            })).prefix(50)
+            })).sorted().prefix(50)
             if !missingUids.isEmpty, await sessionClient.isAuthenticated,
                let profBox = try? await sessionClient.fetchProfiles(uids: Array(missingUids)) {
                 for (uid, row) in ZaloWireParser.extractProfilesMap(profBox.dict) {

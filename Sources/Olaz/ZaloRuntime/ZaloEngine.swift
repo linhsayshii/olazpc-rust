@@ -186,6 +186,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var sendFilesHostHandler: (([String: Any]) async -> ComposerOutcome)?
     @ObservationIgnored internal var forwardTempPhotoURL: (() -> URL)?
     @ObservationIgnored internal var traceU4HostEnabled: Bool = false
+    @ObservationIgnored internal var traceNotifyHostEnabled: Bool = false
     @ObservationIgnored internal var stateTrace: (() -> Void)?
     @ObservationIgnored private let transportSettleTraceActive = OSAllocatedUnfairLock<Bool>(initialState: false)
     nonisolated internal var hasTransportSettleTrace: Bool {
@@ -215,7 +216,12 @@ final class ZaloEngine {
     @ObservationIgnored internal var contactsTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var pollRefreshTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var cloudRefreshTask: Task<Void, Never>?
+    @ObservationIgnored internal var notificationTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var pollDebounceSleep: (@MainActor (Int) async -> Bool)?
+    @ObservationIgnored internal var notifyBannerHook: ((NotifyBannerRecord) -> Void)?
+    @ObservationIgnored internal var requestNotifAuthHostHandler: (@MainActor () async -> NotificationSettingsState.Authorization)?
+    @ObservationIgnored internal var notificationCalendar: Calendar = .current
+    @ObservationIgnored internal var reminderWatchSleep: (@MainActor (Double) async -> Bool)?
     @ObservationIgnored internal var composerConfirmTask: Task<Void, Never>?
     @ObservationIgnored internal var composerConfirmSleep: (@MainActor (Int) async -> Bool)?
     @ObservationIgnored internal var activeSendTask: Task<Bool, Never>?
@@ -284,8 +290,9 @@ final class ZaloEngine {
         userDefaultsSuiteName: String? = nil,
         cookieStorage: HTTPCookieStorage = .shared
     ) {
+        let defaults = userDefaultsSuiteName.flatMap { UserDefaults(suiteName: $0) } ?? .standard
         self.dataDirectory = dataDirectory
-        self.userDefaults = userDefaultsSuiteName.flatMap { UserDefaults(suiteName: $0) } ?? .standard
+        self.userDefaults = defaults
         self.sessionClient = ZaloSessionClient(
             dataDirectory: dataDirectory,
             useKeychain: useKeychain,
@@ -293,6 +300,7 @@ final class ZaloEngine {
             userDefaultsSuiteName: userDefaultsSuiteName,
             cookieStorage: cookieStorage
         )
+        self.notificationSettings.showsPreview = defaults.object(forKey: NotificationSettingsState.previewDefaultsKey) as? Bool ?? true
         self.conversationUI.onRelock = { [weak self] in
             self?.coreLifecycle.core?.relockHidden()
         }
@@ -439,6 +447,7 @@ final class ZaloEngine {
         conversationUI.reset()
         contacts = ContactsState()
         notificationSettings = NotificationSettingsState()
+        notificationSettings.showsPreview = userDefaults.object(forKey: NotificationSettingsState.previewDefaultsKey) as? Bool ?? true
         call = CallState()
         call.helperInstalled = CallBridge.isHelperInstalled()
         call.rendererReady = true
@@ -782,16 +791,38 @@ final class ZaloEngine {
 
                 let rawBody = Self.messagePreviewLabel(msg)
                 let body = notificationSettings.showsPreview ? rawBody : NotificationPolicy.hiddenPreviewBody
-                NativeNotifier.shared.notifyIncomingMessage(
+                let record = NotifyBannerRecord(
                     title: title,
                     body: body,
-                    conversationId: convId,
+                    convId: convId,
                     senderId: cleanSenderId,
                     senderName: senderName,
                     isGroup: isGroup,
-                    avatarURL: resolvedAvatarURL,
+                    avatarURL: resolvedAvatarURL?.absoluteString,
                     silent: !notificationSettings.sound
                 )
+                notifyBannerHook?(record)
+                if traceNotifyHost("notify_banner", args: [
+                    "conv_id": convId,
+                    "sender_id": cleanSenderId,
+                    "is_group": isGroup,
+                    "has_avatar": resolvedAvatarURL != nil,
+                    "silent": !notificationSettings.sound,
+                    "title_len": title.count,
+                    "sender_name_len": senderName.count,
+                    "body_len": body.count,
+                ]) {
+                    NativeNotifier.shared.notifyIncomingMessage(
+                        title: title,
+                        body: body,
+                        conversationId: convId,
+                        senderId: cleanSenderId,
+                        senderName: senderName,
+                        isGroup: isGroup,
+                        avatarURL: resolvedAvatarURL,
+                        silent: !notificationSettings.sound
+                    )
+                }
             }
         }
     }
