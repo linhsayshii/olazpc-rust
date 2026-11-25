@@ -256,14 +256,211 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         }
     }
 
-    func startBootstrap() async {
-        guard let engine else { return }
+    func onBootstrapStarted() async -> Bool {
+        guard let engine else { return false }
         await MainActor.run {
             engine.startBootstrapRefresh()
         }
         await engine.waitForCoreMirrorDrain()
         await MainActor.run {
             engine.noteCoreBootCompleted()
+        }
+        // `startBootstrapRefresh()` spawns `bootstrapTask` -> `performBootstrapSync()` -> `core.bootstrap(nowMs:)`,
+        // so return `false` to prevent double-dispatching `Command::Bootstrap`.
+        return false
+    }
+
+    func applyMutes(mutes: [MuteEntryRecord]) async {
+        guard let engine else { return }
+        await engine.hostApplyBootstrapMutes(mutes)
+    }
+
+    func refreshCloud() async {
+        guard let engine else { return }
+        await MainActor.run {
+            engine.refreshCloud()
+        }
+    }
+
+    func onBatchReceived(
+        cmd: UInt16?,
+        incrementUnread: Bool,
+        notifyIncoming: Bool,
+        payloadJson: String
+    ) async -> String? {
+        guard let engine else { return nil }
+        return await engine.hostOnBatchReceived(
+            cmd: cmd,
+            incrementUnread: incrementUnread,
+            notifyIncoming: notifyIncoming,
+            payloadJson: payloadJson
+        )
+    }
+
+    func onParsedEventsReceived(
+        cmd: UInt16,
+        incrementUnread: Bool,
+        notifyIncoming: Bool,
+        events: [WireEvent],
+        uids: [String],
+        payload: CoreWirePayload
+    ) async -> Bool {
+        guard let engine else { return false }
+        let context = await engine.hostLookupNameContext(uids: uids)
+        let resolvedWire = payload.resolve(
+            myUid: context.myUid,
+            selfConvId: context.selfConvId,
+            names: context.names
+        ) ?? events
+        let parsed = ZaloWireParser.parsedEvents(from: resolvedWire)
+        return await MainActor.run {
+            engine.traceHost("apply_parsed_events", args: [
+                "cmd": Int(cmd),
+                "increment_unread": incrementUnread,
+                "notify_incoming": notifyIncoming,
+                "events": ZaloEngine.serializeParsedWireEvents(parsed),
+            ])
+        }
+    }
+
+    func onOpenConversationSync(convId: String, changed: Bool) async {
+        guard let engine else { return }
+        await MainActor.run {
+            if changed { engine.dropMessagePrompts() }
+            if engine.typing[convId] != nil { engine.typing[convId] = nil }
+            engine.updateCallGateForConversation(convId)
+        }
+    }
+
+    func onCloseConversation() async {
+        guard let engine else { return }
+        await MainActor.run {
+            engine.dropMessagePrompts()
+        }
+    }
+
+    func refreshBoardPins(convId: String) async {
+        guard let engine else { return }
+        await engine.refreshBoardPins(for: convId)
+    }
+
+    func markReadBoundary(convId: String, seenTarget: SeenTargetRecord?) async {
+        guard let engine else { return }
+        await engine.waitForCoreMirrorDrain()
+        await MainActor.run {
+            if engine.traceU4Host("mark_read", args: ["conv_id": convId]) {
+                if let core = engine.coreLifecycle.core {
+                    core.markConversationRead(id: convId, seenTarget: seenTarget)
+                } else {
+                    engine.markRead(convId)
+                }
+            }
+        }
+    }
+
+    func applyRemoteReaction(
+        convId: String,
+        msgId: String,
+        cliMsgId: String,
+        senderId: String,
+        rType: String,
+        rIcon: String,
+        eventId: String,
+        reactClientId: String,
+        senderName: String
+    ) async {
+        guard let engine else { return }
+        await engine.waitForCoreMirrorDrain()
+        await engine.applyRemoteReaction(
+            convId: convId,
+            msgId: msgId,
+            cliMsgId: cliMsgId,
+            senderId: senderId,
+            rType: rType,
+            rIcon: rIcon,
+            eventId: eventId,
+            reactClientId: reactClientId,
+            senderName: senderName
+        )
+    }
+
+    func applyRemoteRecall(
+        convId: String,
+        msgId: String,
+        cliMsgId: String,
+        updateConversationPreview: Bool
+    ) async {
+        guard let engine else { return }
+        await engine.waitForCoreMirrorDrain()
+        _ = await engine.applyRemoteRecall(
+            convId: convId,
+            msgId: msgId,
+            cliMsgId: cliMsgId,
+            updateConversationPreview: updateConversationPreview
+        )
+    }
+
+    func applyRemoteDelete(
+        convId: String,
+        msgId: String,
+        cliMsgId: String,
+        updateConversationPreview: Bool
+    ) async {
+        guard let engine else { return }
+        await engine.waitForCoreMirrorDrain()
+        _ = await engine.applyRemoteDelete(
+            convId: convId,
+            msgId: msgId,
+            cliMsgId: cliMsgId,
+            updateConversationPreview: updateConversationPreview
+        )
+    }
+
+    func decryptEnvelope(payloadJson: String) async -> String {
+        guard let engine else { return payloadJson }
+        return await engine.hostDecryptEnvelope(payloadJson: payloadJson)
+    }
+
+    func markE2eeConversations(convIds: [String]) async {
+        guard let engine else { return }
+        for cid in convIds {
+            await engine.e2eeManager.markE2EEConversation(cid, enabled: true, store: engine.sqliteStore)
+        }
+    }
+
+    func notePollMessages(messages: [ChatMessageRecord]) async {
+        guard let engine, !messages.isEmpty else { return }
+        let mapped = messages.map(ChatMessage.init(record:))
+        await MainActor.run {
+            engine.notePollMessages(mapped)
+        }
+    }
+
+    func notifyIncomingMessages(messages: [ChatMessageRecord]) async {
+        guard let engine, !messages.isEmpty else { return }
+        let mapped = messages.map(ChatMessage.init(record:))
+        await engine.notifyIncomingBatchMessages(mapped)
+    }
+
+    func showBatchTyping(convId: String, senderId: String) async {
+        guard let engine else { return }
+        await MainActor.run {
+            let name = engine.lookupPersonInfo(senderId)?.name ?? "Ai đó"
+            engine.showTyping(convId: convId, name: name)
+        }
+    }
+
+    func transportBatchSettled() async {
+        guard let engine, engine.hasTransportSettleTrace else { return }
+        await engine.waitForCoreMirrorDrain()
+        await MainActor.run {
+            engine.transportSettleTrace?()
+        }
+    }
+
+    func engineLog(message: String) async {
+        await MainActor.run {
+            EngineLog.shared.write(message)
         }
     }
 
@@ -776,15 +973,28 @@ extension ZaloEngine {
                 return nil
             }
 
+            await self.sessionClient.attachCoreApi(core.sharedApi())
             if let store = self.sqliteStore {
                 core.attachStore(store: store.coreStoreHandle)
             }
             core.updateIdentities(table: self.currentIdentityTableRecord())
+            self.pushCoreContactsIfRunning()
+            self.pushCoreHistoryFreshnessIfRunning()
             if let openId = self.openConversationId {
                 core.setOpenConversation(id: openId)
             }
             if !self.conversations.isEmpty {
                 core.syncConversationsSnapshot(list: self.conversations.map(\.coreRecord))
+            }
+            if !self.messages.isEmpty {
+                for (convId, list) in self.messages {
+                    core.writeThroughReplaceWindow(convId: convId, messages: list.map(ChatMessageRecord.init(message:)))
+                }
+            }
+            if !self.hasMoreHistory.isEmpty {
+                for (convId, hasMore) in self.hasMoreHistory {
+                    core.writeThroughSetHasMore(convId: convId, hasMore: hasMore)
+                }
             }
 
             let queued = self.pendingCoreCommands
@@ -1153,6 +1363,98 @@ extension ZaloEngine {
             }
         }
 
+        if batch.messagesResetAll {
+            if !messages.isEmpty { messages = [:] }
+            if !hasMoreHistory.isEmpty { hasMoreHistory = [:] }
+            if !historyTicks.isEmpty { historyTicks = [:] }
+            historyFreshness = [:]
+        }
+
+        if !batch.windowDeltas.isEmpty {
+            for delta in batch.windowDeltas {
+                switch delta {
+                case .reset(let convId, let records):
+                    let mapped = records.map(ChatMessage.init(record:))
+                    if messages[convId] != mapped {
+                        messages[convId] = mapped
+                    }
+                case .append(let convId, let records):
+                    let mapped = records.map(ChatMessage.init(record:))
+                    var list = messages[convId] ?? []
+                    let existingIds = Set(list.map(\.id))
+                    let fresh = mapped.filter { !existingIds.contains($0.id) }
+                    if !fresh.isEmpty {
+                        list.append(contentsOf: fresh)
+                        messages[convId] = list
+                    } else if messages[convId] == nil {
+                        messages[convId] = []
+                    }
+                case .patch(let convId, let upserts, let removedIds):
+                    var list = messages[convId] ?? []
+                    var changed = false
+                    if !removedIds.isEmpty {
+                        let rm = Set(removedIds)
+                        let prevCount = list.count
+                        list.removeAll { rm.contains($0.id) }
+                        if list.count != prevCount { changed = true }
+                    }
+                    for rec in upserts {
+                        let msg = ChatMessage(record: rec)
+                        if let idx = list.firstIndex(where: { $0.id == msg.id }) {
+                            if list[idx] != msg {
+                                list[idx] = msg
+                                changed = true
+                            }
+                        } else {
+                            list.append(msg)
+                            list.sort { a, b in
+                                if a.date != b.date { return a.date < b.date }
+                                return a.id < b.id
+                            }
+                            changed = true
+                        }
+                    }
+                    if changed {
+                        messages[convId] = list
+                    }
+                }
+            }
+        }
+
+        if let meta = batch.messageMeta {
+            var nextHasMore: [String: Bool] = [:]
+            nextHasMore.reserveCapacity(meta.hasMoreHistory.count)
+            for entry in meta.hasMoreHistory {
+                nextHasMore[entry.convId] = entry.value
+            }
+            if nextHasMore != hasMoreHistory {
+                hasMoreHistory = nextHasMore
+            }
+
+            var nextTicks: [String: Int] = [:]
+            nextTicks.reserveCapacity(meta.historyTicks.count)
+            for entry in meta.historyTicks {
+                nextTicks[entry.convId] = Int(entry.tick)
+            }
+            if nextTicks != historyTicks {
+                historyTicks = nextTicks
+            }
+
+            var nextFreshness: [String: HistoryFreshness] = [:]
+            nextFreshness.reserveCapacity(meta.historyFreshness.count)
+            for entry in meta.historyFreshness {
+                switch entry.freshness {
+                case .upToDate: nextFreshness[entry.convId] = .upToDate
+                case .stale: nextFreshness[entry.convId] = .stale
+                }
+            }
+            historyFreshness = nextFreshness
+        }
+
+        if let cRec = batch.contacts {
+            applyContactsMirror(cRec)
+        }
+
         if batch.version > appliedMirrorVersion {
             appliedMirrorVersion = batch.version
         }
@@ -1181,9 +1483,271 @@ extension ZaloEngine {
         )
     }
 
+
+    internal func syncDirectMessageChangesToCore(from oldValue: [String: [ChatMessage]], to newValue: [String: [ChatMessage]]) {
+        guard !isApplyingCoreMirror, !isSuppressingDirectMessageSync, let core = coreLifecycle.core else { return }
+        for convId in oldValue.keys where newValue[convId] == nil {
+            core.writeThroughRemoveWindow(convId: convId)
+        }
+        for (convId, list) in newValue where oldValue[convId] != list {
+            core.writeThroughReplaceWindow(convId: convId, messages: list.map(ChatMessageRecord.init(message:)))
+        }
+    }
+
     internal func pushCoreIdentitiesIfRunning() {
         guard !isApplyingCoreMirror, let core = coreLifecycle.core else { return }
         core.updateIdentities(table: currentIdentityTableRecord())
+    }
+
+    internal func currentContactsStateRecord() -> ContactsStateRecord {
+        ContactsStateRecord(
+            friends: contacts.friends.map {
+                FriendEntryRecord(
+                    id: $0.id,
+                    name: $0.name,
+                    zaloName: $0.zaloName,
+                    avatar: $0.avatar?.absoluteString,
+                    lastActiveMs: $0.lastActive.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) },
+                    online: $0.online,
+                    section: $0.section,
+                    sortKey: $0.sortKey
+                )
+            },
+            groups: contacts.groups.map {
+                GroupEntryRecord(
+                    id: $0.id,
+                    name: $0.name,
+                    avatar: $0.avatar?.absoluteString,
+                    members: Int64($0.members),
+                    sortKey: $0.sortKey
+                )
+            },
+            received: contacts.received.map {
+                FriendRequestEntryRecord(
+                    id: $0.id,
+                    name: $0.name,
+                    avatar: $0.avatar?.absoluteString,
+                    message: $0.message,
+                    timeMs: $0.date.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) }
+                )
+            },
+            sent: contacts.sent.map {
+                FriendRequestEntryRecord(
+                    id: $0.id,
+                    name: $0.name,
+                    avatar: $0.avatar?.absoluteString,
+                    message: $0.message,
+                    timeMs: $0.date.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) }
+                )
+            },
+            pendingRequestCount: Int64(contacts.pendingRequestCount),
+            friendsLoaded: contacts.friendsLoaded,
+            groupsLoaded: contacts.groupsLoaded,
+            loadingRequests: contacts.loadingRequests,
+            groupDetailsJson: cachedGroupDetails.map {
+                StringPairEntry(key: $0.key, value: Self.jsonString(for: $0.value))
+            },
+            receivedRawJson: cachedReceivedRequestsRaw.isEmpty ? nil : Self.jsonArrayString(for: cachedReceivedRequestsRaw),
+            sentRawJson: cachedSentRequestsRaw.isEmpty ? nil : Self.jsonArrayString(for: cachedSentRequestsRaw),
+            friendGlobalIds: cachedFriendGlobalIds.map { StringPairEntry(key: $0.key, value: $0.value) }
+        )
+    }
+
+    internal func pushCoreContactsIfRunning() {
+        guard !isApplyingCoreMirror, let core = coreLifecycle.core else { return }
+        core.seedContacts(contacts: currentContactsStateRecord())
+    }
+
+    internal func pushCoreHistoryFreshnessIfRunning() {
+        guard !isApplyingCoreMirror, let core = coreLifecycle.core else { return }
+        let entries = historyFreshness.map { key, val -> FreshnessMapEntry in
+            let rec: HistoryFreshnessRecord = (val == .upToDate) ? .upToDate : .stale
+            return FreshnessMapEntry(convId: key, freshness: rec)
+        }
+        core.seedHistoryFreshness(entries: entries)
+    }
+
+    internal func applyContactsMirror(_ cRec: ContactsStateRecord) {
+        var next = contacts
+        next.friends = cRec.friends.map { f in
+            ContactsState.Friend(
+                id: f.id,
+                name: f.name,
+                zaloName: f.zaloName,
+                avatar: f.avatar.flatMap(URL.init(string:)),
+                lastActive: f.lastActiveMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) },
+                online: f.online,
+                section: f.section,
+                sortKey: f.sortKey
+            )
+        }
+        next.groups = cRec.groups.map { g in
+            ContactsState.Group(
+                id: g.id,
+                name: g.name,
+                avatar: g.avatar.flatMap(URL.init(string:)),
+                members: Int(g.members),
+                sortKey: g.sortKey
+            )
+        }
+        next.received = cRec.received.map { r in
+            ContactsState.FriendRequest(
+                id: r.id,
+                name: r.name,
+                avatar: r.avatar.flatMap(URL.init(string:)),
+                message: r.message,
+                date: r.timeMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) }
+            )
+        }
+        next.sent = cRec.sent.map { r in
+            ContactsState.FriendRequest(
+                id: r.id,
+                name: r.name,
+                avatar: r.avatar.flatMap(URL.init(string:)),
+                message: r.message,
+                date: r.timeMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) }
+            )
+        }
+        next.pendingRequestCount = Int(cRec.pendingRequestCount)
+        next.friendsLoaded = cRec.friendsLoaded
+        next.groupsLoaded = cRec.groupsLoaded
+        next.loadingRequests = cRec.loadingRequests
+        if next != contacts {
+            contacts = next
+        }
+
+        if !cRec.groupDetailsJson.isEmpty {
+            var details = cachedGroupDetails
+            for pair in cRec.groupDetailsJson {
+                if let parsed = JSONLossless.parseObject(string: pair.value) {
+                    details[pair.key] = parsed
+                }
+            }
+            cachedGroupDetails = details
+        }
+        if let recRaw = cRec.receivedRawJson,
+           let data = recRaw.data(using: .utf8),
+           let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
+            cachedReceivedRequestsRaw = arr
+        }
+        if let sentRaw = cRec.sentRawJson,
+           let data = sentRaw.data(using: .utf8),
+           let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
+            cachedSentRequestsRaw = arr
+        }
+        if !cRec.friendGlobalIds.isEmpty {
+            var nextUids = cachedFriendGlobalIds
+            var gidToUid: [String: String] = [:]
+            for pair in cRec.friendGlobalIds where !pair.key.isEmpty && !pair.value.isEmpty {
+                nextUids[pair.key] = pair.value
+                gidToUid[pair.value] = pair.key
+            }
+            if nextUids != cachedFriendGlobalIds {
+                cachedFriendGlobalIds = nextUids
+            }
+            if !gidToUid.isEmpty {
+                let client = sessionClient
+                Task { await client.seedGlobalIdMappings(gidToUid) }
+            }
+        }
+    }
+
+    internal func hostApplyBootstrapMutes(_ mutes: [MuteEntryRecord]) async {
+        let serializedMutes: [[String: Any]] = mutes.map {
+            [
+                "conv_id": $0.convId,
+                "start": $0.start,
+                "duration": $0.duration,
+            ]
+        }
+        if traceU4Host("apply_mutes", args: ["mutes": serializedMutes]) {
+            var map = notificationSettings.mutes
+            for m in mutes {
+                map[m.convId] = MuteInfo(startTime: Double(m.start), duration: Double(m.duration))
+            }
+            notificationSettings.mutes = map
+            await saveNotificationPreferences()
+        }
+    }
+
+    internal func hostOnBatchReceived(
+        cmd: UInt16?,
+        incrementUnread: Bool,
+        notifyIncoming: Bool,
+        payloadJson: String
+    ) async -> String? {
+        let dict = JSONLossless.parseObject(string: payloadJson) ?? [:]
+        let cmdArg: Any = cmd.map { Int($0) } ?? NSNull()
+        guard traceHost("apply_batch", args: [
+            "cmd": cmdArg,
+            "increment_unread": incrementUnread,
+            "notify_incoming": notifyIncoming,
+            "payload": dict,
+        ]) else {
+            return nil
+        }
+        return await hostDecryptEnvelope(payloadJson: payloadJson, parsedDict: dict)
+    }
+
+    internal func hostDecryptEnvelope(payloadJson: String, parsedDict: [String: Any]? = nil) async -> String {
+        let myUid = profile?.userId ?? ""
+        guard !myUid.isEmpty else { return payloadJson }
+        let dict = parsedDict ?? JSONLossless.parseObject(string: payloadJson) ?? [:]
+        let decrypted = await e2eeManager.decryptEnvelopeIfNeeded(
+            ZaloJSONBox(dict),
+            myUid: myUid,
+            store: sqliteStore
+        )
+        return Self.jsonString(for: decrypted.dict)
+    }
+
+    internal func syncCachedIdentityPreferencesFromStore() async {
+        guard let store = sqliteStore else { return }
+        let aliasesData = try? await store.getPreferenceData(key: "aliases")
+        let profData = try? await store.getPreferenceData(key: "cachedProfiles")
+        let grpData = try? await store.getPreferenceData(key: "cachedGroups")
+        let ranksData = try? await store.getPreferenceData(key: "activityRanks")
+        let gidData = try? await store.getPreferenceData(key: "gidToUidMap")
+
+        isApplyingCoreMirror = true
+        defer { isApplyingCoreMirror = false }
+
+        if let aliasesData,
+           let dict = (try? JSONSerialization.jsonObject(with: aliasesData)) as? [String: String] {
+            cachedAliases = dict
+        }
+        if let profData,
+           let decoded = try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedProfile].self, from: profData) {
+            cachedProfiles = decoded
+        }
+        if let grpData,
+           let decoded = try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedGroup].self, from: grpData) {
+            cachedGroups = decoded
+        }
+        if let ranksData,
+           let rawRanks = (try? JSONSerialization.jsonObject(with: ranksData)) as? [String: Any] {
+            var parsed: [String: Int64] = [:]
+            for (k, v) in rawRanks {
+                if let val = JSONLossless.int64(v), val > 0 { parsed[k] = val }
+            }
+            cachedActivityRanks = parsed
+        }
+        if let gidData,
+           let gidToUid = (try? JSONSerialization.jsonObject(with: gidData)) as? [String: String] {
+            await sessionClient.seedGlobalIdMappings(gidToUid)
+            for (gid, uid) in gidToUid where !gid.isEmpty && !uid.isEmpty {
+                cachedFriendGlobalIds[uid] = gid
+            }
+        }
+    }
+
+    internal static func jsonArrayString(for array: [[String: Any]]) -> String {
+        guard JSONSerialization.isValidJSONObject(array),
+              let data = try? JSONSerialization.data(withJSONObject: array, options: [.sortedKeys]),
+              let str = String(data: data, encoding: .utf8) else {
+            return "[]"
+        }
+        return str
     }
 
     internal func offlineConversationsCore() -> CoreOfflineConversations {

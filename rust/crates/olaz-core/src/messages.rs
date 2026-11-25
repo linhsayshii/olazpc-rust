@@ -7,8 +7,7 @@ use olaz_store::StoredMessage as DbStoredMessage;
 use olaz_wire::{
     ChatMessage, Kind, NameLookup, ParsedWireEvent, StoredMessage as WireStoredMessage,
     UNKNOWN_NAME, WireParseOptions, clean_group_id, decode_stored_message, encode_chat_message,
-    extract_batch_events, group_conv_id, is_group_id, sanitize_profile_uid,
-    strip_user_prefix,
+    extract_batch_events, group_conv_id, is_group_id, sanitize_profile_uid, strip_user_prefix,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -316,11 +315,7 @@ impl fmt::Debug for IdentitySnapshot {
 
 impl IdentitySnapshot {
     #[must_use]
-    pub fn from_core(
-        my_uid: &str,
-        my_avatar: Option<&str>,
-        convs: &ConversationsState,
-    ) -> Self {
+    pub fn from_core(my_uid: &str, my_avatar: Option<&str>, convs: &ConversationsState) -> Self {
         let mut conversation_fallbacks = HashMap::with_capacity(convs.conversations.len());
         for c in &convs.conversations {
             let trimmed = c.name.trim();
@@ -346,10 +341,7 @@ impl IdentitySnapshot {
     #[must_use]
     pub fn lookup_person(&self, raw_uid: &str) -> Option<NameLookup> {
         let clean = strip_user_prefix(raw_uid);
-        if matches!(
-            clean.as_str(),
-            "" | "0" | "-1" | "__legacy__" | "unknown"
-        ) {
+        if matches!(clean.as_str(), "" | "0" | "-1" | "__legacy__" | "unknown") {
             return None;
         }
         let mut candidates = vec![clean.clone()];
@@ -635,11 +627,7 @@ impl MessagesState {
 
     /// Starts a launch history freshness pass (`ZaloEngine.beginHistoryFreshnessPass`).
     /// Clears `history_freshness` unconditionally and returns `full_refresh_due`.
-    pub fn begin_freshness_pass(
-        &mut self,
-        last_refresh_pref: Option<&str>,
-        now_ms: i64,
-    ) -> bool {
+    pub fn begin_freshness_pass(&mut self, last_refresh_pref: Option<&str>, now_ms: i64) -> bool {
         self.history_freshness.clear();
         let last = last_refresh_pref
             .and_then(|s| s.parse::<f64>().ok())
@@ -649,9 +637,8 @@ impl MessagesState {
             reason = "Epoch ms fits comfortably in f64 precision matching Swift Date.timeIntervalSince1970"
         )]
         let now_secs = (now_ms as f64) / 1000.0;
-        let due = last.is_none_or(|l| {
-            (now_secs - l) >= FULL_HISTORY_REFRESH_INTERVAL_SECS || l > now_secs
-        });
+        let due = last
+            .is_none_or(|l| (now_secs - l) >= FULL_HISTORY_REFRESH_INTERVAL_SECS || l > now_secs);
         self.history_full_refresh_due = due;
         due
     }
@@ -788,8 +775,7 @@ impl MessagesState {
                 msg.client_id = existing_by_id.client_id.clone();
             }
         } else if let Some(cid) = resolved_client_id.as_deref()
-            && let Some(existing_by_cli) =
-                list.iter().find(|m| m.id == cid || m.client_id == cid)
+            && let Some(existing_by_cli) = list.iter().find(|m| m.id == cid || m.client_id == cid)
         {
             if !existing_by_cli.reactions.is_empty() {
                 preserved_reactions = existing_by_cli.reactions.clone();
@@ -803,9 +789,7 @@ impl MessagesState {
             }
         }
 
-        if msg.reactions.is_empty()
-            && !preserved_reactions.is_empty()
-            && msg.kind != Kind::Recalled
+        if msg.reactions.is_empty() && !preserved_reactions.is_empty() && msg.kind != Kind::Recalled
         {
             msg.reactions = preserved_reactions;
         }
@@ -1130,8 +1114,7 @@ impl MessagesState {
                 || m.client_id == target_id
                 || (!cli_msg_id.is_empty() && (m.id == cli_msg_id || m.client_id == cli_msg_id));
             if matches_target {
-                deleted_ts_ms =
-                    Some(deleted_ts_ms.map_or(m.date_ms, |prev| prev.max(m.date_ms)));
+                deleted_ts_ms = Some(deleted_ts_ms.map_or(m.date_ms, |prev| prev.max(m.date_ms)));
                 removed_ids.push(m.id.clone());
             }
             !matches_target
@@ -1605,7 +1588,8 @@ pub fn apply_batch_pass1(
             if increment_unread
                 && !already_known
                 && !msg.is_mine
-                && conversations.open_conversation_id.as_deref() != Some(msg.conversation_id.as_str())
+                && conversations.open_conversation_id.as_deref()
+                    != Some(msg.conversation_id.as_str())
             {
                 *unread_delta_by_conv
                     .entry(msg.conversation_id.clone())
@@ -1647,7 +1631,11 @@ pub fn apply_batch_pass1(
         let avatar = info
             .1
             .or_else(|| existing.and_then(|e| e.avatar.clone()))
-            .or_else(|| (!is_grp && !latest.is_mine).then(|| latest.sender_avatar.clone()).flatten());
+            .or_else(|| {
+                (!is_grp && !latest.is_mine)
+                    .then(|| latest.sender_avatar.clone())
+                    .flatten()
+            });
         let members = if info.2 > 0 {
             info.2
         } else {
@@ -1785,14 +1773,13 @@ pub fn collect_missing_sender_uids(
             return;
         }
         let person = snap.lookup_person(&clean);
-        let best_name = if !existing_name.is_empty()
-            && existing_name != clean
-            && existing_name != UNKNOWN_NAME
-        {
-            existing_name
-        } else {
-            person.as_ref().map_or("", |p| p.name.as_str())
-        };
+        let best_name =
+            if !existing_name.is_empty() && existing_name != clean && existing_name != UNKNOWN_NAME
+            {
+                existing_name
+            } else {
+                person.as_ref().map_or("", |p| p.name.as_str())
+            };
         let needs_name = best_name.is_empty() || best_name == clean || best_name == UNKNOWN_NAME;
         let person_avt_empty = person.as_ref().is_none_or(|p| p.avatar.is_empty());
         let cached_avt_empty = snap
@@ -1812,7 +1799,11 @@ pub fn collect_missing_sender_uids(
             && msg.sender_id != "0"
             && msg.sender_id != clean_my
         {
-            consider(&msg.sender_id, &msg.sender_name, msg.sender_avatar.is_some());
+            consider(
+                &msg.sender_id,
+                &msg.sender_name,
+                msg.sender_avatar.is_some(),
+            );
         }
         for react in &msg.reactions {
             for raw_uid in react.user_counts.keys() {
@@ -1836,21 +1827,25 @@ pub fn contact_fold(text: &str) -> String {
 fn fold_vietnamese_and_latin_char(ch: char) -> &'static [char] {
     match ch {
         'đ' | 'Đ' => &['d'],
-        'à' | 'á' | 'ả' | 'ã' | 'ạ' | 'ă' | 'ằ' | 'ắ' | 'ẳ' | 'ẵ' | 'ặ' | 'â' | 'ầ' | 'ấ'
-        | 'ẩ' | 'ẫ' | 'ậ' | 'À' | 'Á' | 'Ả' | 'Ã' | 'Ạ' | 'Ă' | 'Ằ' | 'Ắ' | 'Ẳ' | 'Ẵ' | 'Ặ'
-        | 'Â' | 'Ầ' | 'Ấ' | 'Ẩ' | 'Ẫ' | 'Ậ' | 'ä' | 'å' | 'ā' | 'Ä' | 'Å' | 'Ā' => &['a'],
-        'è' | 'é' | 'ẻ' | 'ẽ' | 'ẹ' | 'ê' | 'ề' | 'ế' | 'ể' | 'ễ' | 'ệ' | 'È' | 'É' | 'Ẻ'
-        | 'Ẽ' | 'Ẹ' | 'Ê' | 'Ề' | 'Ế' | 'Ể' | 'Ễ' | 'Ệ' | 'ë' | 'ē' | 'Ë' | 'Ē' => &['e'],
-        'ì' | 'í' | 'ỉ' | 'ĩ' | 'ị' | 'Ì' | 'Í' | 'Ỉ' | 'Ĩ' | 'Ị' | 'î' | 'ï' | 'ī' | 'Î'
-        | 'Ï' | 'Ī' => &['i'],
-        'ò' | 'ó' | 'ỏ' | 'õ' | 'ọ' | 'ô' | 'ồ' | 'ố' | 'ổ' | 'ỗ' | 'ộ' | 'ơ' | 'ờ' | 'ớ'
-        | 'ở' | 'ỡ' | 'ợ' | 'Ò' | 'Ó' | 'Ỏ' | 'Õ' | 'Ọ' | 'Ô' | 'Ồ' | 'Ố' | 'Ổ' | 'Ỗ' | 'Ộ'
-        | 'Ơ' | 'Ờ' | 'Ớ' | 'Ở' | 'Ỡ' | 'Ợ' | 'ö' | 'ø' | 'ō' | 'Ö' | 'Ø' | 'Ō' => &['o'],
-        'ù' | 'ú' | 'ủ' | 'ũ' | 'ụ' | 'ư' | 'ừ' | 'ứ' | 'ử' | 'ữ' | 'ự' | 'Ù' | 'Ú' | 'Ủ'
-        | 'Ũ' | 'Ụ' | 'Ư' | 'Ừ' | 'Ứ' | 'Ử' | 'Ữ' | 'Ự' | 'û' | 'ü' | 'ū' | 'Û' | 'Ü' | 'Ū' => {
+        'à' | 'á' | 'ả' | 'ã' | 'ạ' | 'ă' | 'ằ' | 'ắ' | 'ẳ' | 'ẵ' | 'ặ' | 'â' | 'ầ' | 'ấ' | 'ẩ'
+        | 'ẫ' | 'ậ' | 'À' | 'Á' | 'Ả' | 'Ã' | 'Ạ' | 'Ă' | 'Ằ' | 'Ắ' | 'Ẳ' | 'Ẵ' | 'Ặ' | 'Â'
+        | 'Ầ' | 'Ấ' | 'Ẩ' | 'Ẫ' | 'Ậ' | 'ä' | 'å' | 'ā' | 'Ä' | 'Å' | 'Ā' => &['a'],
+        'è' | 'é' | 'ẻ' | 'ẽ' | 'ẹ' | 'ê' | 'ề' | 'ế' | 'ể' | 'ễ' | 'ệ' | 'È' | 'É' | 'Ẻ' | 'Ẽ'
+        | 'Ẹ' | 'Ê' | 'Ề' | 'Ế' | 'Ể' | 'Ễ' | 'Ệ' | 'ë' | 'ē' | 'Ë' | 'Ē' => {
+            &['e']
+        }
+        'ì' | 'í' | 'ỉ' | 'ĩ' | 'ị' | 'Ì' | 'Í' | 'Ỉ' | 'Ĩ' | 'Ị' | 'î' | 'ï' | 'ī' | 'Î' | 'Ï'
+        | 'Ī' => &['i'],
+        'ò' | 'ó' | 'ỏ' | 'õ' | 'ọ' | 'ô' | 'ồ' | 'ố' | 'ổ' | 'ỗ' | 'ộ' | 'ơ' | 'ờ' | 'ớ' | 'ở'
+        | 'ỡ' | 'ợ' | 'Ò' | 'Ó' | 'Ỏ' | 'Õ' | 'Ọ' | 'Ô' | 'Ồ' | 'Ố' | 'Ổ' | 'Ỗ' | 'Ộ' | 'Ơ'
+        | 'Ờ' | 'Ớ' | 'Ở' | 'Ỡ' | 'Ợ' | 'ö' | 'ø' | 'ō' | 'Ö' | 'Ø' | 'Ō' => &['o'],
+        'ù' | 'ú' | 'ủ' | 'ũ' | 'ụ' | 'ư' | 'ừ' | 'ứ' | 'ử' | 'ữ' | 'ự' | 'Ù' | 'Ú' | 'Ủ' | 'Ũ'
+        | 'Ụ' | 'Ư' | 'Ừ' | 'Ứ' | 'Ử' | 'Ữ' | 'Ự' | 'û' | 'ü' | 'ū' | 'Û' | 'Ü' | 'Ū' => {
             &['u']
         }
-        'ỳ' | 'ý' | 'ỷ' | 'ỹ' | 'ỵ' | 'Ỳ' | 'Ý' | 'Ỷ' | 'Ỹ' | 'Ỵ' | 'ÿ' | 'Ÿ' => &['y'],
+        'ỳ' | 'ý' | 'ỷ' | 'ỹ' | 'ỵ' | 'Ỳ' | 'Ý' | 'Ỷ' | 'Ỹ' | 'Ỵ' | 'ÿ' | 'Ÿ' => {
+            &['y']
+        }
         'ñ' | 'Ñ' => &['n'],
         'ç' | 'Ç' => &['c'],
         'ß' => &['s', 's'],
@@ -2049,8 +2044,7 @@ pub fn apply_fetched_contacts(
             }
             let conv_id = group_conv_id(&clean_id);
             let name = olaz_wire::lossless::string(info.get("name"));
-            let avt =
-                olaz_wire::lossless::string(info.get("avt").or_else(|| info.get("fullAvt")));
+            let avt = olaz_wire::lossless::string(info.get("avt").or_else(|| info.get("fullAvt")));
             let avatar = is_valid_url_str(&avt).then_some(avt);
             let members =
                 olaz_wire::lossless::int64(info.get("totalMember").or_else(|| info.get("total")))
@@ -2122,8 +2116,7 @@ fn parse_friend_request_row(
     if uid.is_empty() {
         return None;
     }
-    let name =
-        olaz_wire::lossless::string(row.get("displayName").or_else(|| row.get("zaloName")));
+    let name = olaz_wire::lossless::string(row.get("displayName").or_else(|| row.get("zaloName")));
     let avt = olaz_wire::lossless::string(row.get("avatar").or_else(|| row.get("avt")));
     let avatar = is_valid_url_str(&avt).then_some(avt);
     let message = olaz_wire::lossless::string(row.get("message").or_else(|| row.get("msg")));
@@ -2257,11 +2250,7 @@ mod tests {
 
         // 2. Append + Append on already-shipped base stays Append.
         let ap = coalesce_window_op(true, None, PendingWindowOp::Append(vec![m1.clone()]));
-        let ap2 = coalesce_window_op(
-            true,
-            Some(ap),
-            PendingWindowOp::Append(vec![m2.clone()]),
-        );
+        let ap2 = coalesce_window_op(true, Some(ap), PendingWindowOp::Append(vec![m2.clone()]));
         assert_eq!(ap2, PendingWindowOp::Append(vec![m1.clone(), m2.clone()]));
 
         // 3. Append + Reset -> Reset.
@@ -2314,15 +2303,15 @@ mod tests {
         assert!(ms.begin_freshness_pass(None, 1_700_100_000_000));
         assert!(!ms.begin_freshness_pass(Some("1700099900.0"), 1_700_100_000_000));
 
-        assert!(ms.record_freshness_probes(&[
-            ("g1".to_owned(), true),
-            ("g2".to_owned(), false),
-        ]));
+        assert!(ms.record_freshness_probes(&[("g1".to_owned(), true), ("g2".to_owned(), false),]));
         assert!(ms.is_recent_history_up_to_date("g1"));
         assert!(!ms.is_recent_history_up_to_date("g2"));
 
         // Once Stale in a pass, a subsequent probe does not flip g2 back to UpToDate.
         assert!(!ms.record_freshness_probes(&[("g2".to_owned(), true)]));
-        assert_eq!(ms.history_freshness.get("g2"), Some(&HistoryFreshness::Stale));
+        assert_eq!(
+            ms.history_freshness.get("g2"),
+            Some(&HistoryFreshness::Stale)
+        );
     }
 }

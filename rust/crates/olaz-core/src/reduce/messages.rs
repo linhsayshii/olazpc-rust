@@ -68,7 +68,11 @@ pub(crate) fn reduce_messages(state: &mut CoreState, input: Input, out: &mut Red
                     out.dirty.insert(DirtyKey::Messages);
                 }
                 if decoded_count >= 45
-                    && state.messages.has_more_history.insert(conv_id.clone(), true) != Some(true)
+                    && state
+                        .messages
+                        .has_more_history
+                        .insert(conv_id.clone(), true)
+                        != Some(true)
                 {
                     out.dirty.insert(DirtyKey::MessageMeta);
                 }
@@ -300,9 +304,7 @@ pub(crate) fn reduce_messages(state: &mut CoreState, input: Input, out: &mut Red
                 let trimmed = strip_user_prefix(&uid);
                 let clean = sanitize_profile_uid(&trimmed).unwrap_or(trimmed);
                 let fetched_name = preferred_contact_name(row);
-                let avt = olaz_wire::lossless::string(
-                    row.get("avatar").or_else(|| row.get("avt")),
-                );
+                let avt = olaz_wire::lossless::string(row.get("avatar").or_else(|| row.get("avt")));
                 if !clean.is_empty() && (!fetched_name.is_empty() || !avt.is_empty()) {
                     state.conversations.identities.cached_profiles.insert(
                         clean,
@@ -333,15 +335,15 @@ pub(crate) fn reduce_messages(state: &mut CoreState, input: Input, out: &mut Red
                 if let Some(data) =
                     serialize_cached_profiles_json(&state.conversations.identities.cached_profiles)
                 {
-                    out.effects
-                        .push(Effect::Store(StoreOp::SetPreferenceData {
-                            key: "cachedProfiles".to_owned(),
-                            data,
-                        }));
+                    out.effects.push(Effect::Store(StoreOp::SetPreferenceData {
+                        key: "cachedProfiles".to_owned(),
+                        data,
+                    }));
                 }
                 let snap = state.identity_snapshot();
-                let (to_persist, win_changed) =
-                    state.messages.apply_resolved_sender_profiles(&conv_id, &snap);
+                let (to_persist, win_changed) = state
+                    .messages
+                    .apply_resolved_sender_profiles(&conv_id, &snap);
                 if win_changed {
                     out.dirty.insert(DirtyKey::Messages);
                 }
@@ -393,7 +395,11 @@ pub(crate) fn reduce_messages(state: &mut CoreState, input: Input, out: &mut Red
                 }
                 envelope
                     .payload
-                    .resolve(&snap.my_uid, state.session.self_conversation_id.as_deref(), &names)
+                    .resolve(
+                        &snap.my_uid,
+                        state.session.self_conversation_id.as_deref(),
+                        &names,
+                    )
                     .unwrap_or(envelope.events)
             } else {
                 envelope.events
@@ -407,6 +413,8 @@ pub(crate) fn reduce_messages(state: &mut CoreState, input: Input, out: &mut Red
                 false,
                 out,
             );
+            out.effects
+                .push(Effect::Host(HostCall::TransportBatchSettled));
         }
 
         Input::DecryptedEnvelopeReady {
@@ -435,11 +443,7 @@ pub(crate) fn reduce_messages(state: &mut CoreState, input: Input, out: &mut Red
             );
             if let Some((lp_gen, drain_id)) = poll_batch_done {
                 crate::reduce::transport::finish_poll_batch_in_core(
-                    state,
-                    lp_gen,
-                    drain_id,
-                    applied,
-                    out,
+                    state, lp_gen, drain_id, applied, out,
                 );
             }
             if let Some(id) = op_id {
@@ -448,6 +452,9 @@ pub(crate) fn reduce_messages(state: &mut CoreState, input: Input, out: &mut Red
                     result: OpResult::Int(i64::from(applied)),
                     after_store: true,
                 });
+            } else {
+                out.effects
+                    .push(Effect::Host(HostCall::TransportBatchSettled));
             }
         }
 
@@ -476,7 +483,10 @@ fn reduce_message_command(
             let changed = state.conversations.open_conversation_id.as_deref() != Some(id.as_str());
             state.conversations.open_conversation_id = Some(id.clone());
 
-            if matches!(state.messages.ensure_window_exists(&id), WindowChange::Changed(_)) {
+            if matches!(
+                state.messages.ensure_window_exists(&id),
+                WindowChange::Changed(_)
+            ) {
                 out.dirty.insert(DirtyKey::Messages);
             }
 
@@ -496,10 +506,11 @@ fn reduce_message_command(
                 }
             }
 
-            out.effects.push(Effect::Host(HostCall::OnOpenConversationSync {
-                conv_id: id.clone(),
-                changed,
-            }));
+            out.effects
+                .push(Effect::Host(HostCall::OnOpenConversationSync {
+                    conv_id: id.clone(),
+                    changed,
+                }));
 
             state.messages.active_open = Some(crate::messages::OpenFlowState {
                 open_seq,
@@ -508,18 +519,15 @@ fn reduce_message_command(
                 fetched_count: 0,
             });
 
-            let window_empty = state
-                .messages
-                .windows
-                .get(&id)
-                .is_none_or(Vec::is_empty);
+            let window_empty = state.messages.windows.get(&id).is_none_or(Vec::is_empty);
             if window_empty && !skip_local_read {
-                out.effects.push(Effect::Store(StoreOp::LoadOpenLocalMessages {
-                    open_seq,
-                    conv_id: id,
-                    limit: 50,
-                    op_id,
-                }));
+                out.effects
+                    .push(Effect::Store(StoreOp::LoadOpenLocalMessages {
+                        open_seq,
+                        conv_id: id,
+                        limit: 50,
+                        op_id,
+                    }));
             } else {
                 begin_open_step2(state, open_seq, &id, op_id, out);
             }
@@ -529,7 +537,8 @@ fn reduce_message_command(
             state.messages.open_seq = state.messages.open_seq.saturating_add(1);
             state.messages.active_open = None;
             state.conversations.open_conversation_id = None;
-            out.effects.push(Effect::Host(HostCall::OnCloseConversation));
+            out.effects
+                .push(Effect::Host(HostCall::OnCloseConversation));
             complete_op(op_id, out);
         }
 
@@ -552,13 +561,14 @@ fn reduce_message_command(
                 .and_then(|l| l.first())
                 .map(|m| m.date_ms);
             if let Some(ts_ms) = before_ts_ms {
-                out.effects.push(Effect::Store(StoreOp::LoadOlderStoreMessages {
-                    load_seq,
-                    conv_id: id,
-                    before_ts_ms: ts_ms,
-                    limit: 50,
-                    op_id,
-                }));
+                out.effects
+                    .push(Effect::Store(StoreOp::LoadOlderStoreMessages {
+                        load_seq,
+                        conv_id: id,
+                        before_ts_ms: ts_ms,
+                        limit: 50,
+                        op_id,
+                    }));
             } else {
                 out.effects.push(Effect::FetchHistoryPageApi {
                     conv_id: id,
@@ -620,6 +630,9 @@ fn reduce_message_command(
                     result: OpResult::Int(i64::from(applied)),
                     after_store: true,
                 });
+            } else {
+                out.effects
+                    .push(Effect::Host(HostCall::TransportBatchSettled));
             }
         }
 
@@ -644,6 +657,9 @@ fn reduce_message_command(
                     result: OpResult::Int(i64::from(applied)),
                     after_store: true,
                 });
+            } else {
+                out.effects
+                    .push(Effect::Host(HostCall::TransportBatchSettled));
             }
         }
 
@@ -851,11 +867,12 @@ fn begin_sender_profile_resolution(
         .messages
         .windows
         .get(conv_id)
-        .map_or_else(Vec::new, |list| collect_missing_sender_uids(list, &my_uid, &snap));
+        .map_or_else(Vec::new, |list| {
+            collect_missing_sender_uids(list, &my_uid, &snap)
+        });
 
     if unknown_uids.is_empty() {
-        let (react_rows, react_ops) =
-            state.messages.refresh_reaction_names(Some(conv_id), &snap);
+        let (react_rows, react_ops) = state.messages.refresh_reaction_names(Some(conv_id), &snap);
         if !react_ops.is_empty() {
             out.dirty.insert(DirtyKey::Messages);
         }
@@ -1150,12 +1167,13 @@ pub(crate) fn ingest_parsed_events_in_core(
     }
 
     if !probe_targets.is_empty() {
-        out.effects.push(Effect::Store(StoreOp::ProbeAndSaveMessages {
-            probe_targets,
-            rows: stored_rows,
-            preserve_existing_reactions: true,
-            reply_boot_gen: None,
-        }));
+        out.effects
+            .push(Effect::Store(StoreOp::ProbeAndSaveMessages {
+                probe_targets,
+                rows: stored_rows,
+                preserve_existing_reactions: true,
+                reply_boot_gen: None,
+            }));
     } else if !stored_rows.is_empty() {
         out.effects.push(Effect::Store(StoreOp::SaveMessages {
             rows: stored_rows,
@@ -1264,7 +1282,9 @@ fn emit_pass2_events(
                     msg_id: msg_id.clone(),
                     cli_msg_id: cli_msg_id.clone(),
                     update_conversation_preview: update_conversation_preview_immediately
-                        || !events.iter().any(|e| matches!(e, ParsedWireEvent::Message(..))),
+                        || !events
+                            .iter()
+                            .any(|e| matches!(e, ParsedWireEvent::Message(..))),
                 }));
             }
             ParsedWireEvent::Delete {
@@ -1277,7 +1297,9 @@ fn emit_pass2_events(
                     msg_id: msg_id.clone(),
                     cli_msg_id: cli_msg_id.clone(),
                     update_conversation_preview: update_conversation_preview_immediately
-                        || !events.iter().any(|e| matches!(e, ParsedWireEvent::Message(..))),
+                        || !events
+                            .iter()
+                            .any(|e| matches!(e, ParsedWireEvent::Message(..))),
                 }));
             }
             ParsedWireEvent::Typing {

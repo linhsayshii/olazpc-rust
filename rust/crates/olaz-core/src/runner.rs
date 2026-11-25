@@ -306,6 +306,28 @@ impl WsDriver for LiveWsDriver {
 /// Storage primitives (`load_saved_session`, `load_legacy_cookie`, `load_transport_state`,
 /// `set_pref`) live here alongside domain calls that still belong to Swift until later units
 /// (`prepare_store`, `start_bootstrap`, `apply_batch`, etc.).
+/// Outcome of [`Host::on_batch_received`].
+#[derive(Clone, Debug)]
+pub enum BatchHookOutcome {
+    /// Delegate to legacy `Host::apply_batch` (used by U2/U3 unit tests).
+    DelegateToLegacy,
+    /// Suppressed by `hostTrace` (skip ingestion, notify transport settle).
+    Suppressed,
+    /// Ingest natively in `olaz-core` using the (optionally decrypted) payload.
+    IngestInCore(Map<String, Value>),
+}
+
+/// Outcome of [`Host::on_parsed_events_received`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParsedEventsHookOutcome {
+    /// Delegate to legacy `Host::apply_parsed_events` (used by U2/U3 unit tests).
+    DelegateToLegacy,
+    /// Suppressed by `hostTrace` (skip ingestion, notify transport settle).
+    Suppressed,
+    /// Ingest natively in `olaz-core`.
+    IngestInCore,
+}
+
 #[async_trait]
 pub trait Host: Send + Sync {
     async fn load_saved_session(&self) -> Option<String>;
@@ -417,8 +439,8 @@ pub trait Host: Send + Sync {
         _increment_unread: bool,
         _notify_incoming: bool,
         _payload: Map<String, Value>,
-    ) -> Option<Map<String, Value>> {
-        None
+    ) -> BatchHookOutcome {
+        BatchHookOutcome::DelegateToLegacy
     }
     /// Host hook emitted when transport delivers a typed `ApplyParsedEvents` frame.
     /// Return `true` to have `olaz-core` ingest the typed envelope natively; return `false`
@@ -429,9 +451,11 @@ pub trait Host: Send + Sync {
         _increment_unread: bool,
         _notify_incoming: bool,
         _envelope: &TypedChatEnvelope,
-    ) -> bool {
-        false
+    ) -> ParsedEventsHookOutcome {
+        ParsedEventsHookOutcome::DelegateToLegacy
     }
+    async fn transport_batch_settled(&self) {}
+    async fn engine_log(&self, _message: String) {}
     async fn mobile_sync(&self, events: Vec<MobileSyncEvent>);
     async fn e2ee_signal(&self, cmd: u16, payload: Map<String, Value>);
     async fn e2ee_deliver_reports(&self, cmd: u16, payload: Map<String, Value>);
@@ -581,6 +605,13 @@ enum HostJob {
     ShowBatchTyping {
         conv_id: String,
         sender_id: String,
+        _guard: InFlightGuard,
+    },
+    TransportBatchSettled {
+        _guard: InFlightGuard,
+    },
+    EngineLog {
+        message: String,
         _guard: InFlightGuard,
     },
     OfferFirstLoginTransfer {
@@ -1290,6 +1321,10 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
                 Effect::EngineLog(msg) => {
                     tracing::info!(target: "olaz_core::engine_log", "{msg}");
+                    self.send_host(HostJob::EngineLog {
+                        message: msg,
+                        _guard: sink.track(),
+                    });
                 }
                 Effect::Store(op) => {
                     let guard = sink.track();
@@ -2155,6 +2190,9 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                                 _guard: guard,
                             }
                         }
+                        HostCall::TransportBatchSettled => {
+                            HostJob::TransportBatchSettled { _guard: guard }
+                        }
                         HostCall::SendE2eeText { .. } => {
                             continue;
                         }
@@ -2793,6 +2831,12 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
             } => {
                 host.show_batch_typing(conv_id, sender_id).await;
             }
+            HostJob::TransportBatchSettled { _guard } => {
+                host.transport_batch_settled().await;
+            }
+            HostJob::EngineLog { message, _guard } => {
+                host.engine_log(message).await;
+            }
             HostJob::OfferFirstLoginTransfer { force, _guard } => {
                 host.offer_first_login_transfer(force).await;
             }
@@ -2843,37 +2887,50 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 sink,
                 _guard,
             } => {
-                if let Some(decrypted) = host
+                match host
                     .on_batch_received(cmd, increment_unread, notify_incoming, payload.clone())
                     .await
                 {
-                    sink.send(Input::DecryptedEnvelopeReady {
-                        payload: decrypted,
-                        default_cmd: cmd.unwrap_or(0),
-                        fallback_conv_id: None,
-                        is_group_hint: None,
-                        increment_unread,
-                        notify_incoming,
-                        persist_conversations: true,
-                        probe_freshness: false,
-                        poll_batch_done,
-                        op_id: None,
-                    });
-                } else {
-                    let delta = host
-                        .apply_batch(cmd, increment_unread, notify_incoming, payload)
-                        .await;
-                    if let Some((lp_gen, drain_id)) = poll_batch_done {
-                        sink.send(Input::PollBatchApplied {
-                            lp_gen,
-                            drain_id,
-                            delta,
+                    BatchHookOutcome::IngestInCore(decrypted) => {
+                        sink.send(Input::DecryptedEnvelopeReady {
+                            payload: decrypted,
+                            default_cmd: cmd.unwrap_or(0),
+                            fallback_conv_id: None,
+                            is_group_hint: None,
+                            increment_unread,
+                            notify_incoming,
+                            persist_conversations: true,
+                            probe_freshness: false,
+                            poll_batch_done,
+                            op_id: None,
                         });
-                    } else if delta.applied_count > 0
-                        || !delta.updates.is_empty()
-                        || !delta.preview_overrides.is_empty()
-                    {
-                        sink.send(Input::BatchDeltaApplied { delta });
+                    }
+                    BatchHookOutcome::Suppressed => {
+                        host.transport_batch_settled().await;
+                        if let Some((lp_gen, drain_id)) = poll_batch_done {
+                            sink.send(Input::PollBatchApplied {
+                                lp_gen,
+                                drain_id,
+                                delta: crate::conversations::BatchApplyDelta::default(),
+                            });
+                        }
+                    }
+                    BatchHookOutcome::DelegateToLegacy => {
+                        let delta = host
+                            .apply_batch(cmd, increment_unread, notify_incoming, payload)
+                            .await;
+                        if let Some((lp_gen, drain_id)) = poll_batch_done {
+                            sink.send(Input::PollBatchApplied {
+                                lp_gen,
+                                drain_id,
+                                delta,
+                            });
+                        } else if delta.applied_count > 0
+                            || !delta.updates.is_empty()
+                            || !delta.preview_overrides.is_empty()
+                        {
+                            sink.send(Input::BatchDeltaApplied { delta });
+                        }
                     }
                 }
             }
@@ -2885,25 +2942,31 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 sink,
                 _guard,
             } => {
-                if host
+                match host
                     .on_parsed_events_received(cmd, increment_unread, notify_incoming, &envelope)
                     .await
                 {
-                    sink.send(Input::TypedEnvelopeReady {
-                        cmd,
-                        increment_unread,
-                        notify_incoming,
-                        envelope,
-                    });
-                } else {
-                    let delta = host
-                        .apply_parsed_events(cmd, increment_unread, notify_incoming, envelope)
-                        .await;
-                    if delta.applied_count > 0
-                        || !delta.updates.is_empty()
-                        || !delta.preview_overrides.is_empty()
-                    {
-                        sink.send(Input::BatchDeltaApplied { delta });
+                    ParsedEventsHookOutcome::IngestInCore => {
+                        sink.send(Input::TypedEnvelopeReady {
+                            cmd,
+                            increment_unread,
+                            notify_incoming,
+                            envelope,
+                        });
+                    }
+                    ParsedEventsHookOutcome::Suppressed => {
+                        host.transport_batch_settled().await;
+                    }
+                    ParsedEventsHookOutcome::DelegateToLegacy => {
+                        let delta = host
+                            .apply_parsed_events(cmd, increment_unread, notify_incoming, envelope)
+                            .await;
+                        if delta.applied_count > 0
+                            || !delta.updates.is_empty()
+                            || !delta.preview_overrides.is_empty()
+                        {
+                            sink.send(Input::BatchDeltaApplied { delta });
+                        }
                     }
                 }
             }
@@ -3130,8 +3193,8 @@ mod tests {
                 _increment_unread: bool,
                 _notify_incoming: bool,
                 _payload: Map<String, Value>,
-            ) -> Option<Map<String, Value>> {
-                None
+            ) -> BatchHookOutcome {
+                BatchHookOutcome::DelegateToLegacy
             }
             async fn apply_batch(
                 &self,

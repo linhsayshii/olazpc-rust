@@ -371,6 +371,8 @@ pub enum HostCall {
         conv_id: String,
         sender_id: String,
     },
+    /// Fires after a transport-originated batch/parsed-events ingestion and all Pass 2 host jobs complete.
+    TransportBatchSettled,
     // U5-send
     SendE2eeText {
         send_id: u64,
@@ -506,6 +508,7 @@ impl fmt::Debug for HostCall {
                 .field("count", &messages.len())
                 .finish(),
             Self::ShowBatchTyping { .. } => f.write_str("ShowBatchTyping"),
+            Self::TransportBatchSettled => f.write_str("TransportBatchSettled"),
             // U5-send
             Self::SendE2eeText { send_id, quote, .. } => f
                 .debug_struct("SendE2eeText")

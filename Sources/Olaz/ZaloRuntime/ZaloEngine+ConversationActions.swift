@@ -373,6 +373,7 @@ extension ZaloEngine {
     func confirmDeleteConversation(_ id: String) {
         let lastCliId = messages[id]?.last?.id ?? ""
         messages[id] = nil
+        coreLifecycle.core?.writeThroughRemoveWindow(convId: id)
         coreLifecycle.core?.confirmDeleteConversation(id: id, lastCliMsgId: lastCliId)
     }
 

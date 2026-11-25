@@ -225,6 +225,10 @@ actor ZaloSessionClient {
     /// The snapshot is rebuilt from the current fields and pushed only when it changed, so credential / domain updates
     /// made anywhere in this class (login, `applyLoginConfig`, `updateCredentials`, `markExpired`) reach the core on
     /// the next call. The account is carried in the clear inside the in-memory snapshot only; Rust never persists it.
+    func attachCoreApi(_ api: CoreApi) {
+        coreApiHandle = api
+    }
+
     func coreApi() -> CoreApi? {
         syncCoreSession() ? coreApiHandle : nil
     }
