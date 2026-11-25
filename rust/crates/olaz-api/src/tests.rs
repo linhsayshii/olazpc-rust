@@ -1030,19 +1030,38 @@ async fn send_text_group_with_mentions() {
     .await
     .unwrap();
     let req = last(&api);
-    assert_eq!(req.path(), "/api/group/sendmsg");
+    assert_eq!(req.path(), "/api/group/mention");
     assert_service(&api, &req, "group");
     let p = params_of(&req);
-    assert_eq!(p["grid"], "555");
-    assert_eq!(p["visibility"], 0);
-    assert_eq!(p["ttl"], 0);
-    assert!(p.get("toid").is_none());
     assert_eq!(
-        parsed_json_string(&p["mentionInfo"]),
-        json!([{"uid": "-1", "pos": 0, "len": 4, "type": 1},
-               {"uid": "222", "pos": 5, "len": 6, "type": 0}])
+        p,
+        json!({
+            "grid": "555",
+            "message": "@all @Bob hi",
+            "clientId": 77,
+            "mentionInfo": r#"[{"len":4,"pos":0,"type":1,"uid":"-1"},{"len":6,"pos":5,"type":0,"uid":"222"}]"#,
+            "language": "vi",
+            "visibility": 0,
+            "ttl": 0,
+        })
     );
-    // The same mention list is ignored for a 1-1 chat.
+    assert!(p.get("imei").is_none());
+    assert!(p.get("toid").is_none());
+
+    // Plain group text without mentions stays on /api/group/sendmsg.
+    api.send_text(&SendTextArgs {
+        conv_id: "g555",
+        text: "plain hi",
+        cli_msg_id: "79",
+        ..SendTextArgs::default()
+    })
+    .await
+    .unwrap();
+    let plain_req = last(&api);
+    assert_eq!(plain_req.path(), "/api/group/sendmsg");
+    assert_eq!(params_of(&plain_req)["imei"], "imei-1");
+
+    // The same mention list is ignored for a 1-1 chat (stays /api/message/sms).
     api.send_text(&SendTextArgs {
         conv_id: "200",
         text: "x",
@@ -1052,6 +1071,7 @@ async fn send_text_group_with_mentions() {
     })
     .await
     .unwrap();
+    assert_eq!(last(&api).path(), "/api/message/sms");
     assert!(params_of(&last(&api)).get("mentionInfo").is_none());
 }
 
@@ -1668,13 +1688,13 @@ async fn send_text_group_mentions_text_properties_urgency_and_ttl_match_send_jso
     api.send_text(&params_1.as_args()).await.unwrap();
     let req1 = last(&api);
     assert_service(&api, &req1, "group");
-    assert_eq!(req1.path(), "/api/group/sendmsg");
+    assert_eq!(req1.path(), "/api/group/mention");
     assert_eq!(
         params_of(&req1),
         json!({
             "clientId": 5000000000004i64,
             "grid": "500504",
-            "imei": "imei-1",
+            "language": "vi",
             "mentionInfo": r#"[{"len":6,"pos":0,"type":0,"uid":"3000504"},{"len":4,"pos":7,"type":1,"uid":"-1"}]"#,
             "message": "@Alice @All Hello",
             "metaData": {"urgency": 1},
@@ -1795,7 +1815,7 @@ async fn send_text_quote_carries_text_properties_ttl_urgency_and_preserves_on_fa
         r#"[{"len":4,"pos":0,"type":0,"uid":"300"}]"#
     );
 
-    // Quote fails -> fallback to /api/group/sendmsg preserves ttl, urgency, textProperties, mentions.
+    // Quote fails -> fallback with mentions goes to /api/group/mention preserving ttl, urgency, textProperties, mentions, language.
     let api_fb = api_with(|req| {
         if req.path().ends_with("/quote") {
             err(112)
@@ -1805,8 +1825,10 @@ async fn send_text_quote_carries_text_properties_ttl_urgency_and_preserves_on_fa
     });
     api_fb.send_text(&req_params.as_args()).await.unwrap();
     let fb_req = last(&api_fb);
-    assert_eq!(fb_req.path(), "/api/group/sendmsg");
+    assert_eq!(fb_req.path(), "/api/group/mention");
     let fb_p = params_of(&fb_req);
+    assert_eq!(fb_p["language"], "vi");
+    assert!(fb_p.get("imei").is_none());
     assert_eq!(fb_p["ttl"], 3_600_000i64);
     assert_eq!(fb_p["metaData"], json!({"urgency": 1}));
     assert_eq!(fb_p["textProperties"], tp);
