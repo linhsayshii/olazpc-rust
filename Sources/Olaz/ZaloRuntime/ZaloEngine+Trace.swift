@@ -71,6 +71,8 @@ extension ZaloEngine {
         bootTask?.cancel()
         qrTask?.cancel()
         transferTask?.cancel()
+        e2eePrepareTask?.cancel()
+        webkitMigrateTask?.cancel()
         openConversationTask?.cancel()
         loadOlderTask?.cancel()
         persistConversationsTask?.cancel()
@@ -195,6 +197,10 @@ extension ZaloEngine {
         await sessionClient.setSessionTrace(nil)
         _ = await bootTask?.value
         _ = await qrTask?.value
+        _ = await e2eePrepareTask?.value
+        e2eePrepareTask = nil
+        _ = await webkitMigrateTask?.value
+        webkitMigrateTask = nil
         _ = await openConversationTask?.value
         _ = await loadOlderTask?.value
         _ = await activeSendTask?.value
@@ -221,6 +227,10 @@ extension ZaloEngine {
         }
         _ = await persistConversationsTask?.value
         _ = await pendingCleanupTask?.value
+        await webSocket.stop()
+        let oldStore = sqliteStore
+        sqliteStore = nil
+        await oldStore?.close()
     }
 
     internal static func serializeMobileSyncEvents(_ events: [ZaloMobileSyncEvent]) -> [[String: Any]] {
