@@ -39,6 +39,14 @@ fn load_known_diffs(dir: &Path) -> Result<Vec<KnownDiff>, String> {
     load_jsonl(&path)
 }
 
+/// Domains whose recorded cases are on disk (via stacked recorder branches)
+/// but whose Rust ports have not landed on this branch yet.
+const PENDING_DOMAINS: &[&str] = &["contacts", "groups", "message_actions", "pins", "polls"];
+
+fn is_pending_domain(domain: &str) -> bool {
+    PENDING_DOMAINS.contains(&domain)
+}
+
 fn discover_domains(dir: &Path, filter: Option<&str>) -> Result<Vec<(String, PathBuf)>, String> {
     if let Some(domain) = filter {
         let path = dir.join(format!("{domain}.jsonl"));
@@ -61,7 +69,7 @@ fn discover_domains(dir: &Path, filter: Option<&str>) -> Result<Vec<(String, Pat
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        if stem == "known-diffs" {
+        if stem == "known-diffs" || is_pending_domain(stem) {
             continue;
         }
         out.push((stem.to_owned(), path));
