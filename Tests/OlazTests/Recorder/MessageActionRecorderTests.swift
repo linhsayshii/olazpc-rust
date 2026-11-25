@@ -2007,7 +2007,8 @@ final class MessageActionRecorderTests: XCTestCase {
                             "error_code": .int(0),
                             "data": .object([
                                 "convers": .array([
-                                    .object(["destId": .string("3000627"), "isGroup": .int(0), "ttl": .int(3600000)]),
+                                    .object(["destId": .string("u3000627"), "isGroup": .int(0), "ttl": .int(3600000)]),
+                                    .object(["destId": .string("3000629"), "isGroup": .int(0), "ttl": .int(7200000)]),
                                     .object(["destId": .string("627"), "isGroup": .int(1), "ttl": .int(86400000)]),
                                     .object(["destId": .string("3000628"), "isGroup": .int(0), "ttl": .int(0)]),
                                 ]),
