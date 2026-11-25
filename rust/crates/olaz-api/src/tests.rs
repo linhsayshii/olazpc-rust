@@ -1574,3 +1574,53 @@ async fn hidden_conversation_endpoints_match_wire_contract() {
     assert_eq!(req.path(), "/api/hiddenconvers/reset");
     assert!(req.query_value("params").is_none());
 }
+
+
+#[tokio::test]
+async fn friend_request_lists_and_reset_state() {
+    let api = api_with(|req| match req.path().as_str() {
+        "/api/friend/requested/list" => ok(json!({
+            "list": [
+                {"userId": "3001", "displayName": "Sent One", "message": "hi", "time": 1700000001000_i64}
+            ]
+        })),
+        "/api/friend/recommendsv2/list" => ok(json!({
+            "recommItems": [
+                {"dataInfo": {"recommType": 1, "userId": "9999"}},
+                {"dataInfo": {"recommType": 2, "userId": "3002", "displayName": "Older", "recommInfo": {"message": "m1"}, "recommTime": 100}},
+                {"dataInfo": {"recommType": 2, "userId": "3003", "displayName": "Newer", "message": "m2", "friendRequestFetchTime": 200}}
+            ]
+        })),
+        "/api/archivedchat/list" => ok(json!({"items": [], "version": 7})),
+        _ => ok(json!({})),
+    });
+
+    let sent = api.fetch_sent_friend_requests().await.unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["userId"], "3001");
+    let req = last(&api);
+    assert_service(&api, &req, "friend");
+    assert_eq!(req.path(), "/api/friend/requested/list");
+    assert_eq!(params_of(&req), json!({"page": 1, "count": 100, "avatar_size": 120}));
+
+    let recv = api.fetch_received_friend_requests().await.unwrap();
+    assert_eq!(recv.len(), 2);
+    assert_eq!(recv[0]["userId"], "3003");
+    assert_eq!(recv[0]["message"], "m2");
+    assert_eq!(recv[0]["time"], 200);
+    assert_eq!(recv[1]["userId"], "3002");
+    assert_eq!(recv[1]["message"], "m1");
+    assert_eq!(recv[1]["time"], 100);
+    let req = last(&api);
+    assert_service(&api, &req, "friend");
+    assert_eq!(req.path(), "/api/friend/recommendsv2/list");
+    assert_eq!(params_of(&req), json!({"imei": "imei-1"}));
+
+    assert_eq!(received_friend_request_rows(None).len(), 0);
+    assert_eq!(received_friend_request_rows(Some(&json!({"recommItems": "bad"}))).len(), 0);
+
+    let _ = api.fetch_archived_chats().await.unwrap();
+    assert_eq!(api.archived_version(), 7);
+    api.reset_state();
+    assert_eq!(api.archived_version(), 0);
+}

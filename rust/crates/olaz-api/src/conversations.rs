@@ -46,6 +46,47 @@ impl fmt::Debug for HiddenConversationsSnapshot {
     }
 }
 
+/// Flattens `recommendsv2/list` items with `recommType == 2` into the row shape the contacts sync
+/// reads (`userId`, `displayName`, `zaloName`, `avatar`, `message`, `time`), newest first
+/// (Swift `ZaloSessionClient.receivedFriendRequestRows`).
+#[must_use]
+pub fn received_friend_request_rows(data: Option<&Value>) -> Vec<JsonObject> {
+    let items = data
+        .and_then(Value::as_object)
+        .and_then(|d| as_dict_array(d.get("recommItems")))
+        .unwrap_or_default();
+    let mut rows: Vec<JsonObject> = Vec::new();
+    for item in items {
+        let Some(Value::Object(info)) = item.get("dataInfo") else {
+            continue;
+        };
+        if int64(info.get("recommType")) != Some(2) {
+            continue;
+        }
+        let mut row = info.clone();
+        let recomm = info.get("recommInfo").and_then(Value::as_object);
+        let msg = string(
+            recomm
+                .and_then(|r| r.get("message"))
+                .or_else(|| info.get("message")),
+        );
+        let time = int64(
+            info.get("recommTime")
+                .or_else(|| info.get("friendRequestFetchTime")),
+        )
+        .unwrap_or(0);
+        row.insert("message".to_owned(), Value::String(msg));
+        row.insert("time".to_owned(), Value::from(time));
+        rows.push(row);
+    }
+    rows.sort_by(|a, b| {
+        int64(b.get("time"))
+            .unwrap_or(0)
+            .cmp(&int64(a.get("time")).unwrap_or(0))
+    });
+    rows
+}
+
 /// Parses a `/api/hiddenconvers/get-all` response (Swift `parseHiddenConversationsResponse`).
 #[must_use]
 pub fn parse_hidden_conversations_response(resp: &JsonObject) -> HiddenConversationsSnapshot {
@@ -112,6 +153,32 @@ impl<T: Transport> ZaloApi<T> {
         }
         drop(state);
         Ok(rows)
+    }
+
+    /// Swift `fetchSentFriendRequests` (`/api/friend/requested/list`).
+    pub async fn fetch_sent_friend_requests(&self) -> Result<Vec<JsonObject>, ApiError> {
+        let resp = self
+            .get(
+                ApiRequest::new("friend", "/api/friend/requested/list").payload(json!({
+                    "page": 1,
+                    "count": 100,
+                    "avatar_size": 120,
+                })),
+            )
+            .await?;
+        Ok(rows_of_data(&resp, &["list"]))
+    }
+
+    /// Swift `fetchReceivedFriendRequests` (`/api/friend/recommendsv2/list`, keeping
+    /// `recommItems` whose `dataInfo.recommType == 2`).
+    pub async fn fetch_received_friend_requests(&self) -> Result<Vec<JsonObject>, ApiError> {
+        let resp = self
+            .get(
+                ApiRequest::new("friend", "/api/friend/recommendsv2/list")
+                    .payload(json!({"imei": self.imei()})),
+            )
+            .await?;
+        Ok(received_friend_request_rows(resp.get("data")))
     }
 
     /// Swift `fetchGroupsList`: `{gridVerMap, gridInfoMap}` with the group details fetched in
