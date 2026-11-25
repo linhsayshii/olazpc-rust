@@ -52,6 +52,12 @@ The oracle is what can be observed from outside the engine: the domain state the
 - `auto_delete` *(optional, `send`, `message_actions`)*: map of `<convId>` to positive integer TTL milliseconds pre-seeded into `ZaloEngine.autoDelete` before steps run.
 - `e2ee_threads` *(optional, `send`, `message_actions`)*: array of peer uid strings pre-seeded into SQLite `e2eeThreadsV1` preference before boot (`loadLocalAccountState` loads them into `e2eeManager`).
 - `host_results` *(optional, `send`, `message_actions`)*: map of host call name (e.g. `"send_e2ee_text"`) to an ordered queue of scripted outcomes: `{"msg_id": "<str>", "cli_msg_id": "<str>", "ts_ms": <int64>}` on success, or `{"error": {"code": <int>, "message": "<str>", "url": "<str>"}}` (or `{"error": "<message>"}`) on failure. Consumed in order when the host boundary runs.
+  - `send_e2ee_sticker` (`stickers`): `{"msg_id": "<str>", "cli_msg_id": "<str>", "ts_ms": <int64>}` on success, `"e2ee_failed"` (or `{"status": "e2ee_failed"}`) for pre-send Signal failure, or `{"error": {"code": <int>, "message": "<str>", "url": "<str>"}}` (or `{"error": "<message>"}`) on API failure.
+  - `send_e2ee_contact_card` (`stickers`, `forward`): `{"msg_id": "<str>", "cli_msg_id": "<str>", "ts_ms": <int64>}` on success, `"e2ee_failed"` (or `{"status": "e2ee_failed"}`) for pre-send Signal failure, or `{"error": ...}` on API failure; if omitted from `host_results`, deterministic replay returns `{msg_id: client_id, cli_msg_id: client_id, ts_ms: now_ms}`.
+- `recent_stickers` *(optional, `stickers`)*: array of `{"id": <int>, "cateId": <int>, "type": <int>, "url": "<str>"}` seeded into SQLite `recentStickers` preference before boot.
+- `sticker_suggest` *(optional, `stickers`)*: boolean seeded into SQLite `stickerSuggest` preference before boot.
+- `composer_confirm` *(optional, `stickers`)*: `null` or `{"id", "conv_id", "title", "message", "ok", "cancel"}` pre-seeding `ZaloEngine.composerConfirm` before steps run.
+- `queued_composer_confirms` *(optional, `stickers`)*: array of confirm objects pre-seeding `ZaloEngine.queuedComposerConfirms` before steps run.
 
 ### server
 
@@ -140,6 +146,24 @@ Run in order:
   - `load_auto_delete`: `{}` — awaits `loadAutoDelete()`.
   - `set_auto_delete`: `{"conv_id": "<str>", "ttl": <int64>}` — awaits `setAutoDelete(conv_id, ttl: ttl)` and any triggered SQLite conversation persist.
   - `prune_expired`: `{"conv_id": "<str>"}` — calls `pruneExpiredMessages(in: conv_id)` (reading `nowMs`), records the returned next-expiry timestamp in `prune_next_expiry_ms` (`Int64?` ms, or `null`), and awaits SQLite row deletes.
+- Stickers `cmd` steps (`stickers` domain):
+  - Optional `"now_ms": <int64>` on `cmd` steps seeds `nowMs` for the duration of that step.
+  - Inherits `start`, `open`, `close`.
+  - `sticker_tabs`: `{}` — awaits `stickerTabs()` and records `[{"id", "name", "icon", "count"}, ...] | null` in `results["<stepIndex>"]`.
+  - `stickers_in_tab`: `{"id": <int>}` — awaits `stickers(inTab: id)` and records `[{"cate_id", "id", "url", "anim"}, ...] | null` in `results["<stepIndex>"]`.
+  - `search_stickers`: `{"text": "<str>"}` — awaits `searchStickers(text)` and records sticker array `| null` in `results["<stepIndex>"]`.
+  - `typing_suggestions`: `{"conv_id": "<str>", "text": "<str>"}` — awaits `typingStickerSuggestions(in: conv_id, text: text)` and records sticker array in `results["<stepIndex>"]`.
+  - `send_sticker`: `{"conv_id": "<str>", "sticker": {"cate_id": <int>, "id": <int>, "url": "<str>"}, "source": "category"|"recent"|"search"|"suggestion", "typed": <str|null, optional>, "index": <int, optional>}` — awaits `sendSticker(...)` + Core settle and records `CardActionOutcome` JSON in `results["<stepIndex>"]`.
+  - `sticker_setting`: `{}` — awaits `stickerSuggestSetting()` and records `{"enabled": <bool>, "debounce": <int>} | null` in `results["<stepIndex>"]`.
+  - `set_sticker_suggest`: `{"enabled": <bool>}` — awaits `setStickerSuggest(enabled: enabled)` and records `{"enabled": <bool>, "debounce": <int>} | null` in `results["<stepIndex>"]`.
+  - `my_card`: `{}` — awaits `myCard()` and records `{"uid", "name", "avatar", "phone", "with_phone"} | null` in `results["<stepIndex>"]`.
+  - `send_my_card`: `{"conv_id": "<str>", "with_phone": <bool>}` — awaits `sendMyCard(to: conv_id, withPhone: with_phone)` + Core settle and records `ComposerOutcome` JSON in `results["<stepIndex>"]`.
+  - `reminder_info`: `{"conv_id": "<str>"}` — awaits `reminderComposeInfo(for: conv_id)` and records `{"allowed", "hidden", "text", "is_group", "can_pin", "pin_toggle", "title_max_chars", "title_max_bytes"} | null` in `results["<stepIndex>"]`.
+  - `create_reminder`: `{"conv_id": "<str>", "title": "<str>", "start_ms": <int64>, "repeat": 0|1|2|3, "pin": <bool>}` — awaits `createReminder(...)` and records `ComposerOutcome` JSON in `results["<stepIndex>"]`.
+  - `answer_confirm`: `{"ok": <bool>, "confirm": {"id", "conv_id", "title", "message", "ok", "cancel"} (optional, defaults to active composerConfirm)}` — calls `answerComposerConfirm(confirm, ok: ok)`.
+  - `advance_confirm_ms`: `{"ms": <int>}` — advances the virtual 300 ms confirm promotion clock by `ms` milliseconds and flushes any due confirm promotion.
+  - `drop_confirms`: `{}` — calls `dropComposerConfirms()`.
+  - `composer_report`: `{"conv_id": "<str>", "outcome": {"status": "done"|"cancelled"|"failed"|"pending", "text": <str, optional>}}` — calls `report(outcome, in: conv_id)`.
 - `{"await": {"phase": "<kind>", "step": "<login step, optional>"}, "timeout_ms": 5000}`: wait until the state matches. The Rust runner instead runs the core until no input or effect is pending, then checks the same predicate.
 - `{"await_host": "<call>", "timeout_ms": N}`: wait until the recorded `host` list contains `"<call>"` searching from the current host cursor, then advance the host cursor past that entry (`index + 1`). Used for deterministic ordering (for example awaiting `e2ee_connected` before `ws_push`).
 - `{"ws_push": k}` (optional `"timeout_ms": N`): instruct the fake server to send the next `k` scripted `ws_frame` or `ws_close` entries in script order.
@@ -182,6 +206,8 @@ Run in order:
     - `refresh_cloud {}` *(U11 cloud snapshot refresh at the end of `performBootstrapSync`)*
   - Send domain names (Swift-owned U0b boundaries):
     - `send_e2ee_text {conv_id, text, client_id, quote}` *(E2EE 1-1 send boundary in `sendText`, invoked after the optimistic row is merged; `quote` is `null` or `{"msg_id", "cli_msg_id", "sender_id", "sender_name", "text", "ts_ms"}`, and the result is supplied by `seed.host_results.send_e2ee_text`)*
+    - `send_e2ee_sticker {conv_id, cate_id, sticker_id, client_id}` *(E2EE 1-1 sticker send boundary in `sendSticker`; scripted by `seed.host_results.send_e2ee_sticker`)*
+    - `send_e2ee_contact_card {conv_id, client_id, contact_uid, title, phone, avatar, qr_code_url}` *(E2EE 1-1 contact-card send boundary shared by `sendMyCard` and `forward`)*
   - Message actions domain names (Swift-owned UI boundaries):
     - `show_card {conv_id, text}` *(banner notice shown via `CardActionCenter.shared.show(text, in: convId)` from U6 react, recall, delete undo, star, and auto-delete flows; traced and skipped during recording)*
 
@@ -457,6 +483,41 @@ Cases in `message_actions` extend the Send domain state, adding `buttons` to `me
 - `action_logs` holds `"react failed..."`, `"recall failed..."`, and `"autodelete: ..."` lines emitted via `EngineLog` (with the wall-clock `HH:mm:ss.SSS ` prefix stripped).
 - `store.messages[]` adds `reactions` (`[{"icon", "count", "includes_me"}]`) and `starred` (`<bool>`) decoded from `raw_json`.
 - `store.prefs` adds `starred_ids` (sorted array from SQLite pref `starredIds`) and `seen_reaction_event_ids` (ordered array from SQLite pref `seenReactionEventIds`).
+
+## Stickers domain state
+
+Cases in `stickers` extend the Message actions domain state with `sticker_suggest_state`, `composer_confirm`, `queued_composer_confirms`, `results`, `store.prefs.recent_stickers`, `store.prefs.sticker_suggest`, and optional sticker/contact-card fields on `messages[convId][]`:
+
+```json
+{
+  "sticker_suggest_state": { "enabled": true, "debounce": 180 },
+  "composer_confirm": {
+    "id": "c1",
+    "conv_id": "3001301",
+    "title": "Gửi tệp?",
+    "message": "Ảnh vượt quá giới hạn",
+    "ok": "Gửi dạng tệp",
+    "cancel": "Huỷ"
+  },
+  "queued_composer_confirms": [],
+  "results": {
+    "1": [{ "id": 0, "name": "Củ hành", "icon": "https://...", "count": 30 }]
+  },
+  "store": {
+    "prefs": {
+      "recent_stickers": [{ "id": 10, "cateId": 1, "type": 7, "url": "https://..." }],
+      "sticker_suggest": true
+    }
+  }
+}
+```
+
+- `messages[convId][]` adds `"sticker_url"` (`<str|null>`) when `kind` is `.sticker` and `"contact_card"` (`{"name", "uid", "avatar", "phone"} | null`) when `kind` is `.contactCard`.
+- `store.prefs.recent_stickers`: array of recent sticker dictionaries persisted under SQLite preference `recentStickers` (`[]` when absent).
+- `store.prefs.sticker_suggest`: persisted SQLite boolean under preference `stickerSuggest`, or `null` when absent.
+- `sticker_suggest_state`: `null` or `{"enabled": <bool>, "debounce": <int>}` mirroring `StickerSuggestState.shared.setting`.
+- `composer_confirm`, `queued_composer_confirms`: mirror `ZaloEngine.composerConfirm` and `ZaloEngine.queuedComposerConfirms`.
+- `results`: map of 0-based `steps` index string (`"0"`, `"1"`, ...) for each query/action step executed so far.
 
 ## Volatile
 

@@ -1672,7 +1672,7 @@ extension ZaloSessionClient {
                 "needPin": false,
                 "repeat": repeatMode
             ]
-            let objStr = (try? JSONSerialization.data(withJSONObject: objDict)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+            let objStr = (try? JSONSerialization.data(withJSONObject: objDict, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
             let resp = try await post(
                 service: "group_board",
                 path: "/api/board/oneone/create",
@@ -1680,7 +1680,7 @@ extension ZaloSessionClient {
             )
             return ZaloJSONBox(resp)
         }
-        let paramsStr = (try? JSONSerialization.data(withJSONObject: ["title": title, "setTitle": true])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        let paramsStr = (try? JSONSerialization.data(withJSONObject: ["title": title, "setTitle": true], options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
         let resp = try await post(
             service: "group_board",
             path: "/api/board/topic/createv2",
