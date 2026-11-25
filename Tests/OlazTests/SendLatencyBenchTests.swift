@@ -11,8 +11,8 @@ import Testing
 @Suite(.serialized) struct SendLatencyBenchTests {
     @MainActor
     @Test func sendToRowVisibleMainActorLatency() async throws {
-        let warmup = 5
-        let iterations = 30
+        let warmup = ProcessInfo.processInfo.environment["OLAZ_BENCH_WARMUP"].flatMap(Int.init) ?? 5
+        let iterations = ProcessInfo.processInfo.environment["OLAZ_BENCH_ITERS"].flatMap(Int.init) ?? 30
         let totalSends = warmup + iterations
         let convId = "3000999"
         let myUid = "2000999"
@@ -202,7 +202,6 @@ import Testing
         _ = await engine.bootTask?.value
         #expect(engine.phase == .ready)
         engine.openConversation(convId)
-        _ = await engine.openConversationTask?.value
         await engine.settleForRecording()
         #expect((engine.messages[convId]?.count ?? 0) == 50)
 
