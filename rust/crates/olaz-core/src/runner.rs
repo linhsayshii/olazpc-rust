@@ -1550,6 +1550,20 @@ async fn run_store_worker(
                                         StoreOp::SetConversationUnread { id, unread } => {
                                             let _ = store.set_conversation_unread(&id, unread);
                                         }
+                                        StoreOp::SetConversationPreview {
+                                            id,
+                                            preview_text,
+                                            preview_ts_ms,
+                                            preview_from_me,
+                                        } => {
+                                            let _ = store.set_conversation_preview(
+                                                &id,
+                                                &preview_text,
+                                                preview_ts_ms,
+                                                preview_from_me,
+                                                unix_now_ms(),
+                                            );
+                                        }
                                         StoreOp::DeleteConversation { id } => {
                                             let _ = store.delete_conversation(&id);
                                         }
@@ -1850,7 +1864,10 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                         drain_id,
                         delta,
                     });
-                } else if delta.applied_count > 0 || !delta.updates.is_empty() {
+                } else if delta.applied_count > 0
+                    || !delta.updates.is_empty()
+                    || !delta.preview_overrides.is_empty()
+                {
                     sink.send(Input::BatchDeltaApplied { delta });
                 }
             }
@@ -1865,7 +1882,10 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 let delta = host
                     .apply_parsed_events(cmd, increment_unread, notify_incoming, envelope)
                     .await;
-                if delta.applied_count > 0 || !delta.updates.is_empty() {
+                if delta.applied_count > 0
+                    || !delta.updates.is_empty()
+                    || !delta.preview_overrides.is_empty()
+                {
                     sink.send(Input::BatchDeltaApplied { delta });
                 }
             }
@@ -2107,6 +2127,7 @@ mod tests {
                         sender_avatar: None,
                         unread_delta: 1,
                     }],
+                    preview_overrides: Vec::new(),
                     persist_conversations: false,
                 }
             }

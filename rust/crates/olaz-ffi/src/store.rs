@@ -538,6 +538,28 @@ impl CoreStore {
         Ok(())
     }
 
+    pub async fn set_conversation_preview(
+        &self,
+        id: String,
+        preview_text: String,
+        preview_ts_ms: i64,
+        preview_from_me: bool,
+        updated_at_ms: i64,
+    ) -> Result<(), CoreError> {
+        let db = Arc::clone(&self.inner);
+        blocking(move || {
+            lock(&db).set_conversation_preview(
+                &id,
+                &preview_text,
+                preview_ts_ms,
+                preview_from_me,
+                updated_at_ms,
+            )
+        })
+        .await??;
+        Ok(())
+    }
+
     pub async fn delete_conversation(&self, id: String) -> Result<(), CoreError> {
         let db = Arc::clone(&self.inner);
         blocking(move || lock(&db).delete_conversation(&id)).await??;

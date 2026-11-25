@@ -449,9 +449,165 @@ enum CaseFile {
             .deletingLastPathComponent()
     }
 
+    struct KnownDiff {
+        let domain: String
+        let name: String
+        let path: String
+        let actual: CaseJSON
+        let reason: String
+    }
+
+    struct LeafDiff {
+        let path: String
+        let expected: CaseJSON
+        let actual: CaseJSON
+    }
+
     static func casesURL(domain: String, from filePath: String = #filePath) -> URL {
         repoRoot(from: filePath)
             .appendingPathComponent("rust/crates/olaz-core/cases/\(domain).jsonl")
+    }
+
+    static func knownDiffsURL(from filePath: String = #filePath) -> URL {
+        repoRoot(from: filePath)
+            .appendingPathComponent("rust/crates/olaz-core/cases/known-diffs.jsonl")
+    }
+
+    static func loadKnownDiffs(from filePath: String = #filePath) throws -> [KnownDiff] {
+        let url = knownDiffsURL(from: filePath)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return []
+        }
+        return try loadKnownDiffs(url: url)
+    }
+
+    static func loadKnownDiffs(url: URL) throws -> [KnownDiff] {
+        let content = try String(contentsOf: url, encoding: .utf8)
+        var out: [KnownDiff] = []
+        for rawLine in content.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty { continue }
+            let obj = try CaseJSON.parse(line)
+            guard let domain = obj["domain"]?.stringValue,
+                  let name = obj["name"]?.stringValue,
+                  let path = obj["path"]?.stringValue,
+                  let actual = obj["actual"] else {
+                throw CaseJSONError.invalidToken("known-diffs entry missing required fields")
+            }
+            let reason = obj["reason"]?.stringValue ?? ""
+            out.append(KnownDiff(domain: domain, name: name, path: path, actual: actual, reason: reason))
+        }
+        return out
+    }
+
+    /// Collects all leaf diffs matching Rust `tests/common/mod.rs::diff_json` path and `"<missing>"` conventions.
+    static func collectLeafDiffs(expected: CaseJSON, actual: CaseJSON, prefix: String = "") -> [LeafDiff] {
+        if expected == actual { return [] }
+        switch (expected, actual) {
+        case (.object(let eDict), .object(let aDict)):
+            var out: [LeafDiff] = []
+            let allKeys = Set(eDict.keys).union(aDict.keys).sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
+            for k in allKeys {
+                let childPath = prefix.isEmpty ? k : "\(prefix).\(k)"
+                switch (eDict[k], aDict[k]) {
+                case let (eVal?, aVal?):
+                    out.append(contentsOf: collectLeafDiffs(expected: eVal, actual: aVal, prefix: childPath))
+                case let (eVal?, nil):
+                    out.append(LeafDiff(path: childPath, expected: eVal, actual: .string("<missing>")))
+                case let (nil, aVal?):
+                    out.append(LeafDiff(path: childPath, expected: .string("<missing>"), actual: aVal))
+                case (nil, nil):
+                    break
+                }
+            }
+            return out
+        case (.array(let eArr), .array(let aArr)):
+            var out: [LeafDiff] = []
+            let count = max(eArr.count, aArr.count)
+            for i in 0..<count {
+                let childPath = "\(prefix)[\(i)]"
+                if i < eArr.count && i < aArr.count {
+                    out.append(contentsOf: collectLeafDiffs(expected: eArr[i], actual: aArr[i], prefix: childPath))
+                } else if i < eArr.count {
+                    out.append(LeafDiff(path: childPath, expected: eArr[i], actual: .string("<missing>")))
+                } else {
+                    out.append(LeafDiff(path: childPath, expected: .string("<missing>"), actual: aArr[i]))
+                }
+            }
+            return out
+        default:
+            return [LeafDiff(path: prefix, expected: expected, actual: actual)]
+        }
+    }
+
+    /// Compares a recorded case against a fresh Swift run, accepting ONLY leaf diffs under `expect`
+    /// that match a `known-diffs.jsonl` entry by `(domain, name, path)` AND exact canonical `actual`.
+    static func compareCase(
+        domain: String,
+        name: String,
+        expected: CaseJSON,
+        actual: CaseJSON,
+        knownDiffs: [KnownDiff],
+        usedKnownDiffs: inout [Bool]
+    ) -> [String] {
+        guard case .object(var expObj) = expected, case .object(var actObj) = actual else {
+            if let d = CaseJSON.firstDiff(expected: expected, actual: actual) {
+                return [d]
+            }
+            return []
+        }
+
+        let expExpect = expObj.removeValue(forKey: "expect") ?? .null
+        let actExpect = actObj.removeValue(forKey: "expect") ?? .null
+
+        var errors: [String] = []
+        if let metaDiff = CaseJSON.firstDiff(expected: .object(expObj), actual: .object(actObj)) {
+            errors.append(metaDiff)
+        }
+
+        let leafDiffs = collectLeafDiffs(expected: expExpect, actual: actExpect, prefix: "")
+        for diff in leafDiffs {
+            let actualCanon = diff.actual.canonicalString()
+            var matched = false
+            for (idx, kd) in knownDiffs.enumerated() {
+                if kd.domain == domain
+                    && kd.name == name
+                    && kd.path == diff.path
+                    && kd.actual.canonicalString() == actualCanon
+                {
+                    if idx < usedKnownDiffs.count {
+                        usedKnownDiffs[idx] = true
+                    }
+                    matched = true
+                    break
+                }
+            }
+            if !matched {
+                errors.append("\(diff.path): expected \(diff.expected.canonicalString()), got \(actualCanon)")
+            }
+        }
+        return errors
+    }
+
+    /// Returns failure descriptions for any `known-diffs.jsonl` entry in `domain` that did not match
+    /// an executed case (either the case no longer differs from the recording, or its `actual` drifted,
+    /// or the case name does not exist in `<domain>.jsonl`).
+    static func staleKnownDiffs(
+        domain: String,
+        executedNames: Set<String>,
+        allCaseNames: Set<String>,
+        knownDiffs: [KnownDiff],
+        usedKnownDiffs: [Bool]
+    ) -> [String] {
+        var stale: [String] = []
+        for (idx, kd) in knownDiffs.enumerated() where kd.domain == domain {
+            if !allCaseNames.contains(kd.name) {
+                stale.append("stale known diff (unknown case): \(kd.domain)/\(kd.name) \(kd.path)")
+            } else if executedNames.contains(kd.name), !(idx < usedKnownDiffs.count && usedKnownDiffs[idx]) {
+                stale.append("stale known diff (case no longer differs or actual changed): \(kd.domain)/\(kd.name) \(kd.path)")
+            }
+        }
+        return stale
     }
 
     static func load(url: URL) throws -> [CaseJSON] {

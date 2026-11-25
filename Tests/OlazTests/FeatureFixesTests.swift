@@ -1591,3 +1591,168 @@ import Testing
         #expect(zip(list, list.dropFirst()).allSatisfy { $0.date <= $1.date })
     }
 }
+
+
+@Suite struct KnownDiffFixesTests {
+    private func makeEngineAndStore() async throws -> (ZaloEngine, ZaloSQLiteStore, URL) {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("olaz-known-diffs-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let dbURL = root.appendingPathComponent("messages.sqlite")
+        let store = try ZaloSQLiteStore(path: dbURL.path)
+        let engine = await MainActor.run {
+            let e = ZaloEngine(dataDirectory: root, useKeychain: false)
+            e.sqliteStore = store
+            return e
+        }
+        return (engine, store, root)
+    }
+
+    @Test @MainActor func batchRecallUpdatesConversationPreviewAndSQLite() async throws {
+        let (engine, store, root) = try await makeEngineAndStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let msg = ChatMessage(
+            id: "m1", conversationId: "3001", senderId: "3001", senderName: "Lan",
+            senderAvatar: nil, isMine: false, kind: .text, text: "Will recall",
+            date: Date(timeIntervalSince1970: 1_700_001_301), status: .sent,
+            quote: nil, reactions: [], isE2EE: false, clientId: "c1"
+        )
+        let stored = try #require(ZaloWireParser.encodeChatMessage(msg))
+        await engine.applyParsedEvents([.message(msg, stored)], incrementUnread: true, notifyIncoming: false)
+        #expect(engine.conversations.first?.preview?.text == "Will recall")
+
+        await engine.applyParsedEvents(
+            [.undo(convId: "3001", msgId: "m1", cliMsgId: "c1")],
+            incrementUnread: false,
+            notifyIncoming: false
+        )
+        #expect(engine.conversations.first?.preview?.text == "Tin nhắn đã được thu hồi")
+        let saved = try await store.loadConversations()
+        #expect(saved.first(where: { $0.id == "3001" })?.previewText == "Tin nhắn đã được thu hồi")
+    }
+
+    @Test @MainActor func batchDeleteRecomputesPreviewToNewestRemainingAndClearsWhenEmpty() async throws {
+        let (engine, store, root) = try await makeEngineAndStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let first = ChatMessage(
+            id: "m1", conversationId: "3002", senderId: "3002", senderName: "Binh",
+            senderAvatar: nil, isMine: false, kind: .text, text: "First msg",
+            date: Date(timeIntervalSince1970: 1_700_001_401), status: .sent,
+            quote: nil, reactions: [], isE2EE: false, clientId: "c1"
+        )
+        let second = ChatMessage(
+            id: "m2", conversationId: "3002", senderId: "3002", senderName: "Binh",
+            senderAvatar: nil, isMine: false, kind: .text, text: "Latest to delete",
+            date: Date(timeIntervalSince1970: 1_700_001_402), status: .sent,
+            quote: nil, reactions: [], isE2EE: false, clientId: "c2"
+        )
+        let s1 = try #require(ZaloWireParser.encodeChatMessage(first))
+        let s2 = try #require(ZaloWireParser.encodeChatMessage(second))
+        await engine.applyParsedEvents([.message(first, s1), .message(second, s2)], incrementUnread: true, notifyIncoming: false)
+        #expect(engine.conversations.first?.preview?.text == "Latest to delete")
+
+        // Delete newest -> recomputes preview to remaining newest ("First msg") and rolls back SQLite.
+        await engine.applyParsedEvents(
+            [.delete(convId: "3002", msgId: "m2", cliMsgId: "c2")],
+            incrementUnread: false,
+            notifyIncoming: false
+        )
+        #expect(engine.conversations.first?.preview?.text == "First msg")
+        #expect(engine.conversations.first?.preview?.date == first.date)
+        let savedAfterFirstDelete = try await store.loadConversations()
+        #expect(savedAfterFirstDelete.first(where: { $0.id == "3002" })?.previewText == "First msg")
+        #expect(savedAfterFirstDelete.first(where: { $0.id == "3002" })?.previewTsMs == 1_700_001_401_000)
+
+        // Delete last remaining message -> preview clears to nil (SQLite stores "", 0, false).
+        await engine.applyParsedEvents(
+            [.delete(convId: "3002", msgId: "m1", cliMsgId: "c1")],
+            incrementUnread: false,
+            notifyIncoming: false
+        )
+        #expect(engine.conversations.first?.preview == nil)
+        let savedAfterAllDeleted = try await store.loadConversations()
+        #expect(savedAfterAllDeleted.first(where: { $0.id == "3002" })?.previewText == "")
+        #expect(savedAfterAllDeleted.first(where: { $0.id == "3002" })?.previewTsMs == 0)
+        #expect(savedAfterAllDeleted.first(where: { $0.id == "3002" })?.previewFromMe == false)
+    }
+
+    @Test func caseFileKnownDiffsEnforcesExactActualAndCatchesStale() {
+        let recorded: CaseJSON = .object([
+            "format": .int(1),
+            "domain": .string("conversations"),
+            "name": .string("sample"),
+            "expect": .object([
+                "final": .object([
+                    "preview": .string("Old"),
+                    "items": .array([.string("a")]),
+                ]),
+            ]),
+        ])
+        let actual: CaseJSON = .object([
+            "format": .int(1),
+            "domain": .string("conversations"),
+            "name": .string("sample"),
+            "expect": .object([
+                "final": .object([
+                    "preview": .string("New"),
+                    "items": .array([]),
+                ]),
+            ]),
+        ])
+
+        // Exact actual passes and marks both entries used.
+        let exact = [
+            CaseFile.KnownDiff(domain: "conversations", name: "sample", path: "final.preview", actual: .string("New"), reason: "ok"),
+            CaseFile.KnownDiff(domain: "conversations", name: "sample", path: "final.items[0]", actual: .string("<missing>"), reason: "ok"),
+        ]
+        var usedExact = [false, false]
+        let diffsExact = CaseFile.compareCase(
+            domain: "conversations", name: "sample",
+            expected: recorded, actual: actual,
+            knownDiffs: exact, usedKnownDiffs: &usedExact
+        )
+        #expect(diffsExact.isEmpty)
+        #expect(usedExact == [true, true])
+        #expect(CaseFile.staleKnownDiffs(
+            domain: "conversations",
+            executedNames: ["sample"],
+            allCaseNames: ["sample"],
+            knownDiffs: exact,
+            usedKnownDiffs: usedExact
+        ).isEmpty)
+
+        // Wrong actual fails and stays unused.
+        let wrong = [
+            CaseFile.KnownDiff(domain: "conversations", name: "sample", path: "final.preview", actual: .string("Other"), reason: "wrong"),
+            CaseFile.KnownDiff(domain: "conversations", name: "sample", path: "final.items[0]", actual: .string("<missing>"), reason: "ok"),
+        ]
+        var usedWrong = [false, false]
+        let diffsWrong = CaseFile.compareCase(
+            domain: "conversations", name: "sample",
+            expected: recorded, actual: actual,
+            knownDiffs: wrong, usedKnownDiffs: &usedWrong
+        )
+        #expect(diffsWrong.count == 1)
+        #expect(usedWrong == [false, true])
+
+        // Stale known diff (actual matches recorded again) is flagged by staleKnownDiffs.
+        var usedStale = [false, false]
+        let diffsMatch = CaseFile.compareCase(
+            domain: "conversations", name: "sample",
+            expected: recorded, actual: recorded,
+            knownDiffs: exact, usedKnownDiffs: &usedStale
+        )
+        #expect(diffsMatch.isEmpty)
+        #expect(usedStale == [false, false])
+        let stale = CaseFile.staleKnownDiffs(
+            domain: "conversations",
+            executedNames: ["sample"],
+            allCaseNames: ["sample"],
+            knownDiffs: exact,
+            usedKnownDiffs: usedStale
+        )
+        #expect(stale.count == 2)
+    }
+}

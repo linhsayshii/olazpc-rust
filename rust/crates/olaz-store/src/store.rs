@@ -268,6 +268,30 @@ ORDER BY pinned DESC, preview_ts DESC, updated_at DESC;",
         Ok(())
     }
 
+    /// Explicitly overwrites a conversation's persisted preview columns (allowing rollback to an
+    /// older message or clearing to empty when the latest message is deleted).
+    pub fn set_conversation_preview(
+        &mut self,
+        id: &str,
+        preview_text: &str,
+        preview_ts_ms: i64,
+        preview_from_me: bool,
+        updated_at_ms: i64,
+    ) -> Result<()> {
+        self.db()?
+            .prepare_cached(
+                "UPDATE conversations SET preview_text = ?1, preview_ts = ?2, preview_from_me = ?3, updated_at = ?4 WHERE id = ?5;",
+            )?
+            .execute(params![
+                preview_text,
+                preview_ts_ms,
+                i32::from(preview_from_me),
+                updated_at_ms,
+                id
+            ])?;
+        Ok(())
+    }
+
     /// Deletes a conversation and all of its messages.
     pub fn delete_conversation(&mut self, id: &str) -> Result<()> {
         let tx = self
