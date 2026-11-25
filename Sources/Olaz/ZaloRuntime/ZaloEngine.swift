@@ -234,7 +234,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var groupMemberCache: [String: [MentionCandidate]] = [:]
     @ObservationIgnored internal var cachedSentRequestsRaw: [[String: Any]] = []
     @ObservationIgnored internal var cachedReceivedRequestsRaw: [[String: Any]] = []
-    @ObservationIgnored internal var cachedGroupDetails: [String: [String: Any]] = [:]
+    @ObservationIgnored internal var cachedGroupDetails: [String: [String: Any]] = [:] { didSet { pushCoreContactsIfRunning() } }
     @ObservationIgnored internal var cachedFriendGlobalIds: [String: String] = [:] { didSet { friendUidByGlobalId = nil; pushCoreIdentitiesIfRunning() } }
     /// `cachedFriendGlobalIds` reversed (global id → uid), built on first use: looking a sender up scanned the whole map for every
     /// message (50 per chat opened, ~25 ms of main thread).
@@ -1249,7 +1249,10 @@ final class ZaloEngine {
                 }
             }
             if listChanged {
+                let prevSuppress = isSuppressingDirectMessageSync
+                isSuppressingDirectMessageSync = true
                 messages[convId] = list
+                isSuppressingDirectMessageSync = prevSuppress
             }
         }
 
@@ -1562,7 +1565,8 @@ final class ZaloEngine {
         convId: String,
         msgId: String,
         cliMsgId: String,
-        updateConversationPreview: Bool = true
+        updateConversationPreview: Bool = true,
+        persistConversations: Bool = true
     ) async -> ConvPreviewOverrideRecord? {
         guard traceU4Host("apply_remote_recall", args: [
             "conv_id": convId,
@@ -1632,7 +1636,7 @@ final class ZaloEngine {
             )
         }
         if updateConversationPreview, let override {
-            await commitPreviewOverrideToCore(override)
+            await commitPreviewOverrideToCore(override, persistConversations: persistConversations)
         }
         return override
     }
@@ -1642,7 +1646,8 @@ final class ZaloEngine {
         convId: String,
         msgId: String,
         cliMsgId: String,
-        updateConversationPreview: Bool = true
+        updateConversationPreview: Bool = true,
+        persistConversations: Bool = true
     ) async -> ConvPreviewOverrideRecord? {
         guard traceU4Host("apply_remote_delete", args: [
             "conv_id": convId,
@@ -1743,7 +1748,7 @@ final class ZaloEngine {
             preview: bestRemaining
         )
         if updateConversationPreview {
-            await commitPreviewOverrideToCore(override)
+            await commitPreviewOverrideToCore(override, persistConversations: persistConversations)
         }
         return override
     }

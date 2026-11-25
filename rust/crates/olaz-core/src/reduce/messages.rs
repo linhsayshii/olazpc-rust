@@ -845,7 +845,7 @@ fn apply_fetched_history_page(
     }
 
     // Pass 2 on history page: chronological reactions, then recalls & deletes (which update preview).
-    emit_pass2_events(state, &events, true, false, out);
+    emit_pass2_events(state, &events, true, true, false, out);
 
     pass1.new_visible_count
 }
@@ -1182,7 +1182,8 @@ pub(crate) fn ingest_parsed_events_in_core(
     }
 
     // Pass 2: chronological reactions, recalls, deletes, typing.
-    let preview_overrides = emit_pass2_events(state, events, false, true, out);
+    let preview_overrides =
+        emit_pass2_events(state, events, false, persist_conversations, true, out);
 
     let mut updates = Vec::with_capacity(latest_by_conv.len());
     let mut poll_msgs = Vec::with_capacity(latest_by_conv.len());
@@ -1231,6 +1232,7 @@ fn emit_pass2_events(
     state: &mut CoreState,
     events: &[ParsedWireEvent],
     update_conversation_preview_immediately: bool,
+    persist_conversations: bool,
     emit_typing: bool,
     out: &mut ReduceOutput,
 ) -> Vec<ConvPreviewOverride> {
@@ -1285,6 +1287,7 @@ fn emit_pass2_events(
                         || !events
                             .iter()
                             .any(|e| matches!(e, ParsedWireEvent::Message(..))),
+                    persist_conversations,
                 }));
             }
             ParsedWireEvent::Delete {
@@ -1300,6 +1303,7 @@ fn emit_pass2_events(
                         || !events
                             .iter()
                             .any(|e| matches!(e, ParsedWireEvent::Message(..))),
+                    persist_conversations,
                 }));
             }
             ParsedWireEvent::Typing {

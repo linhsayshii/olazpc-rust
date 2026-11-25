@@ -1273,7 +1273,7 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     /**
      * Applies a standalone recall/delete [`ConvPreviewOverrideRecord`] and awaits store persistence.
      */
-    func applyPreviewOverride(overrideRec: ConvPreviewOverrideRecord) async throws  -> UInt64
+    func applyPreviewOverride(overrideRec: ConvPreviewOverrideRecord, persistConversations: Bool) async throws  -> UInt64
     
     /**
      * Applies an already-fetched server hidden-conversations snapshot.
@@ -1839,12 +1839,12 @@ open func applyParsedEventsDirect(events: [WireEvent], incrementUnread: Bool, no
     /**
      * Applies a standalone recall/delete [`ConvPreviewOverrideRecord`] and awaits store persistence.
      */
-open func applyPreviewOverride(overrideRec: ConvPreviewOverrideRecord)async throws  -> UInt64  {
+open func applyPreviewOverride(overrideRec: ConvPreviewOverrideRecord, persistConversations: Bool)async throws  -> UInt64  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_olaz_ffi_fn_method_coreengine_apply_preview_override(
-                        self.uniffiCloneHandle(),FfiConverterTypeConvPreviewOverrideRecord_lower(overrideRec)
+                        self.uniffiCloneHandle(),FfiConverterTypeConvPreviewOverrideRecord_lower(overrideRec),FfiConverterBool.lower(persistConversations)
                 )
             },
             pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
@@ -3231,9 +3231,9 @@ public protocol CoreHost: AnyObject, Sendable {
     
     func applyRemoteReaction(convId: String, msgId: String, cliMsgId: String, senderId: String, rType: String, rIcon: String, eventId: String, reactClientId: String, senderName: String) async 
     
-    func applyRemoteRecall(convId: String, msgId: String, cliMsgId: String, updateConversationPreview: Bool) async 
+    func applyRemoteRecall(convId: String, msgId: String, cliMsgId: String, updateConversationPreview: Bool, persistConversations: Bool) async 
     
-    func applyRemoteDelete(convId: String, msgId: String, cliMsgId: String, updateConversationPreview: Bool) async 
+    func applyRemoteDelete(convId: String, msgId: String, cliMsgId: String, updateConversationPreview: Bool, persistConversations: Bool) async 
     
     func decryptEnvelope(payloadJson: String) async  -> String
     
@@ -3641,12 +3641,12 @@ open func applyRemoteReaction(convId: String, msgId: String, cliMsgId: String, s
         )
 }
     
-open func applyRemoteRecall(convId: String, msgId: String, cliMsgId: String, updateConversationPreview: Bool)async   {
+open func applyRemoteRecall(convId: String, msgId: String, cliMsgId: String, updateConversationPreview: Bool, persistConversations: Bool)async   {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_olaz_ffi_fn_method_corehost_apply_remote_recall(
-                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(msgId),FfiConverterString.lower(cliMsgId),FfiConverterBool.lower(updateConversationPreview)
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(msgId),FfiConverterString.lower(cliMsgId),FfiConverterBool.lower(updateConversationPreview),FfiConverterBool.lower(persistConversations)
                 )
             },
             pollFunc: ffi_olaz_ffi_rust_future_poll_void,
@@ -3658,12 +3658,12 @@ open func applyRemoteRecall(convId: String, msgId: String, cliMsgId: String, upd
         )
 }
     
-open func applyRemoteDelete(convId: String, msgId: String, cliMsgId: String, updateConversationPreview: Bool)async   {
+open func applyRemoteDelete(convId: String, msgId: String, cliMsgId: String, updateConversationPreview: Bool, persistConversations: Bool)async   {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_olaz_ffi_fn_method_corehost_apply_remote_delete(
-                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(msgId),FfiConverterString.lower(cliMsgId),FfiConverterBool.lower(updateConversationPreview)
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(msgId),FfiConverterString.lower(cliMsgId),FfiConverterBool.lower(updateConversationPreview),FfiConverterBool.lower(persistConversations)
                 )
             },
             pollFunc: ffi_olaz_ffi_rust_future_poll_void,
@@ -4856,6 +4856,7 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
             msgId: RustBuffer,
             cliMsgId: RustBuffer,
             updateConversationPreview: Int8,
+            persistConversations: Int8,
             uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
             uniffiCallbackData: UInt64,
             uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
@@ -4869,7 +4870,8 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                      convId: try FfiConverterString.lift(convId),
                      msgId: try FfiConverterString.lift(msgId),
                      cliMsgId: try FfiConverterString.lift(cliMsgId),
-                     updateConversationPreview: try FfiConverterBool.lift(updateConversationPreview)
+                     updateConversationPreview: try FfiConverterBool.lift(updateConversationPreview),
+                     persistConversations: try FfiConverterBool.lift(persistConversations)
                 )
             }
 
@@ -4902,6 +4904,7 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
             msgId: RustBuffer,
             cliMsgId: RustBuffer,
             updateConversationPreview: Int8,
+            persistConversations: Int8,
             uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
             uniffiCallbackData: UInt64,
             uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
@@ -4915,7 +4918,8 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                      convId: try FfiConverterString.lift(convId),
                      msgId: try FfiConverterString.lift(msgId),
                      cliMsgId: try FfiConverterString.lift(cliMsgId),
-                     updateConversationPreview: try FfiConverterBool.lift(updateConversationPreview)
+                     updateConversationPreview: try FfiConverterBool.lift(updateConversationPreview),
+                     persistConversations: try FfiConverterBool.lift(persistConversations)
                 )
             }
 
@@ -6512,7 +6516,7 @@ public func FfiConverterTypeCoreMedia_lower(_ value: CoreMedia) -> UInt64 {
  */
 public protocol CoreOfflineConversationsProtocol: AnyObject, Sendable {
     
-    func applyPreviewOverride(overrideRec: ConvPreviewOverrideRecord)  -> CoreChangesRecord
+    func applyPreviewOverride(overrideRec: ConvPreviewOverrideRecord, persistConversations: Bool)  -> CoreChangesRecord
     
     func ensureKnownContacts()  -> CoreChangesRecord
     
@@ -6604,12 +6608,13 @@ public convenience init() {
     
 
     
-open func applyPreviewOverride(overrideRec: ConvPreviewOverrideRecord) -> CoreChangesRecord  {
+open func applyPreviewOverride(overrideRec: ConvPreviewOverrideRecord, persistConversations: Bool) -> CoreChangesRecord  {
     return try!  FfiConverterTypeCoreChangesRecord_lift(try! rustCall() {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_method_coreofflineconversations_apply_preview_override(
             self.uniffiCloneHandle(),
-        FfiConverterTypeConvPreviewOverrideRecord_lower(overrideRec),uniffiCallStatus
+        FfiConverterTypeConvPreviewOverrideRecord_lower(overrideRec),
+        FfiConverterBool.lower(persistConversations),uniffiCallStatus
     )
 })
 }
@@ -19754,6 +19759,8 @@ public enum WindowDeltaRecord: Equatable, Hashable {
     )
     case patch(convId: String, upserts: [ChatMessageRecord], removedIds: [String]
     )
+    case remove(convId: String
+    )
 
 
 
@@ -19784,6 +19791,9 @@ public struct FfiConverterTypeWindowDeltaRecord: FfiConverterRustBuffer {
         case 3: return .patch(convId: try FfiConverterString.read(from: &buf), upserts: try FfiConverterSequenceTypeChatMessageRecord.read(from: &buf), removedIds: try FfiConverterSequenceString.read(from: &buf)
         )
         
+        case 4: return .remove(convId: try FfiConverterString.read(from: &buf)
+        )
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -19809,6 +19819,11 @@ public struct FfiConverterTypeWindowDeltaRecord: FfiConverterRustBuffer {
             FfiConverterString.write(convId, into: &buf)
             FfiConverterSequenceTypeChatMessageRecord.write(upserts, into: &buf)
             FfiConverterSequenceString.write(removedIds, into: &buf)
+            
+        
+        case let .remove(convId):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(convId, into: &buf)
             
         }
     }
@@ -22576,7 +22591,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_apply_parsed_events_direct() != 64846) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_coreengine_apply_preview_override() != 9988) {
+    if (uniffi_olaz_ffi_checksum_method_coreengine_apply_preview_override() != 12207) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_apply_server_hidden_conversations() != 4274) {
@@ -22903,10 +22918,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_corehost_apply_remote_reaction() != 19195) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_apply_remote_recall() != 42402) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_apply_remote_recall() != 31385) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_apply_remote_delete() != 36382) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_apply_remote_delete() != 29247) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_corehost_decrypt_envelope() != 23082) {
@@ -22984,7 +22999,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_corehost_send_e2ee_text() != 23388) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_coreofflineconversations_apply_preview_override() != 46636) {
+    if (uniffi_olaz_ffi_checksum_method_coreofflineconversations_apply_preview_override() != 60866) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreofflineconversations_ensure_known_contacts() != 38713) {
