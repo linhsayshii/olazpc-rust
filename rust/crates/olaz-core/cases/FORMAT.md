@@ -702,10 +702,10 @@ Cases in `polls` extend the Groups domain state with `polls`, `pins`, and `poll_
 - `polls.pins`: map of `<pollId>` to `PollPinState` (`{"ready", "can_pin", "pinned", "limit", "offers_pin"}`).
 - `pins`: map of `<convId>` to `PinnedList` (`{"ready", "can_pin", "limit", "items": [{"ref", "kind", "title", "sender", "thumbnail", "msg_id", "cli_msg_id"}]}`).
 - `poll_clock`: process-wide `PollClock` state (reset before and after every case):
-  - `watched` is the sorted array of poll ids in `PollClock.watched` while its size stays `<= 500` and no 501st-entry eviction occurred (`!didEvictWatched`), or `null` once eviction occurred (or when `seed.watched_check_ids` is present).
+  - `watched` is the sorted array of poll ids in `PollClock.watched` while its size stays `<= 500` and no 501st-entry eviction occurred (`!didEvictWatched`), or `null` once eviction occurred.
   - `watched_count` is `PollClock.watched.count`.
-  - `watched_contains` is `null` unless `seed.watched_check_ids` is set, in which case it maps each named id to `<bool>` (verifying newly watched ids are kept without exposing the hash-arbitrary evicted key).
-  - `last_attempt_ms` maps `<pollId>` to rounded epoch ms from `PollClock.lastAttempt` (filtered to `seed.watched_check_ids` when `watched_check_ids` is present or eviction occurred).
+  - `watched_contains` is `null` until eviction occurs, at which point (if `seed.watched_check_ids` is set) it maps each named id to `<bool>` (verifying newly watched ids are kept without exposing the hash-arbitrary evicted key).
+  - `last_attempt_ms` maps `<pollId>` to rounded epoch ms from `PollClock.lastAttempt` (filtered to `seed.watched_check_ids` once eviction has occurred).
   - `rewatchPolls` iteration order is harmless because `expect.requests` is compared as a sorted multiset.
 - `refresh_board_pins` boundary: `refresh_board_pins` remains the U4 `traceU4Host` call (recorded in `expect.host` and skipped during recording without `host_results`); `pins` stays as seeded via `seed.pins` or updated via `pins_state` until U7 owns the board refresh.
 
