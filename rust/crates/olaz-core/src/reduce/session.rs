@@ -327,6 +327,14 @@ fn reduce_command(state: &mut CoreState, cmd: Command, out: &mut ReduceOutput) {
                 out.dirty.insert(DirtyKey::Typing);
             }
             state.send.reset(out);
+            // U6
+            let (undo_changed, auto_del_changed) = state.actions.reset_session();
+            if undo_changed {
+                out.dirty.insert(DirtyKey::DeleteUndo);
+            }
+            if auto_del_changed {
+                out.dirty.insert(DirtyKey::AutoDelete);
+            }
             state.session.sign_out_notice = None;
             state.session.qr_gen = state.session.qr_gen.saturating_add(1);
             state.session.phase = Phase::Login(LoginState::generating());
@@ -408,6 +416,14 @@ pub(crate) fn enter_session_expired(state: &mut CoreState, reason: String, out: 
         out.dirty.insert(DirtyKey::Typing);
     }
     state.send.reset(out);
+    // U6
+    let (undo_changed, auto_del_changed) = state.actions.reset_session();
+    if undo_changed {
+        out.dirty.insert(DirtyKey::DeleteUndo);
+    }
+    if auto_del_changed {
+        out.dirty.insert(DirtyKey::AutoDelete);
+    }
     state.session.sign_out_notice = Some(reason);
     state.session.qr_gen = state.session.qr_gen.saturating_add(1);
     state.session.phase = Phase::Login(LoginState::generating());

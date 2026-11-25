@@ -931,6 +931,8 @@ impl CoreOfflineConversations {
                             .collect(),
                     );
                 }
+                // U6 (wired to FFI once U4+U6 cut over Swift)
+                DirtyKey::DeleteUndo | DirtyKey::AutoDelete => {}
             }
         }
         rec

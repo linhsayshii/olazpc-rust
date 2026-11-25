@@ -11,6 +11,7 @@ use olaz_wire::ChatMessage;
 use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
+use crate::actions::DeleteUndoItem;
 use crate::conversations::{ConversationActionResult, IdentityTable, PinBoard};
 use crate::input::{E2eeQuoteArg, HiddenPinSyncKind, SeenTarget, StoreToken};
 use crate::messages::MuteEntry;
@@ -93,6 +94,10 @@ pub enum StoreOp {
         before_ts_ms: i64,
         limit: usize,
         op_id: Option<u64>,
+    // U6
+    DeleteMessage {
+        conv_id: String,
+        id: String,
     },
 }
 
@@ -189,6 +194,8 @@ impl fmt::Debug for StoreOp {
                 .field("before_ts_ms", before_ts_ms)
                 .field("limit", limit)
                 .finish(),
+            // U6
+            Self::DeleteMessage { .. } => f.write_str("DeleteMessage"),
         }
     }
 }
@@ -380,6 +387,10 @@ pub enum HostCall {
         text: String,
         client_id: String,
         quote: Option<E2eeQuoteArg>,
+    // U6
+    ShowCard {
+        conv_id: String,
+        text: String,
     },
 }
 
@@ -514,6 +525,10 @@ impl fmt::Debug for HostCall {
                 .debug_struct("SendE2eeText")
                 .field("send_id", send_id)
                 .field("has_quote", &quote.is_some())
+            // U6
+            Self::ShowCard { text, .. } => f
+                .debug_struct("ShowCard")
+                .field("text_len", &text.len())
                 .finish(),
         }
     }
@@ -725,6 +740,23 @@ pub enum Effect {
     SendTextApi {
         send_id: u64,
         params: SendTextParams,
+    },
+
+    // U6
+    /// Arms the 5 s delete-for-me undo expiry timer.
+    StartDeleteUndoExpiry { undo_gen: u64, delay: Duration },
+    /// Cancels any active delete-for-me undo expiry timer.
+    CancelDeleteUndoExpiry,
+    /// Commits a delete-for-me batch (`delete_message_for_me` API + SQLite delete per item).
+    CommitDeleteBatch { items: Vec<DeleteUndoItem> },
+    /// Calls `ZaloApi::fetch_auto_delete` and reports `Input::AutoDeleteLoaded`.
+    FetchAutoDeleteApi { op_id: Option<u64> },
+    /// Calls `ZaloApi::update_auto_delete` and reports `Input::AutoDeleteUpdated`.
+    UpdateAutoDeleteApi {
+        conv_id: String,
+        ttl: i64,
+        now_ms: i64,
+        op_id: Option<u64>,
     },
 
     /// Domain activity delegated to Swift via `CoreHost`.
@@ -961,6 +993,28 @@ impl fmt::Debug for Effect {
                 .debug_struct("SendTextApi")
                 .field("send_id", send_id)
                 .field("params", params)
+            // U6
+            Self::StartDeleteUndoExpiry { undo_gen, delay } => f
+                .debug_struct("StartDeleteUndoExpiry")
+                .field("undo_gen", undo_gen)
+                .field("delay_ms", &delay.as_millis())
+                .finish(),
+            Self::CancelDeleteUndoExpiry => f.write_str("CancelDeleteUndoExpiry"),
+            Self::CommitDeleteBatch { items } => f
+                .debug_struct("CommitDeleteBatch")
+                .field("count", &items.len())
+                .finish(),
+            Self::FetchAutoDeleteApi { op_id } => f
+                .debug_struct("FetchAutoDeleteApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::UpdateAutoDeleteApi {
+                ttl, now_ms, op_id, ..
+            } => f
+                .debug_struct("UpdateAutoDeleteApi")
+                .field("ttl", ttl)
+                .field("now_ms", now_ms)
+                .field("op_id", op_id)
                 .finish(),
             Self::Host(call) => f.debug_tuple("Host").field(call).finish(),
         }

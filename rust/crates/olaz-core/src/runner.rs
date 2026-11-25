@@ -20,6 +20,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
+use crate::actions::swift_error_type_name;
 use crate::actor::{ActorSink, InFlightGuard};
 use crate::conversations::{
     BatchApplyDelta, IdentityTable, MessagePreviewInput, hidden_pin_md5, hidden_pin_sha256,
@@ -484,6 +485,9 @@ pub trait Host: Send + Sync {
     ) -> Result<olaz_api::SendMessageResult, String> {
         Err("send_e2ee_text not implemented by host".to_owned())
     }
+    // U6: transient in-chat card toast (`CardActionCenter.shared.show`).
+    // Default no-op until U4+U6 cut over Swift `CoreHost`.
+    async fn show_card(&self, _conv_id: String, _text: String) {}
 }
 
 enum HostJob {
@@ -711,6 +715,12 @@ enum HostJob {
         duration: i64,
         _guard: InFlightGuard,
     },
+    // U6
+    ShowCard {
+        conv_id: String,
+        text: String,
+        _guard: InFlightGuard,
+    },
     Drain(oneshot::Sender<()>),
 }
 
@@ -756,6 +766,8 @@ pub struct SessionEffectRunner<T: Transport + 'static> {
     lp_fetch_abort: Mutex<Option<AbortHandle>>,
     // U5: per-conversation incoming typing expiry timers (`conv_id -> (expiry_gen, AbortHandle)`).
     typing_expiry_aborts: Arc<Mutex<BTreeMap<String, (u64, AbortHandle)>>>,
+    // U6: active delete-for-me undo bar expiry timer (`(undo_gen, AbortHandle)`).
+    delete_undo_abort: Arc<Mutex<Option<(u64, AbortHandle)>>>,
     host_worker_abort: AbortHandle,
     store_worker_abort: AbortHandle,
     runtime: Handle,
@@ -852,6 +864,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
             lp_timer_abort,
             lp_fetch_abort: Mutex::new(None),
             typing_expiry_aborts: Arc::new(Mutex::new(BTreeMap::new())),
+            delete_undo_abort: Arc::new(Mutex::new(None)),
             host_worker_abort: worker_handle.abort_handle(),
             store_worker_abort: store_handle.abort_handle(),
             runtime,
@@ -942,6 +955,8 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         for handle in handles {
             handle.abort();
         }
+        self.cancel_typing_expiry_timers();
+        self.cancel_delete_undo_timer();
     }
 
     fn cancel_typing_expiry(&self, conv_id: Option<&str>) {
@@ -960,6 +975,17 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
                     abort.abort();
                 }
             }
+        }
+    }
+
+    fn cancel_delete_undo_timer(&self) {
+        if let Some((_, handle)) = self
+            .delete_undo_abort
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            handle.abort();
         }
     }
 
@@ -1932,6 +1958,108 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         drop(guard);
                     });
                 }
+                // U6
+                Effect::StartDeleteUndoExpiry { undo_gen, delay } => {
+                    // Untracked background timer (like StartTypingExpiry / StartLpTimer) so
+                    // `wait_idle()` does not block on the 5 s undo window.
+                    let timer_sink = sink.clone();
+                    let aborts = Arc::clone(&self.delete_undo_abort);
+                    let aborts_inner = Arc::clone(&aborts);
+                    let handle = self
+                        .runtime
+                        .spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            {
+                                let mut slot =
+                                    aborts_inner.lock().unwrap_or_else(PoisonError::into_inner);
+                                if slot.as_ref().is_some_and(|(g, _)| *g == undo_gen) {
+                                    *slot = None;
+                                }
+                            }
+                            timer_sink.send(Input::DeleteUndoExpired { undo_gen });
+                        })
+                        .abort_handle();
+                    let prev = {
+                        let mut slot = aborts.lock().unwrap_or_else(PoisonError::into_inner);
+                        slot.replace((undo_gen, handle))
+                    };
+                    if let Some((_, prev_handle)) = prev {
+                        prev_handle.abort();
+                    }
+                }
+                Effect::CancelDeleteUndoExpiry => {
+                    self.cancel_delete_undo_timer();
+                }
+                Effect::CommitDeleteBatch { items } => {
+                    let client = Arc::clone(&self.client);
+                    let store_tx = self.store_tx.clone();
+                    let sink_inner = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        for item in items {
+                            let resolved_cli = if item.cli_msg_id.is_empty() {
+                                item.msg_id.as_str()
+                            } else {
+                                item.cli_msg_id.as_str()
+                            };
+                            let _ = api
+                                .delete_message_for_me(
+                                    &item.conv_id,
+                                    &item.msg_id,
+                                    resolved_cli,
+                                    &item.sender_id,
+                                )
+                                .await;
+                            let store_guard = sink_inner.track();
+                            let _ = store_tx.send(StoreJob::Op {
+                                op: StoreOp::DeleteMessage {
+                                    conv_id: item.conv_id,
+                                    id: item.msg_id,
+                                },
+                                sink: sink_inner.clone(),
+                                _guard: store_guard,
+                            });
+                        }
+                        drop(guard);
+                    });
+                }
+                Effect::FetchAutoDeleteApi { op_id } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let outcome = api.fetch_auto_delete().await.ok();
+                        sink.send(Input::AutoDeleteLoaded { outcome, op_id });
+                        drop(guard);
+                    });
+                }
+                Effect::UpdateAutoDeleteApi {
+                    conv_id,
+                    ttl,
+                    now_ms,
+                    op_id,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let error_type = match api.update_auto_delete(&conv_id, ttl).await {
+                            Ok(()) => None,
+                            Err(err) => Some(swift_error_type_name(&err).to_owned()),
+                        };
+                        sink.send(Input::AutoDeleteUpdated {
+                            conv_id,
+                            ttl,
+                            now_ms,
+                            error_type,
+                            op_id,
+                        });
+                        drop(guard);
+                    });
+                }
                 Effect::Host(call) => {
                     let guard = sink.track();
                     let job = match call {
@@ -2196,6 +2324,12 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         HostCall::SendE2eeText { .. } => {
                             continue;
                         }
+                        // U6
+                        HostCall::ShowCard { conv_id, text } => HostJob::ShowCard {
+                            conv_id,
+                            text,
+                            _guard: guard,
+                        },
                     };
                     self.send_host(job);
                 }
@@ -2473,6 +2607,10 @@ async fn run_store_worker(
                                                     preserve_existing_reactions,
                                                 },
                                             );
+                                        }
+                                        // U6
+                                        StoreOp::DeleteMessage { conv_id, id } => {
+                                            let _ = store.delete_message(&conv_id, &id);
                                         }
                                         StoreOp::LoadMentionPreviewMessages { .. }
                                         | StoreOp::LoadPreferenceString { .. }
@@ -3030,6 +3168,14 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
             } => {
                 host.mute(conv_id, set, start, start_explicit, duration)
                     .await;
+            }
+            // U6
+            HostJob::ShowCard {
+                conv_id,
+                text,
+                _guard,
+            } => {
+                host.show_card(conv_id, text).await;
             }
             HostJob::Drain(tx) => {
                 let _ = tx.send(());
@@ -3758,6 +3904,386 @@ mod tests {
         });
         core.wait_idle().await;
         assert_eq!(client.transport().requests().len(), 2);
+
+        core.stop();
+    }
+
+    #[derive(Default)]
+    struct RecordingCardHost {
+        cards: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl Host for RecordingCardHost {
+        async fn load_saved_session(&self) -> Option<String> {
+            None
+        }
+        async fn load_legacy_cookie(&self) -> Option<LegacyCookie> {
+            None
+        }
+        async fn set_pref(&self, _key: String, _value: String) {}
+        async fn prepare_store(&self, _user_id: String, _account: LoginAccount) {}
+        async fn start_bootstrap(&self) {}
+        async fn offer_first_login_transfer(&self, _force: bool) {}
+        async fn reset_domains(&self) {}
+        async fn persist_session(&self, _snapshot_json: String) {}
+        async fn clear_session(&self) {}
+        async fn mark_expired(&self, _snapshot_json: String) {}
+        async fn persist_poll_state(&self, _state: PollState) {}
+        async fn persist_ws_cursors(&self, _cursors: CursorMap) {}
+        async fn apply_batch(
+            &self,
+            _cmd: Option<u16>,
+            _increment_unread: bool,
+            _notify_incoming: bool,
+            _payload: Map<String, Value>,
+        ) -> BatchApplyDelta {
+            BatchApplyDelta::default()
+        }
+        async fn apply_parsed_events(
+            &self,
+            _cmd: u16,
+            _increment_unread: bool,
+            _notify_incoming: bool,
+            _envelope: TypedChatEnvelope,
+        ) -> BatchApplyDelta {
+            BatchApplyDelta::default()
+        }
+        async fn mobile_sync(&self, _events: Vec<MobileSyncEvent>) {}
+        async fn e2ee_signal(&self, _cmd: u16, _payload: Map<String, Value>) {}
+        async fn e2ee_deliver_reports(&self, _cmd: u16, _payload: Map<String, Value>) {}
+        async fn e2ee_connected(&self, _uid: String) {}
+        async fn e2ee_disconnected(&self) {}
+        async fn voip_control(&self, _act: String, _raw_data: Value, _data: Map<String, Value>) {}
+        async fn show_typing(&self, _conv_id: String, _uid: String, _on_pc: bool) {}
+        async fn pin_topic(&self, _conv_id: String) {}
+        async fn group_notice(&self, _act: String, _data: Map<String, Value>, _ts: i64) {}
+        async fn mute(
+            &self,
+            _conv_id: String,
+            _set: bool,
+            _start: i64,
+            _start_explicit: bool,
+            _duration: i64,
+        ) {
+        }
+        async fn show_card(&self, conv_id: String, text: String) {
+            self.cards
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((conv_id, text));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_undo_timer_commits_after_5s_and_undo_cancels_with_show_card() {
+        use crate::actions::{DELETE_UNDO_DURATION, DeleteUndoItem, RESTORE_SUCCESS_CARD_TEXT};
+        use crate::reduce::ReduceOutput;
+        use crate::state::CoreState;
+        use olaz_net::http::RawResponse;
+        use olaz_store::{Store, StoredMessage};
+
+        let transport = MockTransport::from_fn(|_req| {
+            Ok(RawResponse::new(
+                200,
+                serde_json::json!({"error_code": 0, "data": {}})
+                    .to_string()
+                    .into_bytes(),
+            ))
+        });
+        let client = Arc::new(SessionClient::new(
+            transport,
+            "imei-u6".to_owned(),
+            "Mac".to_owned(),
+        ));
+        client.update_credentials(
+            LoginAccount {
+                user_id: "2000620".to_owned(),
+                ..LoginAccount::default()
+            },
+            b"0123456789abcdef".to_vec(),
+            "sek.1".to_owned(),
+            Some(ZaloDomains::default()),
+        );
+        let host = Arc::new(RecordingCardHost::default());
+        let runner = Arc::new(SessionEffectRunner::new(
+            Arc::clone(&client),
+            Arc::clone(&host) as Arc<dyn Host>,
+            Handle::current(),
+        ));
+
+        // Seed an in-memory SQLite store with one message to confirm CommitDeleteBatch deletes it.
+        let Ok(mut store) = Store::open_in_memory() else {
+            panic!("failed to open in-memory store");
+        };
+        let seeded = StoredMessage {
+            id: "9020001".to_owned(),
+            conv_id: "3000620".to_owned(),
+            client_id: "c9020001".to_owned(),
+            sender_id: "2000620".to_owned(),
+            sender_name: "Me".to_owned(),
+            sender_avatar: String::new(),
+            is_mine: true,
+            text: "to delete".to_owned(),
+            kind_tag: "text".to_owned(),
+            ts_ms: 1_700_000_000_000,
+            status: "sent".to_owned(),
+            raw_json_data: Vec::new(),
+        };
+        let Ok(_) = store.save_messages(&[seeded]) else {
+            panic!("failed to save seeded message");
+        };
+        let store_arc = Arc::new(Mutex::new(store));
+        runner.attach_store(Arc::clone(&store_arc));
+
+        // 1) Undo before 5 s cancels timer, emits show_card, and never calls delete API.
+        let mut initial = CoreState::default();
+        let mut out = ReduceOutput::default();
+        initial.actions.delete_undo.start_batch(
+            "3000620".to_owned(),
+            vec![DeleteUndoItem {
+                conv_id: "3000620".to_owned(),
+                msg_id: "9020001".to_owned(),
+                cli_msg_id: "c9020001".to_owned(),
+                sender_id: "2000620".to_owned(),
+            }],
+            1_700_000_011_000,
+            &mut out,
+        );
+        let core = CoreHandle::start_with_state(
+            initial,
+            Arc::clone(&runner) as Arc<dyn EffectRunner>,
+            Handle::current(),
+        );
+        core.request_unit(Command::UndoDelete).await;
+        core.wait_idle().await;
+        assert_eq!(
+            *host.cards.lock().unwrap_or_else(PoisonError::into_inner),
+            vec![("3000620".to_owned(), RESTORE_SUCCESS_CARD_TEXT.to_owned())]
+        );
+        assert!(client.transport().requests().is_empty());
+        core.stop();
+
+        // 2) DismissDeleteUndo commits batch via delete_message_for_me API + SQLite delete.
+        let mut initial2 = CoreState::default();
+        let mut out2 = ReduceOutput::default();
+        initial2.actions.delete_undo.start_batch(
+            "3000620".to_owned(),
+            vec![DeleteUndoItem {
+                conv_id: "3000620".to_owned(),
+                msg_id: "9020001".to_owned(),
+                cli_msg_id: "c9020001".to_owned(),
+                sender_id: "2000620".to_owned(),
+            }],
+            1_700_000_011_000,
+            &mut out2,
+        );
+        let runner2 = Arc::new(SessionEffectRunner::new(
+            Arc::clone(&client),
+            Arc::clone(&host) as Arc<dyn Host>,
+            Handle::current(),
+        ));
+        runner2.attach_store(Arc::clone(&store_arc));
+        let core2 = CoreHandle::start_with_state(
+            initial2,
+            Arc::clone(&runner2) as Arc<dyn EffectRunner>,
+            Handle::current(),
+        );
+        core2.request_unit(Command::DismissDeleteUndo).await;
+        core2.wait_idle().await;
+        runner2.flush_store().await;
+
+        assert_eq!(client.transport().requests().len(), 1);
+        assert_eq!(
+            client.transport().requests()[0].path(),
+            "/api/message/delete"
+        );
+        let remaining = store_arc
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .read_messages_now("3000620", None, 10)
+            .unwrap_or_default();
+        assert!(remaining.is_empty());
+        core2.stop();
+
+        // 3) StartDeleteUndoExpiry fires after 5 s on paused time, clears the bar, and commits.
+        let mut initial3 = CoreState::default();
+        let mut out3 = ReduceOutput::default();
+        initial3.actions.delete_undo.start_batch(
+            "3000620".to_owned(),
+            vec![DeleteUndoItem {
+                conv_id: "3000620".to_owned(),
+                msg_id: "9020002".to_owned(),
+                cli_msg_id: "c9020002".to_owned(),
+                sender_id: "2000620".to_owned(),
+            }],
+            1_700_000_020_000,
+            &mut out3,
+        );
+        let runner3 = Arc::new(SessionEffectRunner::new(
+            Arc::clone(&client),
+            Arc::clone(&host) as Arc<dyn Host>,
+            Handle::current(),
+        ));
+        let core3 = CoreHandle::start_with_state(
+            initial3,
+            Arc::clone(&runner3) as Arc<dyn EffectRunner>,
+            Handle::current(),
+        );
+        runner3.dispatch(out3.effects, core3.test_sink());
+        // wait_idle returns immediately while the 5 s timer is armed.
+        core3.wait_idle().await;
+
+        // Before 5 s: undo bar is still active, no new delete API request yet.
+        tokio::time::advance(Duration::from_millis(4_900)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            core3
+                .full_snapshot()
+                .await
+                .and_then(|s| s.delete_undo)
+                .is_some()
+        );
+        assert_eq!(client.transport().requests().len(), 1);
+
+        // At 5 s: timer fires DeleteUndoExpired -> clears bar + commits delete via API.
+        tokio::time::advance(DELETE_UNDO_DURATION).await;
+        let Some(change) = core3.next_changes().await else {
+            panic!("expected delete_undo clear change");
+        };
+        assert_eq!(change.delete_undo, Some(None));
+        core3.wait_idle().await;
+        assert_eq!(client.transport().requests().len(), 2);
+        assert_eq!(
+            client.transport().requests()[1].path(),
+            "/api/message/delete"
+        );
+        core3.stop();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_delete_load_and_set_runner_flow_updates_state_and_emits_show_card_on_error() {
+        use crate::actions::AUTO_DELETE_FAILED_CARD_TEXT;
+        use olaz_net::http::RawResponse;
+        use std::sync::atomic::AtomicUsize;
+
+        let load_calls = Arc::new(AtomicUsize::new(0));
+        let update_calls = Arc::new(AtomicUsize::new(0));
+        let lc = Arc::clone(&load_calls);
+        let uc = Arc::clone(&update_calls);
+        let transport = MockTransport::from_fn(move |req| match req.path().as_str() {
+            "/api/conv/autodelete/getConvers" => {
+                let n = lc.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // First call fails -> initializes empty map when None.
+                    Ok(RawResponse::new(
+                        200,
+                        serde_json::json!({"error_code": 500, "error_message": "fail"})
+                            .to_string()
+                            .into_bytes(),
+                    ))
+                } else {
+                    Ok(RawResponse::new(
+                        200,
+                        serde_json::json!({
+                            "error_code": 0,
+                            "data": {
+                                "convers": [
+                                    {"destId": "627", "isGroup": 1, "ttl": 86_400_000}
+                                ]
+                            }
+                        })
+                        .to_string()
+                        .into_bytes(),
+                    ))
+                }
+            }
+            "/api/conv/autodelete/updateConvers" => {
+                let n = uc.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Ok(RawResponse::new(
+                        200,
+                        serde_json::json!({"error_code": 112, "error_message": "bad"})
+                            .to_string()
+                            .into_bytes(),
+                    ))
+                } else {
+                    Ok(RawResponse::new(
+                        200,
+                        serde_json::json!({"error_code": 0, "data": {}})
+                            .to_string()
+                            .into_bytes(),
+                    ))
+                }
+            }
+            _ => Ok(RawResponse::new(404, b"{}".to_vec())),
+        });
+        let client = Arc::new(SessionClient::new(
+            transport,
+            "imei-ad".to_owned(),
+            "Mac".to_owned(),
+        ));
+        client.update_credentials(
+            LoginAccount {
+                user_id: "2000627".to_owned(),
+                ..LoginAccount::default()
+            },
+            b"0123456789abcdef".to_vec(),
+            "sek.1".to_owned(),
+            Some(ZaloDomains::default()),
+        );
+        let host = Arc::new(RecordingCardHost::default());
+        let runner = Arc::new(SessionEffectRunner::new(
+            Arc::clone(&client),
+            Arc::clone(&host) as Arc<dyn Host>,
+            Handle::current(),
+        ));
+        let core = CoreHandle::start(runner, Handle::current());
+
+        // 1) Load failure when None sets Some({}).
+        core.request_unit(Command::LoadAutoDelete).await;
+        let snap1 = core.full_snapshot().await;
+        assert_eq!(snap1.and_then(|s| s.auto_delete), Some(BTreeMap::new()));
+
+        // 2) Load success populates map.
+        core.request_unit(Command::LoadAutoDelete).await;
+        let snap2 = core.full_snapshot().await;
+        assert_eq!(
+            snap2.and_then(|s| s.auto_delete),
+            Some(BTreeMap::from([("g627".to_owned(), 86_400_000)]))
+        );
+
+        // 3) SetAutoDelete failure leaves map intact and emits show_card.
+        core.request_unit(Command::SetAutoDelete {
+            conv_id: "3000628".to_owned(),
+            ttl: 3_600_000,
+            now_ms: 1_700_000_000_000,
+        })
+        .await;
+        core.wait_idle().await;
+        assert_eq!(
+            *host.cards.lock().unwrap_or_else(PoisonError::into_inner),
+            vec![(
+                "3000628".to_owned(),
+                AUTO_DELETE_FAILED_CARD_TEXT.to_owned()
+            )]
+        );
+
+        // 4) SetAutoDelete success updates map and publishes CoreChanges.auto_delete.
+        core.request_unit(Command::SetAutoDelete {
+            conv_id: "3000628".to_owned(),
+            ttl: 3_600_000,
+            now_ms: 1_700_000_005_000,
+        })
+        .await;
+        let snap4 = core.full_snapshot().await;
+        assert_eq!(
+            snap4.and_then(|s| s.auto_delete),
+            Some(BTreeMap::from([
+                ("3000628".to_owned(), 3_600_000),
+                ("g627".to_owned(), 86_400_000),
+            ]))
+        );
 
         core.stop();
     }
