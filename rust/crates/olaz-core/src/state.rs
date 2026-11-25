@@ -29,6 +29,8 @@ pub struct CoreState {
     pub typing: TypingState,
     // U5-send
     pub send: crate::reduce::send::SendState,
+    // U14
+    pub search: crate::search::SearchState,
 }
 
 impl CoreState {

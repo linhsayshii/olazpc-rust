@@ -5,7 +5,7 @@ use std::fmt;
 
 use olaz_api::{HiddenConversationsSnapshot, PollState, SendMessageResult};
 use olaz_net::{LoginAccount, NetError, QrScanResult, QrTicket, SessionStatus};
-use olaz_store::StoredMessage;
+use olaz_store::{MessagesAround, StoredMessage};
 use olaz_wire::{ChatMessage, Mention, ParsedWireEvent, TextStyle};
 use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
@@ -313,6 +313,29 @@ pub enum Command {
         conv_id: String,
         ttl_ms: i64,
     },
+    // U14
+    /// Searches in-memory messages and SQLite history for `conv_id`, newest-first.
+    SearchMessages {
+        conv_id: String,
+        query: String,
+        limit: i64,
+        // U6: bridge until U6 moves pending-deleted message state into olaz-core.
+        pending_deleted_keys: Vec<String>,
+    },
+    /// Ensures an older message is loaded into `messages.windows[conv_id]` from SQLite.
+    EnsureMessageLoaded {
+        conv_id: String,
+        message: Box<ChatMessage>,
+        // U6: bridge until U6 moves pending-deleted message state into olaz-core.
+        pending_deleted_keys: Vec<String>,
+    },
+    /// Finds and loads the message quoted by `message` in `conv_id`, returning its id.
+    LoadQuotedMessage {
+        conv_id: String,
+        message: Box<ChatMessage>,
+        // U6: bridge until U6 moves pending-deleted message state into olaz-core.
+        pending_deleted_keys: Vec<String>,
+    },
 }
 
 impl fmt::Debug for Command {
@@ -536,6 +559,32 @@ impl fmt::Debug for Command {
             Self::SetAutoDeleteTtl { ttl_ms, .. } => f
                 .debug_struct("SetAutoDeleteTtl")
                 .field("ttl_ms", ttl_ms)
+                .finish(),
+            // U14
+            Self::SearchMessages {
+                query,
+                limit,
+                pending_deleted_keys,
+                ..
+            } => f
+                .debug_struct("SearchMessages")
+                .field("query_len", &query.len())
+                .field("limit", limit)
+                .field("pending_deleted_count", &pending_deleted_keys.len())
+                .finish(),
+            Self::EnsureMessageLoaded {
+                pending_deleted_keys,
+                ..
+            } => f
+                .debug_struct("EnsureMessageLoaded")
+                .field("pending_deleted_count", &pending_deleted_keys.len())
+                .finish(),
+            Self::LoadQuotedMessage {
+                pending_deleted_keys,
+                ..
+            } => f
+                .debug_struct("LoadQuotedMessage")
+                .field("pending_deleted_count", &pending_deleted_keys.len())
                 .finish(),
         }
     }
@@ -930,6 +979,24 @@ pub enum Input {
         send_id: u64,
         result: Result<SendMessageResult, String>,
     },
+    // U14
+    SearchMessagesPageLoaded {
+        op_id: u64,
+        rows: Vec<StoredMessage>,
+        page_limit: usize,
+    },
+    EnsureMessageWindowLoaded {
+        op_id: u64,
+        window: Option<MessagesAround>,
+    },
+    QuotedLookupDone {
+        op_id: u64,
+        row: Option<StoredMessage>,
+    },
+    LegacyQuotedLookupDone {
+        op_id: u64,
+        rows: Vec<StoredMessage>,
+    },
 }
 
 impl fmt::Debug for Input {
@@ -1296,6 +1363,33 @@ impl fmt::Debug for Input {
                 .debug_struct("SendTextDone")
                 .field("send_id", send_id)
                 .field("ok", &result.is_ok())
+                .finish(),
+            // U14
+            Self::SearchMessagesPageLoaded {
+                op_id,
+                rows,
+                page_limit,
+            } => f
+                .debug_struct("SearchMessagesPageLoaded")
+                .field("op_id", op_id)
+                .field("rows", &rows.len())
+                .field("page_limit", page_limit)
+                .finish(),
+            Self::EnsureMessageWindowLoaded { op_id, window } => f
+                .debug_struct("EnsureMessageWindowLoaded")
+                .field("op_id", op_id)
+                .field("rows", &window.as_ref().map(|w| w.messages.len()))
+                .field("has_more_older", &window.as_ref().map(|w| w.has_more_older))
+                .finish(),
+            Self::QuotedLookupDone { op_id, row } => f
+                .debug_struct("QuotedLookupDone")
+                .field("op_id", op_id)
+                .field("found", &row.is_some())
+                .finish(),
+            Self::LegacyQuotedLookupDone { op_id, rows } => f
+                .debug_struct("LegacyQuotedLookupDone")
+                .field("op_id", op_id)
+                .field("rows", &rows.len())
                 .finish(),
         }
     }

@@ -3082,14 +3082,83 @@ fn enrich_send_message_json(m: &ChatMessage, base: &mut Map<String, Value>) {
     );
 }
 
+#[derive(Clone, Debug)]
+struct HarnessDeleteConfirm {
+    conv_id: String,
+    messages: Vec<olaz_wire::ChatMessage>,
+}
+
+#[derive(Clone, Debug)]
+struct HarnessDeleteUndo {
+    conv_id: String,
+    messages: Vec<olaz_wire::ChatMessage>,
+    deadline_ms: i64,
+}
+
+#[derive(Default)]
+struct SearchHarnessState {
+    results: Map<String, Value>,
+    delete_confirm: Option<HarnessDeleteConfirm>,
+    delete_undo: Option<HarnessDeleteUndo>,
+}
+
+impl SearchHarnessState {
+    fn pending_deleted_keys(&self, conv_id: &str) -> Vec<String> {
+        let Some(undo) = &self.delete_undo else {
+            return Vec::new();
+        };
+        if undo.conv_id != conv_id {
+            return Vec::new();
+        }
+        let mut keys = Vec::new();
+        for m in &undo.messages {
+            if !m.id.is_empty() {
+                keys.push(m.id.clone());
+            }
+            if !m.client_id.is_empty() {
+                keys.push(m.client_id.clone());
+            }
+        }
+        keys
+    }
+}
+
+fn decode_step_message(msg_json: &Value, fallback_conv_id: &str) -> Option<olaz_wire::ChatMessage> {
+    let mut dict = msg_json.as_object()?.clone();
+    let aliases = [
+        ("conv_id", "conversationId"),
+        ("client_id", "clientId"),
+        ("sender_id", "senderId"),
+        ("sender_name", "senderName"),
+        ("sender_avatar", "senderAvatar"),
+        ("is_mine", "isMine"),
+        ("is_e2ee", "isE2EE"),
+        ("date_ms", "date"),
+    ];
+    for (snake, camel) in aliases {
+        if !dict.contains_key(camel)
+            && let Some(v) = dict.get(snake).cloned()
+        {
+            dict.insert(camel.to_owned(), v);
+        }
+    }
+    if let Some(kind_str) = dict.get("kind").and_then(Value::as_str).map(str::to_owned) {
+        dict.insert("kind".to_owned(), json!({ "type": kind_str }));
+    }
+    olaz_wire::ChatMessage::from_json(&dict, fallback_conv_id)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn capture_case_snapshot(
     core: &CoreHandle,
     host: &RecordingHost,
     is_u3: bool,
     is_u4: bool,
     is_u5: bool,
+    is_u14: bool,
     last_send_result: Option<bool>,
     send_logs: &Mutex<Vec<String>>,
+    search_harness: &SearchHarnessState,
 ) -> Option<Value> {
     if !is_u3 {
         return core
@@ -3187,6 +3256,160 @@ async fn capture_case_snapshot(
             .collect();
         obj.insert("send_logs".to_owned(), Value::Array(logs));
     }
+    if is_u14 {
+        if let Some(Value::Object(msgs_obj)) = obj.get_mut("messages") {
+            for (conv_id, list) in &full.messages.windows {
+                if let Some(Value::Array(arr)) = msgs_obj.get_mut(conv_id)
+                    && arr.len() == list.len()
+                {
+                    for (m, item) in list.iter().zip(arr.iter_mut()) {
+                        if let Value::Object(map) = item {
+                            let buttons: Vec<Value> = m
+                                .card_buttons
+                                .iter()
+                                .map(|b| {
+                                    json!({
+                                        "ref": b.r#ref,
+                                        "label": b.label,
+                                        "enabled": b.enabled,
+                                        "help": b.help,
+                                    })
+                                })
+                                .collect();
+                            map.insert("buttons".to_owned(), Value::Array(buttons));
+                        }
+                    }
+                }
+            }
+        }
+        obj.insert(
+            "delete_undo".to_owned(),
+            search_harness
+                .delete_undo
+                .as_ref()
+                .map_or(Value::Null, |u| {
+                    json!({
+                        "conv_id": u.conv_id,
+                        "count": u.messages.len(),
+                        "deadline_ms": u.deadline_ms,
+                    })
+                }),
+        );
+        obj.insert(
+            "message_confirm".to_owned(),
+            search_harness
+                .delete_confirm
+                .as_ref()
+                .map_or(Value::Null, |c| {
+                    json!({
+                        "conv_id": c.conv_id,
+                        "action": "delete_many",
+                        "title": "",
+                        "message": "",
+                        "ok": "",
+                        "destructive": true,
+                    })
+                }),
+        );
+        obj.insert("auto_delete".to_owned(), Value::Null);
+        let mut starred_ids: Vec<String> = Vec::new();
+        let mut seen_reaction_event_ids: Vec<String> = Vec::new();
+        if let Some(store_arc) = host.attached_store() {
+            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Ok(mut ids) = store.get_preference_strings("starredIds") {
+                ids.sort();
+                starred_ids = ids;
+            }
+            if let Ok(ids) = store.get_preference_strings("seenReactionEventIds") {
+                seen_reaction_event_ids = ids;
+            }
+            if let Some(Value::Object(store_obj)) = obj.get_mut("store") {
+                if let Ok(mut stored_msgs) = store.load_all_messages() {
+                    stored_msgs.sort_by(|a, b| {
+                        a.conv_id
+                            .cmp(&b.conv_id)
+                            .then_with(|| a.ts_ms.cmp(&b.ts_ms))
+                            .then_with(|| a.id.cmp(&b.id))
+                    });
+                    if let Some(Value::Array(arr)) = store_obj.get_mut("messages")
+                        && arr.len() == stored_msgs.len()
+                    {
+                        for (row, item) in stored_msgs.iter().zip(arr.iter_mut()) {
+                            if let Value::Object(map) = item {
+                                let decoded = olaz_core::decode_db_stored(row);
+                                let reactions: Vec<Value> = decoded
+                                    .as_ref()
+                                    .map(|m| {
+                                        m.reactions
+                                            .iter()
+                                            .map(|r| {
+                                                let icon = if !r.icon.emoji.is_empty() {
+                                                    r.icon.emoji.as_str()
+                                                } else if !r.icon.key.is_empty() {
+                                                    r.icon.key.as_str()
+                                                } else {
+                                                    r.icon.r#type.as_str()
+                                                };
+                                                json!({
+                                                    "icon": icon,
+                                                    "count": r.count,
+                                                    "includes_me": r.includes_me,
+                                                })
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                map.insert("reactions".to_owned(), Value::Array(reactions));
+                                map.insert(
+                                    "starred".to_owned(),
+                                    Value::Bool(decoded.as_ref().is_some_and(|m| m.menu.starred)),
+                                );
+                            }
+                        }
+                    }
+                }
+                if let Some(Value::Object(prefs_obj)) = store_obj.get_mut("prefs") {
+                    prefs_obj.insert(
+                        "starred_ids".to_owned(),
+                        Value::Array(starred_ids.iter().cloned().map(Value::String).collect()),
+                    );
+                    prefs_obj.insert(
+                        "seen_reaction_event_ids".to_owned(),
+                        Value::Array(
+                            seen_reaction_event_ids
+                                .into_iter()
+                                .map(Value::String)
+                                .collect(),
+                        ),
+                    );
+                }
+            }
+        }
+        obj.insert(
+            "starred_ids".to_owned(),
+            Value::Array(starred_ids.into_iter().map(Value::String).collect()),
+        );
+        obj.insert("prune_next_expiry_ms".to_owned(), Value::Null);
+        let mut cached_profiles_obj = Map::new();
+        for (uid, p) in &full.conversations.identities.cached_profiles {
+            cached_profiles_obj.insert(
+                uid.clone(),
+                json!({
+                    "name": p.name,
+                    "avatar": p.avatar,
+                }),
+            );
+        }
+        obj.insert(
+            "cached_profiles".to_owned(),
+            Value::Object(cached_profiles_obj),
+        );
+        obj.insert("action_logs".to_owned(), Value::Array(Vec::new()));
+        obj.insert(
+            "results".to_owned(),
+            Value::Object(search_harness.results.clone()),
+        );
+    }
     Some(Value::Object(obj))
 }
 
@@ -3212,7 +3435,8 @@ fn str_vec_arg(args: &Value, key: &str) -> Vec<String> {
 /// Runs a single Case format v1 [`Case`] under paused tokio time and returns the observed
 /// snapshots, final state, sorted canonical requests, and ordered host calls.
 pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
-    let is_u5 = case.domain == "send";
+    let is_u14 = case.domain == "search";
+    let is_u5 = case.domain == "send" || is_u14;
     let is_u4 = case.domain == "bootstrap" || case.domain == "messages" || is_u5;
     let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions" || is_u4;
     let temp_dir = if is_u3 {
@@ -3335,7 +3559,8 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let mut last_send_result: Option<bool> = None;
     let mut pending_send_task: Option<tokio::task::JoinHandle<bool>> = None;
 
-    for step in &case.steps {
+    let mut search_harness = SearchHarnessState::default();
+    for (step_index, step) in case.steps.iter().enumerate() {
         match step {
             Step::Cmd {
                 cmd,
@@ -3853,6 +4078,143 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         .await
                         .map_err(|_| format!("timed out awaiting typing expiry for `{id}`"))?;
                 }
+                "search" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let query = str_arg(args, "query");
+                    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(50);
+                    let pd_keys = search_harness.pending_deleted_keys(&conv_id);
+                    let (hits, _ver) = core.search_messages(conv_id, query, limit, pd_keys).await;
+                    search_harness.results.insert(
+                        step_index.to_string(),
+                        Value::Array(hits.into_iter().map(|m| Value::String(m.id)).collect()),
+                    );
+                }
+                "ensure_loaded" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let target = if let Some(msg_json) = args.get("message") {
+                        decode_step_message(msg_json, &conv_id)
+                    } else if let Some(msg_id) = args.get("msg_id").and_then(Value::as_str) {
+                        let mem_hit = core.full_snapshot().await.and_then(|snap| {
+                            snap.messages
+                                .windows
+                                .get(&conv_id)
+                                .and_then(|list| list.iter().find(|m| m.id == msg_id).cloned())
+                        });
+                        if mem_hit.is_some() {
+                            mem_hit
+                        } else if let Some(store_arc) = host.attached_store() {
+                            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                            store
+                                .message(&conv_id, msg_id)
+                                .ok()
+                                .flatten()
+                                .and_then(|row| olaz_core::decode_db_stored(&row))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let msg = target.ok_or_else(|| {
+                        "ensure_loaded could not resolve target message".to_owned()
+                    })?;
+                    let pd_keys = search_harness.pending_deleted_keys(&conv_id);
+                    let (loaded, _ver) = core.ensure_message_loaded(conv_id, msg, pd_keys).await;
+                    search_harness
+                        .results
+                        .insert(step_index.to_string(), Value::Bool(loaded));
+                }
+                "load_quoted" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let mem_hit = core.full_snapshot().await.and_then(|snap| {
+                        snap.messages
+                            .windows
+                            .get(&conv_id)
+                            .and_then(|list| list.iter().find(|m| m.id == msg_id).cloned())
+                    });
+                    let target = if mem_hit.is_some() {
+                        mem_hit
+                    } else if let Some(store_arc) = host.attached_store() {
+                        let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                        store
+                            .message(&conv_id, &msg_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|row| olaz_core::decode_db_stored(&row))
+                    } else {
+                        None
+                    };
+                    let msg = target
+                        .ok_or_else(|| format!("load_quoted could not find msg_id `{msg_id}`"))?;
+                    let pd_keys = search_harness.pending_deleted_keys(&conv_id);
+                    let (quoted_id, _ver) = core.load_quoted_message(conv_id, msg, pd_keys).await;
+                    search_harness.results.insert(
+                        step_index.to_string(),
+                        quoted_id.map_or(Value::Null, Value::String),
+                    );
+                }
+                "delete_many" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_ids = str_vec_arg(args, "msg_ids");
+                    let snap = core.full_snapshot().await;
+                    let msgs: Vec<olaz_wire::ChatMessage> = snap
+                        .and_then(|s| s.messages.windows.get(&conv_id).cloned())
+                        .map(|list| {
+                            msg_ids
+                                .iter()
+                                .filter_map(|id| list.iter().find(|m| m.id == *id).cloned())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !msgs.is_empty() {
+                        search_harness.delete_confirm = Some(HarnessDeleteConfirm {
+                            conv_id,
+                            messages: msgs,
+                        });
+                    }
+                }
+                "answer_confirm" => {
+                    let ok = args.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                    if let Some(confirm) = search_harness.delete_confirm.take()
+                        && ok
+                    {
+                        let ids: Vec<String> =
+                            confirm.messages.iter().map(|m| m.id.clone()).collect();
+                        let _ = core
+                            .send_and_ack(Command::WriteThroughRemoveMessages {
+                                conv_id: confirm.conv_id.clone(),
+                                ids,
+                            })
+                            .await;
+                        let now = now_ms.unwrap_or(1_700_000_000_000);
+                        search_harness.delete_undo = Some(HarnessDeleteUndo {
+                            conv_id: confirm.conv_id,
+                            messages: confirm.messages,
+                            deadline_ms: now + 5_000,
+                        });
+                    }
+                }
+                "undo_delete" => {
+                    if let Some(undo) = search_harness.delete_undo.take() {
+                        let conv_id = undo.conv_id.clone();
+                        for m in undo.messages {
+                            let _ = core
+                                .send_and_ack(Command::WriteThroughUpsertMessage {
+                                    msg: Box::new(m),
+                                    replacing_client_id: None,
+                                })
+                                .await;
+                        }
+                        host.record(
+                            "show_card",
+                            json!({
+                                "conv_id": conv_id,
+                                "text": "Khôi phục thành công",
+                            }),
+                        );
+                    }
+                }
                 other => return Err(format!("unknown step cmd: {other}")),
             },
             Step::Await {
@@ -3912,8 +4274,10 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                     is_u3,
                     is_u4,
                     is_u5,
+                    is_u14,
                     last_send_result,
                     &send_logs,
+                    &search_harness,
                 )
                 .await
                 {
@@ -3954,8 +4318,10 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         is_u3,
         is_u4,
         is_u5,
+        is_u14,
         last_send_result,
         &send_logs,
+        &search_harness,
     )
     .await
     .ok_or_else(|| "actor stopped before final snapshot".to_owned())?;

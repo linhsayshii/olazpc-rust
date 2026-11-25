@@ -6,6 +6,7 @@ pub mod bootstrap;
 pub mod classify;
 pub mod conversations;
 pub mod messages;
+pub mod search;
 pub mod send;
 pub mod session;
 pub mod transport;
@@ -142,6 +143,23 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
             ..
         }
         | Input::SendTextDone { .. } => send::reduce_send(state, input, &mut out),
+        // U14
+        Input::Command(
+            Command::SearchMessages { .. }
+            | Command::EnsureMessageLoaded { .. }
+            | Command::LoadQuotedMessage { .. },
+        )
+        | Input::OpRequest {
+            cmd:
+                Command::SearchMessages { .. }
+                | Command::EnsureMessageLoaded { .. }
+                | Command::LoadQuotedMessage { .. },
+            ..
+        }
+        | Input::SearchMessagesPageLoaded { .. }
+        | Input::EnsureMessageWindowLoaded { .. }
+        | Input::QuotedLookupDone { .. }
+        | Input::LegacyQuotedLookupDone { .. } => search::reduce_search(state, input, &mut out),
 
         Input::Command(_)
         | Input::OpRequest { .. }
