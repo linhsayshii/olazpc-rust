@@ -576,7 +576,408 @@ final class PollRecorderTests: XCTestCase {
             ]
         )
 
-        return [s1, s2, s3, s4]
+
+        // 5. can_close
+        let s5 = PollRecorderHarness.ScenarioDef(
+            name: "can_close",
+            seed: MessageRecorderHarness.readySessionSeed(
+                userId: "2001001",
+                displayName: "Polls User",
+                suppress: ["ws", "long_poll"],
+                extras: [
+                    "contacts": .object([
+                        "friends": .array([
+                            seedFriend(id: "3001001", name: "An Nguyễn", avatar: "https://cdn.example.invalid/an.jpg"),
+                        ]),
+                    ]),
+                    "cached_group_details": .object([
+                        "500501": .object(["groupId": .string("500501"), "creatorId": .string("2001001")]),
+                        "500502": .object(["groupId": .string("500502"), "creator_id": .string("2001001")]),
+                        "500503": .object(["groupId": .string("500503"), "ownerId": .string("2001001")]),
+                        "500504": .object(["groupId": .string("500504"), "owner_id": .string("2001001")]),
+                        "500505": .object(["groupId": .string("500505"), "creator": .string("2001001")]),
+                        "500506": .object(["groupId": .string("500506"), "adminIds": .array([.string("2001001")])]),
+                        "500507": .object(["groupId": .string("500507"), "admin_ids": .array([.string("2001001")])]),
+                        "500508": .object(["groupId": .string("500508"), "admins": .array([.string("2001001")])]),
+                        "500509": .object(["groupId": .string("500509"), "deputies": .array([.string("2001001")])]),
+                        "500510": .object(["groupId": .string("500510"), "deputyIds": .array([.string("2001001")])]),
+                        "500511": .object(["groupId": .string("500511"), "currentMems": .array([
+                            .object(["id": .string("2001001"), "isAdmin": .bool(true)]),
+                            .object(["id": .string("3001001"), "isAdmin": .bool(false)]),
+                        ])]),
+                        "500512": .object(["groupId": .string("500512"), "currentMems": .array([
+                            .object(["uid": .string("2001001"), "isCreator": .bool(true)]),
+                        ])]),
+                        "500513": .object(["groupId": .string("500513"), "creatorId": .string("3001001"), "currentMems": .array([
+                            .object(["id": .string("2001001"), "isAdmin": .bool(false), "isCreator": .bool(false)]),
+                        ])]),
+                    ]),
+                ]
+            ),
+            server: [
+                MessageRecorderHarness.loginInfoScript(uid: "2001001", displayName: "Polls User"),
+                MessageRecorderHarness.profileMeScript(uid: "2001001", displayName: "Polls User"),
+                PollRecorderHarness.httpScript(path: "/api/poll/detail", method: "GET", json: pollDetailPayload(groupIdKey: "group_id", groupIdValue: "500501", question: "Key creatorId", creator: "3001001")),
+                PollRecorderHarness.httpScript(path: "/api/poll/detail", method: "GET", json: pollDetailPayload(groupIdKey: "group_id", groupIdValue: "500502", question: "Key creator_id", creator: "3001001")),
+                PollRecorderHarness.httpScript(path: "/api/poll/detail", method: "GET", json: pollDetailPayload(groupIdKey: "group_id", groupIdValue: "500503", question: "Key ownerId", creator: "3001001")),
+                PollRecorderHarness.httpScript(path: "/api/poll/detail", method: "GET", json: pollDetailPayload(groupIdKey: "group_id", groupIdValue: "500504", question: "Key owner_id", creator: "3001001")),
+                PollRecorderHarness.httpScript(path: "/api/poll/detail", method: "GET", json: pollDetailPayload(groupIdKey: "group_id", groupIdValue: "500505", question: "Key creator", creator: "3001001")),
+                PollRecorderHarness.httpScript(path: "/api/poll/detail", method: "GET", json: pollDetailPayload(groupIdKey: "group_id", groupIdValue: "500506", question: "Key adminIds", creator: "3001001")),
+                PollRecorderHarness.httpScript(path: "/api/poll/detail", method: "GET", json: pollDetailPayload(groupIdKey: "group_id", groupIdValue: "500507", question: "Key admin_ids", creator: "3001001")),
+                PollRecorderHarness.httpScript(path: "/api/poll/detail", method: "GET", json: pollDetailPayload(groupIdKey: "group_id", groupIdValue: "500508", question: "Key admins", creator: "3001001")),
+                PollRecorderHarness.httpScript(path: "/api/poll/detail", method: "GET", json: pollDetailPayload(groupIdKey: "group_id", groupIdValue: "500509", question: "Key deputies", creator: "3001001")),
+                PollRecorderHarness.httpScript(path: "/api/poll/detail", method: "GET", json: pollDetailPayload(groupIdKey: "group_id", groupIdValue: "500510", question: "Key deputyIds", creator: "3001001")),
+                PollRecorderHarness.httpScript(path: "/api/poll/detail", method: "GET", json: pollDetailPayload(groupIdKey: "group_id", groupIdValue: "500511", question: "currentMems isAdmin", creator: "3001001")),
+                PollRecorderHarness.httpScript(path: "/api/poll/detail", method: "GET", json: pollDetailPayload(groupIdKey: "group_id", groupIdValue: "500512", question: "currentMems isCreator", creator: "3001001")),
+                PollRecorderHarness.httpScript(path: "/api/poll/detail", method: "GET", json: pollDetailPayload(groupIdKey: "group_id", groupIdValue: "500513", question: "Plain member false", creator: "3001001")),
+                PollRecorderHarness.httpScript(path: "/api/poll/detail", method: "GET", json: pollDetailPayload(groupIdKey: "group_id", groupIdValue: "500513", question: "Poll creator true", creator: "2001001")),
+            ],
+            steps: [
+                .object(["cmd": .string("start")]),
+                .object(["await": .object(["phase": .string("ready")])]),
+                .object(["cmd": .string("refresh_poll"), "args": .object(["id": .string("9501")])]),
+                .object(["cmd": .string("refresh_poll"), "args": .object(["id": .string("9502")])]),
+                .object(["cmd": .string("refresh_poll"), "args": .object(["id": .string("9503")])]),
+                .object(["cmd": .string("refresh_poll"), "args": .object(["id": .string("9504")])]),
+                .object(["cmd": .string("refresh_poll"), "args": .object(["id": .string("9505")])]),
+                .object(["cmd": .string("refresh_poll"), "args": .object(["id": .string("9506")])]),
+                .object(["cmd": .string("refresh_poll"), "args": .object(["id": .string("9507")])]),
+                .object(["cmd": .string("refresh_poll"), "args": .object(["id": .string("9508")])]),
+                .object(["cmd": .string("refresh_poll"), "args": .object(["id": .string("9509")])]),
+                .object(["cmd": .string("refresh_poll"), "args": .object(["id": .string("9510")])]),
+                .object(["cmd": .string("refresh_poll"), "args": .object(["id": .string("9511")])]),
+                .object(["cmd": .string("refresh_poll"), "args": .object(["id": .string("9512")])]),
+                .object(["cmd": .string("refresh_poll"), "args": .object(["id": .string("9513")])]),
+                .object(["cmd": .string("refresh_poll"), "args": .object(["id": .string("9514")])]),
+                .object([
+                    "cmd": .string("poll_model_checks"),
+                    "args": .object([
+                        "checks": .array([
+                            .object(["kind": .string("is_group_admin"), "uid": .string("0"), "group_id": .string("500501")]),
+                            .object(["kind": .string("is_group_admin"), "uid": .string(""), "group_id": .string("500501")]),
+                            .object(["kind": .string("is_group_admin"), "uid": .string("u2001001"), "group_id": .string("500501")]),
+                            .object(["kind": .string("is_group_admin"), "uid": .string("2001001"), "group_id": .string("599999")]),
+                        ]),
+                    ]),
+                ]),
+            ]
+        )
+
+        // 6. voters
+        let s6 = PollRecorderHarness.ScenarioDef(
+            name: "voters",
+            seed: MessageRecorderHarness.readySessionSeed(
+                userId: "2001001",
+                displayName: "Polls User",
+                suppress: ["ws", "long_poll"],
+                extras: [
+                    "contacts": .object([
+                        "friends": .array([
+                            seedFriend(id: "3001001", name: "An Nguyễn", avatar: "https://cdn.example.invalid/an.jpg"),
+                        ]),
+                    ]),
+                ]
+            ),
+            server: [
+                MessageRecorderHarness.loginInfoScript(uid: "2001001", displayName: "Polls User"),
+                MessageRecorderHarness.profileMeScript(uid: "2001001", displayName: "Polls User"),
+                // 9601: named voters (self unprefixed & prefixed, known friend, unknown id)
+                PollRecorderHarness.httpScript(
+                    path: "/api/poll/detail",
+                    method: "GET",
+                    json: pollDetailPayload(
+                        groupIdKey: "group_id",
+                        groupIdValue: "500601",
+                        question: "Ai đi?",
+                        anonymous: false,
+                        options: [
+                            .object(["option_id": .int(1), "content": .string("Có"), "voters": .array([.string("2001001"), .string("u3001001"), .string("3009999")])]),
+                            .object(["option_id": .int(2), "content": .string("Không"), "voters": .array([])]),
+                        ]
+                    )
+                ),
+                // 9602: anonymous -> restricted=true, users=[]
+                PollRecorderHarness.httpScript(
+                    path: "/api/poll/detail",
+                    method: "GET",
+                    json: pollDetailPayload(
+                        groupIdKey: "group_id",
+                        groupIdValue: "500601",
+                        question: "Ẩn danh",
+                        anonymous: true,
+                        options: [
+                            .object(["option_id": .int(10), "content": .string("A"), "voters": .array([.string("2001001"), .string("3001001")])]),
+                        ]
+                    )
+                ),
+                // 9603: server error -> nil
+                PollRecorderHarness.httpScript(
+                    path: "/api/poll/detail",
+                    method: "GET",
+                    status: 500,
+                    raw: "Voter error"
+                ),
+            ],
+            steps: [
+                .object(["cmd": .string("start")]),
+                .object(["await": .object(["phase": .string("ready")])]),
+                .object(["cmd": .string("poll_voters"), "args": .object(["id": .string("9601")])]),
+                .object(["cmd": .string("poll_voters"), "args": .object(["id": .string("9602")])]),
+                .object(["cmd": .string("poll_voters"), "args": .object(["id": .string("9603")])]),
+            ]
+        )
+
+        // 7. pin_state
+        let s7 = PollRecorderHarness.ScenarioDef(
+            name: "pin_state",
+            seed: MessageRecorderHarness.readySessionSeed(
+                userId: "2001001",
+                displayName: "Polls User",
+                suppress: ["ws", "long_poll"]
+            ),
+            server: [
+                MessageRecorderHarness.loginInfoScript(uid: "2001001", displayName: "Polls User"),
+                MessageRecorderHarness.profileMeScript(uid: "2001001", displayName: "Polls User"),
+            ],
+            steps: [
+                .object(["cmd": .string("start")]),
+                .object(["await": .object(["phase": .string("ready")])]),
+                // Group without board cache -> emits refresh_board_pins host call
+                .object(["cmd": .string("refresh_poll_pin"), "args": .object(["id": .string("9701"), "conv_id": .string("g500701")])]),
+                .object(["snapshot": .string("uncached_group")]),
+                // Board updated via pins_state with 9701 pinned -> no host call, pinned=true
+                .object([
+                    "cmd": .string("pins_state"),
+                    "args": .object([
+                        "json": .object([
+                            "pins": .object([
+                                "convId": .string("g500701"),
+                                "ready": .bool(true),
+                                "canPin": .bool(true),
+                                "limit": .int(5),
+                                "items": .array([
+                                    .object(["ref": .string("9701"), "kind": .string("poll"), "title": .string("Poll A"), "sender": .string("Polls User")]),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                ]),
+                .object(["cmd": .string("refresh_poll_pin"), "args": .object(["id": .string("9701"), "conv_id": .string("g500701")])]),
+                .object(["snapshot": .string("pinned_in_board")]),
+                // Board updated without 9701 -> pinned=false
+                .object([
+                    "cmd": .string("pins_state"),
+                    "args": .object([
+                        "json": .object([
+                            "pins": .object([
+                                "convId": .string("g500701"),
+                                "ready": .bool(true),
+                                "canPin": .bool(true),
+                                "limit": .int(5),
+                                "items": .array([]),
+                            ]),
+                        ]),
+                    ]),
+                ]),
+                .object(["cmd": .string("refresh_poll_pin"), "args": .object(["id": .string("9701"), "conv_id": .string("g500701")])]),
+                // 1-1 conv on new poll 9702 -> ready=false, can_pin=false
+                .object(["cmd": .string("refresh_poll_pin"), "args": .object(["id": .string("9702"), "conv_id": .string("3001001")])]),
+                // 1-1 conv on 9701 (already ready=true) -> keeps existing ready state
+                .object(["cmd": .string("refresh_poll_pin"), "args": .object(["id": .string("9701"), "conv_id": .string("3001001")])]),
+                .object([
+                    "cmd": .string("poll_model_checks"),
+                    "args": .object([
+                        "checks": .array([
+                            .object(["kind": .string("poll_capabilities"), "conv_id": .string("g500701")]),
+                            .object(["kind": .string("poll_capabilities"), "conv_id": .string("3001001")]),
+                        ]),
+                    ]),
+                ]),
+            ]
+        )
+
+        // 8. pin_flows
+        let s8 = PollRecorderHarness.ScenarioDef(
+            name: "pin_flows",
+            seed: MessageRecorderHarness.readySessionSeed(
+                userId: "2001001",
+                displayName: "Polls User",
+                suppress: ["ws", "long_poll"],
+                extras: [
+                    "pins": .object([
+                        "g500801": .object([
+                            "ready": .bool(true),
+                            "canPin": .bool(true),
+                            "limit": .int(5),
+                            "items": .array([
+                                .object(["ref": .string("9811"), "kind": .string("note"), "title": .string("Ghi chú 1"), "sender": .string("An")]),
+                                .object(["ref": .string("9812"), "kind": .string("note"), "title": .string("Ghi chú 2"), "sender": .string("An")]),
+                                .object(["ref": .string("9813"), "kind": .string("reminder"), "title": .string("Nhắc 3"), "sender": .string("An")]),
+                                .object(["ref": .string("9814"), "kind": .string("message"), "title": .string("Tin 4"), "sender": .string("An")]),
+                                .object(["ref": .string("9800"), "kind": .string("poll"), "title": .string("Poll cũ nhất"), "sender": .string("An")]),
+                            ]),
+                        ]),
+                        "g500802": .object([
+                            "ready": .bool(true),
+                            "canPin": .bool(true),
+                            "limit": .int(5),
+                            "items": .array([]),
+                        ]),
+                    ]),
+                    "board_raw_topics": .object([
+                        "g500801": .object([
+                            "version": .int(7),
+                            "topics": .object([
+                                "9800": .object(["id": .string("9800"), "type": .int(3)]),
+                            ]),
+                        ]),
+                    ]),
+                ]
+            ),
+            server: [
+                MessageRecorderHarness.loginInfoScript(uid: "2001001", displayName: "Polls User"),
+                MessageRecorderHarness.profileMeScript(uid: "2001001", displayName: "Polls User"),
+                // Step 3: pin 9801 in g500802 -> ok
+                PollRecorderHarness.httpScript(path: "/api/board/pinv2", method: "GET", json: .object(["error_code": .int(0), "data": .object([:])])),
+                // Step 4: pin 9802 in g500801 -> limit 1005 -> needsConfirmation(ref: 9800)
+                PollRecorderHarness.httpScript(path: "/api/board/pinv2", method: "GET", json: .object(["error_code": .int(1005), "error_message": .string("Board full")])),
+                // Step 5: confirm replace 9800 with 9802 -> unpinv2 ok + pinv2 ok
+                PollRecorderHarness.httpScript(path: "/api/board/unpinv2", method: "GET", json: .object(["error_code": .int(0), "data": .object([:])])),
+                PollRecorderHarness.httpScript(path: "/api/board/pinv2", method: "GET", json: .object(["error_code": .int(0), "data": .object([:])])),
+                // Step 6: confirm replace -> unpin fails (112 forbidden)
+                PollRecorderHarness.httpScript(path: "/api/board/unpinv2", method: "GET", json: .object(["error_code": .int(112), "error_message": .string("No permission")])),
+                // Step 7: confirm replace -> unpin ok, pin fails -> partial
+                PollRecorderHarness.httpScript(path: "/api/board/unpinv2", method: "GET", json: .object(["error_code": .int(0), "data": .object([:])])),
+                PollRecorderHarness.httpScript(path: "/api/board/pinv2", method: "GET", json: .object(["error_code": .int(999), "error_message": .string("Something failed")])),
+                // Step 8: HTTP 500 -> network
+                PollRecorderHarness.httpScript(path: "/api/board/pinv2", method: "GET", status: 500, raw: "Bad Gateway"),
+                // Step 9: code 114 -> forbidden
+                PollRecorderHarness.httpScript(path: "/api/board/pinv2", method: "GET", json: .object(["error_code": .int(114), "error_message": .string("Denied")])),
+                // Step 10: message "Không có quyền" -> forbidden
+                PollRecorderHarness.httpScript(path: "/api/board/pinv2", method: "GET", json: .object(["error_code": .int(999), "error_message": .string("Không có quyền")])),
+                // Step 11: unhandled session code -> error=nil
+                PollRecorderHarness.httpScript(path: "/api/board/pinv2", method: "GET", json: .object(["error_code": .int(999), "error_message": .string("Unknown failure")])),
+                // Step 12: pin 9800 (same as oldest.ref) hits code 1010 -> failed limit (not needsConfirmation)
+                PollRecorderHarness.httpScript(path: "/api/board/pinv2", method: "GET", json: .object(["error_code": .int(1010), "error_message": .string("Max pins")])),
+            ],
+            steps: [
+                .object(["cmd": .string("start")]),
+                .object(["await": .object(["phase": .string("ready")])]),
+                // 1-1 -> forbidden
+                .object(["cmd": .string("pin_poll"), "args": .object(["id": .string("9801"), "conv_id": .string("3001001")])]),
+                // Blank id -> forbidden
+                .object(["cmd": .string("pin_poll"), "args": .object(["id": .string("   "), "conv_id": .string("g500802")])]),
+                // Pin ok
+                .object(["cmd": .string("pin_poll"), "args": .object(["id": .string("9801"), "conv_id": .string("g500802")])]),
+                // Limit confirmation
+                .object(["cmd": .string("pin_poll"), "args": .object(["id": .string("9802"), "conv_id": .string("g500801")])]),
+                // Confirm replace ok
+                .object(["cmd": .string("pin_poll"), "args": .object(["id": .string("9802"), "conv_id": .string("g500801"), "confirming": .string("9800")])]),
+                // Replace unpin fail
+                .object(["cmd": .string("pin_poll"), "args": .object(["id": .string("9803"), "conv_id": .string("g500801"), "confirming": .string("9800")])]),
+                // Replace pin fail -> partial
+                .object(["cmd": .string("pin_poll"), "args": .object(["id": .string("9803"), "conv_id": .string("g500801"), "confirming": .string("9800")])]),
+                // HTTP 500 -> network
+                .object(["cmd": .string("pin_poll"), "args": .object(["id": .string("9804"), "conv_id": .string("g500802")])]),
+                // Code 114 -> forbidden
+                .object(["cmd": .string("pin_poll"), "args": .object(["id": .string("9804"), "conv_id": .string("g500802")])]),
+                // Vietnamese permission -> forbidden
+                .object(["cmd": .string("pin_poll"), "args": .object(["id": .string("9804"), "conv_id": .string("g500802")])]),
+                // Generic session error -> nil
+                .object(["cmd": .string("pin_poll"), "args": .object(["id": .string("9804"), "conv_id": .string("g500802")])]),
+                // Same oldest ref -> failed limit
+                .object(["cmd": .string("pin_poll"), "args": .object(["id": .string("9800"), "conv_id": .string("g500801")])]),
+                // Remaining mapPollPinError + PollPinConfirm.message branches
+                .object([
+                    "cmd": .string("poll_model_checks"),
+                    "args": .object([
+                        "checks": .array([
+                            .object(["kind": .string("map_pin_error"), "code": .int(201), "message": .string("")]),
+                            .object(["kind": .string("map_pin_error"), "code": .int(999), "message": .string("Đã đạt giới hạn")]),
+                            .object(["kind": .string("map_pin_error"), "code": .int(999), "message": .string("Tối đa 5 ghim")]),
+                            .object(["kind": .string("map_pin_error"), "code": .int(999), "message": .string("Max reached")]),
+                            .object(["kind": .string("map_pin_error"), "code": .int(999), "message": .string("Board is full")]),
+                            .object(["kind": .string("map_pin_error"), "code": .int(999), "message": .string("At limit")]),
+                            .object(["kind": .string("map_pin_error"), "code": .int(200), "message": .string("")]),
+                            .object(["kind": .string("map_pin_error"), "code": .int(403), "message": .string("")]),
+                            .object(["kind": .string("map_pin_error"), "code": .int(999), "message": .string("Missing permission")]),
+                            .object(["kind": .string("map_pin_error"), "code": .int(999), "message": .string("Action forbidden")]),
+                            .object(["kind": .string("map_pin_error"), "code": .int(999), "message": .string("Only admin")]),
+                            .object(["kind": .string("map_pin_error"), "code": .int(999), "message": .string("Not allowed here")]),
+                            .object(["kind": .string("map_pin_error"), "other": .bool(true)]),
+                            .object(["kind": .string("pin_confirm_message"), "ref": .string("p1"), "limit": .int(5), "pin_kind": .string("poll"), "title": .string("Họp")]),
+                            .object(["kind": .string("pin_confirm_message"), "ref": .string("r1"), "limit": .int(5), "pin_kind": .string("reminder"), "title": .string("Nhắc")]),
+                            .object(["kind": .string("pin_confirm_message"), "ref": .string("m1"), "limit": .int(5), "pin_kind": .string("message"), "title": .string("Tin")]),
+                            .object(["kind": .string("pin_confirm_message"), "ref": .string("n1"), "limit": .int(0), "pin_kind": .string("note"), "title": .string("")]),
+                        ]),
+                    ]),
+                ]),
+            ]
+        )
+
+        var s9Login = MessageRecorderHarness.loginInfoScript(uid: "2001001", displayName: "Polls User")
+        if var resp = s9Login["response"]?.objectValue,
+           var json = resp["json"]?.objectValue,
+           var data = json["data"]?.objectValue,
+           var svc = data["zpw_service_map_v3"]?.objectValue {
+            svc["friend_board"] = .array([.string("http://fake")])
+            data["zpw_service_map_v3"] = .object(svc)
+            json["data"] = .object(data)
+            resp["json"] = .object(json)
+            if var obj = s9Login.objectValue {
+                obj["response"] = .object(resp)
+                s9Login = .object(obj)
+            }
+        }
+
+        // 9. unpin
+        let s9 = PollRecorderHarness.ScenarioDef(
+            name: "unpin",
+            seed: MessageRecorderHarness.readySessionSeed(
+                userId: "2001001",
+                displayName: "Polls User",
+                suppress: ["ws", "long_poll"],
+                extras: [
+                    "pins": .object([
+                        "g500901": .object([
+                            "ready": .bool(true),
+                            "canPin": .bool(true),
+                            "limit": .int(5),
+                            "items": .array([
+                                .object(["ref": .string("9901"), "kind": .string("poll"), "title": .string("Ghim nhóm"), "sender": .string("Polls User")]),
+                            ]),
+                        ]),
+                    ]),
+                    "board_raw_topics": .object([
+                        "g500901": .object([
+                            "version": .int(3),
+                            "topics": .object([
+                                "9901": .object(["id": .string("9901"), "type": .int(3)]),
+                            ]),
+                        ]),
+                    ]),
+                ]
+            ),
+            server: [
+                s9Login,
+                MessageRecorderHarness.profileMeScript(uid: "2001001", displayName: "Polls User"),
+                // Group unpin ok
+                PollRecorderHarness.httpScript(path: "/api/board/unpinv2", method: "GET", json: .object(["error_code": .int(0), "data": .object([:])])),
+                // 1-1 unpin ok
+                PollRecorderHarness.httpScript(path: "/api/friendboard/multi_unpin", method: "GET", json: .object(["error_code": .int(0), "data": .object([:])])),
+                // Group unpin fail -> network
+                PollRecorderHarness.httpScript(path: "/api/board/unpinv2", method: "GET", status: 500, raw: "Fail"),
+            ],
+            steps: [
+                .object(["cmd": .string("start")]),
+                .object(["await": .object(["phase": .string("ready")])]),
+                .object(["cmd": .string("unpin_poll"), "args": .object(["id": .string("9901"), "conv_id": .string("g500901")])]),
+                .object(["cmd": .string("unpin_poll"), "args": .object(["id": .string("9902"), "conv_id": .string("3001001")])]),
+                .object(["cmd": .string("unpin_poll"), "args": .object(["id": .string("9901"), "conv_id": .string("g500901")])]),
+            ]
+        )
+
+        return [s1, s2, s3, s4, s5, s6, s7, s8, s9]
     }
 }
 
@@ -1368,6 +1769,51 @@ enum PollRecorderHarness {
                             checkResults.append(.object([
                                 "kind": .string(kind),
                                 "resolved": .string(resolved),
+                            ]))
+                        case "is_group_admin":
+                            let uid = check["uid"]?.stringValue ?? ""
+                            let groupId = check["group_id"]?.stringValue ?? ""
+                            let ok = engine.isGroupAdminOrCreator(uid, inGroup: groupId)
+                            checkResults.append(.object([
+                                "kind": .string(kind),
+                                "uid": .string(uid),
+                                "group_id": .string(groupId),
+                                "ok": .bool(ok),
+                            ]))
+                        case "poll_capabilities":
+                            let convId = check["conv_id"]?.stringValue ?? ""
+                            let caps = await engine.pollCapabilities(in: convId)
+                            checkResults.append(.object([
+                                "kind": .string(kind),
+                                "conv_id": .string(convId),
+                                "ready": .bool(caps.ready),
+                                "can_create": .bool(caps.canCreate),
+                                "can_pin": .bool(caps.canPin),
+                            ]))
+                        case "map_pin_error":
+                            let err: Error = {
+                                if check["other"]?.boolValue == true {
+                                    return NSError(domain: "PollTest", code: 1)
+                                }
+                                let code = Int(check["code"]?.int64Value ?? 999)
+                                let msg = check["message"]?.stringValue ?? ""
+                                return ZaloSessionError(code: code, message: msg, url: "http://fake")
+                            }()
+                            let res = ZaloEngine.mapPollPinError(err)
+                            checkResults.append(.object([
+                                "kind": .string(kind),
+                                "ok": .bool(res.ok),
+                                "error": res.error.map(CaseJSON.string) ?? .null,
+                            ]))
+                        case "pin_confirm_message":
+                            let ref = check["ref"]?.stringValue ?? ""
+                            let limit = Int(check["limit"]?.int64Value ?? 0)
+                            let pinKind = check["pin_kind"]?.stringValue ?? ""
+                            let title = check["title"]?.stringValue ?? ""
+                            let confirm = PollPinConfirm(ref: ref, limit: limit, kind: pinKind, title: title)
+                            checkResults.append(.object([
+                                "kind": .string(kind),
+                                "message": .string(confirm.message),
                             ]))
                         default:
                             checkResults.append(.object(["kind": .string(kind)]))
