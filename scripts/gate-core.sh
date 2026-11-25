@@ -31,6 +31,9 @@ fi
 # Tests that assert a wall-clock budget or poll real time.
 TIMING_SWIFT='sqliteClientIdIndexExistsBulkSaveIsFastAndE2EETwinProtectionIntact|fastPhoneSyncPlanFiltersAndSortsNewestFirstAndBulkIngestsFast|startsHelperQueuesUntilReadyThenSendsInitFirst|queueIsLIFOAndDropsCancelledWork|scrubEndsAtOnceAndPlaybackResumesEvenIfALaterSeekSupersedesTheExactOne|phaseGateTasksCompleteAcrossStartLogOutRefreshExpiryAndTeardown|uncachedDecodesStayOutOfTheSharedMemoryCache'
 TIMING_RUST=(ping_cadence_uses_interval_after_auth)
+# The crate holding TIMING_RUST; the olaz-core `cases` harness reads any free argument as a domain, so test
+# filters go to this crate only.
+TIMING_RUST_CRATE=olaz-ws
 
 export PATH="$HOME/.cargo/bin:$PATH"
 if [[ -z "${DEVELOPER_DIR:-}" && "$(xcode-select -p 2>/dev/null || true)" == "/Library/Developer/CommandLineTools" ]]; then
@@ -67,8 +70,9 @@ run_quiet 1 "rust fmt / clippy / test" zsh -c '
     cd "$1/rust"
     cargo fmt --all --check
     cargo clippy --workspace --all-targets -- -D warnings
-    cargo test --workspace --locked -- ${=2}
-' _ "$ROOT" "${(j: :)${TIMING_RUST/#/--skip }}"
+    cargo test --workspace --locked --exclude "$2"
+    cargo test -p "$2" --locked -- ${=3}
+' _ "$ROOT" "$TIMING_RUST_CRATE" "${(j: :)${TIMING_RUST/#/--skip }}"
 echo "check 1 PASS: rust fmt, clippy, workspace tests"
 
 # 2. olaz-core cases replay test, per domain
@@ -252,7 +256,7 @@ wait_quiet() {
     echo "check 7 note: host load stayed at or above ${CORES} for 30 min; running anyway"
 }
 run_timing() {
-    (cd "$ROOT/rust" && cargo test --workspace --locked -- ${=1} --exact) && \
+    (cd "$ROOT/rust" && cargo test -p "$TIMING_RUST_CRATE" --locked -- ${=1} --exact) && \
         (cd "$ROOT" && swift test --skip-build --filter "$2")
 }
 RUST_FILTER="${(j: :)TIMING_RUST}"
