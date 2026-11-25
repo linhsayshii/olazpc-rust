@@ -1574,3 +1574,229 @@ async fn hidden_conversation_endpoints_match_wire_contract() {
     assert_eq!(req.path(), "/api/hiddenconvers/reset");
     assert!(req.query_value("params").is_none());
 }
+
+// ---------------------------------------------------------------- U5 send_text args & error Display
+
+#[tokio::test]
+async fn send_text_group_mentions_text_properties_urgency_and_ttl_match_send_jsonl() {
+    let api = api_with(|_| ok(json!({"msgId": "9001"})));
+
+    let mentions = vec![
+        olaz_wire::Mention {
+            uid: "3000504".to_owned(),
+            pos: 0,
+            len: 6,
+            is_all: false,
+        },
+        olaz_wire::Mention {
+            uid: "-1".to_owned(),
+            pos: 7,
+            len: 4,
+            is_all: true,
+        },
+    ];
+    let styles_1 = vec![olaz_wire::TextStyle {
+        start: 12,
+        len: 5,
+        st: "b".to_owned(),
+    }];
+    let params_1 = SendTextParams {
+        conv_id: "g500504".to_owned(),
+        text: "@Alice @All Hello".to_owned(),
+        cli_msg_id: "5000000000004".to_owned(),
+        mentions,
+        text_properties: olaz_wire::text_properties_json(&styles_1),
+        ttl: 0,
+        urgency: 1,
+        ..SendTextParams::default()
+    };
+    api.send_text(&params_1.as_args()).await.unwrap();
+    let req1 = last(&api);
+    assert_service(&api, &req1, "group");
+    assert_eq!(req1.path(), "/api/group/sendmsg");
+    assert_eq!(
+        params_of(&req1),
+        json!({
+            "clientId": 5000000000004i64,
+            "grid": "500504",
+            "imei": "imei-1",
+            "mentionInfo": r#"[{"len":6,"pos":0,"type":0,"uid":"3000504"},{"len":4,"pos":7,"type":1,"uid":"-1"}]"#,
+            "message": "@Alice @All Hello",
+            "metaData": {"urgency": 1},
+            "textProperties": r#"{"styles":[{"len":5,"st":"b","start":12}],"ver":0}"#,
+            "ttl": 0,
+            "visibility": 0,
+        })
+    );
+
+    // Urgency 2 without mentions, plus non-zero TTL on 1-1 plain.
+    let styles_2 = vec![olaz_wire::TextStyle {
+        start: 0,
+        len: 6,
+        st: "i".to_owned(),
+    }];
+    let params_2 = SendTextParams {
+        conv_id: "g500504".to_owned(),
+        text: "Urgent notice".to_owned(),
+        cli_msg_id: "5000000000005".to_owned(),
+        text_properties: olaz_wire::text_properties_json(&styles_2),
+        ttl: 0,
+        urgency: 2,
+        ..SendTextParams::default()
+    };
+    api.send_text(&params_2.as_args()).await.unwrap();
+    let req2 = last(&api);
+    assert_eq!(
+        params_of(&req2),
+        json!({
+            "clientId": 5000000000005i64,
+            "grid": "500504",
+            "imei": "imei-1",
+            "message": "Urgent notice",
+            "metaData": {"urgency": 2},
+            "textProperties": r#"{"styles":[{"len":6,"st":"i","start":0}],"ver":0}"#,
+            "ttl": 0,
+            "visibility": 0,
+        })
+    );
+
+    let ttl_params = SendTextParams {
+        conv_id: "3000505".to_owned(),
+        text: "Ephemeral hello".to_owned(),
+        cli_msg_id: "5000000000005".to_owned(),
+        ttl: 86_400_000,
+        urgency: 0,
+        ..SendTextParams::default()
+    };
+    api.send_text(&ttl_params.as_args()).await.unwrap();
+    let req3 = last(&api);
+    assert_service(&api, &req3, "chat");
+    assert_eq!(req3.path(), "/api/message/sms");
+    assert_eq!(
+        params_of(&req3),
+        json!({
+            "clientId": 5000000000005i64,
+            "imei": "imei-1",
+            "message": "Ephemeral hello",
+            "toid": "3000505",
+            "ttl": 86_400_000i64,
+        })
+    );
+    assert!(params_of(&req3).get("metaData").is_none());
+    assert!(params_of(&req3).get("textProperties").is_none());
+
+    // Redacted Debug never leaks message text.
+    let dbg = format!("{ttl_params:?}");
+    assert!(!dbg.contains("Ephemeral hello"));
+}
+
+#[tokio::test]
+async fn send_text_quote_carries_text_properties_ttl_urgency_and_preserves_on_fallback() {
+    let styles = vec![olaz_wire::TextStyle {
+        start: 0,
+        len: 4,
+        st: "b".to_owned(),
+    }];
+    let tp = olaz_wire::text_properties_json(&styles).unwrap();
+    let mentions = vec![olaz_wire::Mention {
+        uid: " 300 ".to_owned(),
+        pos: 0,
+        len: 4,
+        is_all: false,
+    }];
+
+    // Quote succeeds: carries textProperties, metaData.urgency, ttl, and mentionInfo.
+    let api = api_with(|_| ok(json!({"msgId": "9010"})));
+    let req_params = SendTextParams {
+        conv_id: "g555".to_owned(),
+        text: "@Bob hi".to_owned(),
+        cli_msg_id: "7001".to_owned(),
+        quote_msg_id: Some("8003001".to_owned()),
+        quote_cli_msg_id: Some("8003001".to_owned()),
+        quote_owner_id: Some("3000503".to_owned()),
+        quote_text: Some(String::new()),
+        quote_ts_ms: Some(1_700_000_003_000),
+        mentions: mentions.clone(),
+        text_properties: Some(tp.clone()),
+        ttl: 3_600_000,
+        urgency: 1,
+    };
+    api.send_text(&req_params.as_args()).await.unwrap();
+    let q_req = last(&api);
+    assert_eq!(q_req.path(), "/api/group/quote");
+    let q_p = params_of(&q_req);
+    assert_eq!(q_p["qmsg"], "");
+    assert_eq!(q_p["qmsgId"], 8_003_001i64);
+    assert_eq!(q_p["qmsgCliId"], 8_003_001i64);
+    assert_eq!(q_p["qmsgOwner"], "3000503");
+    assert_eq!(q_p["qmsgTs"], 1_700_000_003_000i64);
+    assert_eq!(q_p["qmsgType"], 1);
+    assert_eq!(q_p["zsource"], 101);
+    assert_eq!(q_p["ttl"], 3_600_000i64);
+    assert_eq!(q_p["metaData"], json!({"urgency": 1}));
+    assert_eq!(q_p["textProperties"], tp);
+    assert_eq!(
+        q_p["mentionInfo"],
+        r#"[{"len":4,"pos":0,"type":0,"uid":"300"}]"#
+    );
+
+    // Quote fails -> fallback to /api/group/sendmsg preserves ttl, urgency, textProperties, mentions.
+    let api_fb = api_with(|req| {
+        if req.path().ends_with("/quote") {
+            err(112)
+        } else {
+            ok(json!({"msgId": "9011"}))
+        }
+    });
+    api_fb.send_text(&req_params.as_args()).await.unwrap();
+    let fb_req = last(&api_fb);
+    assert_eq!(fb_req.path(), "/api/group/sendmsg");
+    let fb_p = params_of(&fb_req);
+    assert_eq!(fb_p["ttl"], 3_600_000i64);
+    assert_eq!(fb_p["metaData"], json!({"urgency": 1}));
+    assert_eq!(fb_p["textProperties"], tp);
+    assert_eq!(
+        fb_p["mentionInfo"],
+        r#"[{"len":4,"pos":0,"type":0,"uid":"300"}]"#
+    );
+}
+
+#[tokio::test]
+async fn api_error_display_without_url_matches_swift_send_fail_log() {
+    let api = api_with(|_| {
+        reply(&json!({
+            "error_code": 112,
+            "error_message": "Send failed",
+        }))
+    });
+    let err = api
+        .send_text(&SendTextArgs {
+            conv_id: "3000507",
+            text: "Will fail",
+            cli_msg_id: "5000000000007",
+            ..SendTextArgs::default()
+        })
+        .await
+        .unwrap_err();
+
+    // Standard Display keeps the URL suffix (required by session.jsonl qr_server_error).
+    assert_eq!(
+        err.to_string(),
+        "Zalo error 112: Send failed (/api/message/sms)"
+    );
+    // Log Display drops the URL suffix (required by send.jsonl send_fail).
+    assert_eq!(err.display_without_url(), "Zalo error 112: Send failed");
+    assert_eq!(
+        format!("sendText failed: {}", err.display_without_url()),
+        "sendText failed: Zalo error 112: Send failed"
+    );
+
+    // Non-session variants delegate unchanged to Display.
+    let http_err = ApiError::Net(NetError::Http {
+        status: 502,
+        body: "bad gateway".to_owned(),
+    });
+    assert_eq!(http_err.display_without_url(), http_err.to_string());
+    let unauth_err = ApiError::Net(NetError::NotAuthenticated);
+    assert_eq!(unauth_err.display_without_url(), unauth_err.to_string());
+}
