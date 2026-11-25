@@ -22,6 +22,8 @@ pub struct CoreState {
     pub conversations: ConversationsState,
     pub messages: MessagesState,
     pub contacts: ContactsState,
+    // U4-bootstrap
+    pub(crate) bootstrap: crate::reduce::bootstrap::BootstrapRuntimeState,
 }
 
 impl CoreState {
@@ -61,6 +63,7 @@ impl fmt::Debug for CoreState {
             .field("conversations", &self.conversations)
             .field("messages", &self.messages)
             .field("contacts", &self.contacts)
+            .field("bootstrap", &self.bootstrap)
             .finish()
     }
 }

@@ -2560,6 +2560,8 @@ pub fn load_local_account_from_store(
     self_conv_id: Option<&str>,
     existing_identities: &IdentityTable,
 ) -> LocalAccountHydration {
+    let _ = store.repair_undecrypted_e2ee_messages();
+    let _ = store.repair_legacy_reactions(my_uid);
     let mut out = LocalAccountHydration {
         pinned_ids: store
             .get_preference_strings("pinnedIds")

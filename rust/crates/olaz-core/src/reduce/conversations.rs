@@ -1260,7 +1260,8 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
     }
 }
 
-fn apply_server_hidden(
+// U4-bootstrap
+pub(crate) fn apply_server_hidden(
     state: &mut CoreState,
     pin: &str,
     thread_ids: &[String],
@@ -1346,7 +1347,8 @@ fn emit_save_labels(state: &CoreState, op_id: Option<u64>, out: &mut ReduceOutpu
     });
 }
 
-fn emit_save_conversations(state: &CoreState, out: &mut ReduceOutput) {
+// U4-bootstrap
+pub(crate) fn emit_save_conversations(state: &CoreState, out: &mut ReduceOutput) {
     // Timestamp is stamped by the store worker (`updated_at_ms`) when writing to SQLite so `reduce`
     // stays clock-free (D9).
     let rows = state.conversations.stored_conversation_rows(0);
@@ -1354,7 +1356,8 @@ fn emit_save_conversations(state: &CoreState, out: &mut ReduceOutput) {
         .push(Effect::Store(StoreOp::SaveConversations(rows)));
 }
 
-fn rebuild_flags_and_extras(state: &mut CoreState, out: &mut ReduceOutput) {
+// U4-bootstrap
+pub(crate) fn rebuild_flags_and_extras(state: &mut CoreState, out: &mut ReduceOutput) {
     let self_conv_id = state.session.self_conversation_id.clone();
     if state
         .conversations
@@ -1392,7 +1395,8 @@ fn complete_op(op_id: Option<u64>, result: OpResult, after_store: bool, out: &mu
     }
 }
 
-fn sorted_set_vec(set: &BTreeSet<String>) -> Vec<String> {
+// U4-bootstrap
+pub(crate) fn sorted_set_vec(set: &BTreeSet<String>) -> Vec<String> {
     set.iter().cloned().collect()
 }
 

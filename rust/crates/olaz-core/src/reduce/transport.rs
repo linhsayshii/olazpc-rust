@@ -13,7 +13,7 @@ use crate::reduce::ReduceOutput;
 use crate::reduce::classify::{
     CMD_PUSH_MSG_11, CMD_PUSH_MSG_GROUP, LP_EXPIRED_REASON, Route, classify, classify_poll,
 };
-use crate::reduce::{conversations, session};
+use crate::reduce::{bootstrap, conversations, session};
 use crate::state::{ActiveDrain, CoreState, PendingDrain, Phase, WsPhase};
 use crate::typed_chat::{PlainChatParse, try_parse_plain_chat_pure};
 
@@ -27,6 +27,18 @@ pub const LP_PERIODIC_MAX_BATCHES: u32 = 2;
 #[must_use]
 pub fn is_typed_live_push(cmd: u16) -> bool {
     cmd == CMD_PUSH_MSG_11 || cmd == CMD_PUSH_MSG_GROUP
+}
+
+// U4-bootstrap
+/// Enqueues a concurrent long-poll drain on behalf of launch bootstrap using the given `drain_id`.
+pub(crate) fn start_bootstrap_drain(
+    state: &mut CoreState,
+    drain_id: u64,
+    max_batches: u32,
+    notify_incoming: bool,
+    out: &mut ReduceOutput,
+) {
+    handle_drain_requested(state, drain_id, max_batches, notify_incoming, out);
 }
 
 /// Starts both the WebSocket client and the periodic long-poll loop after session boot / QR login.
@@ -308,6 +320,8 @@ fn handle_drain_requested(
             drain_id,
             total_events: 0,
         });
+        // U4-bootstrap
+        bootstrap::on_lp_drain_done(state, drain_id, out);
         return;
     }
     let req = PendingDrain {
@@ -362,20 +376,29 @@ fn complete_active_drain(state: &mut CoreState, out: &mut ReduceOutput) {
     {
         begin_drain(state, next, out);
     }
+    // U4-bootstrap
+    bootstrap::on_lp_drain_done(state, done.drain_id, out);
 }
 
 fn finish_all_drains(state: &mut CoreState, out: &mut ReduceOutput) {
+    let mut finished_ids = Vec::new();
     if let Some(active) = state.transport.active_drain.take() {
+        finished_ids.push(active.drain_id);
         out.effects.push(Effect::CompleteDrain {
             drain_id: active.drain_id,
             total_events: active.total_events,
         });
     }
     while let Some(pending) = state.transport.pending_drains.pop_front() {
+        finished_ids.push(pending.drain_id);
         out.effects.push(Effect::CompleteDrain {
             drain_id: pending.drain_id,
             total_events: 0,
         });
+    }
+    // U4-bootstrap
+    for drain_id in finished_ids {
+        bootstrap::on_lp_drain_done(state, drain_id, out);
     }
 }
 

@@ -24,7 +24,7 @@ pub enum HistoryFetchPurpose {
     LoadOlder { load_seq: u64, op_id: Option<u64> },
 }
 
-/// Serial SQLite persistence operations executed by the core runner's store worker (U3/U4).
+/// Serial SQLite persistence operations executed by the core runner's store worker (U3).
 #[derive(Clone)]
 pub enum StoreOp {
     SaveConversations(Vec<StoredConversation>),
@@ -66,16 +66,20 @@ pub enum StoreOp {
         my_uid: String,
     },
 
-    // --- Messages & bootstrap domain (U4) ---
-    SaveMessages {
-        rows: Vec<StoredMessage>,
-        preserve_existing_reactions: bool,
+    // --- Launch bootstrap & freshness persistence (U4-bootstrap) ---
+    LoadPreferenceString {
+        key: String,
+        boot_gen: u64,
     },
     ProbeAndSaveMessages {
         probe_targets: BTreeMap<String, String>,
         rows: Vec<StoredMessage>,
         preserve_existing_reactions: bool,
         reply_boot_gen: Option<u64>,
+    },
+    SaveMessages {
+        rows: Vec<StoredMessage>,
+        preserve_existing_reactions: bool,
     },
     LoadOpenLocalMessages {
         open_seq: u64,
@@ -89,10 +93,6 @@ pub enum StoreOp {
         before_ts_ms: i64,
         limit: usize,
         op_id: Option<u64>,
-    },
-    LoadPreferenceString {
-        key: String,
-        boot_gen: u64,
     },
 }
 
@@ -145,6 +145,24 @@ impl fmt::Debug for StoreOp {
                 .debug_struct("LoadMentionPreviewMessages")
                 .field("group_count", &group_ids.len())
                 .finish(),
+            // U4-bootstrap
+            Self::LoadPreferenceString { key, boot_gen } => f
+                .debug_struct("LoadPreferenceString")
+                .field("key", key)
+                .field("boot_gen", boot_gen)
+                .finish(),
+            Self::ProbeAndSaveMessages {
+                probe_targets,
+                rows,
+                preserve_existing_reactions,
+                reply_boot_gen,
+            } => f
+                .debug_struct("ProbeAndSaveMessages")
+                .field("probe_count", &probe_targets.len())
+                .field("rows_count", &rows.len())
+                .field("preserve_existing_reactions", preserve_existing_reactions)
+                .field("reply_boot_gen", reply_boot_gen)
+                .finish(),
             Self::SaveMessages {
                 rows,
                 preserve_existing_reactions,
@@ -152,15 +170,6 @@ impl fmt::Debug for StoreOp {
                 .debug_struct("SaveMessages")
                 .field("count", &rows.len())
                 .field("preserve_reactions", preserve_existing_reactions)
-                .finish(),
-            Self::ProbeAndSaveMessages {
-                probe_targets,
-                rows,
-                ..
-            } => f
-                .debug_struct("ProbeAndSaveMessages")
-                .field("probes", &probe_targets.len())
-                .field("rows", &rows.len())
                 .finish(),
             Self::LoadOpenLocalMessages { open_seq, limit, .. } => f
                 .debug_struct("LoadOpenLocalMessages")
@@ -177,11 +186,6 @@ impl fmt::Debug for StoreOp {
                 .field("load_seq", load_seq)
                 .field("before_ts_ms", before_ts_ms)
                 .field("limit", limit)
-                .finish(),
-            Self::LoadPreferenceString { key, boot_gen } => f
-                .debug_struct("LoadPreferenceString")
-                .field("key", key)
-                .field("boot_gen", boot_gen)
                 .finish(),
         }
     }
@@ -300,7 +304,11 @@ pub enum HostCall {
         duration: i64,
     },
 
-    // --- Messages & bootstrap domain boundaries (U4) ---
+    // --- Launch bootstrap host calls (U4-bootstrap) ---
+    ApplyMutes {
+        mutes: Vec<MuteEntry>,
+    },
+    RefreshCloud,
     OnOpenConversationSync {
         conv_id: String,
         changed: bool,
@@ -336,10 +344,6 @@ pub enum HostCall {
         cli_msg_id: String,
         update_conversation_preview: bool,
     },
-    ApplyMutes {
-        mutes: Vec<MuteEntry>,
-    },
-    RefreshCloud,
     DecryptEnvelope {
         payload: Map<String, Value>,
         default_cmd: u16,
@@ -453,6 +457,12 @@ impl fmt::Debug for HostCall {
                 .field("set", set)
                 .field("duration", duration)
                 .finish(),
+            // U4-bootstrap
+            Self::ApplyMutes { mutes } => f
+                .debug_struct("ApplyMutes")
+                .field("count", &mutes.len())
+                .finish(),
+            Self::RefreshCloud => f.write_str("RefreshCloud"),
             Self::OnOpenConversationSync { changed, .. } => f
                 .debug_struct("OnOpenConversationSync")
                 .field("changed", changed)
@@ -469,11 +479,6 @@ impl fmt::Debug for HostCall {
                 .finish(),
             Self::ApplyRemoteRecall { .. } => f.write_str("ApplyRemoteRecall"),
             Self::ApplyRemoteDelete { .. } => f.write_str("ApplyRemoteDelete"),
-            Self::ApplyMutes { mutes } => f
-                .debug_struct("ApplyMutes")
-                .field("count", &mutes.len())
-                .finish(),
-            Self::RefreshCloud => f.write_str("RefreshCloud"),
             Self::DecryptEnvelope { default_cmd, .. } => f
                 .debug_struct("DecryptEnvelope")
                 .field("default_cmd", default_cmd)
@@ -629,7 +634,45 @@ pub enum Effect {
     /// Calls `ZaloApi::fetch_conversation_labels`.
     FetchConversationLabelsApi { op_id: Option<u64> },
 
-    // --- Messages domain (U4) ---
+    // --- Launch bootstrap network effects (U4-bootstrap) ---
+    /// Aborts any in-flight bootstrap HTTP tasks.
+    CancelBootstrapTasks,
+    /// Step 1: fetches `/api/alias/list` (distinguishes auth vs other errors).
+    BootstrapFetchAliasesApi { boot_gen: u64 },
+    /// Step 3: concurrently fetches pinned conversations, archived chats, and mute list.
+    BootstrapFetchPamApi { boot_gen: u64 },
+    /// Step 4a: fetches `/api/convlabel/get`.
+    BootstrapFetchLabelsApi { boot_gen: u64 },
+    /// Step 4b: fetches hidden conversations snapshot.
+    BootstrapFetchHiddenApi { boot_gen: u64 },
+    /// Step 4c: concurrently fetches friends, groups list, sent requests, and received requests.
+    BootstrapFetchContactsApi { boot_gen: u64 },
+    /// Step 5: fetches `/api/preloadconvers/get-last-msgs` (overview or 25-ID chunk).
+    BootstrapFetchPreloadApi {
+        boot_gen: u64,
+        thread_ids: Vec<String>,
+        is_overview: bool,
+    },
+    /// Step 6: fetches recent history for self-cloud (`is_old = Some(false)`).
+    BootstrapFetchHistoryApi {
+        boot_gen: u64,
+        conv_id: String,
+        count: i64,
+    },
+    /// Step 7: fetches one wave of up to 6 group histories concurrently, returning in `gids` order.
+    BootstrapFetchGroupWaveApi {
+        boot_gen: u64,
+        gids: Vec<String>,
+        count: i64,
+    },
+    /// Step 8: resolves one chunk of up to 50 missing-name UIDs during bootstrap finalize.
+    BootstrapFetchProfilesChunkApi {
+        boot_gen: u64,
+        chunk: Vec<String>,
+        remaining_chunks: Vec<Vec<String>>,
+        profiles_cache_changed: bool,
+    },
+
     /// Calls `ZaloApi::fetch_history` for `Open` or `LoadOlder`.
     FetchHistoryPageApi {
         conv_id: String,
@@ -790,6 +833,66 @@ impl fmt::Debug for Effect {
                 .finish(),
             Self::UpdateConversationLabelsApi { .. } => f.write_str("UpdateConversationLabelsApi"),
             Self::FetchConversationLabelsApi { .. } => f.write_str("FetchConversationLabelsApi"),
+            // U4-bootstrap
+            Self::CancelBootstrapTasks => f.write_str("CancelBootstrapTasks"),
+            Self::BootstrapFetchAliasesApi { boot_gen } => f
+                .debug_struct("BootstrapFetchAliasesApi")
+                .field("boot_gen", boot_gen)
+                .finish(),
+            Self::BootstrapFetchPamApi { boot_gen } => f
+                .debug_struct("BootstrapFetchPamApi")
+                .field("boot_gen", boot_gen)
+                .finish(),
+            Self::BootstrapFetchLabelsApi { boot_gen } => f
+                .debug_struct("BootstrapFetchLabelsApi")
+                .field("boot_gen", boot_gen)
+                .finish(),
+            Self::BootstrapFetchHiddenApi { boot_gen } => f
+                .debug_struct("BootstrapFetchHiddenApi")
+                .field("boot_gen", boot_gen)
+                .finish(),
+            Self::BootstrapFetchContactsApi { boot_gen } => f
+                .debug_struct("BootstrapFetchContactsApi")
+                .field("boot_gen", boot_gen)
+                .finish(),
+            Self::BootstrapFetchPreloadApi {
+                boot_gen,
+                thread_ids,
+                is_overview,
+            } => f
+                .debug_struct("BootstrapFetchPreloadApi")
+                .field("boot_gen", boot_gen)
+                .field("thread_count", &thread_ids.len())
+                .field("is_overview", is_overview)
+                .finish(),
+            Self::BootstrapFetchHistoryApi {
+                boot_gen, count, ..
+            } => f
+                .debug_struct("BootstrapFetchHistoryApi")
+                .field("boot_gen", boot_gen)
+                .field("count", count)
+                .finish(),
+            Self::BootstrapFetchGroupWaveApi {
+                boot_gen,
+                gids,
+                count,
+            } => f
+                .debug_struct("BootstrapFetchGroupWaveApi")
+                .field("boot_gen", boot_gen)
+                .field("gids_count", &gids.len())
+                .field("count", count)
+                .finish(),
+            Self::BootstrapFetchProfilesChunkApi {
+                boot_gen,
+                chunk,
+                remaining_chunks,
+                ..
+            } => f
+                .debug_struct("BootstrapFetchProfilesChunkApi")
+                .field("boot_gen", boot_gen)
+                .field("chunk_len", &chunk.len())
+                .field("remaining_chunks", &remaining_chunks.len())
+                .finish(),
             Self::FetchHistoryPageApi { count, purpose, .. } => f
                 .debug_struct("FetchHistoryPageApi")
                 .field("count", count)

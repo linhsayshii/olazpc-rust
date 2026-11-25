@@ -27,8 +27,8 @@ use crate::conversations::{
 };
 use crate::effect::{Effect, HistoryFetchPurpose, HostCall, OpResult, StoreOp};
 use crate::input::{
-    CompletedLogin, Input, LegacyCookie, PollBatchError, PollBatchOutcome, SeenTarget,
-    SessionFailure, StoreToken,
+    BootstrapAliasesError, Command, CompletedLogin, Input, LegacyCookie, PollBatchError,
+    PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
 };
 use crate::messages::MuteEntry;
 use crate::reduce::classify::MobileSyncEvent;
@@ -333,47 +333,18 @@ pub trait Host: Send + Sync {
     async fn on_long_poll_started(&self) -> bool {
         true
     }
-
-    // --- Transport domain callbacks (U2) ---
-    async fn persist_poll_state(&self, state: PollState);
-    async fn persist_ws_cursors(&self, cursors: CursorMap);
-    async fn apply_batch(
-        &self,
-        cmd: Option<u16>,
-        increment_unread: bool,
-        notify_incoming: bool,
-        payload: Map<String, Value>,
-    ) -> BatchApplyDelta;
-    async fn apply_parsed_events(
-        &self,
-        cmd: u16,
-        increment_unread: bool,
-        notify_incoming: bool,
-        envelope: TypedChatEnvelope,
-    ) -> BatchApplyDelta;
-    async fn mobile_sync(&self, events: Vec<MobileSyncEvent>);
-    async fn e2ee_signal(&self, cmd: u16, payload: Map<String, Value>);
-    async fn e2ee_deliver_reports(&self, cmd: u16, payload: Map<String, Value>);
-    async fn e2ee_connected(&self, uid: String);
-    async fn e2ee_disconnected(&self);
-    async fn voip_control(&self, act: String, raw_data: Value, data: Map<String, Value>);
-    async fn show_typing(&self, conv_id: String, uid: String, on_pc: bool);
-    async fn pin_topic(&self, conv_id: String);
-    async fn group_notice(&self, act: String, data: Map<String, Value>, ts: i64);
-    async fn mute(
-        &self,
-        conv_id: String,
-        set: bool,
-        start: i64,
-        start_explicit: bool,
-        duration: i64,
-    );
-
-    // --- Messages & bootstrap domain callbacks (U4) ---
+    // U4-bootstrap
+    /// Host hook emitted when the core signals launch bootstrap. Return `false` to suppress
+    /// auto-dispatching `Command::Bootstrap` (used by case recorders that trigger `bootstrap`
+    /// explicitly or test earlier domains in isolation). Production returns `true`.
     async fn on_bootstrap_started(&self) -> bool {
         self.start_bootstrap().await;
         true
     }
+    /// Applies server mute entries fetched during launch bootstrap step 3.
+    async fn apply_mutes(&self, _mutes: Vec<MuteEntry>) {}
+    /// Requests the host to refresh cloud data once launch bootstrap finalizes.
+    async fn refresh_cloud(&self) {}
     async fn on_open_conversation_sync(&self, _conv_id: String, _changed: bool) {}
     async fn on_close_conversation(&self) {}
     async fn refresh_board_pins(&self, _conv_id: String) {}
@@ -411,8 +382,6 @@ pub trait Host: Send + Sync {
         _update_conversation_preview: bool,
     ) {
     }
-    async fn apply_mutes(&self, _mutes: Vec<MuteEntry>) {}
-    async fn refresh_cloud(&self) {}
     async fn decrypt_envelope(&self, payload: Map<String, Value>) -> Map<String, Value> {
         payload
     }
@@ -420,6 +389,66 @@ pub trait Host: Send + Sync {
     async fn note_poll_messages(&self, _messages: Vec<ChatMessage>) {}
     async fn notify_incoming_messages(&self, _messages: Vec<ChatMessage>) {}
     async fn show_batch_typing(&self, _conv_id: String, _sender_id: String) {}
+
+    // --- Transport domain callbacks (U2) ---
+    async fn persist_poll_state(&self, state: PollState);
+    async fn persist_ws_cursors(&self, cursors: CursorMap);
+    async fn apply_batch(
+        &self,
+        cmd: Option<u16>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        payload: Map<String, Value>,
+    ) -> BatchApplyDelta;
+    async fn apply_parsed_events(
+        &self,
+        cmd: u16,
+        increment_unread: bool,
+        notify_incoming: bool,
+        envelope: TypedChatEnvelope,
+    ) -> BatchApplyDelta;
+    /// Host hook emitted when transport delivers an `ApplyBatch` frame.
+    /// Return `Some(decrypted_payload)` to have `olaz-core` ingest the batch natively
+    /// (windows + SQLite + conversation deltas + Pass 2 events). Return `None` to fall back
+    /// to legacy `Host::apply_batch`.
+    async fn on_batch_received(
+        &self,
+        _cmd: Option<u16>,
+        _increment_unread: bool,
+        _notify_incoming: bool,
+        _payload: Map<String, Value>,
+    ) -> Option<Map<String, Value>> {
+        None
+    }
+    /// Host hook emitted when transport delivers a typed `ApplyParsedEvents` frame.
+    /// Return `true` to have `olaz-core` ingest the typed envelope natively; return `false`
+    /// to fall back to legacy `Host::apply_parsed_events`.
+    async fn on_parsed_events_received(
+        &self,
+        _cmd: u16,
+        _increment_unread: bool,
+        _notify_incoming: bool,
+        _envelope: &TypedChatEnvelope,
+    ) -> bool {
+        false
+    }
+    async fn mobile_sync(&self, events: Vec<MobileSyncEvent>);
+    async fn e2ee_signal(&self, cmd: u16, payload: Map<String, Value>);
+    async fn e2ee_deliver_reports(&self, cmd: u16, payload: Map<String, Value>);
+    async fn e2ee_connected(&self, uid: String);
+    async fn e2ee_disconnected(&self);
+    async fn voip_control(&self, act: String, raw_data: Value, data: Map<String, Value>);
+    async fn show_typing(&self, conv_id: String, uid: String, on_pc: bool);
+    async fn pin_topic(&self, conv_id: String);
+    async fn group_notice(&self, act: String, data: Map<String, Value>, ts: i64);
+    async fn mute(
+        &self,
+        conv_id: String,
+        set: bool,
+        start: i64,
+        start_explicit: bool,
+        duration: i64,
+    );
 }
 
 enum HostJob {
@@ -458,6 +487,89 @@ enum HostJob {
         _guard: InFlightGuard,
     },
     StartBootstrap {
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    // U4-bootstrap
+    ApplyMutes {
+        mutes: Vec<MuteEntry>,
+        _guard: InFlightGuard,
+    },
+    RefreshCloud {
+        _guard: InFlightGuard,
+    },
+    OnOpenConversationSync {
+        conv_id: String,
+        changed: bool,
+        _guard: InFlightGuard,
+    },
+    OnCloseConversation {
+        _guard: InFlightGuard,
+    },
+    RefreshBoardPins {
+        conv_id: String,
+        _guard: InFlightGuard,
+    },
+    MarkReadBoundary {
+        conv_id: String,
+        seen_target: Option<SeenTarget>,
+        _guard: InFlightGuard,
+    },
+    ApplyRemoteReaction {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        sender_id: String,
+        r_type: String,
+        r_icon: String,
+        event_id: String,
+        react_client_id: String,
+        sender_name: String,
+        _guard: InFlightGuard,
+    },
+    ApplyRemoteRecall {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        update_conversation_preview: bool,
+        _guard: InFlightGuard,
+    },
+    ApplyRemoteDelete {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        update_conversation_preview: bool,
+        _guard: InFlightGuard,
+    },
+    DecryptEnvelope {
+        payload: Map<String, Value>,
+        default_cmd: u16,
+        fallback_conv_id: Option<String>,
+        is_group_hint: Option<bool>,
+        increment_unread: bool,
+        notify_incoming: bool,
+        persist_conversations: bool,
+        probe_freshness: bool,
+        poll_batch_done: Option<(u64, u64)>,
+        op_id: Option<u64>,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    MarkE2eeConversations {
+        conv_ids: Vec<String>,
+        _guard: InFlightGuard,
+    },
+    NotePollMessages {
+        messages: Vec<ChatMessage>,
+        _guard: InFlightGuard,
+    },
+    NotifyIncomingMessages {
+        messages: Vec<ChatMessage>,
+        _guard: InFlightGuard,
+    },
+    ShowBatchTyping {
+        conv_id: String,
+        sender_id: String,
         _guard: InFlightGuard,
     },
     OfferFirstLoginTransfer {
@@ -557,87 +669,6 @@ enum HostJob {
         duration: i64,
         _guard: InFlightGuard,
     },
-    OnOpenConversationSync {
-        conv_id: String,
-        changed: bool,
-        _guard: InFlightGuard,
-    },
-    OnCloseConversation {
-        _guard: InFlightGuard,
-    },
-    RefreshBoardPins {
-        conv_id: String,
-        _guard: InFlightGuard,
-    },
-    MarkReadBoundary {
-        conv_id: String,
-        seen_target: Option<SeenTarget>,
-        _guard: InFlightGuard,
-    },
-    ApplyRemoteReaction {
-        conv_id: String,
-        msg_id: String,
-        cli_msg_id: String,
-        sender_id: String,
-        r_type: String,
-        r_icon: String,
-        event_id: String,
-        react_client_id: String,
-        sender_name: String,
-        _guard: InFlightGuard,
-    },
-    ApplyRemoteRecall {
-        conv_id: String,
-        msg_id: String,
-        cli_msg_id: String,
-        update_conversation_preview: bool,
-        _guard: InFlightGuard,
-    },
-    ApplyRemoteDelete {
-        conv_id: String,
-        msg_id: String,
-        cli_msg_id: String,
-        update_conversation_preview: bool,
-        _guard: InFlightGuard,
-    },
-    ApplyMutes {
-        mutes: Vec<MuteEntry>,
-        _guard: InFlightGuard,
-    },
-    RefreshCloud {
-        _guard: InFlightGuard,
-    },
-    DecryptEnvelope {
-        payload: Map<String, Value>,
-        default_cmd: u16,
-        fallback_conv_id: Option<String>,
-        is_group_hint: Option<bool>,
-        increment_unread: bool,
-        notify_incoming: bool,
-        persist_conversations: bool,
-        probe_freshness: bool,
-        poll_batch_done: Option<(u64, u64)>,
-        op_id: Option<u64>,
-        sink: ActorSink,
-        _guard: InFlightGuard,
-    },
-    MarkE2eeConversations {
-        conv_ids: Vec<String>,
-        _guard: InFlightGuard,
-    },
-    NotePollMessages {
-        messages: Vec<ChatMessage>,
-        _guard: InFlightGuard,
-    },
-    NotifyIncomingMessages {
-        messages: Vec<ChatMessage>,
-        _guard: InFlightGuard,
-    },
-    ShowBatchTyping {
-        conv_id: String,
-        sender_id: String,
-        _guard: InFlightGuard,
-    },
     Drain(oneshot::Sender<()>),
 }
 
@@ -665,6 +696,7 @@ enum StoreJob {
 /// in a scripted `Transport` over the exact same request-building code.
 pub struct SessionEffectRunner<T: Transport + 'static> {
     client: Arc<SessionClient<T>>,
+    api: Arc<ZaloApi<T>>,
     ws_driver: Arc<dyn WsDriver>,
     default_domains: Option<ZaloDomains>,
     suppress_long_poll: bool,
@@ -676,6 +708,7 @@ pub struct SessionEffectRunner<T: Transport + 'static> {
     host_dispatched: AtomicU64,
     store_dispatched: AtomicU64,
     active_tasks: Arc<Mutex<Vec<AbortHandle>>>,
+    bootstrap_tasks: Arc<Mutex<Vec<AbortHandle>>>,
     lp_timer_abort: Arc<Mutex<Option<AbortHandle>>>,
     lp_fetch_abort: Mutex<Option<AbortHandle>>,
     host_worker_abort: AbortHandle,
@@ -727,10 +760,12 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         default_domains: Option<ZaloDomains>,
         suppress_long_poll: bool,
     ) -> Self {
+        let api = Arc::new(ZaloApi::from_shared(Arc::clone(&client)));
         let (host_tx, host_rx) = mpsc::unbounded_channel();
         let (store_tx, store_rx) = mpsc::unbounded_channel();
         let shared_store: SharedStoreSlot = Arc::new(Mutex::new(None));
         let active_tasks: Arc<Mutex<Vec<AbortHandle>>> = Arc::new(Mutex::new(Vec::new()));
+        let bootstrap_tasks: Arc<Mutex<Vec<AbortHandle>>> = Arc::new(Mutex::new(Vec::new()));
         let ws_active_gen: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let lp_active_gen: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let lp_timer_abort: Arc<Mutex<Option<AbortHandle>>> = Arc::new(Mutex::new(None));
@@ -755,6 +790,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         }));
         Self {
             client,
+            api,
             ws_driver,
             default_domains,
             suppress_long_poll,
@@ -766,6 +802,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
             host_dispatched: AtomicU64::new(0),
             store_dispatched: AtomicU64::new(0),
             active_tasks,
+            bootstrap_tasks,
             lp_timer_abort,
             lp_fetch_abort: Mutex::new(None),
             host_worker_abort: worker_handle.abort_handle(),
@@ -775,6 +812,11 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
     }
 
     /// Returns a reference to the runner's [`WsDriver`] (for FFI WS pass-throughs and tests).
+    #[must_use]
+    pub fn api(&self) -> &Arc<ZaloApi<T>> {
+        &self.api
+    }
+
     #[must_use]
     pub fn ws_driver(&self) -> &Arc<dyn WsDriver> {
         &self.ws_driver
@@ -887,6 +929,33 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         list.push(handle);
     }
 
+    // U4-bootstrap
+    fn cancel_bootstrap_tasks(&self) {
+        let handles = {
+            let mut list = self
+                .bootstrap_tasks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            std::mem::take(&mut *list)
+        };
+        for handle in handles {
+            handle.abort();
+        }
+    }
+
+    fn spawn_bootstrap<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let handle = self.runtime.spawn(fut).abort_handle();
+        let mut list = self
+            .bootstrap_tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        list.retain(|h| !h.is_finished());
+        list.push(handle);
+    }
+
     fn snapshot_json(&self) -> String {
         serde_json::to_string(&self.client.snapshot()).unwrap_or_default()
     }
@@ -898,8 +967,10 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
             match effect {
                 Effect::CancelSessionTasks => {
                     self.cancel_active_tasks();
+                    self.cancel_bootstrap_tasks();
                 }
                 Effect::ClearCoreSession => {
+                    self.api.reset_state();
                     let pre_clear_domains = self.client.domains();
                     self.client.clear_session();
                     let restore = if pre_clear_domains.isolated {
@@ -935,6 +1006,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
                 Effect::CheckSessionStatus { boot_gen } => {
                     let client = Arc::clone(&self.client);
+                    let _api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.spawn_cancellable(async move {
@@ -952,6 +1024,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
                 Effect::SyncProfileMe { boot_gen } => {
                     let client = Arc::clone(&self.client);
+                    let _api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.spawn_cancellable(async move {
@@ -970,6 +1043,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
                 Effect::RequestQr { qr_gen, language } => {
                     let client = Arc::clone(&self.client);
+                    let _api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.spawn_cancellable(async move {
@@ -983,6 +1057,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
                 Effect::WaitQrScan { qr_gen, ticket } => {
                     let client = Arc::clone(&self.client);
+                    let _api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.spawn_cancellable(async move {
@@ -1003,6 +1078,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
                 Effect::WaitQrConfirm { qr_gen, ticket } => {
                     let client = Arc::clone(&self.client);
+                    let _api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.spawn_cancellable(async move {
@@ -1017,6 +1093,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
                 Effect::CompleteLogin { qr_gen } => {
                     let client = Arc::clone(&self.client);
+                    let _api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.spawn_cancellable(async move {
@@ -1143,14 +1220,14 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     {
                         prev.abort();
                     }
-                    let client = Arc::clone(&self.client);
+                    let _client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
                     let fetch_sink = sink.clone();
                     let guard = sink.track();
                     let handle = self
                         .runtime
                         .spawn(async move {
-                            let api = ZaloApi::from_shared(client);
-                            let result = match api.fetch_chat_from_polling(&poll_state).await {
+                                                        let result = match api.fetch_chat_from_polling(&poll_state).await {
                                 Ok(outcome) => Ok(PollBatchOutcome {
                                     payload: outcome.response,
                                     next_state: outcome.next_state,
@@ -1210,12 +1287,12 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     // Handled directly by the actor before reaching EffectRunner.
                 }
                 Effect::UpdatePinnedConversationApi { id, pinned, op_id } => {
-                    let client = Arc::clone(&self.client);
+                    let _client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                        let api = ZaloApi::from_shared(client);
-                        let ok = api.update_pinned_conversation(&id, pinned).await.is_ok();
+                                                let ok = api.update_pinned_conversation(&id, pinned).await.is_ok();
                         sink.send(Input::PinApiDone {
                             id,
                             pinned,
@@ -1232,12 +1309,12 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     unpin_remaining,
                     pin_id,
                 } => {
-                    let client = Arc::clone(&self.client);
+                    let _client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                        let api = ZaloApi::from_shared(client);
-                        let ok = api
+                                                let ok = api
                             .update_pinned_conversation(&target_id, pinned)
                             .await
                             .is_ok();
@@ -1257,12 +1334,12 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     archived,
                     op_id,
                 } => {
-                    let client = Arc::clone(&self.client);
+                    let _client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                        let api = ZaloApi::from_shared(client);
-                        let ok = api.update_archived_chat(&id, archived).await.is_ok();
+                                                let ok = api.update_archived_chat(&id, archived).await.is_ok();
                         sink.send(Input::MoveApiDone {
                             id,
                             to_other: archived,
@@ -1277,31 +1354,31 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     last_cli_msg_id,
                     op_id,
                 } => {
-                    let client = Arc::clone(&self.client);
+                    let _client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                        let api = ZaloApi::from_shared(client);
-                        let _ = api.delete_conversation(&id, &last_cli_msg_id).await;
+                                                let _ = api.delete_conversation(&id, &last_cli_msg_id).await;
                         sink.send(Input::DeleteApiDone { id, op_id });
                         drop(guard);
                     });
                 }
                 Effect::SetUnreadMarkApi { conv_id, unread } => {
-                    let client = Arc::clone(&self.client);
+                    let _client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                        let api = ZaloApi::from_shared(client);
-                        let _ = api.set_unread_mark(&conv_id, unread).await;
+                                                let _ = api.set_unread_mark(&conv_id, unread).await;
                         drop(guard);
                     });
                 }
                 Effect::SendSeenApi(target) => {
-                    let client = Arc::clone(&self.client);
+                    let _client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                        let api = ZaloApi::from_shared(client);
-                        let _ = api
+                                                let _ = api
                             .send_seen(
                                 &target.conv_id,
                                 &target.msg_id,
@@ -1318,12 +1395,12 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     op_id,
                     result,
                 } => {
-                    let client = Arc::clone(&self.client);
+                    let _client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                        let api = ZaloApi::from_shared(client);
-                        let _ = api.set_hidden_conversation(&conv_id, hidden).await;
+                                                let _ = api.set_hidden_conversation(&conv_id, hidden).await;
                         if let (Some(id), Some(res)) = (op_id, result) {
                             sink.send(Input::OpApiDone {
                                 op_id: id,
@@ -1335,11 +1412,12 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
                 Effect::UpdateHiddenPinApi { pin, kind, op_id } => {
                     let client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
                         let md5 = if client.is_authenticated() {
-                            let api = ZaloApi::from_shared(Arc::clone(&client));
+
                             if api.update_hidden_pin(&pin).await.is_err() {
                                 sink.send(Input::HiddenPinSyncDone {
                                     op_id,
@@ -1368,12 +1446,12 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
                 Effect::ResetHiddenPinApi { op_id } => {
                     let client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
                         let ok = if client.is_authenticated() {
-                            let api = ZaloApi::from_shared(client);
-                            api.reset_hidden_pin().await.is_ok()
+                                                        api.reset_hidden_pin().await.is_ok()
                         } else {
                             true
                         };
@@ -1383,12 +1461,12 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
                 Effect::FetchHiddenConversationsApi { op_id } => {
                     let client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
                         let snapshot = if client.is_authenticated() {
-                            let api = ZaloApi::from_shared(client);
-                            api.fetch_hidden_conversations().await.ok()
+                                                        api.fetch_hidden_conversations().await.ok()
                         } else {
                             None
                         };
@@ -1402,12 +1480,12 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     remaining_chunks,
                     profiles_cache_changed,
                 } => {
-                    let client = Arc::clone(&self.client);
+                    let _client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                        let api = ZaloApi::from_shared(client);
-                        let profiles_map = match api.fetch_profiles(&chunk).await {
+                                                let profiles_map = match api.fetch_profiles(&chunk).await {
                             Ok(raw) => extract_profiles_map(&raw),
                             Err(_) => Map::new(),
                         };
@@ -1424,12 +1502,12 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     label_data_json,
                     op_id,
                 } => {
-                    let client = Arc::clone(&self.client);
+                    let _client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                        let api = ZaloApi::from_shared(client);
-                        let _ = api.update_conversation_labels(&label_data_json).await;
+                                                let _ = api.update_conversation_labels(&label_data_json).await;
                         if let Some(id) = op_id {
                             sink.send(Input::OpApiDone {
                                 op_id: id,
@@ -1440,13 +1518,201 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     });
                 }
                 Effect::FetchConversationLabelsApi { op_id } => {
-                    let client = Arc::clone(&self.client);
+                    let _client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                        let api = ZaloApi::from_shared(client);
-                        let payload = api.fetch_conversation_labels().await.ok();
+                                                let payload = api.fetch_conversation_labels().await.ok();
                         sink.send(Input::SyncLabelsFetched { op_id, payload });
+                        drop(guard);
+                    });
+                }
+                // --- Launch bootstrap network effects (U4-bootstrap) ---
+                Effect::CancelBootstrapTasks => {
+                    self.cancel_bootstrap_tasks();
+                }
+                Effect::BootstrapFetchAliasesApi { boot_gen } => {
+                    let _client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                                                let result = match api.fetch_aliases().await {
+                            Ok(aliases) => Ok(aliases),
+                            Err(err) if err.is_auth_error() => Err(BootstrapAliasesError::Auth),
+                            Err(_) => Err(BootstrapAliasesError::Other),
+                        };
+                        sink.send(Input::BootstrapAliasesDone { boot_gen, result });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchPamApi { boot_gen } => {
+                    let _client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                                                let (pinned_res, archived_res, mute_res) = tokio::join!(
+                            api.fetch_pinned_conversations(),
+                            api.fetch_archived_chats(),
+                            api.fetch_mute_list(),
+                        );
+                        sink.send(Input::BootstrapPamDone {
+                            boot_gen,
+                            pinned_ids: pinned_res.ok(),
+                            archived_ids: archived_res.ok(),
+                            mute_rows: mute_res.ok(),
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchLabelsApi { boot_gen } => {
+                    let _client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                                                let payload = api.fetch_conversation_labels().await.ok();
+                        sink.send(Input::BootstrapLabelsDone { boot_gen, payload });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchHiddenApi { boot_gen } => {
+                    let client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        let snapshot = if client.is_authenticated() {
+                                                        api.fetch_hidden_conversations().await.ok()
+                        } else {
+                            None
+                        };
+                        sink.send(Input::BootstrapHiddenDone { boot_gen, snapshot });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchContactsApi { boot_gen } => {
+                    let _client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                                                let (friends_res, groups_res, sent_res, received_res) = tokio::join!(
+                            api.fetch_friends(1, 20000),
+                            api.fetch_groups_list(),
+                            api.fetch_sent_friend_requests(),
+                            api.fetch_received_friend_requests(),
+                        );
+                        sink.send(Input::BootstrapContactsDone {
+                            boot_gen,
+                            friends_rows: friends_res.ok(),
+                            groups_dict: groups_res.ok(),
+                            sent_rows: sent_res.ok(),
+                            received_rows: received_res.ok(),
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchPreloadApi {
+                    boot_gen,
+                    thread_ids,
+                    is_overview,
+                } => {
+                    let _client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                                                let payload = api.fetch_preload_conversations(&thread_ids).await.ok();
+                        sink.send(Input::BootstrapPreloadDone {
+                            boot_gen,
+                            is_overview,
+                            payload,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchHistoryApi {
+                    boot_gen,
+                    conv_id,
+                    count,
+                } => {
+                    let _client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                                                let payload = api
+                            .fetch_history(&conv_id, None, count, Some(false))
+                            .await
+                            .ok();
+                        sink.send(Input::BootstrapSelfCloudDone {
+                            boot_gen,
+                            conv_id,
+                            payload,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchGroupWaveApi {
+                    boot_gen,
+                    gids,
+                    count,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let _api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                        type WaveEntry = (String, Option<Map<String, Value>>);
+                        let len = gids.len();
+                        let mut set: tokio::task::JoinSet<(usize, WaveEntry)> =
+                            tokio::task::JoinSet::new();
+                        for (idx, gid) in gids.into_iter().enumerate() {
+                            let task_client = Arc::clone(&client);
+                            set.spawn(async move {
+                                let api = ZaloApi::from_shared(task_client);
+                                let payload =
+                                    api.fetch_history(&gid, None, count, Some(false)).await.ok();
+                                (idx, (gid, payload))
+                            });
+                        }
+                        let mut slots: Vec<Option<WaveEntry>> = vec![None; len];
+                        while let Some(joined) = set.join_next().await {
+                            if let Ok((idx, entry)) = joined
+                                && let Some(slot) = slots.get_mut(idx)
+                            {
+                                *slot = Some(entry);
+                            }
+                        }
+                        let results: Vec<WaveEntry> = slots.into_iter().flatten().collect();
+                        sink.send(Input::BootstrapGroupWaveDone { boot_gen, results });
+                        drop(guard);
+                    });
+                }
+                Effect::BootstrapFetchProfilesChunkApi {
+                    boot_gen,
+                    chunk,
+                    remaining_chunks,
+                    profiles_cache_changed,
+                } => {
+                    let _client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_bootstrap(async move {
+                                                let profiles_map = match api.fetch_profiles(&chunk).await {
+                            Ok(raw) => extract_profiles_map(&raw),
+                            Err(_) => Map::new(),
+                        };
+                        sink.send(Input::BootstrapResolveNamesChunkDone {
+                            boot_gen,
+                            remaining_chunks,
+                            profiles_map,
+                            profiles_cache_changed,
+                        });
                         drop(guard);
                     });
                 }
@@ -1458,37 +1724,37 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     purpose,
                 } => {
                     let client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.spawn_cancellable(async move {
-                            let page = if client.is_authenticated() {
-                                let api = ZaloApi::from_shared(client);
-                                api.fetch_history(&conv_id, before_msg_id.as_deref(), count, is_old)
-                                    .await
-                                    .ok()
-                            } else {
-                                None
-                            };
-                            match purpose {
-                                HistoryFetchPurpose::Open { open_seq, op_id } => {
-                                    sink.send(Input::OpenHistoryPageFetched {
-                                        open_seq,
-                                        conv_id,
-                                        page,
-                                        op_id,
-                                    });
-                                }
-                                HistoryFetchPurpose::LoadOlder { load_seq, op_id } => {
-                                    sink.send(Input::LoadOlderPageFetched {
-                                        load_seq,
-                                        conv_id,
-                                        before_msg_id,
-                                        page,
-                                        op_id,
-                                    });
-                                }
+                        let page = if client.is_authenticated() {
+                                                        api.fetch_history(&conv_id, before_msg_id.as_deref(), count, is_old)
+                                .await
+                                .ok()
+                        } else {
+                            None
+                        };
+                        match purpose {
+                            HistoryFetchPurpose::Open { open_seq, op_id } => {
+                                sink.send(Input::OpenHistoryPageFetched {
+                                    open_seq,
+                                    conv_id,
+                                    page,
+                                    op_id,
+                                });
                             }
-                            drop(guard);
+                            HistoryFetchPurpose::LoadOlder { load_seq, op_id } => {
+                                sink.send(Input::LoadOlderPageFetched {
+                                    load_seq,
+                                    conv_id,
+                                    before_msg_id,
+                                    page,
+                                    op_id,
+                                });
+                            }
+                        }
+                        drop(guard);
                     });
                 }
                 Effect::FetchSenderProfilesChunkApi {
@@ -1499,26 +1765,26 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     cache_updated,
                 } => {
                     let client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.spawn_cancellable(async move {
-                            let profiles_map = if client.is_authenticated() {
-                                let api = ZaloApi::from_shared(client);
-                                match api.fetch_profiles(&chunk).await {
-                                    Ok(raw) => extract_profiles_map(&raw),
-                                    Err(_) => Map::new(),
-                                }
-                            } else {
-                                Map::new()
-                            };
-                            sink.send(Input::SenderProfilesChunkDone {
-                                resolve_id,
-                                conv_id,
-                                remaining_chunks,
-                                profiles_map,
-                                cache_updated,
-                            });
-                            drop(guard);
+                        let profiles_map = if client.is_authenticated() {
+                                                        match api.fetch_profiles(&chunk).await {
+                                Ok(raw) => extract_profiles_map(&raw),
+                                Err(_) => Map::new(),
+                            }
+                        } else {
+                            Map::new()
+                        };
+                        sink.send(Input::SenderProfilesChunkDone {
+                            resolve_id,
+                            conv_id,
+                            remaining_chunks,
+                            profiles_map,
+                            cache_updated,
+                        });
+                        drop(guard);
                     });
                 }
                 Effect::Host(call) => {
@@ -1537,7 +1803,10 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             sink: sink.clone(),
                             _guard: guard,
                         },
-                        HostCall::StartBootstrap => HostJob::StartBootstrap { _guard: guard },
+                        HostCall::StartBootstrap => HostJob::StartBootstrap {
+                            sink: sink.clone(),
+                            _guard: guard,
+                        },
                         HostCall::OfferFirstLoginTransfer { force } => {
                             HostJob::OfferFirstLoginTransfer {
                                 force,
@@ -1654,6 +1923,12 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             duration,
                             _guard: guard,
                         },
+                        // U4-bootstrap
+                        HostCall::ApplyMutes { mutes } => HostJob::ApplyMutes {
+                            mutes,
+                            _guard: guard,
+                        },
+                        HostCall::RefreshCloud => HostJob::RefreshCloud { _guard: guard },
                         HostCall::OnOpenConversationSync { conv_id, changed } => {
                             HostJob::OnOpenConversationSync {
                                 conv_id,
@@ -1722,11 +1997,6 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             update_conversation_preview,
                             _guard: guard,
                         },
-                        HostCall::ApplyMutes { mutes } => HostJob::ApplyMutes {
-                            mutes,
-                            _guard: guard,
-                        },
-                        HostCall::RefreshCloud => HostJob::RefreshCloud { _guard: guard },
                         HostCall::DecryptEnvelope {
                             payload,
                             default_cmd,
@@ -1792,6 +2062,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
         self.cancel_active_tasks();
+        self.cancel_bootstrap_tasks();
         self.cancel_long_poll();
         self.ws_driver.stop(false);
         self.host_worker_abort.abort();
@@ -1856,47 +2127,6 @@ async fn run_store_worker(
                         };
                         sink.send(Input::MentionPreviewsLoaded { op_id, messages });
                     }
-                    StoreOp::ProbeAndSaveMessages {
-                        probe_targets,
-                        rows,
-                        preserve_existing_reactions,
-                        reply_boot_gen,
-                    } => {
-                        let probes = if let Some(store_arc) = store_opt {
-                            runtime
-                                .spawn_blocking(move || {
-                                    let mut store =
-                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
-                                    let mut out_probes = Vec::with_capacity(probe_targets.len());
-                                    for (conv_id, msg_id) in &probe_targets {
-                                        let exists = store
-                                            .existing_message_ids(conv_id, std::slice::from_ref(msg_id))
-                                            .is_ok_and(|set| !set.is_empty());
-                                        out_probes.push((conv_id.clone(), exists));
-                                    }
-                                    if !rows.is_empty() {
-                                        let _ = store.save_messages_with(
-                                            &rows,
-                                            SaveOptions {
-                                                skip_twin_checks: false,
-                                                preserve_existing_reactions,
-                                            },
-                                        );
-                                    }
-                                    out_probes
-                                })
-                                .await
-                                .unwrap_or_default()
-                        } else {
-                            probe_targets.into_keys().map(|c| (c, false)).collect()
-                        };
-                        if !probes.is_empty() {
-                            sink.send(Input::FreshnessProbed {
-                                boot_gen: reply_boot_gen,
-                                probes,
-                            });
-                        }
-                    }
                     StoreOp::LoadOpenLocalMessages {
                         open_seq,
                         conv_id,
@@ -1959,6 +2189,7 @@ async fn run_store_worker(
                             op_id,
                         });
                     }
+                    // U4-bootstrap
                     StoreOp::LoadPreferenceString { key, boot_gen } => {
                         let last_refresh_pref = if let Some(store_arc) = store_opt {
                             runtime
@@ -1977,6 +2208,54 @@ async fn run_store_worker(
                             boot_gen,
                             last_refresh_pref,
                         });
+                    }
+                    StoreOp::ProbeAndSaveMessages {
+                        probe_targets,
+                        rows,
+                        preserve_existing_reactions,
+                        reply_boot_gen,
+                    } => {
+                        let probes = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let mut store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let mut out = Vec::with_capacity(probe_targets.len());
+                                    for (conv_id, msg_id) in probe_targets {
+                                        let exists = store
+                                            .existing_message_ids(
+                                                &conv_id,
+                                                std::slice::from_ref(&msg_id),
+                                            )
+                                            .map(|set| set.contains(&msg_id))
+                                            .unwrap_or(false);
+                                        out.push((conv_id, exists));
+                                    }
+                                    if !rows.is_empty() {
+                                        let _ = store.save_messages_with(
+                                            &rows,
+                                            SaveOptions {
+                                                skip_twin_checks: false,
+                                                preserve_existing_reactions,
+                                            },
+                                        );
+                                    }
+                                    out
+                                })
+                                .await
+                                .unwrap_or_default()
+                        } else {
+                            probe_targets
+                                .into_keys()
+                                .map(|conv_id| (conv_id, false))
+                                .collect()
+                        };
+                        if !probes.is_empty() || reply_boot_gen.is_some() {
+                            sink.send(Input::FreshnessProbed {
+                                boot_gen: reply_boot_gen,
+                                probes,
+                            });
+                        }
                     }
                     other => {
                         if let Some(store_arc) = store_opt {
@@ -2040,10 +2319,10 @@ async fn run_store_worker(
                                             );
                                         }
                                         StoreOp::LoadMentionPreviewMessages { .. }
+                                        | StoreOp::LoadPreferenceString { .. }
                                         | StoreOp::ProbeAndSaveMessages { .. }
                                         | StoreOp::LoadOpenLocalMessages { .. }
-                                        | StoreOp::LoadOlderStoreMessages { .. }
-                                        | StoreOp::LoadPreferenceString { .. } => {}
+                                        | StoreOp::LoadOlderStoreMessages { .. } => {}
                                     }
                                 })
                                 .await;
@@ -2273,146 +2552,19 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                     }
                 }
             }
-            HostJob::StartBootstrap { _guard } => {
-                host.start_bootstrap().await;
-            }
-            HostJob::OfferFirstLoginTransfer { force, _guard } => {
-                host.offer_first_login_transfer(force).await;
-            }
-            HostJob::DetachStore { _guard } => {
-                let (tx, rx) = oneshot::channel();
-                if store_tx.send(StoreJob::Drain(tx)).is_ok() {
-                    let _ = rx.await;
-                }
-                *shared_store.lock().unwrap_or_else(PoisonError::into_inner) = None;
-            }
-            HostJob::ResetDomains { _guard } => {
-                host.reset_domains().await;
-            }
-            HostJob::PersistSession {
-                snapshot_json,
-                _guard,
-            } => {
-                host.persist_session(snapshot_json).await;
-            }
-            HostJob::ClearSession { _guard } => {
-                host.clear_session().await;
-            }
-            HostJob::MarkExpired {
-                snapshot_json,
-                _guard,
-            } => {
-                host.mark_expired(snapshot_json).await;
-            }
-            HostJob::PersistPollState { state, _guard } => {
-                host.persist_poll_state(state).await;
-            }
-            HostJob::PersistWsCursors { cursors, _guard } => {
-                host.persist_ws_cursors(cursors).await;
-            }
-            HostJob::ApplyBatch {
-                cmd,
-                increment_unread,
-                notify_incoming,
-                payload,
-                poll_batch_done,
-                sink,
-                _guard,
-            } => {
-                let delta = host
-                    .apply_batch(cmd, increment_unread, notify_incoming, payload)
-                    .await;
-                if let Some((lp_gen, drain_id)) = poll_batch_done {
-                    sink.send(Input::PollBatchApplied {
-                        lp_gen,
-                        drain_id,
-                        delta,
-                    });
-                } else if delta.applied_count > 0
-                    || !delta.updates.is_empty()
-                    || !delta.preview_overrides.is_empty()
-                {
-                    sink.send(Input::BatchDeltaApplied { delta });
+            HostJob::StartBootstrap { sink, _guard } => {
+                if host.on_bootstrap_started().await {
+                    sink.send(Input::Command(Command::Bootstrap {
+                        now_ms: unix_now_ms(),
+                    }));
                 }
             }
-            HostJob::ApplyParsedEvents {
-                cmd,
-                increment_unread,
-                notify_incoming,
-                envelope,
-                sink,
-                _guard,
-            } => {
-                let delta = host
-                    .apply_parsed_events(cmd, increment_unread, notify_incoming, envelope)
-                    .await;
-                if delta.applied_count > 0
-                    || !delta.updates.is_empty()
-                    || !delta.preview_overrides.is_empty()
-                {
-                    sink.send(Input::BatchDeltaApplied { delta });
-                }
+            // U4-bootstrap
+            HostJob::ApplyMutes { mutes, _guard } => {
+                host.apply_mutes(mutes).await;
             }
-            HostJob::MobileSync { events, _guard } => {
-                host.mobile_sync(events).await;
-            }
-            HostJob::E2eeSignal {
-                cmd,
-                payload,
-                _guard,
-            } => {
-                host.e2ee_signal(cmd, payload).await;
-            }
-            HostJob::E2eeDeliverReports {
-                cmd,
-                payload,
-                _guard,
-            } => {
-                host.e2ee_deliver_reports(cmd, payload).await;
-            }
-            HostJob::E2eeConnected { uid, _guard } => {
-                host.e2ee_connected(uid).await;
-            }
-            HostJob::E2eeDisconnected { _guard } => {
-                host.e2ee_disconnected().await;
-            }
-            HostJob::VoipControl {
-                act,
-                raw_data,
-                data,
-                _guard,
-            } => {
-                host.voip_control(act, raw_data, data).await;
-            }
-            HostJob::ShowTyping {
-                conv_id,
-                uid,
-                on_pc,
-                _guard,
-            } => {
-                host.show_typing(conv_id, uid, on_pc).await;
-            }
-            HostJob::PinTopic { conv_id, _guard } => {
-                host.pin_topic(conv_id).await;
-            }
-            HostJob::GroupNotice {
-                act,
-                data,
-                ts,
-                _guard,
-            } => {
-                host.group_notice(act, data, ts).await;
-            }
-            HostJob::Mute {
-                conv_id,
-                set,
-                start,
-                start_explicit,
-                duration,
-                _guard,
-            } => {
-                host.mute(conv_id, set, start, start_explicit, duration)
-                    .await;
+            HostJob::RefreshCloud { _guard } => {
+                host.refresh_cloud().await;
             }
             HostJob::OnOpenConversationSync {
                 conv_id,
@@ -2479,12 +2631,6 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 host.apply_remote_delete(conv_id, msg_id, cli_msg_id, update_conversation_preview)
                     .await;
             }
-            HostJob::ApplyMutes { mutes, _guard } => {
-                host.apply_mutes(mutes).await;
-            }
-            HostJob::RefreshCloud { _guard } => {
-                host.refresh_cloud().await;
-            }
             HostJob::DecryptEnvelope {
                 payload,
                 default_cmd,
@@ -2528,6 +2674,181 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 _guard,
             } => {
                 host.show_batch_typing(conv_id, sender_id).await;
+            }
+            HostJob::OfferFirstLoginTransfer { force, _guard } => {
+                host.offer_first_login_transfer(force).await;
+            }
+            HostJob::DetachStore { _guard } => {
+                let (tx, rx) = oneshot::channel();
+                if store_tx.send(StoreJob::Drain(tx)).is_ok() {
+                    let _ = rx.await;
+                }
+                *shared_store.lock().unwrap_or_else(PoisonError::into_inner) = None;
+            }
+            HostJob::ResetDomains { _guard } => {
+                host.reset_domains().await;
+            }
+            HostJob::PersistSession {
+                snapshot_json,
+                _guard,
+            } => {
+                host.persist_session(snapshot_json).await;
+            }
+            HostJob::ClearSession { _guard } => {
+                host.clear_session().await;
+            }
+            HostJob::MarkExpired {
+                snapshot_json,
+                _guard,
+            } => {
+                // U4-bootstrap: Swift `markExpired` calls `hostResetDomains` and closes SQLite,
+                // so drain pending store ops and detach the shared store handle first.
+                let (tx, rx) = oneshot::channel();
+                if store_tx.send(StoreJob::Drain(tx)).is_ok() {
+                    let _ = rx.await;
+                }
+                *shared_store.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                host.mark_expired(snapshot_json).await;
+            }
+            HostJob::PersistPollState { state, _guard } => {
+                host.persist_poll_state(state).await;
+            }
+            HostJob::PersistWsCursors { cursors, _guard } => {
+                host.persist_ws_cursors(cursors).await;
+            }
+            HostJob::ApplyBatch {
+                cmd,
+                increment_unread,
+                notify_incoming,
+                payload,
+                poll_batch_done,
+                sink,
+                _guard,
+            } => {
+                if let Some(decrypted) = host
+                    .on_batch_received(cmd, increment_unread, notify_incoming, payload.clone())
+                    .await
+                {
+                    sink.send(Input::DecryptedEnvelopeReady {
+                        payload: decrypted,
+                        default_cmd: cmd.unwrap_or(0),
+                        fallback_conv_id: None,
+                        is_group_hint: None,
+                        increment_unread,
+                        notify_incoming,
+                        persist_conversations: true,
+                        probe_freshness: false,
+                        poll_batch_done,
+                        op_id: None,
+                    });
+                } else {
+                    let delta = host
+                        .apply_batch(cmd, increment_unread, notify_incoming, payload)
+                        .await;
+                    if let Some((lp_gen, drain_id)) = poll_batch_done {
+                        sink.send(Input::PollBatchApplied {
+                            lp_gen,
+                            drain_id,
+                            delta,
+                        });
+                    } else if delta.applied_count > 0
+                        || !delta.updates.is_empty()
+                        || !delta.preview_overrides.is_empty()
+                    {
+                        sink.send(Input::BatchDeltaApplied { delta });
+                    }
+                }
+            }
+            HostJob::ApplyParsedEvents {
+                cmd,
+                increment_unread,
+                notify_incoming,
+                envelope,
+                sink,
+                _guard,
+            } => {
+                if host
+                    .on_parsed_events_received(cmd, increment_unread, notify_incoming, &envelope)
+                    .await
+                {
+                    sink.send(Input::TypedEnvelopeReady {
+                        cmd,
+                        increment_unread,
+                        notify_incoming,
+                        envelope,
+                    });
+                } else {
+                    let delta = host
+                        .apply_parsed_events(cmd, increment_unread, notify_incoming, envelope)
+                        .await;
+                    if delta.applied_count > 0
+                        || !delta.updates.is_empty()
+                        || !delta.preview_overrides.is_empty()
+                    {
+                        sink.send(Input::BatchDeltaApplied { delta });
+                    }
+                }
+            }
+            HostJob::MobileSync { events, _guard } => {
+                host.mobile_sync(events).await;
+            }
+            HostJob::E2eeSignal {
+                cmd,
+                payload,
+                _guard,
+            } => {
+                host.e2ee_signal(cmd, payload).await;
+            }
+            HostJob::E2eeDeliverReports {
+                cmd,
+                payload,
+                _guard,
+            } => {
+                host.e2ee_deliver_reports(cmd, payload).await;
+            }
+            HostJob::E2eeConnected { uid, _guard } => {
+                host.e2ee_connected(uid).await;
+            }
+            HostJob::E2eeDisconnected { _guard } => {
+                host.e2ee_disconnected().await;
+            }
+            HostJob::VoipControl {
+                act,
+                raw_data,
+                data,
+                _guard,
+            } => {
+                host.voip_control(act, raw_data, data).await;
+            }
+            HostJob::ShowTyping {
+                conv_id,
+                uid,
+                on_pc,
+                _guard,
+            } => {
+                host.show_typing(conv_id, uid, on_pc).await;
+            }
+            HostJob::PinTopic { conv_id, _guard } => {
+                host.pin_topic(conv_id).await;
+            }
+            HostJob::GroupNotice {
+                act,
+                data,
+                ts,
+                _guard,
+            } => {
+                host.group_notice(act, data, ts).await;
+            }
+            HostJob::Mute {
+                conv_id,
+                set,
+                start,
+                start_explicit,
+                duration,
+                _guard,
+            } => {
+                host.mute(conv_id, set, start, start_explicit, duration)
+                    .await;
             }
             HostJob::Drain(tx) => {
                 let _ = tx.send(());
@@ -2685,6 +3006,15 @@ mod tests {
             async fn mark_expired(&self, _snapshot_json: String) {}
             async fn persist_poll_state(&self, _state: PollState) {}
             async fn persist_ws_cursors(&self, _cursors: CursorMap) {}
+            async fn on_batch_received(
+                &self,
+                _cmd: Option<u16>,
+                _increment_unread: bool,
+                _notify_incoming: bool,
+                _payload: Map<String, Value>,
+            ) -> Option<Map<String, Value>> {
+                None
+            }
             async fn apply_batch(
                 &self,
                 _cmd: Option<u16>,
