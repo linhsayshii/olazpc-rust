@@ -141,6 +141,7 @@ pub struct ContactCardSendSpec {
 #[derive(Clone)]
 pub(crate) enum ContactCardContinuation {
     SendMyCard { op_id: Option<u64> },
+    Forward { forward_id: u64 },
 }
 
 #[derive(Clone)]

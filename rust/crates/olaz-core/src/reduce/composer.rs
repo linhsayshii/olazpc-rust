@@ -72,7 +72,7 @@ pub(crate) fn start_contact_card_send(
                 qr_code_url: spec.qr_code_url,
             }));
     } else {
-        out.effects.push(Effect::SendComposerContactCardApi {
+        out.effects.push(Effect::SendContactCardApi {
             card_send_id,
             params: SendContactCardParams {
                 conv_id: spec.conv_id,
@@ -113,6 +113,17 @@ pub(crate) fn reset_composer(
                     false,
                     out,
                 );
+            }
+            ContactCardContinuation::Forward { forward_id } => {
+                if emit_cancel_effect {
+                    crate::reduce::forward::on_contact_card_done(
+                        state,
+                        forward_id,
+                        item.is_e2ee,
+                        Err(COMPOSER_GENERIC_FAILURE.to_owned()),
+                        out,
+                    );
+                }
             }
         }
     }
@@ -430,6 +441,15 @@ fn reduce_contact_card_done(
                 );
             }
         },
+        ContactCardContinuation::Forward { forward_id } => {
+            crate::reduce::forward::on_contact_card_done(
+                state,
+                forward_id,
+                pending.is_e2ee,
+                result,
+                out,
+            );
+        }
     }
 }
 

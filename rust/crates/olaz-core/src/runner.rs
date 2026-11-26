@@ -2568,7 +2568,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         drop(guard);
                     });
                 }
-                Effect::SendComposerContactCardApi {
+                Effect::SendContactCardApi {
                     card_send_id,
                     params,
                 } => {
@@ -2593,19 +2593,6 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     sink.send(Input::ForwardClientIdAllocated {
                         forward_id,
                         client_id,
-                    });
-                }
-                Effect::SendContactCardApi { forward_id, params } => {
-                    let api = Arc::clone(&self.api);
-                    let sink = sink.clone();
-                    let guard = sink.track();
-                    self.runtime.spawn(async move {
-                        let result = api
-                            .send_contact_card(&params)
-                            .await
-                            .map_err(|err| err.display_without_url());
-                        sink.send(Input::ForwardContactCardDone { forward_id, result });
-                        drop(guard);
                     });
                 }
                 Effect::Host(HostCall::ResolveMedia {

@@ -1437,10 +1437,6 @@ pub enum Input {
         forward_id: u64,
         client_id: i64,
     },
-    ForwardContactCardDone {
-        forward_id: u64,
-        result: Result<SendMessageResult, String>,
-    },
     ForwardMediaResolved {
         forward_id: u64,
         resolution: MediaResolutionOutcome,
@@ -2017,11 +2013,6 @@ impl fmt::Debug for Input {
             Self::ForwardClientIdAllocated { forward_id, .. } => f
                 .debug_struct("ForwardClientIdAllocated")
                 .field("forward_id", forward_id)
-                .finish(),
-            Self::ForwardContactCardDone { forward_id, result } => f
-                .debug_struct("ForwardContactCardDone")
-                .field("forward_id", forward_id)
-                .field("ok", &result.is_ok())
                 .finish(),
             Self::ForwardMediaResolved {
                 forward_id,

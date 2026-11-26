@@ -1103,11 +1103,6 @@ pub enum Effect {
     AllocClientId {
         forward_id: u64,
     },
-    /// Calls `ZaloApi::send_contact_card` and returns [`Input::ForwardContactCardDone`].
-    SendContactCardApi {
-        forward_id: u64,
-        params: SendContactCardParams,
-    },
     // U12
     /// Calls `ZaloApi::fetch_poll_detail` for `Refresh` or `Voters`.
     FetchPollDetailApi {
@@ -1267,7 +1262,7 @@ pub enum Effect {
     LoadStickerSuggestPref {
         op_id: Option<u64>,
     },
-    SendComposerContactCardApi {
+    SendContactCardApi {
         card_send_id: u64,
         params: SendContactCardParams,
     },
@@ -1521,11 +1516,6 @@ impl fmt::Debug for Effect {
                 .debug_struct("AllocClientId")
                 .field("forward_id", forward_id)
                 .finish(),
-            Self::SendContactCardApi { forward_id, params } => f
-                .debug_struct("SendContactCardApi")
-                .field("forward_id", forward_id)
-                .field("params", params)
-                .finish(),
             // U6
             Self::ResolveMessageIds { resolve_id, .. } => f
                 .debug_struct("ResolveMessageIds")
@@ -1686,11 +1676,11 @@ impl fmt::Debug for Effect {
                 .debug_struct("LoadStickerSuggestPref")
                 .field("op_id", op_id)
                 .finish(),
-            Self::SendComposerContactCardApi {
+            Self::SendContactCardApi {
                 card_send_id,
                 params,
             } => f
-                .debug_struct("SendComposerContactCardApi")
+                .debug_struct("SendContactCardApi")
                 .field("card_send_id", card_send_id)
                 .field("params", params)
                 .finish(),

@@ -217,7 +217,6 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
             ..
         }
         | Input::ForwardClientIdAllocated { .. }
-        | Input::ForwardContactCardDone { .. }
         | Input::ForwardMediaResolved { .. }
         | Input::ForwardFileResolved { .. }
         | Input::ForwardFetchMediaDone { .. }

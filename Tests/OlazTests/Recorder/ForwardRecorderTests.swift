@@ -1273,6 +1273,35 @@ enum ForwardRecorderHarness {
             }
         }
 
+        let e2eeContactCardQueue = scenario.seed["host_results"]?["send_e2ee_contact_card"]?.arrayValue ?? []
+        let hasScriptedContactCard = scenario.seed["host_results"]?["send_e2ee_contact_card"] != nil
+        var e2eeContactCardIndex = 0
+        engine.sendE2EEContactCardHostHandler = { args in
+            let cliId = args["client_id"] as? String ?? ""
+            if hasScriptedContactCard {
+                guard e2eeContactCardIndex < e2eeContactCardQueue.count else {
+                    throw ZaloSessionError(code: 500, message: "No scripted send_e2ee_contact_card result", url: "/api/e2ee/pc/message/forward")
+                }
+                let item = e2eeContactCardQueue[e2eeContactCardIndex]
+                e2eeContactCardIndex += 1
+                if let errObj = item["error"]?.objectValue {
+                    let code = Int(errObj["code"]?.int64Value ?? 500)
+                    let msg = errObj["message"]?.stringValue ?? "E2EE error"
+                    let url = errObj["url"]?.stringValue ?? "/api/e2ee/pc/message/forward"
+                    throw ZaloSessionError(code: code, message: msg, url: url)
+                }
+                if let errMsg = item["error"]?.stringValue {
+                    throw ZaloSessionError(code: 500, message: errMsg, url: "/api/e2ee/pc/message/forward")
+                }
+                let msgId = item["msg_id"]?.stringValue ?? cliId
+                let cliMsgId = item["cli_msg_id"]?.stringValue ?? cliId
+                let tsMs = item["ts_ms"]?.int64Value ?? 0
+                return SendMessageResult(msgId: msgId, cliMsgId: cliMsgId, tsMs: tsMs)
+            }
+            // Deterministic fallback for unscripted send_e2ee_contact_card (user-decisions item 14.1).
+            return SendMessageResult(msgId: cliId, cliMsgId: cliId, tsMs: 0)
+        }
+
         let resolveMediaQueue = scenario.seed["host_results"]?["resolve_media"]?.arrayValue ?? []
         var resolveMediaIndex = 0
         if scenario.seed["host_results"]?["resolve_media"] != nil {
@@ -1433,7 +1462,8 @@ enum ForwardRecorderHarness {
                 return true
             case "apply_batch", "apply_parsed_events", "show_typing",
                  "resolve_media", "resolve_file", "fetch_media_data",
-                 "send_media", "send_files", "send_e2ee_text":
+                 "send_media", "send_files", "send_e2ee_text",
+                 "send_e2ee_contact_card":
                 return true
             case "start_ws":
                 return !suppressedTransports.contains("ws")
