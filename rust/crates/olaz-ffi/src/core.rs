@@ -3360,12 +3360,16 @@ mod tests {
     use super::*;
     use crate::conversations::ConversationPreviewRecord;
 
-    struct NoopCoreHost;
+    #[derive(Default)]
+    struct NoopCoreHost {
+        saved_session: Option<String>,
+        allow_ws: bool,
+    }
 
     #[async_trait::async_trait]
     impl CoreHost for NoopCoreHost {
         async fn load_saved_session(&self) -> Option<String> {
-            None
+            self.saved_session.clone()
         }
         async fn load_legacy_cookie(&self) -> Option<LegacyCookieRecord> {
             None
@@ -3376,7 +3380,7 @@ mod tests {
         async fn set_pref(&self, _key: String, _value: String) {}
         async fn prepare_store(&self, _user_id: String, _account: LoginAccountRecord) {}
         async fn on_ws_started(&self, _endpoints: Vec<String>) -> bool {
-            false
+            self.allow_ws
         }
         async fn on_long_poll_started(&self) -> bool {
             false
@@ -3562,7 +3566,7 @@ mod tests {
     async fn core_engine_apply_account_profile_delivers_changes_and_stops() -> Result<(), CoreError>
     {
         let session = CoreSession::with_config("imei-1".to_owned(), "Mac".to_owned(), None)?;
-        let engine = CoreEngine::new(session, Arc::new(NoopCoreHost))?;
+        let engine = CoreEngine::new(session, Arc::new(NoopCoreHost::default()))?;
         let acc = LoginAccountRecord {
             user_id: "42".to_owned(),
             display_name: "Linh".to_owned(),
@@ -3600,7 +3604,7 @@ mod tests {
     #[tokio::test]
     async fn core_engine_u3_message_and_hidden_pin_flow() -> Result<(), CoreError> {
         let session = CoreSession::with_config("imei-2".to_owned(), "Mac".to_owned(), None)?;
-        let engine = CoreEngine::new(session, Arc::new(NoopCoreHost))?;
+        let engine = CoreEngine::new(session, Arc::new(NoopCoreHost::default()))?;
 
         engine.update_conversation_on_message(
             MessagePreviewInputRecord {
@@ -3638,6 +3642,103 @@ mod tests {
         assert!(!engine.check_hidden_pin("9999".to_owned()).await?);
 
         engine.stop();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Tungstenite fixes the server callback error type to an HTTP response"
+    )]
+    async fn core_engine_session_languages_reach_real_ws_upgrade()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use olaz_net::ZaloDomains;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+
+        let http = TcpListener::bind("127.0.0.1:0").await?;
+        let http_base = format!("http://{}", http.local_addr()?);
+        let http_server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = http.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0u8; 8192];
+                    let _ = socket.read(&mut request).await;
+                    let body = br#"{"error_code":0,"data":{}}"#;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                });
+            }
+        });
+        let ws = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", ws.local_addr()?);
+        let (tx, rx) = oneshot::channel();
+        let ws_server = tokio::spawn(async move {
+            let (socket, _) = ws.accept().await?;
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                socket,
+                move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                      response| {
+                    let _ = tx.send(request.headers().clone());
+                    Ok(response)
+                },
+            )
+            .await?;
+            socket.close(None).await
+        });
+        let domains = ZaloDomains {
+            auth: http_base.clone(),
+            wpa_chat: http_base.clone(),
+            ws: vec![endpoint],
+            isolated: true,
+            service_candidates: std::collections::BTreeMap::from([(
+                "profile".into(),
+                vec![http_base],
+            )]),
+            ..ZaloDomains::default()
+        };
+        let snapshot = serde_json::json!({
+            "zpwType":"23", "imei":"imei-language-test", "computerName":"Mac",
+            "domains":domains,
+            "plainAccount":{"userId":"100","displayName":"Test","avatar":"","phone":"",
+                "send2MeId":"100","dkey":"","zpwEnk":"0123456789abcdef","zpwSek":"sek.1.2"},
+            "expiredAt":null,"sealedSecretsBase64":null,
+        })
+        .to_string();
+        let session = CoreSession::with_client_config(
+            "imei-language-test".into(),
+            "Mac".into(),
+            Some(serde_json::to_string(&domains)?),
+            vec!["vi_VN".into(), "en-US".into()],
+        )?;
+        let engine = CoreEngine::new(
+            session,
+            Arc::new(NoopCoreHost {
+                saved_session: Some(snapshot),
+                allow_ws: true,
+            }),
+        )?;
+        engine.start();
+        let result = tokio::time::timeout(Duration::from_secs(10), rx).await;
+        engine.stop();
+        http_server.abort();
+        ws_server.abort();
+        let headers = result??;
+        assert_eq!(
+            headers.get("accept-language").and_then(|v| v.to_str().ok()),
+            Some("vi-VN,en-US;q=0.9")
+        );
+        assert_eq!(
+            headers.get("origin").and_then(|v| v.to_str().ok()),
+            Some("file://")
+        );
+        assert!(!headers.contains_key("zpw_sek"));
+        assert!(!headers.contains_key("cookie")); // local host must not receive the session secret
         Ok(())
     }
 

@@ -8,7 +8,10 @@ use serde_json::{Map, Value};
 use crate::cookie::{extract_zpw_sek_cookie, is_valid_zpw_sek};
 use crate::decode::{check_response_error, decode_response, parse_and_decrypt_response};
 use crate::error::NetError;
-use crate::http::{Method, RawResponse, RequestOptions, Transport, build_request, url_path};
+use crate::http::{
+    Method, RawResponse, RequestOptions, Transport, build_request_with_kind,
+    build_request_with_languages, url_path,
+};
 use crate::request::{
     ApiRequest, MultipartPart, get_suffix, multipart_body, multipart_suffix,
     new_multipart_boundary, post_suffix_and_body,
@@ -198,7 +201,7 @@ impl<T: Transport> SessionClient<T> {
         Ok(result)
     }
 
-    /// Swift `rawDownloadData`: GET with only the `User-Agent` header (no session cookie).
+    /// Swift `rawDownloadData`: GET with Chromium media-other headers (no session cookie).
     pub async fn raw_download_data(
         &self,
         url: &str,
@@ -349,7 +352,7 @@ pub async fn send_raw<T: Transport>(
     zpw_sek: Option<&str>,
     now_unix: i64,
 ) -> Result<RawOutcome, NetError> {
-    let spec = build_request(options, zpw_sek)?;
+    let spec = build_request_with_languages(options, zpw_sek, transport.preferred_languages())?;
     let response = transport.send(spec).await?;
     let zpw_sek_cookie = extract_zpw_sek_cookie(&response.headers, now_unix);
     Ok(RawOutcome {
@@ -364,7 +367,7 @@ pub async fn download_data<T: Transport>(
     url: &str,
     timeout: Duration,
 ) -> Result<Vec<u8>, NetError> {
-    let spec = bare_request(url, timeout, None)?;
+    let spec = bare_request(url, timeout, None, transport.preferred_languages())?;
     let response = transport.send(spec).await?;
     if (200..300).contains(&response.status) {
         Ok(response.body)
@@ -384,7 +387,7 @@ pub async fn download_sync_batch_with<T: Transport>(
     zpw_sek: Option<&str>,
     user_id: Option<&str>,
 ) -> Result<Vec<u8>, NetError> {
-    let spec = bare_request(url, timeout, None)?;
+    let spec = bare_request(url, timeout, None, transport.preferred_languages())?;
     let response = transport.send(spec).await?;
     if (200..300).contains(&response.status) {
         return Ok(response.body);
@@ -394,8 +397,12 @@ pub async fn download_sync_batch_with<T: Transport>(
         && is_valid_zpw_sek(Some(sek))
         && !uid.is_empty()
     {
-        let cookie = format!("zpw_sek={sek}; zpw_uin={uid}");
-        let retry = bare_request(url, timeout, Some(&cookie))?;
+        let host = url::Url::parse(url).map_err(|_| NetError::InvalidUrl(url.to_owned()))?;
+        let session_cookie =
+            olaz_client::headers::session_cookie(host.host_str().unwrap_or(""), sek)
+                .unwrap_or_default();
+        let cookie = format!("{session_cookie}; zpw_uin={uid}");
+        let retry = bare_request(url, timeout, Some(&cookie), transport.preferred_languages())?;
         let retried = transport.send(retry).await?;
         if (200..300).contains(&retried.status) {
             return Ok(retried.body);
@@ -412,6 +419,7 @@ fn bare_request(
     url: &str,
     timeout: Duration,
     cookie: Option<&str>,
+    preferred_languages: &[String],
 ) -> Result<crate::http::RequestSpec, NetError> {
     let mut options = RequestOptions::get(url).timeout(timeout);
     if let Some(cookie) = cookie {
@@ -420,5 +428,10 @@ fn bare_request(
             .push(("Cookie".to_owned(), cookie.to_owned()));
     }
     // A bare request never carries the session cookie: pass no sek.
-    build_request(&options, None)
+    build_request_with_kind(
+        &options,
+        None,
+        preferred_languages,
+        olaz_client::headers::RequestKind::MediaOther,
+    )
 }

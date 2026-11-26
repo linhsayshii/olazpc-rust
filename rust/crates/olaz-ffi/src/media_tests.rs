@@ -57,6 +57,7 @@ async fn server(body: &'static [u8], hang: bool) -> TestServer {
 fn media(dir: &std::path::Path) -> Arc<CoreMedia> {
     CoreMedia::new(
         MediaCoreOptions {
+            preferred_languages: vec!["vi".to_owned()],
             files_dir: dir.join("files").to_string_lossy().into_owned(),
             files_cache_limit: 1 << 30,
             max_concurrent: 6,

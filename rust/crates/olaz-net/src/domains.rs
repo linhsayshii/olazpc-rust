@@ -5,12 +5,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
-pub const ZPW_VER: &str = "694";
-pub const ZPW_TYPE: &str = "23";
-pub const ZPW_PC_TYPE: &str = "23";
-pub const ZPW_WEB_TYPE: &str = "30";
-pub const USER_AGENT: &str = "ZaloPC-darwin-23v694";
-pub const WS_ORIGIN: &str = "file://";
+pub use olaz_client::identity::CLIENT_TYPE as ZPW_TYPE;
+pub use olaz_client::identity::CLIENT_TYPE as ZPW_PC_TYPE;
+pub use olaz_client::identity::CLIENT_VERSION as ZPW_VER;
+pub use olaz_client::identity::USER_AGENT;
+pub use olaz_client::identity::WEB_CLIENT_TYPE as ZPW_WEB_TYPE;
+pub use olaz_client::identity::WS_ORIGIN;
 
 const CHAT_HOSTS: &[&str] = &[
     "https://tt-chat3-wpa.api.zaloapp.com",

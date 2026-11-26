@@ -3,8 +3,9 @@
 use std::future::Future;
 use std::time::Duration;
 
-use crate::domains::{USER_AGENT, ZPW_TYPE, ZPW_VER};
+use crate::domains::{ZPW_TYPE, ZPW_VER};
 use crate::error::{NetError, NetworkErrorKind};
+use olaz_client::headers::{RequestKind, request_headers, session_cookie};
 
 /// Default per-request INACTIVITY timeout (Swift `timeoutIntervalForRequest = 35`): it applies to
 /// each wait for headers or body bytes, not to the whole request.
@@ -90,6 +91,11 @@ impl RawResponse {
 
 /// The only place that touches the network.
 pub trait Transport: Send + Sync {
+    /// System preferences supplied by the host, kept on this client instance.
+    fn preferred_languages(&self) -> &[String] {
+        &[]
+    }
+
     fn send(
         &self,
         request: RequestSpec,
@@ -168,8 +174,7 @@ impl RequestOptions {
 
 /// True for hosts that receive the `zpw_sek` cookie (`zalo.me`, `zaloapp.com`, `zadn.vn`).
 pub fn is_zalo_host(host: &str) -> bool {
-    let host = host.to_lowercase();
-    host.contains("zalo.me") || host.contains("zaloapp.com") || host.contains("zadn.vn")
+    olaz_client::headers::is_api_host(host)
 }
 
 /// Sets a header, replacing any existing one with the same name (Swift `setValue`).
@@ -184,30 +189,50 @@ pub fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) 
     }
 }
 
-/// Swift `rawRequest` header logic as a pure function.
-///
-/// Header order: `User-Agent`, then (when a session cookie exists and the host is a Zalo host)
-/// `Cookie: zpw_sek=<sek>; _zlang=vi` and `zpw_sek: <sek>`, then `Content-Type`, then extras.
+/// Pure Chromium API header builder, with default system-language fallback.
 pub fn build_request(
     options: &RequestOptions,
     zpw_sek: Option<&str>,
 ) -> Result<RequestSpec, NetError> {
+    build_request_with_languages(options, zpw_sek, &[])
+}
+
+/// Explicit language preferences are independent of session persistence and runtime version.
+pub fn build_request_with_languages(
+    options: &RequestOptions,
+    zpw_sek: Option<&str>,
+    preferred_languages: &[String],
+) -> Result<RequestSpec, NetError> {
+    build_request_with_kind(options, zpw_sek, preferred_languages, RequestKind::Api)
+}
+
+pub(crate) fn build_request_with_kind(
+    options: &RequestOptions,
+    zpw_sek: Option<&str>,
+    preferred_languages: &[String],
+    kind: RequestKind,
+) -> Result<RequestSpec, NetError> {
     let parsed =
         url::Url::parse(&options.url).map_err(|_| NetError::InvalidUrl(options.url.clone()))?;
-    let mut headers: Vec<(String, String)> = Vec::new();
-    set_header(&mut headers, "User-Agent", USER_AGENT);
-    if let Some(sek) = zpw_sek.filter(|s| !s.is_empty())
-        && is_zalo_host(parsed.host_str().unwrap_or(""))
+    let host = parsed.host_str().unwrap_or("");
+    let mut extra = Vec::new();
+    if parsed.scheme() == "https"
+        && is_zalo_host(host)
+        && let Some(cookie) = zpw_sek.and_then(|sek| session_cookie(host, sek))
     {
-        set_header(&mut headers, "Cookie", &format!("zpw_sek={sek}; _zlang=vi"));
-        set_header(&mut headers, "zpw_sek", sek);
+        set_header(&mut extra, "Cookie", &cookie);
     }
     if let Some(ct) = &options.content_type {
-        set_header(&mut headers, "Content-Type", ct);
+        set_header(&mut extra, "Content-Type", ct);
     }
     for (k, v) in &options.extra_headers {
-        set_header(&mut headers, k, v);
+        set_header(&mut extra, k, v);
     }
+    // Session-bearing caller headers obey the same destination rule as generated cookies.
+    if parsed.scheme() != "https" || !is_zalo_host(host) {
+        extra.retain(|(name, _)| !name.eq_ignore_ascii_case("cookie"));
+    }
+    let headers = request_headers(kind, preferred_languages, &extra);
     Ok(RequestSpec {
         method: options.method,
         url: options.url.clone(),
@@ -226,15 +251,34 @@ pub fn build_request(
 #[derive(Debug, Clone)]
 pub struct ReqwestTransport {
     client: reqwest::Client,
+    preferred_languages: Vec<String>,
 }
 
 impl ReqwestTransport {
     pub fn new() -> Result<Self, NetError> {
-        let client = reqwest::Client::builder()
-            .timeout(RESOURCE_TIMEOUT)
-            .build()
-            .map_err(map_reqwest_error)?;
-        Ok(Self { client })
+        Self::with_preferred_languages(Vec::new())
+    }
+
+    pub fn with_preferred_languages(preferred_languages: Vec<String>) -> Result<Self, NetError> {
+        Self::with_roots(preferred_languages, &[])
+    }
+
+    /// Additional trust anchors, used by local TLS integration tests. Production passes none.
+    pub fn with_roots(
+        preferred_languages: Vec<String>,
+        extra_root_pem: &[Vec<u8>],
+    ) -> Result<Self, NetError> {
+        let mut builder = reqwest::Client::builder().timeout(RESOURCE_TIMEOUT);
+        for pem in extra_root_pem {
+            builder = builder.add_root_certificate(
+                reqwest::Certificate::from_pem(pem).map_err(map_reqwest_error)?,
+            );
+        }
+        let client = builder.build().map_err(map_reqwest_error)?;
+        Ok(Self {
+            client,
+            preferred_languages,
+        })
     }
 }
 
@@ -256,6 +300,10 @@ fn map_reqwest_error(e: reqwest::Error) -> NetError {
 }
 
 impl Transport for ReqwestTransport {
+    fn preferred_languages(&self) -> &[String] {
+        &self.preferred_languages
+    }
+
     fn send(
         &self,
         request: RequestSpec,

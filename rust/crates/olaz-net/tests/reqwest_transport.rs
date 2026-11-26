@@ -30,7 +30,7 @@ fn spec(url: String, method: Method, body: Option<Vec<u8>>) -> RequestSpec {
         query: Vec::new(),
         headers: vec![
             ("User-Agent".to_owned(), "ZaloPC-darwin-23v694".to_owned()),
-            ("Cookie".to_owned(), "zpw_sek=a.b; _zlang=vi".to_owned()),
+            ("Cookie".to_owned(), "zpw_sek=a.b".to_owned()),
             (
                 "Content-Type".to_owned(),
                 "application/x-www-form-urlencoded".to_owned(),
@@ -71,7 +71,7 @@ async fn sends_headers_and_body_and_keeps_duplicate_set_cookie() {
         .to_lowercase();
     assert!(raw.starts_with("post /api/x?zpw_ver=694 http/1.1"), "{raw}");
     assert!(raw.contains("user-agent: zalopc-darwin-23v694"));
-    assert!(raw.contains("cookie: zpw_sek=a.b; _zlang=vi"));
+    assert!(raw.contains("cookie: zpw_sek=a.b"));
     assert!(raw.contains("content-type: application/x-www-form-urlencoded"));
     assert!(raw.ends_with("params=abc"));
 }

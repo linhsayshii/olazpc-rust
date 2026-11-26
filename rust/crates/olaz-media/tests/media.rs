@@ -1003,3 +1003,134 @@ async fn parallel_burst_over_local_server_completes() {
     assert!(started.elapsed() < Duration::from_secs(10));
     let _ = AtomicBool::new(false);
 }
+
+#[tokio::test]
+async fn encoded_files_decode_before_decryption_and_finish_progress_without_wire_totals() {
+    use std::io::Write;
+    fn encode(body: &[u8], encoding: &str) -> Vec<u8> {
+        if encoding == "gzip" {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(body).unwrap();
+            encoder.finish().unwrap()
+        } else {
+            let mut out = Vec::new();
+            {
+                let mut encoder = brotli::CompressorWriter::new(&mut out, 4096, 4, 22);
+                encoder.write_all(body).unwrap();
+            }
+            out
+        }
+    }
+    fn probe() -> (Arc<Mutex<Vec<f64>>>, ProgressFn) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observer = Arc::clone(&seen);
+        (
+            seen,
+            Arc::new(move |fraction| observer.lock().unwrap().push(fraction)),
+        )
+    }
+    fn assert_finished(seen: &Mutex<Vec<f64>>) {
+        let values = seen.lock().unwrap();
+        assert_eq!(values.last().copied(), Some(1.0), "{values:?}");
+        assert!(
+            values
+                .iter()
+                .all(|v| v.is_finite() && (0.0..=1.0).contains(v)),
+            "{values:?}"
+        );
+    }
+
+    let plain: Vec<u8> = (0..100_000_u32).map(|i| (i % 241) as u8).collect();
+    let (key, iv) = ([6_u8; 32], [1_u8; 12]);
+    let (cipher, token) = encrypt_e2ee_file(&plain, &key, &iv).unwrap();
+    let spec = SecureSpec {
+        algorithm: Algorithm::Gcm,
+        key: key.to_vec(),
+        iv: iv.to_vec(),
+        tag: Some(token[44..].to_vec()),
+        block: false,
+        block_size: 4096,
+    };
+    let bodies: std::collections::HashMap<_, _> = [
+        ("/plain/gzip", encode(&plain, "gzip")),
+        ("/plain/br", encode(&plain, "br")),
+        ("/encrypted/gzip", encode(&cipher, "gzip")),
+        ("/encrypted/br", encode(&cipher, "br")),
+    ]
+    .into_iter()
+    .collect();
+    // Incompressible ciphertext adds framing overhead: this would falsely exceed max_bytes
+    // if the wire Content-Length were compared against the decoded-byte limit.
+    assert!(bodies["/encrypted/gzip"].len() > cipher.len());
+    let server = serve(handler(move |r| {
+        let body = bodies[r.path.as_str()].clone();
+        Resp {
+            headers: vec![(
+                "Content-Encoding".into(),
+                r.path.rsplit('/').next().unwrap().into(),
+            )],
+            declared_length: Some(body.len()),
+            ..Resp::ok(body)
+        }
+    }))
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = core(dir.path());
+    for encoding in ["gzip", "br"] {
+        for encrypted in [false, true] {
+            let flavour = if encrypted { "encrypted" } else { "plain" };
+            let target = url(&server, &format!("/{flavour}/{encoding}"));
+            let mut request = file_req(&target, &format!("{flavour}-{encoding}.bin"));
+            request.secure = encrypted.then(|| spec.clone());
+            let (seen, progress) = probe();
+            let path = core.local_file(request, Some(progress)).await.unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), plain);
+            assert_finished(&seen);
+
+            // Header/cloud download path streams decoded bytes to disk, then decrypts them.
+            let (seen, progress) = probe();
+            let outcome = core
+                .download_to(
+                    DownloadRequest {
+                        source: DownloadSource::Headers(HeadersRequest {
+                            url: target,
+                            headers: Vec::new(),
+                            max_bytes: plain.len() as u64,
+                            ttfb: None,
+                            temp_dir: dir.path().join("raw"),
+                        }),
+                        secure: if encrypted {
+                            SecureChoice::Stream(spec.clone())
+                        } else {
+                            SecureChoice::None
+                        },
+                        temp_dir: dir.path().join("staged"),
+                    },
+                    Some(progress),
+                )
+                .await;
+            assert_eq!(outcome.failure, None, "{flavour}/{encoding}");
+            assert_eq!(std::fs::read(outcome.staged.unwrap()).unwrap(), plain);
+            assert_finished(&seen);
+        }
+    }
+    let error = core
+        .download_with_headers(
+            HeadersRequest {
+                url: url(&server, "/plain/gzip"),
+                headers: Vec::new(),
+                max_bytes: plain.len() as u64 - 1,
+                ttfb: None,
+                temp_dir: dir.path().join("over-limit"),
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        MediaError::TooLarge,
+        "the size cap applies to decoded bytes"
+    );
+}

@@ -29,7 +29,7 @@ pub struct RawRequestRecord {
     /// Inactivity timeout in seconds; `None` = the 35 s default.
     pub timeout_secs: Option<f64>,
     pub headers: HashMap<String, String>,
-    /// Sent as `Cookie: zpw_sek=..; _zlang=vi` + `zpw_sek:` header on Zalo hosts only.
+    /// Sent only as host-shaped session cookies on HTTPS Zalo hosts.
     pub zpw_sek: Option<String>,
 }
 
@@ -95,8 +95,15 @@ pub struct CoreRawHttp {
 impl CoreRawHttp {
     #[uniffi::constructor]
     pub fn new() -> Result<Arc<Self>, CoreError> {
+        Self::with_preferred_languages(Vec::new())
+    }
+
+    #[uniffi::constructor]
+    pub fn with_preferred_languages(
+        preferred_languages: Vec<String>,
+    ) -> Result<Arc<Self>, CoreError> {
         Ok(Arc::new(Self {
-            transport: ReqwestTransport::new()?,
+            transport: ReqwestTransport::with_preferred_languages(preferred_languages)?,
         }))
     }
 
@@ -106,7 +113,7 @@ impl CoreRawHttp {
         run(async move { perform_raw(&transport, request, now_unix()).await }).await?
     }
 
-    /// Swift `rawDownloadData`: GET with only the `User-Agent` header; non-2xx is `CoreError.http`.
+    /// Swift `rawDownloadData`: GET with Chromium media-other headers; non-2xx is `CoreError.http`.
     pub async fn download(&self, url: String, timeout_secs: f64) -> Result<Vec<u8>, CoreError> {
         let transport = self.transport.clone();
         let timeout = download_timeout(timeout_secs)?;
@@ -186,8 +193,8 @@ mod tests {
             req.header("Content-Type"),
             Some("application/x-www-form-urlencoded")
         );
-        assert_eq!(req.header("Cookie"), Some("zpw_sek=sek.1.2; _zlang=vi"));
-        assert_eq!(req.header("zpw_sek"), Some("sek.1.2"));
+        assert_eq!(req.header("Cookie"), Some("zpw_sek=sek.1.2"));
+        assert_eq!(req.header("zpw_sek"), None);
     }
 
     #[tokio::test]
@@ -252,7 +259,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn downloads_send_only_the_user_agent_and_map_status() {
+    async fn downloads_send_client_headers_and_map_status() {
         let t = MockTransport::from_fn(|_| Ok(RawResponse::new(200, b"bytes".to_vec())));
         let body = download_data(&t, "https://f.zadn.vn/a", Duration::from_secs(20))
             .await

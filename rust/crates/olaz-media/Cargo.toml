@@ -9,12 +9,13 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+olaz-client = { path = "../olaz-client" }
 aes = "0.9.2"
 aes-gcm = "0.11.1"
 ctr = "0.10.1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 ghash = "0.6.0"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "gzip", "brotli", "deflate"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0.21"
@@ -23,6 +24,12 @@ tracing = "0.1"
 url = "2"
 
 [dev-dependencies]
+olaz-net = { path = "../olaz-net" }
+bytes = "1"
+http = "1"
+h2 = "0.4"
+flate2 = "1"
+brotli = "9"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }

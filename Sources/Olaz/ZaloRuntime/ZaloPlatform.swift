@@ -13,8 +13,8 @@ final class ZaloPlatform {
     /// Values the Electron main process passes to renderer pages.
     struct ClientIdentity {
         /// `type` query parameter of the macOS client.
-        var clientType = "23"
-        var clientVersion = "694"
+        var clientType = RustCore.clientIdentity.clientType
+        var clientVersion = RustCore.clientIdentity.clientVersion
     }
 
     let appVersion: String

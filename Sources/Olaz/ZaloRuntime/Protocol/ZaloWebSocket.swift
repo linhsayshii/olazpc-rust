@@ -261,6 +261,7 @@ actor ZaloWebSocket {
 
         let listener = RustWSListener(continuation: continuation, cursors: rustCursors)
         let config = WsConfigRecord(
+            preferredLanguages: Locale.preferredLanguages,
             endpoints: endpoints.isEmpty ? ZaloDomains().ws : endpoints,
             zpwSek: zpwSek,
             seedCursors: RustWSCursorBox.entries(rustCursors.current()),

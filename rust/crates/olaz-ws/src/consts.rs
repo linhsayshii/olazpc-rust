@@ -37,11 +37,11 @@ pub const CMD_E2EE_RECEIVE_GROUP: u16 = 552;
 /// Frame version byte used by every outgoing frame.
 pub const FRAME_VERSION: u8 = 1;
 
+pub use olaz_client::identity::CLIENT_TYPE as ZPW_TYPE;
 /// `ZaloDomains.zpwVer` / `zpwType` (PC macOS) used in the socket URL.
-pub const ZPW_VER: &str = "694";
-pub const ZPW_TYPE: &str = "23";
-pub const USER_AGENT: &str = "ZaloPC-darwin-23v694";
-pub const WS_ORIGIN: &str = "file://";
+pub use olaz_client::identity::CLIENT_VERSION as ZPW_VER;
+pub use olaz_client::identity::USER_AGENT;
+pub use olaz_client::identity::WS_ORIGIN;
 
 /// Default endpoints (`ZaloDomains().ws`).
 pub const DEFAULT_WS_ENDPOINTS: [&str; 4] = [
