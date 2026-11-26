@@ -14,6 +14,7 @@ use serde_json::{Map, Value, json};
 use crate::actions::{ActionsState, DeleteUndoSnapshot, MessageConfirmState};
 use crate::conversations::{CachedProfile, ConversationsState};
 use crate::messages::{ContactsState, IdentitySnapshot, MessagesState};
+use crate::pins::{PinsSnapshot, PinsState};
 use crate::typing::{TypingState, TypingStatus};
 
 /// Top-level state owned by the single `olaz-core` actor.
@@ -32,6 +33,8 @@ pub struct CoreState {
     pub send: crate::reduce::send::SendState,
     // U6
     pub actions: ActionsState,
+    // U7
+    pub pins: PinsState,
 }
 
 impl CoreState {
@@ -52,6 +55,8 @@ impl CoreState {
             starred_ids: self.actions.starred_ids.clone(),
             cached_profiles: self.conversations.identities.cached_profiles.clone(),
             last_prune_next_expiry_ms: self.actions.last_prune_next_expiry_ms,
+            // U7
+            pins: self.pins.snapshot(),
         }
     }
 
@@ -87,6 +92,8 @@ impl fmt::Debug for CoreState {
             .field("send", &self.send)
             // U6
             .field("actions", &self.actions)
+            // U7
+            .field("pins", &self.pins)
             .finish()
     }
 }
@@ -107,6 +114,8 @@ pub struct CoreSnapshot {
     pub starred_ids: BTreeSet<String>,
     pub cached_profiles: BTreeMap<String, CachedProfile>,
     pub last_prune_next_expiry_ms: Option<i64>,
+    // U7
+    pub pins: PinsSnapshot,
 }
 
 impl fmt::Debug for CoreSnapshot {
@@ -128,6 +137,8 @@ impl fmt::Debug for CoreSnapshot {
             .field("starred_ids_count", &self.starred_ids.len())
             .field("cached_profiles_count", &self.cached_profiles.len())
             .field("last_prune_next_expiry_ms", &self.last_prune_next_expiry_ms)
+            // U7
+            .field("pins", &self.pins)
             .finish()
     }
 }

@@ -6,6 +6,7 @@ pub mod bootstrap;
 pub mod classify;
 pub mod conversations;
 pub mod messages;
+pub mod pins;
 pub mod send;
 pub mod session;
 pub mod transport;
@@ -38,6 +39,23 @@ fn is_message_command(cmd: &Command) -> bool {
             | Command::RefreshReactionNames { .. }
             | Command::SeedHistoryFreshness(_)
             | Command::SeedContacts(_)
+    )
+}
+
+fn is_pin_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::RefreshBoardPins { .. }
+            | Command::RewatchPins
+            | Command::PinMessage { .. }
+            | Command::Pin { .. }
+            | Command::RequestUnpin { .. }
+            | Command::RequestUnpinMessage { .. }
+            | Command::Unpin { .. }
+            | Command::HandlePinsState { .. }
+            | Command::HandlePinTopicEvent { .. }
+            | Command::LoadPinnedMessage { .. }
+            | Command::SeedPins { .. }
     )
 }
 
@@ -182,6 +200,23 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::DeleteUndoExpired { .. }
         | Input::AutoDeleteLoaded { .. }
         | Input::AutoDeleteUpdated { .. } => crate::actions::reduce_actions(state, input, &mut out),
+
+        // U7
+        Input::Command(ref cmd) if is_pin_command(cmd) => {
+            pins::reduce_pins(state, input, &mut out);
+        }
+        Input::OpRequest { ref cmd, .. } if is_pin_command(cmd) => {
+            pins::reduce_pins(state, input, &mut out);
+        }
+        Input::BoardPinsFetched { .. }
+        | Input::BoardPinsFetchSkipped { .. }
+        | Input::UnpinBoardTopicDone { .. }
+        | Input::PinBoardMessageDone { .. }
+        | Input::PinTopicApproved { .. }
+        | Input::PinnedMessageLookupDone { .. }
+        | Input::PinnedEnsureMessageLoadedDone { .. } => {
+            pins::reduce_pins(state, input, &mut out);
+        }
 
         Input::Command(_)
         | Input::OpRequest { .. }

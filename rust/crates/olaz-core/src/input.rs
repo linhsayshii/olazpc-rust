@@ -1,5 +1,6 @@
 //! Inputs to the pure reducer: external commands and effect completions.
 
+use crate::pins::{BoardRawTopics, PinnedList, RefreshBoardFollowup, UnpinBoardPurpose};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -376,6 +377,47 @@ pub enum Command {
         keys: Vec<String>,
         persist: bool,
     },
+
+    // --- Board pins domain (U7) ---
+    RefreshBoardPins {
+        conv_id: String,
+    },
+    RewatchPins,
+    PinMessage {
+        conv_id: String,
+        msg_id: String,
+    },
+    Pin {
+        conv_id: String,
+        msg_id: String,
+        replacing: Option<String>,
+    },
+    RequestUnpin {
+        conv_id: String,
+        topic_ref: String,
+    },
+    RequestUnpinMessage {
+        conv_id: String,
+        msg_id: String,
+    },
+    Unpin {
+        conv_id: String,
+        topic_ref: String,
+    },
+    HandlePinsState {
+        state_json: Map<String, Value>,
+    },
+    HandlePinTopicEvent {
+        conv_id: String,
+    },
+    LoadPinnedMessage {
+        conv_id: String,
+        topic_ref: String,
+    },
+    SeedPins {
+        lists: BTreeMap<String, PinnedList>,
+        raw_topics: BTreeMap<String, BoardRawTopics>,
+    },
 }
 
 impl fmt::Debug for Command {
@@ -671,6 +713,28 @@ impl fmt::Debug for Command {
                 .debug_struct("RecordSeenReactionKeys")
                 .field("count", &keys.len())
                 .field("persist", persist)
+                .finish(),
+            // U7
+            Self::RefreshBoardPins { .. } => f.write_str("RefreshBoardPins"),
+            Self::RewatchPins => f.write_str("RewatchPins"),
+            Self::PinMessage { .. } => f.write_str("PinMessage"),
+            Self::Pin { replacing, .. } => f
+                .debug_struct("Pin")
+                .field("has_replacing", &replacing.is_some())
+                .finish(),
+            Self::RequestUnpin { .. } => f.write_str("RequestUnpin"),
+            Self::RequestUnpinMessage { .. } => f.write_str("RequestUnpinMessage"),
+            Self::Unpin { .. } => f.write_str("Unpin"),
+            Self::HandlePinsState { state_json } => f
+                .debug_struct("HandlePinsState")
+                .field("keys", &state_json.len())
+                .finish(),
+            Self::HandlePinTopicEvent { .. } => f.write_str("HandlePinTopicEvent"),
+            Self::LoadPinnedMessage { .. } => f.write_str("LoadPinnedMessage"),
+            Self::SeedPins { lists, raw_topics } => f
+                .debug_struct("SeedPins")
+                .field("lists", &lists.len())
+                .field("raw_topics", &raw_topics.len())
                 .finish(),
         }
     }
@@ -1143,6 +1207,40 @@ pub enum Input {
         ttl: i64,
         now_ms: i64,
         error_type: Option<String>,
+        op_id: Option<u64>,
+    },
+
+    // --- Board pins domain (U7) ---
+    BoardPinsFetched {
+        conv_id: String,
+        req_gen: u64,
+        result: Result<Map<String, Value>, String>,
+        followup: RefreshBoardFollowup,
+    },
+    BoardPinsFetchSkipped {
+        conv_id: String,
+        req_gen: u64,
+        followup: RefreshBoardFollowup,
+    },
+    UnpinBoardTopicDone {
+        purpose: UnpinBoardPurpose,
+        error: Option<String>,
+    },
+    PinBoardMessageDone {
+        pin_op_id: u64,
+        error: Option<String>,
+    },
+    PinTopicApproved {
+        conv_id: String,
+    },
+    PinnedMessageLookupDone {
+        conv_id: String,
+        row: Option<olaz_store::StoredMessage>,
+        op_id: Option<u64>,
+    },
+    PinnedEnsureMessageLoadedDone {
+        msg_id: String,
+        loaded: bool,
         op_id: Option<u64>,
     },
 }
@@ -1620,6 +1718,46 @@ impl fmt::Debug for Input {
                 .field("ttl", ttl)
                 .field("now_ms", now_ms)
                 .field("error_type", error_type)
+                .field("op_id", op_id)
+                .finish(),
+            // U7
+            Self::BoardPinsFetched {
+                req_gen,
+                result,
+                followup,
+                ..
+            } => f
+                .debug_struct("BoardPinsFetched")
+                .field("req_gen", req_gen)
+                .field("ok", &result.is_ok())
+                .field("followup", followup)
+                .finish(),
+            Self::BoardPinsFetchSkipped {
+                req_gen, followup, ..
+            } => f
+                .debug_struct("BoardPinsFetchSkipped")
+                .field("req_gen", req_gen)
+                .field("followup", followup)
+                .finish(),
+            Self::UnpinBoardTopicDone { purpose, error } => f
+                .debug_struct("UnpinBoardTopicDone")
+                .field("purpose", purpose)
+                .field("ok", &error.is_none())
+                .finish(),
+            Self::PinBoardMessageDone { pin_op_id, error } => f
+                .debug_struct("PinBoardMessageDone")
+                .field("pin_op_id", pin_op_id)
+                .field("ok", &error.is_none())
+                .finish(),
+            Self::PinTopicApproved { .. } => f.write_str("PinTopicApproved"),
+            Self::PinnedMessageLookupDone { row, op_id, .. } => f
+                .debug_struct("PinnedMessageLookupDone")
+                .field("found", &row.is_some())
+                .field("op_id", op_id)
+                .finish(),
+            Self::PinnedEnsureMessageLoadedDone { loaded, op_id, .. } => f
+                .debug_struct("PinnedEnsureMessageLoadedDone")
+                .field("loaded", loaded)
                 .field("op_id", op_id)
                 .finish(),
         }

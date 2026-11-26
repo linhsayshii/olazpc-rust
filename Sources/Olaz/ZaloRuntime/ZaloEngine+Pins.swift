@@ -167,6 +167,15 @@ extension ZaloEngine {
 
     /// "Ghim tin nhắn" from the message menu: the official limit check first (`checkPinTopic`), then the pin.
     func pinMessage(_ message: ChatMessage) {
+        if let core = coreLifecycle.core {
+            trackMessageActionTask { [weak self] in
+                guard let self else { return }
+                if let v = try? await core.pinMessageAsync(convId: message.conversationId, msgId: message.id) {
+                    await self.waitForMirrorVersion(v)
+                }
+            }
+            return
+        }
         let conversation = message.conversationId
         guard !isPinned(message) else { return }
         let list = pins[conversation]
@@ -215,6 +224,11 @@ extension ZaloEngine {
 
     /// Loads the pinned message into the open chat (from the local store when it is older than what is shown); its row id, or nil.
     func loadPinnedMessage(_ item: PinnedItem, in conversationId: String) async -> String? {
+        if let core = coreLifecycle.core {
+            let loaded = try? await core.loadPinnedMessage(convId: conversationId, topicRef: item.ref)
+            await waitForCoreMirrorDrain()
+            return loaded ?? nil
+        }
         if let loaded = item.message(in: messages[conversationId] ?? []) { return loaded.id }
         guard item.kind == .message, let store = sqliteStore else { return nil }
         for key in [item.msgId, item.cliMsgId] where !key.isEmpty {
@@ -227,6 +241,15 @@ extension ZaloEngine {
 
     /// A pin control event: re-read the board of the open chat; others are dropped so their next open reads it fresh.
     func handlePinTopicEvent(conversationId: String) {
+        if let core = coreLifecycle.core {
+            trackMessageActionTask { [weak self] in
+                guard let self else { return }
+                if let v = try? await core.handlePinTopicEvent(convId: conversationId) {
+                    await self.waitForMirrorVersion(v)
+                }
+            }
+            return
+        }
         EngineLog.shared.write("pins: event group=\(ZaloWireParser.isGroupId(conversationId)) open=\(openConversationId == conversationId)")
         if openConversationId == conversationId {
             trackMessageActionTask { [weak self] in

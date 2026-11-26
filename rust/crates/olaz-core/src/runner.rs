@@ -32,6 +32,7 @@ use crate::input::{
     PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
 };
 use crate::messages::MuteEntry;
+use crate::pins::{RefreshBoardFollowup, pin_error_shape};
 use crate::reduce::classify::MobileSyncEvent;
 use crate::state::PersistedTransportState;
 use crate::typed_chat::{
@@ -370,7 +371,9 @@ pub trait Host: Send + Sync {
     async fn refresh_cloud(&self) {}
     async fn on_open_conversation_sync(&self, _conv_id: String, _changed: bool) {}
     async fn on_close_conversation(&self) {}
-    async fn refresh_board_pins(&self, _conv_id: String) {}
+    async fn refresh_board_pins(&self, _conv_id: String) -> bool {
+        true
+    }
     async fn mark_read_boundary(&self, _conv_id: String, _seen_target: Option<SeenTarget>) {}
     #[expect(
         clippy::too_many_arguments,
@@ -469,7 +472,7 @@ pub trait Host: Send + Sync {
     async fn e2ee_disconnected(&self);
     async fn voip_control(&self, act: String, raw_data: Value, data: Map<String, Value>);
     async fn show_typing(&self, conv_id: String, uid: String, on_pc: bool);
-    async fn pin_topic(&self, conv_id: String);
+    async fn pin_topic(&self, conv_id: String) -> bool;
     async fn group_notice(&self, act: String, data: Map<String, Value>, ts: i64);
     async fn mute(
         &self,
@@ -493,6 +496,10 @@ pub trait Host: Send + Sync {
     // U6: transient in-chat card toast (`CardActionCenter.shared.show`).
     // Default no-op until U4+U6 cut over Swift `CoreHost`.
     async fn show_card(&self, _conv_id: String, _text: String) {}
+    // U14: temporary host boundary until U14's core `ensure_message_loaded` lands on main.
+    async fn ensure_message_loaded(&self, _conv_id: String, _message: ChatMessage) -> bool {
+        false
+    }
 }
 
 enum HostJob {
@@ -552,6 +559,13 @@ enum HostJob {
     },
     RefreshBoardPins {
         conv_id: String,
+        _guard: InFlightGuard,
+    },
+    RefreshBoardPinsGate {
+        conv_id: String,
+        req_gen: u64,
+        followup: RefreshBoardFollowup,
+        sink: ActorSink,
         _guard: InFlightGuard,
     },
     MarkReadBoundary {
@@ -712,6 +726,7 @@ enum HostJob {
     },
     PinTopic {
         conv_id: String,
+        sink: ActorSink,
         _guard: InFlightGuard,
     },
     GroupNotice {
@@ -732,6 +747,14 @@ enum HostJob {
     ShowCard {
         conv_id: String,
         text: String,
+        _guard: InFlightGuard,
+    },
+    // U14
+    EnsureMessageLoaded {
+        conv_id: String,
+        message: Box<ChatMessage>,
+        op_id: Option<u64>,
+        sink: ActorSink,
         _guard: InFlightGuard,
     },
     Drain(oneshot::Sender<()>),
@@ -860,6 +883,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         let worker_handle = runtime.spawn(run_host_worker(HostWorkerDeps {
             rx: host_rx,
             client: Arc::clone(&client),
+            api: Arc::clone(&api),
             host: Arc::clone(&host),
             shared_store: Arc::clone(&shared_store),
             store_tx: store_tx.clone(),
@@ -2248,6 +2272,69 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         drop(guard);
                     });
                 }
+                // U7
+                Effect::RefreshBoardPins {
+                    conv_id,
+                    req_gen,
+                    followup,
+                } => {
+                    let guard = sink.track();
+                    self.send_host(HostJob::RefreshBoardPinsGate {
+                        conv_id,
+                        req_gen,
+                        followup,
+                        sink: sink.clone(),
+                        _guard: guard,
+                    });
+                }
+                Effect::PinBoardMessageApi {
+                    pin_op_id,
+                    conv_id,
+                    params,
+                    board_version,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let error = match api
+                            .pin_board_message(&conv_id, &params, board_version)
+                            .await
+                        {
+                            Ok(_) => None,
+                            Err(err) => Some(pin_error_shape(&err)),
+                        };
+                        sink.send(Input::PinBoardMessageDone { pin_op_id, error });
+                        drop(guard);
+                    });
+                }
+                Effect::UnpinBoardTopicApi {
+                    conv_id,
+                    topic_id,
+                    raw_topic,
+                    board_version,
+                    purpose,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let error = match api
+                            .unpin_board_topic(
+                                &conv_id,
+                                &topic_id,
+                                raw_topic.as_ref(),
+                                board_version,
+                            )
+                            .await
+                        {
+                            Ok(()) => None,
+                            Err(err) => Some(pin_error_shape(&err)),
+                        };
+                        sink.send(Input::UnpinBoardTopicDone { purpose, error });
+                        drop(guard);
+                    });
+                }
                 Effect::Host(call) => {
                     let guard = sink.track();
                     let job = match call {
@@ -2362,6 +2449,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         },
                         HostCall::PinTopic { conv_id } => HostJob::PinTopic {
                             conv_id,
+                            sink: sink.clone(),
                             _guard: guard,
                         },
                         HostCall::GroupNotice { act, data, ts } => HostJob::GroupNotice {
@@ -2529,6 +2617,17 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         HostCall::ShowCard { conv_id, text } => HostJob::ShowCard {
                             conv_id,
                             text,
+                            _guard: guard,
+                        },
+                        HostCall::EnsureMessageLoaded {
+                            conv_id,
+                            message,
+                            op_id,
+                        } => HostJob::EnsureMessageLoaded {
+                            conv_id,
+                            message,
+                            op_id,
+                            sink: sink.clone(),
                             _guard: guard,
                         },
                     };
@@ -2882,6 +2981,36 @@ async fn run_store_worker(
                             persist_conversations,
                         });
                     }
+                    // U7
+                    StoreOp::LookupPinnedMessage {
+                        conv_id,
+                        keys,
+                        op_id,
+                    } => {
+                        let row = if let Some(store_arc) = store_opt {
+                            let conv_c = conv_id.clone();
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    for key in &keys {
+                                        if let Ok(Some(found)) = store.message(&conv_c, key) {
+                                            return Some(found);
+                                        }
+                                    }
+                                    None
+                                })
+                                .await
+                                .unwrap_or(None)
+                        } else {
+                            None
+                        };
+                        sink.send(Input::PinnedMessageLookupDone {
+                            conv_id,
+                            row,
+                            op_id,
+                        });
+                    }
                     other => {
                         if let Some(store_arc) = store_opt {
                             let _ = runtime
@@ -3021,7 +3150,8 @@ async fn run_store_worker(
                                         | StoreOp::LoadOpenLocalMessages { .. }
                                         | StoreOp::LoadOlderStoreMessages { .. }
                                         | StoreOp::MarkRecalledAndCheckLatest { .. }
-                                        | StoreOp::DeleteMessageAndCheckLatest { .. } => {}
+                                        | StoreOp::DeleteMessageAndCheckLatest { .. }
+                                        | StoreOp::LookupPinnedMessage { .. } => {}
                                     }
                                 })
                                 .await;
@@ -3151,6 +3281,7 @@ async fn run_store_worker(
 struct HostWorkerDeps<T: Transport + 'static> {
     rx: mpsc::UnboundedReceiver<HostJob>,
     client: Arc<SessionClient<T>>,
+    api: Arc<ZaloApi<T>>,
     host: Arc<dyn Host>,
     shared_store: SharedStoreSlot,
     store_tx: mpsc::UnboundedSender<StoreJob>,
@@ -3167,6 +3298,7 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
     let HostWorkerDeps {
         mut rx,
         client,
+        api,
         host,
         shared_store,
         store_tx,
@@ -3380,7 +3512,42 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 host.on_close_conversation().await;
             }
             HostJob::RefreshBoardPins { conv_id, _guard } => {
-                host.refresh_board_pins(conv_id).await;
+                let _ = host.refresh_board_pins(conv_id).await;
+            }
+            HostJob::RefreshBoardPinsGate {
+                conv_id,
+                req_gen,
+                followup,
+                sink,
+                _guard,
+            } => {
+                if !host.refresh_board_pins(conv_id.clone()).await {
+                    sink.send(Input::BoardPinsFetchSkipped {
+                        conv_id,
+                        req_gen,
+                        followup,
+                    });
+                } else {
+                    let api = Arc::clone(&api);
+                    let handle = runtime
+                        .spawn(async move {
+                            let result = api
+                                .fetch_board_pins(&conv_id)
+                                .await
+                                .map_err(|err| pin_error_shape(&err));
+                            sink.send(Input::BoardPinsFetched {
+                                conv_id,
+                                req_gen,
+                                result,
+                                followup,
+                            });
+                            drop(_guard);
+                        })
+                        .abort_handle();
+                    let mut list = active_tasks.lock().unwrap_or_else(PoisonError::into_inner);
+                    list.retain(|h| !h.is_finished());
+                    list.push(handle);
+                }
             }
             HostJob::MarkReadBoundary {
                 conv_id,
@@ -3719,8 +3886,14 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
             } => {
                 host.show_typing(conv_id, uid, on_pc).await;
             }
-            HostJob::PinTopic { conv_id, _guard } => {
-                host.pin_topic(conv_id).await;
+            HostJob::PinTopic {
+                conv_id,
+                sink,
+                _guard,
+            } => {
+                if host.pin_topic(conv_id.clone()).await {
+                    sink.send(Input::PinTopicApproved { conv_id });
+                }
             }
             HostJob::GroupNotice {
                 act,
@@ -3748,6 +3921,21 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 _guard,
             } => {
                 host.show_card(conv_id, text).await;
+            }
+            HostJob::EnsureMessageLoaded {
+                conv_id,
+                message,
+                op_id,
+                sink,
+                _guard,
+            } => {
+                let msg_id = message.id.clone();
+                let loaded = host.ensure_message_loaded(conv_id, *message).await;
+                sink.send(Input::PinnedEnsureMessageLoadedDone {
+                    msg_id,
+                    loaded,
+                    op_id,
+                });
             }
             HostJob::Drain(tx) => {
                 let _ = tx.send(());
@@ -3842,7 +4030,9 @@ mod tests {
         async fn e2ee_disconnected(&self) {}
         async fn voip_control(&self, _act: String, _raw_data: Value, _data: Map<String, Value>) {}
         async fn show_typing(&self, _conv_id: String, _uid: String, _on_pc: bool) {}
-        async fn pin_topic(&self, _conv_id: String) {}
+        async fn pin_topic(&self, _conv_id: String) -> bool {
+            false
+        }
         async fn group_notice(&self, _act: String, _data: Map<String, Value>, _ts: i64) {}
         async fn mute(
             &self,
@@ -3961,7 +4151,9 @@ mod tests {
             ) {
             }
             async fn show_typing(&self, _conv_id: String, _uid: String, _on_pc: bool) {}
-            async fn pin_topic(&self, _conv_id: String) {}
+            async fn pin_topic(&self, _conv_id: String) -> bool {
+                false
+            }
             async fn group_notice(&self, _act: String, _data: Map<String, Value>, _ts: i64) {}
             async fn mute(
                 &self,
@@ -4135,7 +4327,9 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push((conv_id, uid, on_pc));
         }
-        async fn pin_topic(&self, _conv_id: String) {}
+        async fn pin_topic(&self, _conv_id: String) -> bool {
+            false
+        }
         async fn group_notice(&self, _act: String, _data: Map<String, Value>, _ts: i64) {}
         async fn mute(
             &self,
@@ -4528,7 +4722,9 @@ mod tests {
         async fn e2ee_disconnected(&self) {}
         async fn voip_control(&self, _act: String, _raw_data: Value, _data: Map<String, Value>) {}
         async fn show_typing(&self, _conv_id: String, _uid: String, _on_pc: bool) {}
-        async fn pin_topic(&self, _conv_id: String) {}
+        async fn pin_topic(&self, _conv_id: String) -> bool {
+            false
+        }
         async fn group_notice(&self, _act: String, _data: Map<String, Value>, _ts: i64) {}
         async fn mute(
             &self,

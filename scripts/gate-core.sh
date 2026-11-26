@@ -233,6 +233,9 @@ for DOMAIN in "${DOMAINS[@]}"; do
         message_actions)
             RECORDER_FILTER="MessageActionRecorderTests"
             ;;
+        pins)
+            RECORDER_FILTER="PinRecorderTests"
+            ;;
         *)
             RECORDER_FILTER="${DOMAIN_CAP}RecorderTests"
             ;;

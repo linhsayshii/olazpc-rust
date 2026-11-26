@@ -1,5 +1,6 @@
 //! Side effects returned by `reduce` and executed by [`crate::runner::EffectRunner`].
 
+use crate::pins::{RefreshBoardFollowup, UnpinBoardPurpose};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
@@ -55,6 +56,12 @@ pub enum StoreOp {
     SetPreferenceStrings {
         key: String,
         values: Vec<String>,
+    },
+    // U7
+    LookupPinnedMessage {
+        conv_id: String,
+        keys: Vec<String>,
+        op_id: Option<u64>,
     },
     SetPreferenceData {
         key: String,
@@ -172,6 +179,11 @@ impl fmt::Debug for StoreOp {
                 .field("key", key)
                 .field("count", &values.len())
                 .finish(),
+            Self::LookupPinnedMessage { keys, op_id, .. } => f
+                .debug_struct("LookupPinnedMessage")
+                .field("keys", &keys.len())
+                .field("op_id", op_id)
+                .finish(),
             Self::SetPreferenceData { key, data } => f
                 .debug_struct("SetPreferenceData")
                 .field("key", key)
@@ -269,6 +281,7 @@ pub enum OpResult {
     Bool(bool),
     Int(i64),
     OptI64(Option<i64>),
+    OptString(Option<String>),
 }
 
 impl fmt::Debug for OpResult {
@@ -284,6 +297,10 @@ impl fmt::Debug for OpResult {
             Self::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
             Self::Int(n) => f.debug_tuple("Int").field(n).finish(),
             Self::OptI64(n) => f.debug_tuple("OptI64").field(n).finish(),
+            Self::OptString(s) => f
+                .debug_struct("OptString")
+                .field("some", &s.is_some())
+                .finish(),
         }
     }
 }
@@ -459,6 +476,12 @@ pub enum HostCall {
         conv_id: String,
         text: String,
     },
+    // U14: temporary host boundary until U14's core `ensure_message_loaded` lands on main.
+    EnsureMessageLoaded {
+        conv_id: String,
+        message: Box<ChatMessage>,
+        op_id: Option<u64>,
+    },
 }
 
 impl fmt::Debug for HostCall {
@@ -597,6 +620,11 @@ impl fmt::Debug for HostCall {
             Self::ShowCard { text, .. } => f
                 .debug_struct("ShowCard")
                 .field("text_len", &text.len())
+                .finish(),
+            // U14
+            Self::EnsureMessageLoaded { op_id, .. } => f
+                .debug_struct("EnsureMessageLoaded")
+                .field("op_id", op_id)
                 .finish(),
         }
     }
@@ -851,6 +879,28 @@ pub enum Effect {
         ttl: i64,
         now_ms: i64,
         op_id: Option<u64>,
+    },
+    // --- Board pins domain (U7) ---
+    /// Calls `host.refresh_board_pins` gate and (when approved) `ZaloApi::fetch_board_pins`.
+    RefreshBoardPins {
+        conv_id: String,
+        req_gen: u64,
+        followup: RefreshBoardFollowup,
+    },
+    /// Calls `ZaloApi::pin_board_message` and reports `Input::PinBoardMessageDone`.
+    PinBoardMessageApi {
+        pin_op_id: u64,
+        conv_id: String,
+        params: Map<String, Value>,
+        board_version: i64,
+    },
+    /// Calls `ZaloApi::unpin_board_topic` and reports `Input::UnpinBoardTopicDone`.
+    UnpinBoardTopicApi {
+        conv_id: String,
+        topic_id: String,
+        raw_topic: Option<Map<String, Value>>,
+        board_version: i64,
+        purpose: UnpinBoardPurpose,
     },
 
     /// Domain activity delegated to Swift via `CoreHost`.
@@ -1136,6 +1186,32 @@ impl fmt::Debug for Effect {
                 .field("ttl", ttl)
                 .field("now_ms", now_ms)
                 .field("op_id", op_id)
+                .finish(),
+            // U7
+            Self::RefreshBoardPins {
+                req_gen, followup, ..
+            } => f
+                .debug_struct("RefreshBoardPins")
+                .field("req_gen", req_gen)
+                .field("followup", followup)
+                .finish(),
+            Self::PinBoardMessageApi {
+                pin_op_id,
+                board_version,
+                ..
+            } => f
+                .debug_struct("PinBoardMessageApi")
+                .field("pin_op_id", pin_op_id)
+                .field("board_version", board_version)
+                .finish(),
+            Self::UnpinBoardTopicApi {
+                board_version,
+                purpose,
+                ..
+            } => f
+                .debug_struct("UnpinBoardTopicApi")
+                .field("board_version", board_version)
+                .field("purpose", purpose)
                 .finish(),
             Self::Host(call) => f.debug_tuple("Host").field(call).finish(),
         }

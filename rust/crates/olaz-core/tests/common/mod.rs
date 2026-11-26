@@ -26,8 +26,9 @@ use olaz_core::conversations::{
 };
 use olaz_core::effect::Effect;
 use olaz_core::input::{Command, E2eeQuoteArg, Input, LegacyCookie, SeenTarget};
-use olaz_core::messages::{HistoryFreshness, MuteEntry};
-use olaz_core::reduce::classify::MobileSyncEvent;
+use olaz_core::messages::{HistoryFreshness, MuteEntry, decode_db_stored};
+use olaz_core::pins::{BoardRawTopics, PinnedList, can_pin_message, is_pinned};
+use olaz_core::reduce::classify::{MobileSyncEvent, pin_topic_event_conversations};
 use olaz_core::runner::{
     EffectRunner, Host, SessionEffectRunner, SharedStoreSlot, WsDriver, WsStartParams,
 };
@@ -185,6 +186,11 @@ pub struct Seed {
     pub starred_ids: Option<Vec<String>>,
     #[serde(default)]
     pub seen_reaction_event_ids: Option<Vec<String>>,
+    // U7
+    #[serde(default)]
+    pub pins: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub board_raw_topics: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -561,7 +567,7 @@ fn scrub_volatile_value(val: Value) -> Value {
         Value::Object(map) => {
             let mut out = Map::new();
             for (k, v) in map {
-                if is_volatile_key(&k) {
+                if k != "params" && is_volatile_key(&k) {
                     out.insert(k, Value::String("<volatile>".to_owned()));
                 } else {
                     out.insert(k, scrub_volatile_value(v));
@@ -1301,9 +1307,11 @@ pub struct RecordingHost {
     is_u3: bool,
     is_u4: bool,
     is_u6: bool,
+    is_u7: bool,
     data_dir: Option<PathBuf>,
     shared_store_slot: Mutex<Option<SharedStoreSlot>>,
     store: Mutex<Option<Arc<Mutex<Store>>>>,
+    core_handle: Mutex<Option<Arc<CoreHandle>>>,
     e2ee_send_results: Mutex<VecDeque<Result<SendMessageResult, String>>>,
     messages: Mutex<HashMap<String, Vec<ChatMessage>>>,
     open_conversation_id: Mutex<Option<String>>,
@@ -1325,7 +1333,7 @@ impl RecordingHost {
         is_u4: bool,
         data_dir: Option<PathBuf>,
     ) -> Self {
-        Self::from_seed_with_all_modes(seed, is_u3, is_u4, false, data_dir)
+        Self::from_seed_with_all_modes(seed, is_u3, is_u4, false, false, data_dir)
     }
 
     pub fn from_seed_with_all_modes(
@@ -1333,6 +1341,7 @@ impl RecordingHost {
         is_u3: bool,
         is_u4: bool,
         is_u6: bool,
+        is_u7: bool,
         data_dir: Option<PathBuf>,
     ) -> Self {
         let saved_session = seed
@@ -1441,9 +1450,11 @@ impl RecordingHost {
             is_u3,
             is_u4,
             is_u6,
+            is_u7,
             data_dir,
             shared_store_slot: Mutex::new(None),
             store: Mutex::new(None),
+            core_handle: Mutex::new(None),
             e2ee_send_results: Mutex::new(e2ee_send_results),
             messages: Mutex::new(HashMap::new()),
             open_conversation_id: Mutex::new(open_conv),
@@ -1456,6 +1467,13 @@ impl RecordingHost {
             .shared_store_slot
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(slot);
+    }
+
+    pub fn attach_core_handle(&self, core: Arc<CoreHandle>) {
+        *self
+            .core_handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(core);
     }
 
     pub fn attached_store(&self) -> Option<Arc<Mutex<Store>>> {
@@ -2190,10 +2208,11 @@ impl Host for RecordingHost {
         }
     }
 
-    async fn refresh_board_pins(&self, conv_id: String) {
+    async fn refresh_board_pins(&self, conv_id: String) -> bool {
         if self.is_u4 {
             self.record("refresh_board_pins", json!({ "conv_id": conv_id }));
         }
+        self.is_u7
     }
 
     async fn mark_read_boundary(&self, conv_id: String, _seen_target: Option<SeenTarget>) {
@@ -2464,8 +2483,77 @@ impl Host for RecordingHost {
         );
     }
 
-    async fn pin_topic(&self, conv_id: String) {
+    async fn pin_topic(&self, conv_id: String) -> bool {
         self.record("pin_topic", json!({ "conv_id": conv_id }));
+        self.is_u7
+    }
+
+    // U14: test-only host shim matching Swift `ZaloEngine.ensureMessageLoaded` until U14 lands on main.
+    async fn ensure_message_loaded(&self, conv_id: String, message: ChatMessage) -> bool {
+        if conv_id.is_empty() {
+            return false;
+        }
+        let core = self
+            .core_handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(core) = core else {
+            return false;
+        };
+        let current = core
+            .full_snapshot()
+            .await
+            .and_then(|snap| snap.messages.windows.get(&conv_id).cloned())
+            .unwrap_or_default();
+        if current.iter().any(|m| m.id == message.id) {
+            return true;
+        }
+        let oldest_ts_ms = current.first().map(|m| m.date_ms);
+        let mut loaded_rows: Vec<ChatMessage> = Vec::new();
+        let mut has_more_older = false;
+        if let Some(store_arc) = self.attached_store() {
+            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Ok(window) =
+                store.messages_around(&conv_id, message.date_ms, oldest_ts_ms, 20, 200)
+            {
+                has_more_older = window.has_more_older;
+                for row in &window.messages {
+                    if let Some(decoded) = decode_db_stored(row) {
+                        loaded_rows.push(decoded);
+                    }
+                }
+            }
+        }
+        let mut found_target = false;
+        for row_msg in loaded_rows {
+            if row_msg.id == message.id {
+                found_target = true;
+            }
+            core.send(Command::WriteThroughUpsertMessage {
+                msg: Box::new(row_msg),
+                replacing_client_id: None,
+            });
+        }
+        if has_more_older {
+            core.send(Command::WriteThroughSetHasMore {
+                conv_id: conv_id.clone(),
+                has_more: true,
+            });
+        }
+        if !found_target
+            && (message.conversation_id == conv_id || message.conversation_id.is_empty())
+        {
+            core.send(Command::WriteThroughUpsertMessage {
+                msg: Box::new(message.clone()),
+                replacing_client_id: None,
+            });
+        }
+        let _ = core.settle().await;
+        core.full_snapshot()
+            .await
+            .and_then(|snap| snap.messages.windows.get(&conv_id).cloned())
+            .is_some_and(|list| list.iter().any(|m| m.id == message.id))
     }
 
     async fn group_notice(&self, act: String, data: Map<String, Value>, ts: i64) {
@@ -3032,6 +3120,7 @@ struct LogCapturingRunner<R> {
     inner: Arc<R>,
     send_logs: Arc<Mutex<Vec<String>>>,
     action_logs: Arc<Mutex<Vec<String>>>,
+    pin_logs: Arc<Mutex<Vec<String>>>,
 }
 
 impl<R: EffectRunner> EffectRunner for LogCapturingRunner<R> {
@@ -3045,6 +3134,7 @@ impl<R: EffectRunner> EffectRunner for LogCapturingRunner<R> {
                 .action_logs
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            let mut p_logs = self.pin_logs.lock().unwrap_or_else(PoisonError::into_inner);
             for eff in &effects {
                 if let Effect::EngineLog(line) = eff {
                     if line.starts_with("sendText ") {
@@ -3055,6 +3145,9 @@ impl<R: EffectRunner> EffectRunner for LogCapturingRunner<R> {
                         || line.starts_with("autodelete: ")
                     {
                         a_logs.push(line.clone());
+                    }
+                    if line.starts_with("pins: ") {
+                        p_logs.push(line.clone());
                     }
                 }
             }
@@ -3145,10 +3238,13 @@ struct SnapshotOpts<'a> {
     is_u4: bool,
     is_u5: bool,
     is_u6: bool,
+    is_u7: bool,
     last_send_result: Option<bool>,
     send_logs: &'a Mutex<Vec<String>>,
     prune_next_expiry_ms: Option<i64>,
     action_logs: &'a Mutex<Vec<String>>,
+    pin_logs: &'a Mutex<Vec<String>>,
+    results: &'a BTreeMap<String, Value>,
 }
 
 async fn capture_case_snapshot(
@@ -3161,10 +3257,13 @@ async fn capture_case_snapshot(
         is_u4,
         is_u5,
         is_u6,
+        is_u7,
         last_send_result,
         send_logs,
         prune_next_expiry_ms,
         action_logs,
+        pin_logs,
+        results,
     } = *opts;
     if !is_u3 {
         return core
@@ -3419,8 +3518,136 @@ async fn capture_case_snapshot(
                     "seen_reaction_event_ids".to_owned(),
                     Value::Array(seen_pref.into_iter().map(Value::String).collect()),
                 );
+                if is_u7 {
+                    let aliases_val = store
+                        .get_preference_data("aliases")
+                        .ok()
+                        .flatten()
+                        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                        .unwrap_or_else(|| json!({}));
+                    prefs_obj.insert("aliases".to_owned(), aliases_val);
+                    let cached_groups_val = store
+                        .get_preference_data("cachedGroups")
+                        .ok()
+                        .flatten()
+                        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                        .unwrap_or_else(|| json!({}));
+                    prefs_obj.insert("cached_groups".to_owned(), cached_groups_val);
+                    let cached_profiles_val = store
+                        .get_preference_data("cachedProfiles")
+                        .ok()
+                        .flatten()
+                        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                        .unwrap_or_else(|| json!({}));
+                    prefs_obj.insert("cached_profiles".to_owned(), cached_profiles_val);
+                }
             }
         }
+    }
+    if is_u7 {
+        obj.insert("pins".to_owned(), full.pins.lists_to_case_json());
+        obj.insert(
+            "cached_board_raw_topics".to_owned(),
+            full.pins.raw_topics_to_case_json(),
+        );
+        let p_logs: Vec<Value> = pin_logs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .map(Value::String)
+            .collect();
+        obj.insert("pin_logs".to_owned(), Value::Array(p_logs));
+        let mut results_obj = Map::new();
+        for (k, v) in results {
+            results_obj.insert(k.clone(), v.clone());
+        }
+        obj.insert("results".to_owned(), Value::Object(results_obj));
+        let mut aliases_obj = Map::new();
+        for (k, v) in &full.conversations.identities.aliases {
+            aliases_obj.insert(k.clone(), Value::String(v.clone()));
+        }
+        obj.insert("aliases".to_owned(), Value::Object(aliases_obj));
+        let mut cached_groups_obj = Map::new();
+        for (k, g) in &full.conversations.identities.cached_groups {
+            cached_groups_obj.insert(
+                k.clone(),
+                json!({
+                    "name": g.name,
+                    "avatar": g.avatar,
+                    "members": g.members,
+                }),
+            );
+        }
+        obj.insert("cached_groups".to_owned(), Value::Object(cached_groups_obj));
+        let mut fgids_obj = Map::new();
+        for (k, v) in &full.conversations.identities.friend_global_ids {
+            fgids_obj.insert(k.clone(), Value::String(v.clone()));
+        }
+        obj.insert("friend_global_ids".to_owned(), Value::Object(fgids_obj));
+        let friends_arr: Vec<Value> = full
+            .contacts
+            .friends
+            .iter()
+            .map(|f| {
+                json!({
+                    "id": f.id,
+                    "name": f.name,
+                    "zalo_name": f.zalo_name,
+                    "avatar": f.avatar,
+                    "online": f.online,
+                    "last_active_ms": f.last_active_ms,
+                    "sort_key": f.sort_key,
+                    "section": f.section,
+                })
+            })
+            .collect();
+        let groups_arr: Vec<Value> = full
+            .contacts
+            .groups
+            .iter()
+            .map(|g| {
+                json!({
+                    "id": g.id,
+                    "name": g.name,
+                    "avatar": g.avatar,
+                    "members": g.members,
+                    "sort_key": g.sort_key,
+                })
+            })
+            .collect();
+        obj.insert(
+            "contacts".to_owned(),
+            json!({
+                "friends": friends_arr,
+                "friends_loaded": false,
+                "groups": groups_arr,
+                "groups_loaded": false,
+                "loading_requests": false,
+                "notice": Value::Null,
+                "pending_request_count": 0,
+                "received": [],
+                "search": {"error": Value::Null, "status": "idle", "user": Value::Null},
+                "sent": [],
+            }),
+        );
+        obj.insert("blocked_users".to_owned(), Value::Null);
+        obj.insert("cached_group_details".to_owned(), json!({}));
+        obj.insert("group_logs".to_owned(), json!([]));
+        obj.insert("group_member_cache".to_owned(), json!({}));
+        let mut gr_obj = Map::new();
+        for c in &full.conversations.conversations {
+            if c.is_group {
+                gr_obj.insert(
+                    c.id.clone(),
+                    json!({"admins": [], "join_approval": false, "owner": ""}),
+                );
+            }
+        }
+        obj.insert("group_roles".to_owned(), Value::Object(gr_obj));
+        obj.insert("last_alias_result".to_owned(), Value::Null);
+        obj.insert("lookups".to_owned(), json!({}));
+        obj.insert("navigation_request".to_owned(), Value::Null);
     }
     Some(Value::Object(obj))
 }
@@ -3447,7 +3674,8 @@ fn str_vec_arg(args: &Value, key: &str) -> Vec<String> {
 /// Runs a single Case format v1 [`Case`] under paused tokio time and returns the observed
 /// snapshots, final state, sorted canonical requests, and ordered host calls.
 pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
-    let is_u6 = case.domain == "message_actions";
+    let is_u7 = case.domain == "pins";
+    let is_u6 = case.domain == "message_actions" || is_u7;
     let is_u5 = case.domain == "send" || is_u6;
     let is_u4 = case.domain == "bootstrap" || case.domain == "messages" || is_u5;
     let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions" || is_u4;
@@ -3511,6 +3739,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         is_u3,
         is_u4,
         is_u6,
+        is_u7,
         temp_dir.as_ref().map(|d| d.path().to_path_buf()),
     ));
     let inner_runner = Arc::new(SessionEffectRunner::with_options(
@@ -3524,10 +3753,12 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     host.bind_store_slot(inner_runner.shared_store_slot());
     let send_logs = Arc::new(Mutex::new(Vec::<String>::new()));
     let action_logs = Arc::new(Mutex::new(Vec::<String>::new()));
+    let pin_logs = Arc::new(Mutex::new(Vec::<String>::new()));
     let runner: Arc<dyn EffectRunner> = Arc::new(LogCapturingRunner {
         inner: Arc::clone(&inner_runner),
         send_logs: Arc::clone(&send_logs),
         action_logs: Arc::clone(&action_logs),
+        pin_logs: Arc::clone(&pin_logs),
     });
 
     let mut initial_state = CoreState::default();
@@ -3568,11 +3799,93 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         }
         initial_state.actions.auto_delete = Some(map);
     }
+    if is_u7 {
+        if let Some(contacts_val) = &case.seed.contacts
+            && let Some(friends_arr) = contacts_val.get("friends").and_then(Value::as_array)
+        {
+            for item in friends_arr {
+                let Some(obj) = item.as_object() else {
+                    continue;
+                };
+                let id = obj
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                if id.is_empty() {
+                    continue;
+                }
+                let name = obj
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let zalo_name = obj
+                    .get("zalo_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&name)
+                    .to_owned();
+                let avatar = obj
+                    .get("avatar")
+                    .and_then(Value::as_str)
+                    .filter(|a| !a.is_empty())
+                    .map(str::to_owned);
+                let online = obj.get("online").and_then(Value::as_bool).unwrap_or(false);
+                let last_active_ms = obj.get("last_active_ms").and_then(Value::as_i64);
+                let sort_key = obj
+                    .get("sort_key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let section = obj
+                    .get("section")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                initial_state.contacts.friends.push(olaz_core::FriendEntry {
+                    id,
+                    name,
+                    zalo_name,
+                    avatar,
+                    online,
+                    last_active_ms,
+                    sort_key,
+                    section,
+                });
+            }
+        }
+        for (conv_id, val) in &case.seed.pins {
+            if let Some(obj) = val.as_object() {
+                initial_state
+                    .pins
+                    .lists
+                    .insert(conv_id.clone(), PinnedList::from_json(obj));
+            }
+        }
+        for (conv_id, val) in &case.seed.board_raw_topics {
+            if let Some(obj) = val.as_object() {
+                let version = obj.get("version").and_then(Value::as_i64).unwrap_or(0);
+                let mut topics = BTreeMap::new();
+                if let Some(tmap) = obj.get("topics").and_then(Value::as_object) {
+                    for (tid, trow) in tmap {
+                        if let Some(row_obj) = trow.as_object() {
+                            topics.insert(tid.clone(), row_obj.clone());
+                        }
+                    }
+                }
+                initial_state
+                    .pins
+                    .raw_topics
+                    .insert(conv_id.clone(), BoardRawTopics { version, topics });
+            }
+        }
+    }
     let core = Arc::new(CoreHandle::start_with_state(
         initial_state,
         runner,
         Handle::current(),
     ));
+    host.attach_core_handle(Arc::clone(&core));
 
     let mut snapshots = BTreeMap::new();
     let mut host_cursor = 0usize;
@@ -3580,8 +3893,10 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let mut prune_next_expiry_ms: Option<i64> = None;
     let mut pending_send_task: Option<tokio::task::JoinHandle<bool>> = None;
     let mut pending_action_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut pending_extra_action_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut results: BTreeMap<String, Value> = BTreeMap::new();
 
-    for step in &case.steps {
+    for (step_idx, step) in case.steps.iter().enumerate() {
         match step {
             Step::Cmd {
                 cmd,
@@ -3773,8 +4088,43 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                     }
                 }
                 "pin" => {
-                    let id = str_arg(args, "id");
-                    core.request_unit(Command::PinConversation { id }).await;
+                    if is_u7 {
+                        let conv_id = str_arg(args, "conv_id");
+                        let msg_id = str_arg(args, "msg_id");
+                        let replacing = args
+                            .get("replacing")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
+                        let pin_cmd = Command::Pin {
+                            conv_id,
+                            msg_id,
+                            replacing,
+                        };
+                        if is_async {
+                            let core_c = Arc::clone(&core);
+                            let task = tokio::spawn(async move {
+                                core_c.request_unit(pin_cmd).await;
+                            });
+                            if pending_action_task.is_none() {
+                                pending_action_task = Some(task);
+                            } else {
+                                pending_extra_action_tasks.push(task);
+                            }
+                            tokio::task::yield_now().await;
+                            let _ = core.settle().await;
+                        } else {
+                            core.request_unit(pin_cmd).await;
+                            if pending_send_task.is_none() && pending_action_task.is_none() {
+                                let _ =
+                                    tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
+                                        .await;
+                            }
+                        }
+                    } else {
+                        let id = str_arg(args, "id");
+                        core.request_unit(Command::PinConversation { id }).await;
+                    }
                 }
                 "unpin" => {
                     let id = str_arg(args, "id");
@@ -4168,6 +4518,11 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                             .await
                             .map_err(|e| format!("await_action join error: {e}"))?;
                     }
+                    for handle in std::mem::take(&mut pending_extra_action_tasks) {
+                        handle
+                            .await
+                            .map_err(|e| format!("await_action extra join error: {e}"))?;
+                    }
                     if pending_send_task.is_none() {
                         let _ =
                             tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
@@ -4297,12 +4652,27 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 }
                 "answer_confirm" => {
                     let ok = args.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                    let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
                     let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
-                    core.request_unit(Command::AnswerMessageConfirm { ok, now_ms: ts_ms })
-                        .await;
-                    if pending_send_task.is_none() && pending_action_task.is_none() {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let confirm_cmd = Command::AnswerMessageConfirm { ok, now_ms: ts_ms };
+                    if is_async {
+                        let core_c = Arc::clone(&core);
+                        let task = tokio::spawn(async move {
+                            core_c.request_unit(confirm_cmd).await;
+                        });
+                        if pending_action_task.is_none() {
+                            pending_action_task = Some(task);
+                        } else {
+                            pending_extra_action_tasks.push(task);
+                        }
+                        tokio::task::yield_now().await;
+                        let _ = core.settle().await;
+                    } else {
+                        core.request_unit(confirm_cmd).await;
+                        if pending_send_task.is_none() && pending_action_task.is_none() {
+                            let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
+                                .await;
+                        }
                     }
                 }
                 "star" => {
@@ -4356,6 +4726,132 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                             tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
                     }
                 }
+                // U7 board pins domain commands
+                "refresh_board" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let _ = core.refresh_board_pins(conv_id).await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "pin_message" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    core.request_unit(Command::PinMessage { conv_id, msg_id })
+                        .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+
+                "request_unpin" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let topic_ref = str_arg(args, "ref");
+                    core.request_unit(Command::RequestUnpin { conv_id, topic_ref })
+                        .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "request_unpin_message" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    core.request_unit(Command::RequestUnpinMessage { conv_id, msg_id })
+                        .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "pins_state" => {
+                    let state_json = args
+                        .get("json")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    core.request_unit(Command::HandlePinsState { state_json })
+                        .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "pin_event" => {
+                    let act_type = str_arg(args, "act_type");
+                    let act = str_arg(args, "act");
+                    let data = args
+                        .get("data")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    let convs = pin_topic_event_conversations(&act_type, &act, &data);
+                    results.insert(
+                        step_idx.to_string(),
+                        Value::Array(convs.iter().cloned().map(Value::String).collect()),
+                    );
+                    for cid in convs {
+                        core.request_unit(Command::HandlePinTopicEvent { conv_id: cid })
+                            .await;
+                    }
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "can_pin" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let val = core
+                        .full_snapshot()
+                        .await
+                        .and_then(|snap| {
+                            snap.messages
+                                .windows
+                                .get(&conv_id)
+                                .and_then(|list| {
+                                    list.iter()
+                                        .find(|m| m.id == msg_id || m.client_id == msg_id)
+                                })
+                                .map(|msg| can_pin_message(&snap.pins.lists, msg))
+                        })
+                        .unwrap_or(false);
+                    results.insert(step_idx.to_string(), Value::Bool(val));
+                }
+                "is_pinned" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let val = core
+                        .full_snapshot()
+                        .await
+                        .and_then(|snap| {
+                            snap.messages
+                                .windows
+                                .get(&conv_id)
+                                .and_then(|list| {
+                                    list.iter()
+                                        .find(|m| m.id == msg_id || m.client_id == msg_id)
+                                })
+                                .map(|msg| is_pinned(&snap.pins.lists, msg))
+                        })
+                        .unwrap_or(false);
+                    results.insert(step_idx.to_string(), Value::Bool(val));
+                }
+                "load_pinned" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let topic_ref = str_arg(args, "ref");
+                    let loaded = core.load_pinned_message(conv_id, topic_ref).await;
+                    results.insert(
+                        step_idx.to_string(),
+                        loaded.map_or(Value::Null, Value::String),
+                    );
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
                 other => return Err(format!("unknown step cmd: {other}")),
             },
             Step::Await {
@@ -4369,6 +4865,10 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                     let dur = Duration::from_millis(timeout_ms.unwrap_or(10_000));
                     let wait_fut = core.wait_for_predicate(|snap| predicate.matches(snap));
                     let _ = tokio::time::timeout(dur, wait_fut).await;
+                    if is_u7 {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
                 }
             }
             Step::AwaitHost {
@@ -4417,10 +4917,13 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         is_u4,
                         is_u5,
                         is_u6,
+                        is_u7,
                         last_send_result,
                         send_logs: &send_logs,
                         prune_next_expiry_ms,
                         action_logs: &action_logs,
+                        pin_logs: &pin_logs,
+                        results: &results,
                     },
                 )
                 .await
@@ -4469,10 +4972,13 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             is_u4,
             is_u5,
             is_u6,
+            is_u7,
             last_send_result,
             send_logs: &send_logs,
             prune_next_expiry_ms,
             action_logs: &action_logs,
+            pin_logs: &pin_logs,
+            results: &results,
         },
     )
     .await

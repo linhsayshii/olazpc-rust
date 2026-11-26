@@ -4,7 +4,7 @@
 //! conversation lists (preload, pins, archive, mute, labels, groups, friends, friend-request lists,
 //! aliases, profiles, hidden chats, delete), message history (1-1 preload, group and self cloud
 //! paging), the HTTP long-poll queue, sending text (plain, quoted, E2EE envelope), typing, seen,
-//! unread marks, recall, delete-for-me, reactions, and auto-delete settings.
+//! unread marks, recall, delete-for-me, reactions, auto-delete settings, and board pins.
 //!
 //! Every method is a request builder (service, path, params payload with the exact Swift keys and
 //! JSON types) plus a response parser. The pure builders ([`build_recall_message_request`],
@@ -13,7 +13,7 @@
 //! (reach them with [`ZaloApi::client`]).
 //!
 //! Not ported here (later waves): media upload and file send, polls and reminders, cloud, stickers,
-//! group management, board pins, contact cards, friend-request mutations, call signalling, global-id
+//! group management, contact cards, friend-request mutations, call signalling, global-id
 //! encrypt/decrypt, mute set.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -25,6 +25,7 @@ mod e2ee;
 mod error;
 mod history;
 mod messaging;
+mod pins;
 mod poll;
 mod profiles;
 mod util;
@@ -49,5 +50,8 @@ pub use error::ApiError;
 pub use messaging::{
     CallSpec, ReactionParams, ReactionRequestSpec, RecallParams, SendTextArgs, SendTextParams,
     build_reaction_request, build_recall_message_request,
+};
+pub use pins::{
+    board_topic_params, friend_board_list_box, friend_board_unpin_topics, pin_topic_params,
 };
 pub use poll::{PollQueueCursor, PollState};

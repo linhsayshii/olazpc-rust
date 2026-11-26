@@ -121,6 +121,13 @@ struct PinnedList: Equatable, Sendable {
     /// Pins the board holds at most (official `pinLimit`).
     var limit = ZaloWireParser.defaultPinLimit
 
+    init(ready: Bool = false, canPin: Bool = false, items: [PinnedItem] = [], limit: Int = ZaloWireParser.defaultPinLimit) {
+        self.ready = ready
+        self.canPin = canPin
+        self.items = items
+        self.limit = limit
+    }
+
     init(json: [String: Any]) {
         ready = json["ready"] as? Bool ?? false
         canPin = json["canPin"] as? Bool ?? false
@@ -750,6 +757,18 @@ extension ZaloEngine {
     // MARK: Ghim tin nhắn
 
     func pin(_ message: ChatMessage, replacing ref: String? = nil) {
+        if let core = coreLifecycle.core {
+            let key = "\(message.conversationId)|\(message.id)|pin"
+            guard messageActionsBusy.insert(key).inserted else { return }
+            trackMessageActionTask { [weak self] in
+                guard let self else { return }
+                defer { self.messageActionsBusy.remove(key) }
+                if let v = try? await core.pin(convId: message.conversationId, msgId: message.id, replacing: ref) {
+                    await self.waitForMirrorVersion(v)
+                }
+            }
+            return
+        }
         let conversation = message.conversationId
         let key = "\(conversation)|\(message.id)|pin"
         guard messageActionsBusy.insert(key).inserted else { return }
@@ -793,6 +812,21 @@ extension ZaloEngine {
     }
 
     func requestUnpin(_ item: PinnedItem, in conversationId: String) {
+        if let core = coreLifecycle.core {
+            if openConversationId == conversationId, messageConfirm == nil {
+                mirroredMessageConfirmCoreId = nil
+                messageConfirm = MessageActionConfirm(
+                    conversationId: conversationId,
+                    action: .unpin(ref: item.ref),
+                    title: item.kind == .message ? "Bỏ ghim tin nhắn" : "Bỏ ghim",
+                    message: item.kind == .message ? "Bạn muốn bỏ ghim tin nhắn?" : "Bạn muốn bỏ ghim nội dung này?",
+                    ok: "Bỏ ghim",
+                    destructive: true
+                )
+            }
+            core.requestUnpin(convId: conversationId, topicRef: item.ref)
+            return
+        }
         ask(MessageActionConfirm(
             conversationId: conversationId,
             action: .unpin(ref: item.ref),
@@ -859,13 +893,13 @@ extension ZaloEngine {
                     overlayToken = applyOptimisticDeleteMirror(list, nowMs: tsMs)
                 case .recallMany:
                     endSelection()
-                case .pin(let message, let replacing):
-                    core.answerMessageConfirm(ok: ok, nowMs: tsMs)
-                    pin(message, replacing: replacing)
-                    return
-                case .unpin(let ref):
-                    core.answerMessageConfirm(ok: ok, nowMs: tsMs)
-                    unpin(ref, in: confirm.conversationId)
+                case .pin, .unpin:
+                    trackMessageActionTask { [weak self] in
+                        guard let self else { return }
+                        if let v = try? await core.answerMessageConfirmAsync(ok: ok, nowMs: tsMs) {
+                            await self.waitForMirrorVersion(v)
+                        }
+                    }
                     return
                 }
             }
@@ -888,6 +922,12 @@ extension ZaloEngine {
     // MARK: Pins of the open conversation
 
     internal func refreshBoardPins(for convId: String) async {
+        if let core = coreLifecycle.core {
+            if let v = try? await core.refreshBoardPins(convId: convId) {
+                await waitForMirrorVersion(v)
+            }
+            return
+        }
         guard traceU4Host("refresh_board_pins", args: ["conv_id": convId]) else {
             return
         }
@@ -915,12 +955,24 @@ extension ZaloEngine {
     }
 
     func handlePins(state: [String: Any]) {
+        if let core = coreLifecycle.core {
+            core.handlePinsState(stateJson: Self.jsonString(for: state))
+        }
         guard let json = state["pins"] as? [String: Any], let conversation = json["convId"] as? String, !conversation.isEmpty else { return }
         let list = PinnedList(json: json)
         if pins[conversation] != list { pins[conversation] = list }
     }
 
     func rewatchPins() {
+        if let core = coreLifecycle.core {
+            trackMessageActionTask { [weak self] in
+                guard let self else { return }
+                if let v = try? await core.rewatchPins() {
+                    await self.waitForMirrorVersion(v)
+                }
+            }
+            return
+        }
         guard let id = openConversationId else { return }
         trackMessageActionTask { [weak self] in
             await self?.refreshBoardPins(for: id)

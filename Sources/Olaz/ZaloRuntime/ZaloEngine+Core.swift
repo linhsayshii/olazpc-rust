@@ -372,9 +372,11 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         }
     }
 
-    func refreshBoardPins(convId: String) async {
-        guard let engine else { return }
-        await engine.refreshBoardPins(for: convId)
+    func refreshBoardPins(convId: String) async -> Bool {
+        guard let engine else { return false }
+        return await MainActor.run {
+            engine.traceU4Host("refresh_board_pins", args: ["conv_id": convId])
+        }
     }
 
     func markReadBoundary(convId: String, seenTarget: SeenTargetRecord?) async {
@@ -642,12 +644,10 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         }
     }
 
-    func pinTopic(convId: String) async {
-        guard let engine else { return }
-        await MainActor.run {
-            if engine.traceHost("pin_topic", args: ["conv_id": convId]) {
-                engine.handlePinTopicEvent(conversationId: convId)
-            }
+    func pinTopic(convId: String) async -> Bool {
+        guard let engine else { return false }
+        return await MainActor.run {
+            engine.traceHost("pin_topic", args: ["conv_id": convId])
         }
     }
 
@@ -689,6 +689,13 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         await MainActor.run {
             engine.showActionCard(text, in: convId)
         }
+    }
+
+    // U14: temporary host boundary until U14's core `ensure_message_loaded` lands on main.
+    func ensureMessageLoaded(convId: String, message: ChatMessageRecord) async -> Bool {
+        guard let engine else { return false }
+        await engine.waitForCoreMirrorDrain()
+        return await engine.ensureMessageLoaded(ChatMessage(record: message), in: convId)
     }
 }
 
@@ -995,6 +1002,7 @@ extension ZaloEngine {
             }
             self.pushCoreContactsIfRunning()
             self.pushCoreHistoryFreshnessIfRunning()
+            self.pushCorePinsIfRunning()
             if let openId = self.openConversationId {
                 core.setOpenConversation(id: openId)
             }
@@ -1533,6 +1541,46 @@ extension ZaloEngine {
                 next[entry.uid] = ZaloWebKitMigrator.CachedProfile(name: entry.name, avatar: entry.avatar)
             }
             cachedProfiles = next
+        }
+
+        if let pinsSnap = batch.pins {
+            var nextLists: [String: PinnedList] = [:]
+            nextLists.reserveCapacity(pinsSnap.lists.count)
+            for entry in pinsSnap.lists {
+                let items = entry.items.map { it in
+                    PinnedItem(
+                        ref: it.refId,
+                        kind: PinnedItem.Kind(rawValue: it.kind) ?? .note,
+                        title: it.title,
+                        sender: it.sender,
+                        thumbnail: it.thumbnail.flatMap(URL.init(string:)),
+                        msgId: it.msgId,
+                        cliMsgId: it.cliMsgId
+                    )
+                }
+                nextLists[entry.convId] = PinnedList(
+                    ready: entry.ready,
+                    canPin: entry.canPin,
+                    items: items,
+                    limit: Int(entry.limit)
+                )
+            }
+            if pins != nextLists {
+                pins = nextLists
+            }
+            var nextRaw: [String: (version: Int64, topics: [String: [String: Any]])] = [:]
+            nextRaw.reserveCapacity(pinsSnap.rawTopics.count)
+            for entry in pinsSnap.rawTopics {
+                let rawObj = JSONLossless.parseObject(string: entry.topicsJson) ?? [:]
+                var topics: [String: [String: Any]] = [:]
+                for (tid, val) in rawObj {
+                    if let row = val as? [String: Any] {
+                        topics[tid] = row
+                    }
+                }
+                nextRaw[entry.convId] = (version: entry.version, topics: topics)
+            }
+            cachedBoardRawTopics = nextRaw
         }
 
         if !optimisticMessageOverlays.isEmpty {
@@ -2097,6 +2145,42 @@ extension ZaloEngine {
             return FreshnessMapEntry(convId: key, freshness: rec)
         }
         core.seedHistoryFreshness(entries: entries)
+    }
+
+    internal func pushCorePinsIfRunning() {
+        guard !isApplyingCoreMirror, let core = coreLifecycle.core else { return }
+        guard !pins.isEmpty || !cachedBoardRawTopics.isEmpty else { return }
+        var listsDict: [String: Any] = [:]
+        for (convId, list) in pins {
+            listsDict[convId] = [
+                "convId": convId,
+                "ready": list.ready,
+                "canPin": list.canPin,
+                "limit": list.limit,
+                "items": list.items.map { item -> [String: Any] in
+                    [
+                        "ref": item.ref,
+                        "kind": item.kind.rawValue,
+                        "title": item.title,
+                        "sender": item.sender,
+                        "thumb": item.thumbnail?.absoluteString ?? "",
+                        "msgId": item.msgId,
+                        "cliMsgId": item.cliMsgId,
+                    ]
+                },
+            ]
+        }
+        var rawDict: [String: Any] = [:]
+        for (convId, raw) in cachedBoardRawTopics {
+            rawDict[convId] = [
+                "version": raw.version,
+                "topics": raw.topics,
+            ]
+        }
+        core.seedPins(
+            listsJson: Self.jsonString(for: listsDict),
+            rawTopicsJson: Self.jsonString(for: rawDict)
+        )
     }
 
     internal func applyContactsMirror(_ cRec: ContactsStateRecord) {

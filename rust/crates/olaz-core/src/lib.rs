@@ -14,6 +14,7 @@ pub mod conversations;
 pub mod effect;
 pub mod input;
 pub mod messages;
+pub mod pins;
 pub mod reduce;
 pub mod runner;
 pub mod state;
@@ -80,4 +81,12 @@ pub use typed_chat::{
 pub use typing::{
     DEFAULT_TYPING_NAME, OUTGOING_TYPING_THROTTLE_MS, TYPING_DISPLAY_DURATION, TypingState,
     TypingStatus, clear_typing, set_typing,
+};
+
+// U7
+pub use pins::{
+    BoardPinItem, BoardPinList, BoardRawTopics, DEFAULT_PIN_LIMIT, PIN_FAILED_CARD_TEXT,
+    ParsedBoardTopics, PinLimitDecision, PinnedItem, PinnedList, PinsSnapshot, PinsState,
+    RefreshBoardFollowup, UNPIN_FAILED_CARD_TEXT, UnpinBoardPurpose, can_pin_message, is_pinned,
+    parse_board_topics, pin_error_shape,
 };

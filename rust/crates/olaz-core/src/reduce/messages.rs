@@ -978,22 +978,28 @@ fn finish_sender_resolve_followup(
                 .iter()
                 .any(|f| f.id == conv_id)
                 || state.contacts.friends.iter().any(|f| f.id == conv_id);
+            let seen_target = state.messages.seen_target_for(&conv_id);
             if is_grp || is_friend {
-                out.effects.push(Effect::Host(HostCall::RefreshBoardPins {
+                let req_gen = state.pins.current_gen(&conv_id);
+                out.effects.push(Effect::RefreshBoardPins {
                     conv_id: conv_id.clone(),
-                }));
+                    req_gen,
+                    followup: crate::pins::RefreshBoardFollowup::OpenConversation {
+                        conv_id,
+                        seen_target,
+                        op_id,
+                    },
+                });
             } else {
                 out.effects.push(Effect::EngineLog(
                     "pins: list skipped (1-1 not in friends)".to_owned(),
                 ));
+                out.effects.push(Effect::Host(HostCall::MarkReadBoundary {
+                    conv_id,
+                    seen_target,
+                }));
+                complete_op_after_store(op_id, true, out);
             }
-
-            let seen_target = state.messages.seen_target_for(&conv_id);
-            out.effects.push(Effect::Host(HostCall::MarkReadBoundary {
-                conv_id,
-                seen_target,
-            }));
-            complete_op_after_store(op_id, true, out);
         }
 
         SenderResolveFollowup::LoadOlder {
