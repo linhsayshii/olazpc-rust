@@ -43,7 +43,8 @@ jobs:
     name: Shard ${{ matrix.shard }}
     needs: plan
     runs-on: macos-26
-    timeout-minutes: 120
+    # One full RecorderTests run takes 25-30 min on a runner under load, so 4 runs need about 2 h plus the build.
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
@@ -80,8 +81,10 @@ jobs:
           pass=0; fail=0
           for i in $(seq 1 "$RUNS"); do
             log="stress-logs/shard${SHARD}-run${i}.log"
+            start=$(date +%s)
             if swift test --skip-build --filter "$FILTER" > "$log" 2>&1; then
               pass=$((pass + 1)); rm "$log"
+              echo "shard $SHARD run $i pass in $(( $(date +%s) - start ))s"
             else
               fail=$((fail + 1))
               echo "::error::shard $SHARD run $i failed"
