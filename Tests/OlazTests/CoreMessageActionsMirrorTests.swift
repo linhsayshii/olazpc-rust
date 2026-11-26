@@ -25,6 +25,8 @@ import Testing
             messageMeta: nil,
             contacts: nil,
             typing: nil,
+            forwardRequest: nil,
+            clearSelection: false,
             deleteUndo: deleteUndo,
             messageConfirm: nil,
             autoDelete: nil,

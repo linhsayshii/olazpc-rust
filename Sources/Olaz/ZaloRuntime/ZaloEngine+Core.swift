@@ -737,11 +737,72 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         }
     }
 
-    func showCard(convId: String, text: String) async {
+    // MARK: - Forward & Message Action Host Effects (U6/U8)
+
+    func showCard(convId: String?, text: String) async {
         guard let engine else { return }
         await engine.waitForCoreMirrorDrain()
         await MainActor.run {
             engine.showActionCard(text, in: convId)
+        }
+    }
+
+    func resolveMedia(convId: String, msgId: String, kind: String) async -> MediaResolutionRecord {
+        guard let engine else { return .unavailable }
+        return await engine.hostResolveMedia(convId: convId, msgId: msgId, kind: kind)
+    }
+
+    func resolveFile(convId: String, msgId: String, name: String, url: String?) async -> FileResolutionRecord {
+        guard let engine else { return .expired }
+        return await engine.hostResolveFile(convId: convId, msgId: msgId, name: name, url: url)
+    }
+
+    func fetchMediaData(url: String) async -> String? {
+        guard let engine else { return nil }
+        return await engine.hostFetchMediaData(url: url)
+    }
+
+    func sendMedia(convId: String, paths: [String], cleanupAfter: Bool) async -> ComposerSendOutcomeRecord {
+        guard let engine else { return .cancelled }
+        return await engine.hostSendMedia(convId: convId, paths: paths, cleanupAfter: cleanupAfter)
+    }
+
+    func sendFiles(convId: String, paths: [String]) async -> ComposerSendOutcomeRecord {
+        guard let engine else { return .cancelled }
+        return await engine.hostSendFiles(convId: convId, paths: paths)
+    }
+}
+
+extension ForwardRequest {
+    init(coreRecord record: ForwardRequestRecord) {
+        var bytes: uuid_t = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        let v = record.id.bigEndian
+        bytes.8 = UInt8((v >> 56) & 0xFF)
+        bytes.9 = UInt8((v >> 48) & 0xFF)
+        bytes.10 = UInt8((v >> 40) & 0xFF)
+        bytes.11 = UInt8((v >> 32) & 0xFF)
+        bytes.12 = UInt8((v >> 24) & 0xFF)
+        bytes.13 = UInt8((v >> 16) & 0xFF)
+        bytes.14 = UInt8((v >> 8) & 0xFF)
+        bytes.15 = UInt8(v & 0xFF)
+        self.init(
+            id: UUID(uuid: bytes),
+            conversationId: record.conversationId,
+            message: ChatMessage(record: record.message),
+            more: record.more.map(ChatMessage.init(record:))
+        )
+    }
+}
+
+extension MessageActionOutcome {
+    init(forwardRecord record: ForwardOutcomeRecord) {
+        switch record {
+        case .done(let text):
+            self = .done(text: text)
+        case .pending(let text):
+            self = .pending(text)
+        case .failed(let text):
+            self = .failed(text)
         }
     }
 }
@@ -1327,6 +1388,65 @@ extension ZaloEngine {
         await saveNotificationPreferences()
     }
 
+    // MARK: - U8 Forward Host Helpers
+
+    internal func hostResolveMedia(convId: String, msgId: String, kind: String) async -> MediaResolutionRecord {
+        let mediaKind = MediaKind(rawValue: kind) ?? .photo
+        let res = await resolveMedia(conversationId: convId, messageId: msgId, kind: mediaKind)
+        switch res {
+        case .file(let url): return .file(path: url.path)
+        case .expired: return .expired
+        case .unsupported: return .unsupported
+        case .unavailable: return .unavailable
+        }
+    }
+
+    internal func hostResolveFile(convId: String, msgId: String, name: String, url: String?) async -> FileResolutionRecord {
+        let parsed = url.flatMap { $0.isEmpty ? nil : URL(string: $0) }
+        let res = await resolveFile(conversationId: convId, messageId: msgId, name: name, url: parsed)
+        switch res {
+        case .ready(let staged): return .ready(path: staged.path)
+        case .expired: return .expired
+        case .failed(let message): return .failed(message: message)
+        }
+    }
+
+    internal func hostFetchMediaData(url: String) async -> String? {
+        guard let parsed = URL(string: url),
+              let data = await fetchMediaData(for: parsed) else {
+            return nil
+        }
+        let tmp = makeForwardTempPhotoURL()
+        try? data.write(to: tmp, options: .atomic)
+        return tmp.path
+    }
+
+    internal func hostSendMedia(convId: String, paths: [String], cleanupAfter: Bool) async -> ComposerSendOutcomeRecord {
+        let urls = paths.map(URL.init(fileURLWithPath:))
+        defer {
+            if cleanupAfter {
+                for url in urls {
+                    try? FileManager.default.removeItem(at: url)
+                }
+            }
+        }
+        return Self.composerSendOutcomeRecord(await sendMedia(urls, to: convId))
+    }
+
+    internal func hostSendFiles(convId: String, paths: [String]) async -> ComposerSendOutcomeRecord {
+        let urls = paths.map(URL.init(fileURLWithPath:))
+        return Self.composerSendOutcomeRecord(await sendFiles(urls, to: convId))
+    }
+
+    nonisolated private static func composerSendOutcomeRecord(_ outcome: ComposerOutcome) -> ComposerSendOutcomeRecord {
+        switch outcome {
+        case .done: return .done
+        case .cancelled: return .cancelled
+        case .pending(let text): return .pending(text: text)
+        case .failed(let text): return .failed(text: text)
+        }
+    }
+
     private static func sendCommand(_ command: PendingCoreCommand, to core: CoreEngine) {
         switch command {
         case .start:
@@ -1550,6 +1670,16 @@ extension ZaloEngine {
             if nextTyping != typing {
                 typing = nextTyping
             }
+        }
+
+        if let fwdUpdate = batch.forwardRequest {
+            let mapped = fwdUpdate.request.map(ForwardRequest.init(coreRecord:))
+            if mapped != forwardRequest {
+                forwardRequest = mapped
+            }
+        }
+        if batch.clearSelection {
+            endSelection()
         }
 
         if let undoUpdate = batch.deleteUndo {

@@ -13,6 +13,7 @@ use serde_json::{Map, Value, json};
 
 use crate::actions::{ActionsState, DeleteUndoSnapshot, MessageConfirmState};
 use crate::conversations::{CachedProfile, ConversationsState};
+use crate::forward::{ForwardRequest, ForwardState};
 use crate::messages::{ContactsState, IdentitySnapshot, MessagesState};
 use crate::typing::{TypingState, TypingStatus};
 
@@ -30,6 +31,8 @@ pub struct CoreState {
     pub typing: TypingState,
     // U5-send
     pub send: crate::reduce::send::SendState,
+    // U8
+    pub forward: ForwardState,
     // U6
     pub actions: ActionsState,
     // U12
@@ -51,6 +54,9 @@ impl CoreState {
             contacts: self.contacts.clone(),
             // U5
             typing: self.typing.active.clone(),
+            // U8
+            forward_request: self.forward.request.clone(),
+            send_auto_delete: self.send.auto_delete_ttl_ms.clone(),
             // U6
             delete_undo: self.actions.delete_undo.snapshot(),
             message_confirm: self.actions.message_confirm.clone(),
@@ -94,6 +100,8 @@ impl fmt::Debug for CoreState {
             .field("typing", &self.typing)
             // U5-send
             .field("send", &self.send)
+            // U8
+            .field("forward", &self.forward)
             // U6
             .field("actions", &self.actions)
             // U12
@@ -113,6 +121,9 @@ pub struct CoreSnapshot {
     pub contacts: ContactsState,
     // U5
     pub typing: BTreeMap<String, TypingStatus>,
+    // U8
+    pub forward_request: Option<ForwardRequest>,
+    pub send_auto_delete: BTreeMap<String, i64>,
     // U6
     pub delete_undo: Option<DeleteUndoSnapshot>,
     pub message_confirm: Option<MessageConfirmState>,
@@ -134,6 +145,8 @@ impl fmt::Debug for CoreSnapshot {
             .field("contacts", &self.contacts)
             // U5
             .field("typing_count", &self.typing.len())
+            // U8
+            .field("has_forward_request", &self.forward_request.is_some())
             // U6
             .field("delete_undo", &self.delete_undo)
             .field("message_confirm", &self.message_confirm)

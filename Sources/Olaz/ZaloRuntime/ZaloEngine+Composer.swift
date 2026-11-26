@@ -215,6 +215,14 @@ extension ZaloEngine {
     }
 
     func sendMedia(_ urls: [URL], to id: String) async -> ComposerOutcome {
+        if let sendMediaHostHandler {
+            let args: [String: Any] = [
+                "conv_id": id,
+                "paths": urls.map(\.path),
+            ]
+            _ = traceHost("send_media", args: args)
+            return await sendMediaHostHandler(args)
+        }
         guard !urls.isEmpty, !id.isEmpty else { return .cancelled }
         var sentAny = false
         for url in urls {
@@ -298,6 +306,14 @@ extension ZaloEngine {
     }
 
     func sendFiles(_ urls: [URL], to id: String) async -> ComposerOutcome {
+        if let sendFilesHostHandler {
+            let args: [String: Any] = [
+                "conv_id": id,
+                "paths": urls.map(\.path),
+            ]
+            _ = traceHost("send_files", args: args)
+            return await sendFilesHostHandler(args)
+        }
         guard !urls.isEmpty, !id.isEmpty else { return .cancelled }
         let maxBytes = max(cloud.plan?.fileLimit ?? 0, 100 * 1_048_576)
         let isGroup = ZaloWireParser.isGroupId(id)

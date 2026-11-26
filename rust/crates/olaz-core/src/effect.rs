@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
-use olaz_api::{PollState, SendTextParams};
+use olaz_api::{PollState, SendContactCardParams, SendTextParams};
 use olaz_net::{LoginAccount, QrTicket};
 use olaz_store::{StoredConversation, StoredMessage};
 use olaz_wire::ChatMessage;
@@ -15,6 +15,7 @@ use crate::actions::DeleteUndoItem;
 use crate::conversations::{
     ConversationActionResult, ConversationPreview, IdentityTable, PinBoard,
 };
+use crate::forward::ForwardOutcome;
 use crate::input::{E2eeQuoteArg, HiddenPinSyncKind, SeenTarget, StoreToken};
 use crate::messages::{IdentitySnapshot, MuteEntry};
 use crate::reduce::classify::MobileSyncEvent;
@@ -343,6 +344,8 @@ pub enum OpResult {
     HiddenSearch(Option<Vec<String>>),
     Bool(bool),
     Int(i64),
+    // U8
+    Forward(ForwardOutcome),
     OptI64(Option<i64>),
     // U12
     PollVoters(Option<crate::polls::PollVoters>),
@@ -364,6 +367,7 @@ impl fmt::Debug for OpResult {
                 .finish(),
             Self::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
             Self::Int(n) => f.debug_tuple("Int").field(n).finish(),
+            Self::Forward(o) => f.debug_tuple("Forward").field(o).finish(),
             Self::OptI64(n) => f.debug_tuple("OptI64").field(n).finish(),
             // U12
             Self::PollVoters(v) => f
@@ -544,10 +548,38 @@ pub enum HostCall {
         client_id: String,
         quote: Option<E2eeQuoteArg>,
     },
-    // U6
+    // U8
     ShowCard {
-        conv_id: String,
+        conv_id: Option<String>,
         text: String,
+    },
+    ResolveMedia {
+        forward_id: u64,
+        conv_id: String,
+        msg_id: String,
+        kind: String,
+    },
+    ResolveFile {
+        forward_id: u64,
+        conv_id: String,
+        msg_id: String,
+        name: String,
+        url: Option<String>,
+    },
+    FetchMediaData {
+        forward_id: u64,
+        url: String,
+    },
+    SendMedia {
+        forward_id: u64,
+        conv_id: String,
+        paths: Vec<String>,
+        cleanup_after: bool,
+    },
+    SendFiles {
+        forward_id: u64,
+        conv_id: String,
+        paths: Vec<String>,
     },
 }
 
@@ -683,10 +715,46 @@ impl fmt::Debug for HostCall {
                 .field("send_id", send_id)
                 .field("has_quote", &quote.is_some())
                 .finish(),
-            // U6
-            Self::ShowCard { text, .. } => f
+            // U8
+            Self::ShowCard { conv_id, .. } => f
                 .debug_struct("ShowCard")
-                .field("text_len", &text.len())
+                .field("has_conv_id", &conv_id.is_some())
+                .finish(),
+            Self::ResolveMedia {
+                forward_id, kind, ..
+            } => f
+                .debug_struct("ResolveMedia")
+                .field("forward_id", forward_id)
+                .field("kind", kind)
+                .finish(),
+            Self::ResolveFile {
+                forward_id, url, ..
+            } => f
+                .debug_struct("ResolveFile")
+                .field("forward_id", forward_id)
+                .field("has_url", &url.is_some())
+                .finish(),
+            Self::FetchMediaData { forward_id, .. } => f
+                .debug_struct("FetchMediaData")
+                .field("forward_id", forward_id)
+                .finish(),
+            Self::SendMedia {
+                forward_id,
+                paths,
+                cleanup_after,
+                ..
+            } => f
+                .debug_struct("SendMedia")
+                .field("forward_id", forward_id)
+                .field("paths_count", &paths.len())
+                .field("cleanup_after", cleanup_after)
+                .finish(),
+            Self::SendFiles {
+                forward_id, paths, ..
+            } => f
+                .debug_struct("SendFiles")
+                .field("forward_id", forward_id)
+                .field("paths_count", &paths.len())
                 .finish(),
         }
     }
@@ -898,6 +966,14 @@ pub enum Effect {
     SendTextApi {
         send_id: u64,
         params: SendTextParams,
+    },
+    // U8
+    /// Allocates a client id from `SessionClient::next_client_id` and returns [`Input::ForwardClientIdAllocated`].
+    AllocClientId { forward_id: u64 },
+    /// Calls `ZaloApi::send_contact_card` and returns [`Input::ForwardContactCardDone`].
+    SendContactCardApi {
+        forward_id: u64,
+        params: SendContactCardParams,
     },
     // U12
     /// Calls `ZaloApi::fetch_poll_detail` for `Refresh` or `Voters`.
@@ -1251,6 +1327,16 @@ impl fmt::Debug for Effect {
             Self::SendTextApi { send_id, params } => f
                 .debug_struct("SendTextApi")
                 .field("send_id", send_id)
+                .field("params", params)
+                .finish(),
+            // U8
+            Self::AllocClientId { forward_id } => f
+                .debug_struct("AllocClientId")
+                .field("forward_id", forward_id)
+                .finish(),
+            Self::SendContactCardApi { forward_id, params } => f
+                .debug_struct("SendContactCardApi")
+                .field("forward_id", forward_id)
                 .field("params", params)
                 .finish(),
             // U6

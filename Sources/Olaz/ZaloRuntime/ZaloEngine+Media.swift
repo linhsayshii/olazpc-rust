@@ -337,6 +337,15 @@ extension ZaloEngine {
     /// decrypting `?e2esession=...` payloads, trying fallback URLs (`hd`/`normal`/`ori`/`thumb`), consulting SQLite
     /// when messages are outside the 50-item memory window, and generating first-frame posters for videos.
     func resolveMedia(conversationId: String, messageId: String, kind: MediaKind = .photo, force: Bool = false) async -> MediaResolution {
+        if let resolveMediaHostHandler {
+            let args: [String: Any] = [
+                "conv_id": conversationId,
+                "msg_id": messageId,
+                "kind": kind.rawValue,
+            ]
+            _ = traceHost("resolve_media", args: args)
+            return await resolveMediaHostHandler(args)
+        }
         let key = "\(conversationId)|\(messageId)|\(kind.rawValue)"
         if force, case .file(let bad)? = mediaResolver.known(key), MediaLoader.isOwnLocalFile(bad) {
             try? FileManager.default.removeItem(at: bad)
@@ -461,6 +470,16 @@ extension ZaloEngine {
         force: Bool = false,
         progress: (@Sendable (Double) -> Void)? = nil
     ) async -> FileResolution {
+        if let resolveFileHostHandler {
+            let args: [String: Any] = [
+                "conv_id": conversationId,
+                "msg_id": messageId,
+                "name": name,
+                "url": url?.absoluteString ?? NSNull(),
+            ]
+            _ = traceHost("resolve_file", args: args)
+            return await resolveFileHostHandler(args)
+        }
         var resolvedURL = url
         var resolvedName = name
         if resolvedURL == nil, (!conversationId.isEmpty || !messageId.isEmpty),

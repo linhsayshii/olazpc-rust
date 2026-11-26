@@ -25,6 +25,9 @@ use olaz_core::conversations::{
     message_preview_label, to_wire_stored,
 };
 use olaz_core::effect::Effect;
+use olaz_core::forward::{
+    ComposerSendOutcome, FileResolutionOutcome, ForwardOutcome, MediaResolutionOutcome,
+};
 use olaz_core::input::{Command, E2eeQuoteArg, Input, LegacyCookie, SeenTarget};
 use olaz_core::messages::{HistoryFreshness, MuteEntry};
 use olaz_core::reduce::classify::MobileSyncEvent;
@@ -45,7 +48,7 @@ use olaz_net::{
 use olaz_store::{Store, StoredConversation, StoredMessage};
 use olaz_wire::{
     Availability, ChatMessage, DeleteMode, Kind, Mention, NameLookup, ParsedWireEvent, StarMode,
-    TextStyle, WireParseOptions, decode_stored_message, extract_batch_events,
+    Status, TextStyle, WireParseOptions, decode_stored_message, extract_batch_events,
 };
 use olaz_ws::consts::{CMD_AUTHEN, CMD_PING, CMD_PING_ACTIVE, DEFAULT_WS_ENDPOINTS, FRAME_VERSION};
 use olaz_ws::frame::encode_frame_json;
@@ -1323,6 +1326,12 @@ pub struct RecordingHost {
     shared_store_slot: Mutex<Option<SharedStoreSlot>>,
     store: Mutex<Option<Arc<Mutex<Store>>>>,
     e2ee_send_results: Mutex<VecDeque<Result<SendMessageResult, String>>>,
+    resolve_media_results: Mutex<VecDeque<MediaResolutionOutcome>>,
+    resolve_file_results: Mutex<VecDeque<FileResolutionOutcome>>,
+    fetch_media_data_results: Mutex<VecDeque<bool>>,
+    send_media_results: Mutex<VecDeque<ComposerSendOutcome>>,
+    send_files_results: Mutex<VecDeque<ComposerSendOutcome>>,
+    fwd_photo_counter: Mutex<usize>,
     messages: Mutex<HashMap<String, Vec<ChatMessage>>>,
     open_conversation_id: Mutex<Option<String>>,
     identities: Mutex<IdentityTable>,
@@ -1446,6 +1455,119 @@ impl RecordingHost {
                 }
             }
         }
+        let mut resolve_media_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("resolve_media"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                let outcome = match item
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unavailable")
+                {
+                    "file" | "ok" => match item.get("path").and_then(Value::as_str) {
+                        Some(path) if path.starts_with('/') => {
+                            MediaResolutionOutcome::File(path.to_owned())
+                        }
+                        _ => MediaResolutionOutcome::Unavailable,
+                    },
+                    "expired" => MediaResolutionOutcome::Expired,
+                    "unsupported" => MediaResolutionOutcome::Unsupported,
+                    _ => MediaResolutionOutcome::Unavailable,
+                };
+                resolve_media_results.push_back(outcome);
+            }
+        }
+        let mut resolve_file_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("resolve_file"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                let outcome = match item
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("failed")
+                {
+                    "ready" => match item.get("path").and_then(Value::as_str) {
+                        Some(path) if !path.is_empty() => {
+                            FileResolutionOutcome::Ready(path.to_owned())
+                        }
+                        _ => FileResolutionOutcome::Failed("Missing staged path".to_owned()),
+                    },
+                    "expired" => FileResolutionOutcome::Expired,
+                    _ => FileResolutionOutcome::Failed(
+                        item.get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Không tải được tệp.")
+                            .to_owned(),
+                    ),
+                };
+                resolve_file_results.push_back(outcome);
+            }
+        }
+        let mut fetch_media_data_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("fetch_media_data"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                let has_data = item.get("data_utf8").and_then(Value::as_str).is_some()
+                    || item.get("ok").and_then(Value::as_bool) == Some(true);
+                fetch_media_data_results.push_back(has_data);
+            }
+        }
+        let parse_composer = |item: &Value| -> ComposerSendOutcome {
+            match item
+                .get("outcome")
+                .and_then(Value::as_str)
+                .unwrap_or("failed")
+            {
+                "done" => ComposerSendOutcome::Done,
+                "cancelled" => ComposerSendOutcome::Cancelled,
+                "pending" => ComposerSendOutcome::Pending(
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Đang chờ...")
+                        .to_owned(),
+                ),
+                _ => ComposerSendOutcome::Failed(
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Có lỗi khi gửi tệp")
+                        .to_owned(),
+                ),
+            }
+        };
+        let mut send_media_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("send_media"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                send_media_results.push_back(parse_composer(item));
+            }
+        }
+        let mut send_files_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("send_files"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                send_files_results.push_back(parse_composer(item));
+            }
+        }
         Self {
             saved_session,
             legacy_cookie,
@@ -1466,6 +1588,12 @@ impl RecordingHost {
             shared_store_slot: Mutex::new(None),
             store: Mutex::new(None),
             e2ee_send_results: Mutex::new(e2ee_send_results),
+            resolve_media_results: Mutex::new(resolve_media_results),
+            resolve_file_results: Mutex::new(resolve_file_results),
+            fetch_media_data_results: Mutex::new(fetch_media_data_results),
+            send_media_results: Mutex::new(send_media_results),
+            send_files_results: Mutex::new(send_files_results),
+            fwd_photo_counter: Mutex::new(0),
             messages: Mutex::new(HashMap::new()),
             open_conversation_id: Mutex::new(open_conv),
             identities: Mutex::new(identities),
@@ -2314,6 +2442,118 @@ impl Host for RecordingHost {
             })
     }
 
+    async fn show_card(&self, conv_id: Option<String>, text: String) {
+        if self.is_u6 {
+            self.record(
+                "show_card",
+                json!({
+                    "conv_id": conv_id,
+                    "text": text,
+                }),
+            );
+        }
+    }
+
+    async fn resolve_media(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        kind: String,
+    ) -> MediaResolutionOutcome {
+        self.record(
+            "resolve_media",
+            json!({
+                "conv_id": conv_id,
+                "msg_id": msg_id,
+                "kind": kind,
+            }),
+        );
+        self.resolve_media_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or(MediaResolutionOutcome::Unavailable)
+    }
+
+    async fn resolve_file(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        name: String,
+        url: Option<String>,
+    ) -> FileResolutionOutcome {
+        self.record(
+            "resolve_file",
+            json!({
+                "conv_id": conv_id,
+                "msg_id": msg_id,
+                "name": name,
+                "url": url,
+            }),
+        );
+        self.resolve_file_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or_else(|| {
+                FileResolutionOutcome::Failed("No scripted resolve_file result".to_owned())
+            })
+    }
+
+    async fn fetch_media_data(&self, url: String) -> Option<String> {
+        self.record("fetch_media_data", json!({ "url": url }));
+        let ok = self
+            .fetch_media_data_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or(false);
+        if !ok {
+            return None;
+        }
+        let mut counter = self
+            .fwd_photo_counter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *counter += 1;
+        Some(format!("<tmp>/fwd-{}.jpg", *counter))
+    }
+
+    async fn send_media(
+        &self,
+        conv_id: String,
+        paths: Vec<String>,
+        _cleanup_after: bool,
+    ) -> ComposerSendOutcome {
+        self.record(
+            "send_media",
+            json!({
+                "conv_id": conv_id,
+                "paths": paths,
+            }),
+        );
+        self.send_media_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or_else(|| ComposerSendOutcome::Failed("Có lỗi khi gửi tệp".to_owned()))
+    }
+
+    async fn send_files(&self, conv_id: String, paths: Vec<String>) -> ComposerSendOutcome {
+        self.record(
+            "send_files",
+            json!({
+                "conv_id": conv_id,
+                "paths": paths,
+            }),
+        );
+        self.send_files_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or_else(|| ComposerSendOutcome::Failed("Có lỗi khi gửi tệp".to_owned()))
+    }
+
     async fn apply_remote_reaction(
         &self,
         conv_id: String,
@@ -2385,18 +2625,6 @@ impl Host for RecordingHost {
             );
         }
         self.is_u6
-    }
-
-    async fn show_card(&self, conv_id: String, text: String) {
-        if self.is_u6 {
-            self.record(
-                "show_card",
-                json!({
-                    "conv_id": conv_id,
-                    "text": text,
-                }),
-            );
-        }
     }
 
     async fn apply_batch(
@@ -3234,6 +3462,37 @@ fn enrich_send_message_json(m: &ChatMessage, base: &mut Map<String, Value>) {
     );
 }
 
+#[derive(Clone, Default)]
+struct TestSelection {
+    conv_id: String,
+    ids: Vec<String>,
+    anchor: Option<String>,
+}
+
+fn is_selectable_msg(m: &ChatMessage) -> bool {
+    !matches!(
+        m.kind,
+        Kind::System | Kind::Notice { .. } | Kind::Ecard(_) | Kind::Poll(_)
+    ) && m.status != Status::Sending
+}
+
+fn encode_forward_outcome_json(outcome: &ForwardOutcome) -> Value {
+    match outcome {
+        ForwardOutcome::Done(text) => json!({
+            "status": "done",
+            "text": text,
+        }),
+        ForwardOutcome::Pending(text) => json!({
+            "status": "pending",
+            "text": text,
+        }),
+        ForwardOutcome::Failed(text) => json!({
+            "status": "failed",
+            "text": text,
+        }),
+    }
+}
+
 fn encode_u12_poll_detail(d: &olaz_core::PollDetail) -> Value {
     let opts: Vec<Value> = d
         .options
@@ -4004,11 +4263,14 @@ struct SnapshotOpts<'a> {
     is_u4: bool,
     is_u5: bool,
     is_u6: bool,
+    is_u8: bool,
     is_u12: bool,
     last_send_result: Option<bool>,
     send_logs: &'a Mutex<Vec<String>>,
     prune_next_expiry_ms: Option<i64>,
     action_logs: &'a Mutex<Vec<String>>,
+    selection: Option<&'a TestSelection>,
+    forward_results: &'a Map<String, Value>,
     u12_results: &'a BTreeMap<String, Value>,
     watched_check_ids: Option<&'a [String]>,
     seeded_member_cache: Option<&'a Value>,
@@ -4024,11 +4286,14 @@ async fn capture_case_snapshot(
         is_u4,
         is_u5,
         is_u6,
+        is_u8,
         is_u12,
         last_send_result,
         send_logs,
         prune_next_expiry_ms,
         action_logs,
+        selection,
+        forward_results,
         u12_results,
         watched_check_ids,
         seeded_member_cache,
@@ -4298,6 +4563,31 @@ async fn capture_case_snapshot(
                 );
             }
         }
+        if is_u8 {
+            obj.insert(
+                "forward_request".to_owned(),
+                match &full.forward_request {
+                    Some(req) => json!({
+                        "conv_id": req.conversation_id,
+                        "msg_id": req.message.id,
+                        "more": req.more.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+                    }),
+                    None => Value::Null,
+                },
+            );
+            obj.insert(
+                "selection".to_owned(),
+                match selection {
+                    Some(sel) => json!({
+                        "conv_id": sel.conv_id,
+                        "ids": sel.ids,
+                        "anchor": sel.anchor,
+                    }),
+                    None => Value::Null,
+                },
+            );
+            obj.insert("results".to_owned(), Value::Object(forward_results.clone()));
+        }
     }
     Some(Value::Object(obj))
 }
@@ -4324,8 +4614,9 @@ fn str_vec_arg(args: &Value, key: &str) -> Vec<String> {
 /// Runs a single Case format v1 [`Case`] under paused tokio time and returns the observed
 /// snapshots, final state, sorted canonical requests, and ordered host calls.
 pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
+    let is_u8 = case.domain == "forward";
     let is_u12 = case.domain == "polls";
-    let is_u6 = case.domain == "message_actions";
+    let is_u6 = case.domain == "message_actions" || is_u8;
     let is_u5 = case.domain == "send" || is_u6 || is_u12;
     let is_u4 = case.domain == "bootstrap" || case.domain == "messages" || is_u5;
     let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions" || is_u4;
@@ -4666,7 +4957,10 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let mut pending_action_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut u12_results: BTreeMap<String, Value> = BTreeMap::new();
 
+    let mut selection: Option<TestSelection> = None;
+    let mut forward_results: Map<String, Value> = Map::new();
     for (step_index, step) in case.steps.iter().enumerate() {
+        let step_idx = step_index;
         if is_u12
             && let Step::Cmd {
                 now_ms: Some(step_now),
@@ -5220,6 +5514,145 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                     tokio::time::timeout(dur, wait_fut)
                         .await
                         .map_err(|_| format!("timed out awaiting typing expiry for `{id}`"))?;
+                }
+                "request_forward" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let msg = core
+                        .full_snapshot()
+                        .await
+                        .and_then(|s| {
+                            s.messages
+                                .windows
+                                .get(&conv_id)?
+                                .iter()
+                                .find(|m| m.id == msg_id)
+                                .cloned()
+                        })
+                        .ok_or_else(|| {
+                            format!("request_forward missing msg {msg_id} in {conv_id}")
+                        })?;
+                    core.request_unit(Command::RequestForward {
+                        message: Box::new(msg),
+                    })
+                    .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "select" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let ids = str_vec_arg(args, "ids");
+                    if ids.is_empty() {
+                        selection = None;
+                    } else {
+                        let list = core
+                            .full_snapshot()
+                            .await
+                            .and_then(|s| s.messages.windows.get(&conv_id).cloned())
+                            .unwrap_or_default();
+                        let first_msg =
+                            list.iter()
+                                .find(|m| m.id == ids[0])
+                                .cloned()
+                                .ok_or_else(|| {
+                                    format!("select missing first msg {} in {conv_id}", ids[0])
+                                })?;
+                        let mut sel = TestSelection {
+                            conv_id: first_msg.conversation_id.clone(),
+                            ids: Vec::new(),
+                            anchor: None,
+                        };
+                        if is_selectable_msg(&first_msg) {
+                            sel.ids.push(first_msg.id.clone());
+                            sel.anchor = Some(first_msg.id.clone());
+                        }
+                        for toggle_id in ids.iter().skip(1) {
+                            let Some(target) = list.iter().find(|m| &m.id == toggle_id) else {
+                                continue;
+                            };
+                            if !is_selectable_msg(target) {
+                                continue;
+                            }
+                            if let Some(pos) = sel.ids.iter().position(|x| x == toggle_id) {
+                                sel.ids.remove(pos);
+                                sel.anchor = Some(toggle_id.clone());
+                            } else if sel.ids.len() < 100 {
+                                sel.ids.push(toggle_id.clone());
+                                sel.anchor = Some(toggle_id.clone());
+                            }
+                        }
+                        selection = Some(sel);
+                    }
+                }
+                "forward_selection" => {
+                    let selected: Vec<ChatMessage> = if let Some(sel) = selection.as_ref() {
+                        let id_set: std::collections::HashSet<&str> =
+                            sel.ids.iter().map(String::as_str).collect();
+                        core.full_snapshot()
+                            .await
+                            .and_then(|s| s.messages.windows.get(&sel.conv_id).cloned())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|m| id_set.contains(m.id.as_str()))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    core.request_unit(Command::ForwardSelection { messages: selected })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "forward" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let targets = str_vec_arg(args, "targets");
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    let msg = core
+                        .full_snapshot()
+                        .await
+                        .and_then(|s| {
+                            s.messages
+                                .windows
+                                .get(&conv_id)?
+                                .iter()
+                                .find(|m| m.id == msg_id)
+                                .cloned()
+                        })
+                        .ok_or_else(|| format!("forward missing msg {msg_id} in {conv_id}"))?;
+                    let outcome = core
+                        .request_forward_outcome(Command::Forward {
+                            message: Box::new(msg),
+                            targets,
+                            now_ms: ts_ms,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    forward_results
+                        .insert(step_idx.to_string(), encode_forward_outcome_json(&outcome));
+                }
+                "forward_all" => {
+                    let targets = str_vec_arg(args, "targets");
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    // Drain any earlier mirror changes so clear_selection reflects this op.
+                    while let Ok(Some(_)) =
+                        tokio::time::timeout(Duration::ZERO, core.next_changes()).await
+                    {
+                    }
+                    let outcome = core
+                        .request_forward_outcome(Command::ForwardAll {
+                            targets,
+                            now_ms: ts_ms,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    while let Ok(Some(batch)) =
+                        tokio::time::timeout(Duration::ZERO, core.next_changes()).await
+                    {
+                        if batch.clear_selection {
+                            selection = None;
+                        }
+                    }
+                    forward_results
+                        .insert(step_idx.to_string(), encode_forward_outcome_json(&outcome));
                 }
                 // U6 message_actions domain commands
                 "react" => {
@@ -5916,11 +6349,14 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         is_u4,
                         is_u5,
                         is_u6,
+                        is_u8,
                         is_u12,
                         last_send_result,
                         send_logs: &send_logs,
                         prune_next_expiry_ms,
                         action_logs: &action_logs,
+                        selection: selection.as_ref(),
+                        forward_results: &forward_results,
                         u12_results: &u12_results,
                         watched_check_ids: case.seed.watched_check_ids.as_deref(),
                         seeded_member_cache: case.seed.group_member_cache.as_ref(),
@@ -5972,11 +6408,14 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             is_u4,
             is_u5,
             is_u6,
+            is_u8,
             is_u12,
             last_send_result,
             send_logs: &send_logs,
             prune_next_expiry_ms,
             action_logs: &action_logs,
+            selection: selection.as_ref(),
+            forward_results: &forward_results,
             u12_results: &u12_results,
             watched_check_ids: case.seed.watched_check_ids.as_deref(),
             seeded_member_cache: case.seed.group_member_cache.as_ref(),

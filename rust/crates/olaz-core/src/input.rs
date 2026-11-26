@@ -16,6 +16,7 @@ use crate::conversations::{
     IdentityTable, LocalAccountHydration, MessagePreviewInput,
 };
 use crate::effect::OpResult;
+use crate::forward::{ComposerSendOutcome, FileResolutionOutcome, MediaResolutionOutcome};
 use crate::messages::{ContactsState, HistoryFreshness};
 use crate::state::{CoreFailKind, FailReason, PersistedTransportState};
 use crate::typed_chat::TypedChatEnvelope;
@@ -314,6 +315,28 @@ pub enum Command {
     SetAutoDeleteTtl {
         conv_id: String,
         ttl_ms: i64,
+    },
+    // U8
+    /// Opens the forward picker for a single message (or shows a blocked card).
+    RequestForward {
+        message: Box<ChatMessage>,
+    },
+    /// Opens the forward picker for Swift's current multi-message selection (oldest first).
+    ForwardSelection {
+        messages: Vec<ChatMessage>,
+    },
+    /// Dismisses the active forward picker request (e.g. sheet closed by user).
+    ClearForwardRequest,
+    /// Forwards one message to `targets`.
+    Forward {
+        message: Box<ChatMessage>,
+        targets: Vec<String>,
+        now_ms: i64,
+    },
+    /// Forwards all messages in the active `forward.request` to `targets`.
+    ForwardAll {
+        targets: Vec<String>,
+        now_ms: i64,
     },
 
     // U6
@@ -693,6 +716,21 @@ impl fmt::Debug for Command {
             Self::SetAutoDeleteTtl { ttl_ms, .. } => f
                 .debug_struct("SetAutoDeleteTtl")
                 .field("ttl_ms", ttl_ms)
+                .finish(),
+            // U8
+            Self::RequestForward { .. } => f.write_str("RequestForward"),
+            Self::ForwardSelection { messages } => f
+                .debug_struct("ForwardSelection")
+                .field("count", &messages.len())
+                .finish(),
+            Self::ClearForwardRequest => f.write_str("ClearForwardRequest"),
+            Self::Forward { targets, .. } => f
+                .debug_struct("Forward")
+                .field("targets_count", &targets.len())
+                .finish(),
+            Self::ForwardAll { targets, .. } => f
+                .debug_struct("ForwardAll")
+                .field("targets_count", &targets.len())
                 .finish(),
             // U6
             Self::React {
@@ -1239,6 +1277,35 @@ pub enum Input {
         send_id: u64,
         result: Result<SendMessageResult, String>,
     },
+    // U8
+    ForwardClientIdAllocated {
+        forward_id: u64,
+        client_id: i64,
+    },
+    ForwardContactCardDone {
+        forward_id: u64,
+        result: Result<SendMessageResult, String>,
+    },
+    ForwardMediaResolved {
+        forward_id: u64,
+        resolution: MediaResolutionOutcome,
+    },
+    ForwardFileResolved {
+        forward_id: u64,
+        resolution: FileResolutionOutcome,
+    },
+    ForwardFetchMediaDone {
+        forward_id: u64,
+        temp_path: Option<String>,
+    },
+    ForwardSendMediaDone {
+        forward_id: u64,
+        outcome: ComposerSendOutcome,
+    },
+    ForwardSendFilesDone {
+        forward_id: u64,
+        outcome: ComposerSendOutcome,
+    },
     // U12
     PollDetailFetched {
         op_id: Option<u64>,
@@ -1745,6 +1812,56 @@ impl fmt::Debug for Input {
                 .debug_struct("SendTextDone")
                 .field("send_id", send_id)
                 .field("ok", &result.is_ok())
+                .finish(),
+            // U8
+            Self::ForwardClientIdAllocated { forward_id, .. } => f
+                .debug_struct("ForwardClientIdAllocated")
+                .field("forward_id", forward_id)
+                .finish(),
+            Self::ForwardContactCardDone { forward_id, result } => f
+                .debug_struct("ForwardContactCardDone")
+                .field("forward_id", forward_id)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::ForwardMediaResolved {
+                forward_id,
+                resolution,
+            } => f
+                .debug_struct("ForwardMediaResolved")
+                .field("forward_id", forward_id)
+                .field("resolution", resolution)
+                .finish(),
+            Self::ForwardFileResolved {
+                forward_id,
+                resolution,
+            } => f
+                .debug_struct("ForwardFileResolved")
+                .field("forward_id", forward_id)
+                .field("resolution", resolution)
+                .finish(),
+            Self::ForwardFetchMediaDone {
+                forward_id,
+                temp_path,
+            } => f
+                .debug_struct("ForwardFetchMediaDone")
+                .field("forward_id", forward_id)
+                .field("has_path", &temp_path.is_some())
+                .finish(),
+            Self::ForwardSendMediaDone {
+                forward_id,
+                outcome,
+            } => f
+                .debug_struct("ForwardSendMediaDone")
+                .field("forward_id", forward_id)
+                .field("outcome", outcome)
+                .finish(),
+            Self::ForwardSendFilesDone {
+                forward_id,
+                outcome,
+            } => f
+                .debug_struct("ForwardSendFilesDone")
+                .field("forward_id", forward_id)
+                .field("outcome", outcome)
                 .finish(),
             // U12
             Self::PollDetailFetched {

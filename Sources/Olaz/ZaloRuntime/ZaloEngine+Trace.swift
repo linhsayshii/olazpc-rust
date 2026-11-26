@@ -64,6 +64,12 @@ extension ZaloEngine {
     internal func cancelTasksForRecording() {
         hostTrace = nil
         sendE2EETextHostHandler = nil
+        resolveMediaHostHandler = nil
+        resolveFileHostHandler = nil
+        fetchMediaDataHostHandler = nil
+        sendMediaHostHandler = nil
+        sendFilesHostHandler = nil
+        forwardTempPhotoURL = nil
         traceU4HostEnabled = false
         stateTrace = nil
         transportSettleTrace = nil
@@ -87,6 +93,11 @@ extension ZaloEngine {
         deleteUndoTimerTask = nil
         messageActionTasks.values.forEach { $0.cancel() }
         messageActionTasks.removeAll()
+        contactsTasks.values.forEach { $0.cancel() }
+        contactsTasks.removeAll()
+        pollDebounceSleep = nil
+        resetPolls()
+        pollRefreshTasks.values.forEach { $0.cancel() }
         optimisticOverlayFenceTasks.values.forEach { $0.cancel() }
         optimisticOverlayFenceTasks.removeAll()
         contactsTasks.values.forEach { $0.cancel() }

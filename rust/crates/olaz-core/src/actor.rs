@@ -13,6 +13,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use crate::changes::{ChangeHub, CoreChanges};
 use crate::conversations::{ConversationActionResult, PinBoard};
 use crate::effect::{Effect, OpResult};
+use crate::forward::ForwardOutcome;
 use crate::input::{Command, Input};
 use crate::messages::IdentitySnapshot;
 use crate::reduce::reduce;
@@ -268,6 +269,14 @@ impl CoreHandle {
         match self.request(Command::HiddenSearch { query }).await {
             Some(OpResult::HiddenSearch(ids)) => ids,
             _ => None,
+        }
+    }
+
+    /// Awaits a U8 forward command returning [`ForwardOutcome`].
+    pub async fn request_forward_outcome(&self, command: Command) -> ForwardOutcome {
+        match self.request(command).await {
+            Some(OpResult::Forward(outcome)) => outcome,
+            _ => ForwardOutcome::Failed("Có lỗi khi chia sẻ tin nhắn".to_owned()),
         }
     }
 
