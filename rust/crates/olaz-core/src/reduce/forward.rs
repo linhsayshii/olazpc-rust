@@ -1,12 +1,13 @@
 //! Pure U8 reducer for message forwarding (`requestForward`, `forwardSelection`, `forward`, `forwardAll`).
 
-use olaz_api::{SendContactCardParams, SendMessageResult};
+use olaz_api::SendMessageResult;
 use olaz_wire::{
     Availability, ChatMessage, DeleteMode, Kind, MessageMenu, StarMode, Status,
     encode_chat_message, is_group_id,
 };
 
 use crate::changes::DirtyKey;
+use crate::composer::{ContactCardContinuation, ContactCardSendSpec};
 use crate::effect::{Effect, HostCall, OpResult, StoreOp};
 use crate::forward::{
     ActiveForward, ComposerSendOutcome, FileResolutionOutcome, ForwardClientBody, ForwardMode,
@@ -36,9 +37,6 @@ pub(crate) fn reduce_forward(state: &mut CoreState, input: Input, out: &mut Redu
             forward_id,
             client_id,
         } => on_client_id_allocated(state, forward_id, client_id, out),
-        Input::ForwardContactCardDone { forward_id, result } => {
-            on_contact_card_done(state, forward_id, result, out);
-        }
         Input::ForwardMediaResolved {
             forward_id,
             resolution,
@@ -466,23 +464,34 @@ fn on_client_id_allocated(
             );
         }
         ForwardClientBody::ContactCard(card) => {
-            let params = SendContactCardParams {
+            let now_ms = flow.now_ms;
+            let spec = ContactCardSendSpec {
                 conv_id: target.clone(),
-                card_uid: card.uid.clone(),
+                contact_uid: card.uid.clone(),
+                title: card.name.clone(),
+                avatar: card.avatar.clone().filter(|s| !s.is_empty()),
                 phone: (!card.phone.is_empty()).then(|| card.phone.clone()),
+                qr_code_url: card.qr.clone().unwrap_or_default(),
                 client_id: Some(client_id),
+                now_ms,
+                is_e2ee_override: None,
             };
             flow.step = ForwardStep::SendingContactCard { target, card };
             state.forward.in_flight.insert(forward_id, flow);
-            out.effects
-                .push(Effect::SendContactCardApi { forward_id, params });
+            let _ = crate::reduce::composer::start_contact_card_send(
+                state,
+                spec,
+                ContactCardContinuation::Forward { forward_id },
+                out,
+            );
         }
     }
 }
 
-fn on_contact_card_done(
+pub(crate) fn on_contact_card_done(
     state: &mut CoreState,
     forward_id: u64,
+    is_e2ee: bool,
     result: Result<SendMessageResult, String>,
     out: &mut ReduceOutput,
 ) {
@@ -530,7 +539,7 @@ fn on_contact_card_done(
             status: Status::Sent,
             quote: None,
             reactions: Vec::new(),
-            is_e2ee: false,
+            is_e2ee,
             mentions: Vec::new(),
             card_buttons: Vec::new(),
             suggests_stickers: false,
@@ -1035,7 +1044,7 @@ mod tests {
         );
         assert!(matches!(
             out.effects.as_slice(),
-            [Effect::SendContactCardApi { forward_id: 1, params }]
+            [Effect::SendContactCardApi { card_send_id: 1, params }]
                 if params.conv_id == "3000800b"
                     && params.card_uid == "9001"
                     && params.phone.as_deref() == Some("+84901234567")
@@ -1044,8 +1053,8 @@ mod tests {
 
         let out = reduce(
             &mut state,
-            Input::ForwardContactCardDone {
-                forward_id: 1,
+            Input::ContactCardSendDone {
+                card_send_id: 1,
                 result: Ok(SendMessageResult {
                     msg_id: "9009001".to_owned(),
                     cli_msg_id: "8000000000001".to_owned(),
@@ -1063,6 +1072,98 @@ mod tests {
             e,
             Effect::CompleteOp {
                 op_id: 5,
+                result: OpResult::Forward(ForwardOutcome::Done(Some(t))),
+                after_store: true,
+            } if t == MSG_FORWARD_DONE
+        )));
+    }
+
+    #[test]
+    fn forward_contact_card_to_e2ee_routes_through_shared_e2ee_host_bridge() {
+        let mut state = ready_state();
+        state.send.e2ee_threads.insert("3000800b".to_owned());
+        let m = make_msg(
+            "9008005",
+            "3000800a",
+            Kind::ContactCard(olaz_wire::ContactCard {
+                name: "Card E2EE".to_owned(),
+                uid: "9002".to_owned(),
+                avatar: Some("https://cdn.example.invalid/c.jpg".to_owned()),
+                phone: "+84901234569".to_owned(),
+                qr: Some("https://cdn.example.invalid/qr.png".to_owned()),
+                oa_link: String::new(),
+                is_official_account: false,
+            }),
+            "[Danh thiếp] Card E2EE",
+            Availability::Available,
+        );
+        let out = reduce(
+            &mut state,
+            Input::OpRequest {
+                op_id: 6,
+                cmd: Command::Forward {
+                    message: Box::new(m),
+                    targets: vec!["3000800b".to_owned()],
+                    now_ms: 1_700_000_030_000,
+                },
+            },
+        );
+        assert!(matches!(
+            out.effects.as_slice(),
+            [Effect::AllocClientId { forward_id: 1 }]
+        ));
+
+        let out = reduce(
+            &mut state,
+            Input::ForwardClientIdAllocated {
+                forward_id: 1,
+                client_id: 8_000_000_000_900,
+            },
+        );
+        assert!(matches!(
+            out.effects.as_slice(),
+            [Effect::Host(HostCall::SendE2eeContactCard {
+                card_send_id: 1,
+                conv_id,
+                client_id,
+                contact_uid,
+                title,
+                phone,
+                avatar,
+                qr_code_url,
+            })] if conv_id == "3000800b"
+                && client_id == "8000000000900"
+                && contact_uid == "9002"
+                && title == "Card E2EE"
+                && phone == "+84901234569"
+                && avatar == "https://cdn.example.invalid/c.jpg"
+                && qr_code_url == "https://cdn.example.invalid/qr.png"
+        ));
+
+        let out = reduce(
+            &mut state,
+            Input::ContactCardSendDone {
+                card_send_id: 1,
+                result: Ok(SendMessageResult {
+                    msg_id: "8000000000900".to_owned(),
+                    cli_msg_id: "8000000000900".to_owned(),
+                    ts_ms: 0,
+                }),
+            },
+        );
+        let rows = state
+            .messages
+            .windows
+            .get("3000800b")
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].is_e2ee);
+        assert_eq!(rows[0].id, "8000000000900");
+        assert!(out.effects.iter().any(|e| matches!(
+            e,
+            Effect::CompleteOp {
+                op_id: 6,
                 result: OpResult::Forward(ForwardOutcome::Done(Some(t))),
                 after_store: true,
             } if t == MSG_FORWARD_DONE
