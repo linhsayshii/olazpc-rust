@@ -2695,8 +2695,35 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                        let ok = api.create_reminder(&params).await.is_ok();
-                        sink.send(Input::CreateReminderDone { op_id, ok });
+                        let conv_id = params.conv_id.clone();
+                        let pin = params.pin;
+                        match api.create_reminder(&params).await {
+                            Ok(resp) => {
+                                let data_node = resp
+                                    .get("data")
+                                    .and_then(serde_json::Value::as_object)
+                                    .unwrap_or(&resp);
+                                let mut create_keys: Vec<String> =
+                                    data_node.keys().cloned().collect();
+                                create_keys.sort_unstable();
+                                sink.send(Input::CreateReminderDone {
+                                    op_id,
+                                    conv_id,
+                                    pin,
+                                    ok: true,
+                                    create_keys,
+                                });
+                            }
+                            Err(_) => {
+                                sink.send(Input::CreateReminderDone {
+                                    op_id,
+                                    conv_id,
+                                    pin,
+                                    ok: false,
+                                    create_keys: Vec::new(),
+                                });
+                            }
+                        }
                         drop(guard);
                     });
                 }

@@ -13,7 +13,7 @@ use crate::input::{Command, Input};
 use crate::polls::{
     BoardPinItem, BoardPinList, POLL_DEBOUNCE_DELAY_MS, PollActionResult, PollCapabilities,
     PollPinOutcome, build_pin_limit_confirm, build_poll_voters, clamped_int64,
-    merge_fetched_group_metadata, normalize_poll_detail, poll_detail_shape_log_line,
+    merge_fetched_group_metadata, normalize_poll_detail, poll_detail_shape_anomaly_log_line,
     refresh_poll_pin_state, resolve_poll_group_id,
 };
 use crate::reduce::ReduceOutput;
@@ -323,8 +323,9 @@ pub fn reduce_polls(state: &mut CoreState, input: Input, out: &mut ReduceOutput)
                     complete_op(out, op_id, OpResult::Unit, false);
                     return;
                 };
-                out.effects
-                    .push(Effect::EngineLog(poll_detail_shape_log_line(&data_node)));
+                if let Some(line) = poll_detail_shape_anomaly_log_line(&data_node) {
+                    out.effects.push(Effect::EngineLog(line));
+                }
                 let gid = resolve_poll_group_id(
                     &poll_id,
                     &data_node,
@@ -1068,5 +1069,54 @@ mod tests {
             .expect("cached group updated");
         assert_eq!(cached.name, "Nhóm Poll");
         assert_eq!(cached.members, 2);
+    }
+
+    #[test]
+    fn poll_detail_fetched_omits_shape_log_for_normal_bool_live_payload() {
+        let mut state = CoreState::default();
+        let payload = json!({
+            "data": {
+                "allow_add_new_option": true,
+                "allow_multi_choices": true,
+                "closed": false,
+                "created_time": 1_700_000_000_i64,
+                "creator": "2001001",
+                "expired_time": 0,
+                "is_anonymous": false,
+                "is_hide_vote_preview": false,
+                "joined": false,
+                "num_vote": 0,
+                "options": [
+                    {"option_id": 1, "content": "Opt 1", "voters": []},
+                ],
+                "poll_id": 9303,
+                "poll_type": 0,
+                "question": "Normal live poll",
+                "updated_time": 1_700_000_000_i64,
+            }
+        });
+        let out = reduce(
+            &mut state,
+            Input::PollDetailFetched {
+                op_id: None,
+                poll_id: "9303".to_owned(),
+                purpose: PollDetailPurpose::Refresh {
+                    now_ms: 1_700_010_000_000,
+                },
+                payload: payload.as_object().cloned(),
+                is_authenticated: false,
+            },
+        );
+        let detail = state.polls.details.get("9303").expect("poll detail stored");
+        assert!(detail.allow_add);
+        assert!(detail.multi);
+        assert!(!detail.anonymous);
+        assert!(!detail.hide_preview);
+        assert!(
+            !out.effects.iter().any(
+                |e| matches!(e, Effect::EngineLog(line) if line.starts_with("poll detail shape:"))
+            ),
+            "normal all-bool live payload must not emit shape log"
+        );
     }
 }
