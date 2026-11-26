@@ -722,6 +722,10 @@ async fn run_actor(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests assert invariants on synthetic fixtures"
+)]
 mod tests {
     use olaz_net::LoginAccount;
 

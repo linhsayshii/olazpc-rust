@@ -960,6 +960,10 @@ fn reduce_poll_command(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests assert invariants on synthetic fixtures"
+)]
 mod tests {
     use serde_json::json;
 
