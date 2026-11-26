@@ -14345,12 +14345,13 @@ public struct CoreChangesRecord: Equatable, Hashable {
     public var autoDelete: AutoDeleteUpdateRecord?
     public var starredIds: [String]?
     public var cachedProfiles: [CachedProfileEntry]?
+    public var cachedGroups: [CachedGroupEntry]?
     public var polls: PollsMirrorRecord?
     public var cloud: CloudStateRecord?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, typing: [TypingEntryRecord]?, forwardRequest: ForwardRequestUpdateRecord?, clearSelection: Bool, deleteUndo: DeleteUndoUpdateRecord?, messageConfirm: MessageConfirmUpdateRecord?, autoDelete: AutoDeleteUpdateRecord?, starredIds: [String]?, cachedProfiles: [CachedProfileEntry]?, polls: PollsMirrorRecord? = nil, cloud: CloudStateRecord? = nil) {
+    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, typing: [TypingEntryRecord]?, forwardRequest: ForwardRequestUpdateRecord?, clearSelection: Bool, deleteUndo: DeleteUndoUpdateRecord?, messageConfirm: MessageConfirmUpdateRecord?, autoDelete: AutoDeleteUpdateRecord?, starredIds: [String]?, cachedProfiles: [CachedProfileEntry]?, cachedGroups: [CachedGroupEntry]? = nil, polls: PollsMirrorRecord? = nil, cloud: CloudStateRecord? = nil) {
         self.version = version
         self.session = session
         self.conversations = conversations
@@ -14370,6 +14371,7 @@ public struct CoreChangesRecord: Equatable, Hashable {
         self.autoDelete = autoDelete
         self.starredIds = starredIds
         self.cachedProfiles = cachedProfiles
+        self.cachedGroups = cachedGroups
         self.polls = polls
         self.cloud = cloud
     }
@@ -14409,6 +14411,7 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
                 autoDelete: FfiConverterOptionTypeAutoDeleteUpdateRecord.read(from: &buf), 
                 starredIds: FfiConverterOptionSequenceString.read(from: &buf), 
                 cachedProfiles: FfiConverterOptionSequenceTypeCachedProfileEntry.read(from: &buf), 
+                cachedGroups: FfiConverterOptionSequenceTypeCachedGroupEntry.read(from: &buf), 
                 polls: FfiConverterOptionTypePollsMirrorRecord.read(from: &buf), 
                 cloud: FfiConverterOptionTypeCloudStateRecord.read(from: &buf)
         )
@@ -14434,6 +14437,7 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
         FfiConverterOptionTypeAutoDeleteUpdateRecord.write(value.autoDelete, into: &buf)
         FfiConverterOptionSequenceString.write(value.starredIds, into: &buf)
         FfiConverterOptionSequenceTypeCachedProfileEntry.write(value.cachedProfiles, into: &buf)
+        FfiConverterOptionSequenceTypeCachedGroupEntry.write(value.cachedGroups, into: &buf)
         FfiConverterOptionTypePollsMirrorRecord.write(value.polls, into: &buf)
         FfiConverterOptionTypeCloudStateRecord.write(value.cloud, into: &buf)
     }
@@ -27056,6 +27060,30 @@ fileprivate struct FfiConverterOptionSequenceTypeAutoDeleteEntryRecord: FfiConve
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterSequenceTypeAutoDeleteEntryRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionSequenceTypeCachedGroupEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [CachedGroupEntry]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceTypeCachedGroupEntry.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceTypeCachedGroupEntry.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }

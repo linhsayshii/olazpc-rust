@@ -527,13 +527,17 @@ extension ZaloEngine {
             })).prefix(50)
             if !missingUids.isEmpty, await sessionClient.isAuthenticated,
                let profBox = try? await sessionClient.fetchProfiles(uids: Array(missingUids)) {
+                var nextProfiles = cachedProfiles
                 for (uid, row) in ZaloWireParser.extractProfilesMap(profBox.dict) {
                     let clean = ZaloWireParser.stripUserPrefix(uid)
                     let name = ZaloWireParser.preferredName(row)
                     let avatar = JSONLossless.string(row["avatar"] ?? row["avt"])
                     if !clean.isEmpty, (!name.isEmpty || !avatar.isEmpty) {
-                        cachedProfiles[clean] = ZaloWebKitMigrator.CachedProfile(name: name, avatar: avatar)
+                        nextProfiles[clean] = ZaloWebKitMigrator.CachedProfile(name: name, avatar: avatar)
                     }
+                }
+                if nextProfiles != cachedProfiles {
+                    cachedProfiles = nextProfiles
                 }
             }
         }

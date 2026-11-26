@@ -173,6 +173,8 @@ final class ZaloEngine {
     @ObservationIgnored internal var pendingCoreCommands: [PendingCoreCommand] = []
     @ObservationIgnored internal var appliedMirrorVersion: UInt64 = 0
     @ObservationIgnored internal var isApplyingCoreMirror = false
+    @ObservationIgnored internal var lastPushedIdentityKey: IdentityPushKey?
+    @ObservationIgnored internal var onCoreUpdateIdentities: (() -> Void)?
     @ObservationIgnored internal var offlineConvCore: CoreOfflineConversations?
     @ObservationIgnored internal var mirrorVersionWaiters: [(target: UInt64, continuation: CheckedContinuation<Void, Never>)] = []
     @ObservationIgnored internal var cachedQRPayload: String?
@@ -439,6 +441,7 @@ final class ZaloEngine {
         isApplyingCoreMirror = true
         defer { isApplyingCoreMirror = false }
         offlineConvCore = nil
+        lastPushedIdentityKey = nil
         pollState = ZaloPollState()
         conversations = []
         openConversationId = nil
@@ -613,33 +616,61 @@ final class ZaloEngine {
         // Load identity & non-U3 preference caches; U3 conversations/actions/labels/hidden state are hydrated by `olaz-core`.
         cachedStarredIds = Set((try? await store.getPreferenceStrings(key: "starredIds")) ?? [])
 
-        if let aliasesData = try? await store.getPreferenceData(key: "aliases"),
-           let dict = (try? JSONSerialization.jsonObject(with: aliasesData)) as? [String: String] {
-            cachedAliases = dict
+        let aliasesData = try? await store.getPreferenceData(key: "aliases")
+        let profData = try? await store.getPreferenceData(key: "cachedProfiles")
+        let grpData = try? await store.getPreferenceData(key: "cachedGroups")
+        let ranksData = try? await store.getPreferenceData(key: "activityRanks")
+        let gidData = try? await store.getPreferenceData(key: "gidToUidMap")
+
+        let decodedAliases = aliasesData.flatMap {
+            (try? JSONSerialization.jsonObject(with: $0)) as? [String: String]
         }
-        if let profData = try? await store.getPreferenceData(key: "cachedProfiles"),
-           let decoded = try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedProfile].self, from: profData) {
-            cachedProfiles = decoded
+        let decodedProfiles = profData.flatMap {
+            try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedProfile].self, from: $0)
         }
-        if let grpData = try? await store.getPreferenceData(key: "cachedGroups"),
-           let decoded = try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedGroup].self, from: grpData) {
-            cachedGroups = decoded
+        let decodedGroups = grpData.flatMap {
+            try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedGroup].self, from: $0)
         }
-        if let ranksData = try? await store.getPreferenceData(key: "activityRanks"),
-           let rawRanks = (try? JSONSerialization.jsonObject(with: ranksData)) as? [String: Any] {
+        let decodedRanks: [String: Int64]? = ranksData.flatMap { data in
+            guard let rawRanks = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
             var parsed: [String: Int64] = [:]
             for (k, v) in rawRanks {
                 if let val = JSONLossless.int64(v), val > 0 { parsed[k] = val }
             }
-            cachedActivityRanks = parsed
+            return parsed
         }
-        if let gidData = try? await store.getPreferenceData(key: "gidToUidMap"),
-           let gidToUid = (try? JSONSerialization.jsonObject(with: gidData)) as? [String: String] {
-            await sessionClient.seedGlobalIdMappings(gidToUid)
-            for (gid, uid) in gidToUid where !gid.isEmpty && !uid.isEmpty {
-                cachedFriendGlobalIds[uid] = gid
+        let decodedGidToUid = gidData.flatMap {
+            (try? JSONSerialization.jsonObject(with: $0)) as? [String: String]
+        }
+        if let decodedGidToUid {
+            await sessionClient.seedGlobalIdMappings(decodedGidToUid)
+        }
+
+        // All awaits complete before raising the mirror guard; push once below.
+        isApplyingCoreMirror = true
+        if let decodedAliases, decodedAliases != cachedAliases {
+            cachedAliases = decodedAliases
+        }
+        if let decodedProfiles, decodedProfiles != cachedProfiles {
+            cachedProfiles = decodedProfiles
+        }
+        if let decodedGroups, decodedGroups != cachedGroups {
+            cachedGroups = decodedGroups
+        }
+        if let decodedRanks, decodedRanks != cachedActivityRanks {
+            cachedActivityRanks = decodedRanks
+        }
+        if let decodedGidToUid {
+            var nextGlobalIds = cachedFriendGlobalIds
+            nextGlobalIds.reserveCapacity(nextGlobalIds.count + decodedGidToUid.count)
+            for (gid, uid) in decodedGidToUid where !gid.isEmpty && !uid.isEmpty {
+                nextGlobalIds[uid] = gid
+            }
+            if nextGlobalIds != cachedFriendGlobalIds {
+                cachedFriendGlobalIds = nextGlobalIds
             }
         }
+        isApplyingCoreMirror = false
 
         pushCoreIdentitiesIfRunning()
         await loadNotificationPreferences(from: store)
