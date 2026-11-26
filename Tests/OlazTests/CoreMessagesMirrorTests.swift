@@ -54,7 +54,10 @@ import Testing
             messageConfirm: nil,
             autoDelete: nil,
             starredIds: nil,
-            cachedProfiles: nil
+            cachedProfiles: nil,
+            stickerSuggest: nil,
+            composerConfirm: nil,
+            queuedComposerConfirms: nil
         )
     }
 

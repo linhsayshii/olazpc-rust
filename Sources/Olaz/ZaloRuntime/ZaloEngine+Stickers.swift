@@ -193,174 +193,57 @@ struct TypingStickerState: Equatable {
 
 extension ZaloEngine {
     func stickerTabs() async -> [StickerTab]? {
-        guard let box = try? await sessionClient.fetchStickerCategories() else { return nil }
-        var tabs: [[String: Any]] = []
-        if let recents = try? await recentStickersFromSQLite(), !recents.isEmpty {
-            tabs.append(["id": StickerTab.recentId, "name": "Gần đây", "icon": "", "count": recents.count])
-        }
-        for row in box.array {
-            let id = Int(JSONLossless.int64(row["id"] ?? row["cateId"]) ?? -1)
-            guard id >= 0 else { continue }
-            tabs.append([
-                "id": id,
-                "name": JSONLossless.string(row["name"]),
-                "icon": JSONLossless.string(row["iconUrl"] ?? row["icon"]),
-                "count": Int(JSONLossless.int64(row["total"] ?? row["count"]) ?? 0)
-            ])
-        }
-        return StickerTab.list(json: tabs)
+        guard let core = await ensureCoreEngine() else { return nil }
+        guard let records = try? await core.stickerTabs() else { return nil }
+        return records.map(StickerTab.init(coreRecord:))
     }
 
     func stickers(inTab id: Int) async -> [StickerEntry]? {
-        if id == StickerTab.recentId {
-            let recents = (try? await recentStickersFromSQLite()) ?? []
-            return StickerEntry.list(json: recents)
-        }
-        guard let box = try? await sessionClient.fetchStickerCategoryDetail(cateId: id) else { return nil }
-        let rows: [[String: Any]] = {
-            if let direct = box.dict["data"] as? [[String: Any]] {
-                return direct
-            }
-            if let dataNode = box.dict["data"] as? [String: Any] {
-                return (dataNode["stickers"] as? [[String: Any]])
-                    ?? ((dataNode["\(id)"] as? [String: Any])?["stickers"] as? [[String: Any]])
-                    ?? []
-            }
-            return []
-        }()
-        let mapped = rows.map { normalizeStickerRow($0, fallbackCateId: id) }
-        return StickerEntry.list(json: mapped)
+        guard let core = await ensureCoreEngine() else { return nil }
+        guard let records = try? await core.stickersInTab(id: Int64(id)) else { return nil }
+        return records.compactMap(StickerEntry.init(coreRecord:))
     }
 
     func searchStickers(_ text: String) async -> [StickerEntry]? {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-        guard let box = try? await sessionClient.searchStickersAPI(keyword: trimmed, limit: 40) else { return nil }
-        let mapped = box.array.map { normalizeStickerRow($0, fallbackCateId: 0) }
-        return StickerEntry.list(json: mapped, limit: 40)
+        guard let core = await ensureCoreEngine() else { return nil }
+        guard let records = try? await core.searchStickers(text: text) else { return nil }
+        return records.compactMap(StickerEntry.init(coreRecord:))
     }
 
     func typingStickerSuggestions(in conversationId: String, text: String) async -> [StickerEntry] {
         guard StickerSuggestState.shared.setting?.enabled != false else { return [] }
-        if !ZaloWireParser.isGroupId(conversationId), await e2eeManager.isE2EEConversation(conversationId) {
-            return []
-        }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let box = try? await sessionClient.suggestStickersAPI(keyword: trimmed) else { return [] }
-        let mapped = box.array.map { normalizeStickerRow($0, fallbackCateId: 0) }
-        return StickerEntry.list(json: mapped, limit: 30)
+        let isE2EE: Bool = ZaloWireParser.isGroupId(conversationId)
+            ? false
+            : await e2eeManager.isE2EEConversation(conversationId)
+        guard let core = await ensureCoreEngine() else { return [] }
+        guard let records = try? await core.typingStickerSuggestions(
+            convId: conversationId,
+            text: text,
+            isE2ee: isE2EE
+        ) else { return [] }
+        return records.compactMap(StickerEntry.init(coreRecord:))
     }
 
     func sendSticker(_ sticker: StickerEntry, in conversationId: String, source: StickerSource, typed: String? = nil, index: Int = -1) async -> CardActionOutcome {
+        guard let core = await ensureCoreEngine() else {
+            return .failed("Không gửi được sticker. Hãy thử lại.")
+        }
+        let isE2EE: Bool = ZaloWireParser.isGroupId(conversationId)
+            ? false
+            : await e2eeManager.isE2EEConversation(conversationId)
+        let cliInt = await sessionClient.nextClientId()
+        let tsMs = nowMs()
         do {
-            var isE2EE = false
-            if !ZaloWireParser.isGroupId(conversationId) {
-                isE2EE = await e2eeManager.isE2EEConversation(conversationId)
-            }
-            let res: SendMessageResult
-            if isE2EE {
-                if let sendE2EEStickerHostHandler {
-                    let cliInt = await sessionClient.nextClientId()
-                    let cliId = "\(cliInt)"
-                    let args: [String: Any] = [
-                        "conv_id": conversationId,
-                        "cate_id": sticker.cateId,
-                        "sticker_id": sticker.stickerId,
-                        "client_id": cliId,
-                    ]
-                    _ = traceHost("send_e2ee_sticker", args: args)
-                    guard let hostRes = try await sendE2EEStickerHostHandler(args) else {
-                        return .failed("Không gửi được sticker mã hóa đầu cuối.")
-                    }
-                    res = hostRes
-                } else {
-                let myUid = profile?.userId ?? ""
-                guard !myUid.isEmpty,
-                      await e2eeManager.ensureSessions(forPeer: conversationId, myUid: myUid, webSocket: webSocket, store: sqliteStore) else {
-                    EngineLog.shared.write("sendSticker e2ee failed: no open Signal session for peer=\(conversationId)")
-                    return .failed("Không gửi được sticker mã hóa đầu cuối.")
-                }
-                let encryptedDevices = await e2eeManager.encryptStickerMessage(
-                    peerUid: conversationId,
-                    myUid: myUid,
-                    stickerId: sticker.stickerId,
-                    cateId: sticker.cateId,
-                    stickerType: 7,
-                    store: sqliteStore
-                )
-                guard !encryptedDevices.isEmpty else {
-                    EngineLog.shared.write("sendSticker e2ee failed: encryption produced no peer payloads for peer=\(conversationId)")
-                    return .failed("Không gửi được sticker mã hóa đầu cuối.")
-                }
-                let senderIid = await e2eeManager.localRegistrationId()
-                let imei = await sessionClient.imei
-                let cliInt = await sessionClient.nextClientId()
-                let listParams: [[String: Any]] = encryptedDevices.compactMap { dev in
-                    guard dev.ciphers.count >= 3 else { return nil }
-                    let extra: [String: Any] = [
-                        "stickerId": dev.ciphers[0],
-                        "cateId": dev.ciphers[1],
-                        "type": dev.ciphers[2],
-                        "zsource": 101,
-                    ]
-                    return ZaloSessionClient.buildE2EEListParamEntry(
-                        toId: dev.toId,
-                        platform: dev.platform,
-                        clientId: cliInt,
-                        imei: imei,
-                        registrationId: dev.registrationId,
-                        senderIid: senderIid,
-                        extraFields: extra
-                    )
-                }
-                guard !listParams.isEmpty else {
-                    EngineLog.shared.write("sendSticker e2ee failed: empty listParams for peer=\(conversationId)")
-                    return .failed("Không gửi được sticker mã hóa đầu cuối.")
-                }
-                res = try await sessionClient.sendE2EEMessageAPI(
-                    endpoint: "sticker",
-                    threadId: conversationId,
-                    isGroup: false,
-                    clientId: cliInt,
-                    listParams: ZaloJSONArrayBox(listParams)
-                )
-                }
-            } else {
-                res = try await sessionClient.sendStickerAPI(convId: conversationId, cateId: sticker.cateId, stickerId: sticker.stickerId)
-            }
-            let msg = ChatMessage(
-                id: res.msgId,
-                conversationId: conversationId,
-                senderId: profile?.userId ?? "",
-                senderName: profile?.displayName ?? "Bạn",
-                senderAvatar: profile?.avatar,
-                isMine: true,
-                kind: .sticker(url: sticker.url),
-                text: "[Sticker]",
-                date: Date(timeIntervalSince1970: Double(nowMs()) / 1000.0),
-                status: .sent,
-                quote: nil,
-                reactions: [],
-                isE2EE: isE2EE,
-                mentions: [],
-                cardButtons: [],
-                suggestsStickers: false,
-                menu: MessageMenu(json: [
-                    "forward": "ok",
-                    "recall": conversationId != selfConversationId,
-                    "delete": conversationId == selfConversationId ? "plain" : "forMe",
-                    "pin": false,
-                    "star": "star"
-                ]),
-                clientId: res.cliMsgId
+            let outcome = try await core.sendSticker(
+                convId: conversationId,
+                sticker: sticker.coreRecord,
+                source: source.coreRecord,
+                clientId: cliInt,
+                nowMs: tsMs,
+                isE2ee: isE2EE
             )
-            mergeMessageIntoMemory(msg, replacingClientId: res.cliMsgId)
-            if let stored = ZaloWireParser.encodeChatMessage(msg, clientId: res.cliMsgId) {
-                try? await sqliteStore?.saveMessages([stored])
-            }
-            updateConversationOnMessage(msg, incrementUnread: false)
-            await saveRecentSticker(sticker)
-            return .done
+            await waitForCoreMirrorDrain()
+            return CardActionOutcome(coreRecord: outcome)
         } catch {
             EngineLog.shared.write("sendSticker failed: \(error.localizedDescription)")
             return .failed("Không gửi được sticker. Hãy thử lại.")
@@ -368,70 +251,23 @@ extension ZaloEngine {
     }
 
     func stickerSuggestSetting() async -> StickerSuggestSetting? {
-        let enabled = (try? await sqliteStore?.getPreferenceBool(key: "stickerSuggest", default: true)) ?? true
-        return StickerSuggestSetting(json: ["ok": true, "enabled": enabled, "debounce": 180])
+        guard let core = await ensureCoreEngine() else { return nil }
+        guard let rec = try? await core.stickerSetting() else { return nil }
+        return StickerSuggestSetting(coreRecord: rec)
     }
 
     func setStickerSuggest(enabled: Bool) async -> StickerSuggestSetting? {
-        try? await sqliteStore?.setPreferenceBool(key: "stickerSuggest", value: enabled)
-        let now = await stickerSuggestSetting()
-        StickerSuggestState.shared.apply(now)
-        return now
+        guard let core = await ensureCoreEngine() else { return nil }
+        let rec = try? await core.setStickerSuggest(enabled: enabled)
+        let mapped = rec.map(StickerSuggestSetting.init(coreRecord:))
+        StickerSuggestState.shared.apply(mapped)
+        return mapped
     }
 
     func resetStickers() {
         StickerSuggestState.shared.reset()
-    }
-
-    private func normalizeStickerRow(_ row: [String: Any], fallbackCateId: Int) -> [String: Any] {
-        let id = Int(JSONLossless.int64(row["id"] ?? row["stickerId"] ?? row["sticker_id"]) ?? 0)
-        let cate = Int(JSONLossless.int64(row["cateId"] ?? row["cate_id"]) ?? Int64(fallbackCateId))
-        let explicitUrl = JSONLossless.string(row["stickerUrl"] ?? row["url"])
-        let urlStr = explicitUrl.isEmpty
-            ? ZaloWireParser.stickerCDNURL(cateId: cate, stickerId: "\(id)")
-            : explicitUrl
-        var out: [String: Any] = [
-            "id": id,
-            "cateId": cate,
-            "type": Int(JSONLossless.int64(row["type"]) ?? 7),
-            "url": urlStr
-        ]
-        let sprite = JSONLossless.string(row["stickerSpriteUrl"]).replacingOccurrences(of: "http://", with: "https://")
-        let frames = Int(JSONLossless.int64(row["totalFrames"]) ?? 0)
-        if sprite.hasPrefix("https://"), (2...200).contains(frames) {
-            let dur = Int(JSONLossless.int64(row["duration"]) ?? 120)
-            out["anim"] = [
-                "kind": "sprite",
-                "url": sprite,
-                "frames": frames,
-                "ms": max(30, min(1000, dur > 0 ? dur : 120))
-            ]
-        }
-        return out
-    }
-
-    private func recentStickersFromSQLite() async throws -> [[String: Any]] {
-        guard let store = sqliteStore,
-              let data = try await store.getPreferenceData(key: "recentStickers"),
-              let rows = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
-            return []
-        }
-        return rows
-    }
-
-    private func saveRecentSticker(_ sticker: StickerEntry) async {
-        guard let store = sqliteStore else { return }
-        var rows = (try? await recentStickersFromSQLite()) ?? []
-        rows.removeAll { (JSONLossless.int64($0["id"]) == Int64(sticker.stickerId)) }
-        rows.insert([
-            "id": sticker.stickerId,
-            "cateId": sticker.cateId,
-            "type": 7,
-            "url": sticker.url.absoluteString
-        ], at: 0)
-        if rows.count > 30 { rows = Array(rows.prefix(30)) }
-        if let data = try? JSONSerialization.data(withJSONObject: rows) {
-            try? await store.setPreferenceData(key: "recentStickers", data: data)
+        if !isApplyingCoreMirror {
+            coreLifecycle.core?.resetStickers()
         }
     }
 }

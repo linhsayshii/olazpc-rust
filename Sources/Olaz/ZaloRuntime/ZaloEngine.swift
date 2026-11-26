@@ -189,6 +189,7 @@ final class ZaloEngine {
     }
     @ObservationIgnored internal var sendE2EETextHostHandler: (([String: Any]) async throws -> SendMessageResult)?
     @ObservationIgnored internal var sendE2EEStickerHostHandler: (([String: Any]) async throws -> SendMessageResult?)?
+    @ObservationIgnored internal var sendE2EEContactCardHostHandler: (([String: Any]) async throws -> SendMessageResult)?
     @ObservationIgnored internal var traceU4HostEnabled: Bool = false {
         didSet {
             let active = (hostTrace != nil) && traceU4HostEnabled

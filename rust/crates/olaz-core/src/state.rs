@@ -12,8 +12,10 @@ use olaz_ws::CursorMap;
 use serde_json::{Map, Value, json};
 
 use crate::actions::{ActionsState, DeleteUndoSnapshot, MessageConfirmState};
+use crate::composer::{ComposerConfirm, ComposerState};
 use crate::conversations::{CachedProfile, ConversationsState};
 use crate::messages::{ContactsState, IdentitySnapshot, MessagesState};
+use crate::stickers::{StickerState, StickerSuggestSetting};
 use crate::typing::{TypingState, TypingStatus};
 
 /// Top-level state owned by the single `olaz-core` actor.
@@ -32,6 +34,9 @@ pub struct CoreState {
     pub send: crate::reduce::send::SendState,
     // U6
     pub actions: ActionsState,
+    // U13
+    pub stickers: StickerState,
+    pub composer: ComposerState,
 }
 
 impl CoreState {
@@ -52,6 +57,10 @@ impl CoreState {
             starred_ids: self.actions.starred_ids.clone(),
             cached_profiles: self.conversations.identities.cached_profiles.clone(),
             last_prune_next_expiry_ms: self.actions.last_prune_next_expiry_ms,
+            // U13
+            sticker_suggest_setting: self.stickers.suggest_setting,
+            composer_confirm: self.composer.active_confirm.clone(),
+            queued_composer_confirms: self.composer.queued_confirms.iter().cloned().collect(),
         }
     }
 
@@ -87,6 +96,9 @@ impl fmt::Debug for CoreState {
             .field("send", &self.send)
             // U6
             .field("actions", &self.actions)
+            // U13
+            .field("stickers", &self.stickers)
+            .field("composer", &self.composer)
             .finish()
     }
 }
@@ -107,6 +119,10 @@ pub struct CoreSnapshot {
     pub starred_ids: BTreeSet<String>,
     pub cached_profiles: BTreeMap<String, CachedProfile>,
     pub last_prune_next_expiry_ms: Option<i64>,
+    // U13
+    pub sticker_suggest_setting: Option<StickerSuggestSetting>,
+    pub composer_confirm: Option<ComposerConfirm>,
+    pub queued_composer_confirms: Vec<ComposerConfirm>,
 }
 
 impl fmt::Debug for CoreSnapshot {
@@ -128,6 +144,13 @@ impl fmt::Debug for CoreSnapshot {
             .field("starred_ids_count", &self.starred_ids.len())
             .field("cached_profiles_count", &self.cached_profiles.len())
             .field("last_prune_next_expiry_ms", &self.last_prune_next_expiry_ms)
+            // U13
+            .field("sticker_suggest_setting", &self.sticker_suggest_setting)
+            .field("has_composer_confirm", &self.composer_confirm.is_some())
+            .field(
+                "queued_composer_confirms_count",
+                &self.queued_composer_confirms.len(),
+            )
             .finish()
     }
 }

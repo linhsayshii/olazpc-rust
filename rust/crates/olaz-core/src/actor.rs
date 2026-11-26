@@ -11,6 +11,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::changes::{ChangeHub, CoreChanges};
+use crate::composer::{ComposerOutcome, MyCardInfo, ReminderComposeInfo};
 use crate::conversations::{ConversationActionResult, PinBoard};
 use crate::effect::{Effect, OpResult};
 use crate::input::{Command, Input};
@@ -18,6 +19,7 @@ use crate::messages::IdentitySnapshot;
 use crate::reduce::reduce;
 use crate::runner::EffectRunner;
 use crate::state::{CoreSnapshot, CoreState, SessionSnapshot};
+use crate::stickers::{CardActionOutcome, StickerEntry, StickerSuggestSetting, StickerTab};
 
 enum ActorMsg {
     Input {
@@ -279,6 +281,59 @@ impl CoreHandle {
     pub async fn request_opt_i64(&self, command: Command) -> Option<i64> {
         match self.request(command).await {
             Some(OpResult::OptI64(v)) => v,
+            _ => None,
+        }
+    }
+
+    // U13 typed request helpers
+    pub async fn request_sticker_tabs(&self) -> Option<Vec<StickerTab>> {
+        match self.request(Command::StickerTabs).await {
+            Some(OpResult::StickerTabs(v)) => v,
+            _ => None,
+        }
+    }
+
+    pub async fn request_sticker_entries(&self, command: Command) -> Option<Vec<StickerEntry>> {
+        match self.request(command).await {
+            Some(OpResult::StickerEntries(v)) => v,
+            _ => None,
+        }
+    }
+
+    pub async fn request_sticker_suggest_setting(
+        &self,
+        command: Command,
+    ) -> Option<StickerSuggestSetting> {
+        match self.request(command).await {
+            Some(OpResult::StickerSuggestSetting(s)) => s,
+            _ => None,
+        }
+    }
+
+    pub async fn request_card_action(&self, command: Command) -> CardActionOutcome {
+        match self.request(command).await {
+            Some(OpResult::CardActionOutcome(o)) => o,
+            _ => CardActionOutcome::Failed("Không gửi được sticker. Hãy thử lại.".to_owned()),
+        }
+    }
+
+    pub async fn request_composer_outcome(&self, command: Command) -> ComposerOutcome {
+        match self.request(command).await {
+            Some(OpResult::ComposerOutcome(o)) => o,
+            _ => ComposerOutcome::Failed(crate::composer::COMPOSER_GENERIC_FAILURE.to_owned()),
+        }
+    }
+
+    pub async fn request_my_card(&self) -> Option<MyCardInfo> {
+        match self.request(Command::MyCard).await {
+            Some(OpResult::MyCard(c)) => c,
+            _ => None,
+        }
+    }
+
+    pub async fn request_reminder_info(&self, conv_id: String) -> Option<ReminderComposeInfo> {
+        match self.request(Command::ReminderComposeInfo { conv_id }).await {
+            Some(OpResult::ReminderComposeInfo(r)) => r,
             _ => None,
         }
     }

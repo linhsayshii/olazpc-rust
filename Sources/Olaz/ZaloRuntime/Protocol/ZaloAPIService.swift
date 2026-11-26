@@ -677,7 +677,8 @@ extension ZaloSessionClient {
         isGroup: Bool,
         clientId: Int64,
         listParams: [[String: Any]],
-        destType: Int = 3
+        destType: Int = 3,
+        msgType: Int? = nil
     ) -> (service: String, path: String, payload: [String: Any]) {
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(threadId) : ZaloWireParser.stripUserPrefix(threadId)
         if isGroup {
@@ -687,12 +688,15 @@ extension ZaloSessionClient {
         }
         let listStr = (try? JSONSerialization.data(withJSONObject: listParams, options: [.sortedKeys]))
             .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "listParams": listStr,
             "destType": destType,
             "threadId": cleanId,
             "clientId": clientId,
         ]
+        if let msgType {
+            payload["msgType"] = msgType
+        }
         return ("chat_e2e", "/api/e2ee/pc/message/\(endpoint)", payload)
     }
 
@@ -734,7 +738,8 @@ extension ZaloSessionClient {
         isGroup: Bool,
         clientId: Int64,
         listParams: ZaloJSONArrayBox,
-        destType: Int = 3
+        destType: Int = 3,
+        msgType: Int? = nil
     ) async throws -> SendMessageResult {
         let spec = Self.buildE2EEMessageRequestPayload(
             endpoint: endpoint,
@@ -742,7 +747,8 @@ extension ZaloSessionClient {
             isGroup: isGroup,
             clientId: clientId,
             listParams: listParams.array,
-            destType: destType
+            destType: destType,
+            msgType: msgType
         )
         let resp = try await post(
             service: spec.service,

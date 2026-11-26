@@ -1255,6 +1255,11 @@ public func FfiConverterTypeCoreApi_lower(_ value: CoreApi) -> UInt64 {
 public protocol CoreEngineProtocol: AnyObject, Sendable {
     
     /**
+     * Answers the active composer confirm dialog (schedules 300 ms promotion if queued).
+     */
+    func answerComposerConfirm(confirmId: String, ok: Bool) 
+    
+    /**
      * Answers the active message-action confirmation dialog (`ok = true` executes, `false` cancels).
      */
     func answerMessageConfirm(ok: Bool, nowMs: Int64) 
@@ -1306,6 +1311,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func closeConversation() 
     
     /**
+     * Reports a composer outcome (`Failed` / `Pending` emit `show_card`).
+     */
+    func composerReport(convId: String, outcome: ComposerOutcomeRecord) 
+    
+    /**
      * Deletes a conversation on the server, in SQLite, and in memory.
      */
     func confirmDeleteConversation(id: String, lastCliMsgId: String) 
@@ -1314,6 +1324,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Creates a new conversation label using caller-supplied `now_ms` and `rand4` for deterministic IDs.
      */
     func createConversationLabel(name: String, colorHex: String, conversationIds: [String], nowMs: Int64, rand4: String) 
+    
+    /**
+     * Creates a reminder (enforces official title limits before HTTP).
+     */
+    func createReminder(convId: String, title: String, startMs: Int64, repeatMode: Int64, pin: Bool) async throws  -> ComposerOutcomeRecord
     
     /**
      * Returns the latest monotonic revision published to the change stream.
@@ -1356,6 +1371,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * number of events applied across those batches.
      */
     func drainChatPolling(maxBatches: UInt32, notifyIncoming: Bool) async throws  -> UInt32
+    
+    /**
+     * Cancels any pending confirm promotion timer and drops all composer confirms.
+     */
+    func dropComposerConfirms() 
     
     /**
      * Drops the active single-conversation hidden unlock.
@@ -1437,6 +1457,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Moves a conversation between Focus (`to_other = false`) and Other (`to_other = true`).
      */
     func moveConversation(id: String, toOther: Bool) 
+    
+    /**
+     * Returns own contact card info from the active profile.
+     */
+    func myCard() async throws  -> MyCardInfoRecord?
     
     /**
      * Pulls the next coalesced batch of dirty domain snapshots, or `None` after [`Self::stop`].
@@ -1528,6 +1553,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func relockHidden() 
     
     /**
+     * Queries reminder compose capabilities and title limits for `conv_id`.
+     */
+    func reminderComposeInfo(convId: String) async throws  -> ReminderComposeInfoRecord?
+    
+    /**
      * Removes a conversation locally (e.g. after leaving a group) and persists the removal.
      */
     func removeLocalConversation(id: String) async throws  -> UInt64
@@ -1558,6 +1588,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func requestPinBoard(id: String) async throws  -> PinBoardRecord?
     
     /**
+     * Resets composer state (cancels timers, drops confirms, fails in-flight contact cards).
+     */
+    func resetComposer() 
+    
+    /**
      * Resets conversation actions, prompt, hidden PIN caches, and UI state.
      */
     func resetConversationActions() 
@@ -1573,9 +1608,24 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func resetOutgoingTyping(convId: String) 
     
     /**
+     * Resets sticker pack cache and in-memory suggest setting.
+     */
+    func resetStickers() 
+    
+    /**
      * Resolves missing conversation display names in 50-UID chunks via `get_profiles`.
      */
     func resolveMissingNames() async throws  -> UInt64
+    
+    /**
+     * Searches stickers by keyword (max 40).
+     */
+    func searchStickers(text: String) async throws  -> [StickerEntryRecord]?
+    
+    /**
+     * Seeds active + queued composer confirms in core state.
+     */
+    func seedComposerConfirms(active: ComposerConfirmRecord?, queued: [ComposerConfirmRecord]) 
     
     func seedContacts(contacts: ContactsStateRecord) 
     
@@ -1585,6 +1635,21 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Seeds previously loaded seen-reaction dedup keys into core without writing back to SQLite.
      */
     func seedSeenReactionKeys(keys: [String]) 
+    
+    /**
+     * Seeds in-memory sticker suggest setting (for tests / state sync).
+     */
+    func seedStickerSuggestSetting(setting: StickerSuggestSettingRecord?) 
+    
+    /**
+     * Sends own contact card (plain or 1-1 E2EE via `send_e2ee_contact_card`).
+     */
+    func sendMyCard(convId: String, withPhone: Bool, clientId: Int64?, nowMs: Int64, isE2ee: Bool?) async throws  -> ComposerOutcomeRecord
+    
+    /**
+     * Sends a sticker through the U5 send pipeline (optimistic message, dedupe, recent persistence).
+     */
+    func sendSticker(convId: String, sticker: StickerEntryRecord, source: StickerSourceRecord, clientId: Int64, nowMs: Int64, isE2ee: Bool?) async throws  -> CardActionOutcomeRecord
     
     /**
      * Sends a text message (plain API or E2EE host boundary) with core-owned optimistic row,
@@ -1643,6 +1708,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func setStarred(convId: String, msgId: String, on: Bool) 
     
     /**
+     * Persists `stickerSuggest` preference and updates in-memory suggest state.
+     */
+    func setStickerSuggest(enabled: Bool) async throws  -> StickerSuggestSettingRecord?
+    
+    /**
      * Enqueues barriers across the actor mailbox, serial host worker, and serial SQLite store
      * worker until all pending host/store jobs and the inputs they feed back into the actor have
      * been reduced and published (`0` if already stopped).
@@ -1660,6 +1730,21 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Starts the engine (idempotent; subsequent calls are no-ops).
      */
     func start() 
+    
+    /**
+     * Reads persisted `stickerSuggest` preference without mutating in-memory suggest state.
+     */
+    func stickerSetting() async throws  -> StickerSuggestSettingRecord?
+    
+    /**
+     * Fetches sticker tabs (recent + Củ hành + server categories with >= 5 pack caching).
+     */
+    func stickerTabs() async throws  -> [StickerTabRecord]?
+    
+    /**
+     * Fetches stickers in tab `id` (`-2` recent, `0` built-in, `> 0` server category).
+     */
+    func stickersInTab(id: Int64) async throws  -> [StickerEntryRecord]?
     
     /**
      * Stops the actor, aborts in-flight session & transport tasks, and closes `next_changes()`.
@@ -1680,6 +1765,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Syncs hidden conversations and PIN digest from the server.
      */
     func syncHiddenConversations() async throws  -> UInt64
+    
+    /**
+     * Fetches typing sticker suggestions for `conv_id` and `text` (empty on E2EE or disabled).
+     */
+    func typingStickerSuggestions(convId: String, text: String, isE2ee: Bool?) async throws  -> [StickerEntryRecord]?
     
     /**
      * Cancels the active 5 s delete-undo bar, restores messages, and shows the restore card.
@@ -1846,6 +1936,19 @@ public convenience init(session: CoreSession, host: CoreHost)throws  {
 
     
 
+    
+    /**
+     * Answers the active composer confirm dialog (schedules 300 ms promotion if queued).
+     */
+open func answerComposerConfirm(confirmId: String, ok: Bool)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_answer_composer_confirm(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(confirmId),
+        FfiConverterBool.lower(ok),uniffiCallStatus
+    )
+}
+}
     
     /**
      * Answers the active message-action confirmation dialog (`ok = true` executes, `false` cancels).
@@ -2039,6 +2142,19 @@ open func closeConversation()  {try! rustCall() {
 }
     
     /**
+     * Reports a composer outcome (`Failed` / `Pending` emit `show_card`).
+     */
+open func composerReport(convId: String, outcome: ComposerOutcomeRecord)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_composer_report(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(convId),
+        FfiConverterTypeComposerOutcomeRecord_lower(outcome),uniffiCallStatus
+    )
+}
+}
+    
+    /**
      * Deletes a conversation on the server, in SQLite, and in memory.
      */
 open func confirmDeleteConversation(id: String, lastCliMsgId: String)  {try! rustCall() {
@@ -2065,6 +2181,25 @@ open func createConversationLabel(name: String, colorHex: String, conversationId
         FfiConverterString.lower(rand4),uniffiCallStatus
     )
 }
+}
+    
+    /**
+     * Creates a reminder (enforces official title limits before HTTP).
+     */
+open func createReminder(convId: String, title: String, startMs: Int64, repeatMode: Int64, pin: Bool)async throws  -> ComposerOutcomeRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_create_reminder(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(title),FfiConverterInt64.lower(startMs),FfiConverterInt64.lower(repeatMode),FfiConverterBool.lower(pin)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeComposerOutcomeRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -2173,6 +2308,17 @@ open func drainChatPolling(maxBatches: UInt32, notifyIncoming: Bool)async throws
             liftFunc: FfiConverterUInt32.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
+}
+    
+    /**
+     * Cancels any pending confirm promotion timer and drops all composer confirms.
+     */
+open func dropComposerConfirms()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_drop_composer_confirms(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
 }
     
     /**
@@ -2421,6 +2567,25 @@ open func moveConversation(id: String, toOther: Bool)  {try! rustCall() {
         FfiConverterBool.lower(toOther),uniffiCallStatus
     )
 }
+}
+    
+    /**
+     * Returns own contact card info from the active profile.
+     */
+open func myCard()async throws  -> MyCardInfoRecord?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_my_card(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeMyCardInfoRecord.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -2712,6 +2877,25 @@ open func relockHidden()  {try! rustCall() {
 }
     
     /**
+     * Queries reminder compose capabilities and title limits for `conv_id`.
+     */
+open func reminderComposeInfo(convId: String)async throws  -> ReminderComposeInfoRecord?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_reminder_compose_info(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeReminderComposeInfoRecord.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
      * Removes a conversation locally (e.g. after leaving a group) and persists the removal.
      */
 open func removeLocalConversation(id: String)async throws  -> UInt64  {
@@ -2797,6 +2981,17 @@ open func requestPinBoard(id: String)async throws  -> PinBoardRecord?  {
 }
     
     /**
+     * Resets composer state (cancels timers, drops confirms, fails in-flight contact cards).
+     */
+open func resetComposer()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_reset_composer(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
+    /**
      * Resets conversation actions, prompt, hidden PIN caches, and UI state.
      */
 open func resetConversationActions()  {try! rustCall() {
@@ -2839,6 +3034,17 @@ open func resetOutgoingTyping(convId: String)  {try! rustCall() {
 }
     
     /**
+     * Resets sticker pack cache and in-memory suggest setting.
+     */
+open func resetStickers()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_reset_stickers(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
+    /**
      * Resolves missing conversation display names in 50-UID chunks via `get_profiles`.
      */
 open func resolveMissingNames()async throws  -> UInt64  {
@@ -2855,6 +3061,38 @@ open func resolveMissingNames()async throws  -> UInt64  {
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
+}
+    
+    /**
+     * Searches stickers by keyword (max 40).
+     */
+open func searchStickers(text: String)async throws  -> [StickerEntryRecord]?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_search_stickers(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(text)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionSequenceTypeStickerEntryRecord.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Seeds active + queued composer confirms in core state.
+     */
+open func seedComposerConfirms(active: ComposerConfirmRecord?, queued: [ComposerConfirmRecord])  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_seed_composer_confirms(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionTypeComposerConfirmRecord.lower(active),
+        FfiConverterSequenceTypeComposerConfirmRecord.lower(queued),uniffiCallStatus
+    )
+}
 }
     
 open func seedContacts(contacts: ContactsStateRecord)  {try! rustCall() {
@@ -2885,6 +3123,56 @@ open func seedSeenReactionKeys(keys: [String])  {try! rustCall() {
         FfiConverterSequenceString.lower(keys),uniffiCallStatus
     )
 }
+}
+    
+    /**
+     * Seeds in-memory sticker suggest setting (for tests / state sync).
+     */
+open func seedStickerSuggestSetting(setting: StickerSuggestSettingRecord?)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_seed_sticker_suggest_setting(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionTypeStickerSuggestSettingRecord.lower(setting),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Sends own contact card (plain or 1-1 E2EE via `send_e2ee_contact_card`).
+     */
+open func sendMyCard(convId: String, withPhone: Bool, clientId: Int64?, nowMs: Int64, isE2ee: Bool?)async throws  -> ComposerOutcomeRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_send_my_card(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterBool.lower(withPhone),FfiConverterOptionInt64.lower(clientId),FfiConverterInt64.lower(nowMs),FfiConverterOptionBool.lower(isE2ee)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeComposerOutcomeRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Sends a sticker through the U5 send pipeline (optimistic message, dedupe, recent persistence).
+     */
+open func sendSticker(convId: String, sticker: StickerEntryRecord, source: StickerSourceRecord, clientId: Int64, nowMs: Int64, isE2ee: Bool?)async throws  -> CardActionOutcomeRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_send_sticker(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterTypeStickerEntryRecord_lower(sticker),FfiConverterTypeStickerSourceRecord_lower(source),FfiConverterInt64.lower(clientId),FfiConverterInt64.lower(nowMs),FfiConverterOptionBool.lower(isE2ee)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCardActionOutcomeRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -3047,6 +3335,25 @@ open func setStarred(convId: String, msgId: String, on: Bool)  {try! rustCall() 
 }
     
     /**
+     * Persists `stickerSuggest` preference and updates in-memory suggest state.
+     */
+open func setStickerSuggest(enabled: Bool)async throws  -> StickerSuggestSettingRecord?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_set_sticker_suggest(
+                        self.uniffiCloneHandle(),FfiConverterBool.lower(enabled)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeStickerSuggestSettingRecord.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
      * Enqueues barriers across the actor mailbox, serial host worker, and serial SQLite store
      * worker until all pending host/store jobs and the inputs they feed back into the actor have
      * been reduced and published (`0` if already stopped).
@@ -3099,6 +3406,63 @@ open func start()  {try! rustCall() {
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
+}
+    
+    /**
+     * Reads persisted `stickerSuggest` preference without mutating in-memory suggest state.
+     */
+open func stickerSetting()async throws  -> StickerSuggestSettingRecord?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_sticker_setting(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeStickerSuggestSettingRecord.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Fetches sticker tabs (recent + Củ hành + server categories with >= 5 pack caching).
+     */
+open func stickerTabs()async throws  -> [StickerTabRecord]?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_sticker_tabs(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionSequenceTypeStickerTabRecord.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Fetches stickers in tab `id` (`-2` recent, `0` built-in, `> 0` server category).
+     */
+open func stickersInTab(id: Int64)async throws  -> [StickerEntryRecord]?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_stickers_in_tab(
+                        self.uniffiCloneHandle(),FfiConverterInt64.lower(id)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionSequenceTypeStickerEntryRecord.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -3158,6 +3522,25 @@ open func syncHiddenConversations()async throws  -> UInt64  {
             completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
             freeFunc: ffi_olaz_ffi_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Fetches typing sticker suggestions for `conv_id` and `text` (empty on E2EE or disabled).
+     */
+open func typingStickerSuggestions(convId: String, text: String, isE2ee: Bool?)async throws  -> [StickerEntryRecord]?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_typing_sticker_suggestions(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(text),FfiConverterOptionBool.lower(isE2ee)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionSequenceTypeStickerEntryRecord.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
 }
@@ -3617,6 +4000,12 @@ public protocol CoreHost: AnyObject, Sendable {
     func sendE2eeText(convId: String, text: String, clientId: String, quote: E2eeQuoteArgRecord?) async  -> E2eeSendOutcomeRecord
     
     func showCard(convId: String, text: String) async 
+    
+    func sendE2eeSticker(convId: String, cateId: Int64, stickerId: Int64, clientId: String) async  -> E2eeStickerSendOutcomeRecord
+    
+    func sendE2eeContactCard(convId: String, clientId: String, contactUid: String, title: String, phone: String, avatar: String, qrCodeUrl: String) async  -> E2eeSendOutcomeRecord
+    
+    func sleepConfirmPromote(delayMs: UInt64) async 
     
 }
 /**
@@ -4439,6 +4828,57 @@ open func showCard(convId: String, text: String)async   {
             rustFutureFunc: {
                 uniffi_olaz_ffi_fn_method_corehost_show_card(
                         self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(text)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
+            freeFunc: ffi_olaz_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+open func sendE2eeSticker(convId: String, cateId: Int64, stickerId: Int64, clientId: String)async  -> E2eeStickerSendOutcomeRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_send_e2ee_sticker(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterInt64.lower(cateId),FfiConverterInt64.lower(stickerId),FfiConverterString.lower(clientId)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeE2eeStickerSendOutcomeRecord_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func sendE2eeContactCard(convId: String, clientId: String, contactUid: String, title: String, phone: String, avatar: String, qrCodeUrl: String)async  -> E2eeSendOutcomeRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_send_e2ee_contact_card(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(clientId),FfiConverterString.lower(contactUid),FfiConverterString.lower(title),FfiConverterString.lower(phone),FfiConverterString.lower(avatar),FfiConverterString.lower(qrCodeUrl)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeE2eeSendOutcomeRecord_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func sleepConfirmPromote(delayMs: UInt64)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_sleep_confirm_promote(
+                        self.uniffiCloneHandle(),FfiConverterUInt64.lower(delayMs)
                 )
             },
             pollFunc: ffi_olaz_ffi_rust_future_poll_void,
@@ -6346,6 +6786,148 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                 return await uniffiObj.showCard(
                      convId: try FfiConverterString.lift(convId),
                      text: try FfiConverterString.lift(text)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        sendE2eeSticker: { (
+            uniffiHandle: UInt64,
+            convId: RustBuffer,
+            cateId: Int64,
+            stickerId: Int64,
+            clientId: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> E2eeStickerSendOutcomeRecord in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.sendE2eeSticker(
+                     convId: try FfiConverterString.lift(convId),
+                     cateId: try FfiConverterInt64.lift(cateId),
+                     stickerId: try FfiConverterInt64.lift(stickerId),
+                     clientId: try FfiConverterString.lift(clientId)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: E2eeStickerSendOutcomeRecord) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterTypeE2eeStickerSendOutcomeRecord_lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        sendE2eeContactCard: { (
+            uniffiHandle: UInt64,
+            convId: RustBuffer,
+            clientId: RustBuffer,
+            contactUid: RustBuffer,
+            title: RustBuffer,
+            phone: RustBuffer,
+            avatar: RustBuffer,
+            qrCodeUrl: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> E2eeSendOutcomeRecord in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.sendE2eeContactCard(
+                     convId: try FfiConverterString.lift(convId),
+                     clientId: try FfiConverterString.lift(clientId),
+                     contactUid: try FfiConverterString.lift(contactUid),
+                     title: try FfiConverterString.lift(title),
+                     phone: try FfiConverterString.lift(phone),
+                     avatar: try FfiConverterString.lift(avatar),
+                     qrCodeUrl: try FfiConverterString.lift(qrCodeUrl)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: E2eeSendOutcomeRecord) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterTypeE2eeSendOutcomeRecord_lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        sleepConfirmPromote: { (
+            uniffiHandle: UInt64,
+            delayMs: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.sleepConfirmPromote(
+                     delayMs: try FfiConverterUInt64.lift(delayMs)
                 )
             }
 
@@ -11495,6 +12077,126 @@ public func FfiConverterTypeChatMessageRecord_lower(_ value: ChatMessageRecord) 
 }
 
 
+public struct ComposerConfirmRecord: Equatable, Hashable {
+    public var id: String
+    public var convId: String
+    public var title: String
+    public var message: String
+    public var ok: String
+    public var cancel: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, convId: String, title: String, message: String, ok: String, cancel: String) {
+        self.id = id
+        self.convId = convId
+        self.title = title
+        self.message = message
+        self.ok = ok
+        self.cancel = cancel
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ComposerConfirmRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeComposerConfirmRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ComposerConfirmRecord {
+        return
+            try ComposerConfirmRecord(
+                id: FfiConverterString.read(from: &buf), 
+                convId: FfiConverterString.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                message: FfiConverterString.read(from: &buf), 
+                ok: FfiConverterString.read(from: &buf), 
+                cancel: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ComposerConfirmRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.convId, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterString.write(value.message, into: &buf)
+        FfiConverterString.write(value.ok, into: &buf)
+        FfiConverterString.write(value.cancel, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeComposerConfirmRecord_lift(_ buf: RustBuffer) throws -> ComposerConfirmRecord {
+    return try FfiConverterTypeComposerConfirmRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeComposerConfirmRecord_lower(_ value: ComposerConfirmRecord) -> RustBuffer {
+    return FfiConverterTypeComposerConfirmRecord.lower(value)
+}
+
+
+public struct ComposerConfirmUpdateRecord: Equatable, Hashable {
+    public var confirm: ComposerConfirmRecord?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(confirm: ComposerConfirmRecord?) {
+        self.confirm = confirm
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ComposerConfirmUpdateRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeComposerConfirmUpdateRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ComposerConfirmUpdateRecord {
+        return
+            try ComposerConfirmUpdateRecord(
+                confirm: FfiConverterOptionTypeComposerConfirmRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ComposerConfirmUpdateRecord, into buf: inout [UInt8]) {
+        FfiConverterOptionTypeComposerConfirmRecord.write(value.confirm, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeComposerConfirmUpdateRecord_lift(_ buf: RustBuffer) throws -> ComposerConfirmUpdateRecord {
+    return try FfiConverterTypeComposerConfirmUpdateRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeComposerConfirmUpdateRecord_lower(_ value: ComposerConfirmUpdateRecord) -> RustBuffer {
+    return FfiConverterTypeComposerConfirmUpdateRecord.lower(value)
+}
+
+
 public struct ContactCardRecord: Equatable, Hashable {
     public var name: String
     public var uid: String
@@ -12394,10 +13096,13 @@ public struct CoreChangesRecord: Equatable, Hashable {
     public var autoDelete: AutoDeleteUpdateRecord?
     public var starredIds: [String]?
     public var cachedProfiles: [CachedProfileEntry]?
+    public var stickerSuggest: StickerSuggestUpdateRecord?
+    public var composerConfirm: ComposerConfirmUpdateRecord?
+    public var queuedComposerConfirms: [ComposerConfirmRecord]?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, typing: [TypingEntryRecord]?, deleteUndo: DeleteUndoUpdateRecord?, messageConfirm: MessageConfirmUpdateRecord?, autoDelete: AutoDeleteUpdateRecord?, starredIds: [String]?, cachedProfiles: [CachedProfileEntry]?) {
+    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, typing: [TypingEntryRecord]?, deleteUndo: DeleteUndoUpdateRecord?, messageConfirm: MessageConfirmUpdateRecord?, autoDelete: AutoDeleteUpdateRecord?, starredIds: [String]?, cachedProfiles: [CachedProfileEntry]?, stickerSuggest: StickerSuggestUpdateRecord?, composerConfirm: ComposerConfirmUpdateRecord?, queuedComposerConfirms: [ComposerConfirmRecord]?) {
         self.version = version
         self.session = session
         self.conversations = conversations
@@ -12415,6 +13120,9 @@ public struct CoreChangesRecord: Equatable, Hashable {
         self.autoDelete = autoDelete
         self.starredIds = starredIds
         self.cachedProfiles = cachedProfiles
+        self.stickerSuggest = stickerSuggest
+        self.composerConfirm = composerConfirm
+        self.queuedComposerConfirms = queuedComposerConfirms
     }
 
     
@@ -12449,7 +13157,10 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
                 messageConfirm: FfiConverterOptionTypeMessageConfirmUpdateRecord.read(from: &buf), 
                 autoDelete: FfiConverterOptionTypeAutoDeleteUpdateRecord.read(from: &buf), 
                 starredIds: FfiConverterOptionSequenceString.read(from: &buf), 
-                cachedProfiles: FfiConverterOptionSequenceTypeCachedProfileEntry.read(from: &buf)
+                cachedProfiles: FfiConverterOptionSequenceTypeCachedProfileEntry.read(from: &buf), 
+                stickerSuggest: FfiConverterOptionTypeStickerSuggestUpdateRecord.read(from: &buf), 
+                composerConfirm: FfiConverterOptionTypeComposerConfirmUpdateRecord.read(from: &buf), 
+                queuedComposerConfirms: FfiConverterOptionSequenceTypeComposerConfirmRecord.read(from: &buf)
         )
     }
 
@@ -12471,6 +13182,9 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
         FfiConverterOptionTypeAutoDeleteUpdateRecord.write(value.autoDelete, into: &buf)
         FfiConverterOptionSequenceString.write(value.starredIds, into: &buf)
         FfiConverterOptionSequenceTypeCachedProfileEntry.write(value.cachedProfiles, into: &buf)
+        FfiConverterOptionTypeStickerSuggestUpdateRecord.write(value.stickerSuggest, into: &buf)
+        FfiConverterOptionTypeComposerConfirmUpdateRecord.write(value.composerConfirm, into: &buf)
+        FfiConverterOptionSequenceTypeComposerConfirmRecord.write(value.queuedComposerConfirms, into: &buf)
     }
 }
 
@@ -15297,6 +16011,72 @@ public func FfiConverterTypeMuteEntryRecord_lower(_ value: MuteEntryRecord) -> R
 }
 
 
+public struct MyCardInfoRecord: Equatable, Hashable {
+    public var uid: String
+    public var name: String
+    public var avatar: String?
+    public var phone: String
+    public var withPhone: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(uid: String, name: String, avatar: String?, phone: String, withPhone: Bool) {
+        self.uid = uid
+        self.name = name
+        self.avatar = avatar
+        self.phone = phone
+        self.withPhone = withPhone
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MyCardInfoRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMyCardInfoRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MyCardInfoRecord {
+        return
+            try MyCardInfoRecord(
+                uid: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                avatar: FfiConverterOptionString.read(from: &buf), 
+                phone: FfiConverterString.read(from: &buf), 
+                withPhone: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MyCardInfoRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.uid, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterOptionString.write(value.avatar, into: &buf)
+        FfiConverterString.write(value.phone, into: &buf)
+        FfiConverterBool.write(value.withPhone, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMyCardInfoRecord_lift(_ buf: RustBuffer) throws -> MyCardInfoRecord {
+    return try FfiConverterTypeMyCardInfoRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMyCardInfoRecord_lower(_ value: MyCardInfoRecord) -> RustBuffer {
+    return FfiConverterTypeMyCardInfoRecord.lower(value)
+}
+
+
 /**
  * One cached contact (`nameLookup` result for `uid`).
  */
@@ -16486,6 +17266,84 @@ public func FfiConverterTypeReactionRecord_lower(_ value: ReactionRecord) -> Rus
 }
 
 
+public struct ReminderComposeInfoRecord: Equatable, Hashable {
+    public var allowed: Bool
+    public var hidden: Bool
+    public var text: String
+    public var isGroup: Bool
+    public var canPin: Bool
+    public var pinToggle: Bool
+    public var titleMaxChars: Int64
+    public var titleMaxBytes: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(allowed: Bool, hidden: Bool, text: String, isGroup: Bool, canPin: Bool, pinToggle: Bool, titleMaxChars: Int64, titleMaxBytes: Int64) {
+        self.allowed = allowed
+        self.hidden = hidden
+        self.text = text
+        self.isGroup = isGroup
+        self.canPin = canPin
+        self.pinToggle = pinToggle
+        self.titleMaxChars = titleMaxChars
+        self.titleMaxBytes = titleMaxBytes
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ReminderComposeInfoRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeReminderComposeInfoRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReminderComposeInfoRecord {
+        return
+            try ReminderComposeInfoRecord(
+                allowed: FfiConverterBool.read(from: &buf), 
+                hidden: FfiConverterBool.read(from: &buf), 
+                text: FfiConverterString.read(from: &buf), 
+                isGroup: FfiConverterBool.read(from: &buf), 
+                canPin: FfiConverterBool.read(from: &buf), 
+                pinToggle: FfiConverterBool.read(from: &buf), 
+                titleMaxChars: FfiConverterInt64.read(from: &buf), 
+                titleMaxBytes: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ReminderComposeInfoRecord, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.allowed, into: &buf)
+        FfiConverterBool.write(value.hidden, into: &buf)
+        FfiConverterString.write(value.text, into: &buf)
+        FfiConverterBool.write(value.isGroup, into: &buf)
+        FfiConverterBool.write(value.canPin, into: &buf)
+        FfiConverterBool.write(value.pinToggle, into: &buf)
+        FfiConverterInt64.write(value.titleMaxChars, into: &buf)
+        FfiConverterInt64.write(value.titleMaxBytes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReminderComposeInfoRecord_lift(_ buf: RustBuffer) throws -> ReminderComposeInfoRecord {
+    return try FfiConverterTypeReminderComposeInfoRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReminderComposeInfoRecord_lower(_ value: ReminderComposeInfoRecord) -> RustBuffer {
+    return FfiConverterTypeReminderComposeInfoRecord.lower(value)
+}
+
+
 public struct RemovalRecord: Equatable, Hashable {
     public var seq: Int64
     public var ids: [String]
@@ -17079,6 +17937,234 @@ public func FfiConverterTypeSignalSessionRecord_lift(_ buf: RustBuffer) throws -
 #endif
 public func FfiConverterTypeSignalSessionRecord_lower(_ value: SignalSessionRecord) -> RustBuffer {
     return FfiConverterTypeSignalSessionRecord.lower(value)
+}
+
+
+public struct StickerEntryRecord: Equatable, Hashable {
+    public var cateId: Int64
+    public var stickerId: Int64
+    public var url: String
+    public var animation: StickerAnimationRecord?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(cateId: Int64, stickerId: Int64, url: String, animation: StickerAnimationRecord?) {
+        self.cateId = cateId
+        self.stickerId = stickerId
+        self.url = url
+        self.animation = animation
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension StickerEntryRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStickerEntryRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StickerEntryRecord {
+        return
+            try StickerEntryRecord(
+                cateId: FfiConverterInt64.read(from: &buf), 
+                stickerId: FfiConverterInt64.read(from: &buf), 
+                url: FfiConverterString.read(from: &buf), 
+                animation: FfiConverterOptionTypeStickerAnimationRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: StickerEntryRecord, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.cateId, into: &buf)
+        FfiConverterInt64.write(value.stickerId, into: &buf)
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterOptionTypeStickerAnimationRecord.write(value.animation, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStickerEntryRecord_lift(_ buf: RustBuffer) throws -> StickerEntryRecord {
+    return try FfiConverterTypeStickerEntryRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStickerEntryRecord_lower(_ value: StickerEntryRecord) -> RustBuffer {
+    return FfiConverterTypeStickerEntryRecord.lower(value)
+}
+
+
+public struct StickerSuggestSettingRecord: Equatable, Hashable {
+    public var enabled: Bool
+    public var debounce: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(enabled: Bool, debounce: Int64) {
+        self.enabled = enabled
+        self.debounce = debounce
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension StickerSuggestSettingRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStickerSuggestSettingRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StickerSuggestSettingRecord {
+        return
+            try StickerSuggestSettingRecord(
+                enabled: FfiConverterBool.read(from: &buf), 
+                debounce: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: StickerSuggestSettingRecord, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.enabled, into: &buf)
+        FfiConverterInt64.write(value.debounce, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStickerSuggestSettingRecord_lift(_ buf: RustBuffer) throws -> StickerSuggestSettingRecord {
+    return try FfiConverterTypeStickerSuggestSettingRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStickerSuggestSettingRecord_lower(_ value: StickerSuggestSettingRecord) -> RustBuffer {
+    return FfiConverterTypeStickerSuggestSettingRecord.lower(value)
+}
+
+
+public struct StickerSuggestUpdateRecord: Equatable, Hashable {
+    public var setting: StickerSuggestSettingRecord?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(setting: StickerSuggestSettingRecord?) {
+        self.setting = setting
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension StickerSuggestUpdateRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStickerSuggestUpdateRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StickerSuggestUpdateRecord {
+        return
+            try StickerSuggestUpdateRecord(
+                setting: FfiConverterOptionTypeStickerSuggestSettingRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: StickerSuggestUpdateRecord, into buf: inout [UInt8]) {
+        FfiConverterOptionTypeStickerSuggestSettingRecord.write(value.setting, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStickerSuggestUpdateRecord_lift(_ buf: RustBuffer) throws -> StickerSuggestUpdateRecord {
+    return try FfiConverterTypeStickerSuggestUpdateRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStickerSuggestUpdateRecord_lower(_ value: StickerSuggestUpdateRecord) -> RustBuffer {
+    return FfiConverterTypeStickerSuggestUpdateRecord.lower(value)
+}
+
+
+public struct StickerTabRecord: Equatable, Hashable {
+    public var id: Int64
+    public var name: String
+    public var icon: String?
+    public var count: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: Int64, name: String, icon: String?, count: Int64) {
+        self.id = id
+        self.name = name
+        self.icon = icon
+        self.count = count
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension StickerTabRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStickerTabRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StickerTabRecord {
+        return
+            try StickerTabRecord(
+                id: FfiConverterInt64.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                icon: FfiConverterOptionString.read(from: &buf), 
+                count: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: StickerTabRecord, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.id, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterOptionString.write(value.icon, into: &buf)
+        FfiConverterInt64.write(value.count, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStickerTabRecord_lift(_ buf: RustBuffer) throws -> StickerTabRecord {
+    return try FfiConverterTypeStickerTabRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStickerTabRecord_lower(_ value: StickerTabRecord) -> RustBuffer {
+    return FfiConverterTypeStickerTabRecord.lower(value)
 }
 
 
@@ -18129,6 +19215,238 @@ public func FfiConverterTypeAvailabilityRecord_lower(_ value: AvailabilityRecord
 
 
 
+
+public enum CardActionOutcomeRecord: Equatable, Hashable {
+    
+    case done
+    case openChat(id: String
+    )
+    case openProfile(uid: String
+    )
+    case openUrl(url: String
+    )
+    case copy(text: String
+    )
+    case present
+    case unsupported(text: String
+    )
+    case locked(text: String
+    )
+    case failed(text: String
+    )
+    case pending(text: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension CardActionOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCardActionOutcomeRecord: FfiConverterRustBuffer {
+    typealias SwiftType = CardActionOutcomeRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CardActionOutcomeRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .done
+        
+        case 2: return .openChat(id: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .openProfile(uid: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .openUrl(url: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 5: return .copy(text: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 6: return .present
+        
+        case 7: return .unsupported(text: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 8: return .locked(text: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 9: return .failed(text: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 10: return .pending(text: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CardActionOutcomeRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .done:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .openChat(id):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(id, into: &buf)
+            
+        
+        case let .openProfile(uid):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(uid, into: &buf)
+            
+        
+        case let .openUrl(url):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(url, into: &buf)
+            
+        
+        case let .copy(text):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(text, into: &buf)
+            
+        
+        case .present:
+            writeInt(&buf, Int32(6))
+        
+        
+        case let .unsupported(text):
+            writeInt(&buf, Int32(7))
+            FfiConverterString.write(text, into: &buf)
+            
+        
+        case let .locked(text):
+            writeInt(&buf, Int32(8))
+            FfiConverterString.write(text, into: &buf)
+            
+        
+        case let .failed(text):
+            writeInt(&buf, Int32(9))
+            FfiConverterString.write(text, into: &buf)
+            
+        
+        case let .pending(text):
+            writeInt(&buf, Int32(10))
+            FfiConverterString.write(text, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCardActionOutcomeRecord_lift(_ buf: RustBuffer) throws -> CardActionOutcomeRecord {
+    return try FfiConverterTypeCardActionOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCardActionOutcomeRecord_lower(_ value: CardActionOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypeCardActionOutcomeRecord.lower(value)
+}
+
+
+
+
+public enum ComposerOutcomeRecord: Equatable, Hashable {
+    
+    case done
+    case cancelled
+    case failed(text: String
+    )
+    case pending(text: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ComposerOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeComposerOutcomeRecord: FfiConverterRustBuffer {
+    typealias SwiftType = ComposerOutcomeRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ComposerOutcomeRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .done
+        
+        case 2: return .cancelled
+        
+        case 3: return .failed(text: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .pending(text: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ComposerOutcomeRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .done:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .cancelled:
+            writeInt(&buf, Int32(2))
+        
+        
+        case let .failed(text):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(text, into: &buf)
+            
+        
+        case let .pending(text):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(text, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeComposerOutcomeRecord_lift(_ buf: RustBuffer) throws -> ComposerOutcomeRecord {
+    return try FfiConverterTypeComposerOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeComposerOutcomeRecord_lower(_ value: ComposerOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypeComposerOutcomeRecord.lower(value)
+}
+
+
+
 /**
  * Control routing decision returned by [`classify_control_envelope`] (pure FFI helper for
  * direct Swift unit tests of `ZaloEngine.processControlEnvelope`).
@@ -18924,6 +20242,90 @@ public func FfiConverterTypeE2eeSendOutcomeRecord_lift(_ buf: RustBuffer) throws
 #endif
 public func FfiConverterTypeE2eeSendOutcomeRecord_lower(_ value: E2eeSendOutcomeRecord) -> RustBuffer {
     return FfiConverterTypeE2eeSendOutcomeRecord.lower(value)
+}
+
+
+
+/**
+ * Outcome returned by Swift's `send_e2ee_sticker` host callback (U13).
+ */
+
+public enum E2eeStickerSendOutcomeRecord: Equatable, Hashable {
+    
+    case sent(msgId: String, cliMsgId: String, tsMs: Int64
+    )
+    case e2eeFailed
+    case apiFailed(message: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension E2eeStickerSendOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeE2eeStickerSendOutcomeRecord: FfiConverterRustBuffer {
+    typealias SwiftType = E2eeStickerSendOutcomeRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> E2eeStickerSendOutcomeRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .sent(msgId: try FfiConverterString.read(from: &buf), cliMsgId: try FfiConverterString.read(from: &buf), tsMs: try FfiConverterInt64.read(from: &buf)
+        )
+        
+        case 2: return .e2eeFailed
+        
+        case 3: return .apiFailed(message: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: E2eeStickerSendOutcomeRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .sent(msgId,cliMsgId,tsMs):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(msgId, into: &buf)
+            FfiConverterString.write(cliMsgId, into: &buf)
+            FfiConverterInt64.write(tsMs, into: &buf)
+            
+        
+        case .e2eeFailed:
+            writeInt(&buf, Int32(2))
+        
+        
+        case let .apiFailed(message):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(message, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeE2eeStickerSendOutcomeRecord_lift(_ buf: RustBuffer) throws -> E2eeStickerSendOutcomeRecord {
+    return try FfiConverterTypeE2eeStickerSendOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeE2eeStickerSendOutcomeRecord_lower(_ value: E2eeStickerSendOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypeE2eeStickerSendOutcomeRecord.lower(value)
 }
 
 
@@ -20625,6 +22027,160 @@ public func FfiConverterTypeStatusRecord_lower(_ value: StatusRecord) -> RustBuf
 
 
 
+
+public enum StickerAnimationRecord: Equatable, Hashable {
+    
+    case sprite(url: String, frames: Int64, frameMs: Int64
+    )
+    case animated(url: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension StickerAnimationRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStickerAnimationRecord: FfiConverterRustBuffer {
+    typealias SwiftType = StickerAnimationRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StickerAnimationRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .sprite(url: try FfiConverterString.read(from: &buf), frames: try FfiConverterInt64.read(from: &buf), frameMs: try FfiConverterInt64.read(from: &buf)
+        )
+        
+        case 2: return .animated(url: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: StickerAnimationRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .sprite(url,frames,frameMs):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(url, into: &buf)
+            FfiConverterInt64.write(frames, into: &buf)
+            FfiConverterInt64.write(frameMs, into: &buf)
+            
+        
+        case let .animated(url):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(url, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStickerAnimationRecord_lift(_ buf: RustBuffer) throws -> StickerAnimationRecord {
+    return try FfiConverterTypeStickerAnimationRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStickerAnimationRecord_lower(_ value: StickerAnimationRecord) -> RustBuffer {
+    return FfiConverterTypeStickerAnimationRecord.lower(value)
+}
+
+
+
+
+public enum StickerSourceRecord: Equatable, Hashable {
+    
+    case category
+    case recent
+    case search
+    case suggestion
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension StickerSourceRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStickerSourceRecord: FfiConverterRustBuffer {
+    typealias SwiftType = StickerSourceRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StickerSourceRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .category
+        
+        case 2: return .recent
+        
+        case 3: return .search
+        
+        case 4: return .suggestion
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: StickerSourceRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .category:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .recent:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .search:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .suggestion:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStickerSourceRecord_lift(_ buf: RustBuffer) throws -> StickerSourceRecord {
+    return try FfiConverterTypeStickerSourceRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStickerSourceRecord_lower(_ value: StickerSourceRecord) -> RustBuffer {
+    return FfiConverterTypeStickerSourceRecord.lower(value)
+}
+
+
+
 /**
  * Coalesced per-conversation message window update delivered via `CoreChangesRecord.window_deltas`.
  */
@@ -21146,6 +22702,54 @@ fileprivate struct FfiConverterOptionTypeAutoDeleteUpdateRecord: FfiConverterRus
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeComposerConfirmRecord: FfiConverterRustBuffer {
+    typealias SwiftType = ComposerConfirmRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeComposerConfirmRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeComposerConfirmRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeComposerConfirmUpdateRecord: FfiConverterRustBuffer {
+    typealias SwiftType = ComposerConfirmUpdateRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeComposerConfirmUpdateRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeComposerConfirmUpdateRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeContactsStateRecord: FfiConverterRustBuffer {
     typealias SwiftType = ContactsStateRecord?
 
@@ -21554,6 +23158,30 @@ fileprivate struct FfiConverterOptionTypeMessageRow: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeMyCardInfoRecord: FfiConverterRustBuffer {
+    typealias SwiftType = MyCardInfoRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMyCardInfoRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMyCardInfoRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypePinBoardRecord: FfiConverterRustBuffer {
     typealias SwiftType = PinBoardRecord?
 
@@ -21674,6 +23302,30 @@ fileprivate struct FfiConverterOptionTypeQuoteRecord: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeReminderComposeInfoRecord: FfiConverterRustBuffer {
+    typealias SwiftType = ReminderComposeInfoRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeReminderComposeInfoRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeReminderComposeInfoRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeRemovalRecord: FfiConverterRustBuffer {
     typealias SwiftType = RemovalRecord?
 
@@ -21738,6 +23390,54 @@ fileprivate struct FfiConverterOptionTypeSessionStateRecord: FfiConverterRustBuf
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeSessionStateRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeStickerSuggestSettingRecord: FfiConverterRustBuffer {
+    typealias SwiftType = StickerSuggestSettingRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeStickerSuggestSettingRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeStickerSuggestSettingRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeStickerSuggestUpdateRecord: FfiConverterRustBuffer {
+    typealias SwiftType = StickerSuggestUpdateRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeStickerSuggestUpdateRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeStickerSuggestUpdateRecord.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -21890,6 +23590,30 @@ fileprivate struct FfiConverterOptionTypeStarModeRecord: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeStickerAnimationRecord: FfiConverterRustBuffer {
+    typealias SwiftType = StickerAnimationRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeStickerAnimationRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeStickerAnimationRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]?
 
@@ -21962,6 +23686,30 @@ fileprivate struct FfiConverterOptionSequenceTypeCachedProfileEntry: FfiConverte
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionSequenceTypeComposerConfirmRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [ComposerConfirmRecord]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceTypeComposerConfirmRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceTypeComposerConfirmRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionSequenceTypeConversationSummaryRecord: FfiConverterRustBuffer {
     typealias SwiftType = [ConversationSummaryRecord]?
 
@@ -21978,6 +23726,54 @@ fileprivate struct FfiConverterOptionSequenceTypeConversationSummaryRecord: FfiC
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterSequenceTypeConversationSummaryRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionSequenceTypeStickerEntryRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [StickerEntryRecord]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceTypeStickerEntryRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceTypeStickerEntryRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionSequenceTypeStickerTabRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [StickerTabRecord]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceTypeStickerTabRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceTypeStickerTabRecord.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -22225,6 +24021,31 @@ fileprivate struct FfiConverterSequenceTypeChatMessageRecord: FfiConverterRustBu
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeChatMessageRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeComposerConfirmRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [ComposerConfirmRecord]
+
+    public static func write(_ value: [ComposerConfirmRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeComposerConfirmRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ComposerConfirmRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ComposerConfirmRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeComposerConfirmRecord.read(from: &buf))
         }
         return seq
     }
@@ -22850,6 +24671,56 @@ fileprivate struct FfiConverterSequenceTypeSignalSessionRecord: FfiConverterRust
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeSignalSessionRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeStickerEntryRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [StickerEntryRecord]
+
+    public static func write(_ value: [StickerEntryRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeStickerEntryRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [StickerEntryRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [StickerEntryRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeStickerEntryRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeStickerTabRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [StickerTabRecord]
+
+    public static func write(_ value: [StickerTabRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeStickerTabRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [StickerTabRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [StickerTabRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeStickerTabRecord.read(from: &buf))
         }
         return seq
     }
@@ -23650,6 +25521,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_historybatch_raw_json() != 50277) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_answer_composer_confirm() != 53689) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_answer_message_confirm() != 27581) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -23686,10 +25560,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_close_conversation() != 59647) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_composer_report() != 54178) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_confirm_delete_conversation() != 38096) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_create_conversation_label() != 13560) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_create_reminder() != 743) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_current_version() != 33807) {
@@ -23714,6 +25594,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_drain_chat_polling() != 3593) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_drop_composer_confirms() != 42857) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_drop_hidden_unlock() != 55647) {
@@ -23768,6 +25651,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_move_conversation() != 1144) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_my_card() != 12828) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_next_changes() != 57544) {
@@ -23827,6 +25713,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_relock_hidden() != 28977) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_reminder_compose_info() != 61775) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_remove_local_conversation() != 52682) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -23845,6 +25734,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_request_pin_board() != 46027) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_reset_composer() != 43900) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_reset_conversation_actions() != 31584) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -23854,7 +25746,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_reset_outgoing_typing() != 50171) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_reset_stickers() != 51996) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_resolve_missing_names() != 34703) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_search_stickers() != 59277) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_seed_composer_confirms() != 43201) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_seed_contacts() != 13201) {
@@ -23864,6 +25765,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_seed_seen_reaction_keys() != 30558) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_seed_sticker_suggest_setting() != 40980) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_send_my_card() != 33199) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_send_sticker() != 11075) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_send_text() != 59517) {
@@ -23899,6 +25809,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_set_starred() != 42048) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_set_sticker_suggest() != 11333) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_settle() != 26622) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -23911,6 +25824,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_start() != 22299) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_sticker_setting() != 38154) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_sticker_tabs() != 10702) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_stickers_in_tab() != 18022) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_stop() != 37332) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -23921,6 +25843,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_sync_hidden_conversations() != 26494) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_typing_sticker_suggestions() != 36231) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_undo_delete() != 62417) {
@@ -24119,6 +26044,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_corehost_show_card() != 63222) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_send_e2ee_sticker() != 47488) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_send_e2ee_contact_card() != 45157) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_sleep_confirm_promote() != 53576) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreofflineconversations_apply_preview_override() != 60866) {

@@ -4,10 +4,12 @@
 
 pub mod bootstrap;
 pub mod classify;
+pub mod composer;
 pub mod conversations;
 pub mod messages;
 pub mod send;
 pub mod session;
+pub mod stickers;
 pub mod transport;
 
 use crate::changes::DirtySet;
@@ -58,6 +60,35 @@ fn is_action_command(cmd: &Command) -> bool {
             | Command::SetAutoDelete { .. }
             | Command::PruneExpiredMessages { .. }
             | Command::RecordSeenReactionKeys { .. }
+    )
+}
+
+fn is_sticker_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::StickerTabs
+            | Command::StickersInTab { .. }
+            | Command::SearchStickers { .. }
+            | Command::TypingStickerSuggestions { .. }
+            | Command::StickerSetting
+            | Command::SetStickerSuggest { .. }
+            | Command::SeedStickerSuggestSetting(_)
+            | Command::ResetStickers
+    )
+}
+
+fn is_composer_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::MyCard
+            | Command::SendMyCard { .. }
+            | Command::ReminderComposeInfo { .. }
+            | Command::CreateReminder { .. }
+            | Command::AnswerComposerConfirm { .. }
+            | Command::DropComposerConfirms
+            | Command::SeedComposerConfirms { .. }
+            | Command::ComposerReport { .. }
+            | Command::ResetComposer
     )
 }
 
@@ -146,9 +177,10 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
             ..
         }
         | Input::TypingExpired { .. } => crate::typing::reduce_typing(state, input, &mut out),
-        // U5-send
+        // U5-send (+ U13 send_sticker reusing the U5 send pipeline)
         Input::Command(
             Command::SendText { .. }
+            | Command::SendSticker { .. }
             | Command::MarkRead { .. }
             | Command::SetE2eeThreads(_)
             | Command::SetAutoDeleteTtl { .. },
@@ -156,12 +188,44 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::OpRequest {
             cmd:
                 Command::SendText { .. }
+                | Command::SendSticker { .. }
                 | Command::MarkRead { .. }
                 | Command::SetE2eeThreads(_)
                 | Command::SetAutoDeleteTtl { .. },
             ..
         }
-        | Input::SendTextDone { .. } => send::reduce_send(state, input, &mut out),
+        | Input::SendTextDone { .. }
+        | Input::SendStickerDone { .. } => send::reduce_send(state, input, &mut out),
+
+        // U13 stickers
+        Input::Command(ref cmd) if is_sticker_command(cmd) => {
+            stickers::reduce_stickers(state, input, &mut out);
+        }
+        Input::OpRequest { ref cmd, .. } if is_sticker_command(cmd) => {
+            stickers::reduce_stickers(state, input, &mut out);
+        }
+        Input::StickerCategoriesFetched { .. }
+        | Input::StickerTabsRecentsLoaded { .. }
+        | Input::RecentStickersLoaded { .. }
+        | Input::StickerCategoryDetailFetched { .. }
+        | Input::StickerSearchFetched { .. }
+        | Input::StickerSuggestFetched { .. }
+        | Input::StickerSuggestPrefLoaded { .. } => {
+            stickers::reduce_stickers(state, input, &mut out);
+        }
+
+        // U13 composer side actions
+        Input::Command(ref cmd) if is_composer_command(cmd) => {
+            composer::reduce_composer(state, input, &mut out);
+        }
+        Input::OpRequest { ref cmd, .. } if is_composer_command(cmd) => {
+            composer::reduce_composer(state, input, &mut out);
+        }
+        Input::ContactCardSendDone { .. }
+        | Input::CreateReminderDone { .. }
+        | Input::ConfirmPromoteExpired { .. } => {
+            composer::reduce_composer(state, input, &mut out);
+        }
 
         // U6
         Input::Command(ref cmd) if is_action_command(cmd) => {

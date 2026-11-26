@@ -27,6 +27,8 @@ mod history;
 mod messaging;
 mod poll;
 mod profiles;
+mod reminders;
+mod stickers;
 mod util;
 
 #[cfg(test)]
@@ -47,7 +49,13 @@ pub use e2ee::{
 };
 pub use error::ApiError;
 pub use messaging::{
-    CallSpec, ReactionParams, ReactionRequestSpec, RecallParams, SendTextArgs, SendTextParams,
-    build_reaction_request, build_recall_message_request,
+    CallSpec, ReactionParams, ReactionRequestSpec, RecallParams, SendContactCardParams,
+    SendTextArgs, SendTextParams, build_reaction_request, build_recall_message_request,
+    build_send_contact_card_request,
 };
 pub use poll::{PollQueueCursor, PollState};
+pub use reminders::{CreateReminderParams, build_create_reminder_request};
+pub use stickers::{
+    FetchedStickerCategories, SendStickerParams, StickerCategoryRow, build_send_sticker_request,
+    builtin_sticker_pack, parse_sticker_catalog_bytes,
+};

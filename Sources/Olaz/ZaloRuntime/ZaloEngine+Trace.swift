@@ -13,8 +13,8 @@ extension ZaloEngine {
         return traceHost(name, args: args())
     }
 
-    internal func showActionCard(_ text: String, in conversationId: String) {
-        if traceHost("show_card", args: ["conv_id": conversationId, "text": text]) {
+    internal func showActionCard(_ text: String, in conversationId: String?) {
+        if traceHost("show_card", args: ["conv_id": conversationId ?? "", "text": text]) {
             CardActionCenter.shared.show(text, in: conversationId)
         }
     }
@@ -47,6 +47,7 @@ extension ZaloEngine {
         hostTrace = nil
         sendE2EETextHostHandler = nil
         sendE2EEStickerHostHandler = nil
+        sendE2EEContactCardHostHandler = nil
         traceU4HostEnabled = false
         stateTrace = nil
         EngineLog.shared.onAppend = nil

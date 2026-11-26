@@ -13,6 +13,7 @@ use std::sync::{Mutex, PoisonError};
 use tokio::sync::Notify;
 
 use crate::actions::{DeleteUndoSnapshot, MessageConfirmState};
+use crate::composer::ComposerConfirm;
 use crate::conversations::{
     CachedProfile, ConversationActionUI, ConversationActionsState, ConversationExtras,
     ConversationPrompt, ConversationSummary,
@@ -21,6 +22,7 @@ use crate::messages::{
     ContactsState, HistoryFreshness, PendingWindowOp, WindowDelta, coalesce_window_op,
 };
 use crate::state::{CoreState, SessionSnapshot};
+use crate::stickers::StickerSuggestSetting;
 use crate::typing::TypingStatus;
 
 /// Upper bound on queued distinct session transitions; keeps hub memory strictly `O(1)`.
@@ -47,6 +49,9 @@ pub enum DirtyKey {
     AutoDelete,
     StarredIds,
     CachedProfiles,
+    // U13
+    StickerSuggest,
+    ComposerConfirm,
 }
 
 /// Set of keys dirtied by one `reduce` step.
@@ -103,6 +108,13 @@ pub struct CoreChanges {
     pub starred_ids: Option<BTreeSet<String>>,
     /// Updated cached profile map (`cachedProfiles`).
     pub cached_profiles: Option<BTreeMap<String, CachedProfile>>,
+    // U13
+    /// Outer `Some(...)` means the sticker suggest setting changed; inner `Option` is the setting.
+    pub sticker_suggest: Option<Option<StickerSuggestSetting>>,
+    /// Outer `Some(...)` means the active composer confirm changed.
+    pub composer_confirm: Option<Option<ComposerConfirm>>,
+    /// Updated queued composer confirms.
+    pub queued_composer_confirms: Option<Vec<ComposerConfirm>>,
 }
 
 impl fmt::Debug for CoreChanges {
@@ -147,6 +159,10 @@ struct DirtyBuffer {
     auto_delete: Option<Option<BTreeMap<String, i64>>>,
     starred_ids: Option<BTreeSet<String>>,
     cached_profiles: Option<BTreeMap<String, CachedProfile>>,
+    // U13
+    sticker_suggest: Option<Option<StickerSuggestSetting>>,
+    composer_confirm: Option<Option<ComposerConfirm>>,
+    queued_composer_confirms: Option<Vec<ComposerConfirm>>,
     closed: bool,
 }
 
@@ -167,6 +183,9 @@ impl DirtyBuffer {
             || self.auto_delete.is_some()
             || self.starred_ids.is_some()
             || self.cached_profiles.is_some()
+            || self.sticker_suggest.is_some()
+            || self.composer_confirm.is_some()
+            || self.queued_composer_confirms.is_some()
     }
 }
 
@@ -302,6 +321,15 @@ impl ChangeHub {
                     buf.cached_profiles =
                         Some(state.conversations.identities.cached_profiles.clone());
                 }
+                // U13
+                DirtyKey::StickerSuggest => {
+                    buf.sticker_suggest = Some(state.stickers.suggest_setting);
+                }
+                DirtyKey::ComposerConfirm => {
+                    buf.composer_confirm = Some(state.composer.active_confirm.clone());
+                    buf.queued_composer_confirms =
+                        Some(state.composer.queued_confirms.iter().cloned().collect());
+                }
             }
             buf.dirty.insert(key);
         }
@@ -387,6 +415,10 @@ impl ChangeHub {
                             auto_delete: None,
                             starred_ids: None,
                             cached_profiles: None,
+                            // U13
+                            sticker_suggest: None,
+                            composer_confirm: None,
+                            queued_composer_confirms: None,
                         });
                     }
                 }
@@ -451,6 +483,10 @@ impl ChangeHub {
                         auto_delete: buf.auto_delete.take(),
                         starred_ids: buf.starred_ids.take(),
                         cached_profiles: buf.cached_profiles.take(),
+                        // U13
+                        sticker_suggest: buf.sticker_suggest.take(),
+                        composer_confirm: buf.composer_confirm.take(),
+                        queued_composer_confirms: buf.queued_composer_confirms.take(),
                     });
                 }
                 if buf.closed {
