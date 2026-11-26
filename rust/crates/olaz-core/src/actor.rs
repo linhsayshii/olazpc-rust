@@ -285,6 +285,13 @@ impl CoreHandle {
         matches!(self.request(command).await, Some(OpResult::Bool(true)))
     }
 
+    pub async fn request_opt_i64(&self, command: Command) -> Option<i64> {
+        match self.request(command).await {
+            Some(OpResult::OptI64(v)) => v,
+            _ => None,
+        }
+    }
+
     /// Drains up to `max_batches` long-poll batches serialized behind any in-flight drain
     /// (ADR-018) and returns the total applied event count (`0` if long-poll or actor is stopped).
     pub async fn drain_chat_polling(&self, max_batches: u32, notify_incoming: bool) -> u32 {
@@ -405,6 +412,14 @@ impl CoreHandle {
     /// Stops the actor, aborts in-flight effects, and closes `next_changes()`.
     pub fn stop(&self) {
         let _ = self.tx.send(ActorMsg::Stop);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_sink(&self) -> ActorSink {
+        ActorSink {
+            tx: self.tx.clone(),
+            tracker: Arc::clone(&self.tracker),
+        }
     }
 }
 

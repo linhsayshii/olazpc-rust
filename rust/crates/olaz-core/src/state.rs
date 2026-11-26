@@ -11,7 +11,8 @@ use olaz_net::NetworkErrorKind;
 use olaz_ws::CursorMap;
 use serde_json::{Map, Value, json};
 
-use crate::conversations::ConversationsState;
+use crate::actions::{ActionsState, DeleteUndoSnapshot, MessageConfirmState};
+use crate::conversations::{CachedProfile, ConversationsState};
 use crate::forward::{ForwardRequest, ForwardState};
 use crate::messages::{ContactsState, IdentitySnapshot, MessagesState};
 use crate::typing::{TypingState, TypingStatus};
@@ -32,6 +33,8 @@ pub struct CoreState {
     pub send: crate::reduce::send::SendState,
     // U8
     pub forward: ForwardState,
+    // U6
+    pub actions: ActionsState,
 }
 
 impl CoreState {
@@ -48,6 +51,13 @@ impl CoreState {
             // U8
             forward_request: self.forward.request.clone(),
             send_auto_delete: self.send.auto_delete_ttl_ms.clone(),
+            // U6
+            delete_undo: self.actions.delete_undo.snapshot(),
+            message_confirm: self.actions.message_confirm.clone(),
+            auto_delete: self.actions.auto_delete.clone(),
+            starred_ids: self.actions.starred_ids.clone(),
+            cached_profiles: self.conversations.identities.cached_profiles.clone(),
+            last_prune_next_expiry_ms: self.actions.last_prune_next_expiry_ms,
         }
     }
 
@@ -83,6 +93,8 @@ impl fmt::Debug for CoreState {
             .field("send", &self.send)
             // U8
             .field("forward", &self.forward)
+            // U6
+            .field("actions", &self.actions)
             .finish()
     }
 }
@@ -99,6 +111,13 @@ pub struct CoreSnapshot {
     // U8
     pub forward_request: Option<ForwardRequest>,
     pub send_auto_delete: BTreeMap<String, i64>,
+    // U6
+    pub delete_undo: Option<DeleteUndoSnapshot>,
+    pub message_confirm: Option<MessageConfirmState>,
+    pub auto_delete: Option<BTreeMap<String, i64>>,
+    pub starred_ids: BTreeSet<String>,
+    pub cached_profiles: BTreeMap<String, CachedProfile>,
+    pub last_prune_next_expiry_ms: Option<i64>,
 }
 
 impl fmt::Debug for CoreSnapshot {
@@ -112,6 +131,16 @@ impl fmt::Debug for CoreSnapshot {
             .field("typing_count", &self.typing.len())
             // U8
             .field("has_forward_request", &self.forward_request.is_some())
+            // U6
+            .field("delete_undo", &self.delete_undo)
+            .field("message_confirm", &self.message_confirm)
+            .field(
+                "auto_delete_count",
+                &self.auto_delete.as_ref().map(BTreeMap::len),
+            )
+            .field("starred_ids_count", &self.starred_ids.len())
+            .field("cached_profiles_count", &self.cached_profiles.len())
+            .field("last_prune_next_expiry_ms", &self.last_prune_next_expiry_ms)
             .finish()
     }
 }

@@ -51,7 +51,12 @@ import Testing
             contacts: contacts,
             typing: nil,
             forwardRequest: nil,
-            clearSelection: false
+            clearSelection: false,
+            deleteUndo: nil,
+            messageConfirm: nil,
+            autoDelete: nil,
+            starredIds: nil,
+            cachedProfiles: nil
         )
     }
 

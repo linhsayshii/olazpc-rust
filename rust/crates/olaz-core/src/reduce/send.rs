@@ -129,9 +129,20 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
         }
         Command::SetAutoDeleteTtl { conv_id, ttl_ms } => {
             if ttl_ms > 0 {
-                state.send.auto_delete_ttl_ms.insert(conv_id, ttl_ms);
+                state
+                    .send
+                    .auto_delete_ttl_ms
+                    .insert(conv_id.clone(), ttl_ms);
+                state
+                    .actions
+                    .auto_delete
+                    .get_or_insert_with(std::collections::BTreeMap::new)
+                    .insert(conv_id, ttl_ms);
             } else {
                 state.send.auto_delete_ttl_ms.remove(&conv_id);
+                if let Some(map) = state.actions.auto_delete.as_mut() {
+                    map.remove(&conv_id);
+                }
             }
             complete_op(op_id, OpResult::Unit, false, out);
         }

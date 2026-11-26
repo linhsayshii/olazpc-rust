@@ -12,9 +12,10 @@ use std::sync::{Mutex, PoisonError};
 
 use tokio::sync::Notify;
 
+use crate::actions::{DeleteUndoSnapshot, MessageConfirmState};
 use crate::conversations::{
-    ConversationActionUI, ConversationActionsState, ConversationExtras, ConversationPrompt,
-    ConversationSummary,
+    CachedProfile, ConversationActionUI, ConversationActionsState, ConversationExtras,
+    ConversationPrompt, ConversationSummary,
 };
 use crate::forward::ForwardRequest;
 use crate::messages::{
@@ -44,6 +45,12 @@ pub enum DirtyKey {
     // U8
     ForwardRequest,
     ForwardClearSelection,
+    // U6
+    DeleteUndo,
+    MessageConfirm,
+    AutoDelete,
+    StarredIds,
+    CachedProfiles,
 }
 
 /// Set of keys dirtied by one `reduce` step.
@@ -94,6 +101,17 @@ pub struct CoreChanges {
     pub forward_request: Option<Option<ForwardRequest>>,
     /// One-shot signal telling Swift to end multi-message selection after a multi-forward succeeds.
     pub clear_selection: bool,
+    // U6
+    /// Outer `Some(...)` means the undo bar changed; inner `Option` is the new snapshot.
+    pub delete_undo: Option<Option<DeleteUndoSnapshot>>,
+    /// Outer `Some(...)` means the message-action confirmation dialog changed.
+    pub message_confirm: Option<Option<MessageConfirmState>>,
+    /// Outer `Some(...)` means auto-delete settings changed; inner `Option` is the new map.
+    pub auto_delete: Option<Option<BTreeMap<String, i64>>>,
+    /// Updated sorted starred message ids (`cachedStarredIds`).
+    pub starred_ids: Option<BTreeSet<String>>,
+    /// Updated cached profile map (`cachedProfiles`).
+    pub cached_profiles: Option<BTreeMap<String, CachedProfile>>,
 }
 
 impl fmt::Debug for CoreChanges {
@@ -137,6 +155,12 @@ struct DirtyBuffer {
     // U8
     forward_request: Option<Option<ForwardRequest>>,
     clear_selection: bool,
+    // U6
+    delete_undo: Option<Option<DeleteUndoSnapshot>>,
+    message_confirm: Option<Option<MessageConfirmState>>,
+    auto_delete: Option<Option<BTreeMap<String, i64>>>,
+    starred_ids: Option<BTreeSet<String>>,
+    cached_profiles: Option<BTreeMap<String, CachedProfile>>,
     closed: bool,
 }
 
@@ -154,6 +178,11 @@ impl DirtyBuffer {
             || self.typing.is_some()
             || self.forward_request.is_some()
             || self.clear_selection
+            || self.delete_undo.is_some()
+            || self.message_confirm.is_some()
+            || self.auto_delete.is_some()
+            || self.starred_ids.is_some()
+            || self.cached_profiles.is_some()
     }
 }
 
@@ -279,6 +308,23 @@ impl ChangeHub {
                 DirtyKey::ForwardClearSelection => {
                     buf.clear_selection = true;
                 }
+                // U6
+                DirtyKey::DeleteUndo => {
+                    buf.delete_undo = Some(state.actions.delete_undo.snapshot());
+                }
+                DirtyKey::MessageConfirm => {
+                    buf.message_confirm = Some(state.actions.message_confirm.clone());
+                }
+                DirtyKey::AutoDelete => {
+                    buf.auto_delete = Some(state.actions.auto_delete.clone());
+                }
+                DirtyKey::StarredIds => {
+                    buf.starred_ids = Some(state.actions.starred_ids.clone());
+                }
+                DirtyKey::CachedProfiles => {
+                    buf.cached_profiles =
+                        Some(state.conversations.identities.cached_profiles.clone());
+                }
             }
             buf.dirty.insert(key);
         }
@@ -361,6 +407,12 @@ impl ChangeHub {
                             // U8
                             forward_request: None,
                             clear_selection: false,
+                            // U6
+                            delete_undo: None,
+                            message_confirm: None,
+                            auto_delete: None,
+                            starred_ids: None,
+                            cached_profiles: None,
                         });
                     }
                 }
@@ -422,6 +474,12 @@ impl ChangeHub {
                         // U8
                         forward_request: buf.forward_request.take(),
                         clear_selection: std::mem::take(&mut buf.clear_selection),
+                        // U6
+                        delete_undo: buf.delete_undo.take(),
+                        message_confirm: buf.message_confirm.take(),
+                        auto_delete: buf.auto_delete.take(),
+                        starred_ids: buf.starred_ids.take(),
+                        cached_profiles: buf.cached_profiles.take(),
                     });
                 }
                 if buf.closed {

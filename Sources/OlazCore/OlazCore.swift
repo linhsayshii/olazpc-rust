@@ -1279,13 +1279,18 @@ public func FfiConverterTypeCoreApi_lower(_ value: CoreApi) -> UInt64 {
 public protocol CoreEngineProtocol: AnyObject, Sendable {
     
     /**
+     * Answers the active message-action confirmation dialog (`ok = true` executes, `false` cancels).
+     */
+    func answerMessageConfirm(ok: Bool, nowMs: Int64) 
+    
+    /**
      * Applies an account profile update and returns the monotonic change revision once reduced.
      * Swift awaits this revision in its `next_changes()` mirror before returning from
      * `async func applyAccountProfile(_:)`.
      */
     func applyAccountProfile(account: LoginAccountRecord) async throws  -> UInt64
     
-    func applyBatchDirect(payloadJson: String, defaultCmd: UInt16, fallbackConvId: String?, isGroupHint: Bool?, incrementUnread: Bool, notifyIncoming: Bool, persistConversations: Bool, probeFreshness: Bool) async throws  -> Int64
+    func applyBatchDirect(payloadJson: String, defaultCmd: UInt16, fallbackConvId: String?, isGroupHint: Bool?, incrementUnread: Bool, notifyIncoming: Bool, persistConversations: Bool, probeFreshness: Bool, nowMs: Int64?) async throws  -> Int64
     
     /**
      * Applies server-fetched pinned and archived conversation ID sets during bootstrap sync.
@@ -1303,6 +1308,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Applies an already-fetched server hidden-conversations snapshot.
      */
     func applyServerHiddenConversations(pin: String, threadIds: [String]) async throws  -> UInt64
+    
+    /**
+     * Presents a host-originated confirmation dialog (e.g. pin / unpin) in core's confirm slot.
+     */
+    func askMessageConfirm(confirm: MessageConfirmRecord) 
     
     /**
      * Attaches the account's opened [`CoreStore`] so `olaz-core` can hydrate local conversation
@@ -1345,6 +1355,17 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func deleteConversationLabel(id: String) 
     
     /**
+     * Deletes a single message only for the current user (shows confirm when `!confirmed` and
+     * `menu.delete == forMe`, else removes optimistically and starts the 5 s undo bar).
+     */
+    func deleteForMe(convId: String, msgId: String, confirmed: Bool, nowMs: Int64) 
+    
+    /**
+     * Deletes multiple selected messages only for the current user.
+     */
+    func deleteMany(convId: String, msgIds: [String], confirm: Bool, nowMs: Int64) 
+    
+    /**
      * Detaches any attached [`CoreStore`] handle.
      */
     func detachStore() 
@@ -1353,6 +1374,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Clears the active conversation prompt.
      */
     func dismissConversationPrompt() 
+    
+    /**
+     * Dismisses the active 5 s delete-undo bar and commits the pending delete immediately.
+     */
+    func dismissDeleteUndo() 
     
     /**
      * Runs up to `max_batches` HTTP long-poll fetches serially (ADR-018) and returns the total
@@ -1423,6 +1449,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func hideConversationNewPin(id: String, pin: String) async throws  -> ConversationActionResultRecord
     
+    /**
+     * Fetches per-conversation auto-delete TTLs from Zalo and awaits the mirror update.
+     */
+    func loadAutoDelete() async throws  -> UInt64
+    
     func loadOlderMessages(id: String) 
     
     func loadOlderMessagesAndWait(id: String) async throws  -> UInt64
@@ -1488,9 +1519,41 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func pinReplacing(unpinIds: [String], pinId: String) async throws  -> ConversationActionResultRecord
     
     /**
+     * Prunes expired messages from `conv_id` in core memory and SQLite (fire-and-forget).
+     */
+    func pruneExpiredMessages(convId: String, nowMs: Int64) 
+    
+    /**
+     * Adds, toggles, or clears (`remove_all = true`) the current user's reaction on a message.
+     * Returns the settled core mirror version after the API + store + host callbacks finish.
+     */
+    func react(convId: String, msgId: String, emoji: String, removeAll: Bool, nowMs: Int64) async throws  -> UInt64
+    
+    /**
      * Rebuilds conversation extras (`stranger_box`, `list_ids`, etc.) using latest identities.
      */
     func rebuildConversationExtras() 
+    
+    /**
+     * Recalls a single message for everyone and awaits completion of the API, local/store update,
+     * and host callbacks. Returns the settled core mirror version.
+     */
+    func recall(convId: String, msgId: String, isE2eeThread: Bool?, nowMs: Int64) async throws  -> UInt64
+    
+    /**
+     * Recalls a selection of messages (shows confirm when `confirm = true`, else executes).
+     */
+    func recallMany(convId: String, msgIds: [String], confirm: Bool, nowMs: Int64) 
+    
+    /**
+     * Recalls a selection of messages directly (`confirm = false`) and awaits completion.
+     */
+    func recallManyAsync(convId: String, msgIds: [String], nowMs: Int64) async throws  -> UInt64
+    
+    /**
+     * Records seen-reaction dedup keys in core and flushes `"seenReactionEventIds"` to SQLite.
+     */
+    func recordSeenReactionKeys(keys: [String]) async throws 
     
     /**
      * Refreshes group `@mention` previews from the attached SQLite store.
@@ -1569,10 +1632,20 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func seedHistoryFreshness(entries: [FreshnessMapEntry]) 
     
     /**
+     * Seeds previously loaded seen-reaction dedup keys into core without writing back to SQLite.
+     */
+    func seedSeenReactionKeys(keys: [String]) 
+    
+    /**
      * Sends a text message (plain API or E2EE host boundary) with core-owned optimistic row,
      * echo/ack reconciliation, persistence, and conversation preview update.
      */
     func sendText(convId: String, text: String, quoteId: String?, mentions: [MessageMention], styles: [TextStyleRecord], urgency: Int64, clientId: Int64, nowMs: Int64, isE2ee: Bool?, ttlMs: Int64?) async throws  -> SendTextOutcomeRecord
+    
+    /**
+     * Updates a conversation's auto-delete TTL on Zalo, inserts the system notice, and persists.
+     */
+    func setAutoDelete(convId: String, ttl: Int64, nowMs: Int64) async throws  -> UInt64
     
     /**
      * Updates a single conversation's auto-delete TTL in milliseconds (`0` disables).
@@ -1615,6 +1688,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func setSendTypingEnabled(enabled: Bool) 
     
     /**
+     * Toggles starred state on a message (updates window, `starredIds` pref, and SQLite row).
+     */
+    func setStarred(convId: String, msgId: String, on: Bool) 
+    
+    /**
      * Enqueues barriers across the actor mailbox, serial host worker, and serial SQLite store
      * worker until all pending host/store jobs and the inputs they feed back into the actor have
      * been reduced and published (`0` if already stopped).
@@ -1652,6 +1730,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Syncs hidden conversations and PIN digest from the server.
      */
     func syncHiddenConversations() async throws  -> UInt64
+    
+    /**
+     * Cancels the active 5 s delete-undo bar, restores messages, and shows the restore card.
+     */
+    func undoDelete() 
     
     /**
      * Unhides `id`, verifying `pin` when provided.
@@ -1815,6 +1898,19 @@ public convenience init(session: CoreSession, host: CoreHost)throws  {
 
     
     /**
+     * Answers the active message-action confirmation dialog (`ok = true` executes, `false` cancels).
+     */
+open func answerMessageConfirm(ok: Bool, nowMs: Int64)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_answer_message_confirm(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(ok),
+        FfiConverterInt64.lower(nowMs),uniffiCallStatus
+    )
+}
+}
+    
+    /**
      * Applies an account profile update and returns the monotonic change revision once reduced.
      * Swift awaits this revision in its `next_changes()` mirror before returning from
      * `async func applyAccountProfile(_:)`.
@@ -1835,12 +1931,12 @@ open func applyAccountProfile(account: LoginAccountRecord)async throws  -> UInt6
         )
 }
     
-open func applyBatchDirect(payloadJson: String, defaultCmd: UInt16, fallbackConvId: String?, isGroupHint: Bool?, incrementUnread: Bool, notifyIncoming: Bool, persistConversations: Bool, probeFreshness: Bool)async throws  -> Int64  {
+open func applyBatchDirect(payloadJson: String, defaultCmd: UInt16, fallbackConvId: String?, isGroupHint: Bool?, incrementUnread: Bool, notifyIncoming: Bool, persistConversations: Bool, probeFreshness: Bool, nowMs: Int64?)async throws  -> Int64  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_olaz_ffi_fn_method_coreengine_apply_batch_direct(
-                        self.uniffiCloneHandle(),FfiConverterString.lower(payloadJson),FfiConverterUInt16.lower(defaultCmd),FfiConverterOptionString.lower(fallbackConvId),FfiConverterOptionBool.lower(isGroupHint),FfiConverterBool.lower(incrementUnread),FfiConverterBool.lower(notifyIncoming),FfiConverterBool.lower(persistConversations),FfiConverterBool.lower(probeFreshness)
+                        self.uniffiCloneHandle(),FfiConverterString.lower(payloadJson),FfiConverterUInt16.lower(defaultCmd),FfiConverterOptionString.lower(fallbackConvId),FfiConverterOptionBool.lower(isGroupHint),FfiConverterBool.lower(incrementUnread),FfiConverterBool.lower(notifyIncoming),FfiConverterBool.lower(persistConversations),FfiConverterBool.lower(probeFreshness),FfiConverterOptionInt64.lower(nowMs)
                 )
             },
             pollFunc: ffi_olaz_ffi_rust_future_poll_i64,
@@ -1922,6 +2018,18 @@ open func applyServerHiddenConversations(pin: String, threadIds: [String])async 
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
+}
+    
+    /**
+     * Presents a host-originated confirmation dialog (e.g. pin / unpin) in core's confirm slot.
+     */
+open func askMessageConfirm(confirm: MessageConfirmRecord)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_ask_message_confirm(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeMessageConfirmRecord_lower(confirm),uniffiCallStatus
+    )
+}
 }
     
     /**
@@ -2045,6 +2153,37 @@ open func deleteConversationLabel(id: String)  {try! rustCall() {
 }
     
     /**
+     * Deletes a single message only for the current user (shows confirm when `!confirmed` and
+     * `menu.delete == forMe`, else removes optimistically and starts the 5 s undo bar).
+     */
+open func deleteForMe(convId: String, msgId: String, confirmed: Bool, nowMs: Int64)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_delete_for_me(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(convId),
+        FfiConverterString.lower(msgId),
+        FfiConverterBool.lower(confirmed),
+        FfiConverterInt64.lower(nowMs),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Deletes multiple selected messages only for the current user.
+     */
+open func deleteMany(convId: String, msgIds: [String], confirm: Bool, nowMs: Int64)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_delete_many(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(convId),
+        FfiConverterSequenceString.lower(msgIds),
+        FfiConverterBool.lower(confirm),
+        FfiConverterInt64.lower(nowMs),uniffiCallStatus
+    )
+}
+}
+    
+    /**
      * Detaches any attached [`CoreStore`] handle.
      */
 open func detachStore()  {try! rustCall() {
@@ -2061,6 +2200,17 @@ open func detachStore()  {try! rustCall() {
 open func dismissConversationPrompt()  {try! rustCall() {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_method_coreengine_dismiss_conversation_prompt(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Dismisses the active 5 s delete-undo bar and commits the pending delete immediately.
+     */
+open func dismissDeleteUndo()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_dismiss_delete_undo(
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
@@ -2280,6 +2430,25 @@ open func hideConversationNewPin(id: String, pin: String)async throws  -> Conver
         )
 }
     
+    /**
+     * Fetches per-conversation auto-delete TTLs from Zalo and awaits the mirror update.
+     */
+open func loadAutoDelete()async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_load_auto_delete(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
 open func loadOlderMessages(id: String)  {try! rustCall() {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_method_coreengine_load_older_messages(
@@ -2488,6 +2657,39 @@ open func pinReplacing(unpinIds: [String], pinId: String)async throws  -> Conver
 }
     
     /**
+     * Prunes expired messages from `conv_id` in core memory and SQLite (fire-and-forget).
+     */
+open func pruneExpiredMessages(convId: String, nowMs: Int64)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_prune_expired_messages(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(convId),
+        FfiConverterInt64.lower(nowMs),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Adds, toggles, or clears (`remove_all = true`) the current user's reaction on a message.
+     * Returns the settled core mirror version after the API + store + host callbacks finish.
+     */
+open func react(convId: String, msgId: String, emoji: String, removeAll: Bool, nowMs: Int64)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_react(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(msgId),FfiConverterString.lower(emoji),FfiConverterBool.lower(removeAll),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
      * Rebuilds conversation extras (`stranger_box`, `list_ids`, etc.) using latest identities.
      */
 open func rebuildConversationExtras()  {try! rustCall() {
@@ -2496,6 +2698,79 @@ open func rebuildConversationExtras()  {try! rustCall() {
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
+}
+    
+    /**
+     * Recalls a single message for everyone and awaits completion of the API, local/store update,
+     * and host callbacks. Returns the settled core mirror version.
+     */
+open func recall(convId: String, msgId: String, isE2eeThread: Bool?, nowMs: Int64)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_recall(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(msgId),FfiConverterOptionBool.lower(isE2eeThread),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Recalls a selection of messages (shows confirm when `confirm = true`, else executes).
+     */
+open func recallMany(convId: String, msgIds: [String], confirm: Bool, nowMs: Int64)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_recall_many(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(convId),
+        FfiConverterSequenceString.lower(msgIds),
+        FfiConverterBool.lower(confirm),
+        FfiConverterInt64.lower(nowMs),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Recalls a selection of messages directly (`confirm = false`) and awaits completion.
+     */
+open func recallManyAsync(convId: String, msgIds: [String], nowMs: Int64)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_recall_many_async(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterSequenceString.lower(msgIds),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Records seen-reaction dedup keys in core and flushes `"seenReactionEventIds"` to SQLite.
+     */
+open func recordSeenReactionKeys(keys: [String])async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_record_seen_reaction_keys(
+                        self.uniffiCloneHandle(),FfiConverterSequenceString.lower(keys)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
+            freeFunc: ffi_olaz_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -2725,6 +3000,18 @@ open func seedHistoryFreshness(entries: [FreshnessMapEntry])  {try! rustCall() {
 }
     
     /**
+     * Seeds previously loaded seen-reaction dedup keys into core without writing back to SQLite.
+     */
+open func seedSeenReactionKeys(keys: [String])  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_seed_seen_reaction_keys(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(keys),uniffiCallStatus
+    )
+}
+}
+    
+    /**
      * Sends a text message (plain API or E2EE host boundary) with core-owned optimistic row,
      * echo/ack reconciliation, persistence, and conversation preview update.
      */
@@ -2740,6 +3027,25 @@ open func sendText(convId: String, text: String, quoteId: String?, mentions: [Me
             completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeSendTextOutcomeRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Updates a conversation's auto-delete TTL on Zalo, inserts the system notice, and persists.
+     */
+open func setAutoDelete(convId: String, ttl: Int64, nowMs: Int64)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_set_auto_delete(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterInt64.lower(ttl),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
 }
@@ -2846,6 +3152,20 @@ open func setSendTypingEnabled(enabled: Bool)  {try! rustCall() {
     uniffi_olaz_ffi_fn_method_coreengine_set_send_typing_enabled(
             self.uniffiCloneHandle(),
         FfiConverterBool.lower(enabled),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Toggles starred state on a message (updates window, `starredIds` pref, and SQLite row).
+     */
+open func setStarred(convId: String, msgId: String, on: Bool)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_set_starred(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(convId),
+        FfiConverterString.lower(msgId),
+        FfiConverterBool.lower(on),uniffiCallStatus
     )
 }
 }
@@ -2964,6 +3284,17 @@ open func syncHiddenConversations()async throws  -> UInt64  {
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
+}
+    
+    /**
+     * Cancels the active 5 s delete-undo bar, restores messages, and shows the restore card.
+     */
+open func undoDelete()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_undo_delete(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
 }
     
     /**
@@ -3353,11 +3684,11 @@ public protocol CoreHost: AnyObject, Sendable {
     
     func markReadBoundary(convId: String, seenTarget: SeenTargetRecord?) async 
     
-    func applyRemoteReaction(convId: String, msgId: String, cliMsgId: String, senderId: String, rType: String, rIcon: String, eventId: String, reactClientId: String, senderName: String) async 
+    func applyRemoteReaction(convId: String, msgId: String, cliMsgId: String, senderId: String, rType: String, rIcon: String, eventId: String, reactClientId: String, senderName: String) async  -> Bool
     
-    func applyRemoteRecall(convId: String, msgId: String, cliMsgId: String, updateConversationPreview: Bool, persistConversations: Bool) async 
+    func applyRemoteRecall(convId: String, msgId: String, cliMsgId: String, updateConversationPreview: Bool, persistConversations: Bool) async  -> Bool
     
-    func applyRemoteDelete(convId: String, msgId: String, cliMsgId: String, updateConversationPreview: Bool, persistConversations: Bool) async 
+    func applyRemoteDelete(convId: String, msgId: String, cliMsgId: String, updateConversationPreview: Bool, persistConversations: Bool) async  -> Bool
     
     func decryptEnvelope(payloadJson: String) async  -> String
     
@@ -3760,7 +4091,7 @@ open func markReadBoundary(convId: String, seenTarget: SeenTargetRecord?)async  
         )
 }
     
-open func applyRemoteReaction(convId: String, msgId: String, cliMsgId: String, senderId: String, rType: String, rIcon: String, eventId: String, reactClientId: String, senderName: String)async   {
+open func applyRemoteReaction(convId: String, msgId: String, cliMsgId: String, senderId: String, rType: String, rIcon: String, eventId: String, reactClientId: String, senderName: String)async  -> Bool  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
@@ -3768,16 +4099,16 @@ open func applyRemoteReaction(convId: String, msgId: String, cliMsgId: String, s
                         self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(msgId),FfiConverterString.lower(cliMsgId),FfiConverterString.lower(senderId),FfiConverterString.lower(rType),FfiConverterString.lower(rIcon),FfiConverterString.lower(eventId),FfiConverterString.lower(reactClientId),FfiConverterString.lower(senderName)
                 )
             },
-            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
-            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
-            freeFunc: ffi_olaz_ffi_rust_future_free_void,
-            liftFunc: { $0 },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_i8,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_i8,
+            freeFunc: ffi_olaz_ffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
             errorHandler: nil
             
         )
 }
     
-open func applyRemoteRecall(convId: String, msgId: String, cliMsgId: String, updateConversationPreview: Bool, persistConversations: Bool)async   {
+open func applyRemoteRecall(convId: String, msgId: String, cliMsgId: String, updateConversationPreview: Bool, persistConversations: Bool)async  -> Bool  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
@@ -3785,16 +4116,16 @@ open func applyRemoteRecall(convId: String, msgId: String, cliMsgId: String, upd
                         self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(msgId),FfiConverterString.lower(cliMsgId),FfiConverterBool.lower(updateConversationPreview),FfiConverterBool.lower(persistConversations)
                 )
             },
-            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
-            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
-            freeFunc: ffi_olaz_ffi_rust_future_free_void,
-            liftFunc: { $0 },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_i8,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_i8,
+            freeFunc: ffi_olaz_ffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
             errorHandler: nil
             
         )
 }
     
-open func applyRemoteDelete(convId: String, msgId: String, cliMsgId: String, updateConversationPreview: Bool, persistConversations: Bool)async   {
+open func applyRemoteDelete(convId: String, msgId: String, cliMsgId: String, updateConversationPreview: Bool, persistConversations: Bool)async  -> Bool  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
@@ -3802,10 +4133,10 @@ open func applyRemoteDelete(convId: String, msgId: String, cliMsgId: String, upd
                         self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(msgId),FfiConverterString.lower(cliMsgId),FfiConverterBool.lower(updateConversationPreview),FfiConverterBool.lower(persistConversations)
                 )
             },
-            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
-            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
-            freeFunc: ffi_olaz_ffi_rust_future_free_void,
-            liftFunc: { $0 },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_i8,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_i8,
+            freeFunc: ffi_olaz_ffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
             errorHandler: nil
             
         )
@@ -5043,12 +5374,12 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
             eventId: RustBuffer,
             reactClientId: RustBuffer,
             senderName: RustBuffer,
-            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteI8,
             uniffiCallbackData: UInt64,
             uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
         ) in
             let makeCall = {
-                () async throws -> () in
+                () async throws -> Bool in
                 guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
@@ -5065,10 +5396,11 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                 )
             }
 
-            let uniffiHandleSuccess = { (returnValue: ()) in
+            let uniffiHandleSuccess = { (returnValue: Bool) in
                 uniffiFutureCallback(
                     uniffiCallbackData,
-                    UniffiForeignFutureResultVoid(
+                    UniffiForeignFutureResultI8(
+                        returnValue: FfiConverterBool.lower(returnValue),
                         callStatus: RustCallStatus()
                     )
                 )
@@ -5076,7 +5408,8 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
             let uniffiHandleError = { (statusCode, errorBuf) in
                 uniffiFutureCallback(
                     uniffiCallbackData,
-                    UniffiForeignFutureResultVoid(
+                    UniffiForeignFutureResultI8(
+                        returnValue: 0,
                         callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
                     )
                 )
@@ -5095,12 +5428,12 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
             cliMsgId: RustBuffer,
             updateConversationPreview: Int8,
             persistConversations: Int8,
-            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteI8,
             uniffiCallbackData: UInt64,
             uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
         ) in
             let makeCall = {
-                () async throws -> () in
+                () async throws -> Bool in
                 guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
@@ -5113,10 +5446,11 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                 )
             }
 
-            let uniffiHandleSuccess = { (returnValue: ()) in
+            let uniffiHandleSuccess = { (returnValue: Bool) in
                 uniffiFutureCallback(
                     uniffiCallbackData,
-                    UniffiForeignFutureResultVoid(
+                    UniffiForeignFutureResultI8(
+                        returnValue: FfiConverterBool.lower(returnValue),
                         callStatus: RustCallStatus()
                     )
                 )
@@ -5124,7 +5458,8 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
             let uniffiHandleError = { (statusCode, errorBuf) in
                 uniffiFutureCallback(
                     uniffiCallbackData,
-                    UniffiForeignFutureResultVoid(
+                    UniffiForeignFutureResultI8(
+                        returnValue: 0,
                         callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
                     )
                 )
@@ -5143,12 +5478,12 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
             cliMsgId: RustBuffer,
             updateConversationPreview: Int8,
             persistConversations: Int8,
-            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteI8,
             uniffiCallbackData: UInt64,
             uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
         ) in
             let makeCall = {
-                () async throws -> () in
+                () async throws -> Bool in
                 guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
@@ -5161,10 +5496,11 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                 )
             }
 
-            let uniffiHandleSuccess = { (returnValue: ()) in
+            let uniffiHandleSuccess = { (returnValue: Bool) in
                 uniffiFutureCallback(
                     uniffiCallbackData,
-                    UniffiForeignFutureResultVoid(
+                    UniffiForeignFutureResultI8(
+                        returnValue: FfiConverterBool.lower(returnValue),
                         callStatus: RustCallStatus()
                     )
                 )
@@ -5172,7 +5508,8 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
             let uniffiHandleError = { (statusCode, errorBuf) in
                 uniffiFutureCallback(
                     uniffiCallbackData,
-                    UniffiForeignFutureResultVoid(
+                    UniffiForeignFutureResultI8(
+                        returnValue: 0,
                         callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
                     )
                 )
@@ -11120,6 +11457,116 @@ public func FfiConverterTypeWsSession_lower(_ value: WsSession) -> UInt64 {
 
 
 
+/**
+ * Single conversation auto-delete TTL entry (ms).
+ */
+public struct AutoDeleteEntryRecord: Equatable, Hashable {
+    public var convId: String
+    public var ttlMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(convId: String, ttlMs: Int64) {
+        self.convId = convId
+        self.ttlMs = ttlMs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension AutoDeleteEntryRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAutoDeleteEntryRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AutoDeleteEntryRecord {
+        return
+            try AutoDeleteEntryRecord(
+                convId: FfiConverterString.read(from: &buf), 
+                ttlMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AutoDeleteEntryRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.convId, into: &buf)
+        FfiConverterInt64.write(value.ttlMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAutoDeleteEntryRecord_lift(_ buf: RustBuffer) throws -> AutoDeleteEntryRecord {
+    return try FfiConverterTypeAutoDeleteEntryRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAutoDeleteEntryRecord_lower(_ value: AutoDeleteEntryRecord) -> RustBuffer {
+    return FfiConverterTypeAutoDeleteEntryRecord.lower(value)
+}
+
+
+/**
+ * Wrapper for `Option<Option<BTreeMap<String, i64>>>` (`entries: None` = unloaded / cleared).
+ */
+public struct AutoDeleteUpdateRecord: Equatable, Hashable {
+    public var entries: [AutoDeleteEntryRecord]?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(entries: [AutoDeleteEntryRecord]?) {
+        self.entries = entries
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension AutoDeleteUpdateRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAutoDeleteUpdateRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AutoDeleteUpdateRecord {
+        return
+            try AutoDeleteUpdateRecord(
+                entries: FfiConverterOptionSequenceTypeAutoDeleteEntryRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AutoDeleteUpdateRecord, into buf: inout [UInt8]) {
+        FfiConverterOptionSequenceTypeAutoDeleteEntryRecord.write(value.entries, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAutoDeleteUpdateRecord_lift(_ buf: RustBuffer) throws -> AutoDeleteUpdateRecord {
+    return try FfiConverterTypeAutoDeleteUpdateRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAutoDeleteUpdateRecord_lower(_ value: AutoDeleteUpdateRecord) -> RustBuffer {
+    return FfiConverterTypeAutoDeleteUpdateRecord.lower(value)
+}
+
+
 public struct BoolMapEntry: Equatable, Hashable {
     public var convId: String
     public var value: Bool
@@ -12389,10 +12836,15 @@ public struct CoreChangesRecord: Equatable, Hashable {
     public var typing: [TypingEntryRecord]?
     public var forwardRequest: ForwardRequestUpdateRecord?
     public var clearSelection: Bool
+    public var deleteUndo: DeleteUndoUpdateRecord?
+    public var messageConfirm: MessageConfirmUpdateRecord?
+    public var autoDelete: AutoDeleteUpdateRecord?
+    public var starredIds: [String]?
+    public var cachedProfiles: [CachedProfileEntry]?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, typing: [TypingEntryRecord]?, forwardRequest: ForwardRequestUpdateRecord?, clearSelection: Bool) {
+    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, typing: [TypingEntryRecord]?, forwardRequest: ForwardRequestUpdateRecord?, clearSelection: Bool, deleteUndo: DeleteUndoUpdateRecord?, messageConfirm: MessageConfirmUpdateRecord?, autoDelete: AutoDeleteUpdateRecord?, starredIds: [String]?, cachedProfiles: [CachedProfileEntry]?) {
         self.version = version
         self.session = session
         self.conversations = conversations
@@ -12407,6 +12859,11 @@ public struct CoreChangesRecord: Equatable, Hashable {
         self.typing = typing
         self.forwardRequest = forwardRequest
         self.clearSelection = clearSelection
+        self.deleteUndo = deleteUndo
+        self.messageConfirm = messageConfirm
+        self.autoDelete = autoDelete
+        self.starredIds = starredIds
+        self.cachedProfiles = cachedProfiles
     }
 
     
@@ -12438,7 +12895,12 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
                 contacts: FfiConverterOptionTypeContactsStateRecord.read(from: &buf), 
                 typing: FfiConverterOptionSequenceTypeTypingEntryRecord.read(from: &buf), 
                 forwardRequest: FfiConverterOptionTypeForwardRequestUpdateRecord.read(from: &buf), 
-                clearSelection: FfiConverterBool.read(from: &buf)
+                clearSelection: FfiConverterBool.read(from: &buf), 
+                deleteUndo: FfiConverterOptionTypeDeleteUndoUpdateRecord.read(from: &buf), 
+                messageConfirm: FfiConverterOptionTypeMessageConfirmUpdateRecord.read(from: &buf), 
+                autoDelete: FfiConverterOptionTypeAutoDeleteUpdateRecord.read(from: &buf), 
+                starredIds: FfiConverterOptionSequenceString.read(from: &buf), 
+                cachedProfiles: FfiConverterOptionSequenceTypeCachedProfileEntry.read(from: &buf)
         )
     }
 
@@ -12457,6 +12919,11 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
         FfiConverterOptionSequenceTypeTypingEntryRecord.write(value.typing, into: &buf)
         FfiConverterOptionTypeForwardRequestUpdateRecord.write(value.forwardRequest, into: &buf)
         FfiConverterBool.write(value.clearSelection, into: &buf)
+        FfiConverterOptionTypeDeleteUndoUpdateRecord.write(value.deleteUndo, into: &buf)
+        FfiConverterOptionTypeMessageConfirmUpdateRecord.write(value.messageConfirm, into: &buf)
+        FfiConverterOptionTypeAutoDeleteUpdateRecord.write(value.autoDelete, into: &buf)
+        FfiConverterOptionSequenceString.write(value.starredIds, into: &buf)
+        FfiConverterOptionSequenceTypeCachedProfileEntry.write(value.cachedProfiles, into: &buf)
     }
 }
 
@@ -12534,6 +13001,120 @@ public func FfiConverterTypeCursorEntry_lift(_ buf: RustBuffer) throws -> Cursor
 #endif
 public func FfiConverterTypeCursorEntry_lower(_ value: CursorEntry) -> RustBuffer {
     return FfiConverterTypeCursorEntry.lower(value)
+}
+
+
+/**
+ * Active 5-second delete-for-me undo bar snapshot delivered via [`CoreChangesRecord`].
+ */
+public struct DeleteUndoSnapshotRecord: Equatable, Hashable {
+    public var convId: String
+    public var count: UInt64
+    public var deadlineMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(convId: String, count: UInt64, deadlineMs: Int64) {
+        self.convId = convId
+        self.count = count
+        self.deadlineMs = deadlineMs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension DeleteUndoSnapshotRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDeleteUndoSnapshotRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DeleteUndoSnapshotRecord {
+        return
+            try DeleteUndoSnapshotRecord(
+                convId: FfiConverterString.read(from: &buf), 
+                count: FfiConverterUInt64.read(from: &buf), 
+                deadlineMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DeleteUndoSnapshotRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.convId, into: &buf)
+        FfiConverterUInt64.write(value.count, into: &buf)
+        FfiConverterInt64.write(value.deadlineMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeleteUndoSnapshotRecord_lift(_ buf: RustBuffer) throws -> DeleteUndoSnapshotRecord {
+    return try FfiConverterTypeDeleteUndoSnapshotRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeleteUndoSnapshotRecord_lower(_ value: DeleteUndoSnapshotRecord) -> RustBuffer {
+    return FfiConverterTypeDeleteUndoSnapshotRecord.lower(value)
+}
+
+
+/**
+ * Wrapper for `Option<Option<DeleteUndoSnapshot>>` (UniFFI forbids nested `Option`).
+ */
+public struct DeleteUndoUpdateRecord: Equatable, Hashable {
+    public var undo: DeleteUndoSnapshotRecord?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(undo: DeleteUndoSnapshotRecord?) {
+        self.undo = undo
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension DeleteUndoUpdateRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDeleteUndoUpdateRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DeleteUndoUpdateRecord {
+        return
+            try DeleteUndoUpdateRecord(
+                undo: FfiConverterOptionTypeDeleteUndoSnapshotRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DeleteUndoUpdateRecord, into buf: inout [UInt8]) {
+        FfiConverterOptionTypeDeleteUndoSnapshotRecord.write(value.undo, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeleteUndoUpdateRecord_lift(_ buf: RustBuffer) throws -> DeleteUndoUpdateRecord {
+    return try FfiConverterTypeDeleteUndoUpdateRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeleteUndoUpdateRecord_lower(_ value: DeleteUndoUpdateRecord) -> RustBuffer {
+    return FfiConverterTypeDeleteUndoUpdateRecord.lower(value)
 }
 
 
@@ -14798,6 +15379,136 @@ public func FfiConverterTypeMenuRecord_lift(_ buf: RustBuffer) throws -> MenuRec
 #endif
 public func FfiConverterTypeMenuRecord_lower(_ value: MenuRecord) -> RustBuffer {
     return FfiConverterTypeMenuRecord.lower(value)
+}
+
+
+/**
+ * Active message-action confirmation dialog state delivered via [`CoreChangesRecord`].
+ */
+public struct MessageConfirmRecord: Equatable, Hashable {
+    public var id: UInt64
+    public var convId: String
+    public var action: MessageConfirmActionRecord
+    public var title: String
+    public var message: String
+    public var ok: String
+    public var destructive: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: UInt64, convId: String, action: MessageConfirmActionRecord, title: String, message: String, ok: String, destructive: Bool) {
+        self.id = id
+        self.convId = convId
+        self.action = action
+        self.title = title
+        self.message = message
+        self.ok = ok
+        self.destructive = destructive
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MessageConfirmRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMessageConfirmRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageConfirmRecord {
+        return
+            try MessageConfirmRecord(
+                id: FfiConverterUInt64.read(from: &buf), 
+                convId: FfiConverterString.read(from: &buf), 
+                action: FfiConverterTypeMessageConfirmActionRecord.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                message: FfiConverterString.read(from: &buf), 
+                ok: FfiConverterString.read(from: &buf), 
+                destructive: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MessageConfirmRecord, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.id, into: &buf)
+        FfiConverterString.write(value.convId, into: &buf)
+        FfiConverterTypeMessageConfirmActionRecord.write(value.action, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterString.write(value.message, into: &buf)
+        FfiConverterString.write(value.ok, into: &buf)
+        FfiConverterBool.write(value.destructive, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageConfirmRecord_lift(_ buf: RustBuffer) throws -> MessageConfirmRecord {
+    return try FfiConverterTypeMessageConfirmRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageConfirmRecord_lower(_ value: MessageConfirmRecord) -> RustBuffer {
+    return FfiConverterTypeMessageConfirmRecord.lower(value)
+}
+
+
+/**
+ * Wrapper for `Option<Option<MessageConfirmState>>` (UniFFI forbids nested `Option`).
+ */
+public struct MessageConfirmUpdateRecord: Equatable, Hashable {
+    public var confirm: MessageConfirmRecord?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(confirm: MessageConfirmRecord?) {
+        self.confirm = confirm
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MessageConfirmUpdateRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMessageConfirmUpdateRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageConfirmUpdateRecord {
+        return
+            try MessageConfirmUpdateRecord(
+                confirm: FfiConverterOptionTypeMessageConfirmRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MessageConfirmUpdateRecord, into buf: inout [UInt8]) {
+        FfiConverterOptionTypeMessageConfirmRecord.write(value.confirm, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageConfirmUpdateRecord_lift(_ buf: RustBuffer) throws -> MessageConfirmUpdateRecord {
+    return try FfiConverterTypeMessageConfirmUpdateRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageConfirmUpdateRecord_lower(_ value: MessageConfirmUpdateRecord) -> RustBuffer {
+    return FfiConverterTypeMessageConfirmUpdateRecord.lower(value)
 }
 
 
@@ -20346,6 +21057,112 @@ public func FfiConverterTypeMediaSecureChoice_lower(_ value: MediaSecureChoice) 
 
 
 /**
+ * Action kind carried by [`MessageConfirmRecord`].
+ */
+
+public enum MessageConfirmActionRecord: Equatable, Hashable {
+    
+    case deleteForMe(msgId: String
+    )
+    case deleteMany(msgIds: [String]
+    )
+    case recallMany(msgIds: [String]
+    )
+    case pin(msgId: String, replacingRef: String?
+    )
+    case unpin(topicRef: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MessageConfirmActionRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMessageConfirmActionRecord: FfiConverterRustBuffer {
+    typealias SwiftType = MessageConfirmActionRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageConfirmActionRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .deleteForMe(msgId: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .deleteMany(msgIds: try FfiConverterSequenceString.read(from: &buf)
+        )
+        
+        case 3: return .recallMany(msgIds: try FfiConverterSequenceString.read(from: &buf)
+        )
+        
+        case 4: return .pin(msgId: try FfiConverterString.read(from: &buf), replacingRef: try FfiConverterOptionString.read(from: &buf)
+        )
+        
+        case 5: return .unpin(topicRef: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MessageConfirmActionRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .deleteForMe(msgId):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(msgId, into: &buf)
+            
+        
+        case let .deleteMany(msgIds):
+            writeInt(&buf, Int32(2))
+            FfiConverterSequenceString.write(msgIds, into: &buf)
+            
+        
+        case let .recallMany(msgIds):
+            writeInt(&buf, Int32(3))
+            FfiConverterSequenceString.write(msgIds, into: &buf)
+            
+        
+        case let .pin(msgId,replacingRef):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(msgId, into: &buf)
+            FfiConverterOptionString.write(replacingRef, into: &buf)
+            
+        
+        case let .unpin(topicRef):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(topicRef, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageConfirmActionRecord_lift(_ buf: RustBuffer) throws -> MessageConfirmActionRecord {
+    return try FfiConverterTypeMessageConfirmActionRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageConfirmActionRecord_lower(_ value: MessageConfirmActionRecord) -> RustBuffer {
+    return FfiConverterTypeMessageConfirmActionRecord.lower(value)
+}
+
+
+
+/**
  * Parsed mobile-sync control event delivered to Swift (`ZaloMobileSyncEvent`).
  * Contains sync tokens/URLs; `Debug` is redacted.
  */
@@ -21275,6 +22092,30 @@ fileprivate struct FfiConverterOptionTypeQrListener: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeAutoDeleteUpdateRecord: FfiConverterRustBuffer {
+    typealias SwiftType = AutoDeleteUpdateRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeAutoDeleteUpdateRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeAutoDeleteUpdateRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeContactsStateRecord: FfiConverterRustBuffer {
     typealias SwiftType = ContactsStateRecord?
 
@@ -21443,6 +22284,54 @@ fileprivate struct FfiConverterOptionTypeCoreChangesRecord: FfiConverterRustBuff
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeDeleteUndoSnapshotRecord: FfiConverterRustBuffer {
+    typealias SwiftType = DeleteUndoSnapshotRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeDeleteUndoSnapshotRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeDeleteUndoSnapshotRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeDeleteUndoUpdateRecord: FfiConverterRustBuffer {
+    typealias SwiftType = DeleteUndoUpdateRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeDeleteUndoUpdateRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeDeleteUndoUpdateRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeE2eeQuoteArgRecord: FfiConverterRustBuffer {
     typealias SwiftType = E2eeQuoteArgRecord?
 
@@ -21579,6 +22468,54 @@ fileprivate struct FfiConverterOptionTypeMediaSecureRecord: FfiConverterRustBuff
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeMediaSecureRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeMessageConfirmRecord: FfiConverterRustBuffer {
+    typealias SwiftType = MessageConfirmRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMessageConfirmRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMessageConfirmRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeMessageConfirmUpdateRecord: FfiConverterRustBuffer {
+    typealias SwiftType = MessageConfirmUpdateRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMessageConfirmUpdateRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMessageConfirmUpdateRecord.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -21995,6 +22932,54 @@ fileprivate struct FfiConverterOptionSequenceString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionSequenceTypeAutoDeleteEntryRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [AutoDeleteEntryRecord]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceTypeAutoDeleteEntryRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceTypeAutoDeleteEntryRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionSequenceTypeCachedProfileEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [CachedProfileEntry]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceTypeCachedProfileEntry.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceTypeCachedProfileEntry.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionSequenceTypeConversationSummaryRecord: FfiConverterRustBuffer {
     typealias SwiftType = [ConversationSummaryRecord]?
 
@@ -22108,6 +23093,31 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeAutoDeleteEntryRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [AutoDeleteEntryRecord]
+
+    public static func write(_ value: [AutoDeleteEntryRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeAutoDeleteEntryRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [AutoDeleteEntryRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [AutoDeleteEntryRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeAutoDeleteEntryRecord.read(from: &buf))
         }
         return seq
     }
@@ -23661,10 +24671,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_historybatch_raw_json() != 50277) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_answer_message_confirm() != 27581) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_apply_account_profile() != 24350) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_coreengine_apply_batch_direct() != 3697) {
+    if (uniffi_olaz_ffi_checksum_method_coreengine_apply_batch_direct() != 43894) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_apply_bootstrap_pin_archive() != 46002) {
@@ -23677,6 +24690,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_apply_server_hidden_conversations() != 4274) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_ask_message_confirm() != 26951) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_attach_store() != 20107) {
@@ -23706,10 +24722,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_delete_conversation_label() != 22782) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_delete_for_me() != 20352) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_delete_many() != 57213) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_detach_store() != 29144) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_dismiss_conversation_prompt() != 65413) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_dismiss_delete_undo() != 25334) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_drain_chat_polling() != 3593) {
@@ -23752,6 +24777,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_hide_conversation_new_pin() != 2897) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_load_auto_delete() != 38688) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_load_older_messages() != 41347) {
@@ -23799,7 +24827,25 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_pin_replacing() != 26531) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_prune_expired_messages() != 8324) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_react() != 45542) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_rebuild_conversation_extras() != 60933) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_recall() != 57867) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_recall_many() != 17156) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_recall_many_async() != 30125) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_record_seen_reaction_keys() != 29165) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_refresh_mention_previews() != 8415) {
@@ -23853,7 +24899,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_seed_history_freshness() != 1024) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_seed_seen_reaction_keys() != 30558) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_send_text() != 59517) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_set_auto_delete() != 30295) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_set_auto_delete_ttl() != 15133) {
@@ -23880,6 +24932,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_set_send_typing_enabled() != 20118) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_set_starred() != 42048) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_settle() != 26622) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -23902,6 +24957,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_sync_hidden_conversations() != 26494) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_undo_delete() != 62417) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_unhide_conversation() != 8811) {
@@ -24012,13 +25070,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_corehost_mark_read_boundary() != 9532) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_apply_remote_reaction() != 19195) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_apply_remote_reaction() != 33529) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_apply_remote_recall() != 31385) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_apply_remote_recall() != 27471) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_apply_remote_delete() != 29247) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_apply_remote_delete() != 58018) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_corehost_decrypt_envelope() != 23082) {
