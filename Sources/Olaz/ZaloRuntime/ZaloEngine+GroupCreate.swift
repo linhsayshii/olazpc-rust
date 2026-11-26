@@ -690,7 +690,7 @@ extension ZaloEngine {
             previewText: summary.preview?.text ?? "",
             previewTsMs: Int64(((summary.preview?.date?.timeIntervalSince1970 ?? 0) * 1000).rounded()),
             previewFromMe: summary.preview?.fromMe ?? false,
-            updatedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+            updatedAtMs: nowMs()
         )
         try? await store.upsertConversation(stored)
     }

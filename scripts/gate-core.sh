@@ -15,17 +15,40 @@ fi
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 
+is_pending_domain() {
+    local domain="$1"
+    [[ -f "$ROOT/rust/crates/olaz-core/tests/cases.rs" ]] || return 1
+    python3 - "$ROOT/rust/crates/olaz-core/tests/cases.rs" "$domain" <<'PY'
+import re, sys
+
+cases_rs, domain = sys.argv[1], sys.argv[2]
+src = open(cases_rs, encoding="utf-8").read()
+m = re.search(r'\bPENDING_DOMAINS\s*:\s*&\[\s*&str\s*\]\s*=\s*&\[(.*?)\];', src, re.S)
+if not m:
+    sys.exit(1)
+body = "\n".join(line.split("//", 1)[0] for line in m.group(1).splitlines())
+pending = set(re.findall(r'"([^"]+)"', body))
+sys.exit(0 if domain in pending else 1)
+PY
+}
+
 if [[ "$1" == "all" ]]; then
     DOMAINS=()
     for f in "$ROOT"/rust/crates/olaz-core/cases/*.jsonl(N); do
         d="${f:t:r}"
         [[ "$d" == "known-diffs" ]] && continue
         # Domains recorded but not ported yet (`PENDING_DOMAINS` in tests/cases.rs) are not gated.
-        grep -Eq "PENDING_DOMAINS.*\"$d\"" "$ROOT/rust/crates/olaz-core/tests/cases.rs" 2>/dev/null && continue
+        is_pending_domain "$d" && continue
         DOMAINS+=("$d")
     done
 else
     DOMAINS=("$@")
+    for DOMAIN in "${DOMAINS[@]}"; do
+        if is_pending_domain "$DOMAIN"; then
+            echo "gate FAIL: domain '$DOMAIN' is listed in PENDING_DOMAINS (rust/crates/olaz-core/tests/cases.rs); remove it before gating" >&2
+            exit 1
+        fi
+    done
 fi
 
 # Tests that assert a wall-clock budget or poll real time.
@@ -232,6 +255,15 @@ for DOMAIN in "${DOMAINS[@]}"; do
             ;;
         message_actions)
             RECORDER_FILTER="MessageActionRecorderTests"
+            ;;
+        contacts)
+            RECORDER_FILTER="ContactRecorderTests"
+            ;;
+        groups)
+            RECORDER_FILTER="GroupRecorderTests"
+            ;;
+        polls)
+            RECORDER_FILTER="PollRecorderTests"
             ;;
         *)
             RECORDER_FILTER="${DOMAIN_CAP}RecorderTests"
