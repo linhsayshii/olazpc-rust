@@ -3738,6 +3738,31 @@ fn enrich_send_message_json(m: &ChatMessage, base: &mut Map<String, Value>) {
     );
 }
 
+fn decode_step_message(msg_json: &Value, fallback_conv_id: &str) -> Option<olaz_wire::ChatMessage> {
+    let mut dict = msg_json.as_object()?.clone();
+    let aliases = [
+        ("conv_id", "conversationId"),
+        ("client_id", "clientId"),
+        ("sender_id", "senderId"),
+        ("sender_name", "senderName"),
+        ("sender_avatar", "senderAvatar"),
+        ("is_mine", "isMine"),
+        ("is_e2ee", "isE2EE"),
+        ("date_ms", "date"),
+    ];
+    for (snake, camel) in aliases {
+        if !dict.contains_key(camel)
+            && let Some(v) = dict.get(snake).cloned()
+        {
+            dict.insert(camel.to_owned(), v);
+        }
+    }
+    if let Some(kind_str) = dict.get("kind").and_then(Value::as_str).map(str::to_owned) {
+        dict.insert("kind".to_owned(), json!({ "type": kind_str }));
+    }
+    olaz_wire::ChatMessage::from_json(&dict, fallback_conv_id)
+}
+
 #[derive(Clone, Default)]
 struct TestSelection {
     conv_id: String,
@@ -4542,6 +4567,7 @@ struct SnapshotOpts<'a> {
     is_u8: bool,
     is_u12: bool,
     is_u13: bool,
+    is_u14: bool,
     last_send_result: Option<bool>,
     send_logs: &'a Mutex<Vec<String>>,
     prune_next_expiry_ms: Option<i64>,
@@ -4551,6 +4577,7 @@ struct SnapshotOpts<'a> {
     u12_results: &'a BTreeMap<String, Value>,
     watched_check_ids: Option<&'a [String]>,
     seeded_member_cache: Option<&'a Value>,
+    search_results: &'a Map<String, Value>,
     results: &'a Map<String, Value>,
 }
 
@@ -4741,6 +4768,7 @@ async fn capture_case_snapshot(
         is_u8,
         is_u12,
         is_u13,
+        is_u14,
         last_send_result,
         send_logs,
         prune_next_expiry_ms,
@@ -4751,6 +4779,7 @@ async fn capture_case_snapshot(
         watched_check_ids,
         seeded_member_cache,
         results,
+        search_results,
     } = *opts;
     if !is_u3 {
         return core
@@ -5043,6 +5072,9 @@ async fn capture_case_snapshot(
             obj.insert("results".to_owned(), Value::Object(forward_results.clone()));
         }
     }
+    if is_u14 {
+        obj.insert("results".to_owned(), Value::Object(search_results.clone()));
+    }
     if is_u13 {
         if let Some(Value::Object(msgs_obj)) = obj.get_mut("messages") {
             for (conv_id, list) in &full.messages.windows {
@@ -5150,7 +5182,8 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let is_u8 = case.domain == "forward";
     let is_u12 = case.domain == "polls";
     let is_u13 = case.domain == "stickers";
-    let is_u6 = case.domain == "message_actions" || is_u8 || is_u13;
+    let is_u14 = case.domain == "search";
+    let is_u6 = case.domain == "message_actions" || is_u8 || is_u13 || is_u14;
     let is_u5 = case.domain == "send" || is_u6 || is_u12;
     let is_u4 = case.domain == "bootstrap" || case.domain == "messages" || is_u5;
     let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions" || is_u4;
@@ -5506,6 +5539,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let mut pending_action_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut u12_results: BTreeMap<String, Value> = BTreeMap::new();
 
+    let mut search_results: Map<String, Value> = Map::new();
     let mut selection: Option<TestSelection> = None;
     let mut forward_results: Map<String, Value> = Map::new();
     for (step_index, step) in case.steps.iter().enumerate() {
@@ -6063,6 +6097,77 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                     tokio::time::timeout(dur, wait_fut)
                         .await
                         .map_err(|_| format!("timed out awaiting typing expiry for `{id}`"))?;
+                }
+                "search" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let query = str_arg(args, "query");
+                    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(50);
+                    let (hits, _ver) = core.search_messages(conv_id, query, limit).await;
+                    search_results.insert(
+                        step_index.to_string(),
+                        Value::Array(hits.into_iter().map(|m| Value::String(m.id)).collect()),
+                    );
+                }
+                "ensure_loaded" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let target = if let Some(msg_json) = args.get("message") {
+                        decode_step_message(msg_json, &conv_id)
+                    } else if let Some(msg_id) = args.get("msg_id").and_then(Value::as_str) {
+                        let mem_hit = core.full_snapshot().await.and_then(|snap| {
+                            snap.messages
+                                .windows
+                                .get(&conv_id)
+                                .and_then(|list| list.iter().find(|m| m.id == msg_id).cloned())
+                        });
+                        if mem_hit.is_some() {
+                            mem_hit
+                        } else if let Some(store_arc) = host.attached_store() {
+                            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                            store
+                                .message(&conv_id, msg_id)
+                                .ok()
+                                .flatten()
+                                .and_then(|row| olaz_core::decode_db_stored(&row))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let msg = target.ok_or_else(|| {
+                        "ensure_loaded could not resolve target message".to_owned()
+                    })?;
+                    let (loaded, _ver) = core.ensure_message_loaded(conv_id, msg).await;
+                    search_results.insert(step_index.to_string(), Value::Bool(loaded));
+                }
+                "load_quoted" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let mem_hit = core.full_snapshot().await.and_then(|snap| {
+                        snap.messages
+                            .windows
+                            .get(&conv_id)
+                            .and_then(|list| list.iter().find(|m| m.id == msg_id).cloned())
+                    });
+                    let target = if mem_hit.is_some() {
+                        mem_hit
+                    } else if let Some(store_arc) = host.attached_store() {
+                        let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                        store
+                            .message(&conv_id, &msg_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|row| olaz_core::decode_db_stored(&row))
+                    } else {
+                        None
+                    };
+                    let msg = target
+                        .ok_or_else(|| format!("load_quoted could not find msg_id `{msg_id}`"))?;
+                    let (quoted_id, _ver) = core.load_quoted_message(conv_id, msg).await;
+                    search_results.insert(
+                        step_index.to_string(),
+                        quoted_id.map_or(Value::Null, Value::String),
+                    );
                 }
                 "request_forward" => {
                     let conv_id = str_arg(args, "conv_id");
@@ -7066,6 +7171,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         is_u8,
                         is_u12,
                         is_u13,
+                        is_u14,
                         last_send_result,
                         send_logs: &send_logs,
                         prune_next_expiry_ms,
@@ -7076,6 +7182,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         watched_check_ids: case.seed.watched_check_ids.as_deref(),
                         seeded_member_cache: case.seed.group_member_cache.as_ref(),
                         results: &results,
+                        search_results: &search_results,
                     },
                 )
                 .await
@@ -7127,6 +7234,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             is_u8,
             is_u12,
             is_u13,
+            is_u14,
             last_send_result,
             send_logs: &send_logs,
             prune_next_expiry_ms,
@@ -7137,6 +7245,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             watched_check_ids: case.seed.watched_check_ids.as_deref(),
             seeded_member_cache: case.seed.group_member_cache.as_ref(),
             results: &results,
+            search_results: &search_results,
         },
     )
     .await

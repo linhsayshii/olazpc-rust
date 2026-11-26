@@ -346,6 +346,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, out: &mut ReduceOutput) {
             }
             state.stickers.reset();
             crate::reduce::composer::reset_composer(state, false, out);
+            state.search.reset(out);
             // U6
             let (undo_changed, confirm_changed, auto_del_changed, starred_changed) =
                 state.actions.reset_session();
@@ -457,6 +458,7 @@ pub(crate) fn enter_session_expired(state: &mut CoreState, reason: String, out: 
     }
     state.stickers.reset();
     crate::reduce::composer::reset_composer(state, false, out);
+    state.search.reset(out);
     // U6
     let (undo_changed, confirm_changed, auto_del_changed, starred_changed) =
         state.actions.reset_session();

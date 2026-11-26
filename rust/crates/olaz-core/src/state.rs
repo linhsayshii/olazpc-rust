@@ -35,6 +35,8 @@ pub struct CoreState {
     pub send: crate::reduce::send::SendState,
     // U8
     pub forward: ForwardState,
+    // U14
+    pub search: crate::search::SearchState,
     // U6
     pub actions: ActionsState,
     // U12

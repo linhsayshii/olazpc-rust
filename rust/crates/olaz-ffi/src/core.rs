@@ -477,6 +477,34 @@ pub struct SendTextOutcomeRecord {
     pub version: u64,
 }
 
+/// Result of `CoreEngine.search_messages`, paired with the actor's settled change revision.
+#[derive(uniffi::Record)]
+pub struct SearchMessagesResultRecord {
+    pub messages: Vec<ChatMessageRecord>,
+    pub settled_version: u64,
+}
+
+/// Result of `CoreEngine.ensure_message_loaded`, paired with the actor's settled change revision.
+#[derive(uniffi::Record)]
+pub struct EnsureMessageLoadedResultRecord {
+    pub loaded: bool,
+    pub settled_version: u64,
+}
+
+/// Result of `CoreEngine.load_quoted_message`, paired with the actor's settled change revision.
+#[derive(uniffi::Record)]
+pub struct LoadQuotedMessageResultRecord {
+    pub message_id: Option<String>,
+    pub settled_version: u64,
+}
+
+/// Pure U14 matcher shared between Swift offline/UI helpers and Rust core/SQLite search.
+#[uniffi::export]
+pub fn core_message_matches_search_query(message: ChatMessageRecord, query: String) -> bool {
+    let wire_msg = olaz_wire::ChatMessage::from(&message);
+    olaz_core::message_matches_search_query(&wire_msg, &query)
+}
+
 /// Active forward picker request mirrored from `olaz-core` (U8).
 #[derive(Clone, PartialEq, uniffi::Record)]
 pub struct ForwardRequestRecord {
@@ -3533,6 +3561,26 @@ impl CoreEngine {
             .send(Command::SetAutoDeleteTtl { conv_id, ttl_ms });
     }
 
+    // --- U14 Search ---
+
+    /// Searches in-memory messages and SQLite history for `conv_id`, newest-first.
+    pub async fn search_messages(
+        &self,
+        conv_id: String,
+        query: String,
+        limit: i64,
+    ) -> Result<SearchMessagesResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            let (msgs, settled_version) = handle.search_messages(conv_id, query, limit).await;
+            SearchMessagesResultRecord {
+                messages: msgs.into_iter().map(ChatMessageRecord::from).collect(),
+                settled_version,
+            }
+        })
+        .await
+    }
+
     // --- U6 message actions ---
 
     /// Adds, toggles, or clears (`remove_all = true`) the current user's reaction on a message.
@@ -3567,6 +3615,24 @@ impl CoreEngine {
         .await
     }
 
+    /// Ensures `message` is loaded into `messages.windows[conv_id]` so the list can scroll to it.
+    pub async fn ensure_message_loaded(
+        &self,
+        conv_id: String,
+        message: ChatMessageRecord,
+    ) -> Result<EnsureMessageLoadedResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let wire_msg = olaz_wire::ChatMessage::from(&message);
+        run(async move {
+            let (loaded, settled_version) = handle.ensure_message_loaded(conv_id, wire_msg).await;
+            EnsureMessageLoadedResultRecord {
+                loaded,
+                settled_version,
+            }
+        })
+        .await
+    }
+
     /// Recalls a single message for everyone and awaits completion of the API, local/store update,
     /// and host callbacks. Returns the settled core mirror version.
     pub async fn recall(
@@ -3596,6 +3662,24 @@ impl CoreEngine {
                 .settle()
                 .await
                 .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    /// Finds and loads the message quoted by `message` in `conv_id`, returning its id if found.
+    pub async fn load_quoted_message(
+        &self,
+        conv_id: String,
+        message: ChatMessageRecord,
+    ) -> Result<LoadQuotedMessageResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let wire_msg = olaz_wire::ChatMessage::from(&message);
+        run(async move {
+            let (message_id, settled_version) = handle.load_quoted_message(conv_id, wire_msg).await;
+            LoadQuotedMessageResultRecord {
+                message_id,
+                settled_version,
+            }
         })
         .await
     }
@@ -4818,5 +4902,39 @@ mod tests {
             Some("not json".to_owned()),
         );
         assert!(matches!(res, Err(CoreError::Parse { .. })));
+    }
+
+    #[test]
+    fn core_message_matches_search_query_handles_unicode_and_recalled() {
+        let mut msg = ChatMessageRecord::from(olaz_wire::ChatMessage {
+            id: "m1".to_owned(),
+            conversation_id: "u1".to_owned(),
+            client_id: "c1".to_owned(),
+            sender_id: "s1".to_owned(),
+            sender_name: "Alice".to_owned(),
+            sender_avatar: None,
+            is_mine: false,
+            kind: olaz_wire::Kind::Text,
+            text: "Đặng ấ Kelvin".to_owned(),
+            date_ms: 1_000,
+            status: olaz_wire::Status::Sent,
+            quote: None,
+            reactions: Vec::new(),
+            is_e2ee: false,
+            mentions: Vec::new(),
+            card_buttons: Vec::new(),
+            suggests_stickers: false,
+            menu: olaz_wire::MessageMenu::default(),
+            fallback_urls: Vec::new(),
+            text_styles: Vec::new(),
+            ttl_ms: 0,
+            urgency: 0,
+        });
+        assert!(core_message_matches_search_query(
+            msg.clone(),
+            "  đặng a\u{0302}\u{0301} kelvin  ".to_owned()
+        ));
+        msg.kind = crate::chat::KindRecord::Recalled;
+        assert!(!core_message_matches_search_query(msg, "đặng".to_owned()));
     }
 }

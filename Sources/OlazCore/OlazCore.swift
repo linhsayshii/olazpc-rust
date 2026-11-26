@@ -1420,6 +1420,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func ensureKnownContacts() 
     
+    /**
+     * Ensures `message` is loaded into `messages.windows[conv_id]` so the list can scroll to it.
+     */
+    func ensureMessageLoaded(convId: String, message: ChatMessageRecord) async throws  -> EnsureMessageLoadedResultRecord
+    
     func firePollDebounce(pollId: String, seq: UInt64, nowMs: Int64) 
     
     func flushAll() async throws  -> UInt64
@@ -1487,6 +1492,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func loadOlderMessages(id: String) 
     
     func loadOlderMessagesAndWait(id: String) async throws  -> UInt64
+    
+    /**
+     * Finds and loads the message quoted by `message` in `conv_id`, returning its id if found.
+     */
+    func loadQuotedMessage(convId: String, message: ChatMessageRecord) async throws  -> LoadQuotedMessageResultRecord
     
     func lockPoll(id: String, convId: String, nowMs: Int64) async throws  -> PollActionOutcomeRecord
     
@@ -1696,6 +1706,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func retryPoll(id: String, convId: String, nowMs: Int64) 
     
     func rewatchPolls(nowMs: Int64) 
+    
+    /**
+     * Searches in-memory messages and SQLite history for `conv_id`, newest-first.
+     */
+    func searchMessages(convId: String, query: String, limit: Int64) async throws  -> SearchMessagesResultRecord
     
     /**
      * Searches stickers by keyword (max 40).
@@ -2472,6 +2487,25 @@ open func ensureKnownContacts()  {try! rustCall() {
 }
 }
     
+    /**
+     * Ensures `message` is loaded into `messages.windows[conv_id]` so the list can scroll to it.
+     */
+open func ensureMessageLoaded(convId: String, message: ChatMessageRecord)async throws  -> EnsureMessageLoadedResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_ensure_message_loaded(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterTypeChatMessageRecord_lower(message)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeEnsureMessageLoadedResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
 open func firePollDebounce(pollId: String, seq: UInt64, nowMs: Int64)  {try! rustCall() {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_method_coreengine_fire_poll_debounce(
@@ -2713,6 +2747,25 @@ open func loadOlderMessagesAndWait(id: String)async throws  -> UInt64  {
             completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
             freeFunc: ffi_olaz_ffi_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Finds and loads the message quoted by `message` in `conv_id`, returning its id if found.
+     */
+open func loadQuotedMessage(convId: String, message: ChatMessageRecord)async throws  -> LoadQuotedMessageResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_load_quoted_message(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterTypeChatMessageRecord_lower(message)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeLoadQuotedMessageResultRecord_lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
 }
@@ -3412,6 +3465,25 @@ open func rewatchPolls(nowMs: Int64)  {try! rustCall() {
         FfiConverterInt64.lower(nowMs),uniffiCallStatus
     )
 }
+}
+    
+    /**
+     * Searches in-memory messages and SQLite history for `conv_id`, newest-first.
+     */
+open func searchMessages(convId: String, query: String, limit: Int64)async throws  -> SearchMessagesResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_search_messages(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(query),FfiConverterInt64.lower(limit)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeSearchMessagesResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -14644,6 +14716,63 @@ public func FfiConverterTypeECardRecord_lower(_ value: ECardRecord) -> RustBuffe
 }
 
 
+/**
+ * Result of `CoreEngine.ensure_message_loaded`, paired with the actor's settled change revision.
+ */
+public struct EnsureMessageLoadedResultRecord: Equatable, Hashable {
+    public var loaded: Bool
+    public var settledVersion: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(loaded: Bool, settledVersion: UInt64) {
+        self.loaded = loaded
+        self.settledVersion = settledVersion
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension EnsureMessageLoadedResultRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEnsureMessageLoadedResultRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EnsureMessageLoadedResultRecord {
+        return
+            try EnsureMessageLoadedResultRecord(
+                loaded: FfiConverterBool.read(from: &buf), 
+                settledVersion: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EnsureMessageLoadedResultRecord, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.loaded, into: &buf)
+        FfiConverterUInt64.write(value.settledVersion, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEnsureMessageLoadedResultRecord_lift(_ buf: RustBuffer) throws -> EnsureMessageLoadedResultRecord {
+    return try FfiConverterTypeEnsureMessageLoadedResultRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEnsureMessageLoadedResultRecord_lower(_ value: EnsureMessageLoadedResultRecord) -> RustBuffer {
+    return FfiConverterTypeEnsureMessageLoadedResultRecord.lower(value)
+}
+
+
 public struct FlagEntry: Equatable, Hashable {
     public var id: String
     public var bits: Int32
@@ -15702,6 +15831,63 @@ public func FfiConverterTypeLegacyCookieRecord_lift(_ buf: RustBuffer) throws ->
 #endif
 public func FfiConverterTypeLegacyCookieRecord_lower(_ value: LegacyCookieRecord) -> RustBuffer {
     return FfiConverterTypeLegacyCookieRecord.lower(value)
+}
+
+
+/**
+ * Result of `CoreEngine.load_quoted_message`, paired with the actor's settled change revision.
+ */
+public struct LoadQuotedMessageResultRecord: Equatable, Hashable {
+    public var messageId: String?
+    public var settledVersion: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(messageId: String?, settledVersion: UInt64) {
+        self.messageId = messageId
+        self.settledVersion = settledVersion
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension LoadQuotedMessageResultRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLoadQuotedMessageResultRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LoadQuotedMessageResultRecord {
+        return
+            try LoadQuotedMessageResultRecord(
+                messageId: FfiConverterOptionString.read(from: &buf), 
+                settledVersion: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LoadQuotedMessageResultRecord, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.messageId, into: &buf)
+        FfiConverterUInt64.write(value.settledVersion, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoadQuotedMessageResultRecord_lift(_ buf: RustBuffer) throws -> LoadQuotedMessageResultRecord {
+    return try FfiConverterTypeLoadQuotedMessageResultRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoadQuotedMessageResultRecord_lower(_ value: LoadQuotedMessageResultRecord) -> RustBuffer {
+    return FfiConverterTypeLoadQuotedMessageResultRecord.lower(value)
 }
 
 
@@ -20536,6 +20722,63 @@ public func FfiConverterTypeRemovalRecord_lift(_ buf: RustBuffer) throws -> Remo
 #endif
 public func FfiConverterTypeRemovalRecord_lower(_ value: RemovalRecord) -> RustBuffer {
     return FfiConverterTypeRemovalRecord.lower(value)
+}
+
+
+/**
+ * Result of `CoreEngine.search_messages`, paired with the actor's settled change revision.
+ */
+public struct SearchMessagesResultRecord: Equatable, Hashable {
+    public var messages: [ChatMessageRecord]
+    public var settledVersion: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(messages: [ChatMessageRecord], settledVersion: UInt64) {
+        self.messages = messages
+        self.settledVersion = settledVersion
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SearchMessagesResultRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSearchMessagesResultRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SearchMessagesResultRecord {
+        return
+            try SearchMessagesResultRecord(
+                messages: FfiConverterSequenceTypeChatMessageRecord.read(from: &buf), 
+                settledVersion: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SearchMessagesResultRecord, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeChatMessageRecord.write(value.messages, into: &buf)
+        FfiConverterUInt64.write(value.settledVersion, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSearchMessagesResultRecord_lift(_ buf: RustBuffer) throws -> SearchMessagesResultRecord {
+    return try FfiConverterTypeSearchMessagesResultRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSearchMessagesResultRecord_lower(_ value: SearchMessagesResultRecord) -> RustBuffer {
+    return FfiConverterTypeSearchMessagesResultRecord.lower(value)
 }
 
 
@@ -29476,6 +29719,18 @@ public func classifyControlEnvelope(cmd: UInt16, payloadJson: String, myUid: Str
 })
 }
 /**
+ * Pure U14 matcher shared between Swift offline/UI helpers and Rust core/SQLite search.
+ */
+public func coreMessageMatchesSearchQuery(message: ChatMessageRecord, query: String) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_core_message_matches_search_query(
+        FfiConverterTypeChatMessageRecord_lower(message),
+        FfiConverterString.lower(query),uniffiCallStatus
+    )
+})
+}
+/**
  * Pure conversation list ordering backed by `olaz_core::conversations::sort_conversations`.
  */
 public func sortConversationsOrder(items: [ConversationSummaryRecord], activityRanks: [RankEntry]) -> [ConversationSummaryRecord]  {
@@ -30033,6 +30288,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_func_classify_control_envelope() != 37537) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_func_core_message_matches_search_query() != 2764) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_func_sort_conversations_order() != 50647) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -30351,6 +30609,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_ensure_known_contacts() != 6914) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_ensure_message_loaded() != 11408) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_fire_poll_debounce() != 19532) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -30400,6 +30661,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_load_older_messages_and_wait() != 36746) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_load_quoted_message() != 49356) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_lock_poll() != 8377) {
@@ -30547,6 +30811,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_rewatch_polls() != 35928) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_search_messages() != 44896) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_search_stickers() != 59277) {

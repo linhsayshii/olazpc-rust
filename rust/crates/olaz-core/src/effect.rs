@@ -184,6 +184,34 @@ pub enum StoreOp {
         limit: usize,
         op_id: Option<u64>,
     },
+    // U14
+    SearchMessagesPage {
+        op_id: u64,
+        conv_id: String,
+        query: String,
+        before: Option<(i64, String)>,
+        limit: i64,
+    },
+    LoadMessagesAround {
+        op_id: u64,
+        conv_id: String,
+        target_ts_ms: i64,
+        before_oldest_ts_ms: Option<i64>,
+    },
+    LookupMessage {
+        op_id: u64,
+        conv_id: String,
+        key: String,
+    },
+    FindLegacyQuoted {
+        op_id: u64,
+        conv_id: String,
+        exclude_id: String,
+        max_ts_ms: i64,
+        trimmed_text: String,
+        mine_only: bool,
+        limit: i64,
+    },
     // U6
     DeleteMessage {
         conv_id: String,
@@ -325,6 +353,50 @@ impl fmt::Debug for StoreOp {
                 .field("before_ts_ms", before_ts_ms)
                 .field("limit", limit)
                 .finish(),
+            // U14
+            Self::SearchMessagesPage {
+                op_id,
+                query,
+                before,
+                limit,
+                ..
+            } => f
+                .debug_struct("SearchMessagesPage")
+                .field("op_id", op_id)
+                .field("query_len", &query.len())
+                .field("has_before", &before.is_some())
+                .field("limit", limit)
+                .finish(),
+            Self::LoadMessagesAround {
+                op_id,
+                target_ts_ms,
+                before_oldest_ts_ms,
+                ..
+            } => f
+                .debug_struct("LoadMessagesAround")
+                .field("op_id", op_id)
+                .field("target_ts_ms", target_ts_ms)
+                .field("has_before_oldest", &before_oldest_ts_ms.is_some())
+                .finish(),
+            Self::LookupMessage { op_id, .. } => f
+                .debug_struct("LookupMessage")
+                .field("op_id", op_id)
+                .finish(),
+            Self::FindLegacyQuoted {
+                op_id,
+                max_ts_ms,
+                trimmed_text,
+                mine_only,
+                limit,
+                ..
+            } => f
+                .debug_struct("FindLegacyQuoted")
+                .field("op_id", op_id)
+                .field("max_ts_ms", max_ts_ms)
+                .field("text_len", &trimmed_text.len())
+                .field("mine_only", mine_only)
+                .field("limit", limit)
+                .finish(),
             // U6
             Self::DeleteMessage { .. } => f.write_str("DeleteMessage"),
             Self::ApplyRemoteReactionInStore { r_type, .. } => f
@@ -366,6 +438,9 @@ pub enum OpResult {
     Int(i64),
     // U8
     Forward(ForwardOutcome),
+    // U14
+    SearchMessages(Vec<olaz_wire::ChatMessage>),
+    OptionalString(Option<String>),
     OptI64(Option<i64>),
     // U12
     PollVoters(Option<crate::polls::PollVoters>),
@@ -396,6 +471,14 @@ impl fmt::Debug for OpResult {
             Self::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
             Self::Int(n) => f.debug_tuple("Int").field(n).finish(),
             Self::Forward(o) => f.debug_tuple("Forward").field(o).finish(),
+            Self::SearchMessages(msgs) => f
+                .debug_struct("SearchMessages")
+                .field("count", &msgs.len())
+                .finish(),
+            Self::OptionalString(opt) => f
+                .debug_struct("OptionalString")
+                .field("present", &opt.is_some())
+                .finish(),
             Self::OptI64(n) => f.debug_tuple("OptI64").field(n).finish(),
             // U12
             Self::PollVoters(v) => f

@@ -37,6 +37,9 @@ The oracle is what can be observed from outside the engine: the domain state the
 - `suppress` *(optional, runner metadata, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `pins`)*: array of transport names (`"ws"`, `"long_poll"`, or both) to suppress during the run. Both the recorder's `hostTrace` and the Rust replay obey it: `start_ws` / `start_long_poll` are still traced, `hostTrace` returns `false` for listed transports, a suppressed WS never connects, and a suppressed long-poll never ticks.
 - `ws_auth` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `pins`)*: `"manual"` (or omitted for auto-auth). When `"manual"`, the fake server does not send the initial `cmd == 1` auth reply automatically on WebSocket connect; instead, that `cmd == 1` `ws_frame` remains the first scripted `ws_frame` and is delivered by an explicit `ws_push` step (typically `await_host start_bootstrap` → `ws_push 1` → `await_host e2ee_connected`).
 - `contacts` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `pins`)*: `{"friends": [{"id", "name", "zalo_name", "avatar", "last_active_ms", "online", "section", "sort_key"}], "groups": [{"id", "name", "avatar", "members", "sort_key"}], "received": [{"id", "name", "avatar", "message", "date_ms"}], "sent": [{"id", "name", "avatar", "message", "date_ms"}], "pending_request_count": <int>, "loading_requests": <bool>, "search": {"status", "error", "user"}, "notice": {"seq", "ok", "text"}, "friends_loaded": <bool>, "groups_loaded": <bool>, "aliases": {"<uid>": "<alias>"}, "cached_profiles": {"<uid>": {"name", "avatar"}}, "cached_groups": {"<gid>": {"name", "avatar", "members"}}, "friend_global_ids": {"<uid>": "<gid>"}, "gid_to_uid_map": {"<gid>": "<uid>"}}`. Friends/groups/requests/search/notice populate `ContactsState`; aliases/profiles/groups/global-ids seed the corresponding store preferences before boot so `loadLocalAccountState` loads them (in `contacts`, `friend_global_ids` `{"<uid>": "<gid>"}` is inverted into SQLite `gidToUidMap` if `gid_to_uid_map` is omitted).
+- `suppress` *(optional, runner metadata, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `pins`, `forward`, `search`)*: array of transport names (`"ws"`, `"long_poll"`, or both) to suppress during the run. Both the recorder's `hostTrace` and the Rust replay obey it: `start_ws` / `start_long_poll` are still traced, `hostTrace` returns `false` for listed transports, a suppressed WS never connects, and a suppressed long-poll never ticks.
+- `ws_auth` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `pins`, `forward`, `search`)*: `"manual"` (or omitted for auto-auth). When `"manual"`, the fake server does not send the initial `cmd == 1` auth reply automatically on WebSocket connect; instead, that `cmd == 1` `ws_frame` remains the first scripted `ws_frame` and is delivered by an explicit `ws_push` step (typically `await_host start_bootstrap` → `ws_push 1` → `await_host e2ee_connected`).
+- `contacts` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `pins`, `forward`, `search`)*: `{"friends": [{"id", "name", "zalo_name", "avatar", "last_active_ms", "online", "section", "sort_key"}], "groups": [{"id", "name", "avatar", "members", "sort_key"}], "received": [{"id", "name", "avatar", "message", "date_ms"}], "sent": [{"id", "name", "avatar", "message", "date_ms"}], "pending_request_count": <int>, "loading_requests": <bool>, "search": {"status", "error", "user"}, "notice": {"seq", "ok", "text"}, "friends_loaded": <bool>, "groups_loaded": <bool>, "aliases": {"<uid>": "<alias>"}, "cached_profiles": {"<uid>": {"name", "avatar"}}, "cached_groups": {"<gid>": {"name", "avatar", "members"}}, "friend_global_ids": {"<uid>": "<gid>"}, "gid_to_uid_map": {"<gid>": "<uid>"}}`. Friends/groups/requests/search/notice populate `ContactsState`; aliases/profiles/groups/global-ids seed the corresponding store preferences before boot so `loadLocalAccountState` loads them (in `contacts`, `friend_global_ids` `{"<uid>": "<gid>"}` is inverted into SQLite `gidToUidMap` if `gid_to_uid_map` is omitted).
 - `blocked_users` *(optional, `contacts`)*: `null`, or array of `{"id": "<uid>", "name": "<str>", "avatar": <str|null>}` pre-seeding `ZaloEngine.blockedUsers` before steps run.
 - `pinned_ids`, `archived_ids`, `unread_marks`, `hidden_ids` *(optional, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `pins`)*: arrays of conversation ids seeded into SQLite `pinnedIds`, `archivedIds`, `unreadMarks`, `hiddenIds` preferences before boot.
 - `starred_ids` *(optional, `message_actions`)*: array of message ids seeded into SQLite `starredIds` preference before boot (`loadLocalAccountState` loads them into `cachedStarredIds`).
@@ -258,6 +261,12 @@ Run in order:
   - `advance_confirm_ms`: `{"ms": <int>}` — advances the virtual 300 ms confirm promotion clock by `ms` milliseconds and flushes any due confirm promotion.
   - `drop_confirms`: `{}` — calls `dropComposerConfirms()`.
   - `composer_report`: `{"conv_id": "<str>", "outcome": {"status": "done"|"cancelled"|"failed"|"pending", "text": <str, optional>}}` — calls `report(outcome, in: conv_id)`.
+- Search `cmd` steps (`search` domain):
+  - Optional `"now_ms": <int64>` on `cmd` steps seeds `nowMs` for the duration of that step (used for `delete_for_me` / `delete_many` undo bar deadline).
+  - Inherits `start`, `open`, `close`, `apply_batch`, `send_text`, `await_send`, `delete_for_me`, `delete_many`, `undo_delete`, `dismiss_delete_undo`, `answer_confirm`.
+  - `search`: `{"conv_id": "<str>", "query": "<str>", "limit": <int, optional>}` — awaits `searchMessages(in: conv_id, query: query, limit: limit ?? 50)` and records the ordered array of matched message `id` strings in `results["<stepIndex>"]`.
+  - `ensure_loaded`: `{"conv_id": "<str>", "msg_id": "<str, optional>", "message": <object, optional>}` — resolves a `ChatMessage` from either `message` (canonical `ChatMessageJSON` with `conv_id`/`conversationId`, `date_ms`/`date`, `client_id`/`clientId`, `sender_id`/`senderId`, `sender_name`/`senderName`, `is_mine`/`isMine`, `is_e2ee`/`isE2EE`, `kind`, `text`) or `msg_id` (looked up in memory or SQLite), awaits `ensureMessageLoaded(msg, in: conv_id)`, and records the returned boolean in `results["<stepIndex>"]`.
+  - `load_quoted`: `{"conv_id": "<str>", "msg_id": "<str>"}` — looks up `msg_id` in `messages[conv_id]` (or SQLite store), awaits `loadQuotedMessage(of: msg, in: conv_id)`, and records the returned message `id` string or `null` in `results["<stepIndex>"]`.
 - `{"await": {"phase": "<kind>", "step": "<login step, optional>"}, "timeout_ms": 5000}`: wait until the state matches. The Rust runner instead runs the core until no input or effect is pending, then checks the same predicate.
 - `{"await_host": "<call>", "timeout_ms": N}`: wait until the recorded `host` list contains `"<call>"` searching from the current host cursor, then advance the host cursor past that entry (`index + 1`). Used for deterministic ordering (for example awaiting `e2ee_connected` before `ws_push`).
 - `{"ws_push": k}` (optional `"timeout_ms": N`): instruct the fake server to send the next `k` scripted `ws_frame` or `ws_close` entries in script order.
@@ -866,6 +875,22 @@ Cases in `forward` extend the Message actions domain state with `forward_request
 - `sticker_suggest_state`: `null` or `{"enabled": <bool>, "debounce": <int>}` mirroring `StickerSuggestState.shared.setting`.
 - `composer_confirm`, `queued_composer_confirms`: mirror `ZaloEngine.composerConfirm` and `ZaloEngine.queuedComposerConfirms`.
 - `results`: map of 0-based `steps` index string (`"0"`, `"1"`, ...) for each query/action step executed so far.
+
+## Search domain state
+
+Cases in `search` extend the Message actions domain state with step results:
+
+```json
+{
+  "results": {
+    "3": ["m2", "m1"],
+    "4": true,
+    "5": "m0"
+  }
+}
+```
+
+- `results`: map of 0-based `steps` index string (`"0"`, `"1"`, ...) for each `search`, `ensure_loaded`, or `load_quoted` step executed so far.
 
 ## Volatile
 

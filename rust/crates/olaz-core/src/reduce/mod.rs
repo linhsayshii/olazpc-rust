@@ -10,6 +10,7 @@ pub mod forward;
 pub mod messages;
 // U12
 pub mod polls;
+pub mod search;
 pub mod send;
 pub mod session;
 pub mod stickers;
@@ -222,6 +223,23 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::ForwardFetchMediaDone { .. }
         | Input::ForwardSendMediaDone { .. }
         | Input::ForwardSendFilesDone { .. } => forward::reduce_forward(state, input, &mut out),
+        // U14
+        Input::Command(
+            Command::SearchMessages { .. }
+            | Command::EnsureMessageLoaded { .. }
+            | Command::LoadQuotedMessage { .. },
+        )
+        | Input::OpRequest {
+            cmd:
+                Command::SearchMessages { .. }
+                | Command::EnsureMessageLoaded { .. }
+                | Command::LoadQuotedMessage { .. },
+            ..
+        }
+        | Input::SearchMessagesPageLoaded { .. }
+        | Input::EnsureMessageWindowLoaded { .. }
+        | Input::QuotedLookupDone { .. }
+        | Input::LegacyQuotedLookupDone { .. } => search::reduce_search(state, input, &mut out),
 
         // U13 stickers
         Input::Command(ref cmd) if is_sticker_command(cmd) => {

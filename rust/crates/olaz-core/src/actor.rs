@@ -30,7 +30,7 @@ enum ActorMsg {
     CoalescedIdentities,
     OpRequest {
         cmd: Box<Command>,
-        reply: oneshot::Sender<OpResult>,
+        reply: oneshot::Sender<(OpResult, u64)>,
     },
     DrainChatPolling {
         max_batches: u32,
@@ -249,8 +249,8 @@ impl CoreHandle {
         ack_rx.await.ok()
     }
 
-    /// Sends a request-reply command and awaits its completion [`OpResult`].
-    pub async fn request(&self, command: Command) -> Option<OpResult> {
+    /// Sends a request-reply command and awaits its completion `(OpResult, settled_version)`.
+    pub async fn request_with_version(&self, command: Command) -> Option<(OpResult, u64)> {
         let (reply, rx) = oneshot::channel();
         self.tracker.increment();
         if self
@@ -265,6 +265,67 @@ impl CoreHandle {
             return None;
         }
         rx.await.ok()
+    }
+
+    /// Sends a request-reply command and awaits its completion [`OpResult`].
+    pub async fn request(&self, command: Command) -> Option<OpResult> {
+        self.request_with_version(command).await.map(|(res, _)| res)
+    }
+
+    /// U14: Searches in-memory and SQLite messages for `conv_id`, returning `(matches, settled_version)`.
+    pub async fn search_messages(
+        &self,
+        conv_id: String,
+        query: String,
+        limit: i64,
+    ) -> (Vec<olaz_wire::ChatMessage>, u64) {
+        match self
+            .request_with_version(Command::SearchMessages {
+                conv_id,
+                query,
+                limit,
+            })
+            .await
+        {
+            Some((OpResult::SearchMessages(msgs), ver)) => (msgs, ver),
+            _ => (Vec::new(), self.current_version()),
+        }
+    }
+
+    /// U14: Ensures `message` is loaded into `messages.windows[conv_id]`, returning `(loaded, settled_version)`.
+    pub async fn ensure_message_loaded(
+        &self,
+        conv_id: String,
+        message: olaz_wire::ChatMessage,
+    ) -> (bool, u64) {
+        match self
+            .request_with_version(Command::EnsureMessageLoaded {
+                conv_id,
+                message: Box::new(message),
+            })
+            .await
+        {
+            Some((OpResult::Bool(loaded), ver)) => (loaded, ver),
+            _ => (false, self.current_version()),
+        }
+    }
+
+    /// U14: Finds and loads the message quoted by `message` in `conv_id`, returning `(id, settled_version)`.
+    pub async fn load_quoted_message(
+        &self,
+        conv_id: String,
+        message: olaz_wire::ChatMessage,
+    ) -> (Option<String>, u64) {
+        match self
+            .request_with_version(Command::LoadQuotedMessage {
+                conv_id,
+                message: Box::new(message),
+            })
+            .await
+        {
+            Some((OpResult::OptionalString(id), ver)) => (id, ver),
+            _ => (None, self.current_version()),
+        }
     }
 
     /// Awaits a request-reply command that completes with `OpResult::Unit`.
@@ -572,7 +633,7 @@ impl Drop for CoreHandle {
 
 struct ActorWaiters {
     drains: HashMap<u64, oneshot::Sender<u32>>,
-    ops: HashMap<u64, oneshot::Sender<OpResult>>,
+    ops: HashMap<u64, oneshot::Sender<(OpResult, u64)>>,
     next_op_id: u64,
 }
 
@@ -636,7 +697,7 @@ fn dispatch_reduce_output(
                     after_store: false,
                 } => {
                     if let Some(waiter) = waiters.ops.remove(&op_id) {
-                        let _ = waiter.send(result);
+                        let _ = waiter.send((result, version));
                     }
                 }
                 other => runner_effects.push(other),

@@ -107,9 +107,6 @@ extension ZaloEngine {
         composerConfirmTask = nil
         contactsTasks.values.forEach { $0.cancel() }
         contactsTasks.removeAll()
-        pollDebounceSleep = nil
-        resetPolls()
-        pollRefreshTasks.values.forEach { $0.cancel() }
         pollRefreshTasks.removeAll()
         typingResetTasks.values.forEach { $0.cancel() }
         typingResetTasks = [:]

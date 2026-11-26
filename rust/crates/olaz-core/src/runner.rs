@@ -3455,6 +3455,117 @@ async fn run_store_worker(
                             op_id,
                         });
                     }
+                    // U14
+                    StoreOp::SearchMessagesPage {
+                        op_id,
+                        conv_id,
+                        query,
+                        before,
+                        limit,
+                    } => {
+                        let page_limit = usize::try_from(limit).unwrap_or(50);
+                        let rows = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let cursor = before.as_ref().map(|(ts, id)| (*ts, id.as_str()));
+                                    store
+                                        .search_messages_page(&conv_id, &query, cursor, limit)
+                                        .unwrap_or_default()
+                                })
+                                .await
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        sink.send(Input::SearchMessagesPageLoaded {
+                            op_id,
+                            rows,
+                            page_limit,
+                        });
+                    }
+                    StoreOp::LoadMessagesAround {
+                        op_id,
+                        conv_id,
+                        target_ts_ms,
+                        before_oldest_ts_ms,
+                    } => {
+                        let window = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    store
+                                        .messages_around(
+                                            &conv_id,
+                                            target_ts_ms,
+                                            before_oldest_ts_ms,
+                                            25,
+                                            3000,
+                                        )
+                                        .ok()
+                                })
+                                .await
+                                .ok()
+                                .flatten()
+                        } else {
+                            None
+                        };
+                        sink.send(Input::EnsureMessageWindowLoaded { op_id, window });
+                    }
+                    StoreOp::LookupMessage {
+                        op_id,
+                        conv_id,
+                        key,
+                    } => {
+                        let row = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    store.message(&conv_id, &key).ok().flatten()
+                                })
+                                .await
+                                .ok()
+                                .flatten()
+                        } else {
+                            None
+                        };
+                        sink.send(Input::QuotedLookupDone { op_id, row });
+                    }
+                    StoreOp::FindLegacyQuoted {
+                        op_id,
+                        conv_id,
+                        exclude_id,
+                        max_ts_ms,
+                        trimmed_text,
+                        mine_only,
+                        limit,
+                    } => {
+                        let rows = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    store
+                                        .find_legacy_quoted_candidates(
+                                            &conv_id,
+                                            &exclude_id,
+                                            max_ts_ms,
+                                            &trimmed_text,
+                                            mine_only,
+                                            limit,
+                                        )
+                                        .unwrap_or_default()
+                                })
+                                .await
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        sink.send(Input::LegacyQuotedLookupDone { op_id, rows });
+                    }
                     // U4-bootstrap
                     StoreOp::LoadPreferenceString { key, boot_gen } => {
                         let last_refresh_pref = if let Some(store_arc) = store_opt {
@@ -3813,6 +3924,10 @@ async fn run_store_worker(
                                         | StoreOp::ProbeAndSaveMessages { .. }
                                         | StoreOp::LoadOpenLocalMessages { .. }
                                         | StoreOp::LoadOlderStoreMessages { .. }
+                                        | StoreOp::SearchMessagesPage { .. }
+                                        | StoreOp::LoadMessagesAround { .. }
+                                        | StoreOp::LookupMessage { .. }
+                                        | StoreOp::FindLegacyQuoted { .. }
                                         | StoreOp::MarkRecalledAndCheckLatest { .. }
                                         | StoreOp::DeleteMessageAndCheckLatest { .. } => {}
                                     }

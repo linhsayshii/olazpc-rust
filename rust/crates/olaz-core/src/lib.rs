@@ -20,6 +20,7 @@ pub mod messages;
 pub mod polls;
 pub mod reduce;
 pub mod runner;
+pub mod search;
 pub mod state;
 pub mod stickers;
 pub mod typed_chat;
@@ -100,6 +101,7 @@ pub use reduce::{ReduceOutput, reduce};
 pub use runner::{
     EffectRunner, Host, LiveWsDriver, SessionEffectRunner, SharedStoreSlot, WsDriver, WsStartParams,
 };
+pub use search::{SearchState, message_matches_folded_needle, message_matches_search_query};
 pub use state::{
     CoreFailKind, CoreSnapshot, CoreState, FailReason, LoginState, LoginStep,
     PersistedTransportState, Phase, Profile, SessionSnapshot, SessionState, TransportState,
