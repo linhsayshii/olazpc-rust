@@ -6,7 +6,7 @@ The oracle is what can be observed from outside the engine: the domain state the
 
 ## Files
 
-- `rust/crates/olaz-core/cases/<domain>.jsonl`: one case per line, sorted by `name`. Domains: `session`, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `pins`, `forward`, `search`, `cloud`.
+- `rust/crates/olaz-core/cases/<domain>.jsonl`: one case per line, sorted by `name`. Domains: `session`, `transport`, `conversations`, `conversation_actions`, `messages`, `bootstrap`, `send`, `message_actions`, `contacts`, `groups`, `polls`, `pins`, `forward`, `search`, `stickers`, `cloud`.
 - `rust/crates/olaz-core/cases/known-diffs.jsonl`: intended differences, one line `{"domain", "name", "path", "actual", "reason"}` each. Only lines the user approved. A line whose case no longer differs fails the runner.
 - Data is synthetic. Never content from a real account, never a real token.
 
@@ -65,6 +65,14 @@ The oracle is what can be observed from outside the engine: the domain state the
 - `board_raw_topics` *(optional, `polls`, `pins`)*: map of `<convId>` to `{"version": <int64>, "topics": {"<topicId>": <raw topic JSON>}}` pre-seeding `ZaloEngine.cachedBoardRawTopics` before steps run.
 - `poll_clock` *(optional, `polls`)*: `{"watched": {"<pollId>": "<convId>"}, "last_attempt_ms": {"<pollId>": <int64>}, "seen_messages": ["<msgId>", ...]}` pre-seeding `PollClock` (`watched`, `lastAttempt`, `seenMessages`) before steps run.
 - `watched_check_ids` *(optional, `polls`)*: array of poll id strings (`["<pollId>", ...]`) used when `watchPoll` exceeds 500 watched entries and drops an arbitrary key; see `## Polls domain state`.
+- `e2ee_threads` *(optional, `send`, `message_actions`)*: array of peer uid strings pre-seeded into SQLite `e2eeThreadsV1` preference before boot (`loadLocalAccountState` loads them into `e2eeManager`).
+- `host_results` *(optional, `send`, `message_actions`)*: map of host call name (e.g. `"send_e2ee_text"`) to an ordered queue of scripted outcomes: `{"msg_id": "<str>", "cli_msg_id": "<str>", "ts_ms": <int64>}` on success, or `{"error": {"code": <int>, "message": "<str>", "url": "<str>"}}` (or `{"error": "<message>"}`) on failure. Consumed in order when the host boundary runs.
+  - `send_e2ee_sticker` (`stickers`): `{"msg_id": "<str>", "cli_msg_id": "<str>", "ts_ms": <int64>}` on success, `"e2ee_failed"` (or `{"status": "e2ee_failed"}`) for pre-send Signal failure, or `{"error": {"code": <int>, "message": "<str>", "url": "<str>"}}` (or `{"error": "<message>"}`) on API failure.
+  - `send_e2ee_contact_card` (`stickers`, `forward`): `{"msg_id": "<str>", "cli_msg_id": "<str>", "ts_ms": <int64>}` on success, `"e2ee_failed"` (or `{"status": "e2ee_failed"}`) for pre-send Signal failure, or `{"error": ...}` on API failure; if omitted from `host_results`, deterministic replay returns `{msg_id: client_id, cli_msg_id: client_id, ts_ms: now_ms}`.
+- `recent_stickers` *(optional, `stickers`)*: array of `{"id": <int>, "cateId": <int>, "type": <int>, "url": "<str>"}` seeded into SQLite `recentStickers` preference before boot.
+- `sticker_suggest` *(optional, `stickers`)*: boolean seeded into SQLite `stickerSuggest` preference before boot.
+- `composer_confirm` *(optional, `stickers`)*: `null` or `{"id", "conv_id", "title", "message", "ok", "cancel"}` pre-seeding `ZaloEngine.composerConfirm` before steps run.
+- `queued_composer_confirms` *(optional, `stickers`)*: array of confirm objects pre-seeding `ZaloEngine.queuedComposerConfirms` before steps run.
 
 ### server
 
@@ -232,6 +240,24 @@ Run in order:
   - `forward_selection`: `{}` — calls `forwardSelection()`.
   - `forward`: `{"conv_id": "<convId>", "msg_id": "<msgId>", "targets": ["<convId>", ...]}` — locates the loaded message in `messages[conv_id]`, awaits `forward(message, to: targets)` + Core settle, and records the `MessageActionOutcome` JSON in `results["<stepIndex>"]`.
   - `forward_all`: `{"targets": ["<convId>", ...]}` — awaits `forwardAll(to: targets)` on the open `forwardRequest` + Core settle, and records the `MessageActionOutcome` JSON in `results["<stepIndex>"]`.
+- Stickers `cmd` steps (`stickers` domain):
+  - Optional `"now_ms": <int64>` on `cmd` steps seeds `nowMs` for the duration of that step.
+  - Inherits `start`, `open`, `close`.
+  - `sticker_tabs`: `{}` — awaits `stickerTabs()` and records `[{"id", "name", "icon", "count"}, ...] | null` in `results["<stepIndex>"]`.
+  - `stickers_in_tab`: `{"id": <int>}` — awaits `stickers(inTab: id)` and records `[{"cate_id", "id", "url", "anim"}, ...] | null` in `results["<stepIndex>"]`.
+  - `search_stickers`: `{"text": "<str>"}` — awaits `searchStickers(text)` and records sticker array `| null` in `results["<stepIndex>"]`.
+  - `typing_suggestions`: `{"conv_id": "<str>", "text": "<str>"}` — awaits `typingStickerSuggestions(in: conv_id, text: text)` and records sticker array in `results["<stepIndex>"]`.
+  - `send_sticker`: `{"conv_id": "<str>", "sticker": {"cate_id": <int>, "id": <int>, "url": "<str>"}, "source": "category"|"recent"|"search"|"suggestion", "typed": <str|null, optional>, "index": <int, optional>}` — awaits `sendSticker(...)` + Core settle and records `CardActionOutcome` JSON in `results["<stepIndex>"]`.
+  - `sticker_setting`: `{}` — awaits `stickerSuggestSetting()` and records `{"enabled": <bool>, "debounce": <int>} | null` in `results["<stepIndex>"]`.
+  - `set_sticker_suggest`: `{"enabled": <bool>}` — awaits `setStickerSuggest(enabled: enabled)` and records `{"enabled": <bool>, "debounce": <int>} | null` in `results["<stepIndex>"]`.
+  - `my_card`: `{}` — awaits `myCard()` and records `{"uid", "name", "avatar", "phone", "with_phone"} | null` in `results["<stepIndex>"]`.
+  - `send_my_card`: `{"conv_id": "<str>", "with_phone": <bool>}` — awaits `sendMyCard(to: conv_id, withPhone: with_phone)` + Core settle and records `ComposerOutcome` JSON in `results["<stepIndex>"]`.
+  - `reminder_info`: `{"conv_id": "<str>"}` — awaits `reminderComposeInfo(for: conv_id)` and records `{"allowed", "hidden", "text", "is_group", "can_pin", "pin_toggle", "title_max_chars", "title_max_bytes"} | null` in `results["<stepIndex>"]`.
+  - `create_reminder`: `{"conv_id": "<str>", "title": "<str>", "start_ms": <int64>, "repeat": 0|1|2|3, "pin": <bool>}` — awaits `createReminder(...)` and records `ComposerOutcome` JSON in `results["<stepIndex>"]`.
+  - `answer_confirm`: `{"ok": <bool>, "confirm": {"id", "conv_id", "title", "message", "ok", "cancel"} (optional, defaults to active composerConfirm)}` — calls `answerComposerConfirm(confirm, ok: ok)`.
+  - `advance_confirm_ms`: `{"ms": <int>}` — advances the virtual 300 ms confirm promotion clock by `ms` milliseconds and flushes any due confirm promotion.
+  - `drop_confirms`: `{}` — calls `dropComposerConfirms()`.
+  - `composer_report`: `{"conv_id": "<str>", "outcome": {"status": "done"|"cancelled"|"failed"|"pending", "text": <str, optional>}}` — calls `report(outcome, in: conv_id)`.
 - Search `cmd` steps (`search` domain):
   - Optional `"now_ms": <int64>` on `cmd` steps seeds `nowMs` for the duration of that step (used for `delete_for_me` / `delete_many` undo bar deadline).
   - Inherits `start`, `open`, `close`, `apply_batch`, `send_text`, `await_send`, `delete_for_me`, `delete_many`, `undo_delete`, `dismiss_delete_undo`, `answer_confirm`.
@@ -290,6 +316,8 @@ Run in order:
     - `refresh_cloud {}` *(U11 cloud snapshot refresh at the end of `performBootstrapSync` or explicit `refresh_cloud` step; traced-and-skipped during bootstrap and earlier domains, traced-and-allowed on explicit `refresh_cloud` steps in `cloud`)*
   - Send domain names (Swift-owned U0b boundaries):
     - `send_e2ee_text {conv_id, text, client_id, quote}` *(E2EE 1-1 send boundary in `sendText`, invoked after the optimistic row is merged; `quote` is `null` or `{"msg_id", "cli_msg_id", "sender_id", "sender_name", "text", "ts_ms"}`, and the result is supplied by `seed.host_results.send_e2ee_text`)*
+    - `send_e2ee_sticker {conv_id, cate_id, sticker_id, client_id}` *(E2EE 1-1 sticker send boundary in `sendSticker`; scripted by `seed.host_results.send_e2ee_sticker`)*
+    - `send_e2ee_contact_card {conv_id, client_id, contact_uid, title, phone, avatar, qr_code_url}` *(E2EE 1-1 contact-card send boundary shared by `sendMyCard` and `forward`)*
   - Message actions domain names (Swift-owned UI boundaries):
     - `show_card {conv_id, text}` *(banner notice shown via `CardActionCenter.shared.show(text, in: convId)` from U6 react, recall, delete undo, star, auto-delete, U7 pin/unpin/choose-many, U8 forward guards/selection/forwardAll, U9 block/unblock, and U10 group admin / group link flows; `conv_id` is `<str|null>`; traced and skipped during recording)*
   - Media and forward domain names (Swift-owned U15 media upload/fetch boundaries, shared by `forward` and `cloud`):
@@ -674,6 +702,29 @@ Cases in `groups` extend the Contacts domain state (`cached_group_details` overr
       "cached_groups": {
         "g500901": { "name": "Nhóm A", "avatar": "", "members": 2 }
       }
+## Stickers domain state
+
+Cases in `stickers` extend the Message actions domain state with `sticker_suggest_state`, `composer_confirm`, `queued_composer_confirms`, `results`, `store.prefs.recent_stickers`, `store.prefs.sticker_suggest`, and optional sticker/contact-card fields on `messages[convId][]`:
+
+```json
+{
+  "sticker_suggest_state": { "enabled": true, "debounce": 180 },
+  "composer_confirm": {
+    "id": "c1",
+    "conv_id": "3001301",
+    "title": "Gửi tệp?",
+    "message": "Ảnh vượt quá giới hạn",
+    "ok": "Gửi dạng tệp",
+    "cancel": "Huỷ"
+  },
+  "queued_composer_confirms": [],
+  "results": {
+    "1": [{ "id": 0, "name": "Củ hành", "icon": "https://...", "count": 30 }]
+  },
+  "store": {
+    "prefs": {
+      "recent_stickers": [{ "id": 10, "cateId": 1, "type": 7, "url": "https://..." }],
+      "sticker_suggest": true
     }
   }
 }
@@ -825,6 +876,12 @@ Cases in `forward` extend the Message actions domain state with `forward_request
 - `selection`: `null` or `{"conv_id": <str>, "ids": [<str>, ...], "anchor": <str|null>}` mirroring `ZaloEngine.messageSelection` (`ids` preserves click order while `forwardSelection()` orders `forward_request` by the conversation window).
 - `results`: map of 0-based `steps` index string (`"0"`, `"1"`, ...) for each `forward` or `forward_all` step executed so far, encoded as `{"status": "done", "text": <str|null>}` | `{"status": "failed"|"pending", "text": <str>}` | `{"status": "confirm", "title": <str>, "message": <str>, "ok": <str>, "cancel": <str>, "ref": <str|null>}`.
 - `forwardTempPhotoURL` normalization: photo CDN fallbacks stage temp bytes under `"<tmp>/fwd-<n>.jpg"` (normalized from the per-run temp directory in `expect.host`).
+- `messages[convId][]` adds `"sticker_url"` (`<str|null>`) when `kind` is `.sticker` and `"contact_card"` (`{"name", "uid", "avatar", "phone"} | null`) when `kind` is `.contactCard`.
+- `store.prefs.recent_stickers`: array of recent sticker dictionaries persisted under SQLite preference `recentStickers` (`[]` when absent).
+- `store.prefs.sticker_suggest`: persisted SQLite boolean under preference `stickerSuggest`, or `null` when absent.
+- `sticker_suggest_state`: `null` or `{"enabled": <bool>, "debounce": <int>}` mirroring `StickerSuggestState.shared.setting`.
+- `composer_confirm`, `queued_composer_confirms`: mirror `ZaloEngine.composerConfirm` and `ZaloEngine.queuedComposerConfirms`.
+- `results`: map of 0-based `steps` index string (`"0"`, `"1"`, ...) for each query/action step executed so far.
 
 ## Search domain state
 

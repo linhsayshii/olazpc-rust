@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
-use olaz_api::{PollState, SendContactCardParams, SendTextParams};
+use olaz_api::{
+    CreateReminderParams, PollState, SendContactCardParams, SendStickerParams, SendTextParams,
+};
 use olaz_net::{LoginAccount, QrTicket};
 use olaz_store::{StoredConversation, StoredMessage};
 use olaz_wire::ChatMessage;
@@ -13,6 +15,7 @@ use serde_json::{Map, Value};
 
 use crate::actions::DeleteUndoItem;
 use crate::cloud::{CloudActionResult, CloudFetch, CloudPage, MediaResolutionOutcome};
+use crate::composer::{ComposerOutcome, MyCardInfo, ReminderComposeInfo};
 use crate::conversations::{
     ConversationActionResult, ConversationPreview, IdentityTable, PinBoard,
 };
@@ -20,6 +23,7 @@ use crate::forward::ForwardOutcome;
 use crate::input::{E2eeQuoteArg, HiddenPinSyncKind, SeenTarget, StoreToken};
 use crate::messages::{IdentitySnapshot, MuteEntry};
 use crate::reduce::classify::MobileSyncEvent;
+use crate::stickers::{CardActionOutcome, StickerEntry, StickerSuggestSetting, StickerTab};
 use crate::typed_chat::TypedChatEnvelope;
 
 /// Distinguishes which history-paging flow requested [`Effect::FetchHistoryPageApi`].
@@ -137,6 +141,13 @@ pub enum StoreOp {
         key: String,
         data: Vec<u8>,
     },
+    SetPreferenceBool {
+        key: String,
+        value: bool,
+    },
+    SaveRecentSticker {
+        sticker: StickerEntry,
+    },
     DeletePreference {
         key: String,
     },
@@ -173,6 +184,34 @@ pub enum StoreOp {
         before_ts_ms: i64,
         limit: usize,
         op_id: Option<u64>,
+    },
+    // U14
+    SearchMessagesPage {
+        op_id: u64,
+        conv_id: String,
+        query: String,
+        before: Option<(i64, String)>,
+        limit: i64,
+    },
+    LoadMessagesAround {
+        op_id: u64,
+        conv_id: String,
+        target_ts_ms: i64,
+        before_oldest_ts_ms: Option<i64>,
+    },
+    LookupMessage {
+        op_id: u64,
+        conv_id: String,
+        key: String,
+    },
+    FindLegacyQuoted {
+        op_id: u64,
+        conv_id: String,
+        exclude_id: String,
+        max_ts_ms: i64,
+        trimmed_text: String,
+        mine_only: bool,
+        limit: i64,
     },
     // U6
     DeleteMessage {
@@ -255,6 +294,15 @@ impl fmt::Debug for StoreOp {
                 .field("key", key)
                 .field("bytes", &data.len())
                 .finish(),
+            Self::SetPreferenceBool { key, value } => f
+                .debug_struct("SetPreferenceBool")
+                .field("key", key)
+                .field("value", value)
+                .finish(),
+            Self::SaveRecentSticker { sticker } => f
+                .debug_struct("SaveRecentSticker")
+                .field("sticker", sticker)
+                .finish(),
             Self::DeletePreference { key } => f
                 .debug_struct("DeletePreference")
                 .field("key", key)
@@ -307,6 +355,50 @@ impl fmt::Debug for StoreOp {
                 .field("before_ts_ms", before_ts_ms)
                 .field("limit", limit)
                 .finish(),
+            // U14
+            Self::SearchMessagesPage {
+                op_id,
+                query,
+                before,
+                limit,
+                ..
+            } => f
+                .debug_struct("SearchMessagesPage")
+                .field("op_id", op_id)
+                .field("query_len", &query.len())
+                .field("has_before", &before.is_some())
+                .field("limit", limit)
+                .finish(),
+            Self::LoadMessagesAround {
+                op_id,
+                target_ts_ms,
+                before_oldest_ts_ms,
+                ..
+            } => f
+                .debug_struct("LoadMessagesAround")
+                .field("op_id", op_id)
+                .field("target_ts_ms", target_ts_ms)
+                .field("has_before_oldest", &before_oldest_ts_ms.is_some())
+                .finish(),
+            Self::LookupMessage { op_id, .. } => f
+                .debug_struct("LookupMessage")
+                .field("op_id", op_id)
+                .finish(),
+            Self::FindLegacyQuoted {
+                op_id,
+                max_ts_ms,
+                trimmed_text,
+                mine_only,
+                limit,
+                ..
+            } => f
+                .debug_struct("FindLegacyQuoted")
+                .field("op_id", op_id)
+                .field("max_ts_ms", max_ts_ms)
+                .field("text_len", &trimmed_text.len())
+                .field("mine_only", mine_only)
+                .field("limit", limit)
+                .finish(),
             // U6
             Self::DeleteMessage { .. } => f.write_str("DeleteMessage"),
             Self::ApplyRemoteReactionInStore { r_type, .. } => f
@@ -348,6 +440,9 @@ pub enum OpResult {
     Int(i64),
     // U8
     Forward(ForwardOutcome),
+    // U14
+    SearchMessages(Vec<olaz_wire::ChatMessage>),
+    OptionalString(Option<String>),
     OptI64(Option<i64>),
     // U12
     PollVoters(Option<crate::polls::PollVoters>),
@@ -360,6 +455,14 @@ pub enum OpResult {
     CloudFetch(CloudFetch),
     CloudAction(CloudActionResult),
     MediaResolution(MediaResolutionOutcome),
+    // U13
+    StickerTabs(Option<Vec<StickerTab>>),
+    StickerEntries(Option<Vec<StickerEntry>>),
+    StickerSuggestSetting(Option<StickerSuggestSetting>),
+    CardActionOutcome(CardActionOutcome),
+    ComposerOutcome(ComposerOutcome),
+    MyCard(Option<MyCardInfo>),
+    ReminderComposeInfo(Option<ReminderComposeInfo>),
 }
 
 impl fmt::Debug for OpResult {
@@ -375,6 +478,14 @@ impl fmt::Debug for OpResult {
             Self::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
             Self::Int(n) => f.debug_tuple("Int").field(n).finish(),
             Self::Forward(o) => f.debug_tuple("Forward").field(o).finish(),
+            Self::SearchMessages(msgs) => f
+                .debug_struct("SearchMessages")
+                .field("count", &msgs.len())
+                .finish(),
+            Self::OptionalString(opt) => f
+                .debug_struct("OptionalString")
+                .field("present", &opt.is_some())
+                .finish(),
             Self::OptI64(n) => f.debug_tuple("OptI64").field(n).finish(),
             // U12
             Self::PollVoters(v) => f
@@ -390,6 +501,22 @@ impl fmt::Debug for OpResult {
             Self::CloudFetch(r) => f.debug_tuple("CloudFetch").field(r).finish(),
             Self::CloudAction(a) => f.debug_tuple("CloudAction").field(a).finish(),
             Self::MediaResolution(m) => f.debug_tuple("MediaResolution").field(m).finish(),
+            // U13
+            Self::StickerTabs(v) => f
+                .debug_struct("StickerTabs")
+                .field("count", &v.as_ref().map(Vec::len))
+                .finish(),
+            Self::StickerEntries(v) => f
+                .debug_struct("StickerEntries")
+                .field("count", &v.as_ref().map(Vec::len))
+                .finish(),
+            Self::StickerSuggestSetting(s) => {
+                f.debug_tuple("StickerSuggestSetting").field(s).finish()
+            }
+            Self::CardActionOutcome(o) => f.debug_tuple("CardActionOutcome").field(o).finish(),
+            Self::ComposerOutcome(o) => f.debug_tuple("ComposerOutcome").field(o).finish(),
+            Self::MyCard(c) => f.debug_tuple("MyCard").field(c).finish(),
+            Self::ReminderComposeInfo(r) => f.debug_tuple("ReminderComposeInfo").field(r).finish(),
         }
     }
 }
@@ -608,6 +735,24 @@ pub enum HostCall {
         name: String,
         url: Option<String>,
     },
+    // U13
+    SendE2eeSticker {
+        send_id: u64,
+        conv_id: String,
+        cate_id: i64,
+        sticker_id: i64,
+        client_id: String,
+    },
+    SendE2eeContactCard {
+        card_send_id: u64,
+        conv_id: String,
+        client_id: String,
+        contact_uid: String,
+        title: String,
+        phone: String,
+        avatar: String,
+        qr_code_url: String,
+    },
 }
 
 impl fmt::Debug for HostCall {
@@ -794,6 +939,22 @@ impl fmt::Debug for HostCall {
                 .field("op_id", op_id)
                 .field("has_url", &url.is_some())
                 .finish(),
+            // U13
+            Self::SendE2eeSticker {
+                send_id,
+                cate_id,
+                sticker_id,
+                ..
+            } => f
+                .debug_struct("SendE2eeSticker")
+                .field("send_id", send_id)
+                .field("cate_id", cate_id)
+                .field("sticker_id", sticker_id)
+                .finish(),
+            Self::SendE2eeContactCard { card_send_id, .. } => f
+                .debug_struct("SendE2eeContactCard")
+                .field("card_send_id", card_send_id)
+                .finish(),
         }
     }
 }
@@ -804,27 +965,49 @@ pub enum Effect {
     /// Aborts any in-flight QR / boot network tasks.
     CancelSessionTasks,
     /// Loads and restores the saved session via `Host::load_saved_session` + `SessionClient::restore`.
-    LoadSavedSession { boot_gen: u64 },
+    LoadSavedSession {
+        boot_gen: u64,
+    },
     /// Reads the legacy cookie via `Host::load_legacy_cookie` and runs `complete_login` if present.
-    LoadLegacyCookie { boot_gen: u64 },
+    LoadLegacyCookie {
+        boot_gen: u64,
+    },
     /// Validates the restored session against the server (`session_status_detailed`).
-    CheckSessionStatus { boot_gen: u64 },
+    CheckSessionStatus {
+        boot_gen: u64,
+    },
     /// Refreshes the signed-in user's profile (`sync_profile_me`).
-    SyncProfileMe { boot_gen: u64 },
+    SyncProfileMe {
+        boot_gen: u64,
+    },
     /// Requests a fresh QR login ticket (`request_qr`).
-    RequestQr { qr_gen: u64, language: String },
+    RequestQr {
+        qr_gen: u64,
+        language: String,
+    },
     /// Long-polls until the phone scans the QR code (rotations arrive as `Input::QrRotated`).
-    WaitQrScan { qr_gen: u64, ticket: QrTicket },
+    WaitQrScan {
+        qr_gen: u64,
+        ticket: QrTicket,
+    },
     /// Long-polls until the phone confirms the login.
-    WaitQrConfirm { qr_gen: u64, ticket: QrTicket },
+    WaitQrConfirm {
+        qr_gen: u64,
+        ticket: QrTicket,
+    },
     /// Finishes login (`getLoginInfo` + `syncProfileMe`).
-    CompleteLogin { qr_gen: u64 },
+    CompleteLogin {
+        qr_gen: u64,
+    },
     /// Clears the in-memory `SessionClient` credentials and domains before `HostCall::ClearSession`.
     ClearCoreSession,
     /// Marks `expired_at` on the in-memory `SessionClient` before `HostCall::MarkExpired`.
     MarkCoreSessionExpired,
     /// Writes a session-domain preference to the opened store (storage primitive, not in `hostTrace`).
-    SetPref { key: String, value: String },
+    SetPref {
+        key: String,
+        value: String,
+    },
 
     // --- Transport domain (U2) ---
     /// Starts the core-owned WebSocket client and emits the serial `start_ws` replay trace marker.
@@ -836,9 +1019,14 @@ pub enum Effect {
         self_conv_id: Option<String>,
     },
     /// Stops the core-owned WebSocket client (optionally resetting cursors).
-    StopWs { reset_cursors: bool },
+    StopWs {
+        reset_cursors: bool,
+    },
     /// Records a `file_done` / `video_done` completion on the active WebSocket client.
-    RecordFileDone { file_id: String, url: String },
+    RecordFileDone {
+        file_id: String,
+        url: String,
+    },
     /// Arms the long-poll timer (`delay` = 4 s). When `initial` is true, also emits the serial
     /// `start_long_poll` replay trace marker on the host FIFO.
     StartLpTimer {
@@ -855,7 +1043,10 @@ pub enum Effect {
         poll_state: PollState,
     },
     /// Resolves a `drain_chat_polling` waiter with `total_events` (handled directly by the actor).
-    CompleteDrain { drain_id: u64, total_events: u32 },
+    CompleteDrain {
+        drain_id: u64,
+        total_events: u32,
+    },
     /// Shape-only diagnostic log line routed via `tracing` (`olaz_core::engine_log`).
     EngineLog(String),
 
@@ -897,7 +1088,10 @@ pub enum Effect {
         op_id: Option<u64>,
     },
     /// Calls `ZaloApi::set_unread_mark` (best-effort fire-and-forget).
-    SetUnreadMarkApi { conv_id: String, unread: bool },
+    SetUnreadMarkApi {
+        conv_id: String,
+        unread: bool,
+    },
     /// Calls `ZaloApi::send_seen` (best-effort fire-and-forget).
     SendSeenApi(SeenTarget),
     /// Calls `ZaloApi::set_hidden_conversation` (best-effort, optional op completion).
@@ -914,9 +1108,13 @@ pub enum Effect {
         op_id: Option<u64>,
     },
     /// Calls `ZaloApi::reset_hidden_pin` if authenticated.
-    ResetHiddenPinApi { op_id: Option<u64> },
+    ResetHiddenPinApi {
+        op_id: Option<u64>,
+    },
     /// Calls `ZaloApi::fetch_hidden_conversations` if authenticated.
-    FetchHiddenConversationsApi { op_id: Option<u64> },
+    FetchHiddenConversationsApi {
+        op_id: Option<u64>,
+    },
     /// Calls `ZaloApi::fetch_profiles` for one chunk of up to 50 missing-name UIDs.
     FetchProfilesChunkApi {
         op_id: Option<u64>,
@@ -930,21 +1128,33 @@ pub enum Effect {
         op_id: Option<u64>,
     },
     /// Calls `ZaloApi::fetch_conversation_labels`.
-    FetchConversationLabelsApi { op_id: Option<u64> },
+    FetchConversationLabelsApi {
+        op_id: Option<u64>,
+    },
 
     // --- Launch bootstrap network effects (U4-bootstrap) ---
     /// Aborts any in-flight bootstrap HTTP tasks.
     CancelBootstrapTasks,
     /// Step 1: fetches `/api/alias/list` (distinguishes auth vs other errors).
-    BootstrapFetchAliasesApi { boot_gen: u64 },
+    BootstrapFetchAliasesApi {
+        boot_gen: u64,
+    },
     /// Step 3: concurrently fetches pinned conversations, archived chats, and mute list.
-    BootstrapFetchPamApi { boot_gen: u64 },
+    BootstrapFetchPamApi {
+        boot_gen: u64,
+    },
     /// Step 4a: fetches `/api/convlabel/get`.
-    BootstrapFetchLabelsApi { boot_gen: u64 },
+    BootstrapFetchLabelsApi {
+        boot_gen: u64,
+    },
     /// Step 4b: fetches hidden conversations snapshot.
-    BootstrapFetchHiddenApi { boot_gen: u64 },
+    BootstrapFetchHiddenApi {
+        boot_gen: u64,
+    },
     /// Step 4c: concurrently fetches friends, groups list, sent requests, and received requests.
-    BootstrapFetchContactsApi { boot_gen: u64 },
+    BootstrapFetchContactsApi {
+        boot_gen: u64,
+    },
     /// Step 5: fetches `/api/preloadconvers/get-last-msgs` (overview or 25-ID chunk).
     BootstrapFetchPreloadApi {
         boot_gen: u64,
@@ -990,7 +1200,9 @@ pub enum Effect {
 
     // U5
     /// Calls `ZaloApi::send_typing` when `SessionClient::is_authenticated()` is true.
-    SendTypingApi { conv_id: String },
+    SendTypingApi {
+        conv_id: String,
+    },
     /// Starts or resets the incoming typing expiry timer for `conv_id`.
     StartTypingExpiry {
         conv_id: String,
@@ -998,7 +1210,9 @@ pub enum Effect {
         delay: Duration,
     },
     /// Cancels any active incoming typing expiry timer for `conv_id`.
-    CancelTypingExpiry { conv_id: String },
+    CancelTypingExpiry {
+        conv_id: String,
+    },
     // U5-send
     /// Calls `ZaloApi::send_text` for a plain-text send and returns [`Input::SendTextDone`].
     SendTextApi {
@@ -1007,11 +1221,8 @@ pub enum Effect {
     },
     // U8
     /// Allocates a client id from `SessionClient::next_client_id` and returns [`Input::ForwardClientIdAllocated`].
-    AllocClientId { forward_id: u64 },
-    /// Calls `ZaloApi::send_contact_card` and returns [`Input::ForwardContactCardDone`].
-    SendContactCardApi {
+    AllocClientId {
         forward_id: u64,
-        params: SendContactCardParams,
     },
     // U12
     /// Calls `ZaloApi::fetch_poll_detail` for `Refresh` or `Voters`.
@@ -1066,7 +1277,10 @@ pub enum Effect {
         now_ms: i64,
     },
     /// Calls `ZaloApi::share_poll_api`.
-    SharePollApi { op_id: Option<u64>, poll_id: String },
+    SharePollApi {
+        op_id: Option<u64>,
+        poll_id: String,
+    },
     /// Calls `ZaloApi::create_poll_api`.
     CreatePollApi {
         op_id: Option<u64>,
@@ -1117,13 +1331,20 @@ pub enum Effect {
         can_try_alt: bool,
     },
     /// Arms the 5 s delete-for-me undo expiry timer.
-    StartDeleteUndoExpiry { undo_gen: u64, delay: Duration },
+    StartDeleteUndoExpiry {
+        undo_gen: u64,
+        delay: Duration,
+    },
     /// Cancels any active delete-for-me undo expiry timer.
     CancelDeleteUndoExpiry,
     /// Commits a delete-for-me batch (`delete_message_for_me` API + SQLite delete per item).
-    CommitDeleteBatch { items: Vec<DeleteUndoItem> },
+    CommitDeleteBatch {
+        items: Vec<DeleteUndoItem>,
+    },
     /// Calls `ZaloApi::fetch_auto_delete` and reports `Input::AutoDeleteLoaded`.
-    FetchAutoDeleteApi { op_id: Option<u64> },
+    FetchAutoDeleteApi {
+        op_id: Option<u64>,
+    },
     /// Calls `ZaloApi::update_auto_delete` and reports `Input::AutoDeleteUpdated`.
     UpdateAutoDeleteApi {
         conv_id: String,
@@ -1166,6 +1387,50 @@ pub enum Effect {
     },
     /// Clears cached zCloud viewer key/enk credentials on `ResetCloud`.
     ClearCloudViewerKey,
+
+    // U13
+    FetchStickerCategories {
+        op_id: Option<u64>,
+    },
+    LoadRecentStickersForTabs {
+        op_id: Option<u64>,
+    },
+    LoadRecentStickers {
+        op_id: Option<u64>,
+    },
+    FetchStickerCategoryDetail {
+        op_id: Option<u64>,
+        cate_id: i64,
+    },
+    SearchStickersApi {
+        op_id: Option<u64>,
+        keyword: String,
+        limit: i64,
+    },
+    SuggestStickersApi {
+        op_id: Option<u64>,
+        keyword: String,
+    },
+    SendStickerApi {
+        send_id: u64,
+        params: SendStickerParams,
+    },
+    LoadStickerSuggestPref {
+        op_id: Option<u64>,
+    },
+    SendContactCardApi {
+        card_send_id: u64,
+        params: SendContactCardParams,
+    },
+    CreateReminderApi {
+        op_id: Option<u64>,
+        params: CreateReminderParams,
+    },
+    StartConfirmPromoteDelay {
+        confirm_gen: u64,
+        delay: Duration,
+    },
+    CancelConfirmPromoteDelay,
 
     /// Domain activity delegated to Swift via `CoreHost`.
     Host(HostCall),
@@ -1407,11 +1672,6 @@ impl fmt::Debug for Effect {
                 .debug_struct("AllocClientId")
                 .field("forward_id", forward_id)
                 .finish(),
-            Self::SendContactCardApi { forward_id, params } => f
-                .debug_struct("SendContactCardApi")
-                .field("forward_id", forward_id)
-                .field("params", params)
-                .finish(),
             // U6
             Self::ResolveMessageIds { resolve_id, .. } => f
                 .debug_struct("ResolveMessageIds")
@@ -1571,6 +1831,61 @@ impl fmt::Debug for Effect {
                 .field("op_id", op_id)
                 .finish(),
             Self::ClearCloudViewerKey => f.write_str("ClearCloudViewerKey"),
+            // U13
+            Self::FetchStickerCategories { op_id } => f
+                .debug_struct("FetchStickerCategories")
+                .field("op_id", op_id)
+                .finish(),
+            Self::LoadRecentStickersForTabs { op_id } => f
+                .debug_struct("LoadRecentStickersForTabs")
+                .field("op_id", op_id)
+                .finish(),
+            Self::LoadRecentStickers { op_id } => f
+                .debug_struct("LoadRecentStickers")
+                .field("op_id", op_id)
+                .finish(),
+            Self::FetchStickerCategoryDetail { op_id, cate_id } => f
+                .debug_struct("FetchStickerCategoryDetail")
+                .field("op_id", op_id)
+                .field("cate_id", cate_id)
+                .finish(),
+            Self::SearchStickersApi { op_id, limit, .. } => f
+                .debug_struct("SearchStickersApi")
+                .field("op_id", op_id)
+                .field("limit", limit)
+                .finish(),
+            Self::SuggestStickersApi { op_id, .. } => f
+                .debug_struct("SuggestStickersApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::SendStickerApi { send_id, params } => f
+                .debug_struct("SendStickerApi")
+                .field("send_id", send_id)
+                .field("params", params)
+                .finish(),
+            Self::LoadStickerSuggestPref { op_id } => f
+                .debug_struct("LoadStickerSuggestPref")
+                .field("op_id", op_id)
+                .finish(),
+            Self::SendContactCardApi {
+                card_send_id,
+                params,
+            } => f
+                .debug_struct("SendContactCardApi")
+                .field("card_send_id", card_send_id)
+                .field("params", params)
+                .finish(),
+            Self::CreateReminderApi { op_id, params } => f
+                .debug_struct("CreateReminderApi")
+                .field("op_id", op_id)
+                .field("params", params)
+                .finish(),
+            Self::StartConfirmPromoteDelay { confirm_gen, delay } => f
+                .debug_struct("StartConfirmPromoteDelay")
+                .field("confirm_gen", confirm_gen)
+                .field("delay_ms", &delay.as_millis())
+                .finish(),
+            Self::CancelConfirmPromoteDelay => f.write_str("CancelConfirmPromoteDelay"),
             Self::Host(call) => f.debug_tuple("Host").field(call).finish(),
         }
     }

@@ -747,6 +747,47 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         }
     }
 
+    func sendE2eeSticker(
+        convId: String,
+        cateId: Int64,
+        stickerId: Int64,
+        clientId: String
+    ) async -> E2eeStickerSendOutcomeRecord {
+        guard let engine else { return .e2eeFailed }
+        return await engine.hostSendE2EESticker(
+            convId: convId,
+            cateId: cateId,
+            stickerId: stickerId,
+            clientId: clientId
+        )
+    }
+
+    func sendE2eeContactCard(
+        convId: String,
+        clientId: String,
+        contactUid: String,
+        title: String,
+        phone: String,
+        avatar: String,
+        qrCodeUrl: String
+    ) async -> E2eeSendOutcomeRecord {
+        guard let engine else { return .aborted }
+        return await engine.hostSendE2EEContactCard(
+            convId: convId,
+            clientId: clientId,
+            contactUid: contactUid,
+            title: title,
+            phone: phone,
+            avatar: avatar,
+            qrCodeUrl: qrCodeUrl
+        )
+    }
+
+    func sleepConfirmPromote(delayMs: UInt64) async {
+        guard let engine else { return }
+        await engine.hostSleepConfirmPromote(delayMs: delayMs)
+    }
+
     func resolveMedia(convId: String, msgId: String, kind: String) async -> MediaResolutionRecord {
         guard let engine else { return .unavailable }
         return await engine.hostResolveMedia(convId: convId, msgId: msgId, kind: kind)
@@ -984,6 +1025,49 @@ extension MediaResolution {
     }
 }
 
+extension StickerAnimation {
+    init?(coreRecord record: StickerAnimationRecord) {
+        switch record {
+        case .sprite(let url, let frames, let frameMs):
+            guard let parsed = URL(string: url) else { return nil }
+            self = .sprite(url: parsed, frames: Int(frames), frameMs: Int(frameMs))
+        case .animated(let url):
+            guard let parsed = URL(string: url) else { return nil }
+            self = .animated(url: parsed)
+        }
+    }
+
+    var coreRecord: StickerAnimationRecord {
+        switch self {
+        case .sprite(let url, let frames, let frameMs):
+            return .sprite(url: url.absoluteString, frames: Int64(frames), frameMs: Int64(frameMs))
+        case .animated(let url):
+            return .animated(url: url.absoluteString)
+        }
+    }
+}
+
+extension StickerEntry {
+    init?(coreRecord record: StickerEntryRecord) {
+        guard let url = URL(string: record.url) else { return nil }
+        self.init(
+            cateId: Int(record.cateId),
+            stickerId: Int(record.stickerId),
+            url: url,
+            animation: record.animation.flatMap(StickerAnimation.init(coreRecord:))
+        )
+    }
+
+    var coreRecord: StickerEntryRecord {
+        StickerEntryRecord(
+            cateId: Int64(cateId),
+            stickerId: Int64(stickerId),
+            url: url.absoluteString,
+            animation: animation?.coreRecord
+        )
+    }
+}
+
 extension MessageActionOutcome {
     init(forwardRecord record: ForwardOutcomeRecord) {
         switch record {
@@ -994,6 +1078,111 @@ extension MessageActionOutcome {
         case .failed(let text):
             self = .failed(text)
         }
+    }
+}
+
+extension StickerTab {
+    init(coreRecord record: StickerTabRecord) {
+        self.init(
+            id: Int(record.id),
+            name: record.name,
+            icon: record.icon.flatMap(URL.init(string:)),
+            count: Int(record.count)
+        )
+    }
+}
+
+extension StickerSuggestSetting {
+    init(coreRecord record: StickerSuggestSettingRecord) {
+        self.enabled = record.enabled
+        self.debounce = Int(record.debounce)
+    }
+}
+
+extension StickerSource {
+    var coreRecord: StickerSourceRecord {
+        switch self {
+        case .category: return .category
+        case .recent: return .recent
+        case .search: return .search
+        case .suggestion: return .suggestion
+        }
+    }
+}
+
+extension CardActionOutcome {
+    init(coreRecord record: CardActionOutcomeRecord) {
+        switch record {
+        case .done: self = .done
+        case .openChat(let id): self = .openChat(id)
+        case .openProfile(let uid): self = .openProfile(uid)
+        case .openUrl(let url):
+            self = URL(string: url).map(Self.openURL) ?? .failed("Không thực hiện được thao tác.")
+        case .copy(let text): self = .copy(text)
+        case .present: self = .unsupported(Self.defaultUnsupported)
+        case .unsupported(let text): self = .unsupported(text)
+        case .locked(let text): self = .locked(text)
+        case .failed(let text): self = .failed(text)
+        case .pending(let text): self = .pending(text)
+        }
+    }
+}
+
+extension ComposerOutcome {
+    init(coreRecord record: ComposerOutcomeRecord) {
+        switch record {
+        case .done: self = .done
+        case .cancelled: self = .cancelled
+        case .failed(let text): self = .failed(text)
+        case .pending(let text): self = .pending(text)
+        }
+    }
+}
+
+extension MyCardInfo {
+    init(coreRecord record: MyCardInfoRecord) {
+        self.uid = record.uid
+        self.name = record.name
+        self.avatar = record.avatar.flatMap { $0.isEmpty ? nil : URL(string: $0) }
+        self.phone = record.phone
+        self.withPhone = record.withPhone
+    }
+}
+
+extension ReminderComposeInfo {
+    init(coreRecord record: ReminderComposeInfoRecord) {
+        self.allowed = record.allowed
+        self.hidden = record.hidden
+        self.text = record.text
+        self.isGroup = record.isGroup
+        self.canPin = record.canPin
+        self.pinToggle = record.pinToggle
+        self.titleMaxChars = Int(record.titleMaxChars)
+        self.titleMaxBytes = Int(record.titleMaxBytes)
+    }
+}
+
+extension ComposerConfirm {
+    init(coreRecord record: ComposerConfirmRecord) {
+        self.init(
+            id: record.id,
+            conversationId: record.convId,
+            title: record.title,
+            message: record.message,
+            ok: record.ok,
+            cancel: record.cancel
+        )
+    }
+
+    var coreRecord: ComposerConfirmRecord {
+        ComposerConfirmRecord(
+            id: id,
+            convId: conversationId,
+            title: title,
+            message: message,
+            ok: ok,
+            cancel: cancel
+        )
     }
 }
 
@@ -1335,6 +1524,12 @@ extension ZaloEngine {
                 for (convId, ttl) in autoDel where ttl > 0 {
                     core.setAutoDeleteTtl(convId: convId, ttlMs: ttl)
                 }
+            }
+            if self.composerConfirm != nil || !self.queuedComposerConfirms.isEmpty {
+                core.seedComposerConfirms(
+                    active: self.composerConfirm?.coreRecord,
+                    queued: self.queuedComposerConfirms.map(\.coreRecord)
+                )
             }
             let initialPolls = self.currentPollsMirrorRecord()
             if !initialPolls.details.isEmpty
@@ -1983,6 +2178,26 @@ extension ZaloEngine {
             }
         }
 
+        if let suggestUpdate = batch.stickerSuggest {
+            StickerSuggestState.shared.apply(
+                suggestUpdate.setting.map(StickerSuggestSetting.init(coreRecord:))
+            )
+        }
+
+        if let confirmUpdate = batch.composerConfirm {
+            let next = confirmUpdate.confirm.map(ComposerConfirm.init(coreRecord:))
+            if composerConfirm != next {
+                composerConfirm = next
+            }
+        }
+
+        if let queuedRecords = batch.queuedComposerConfirms {
+            let next = queuedRecords.map(ComposerConfirm.init(coreRecord:))
+            if queuedComposerConfirms != next {
+                queuedComposerConfirms = next
+            }
+        }
+
         if !optimisticMessageOverlays.isEmpty {
             reapplyActiveOptimisticOverlays(for: batch)
         }
@@ -2548,6 +2763,217 @@ extension ZaloEngine {
             return .sent(msgId: res.msgId, cliMsgId: res.cliMsgId, tsMs: res.tsMs)
         } catch {
             return .failed(message: error.localizedDescription)
+        }
+    }
+
+    internal func hostSendE2EESticker(
+        convId: String,
+        cateId: Int64,
+        stickerId: Int64,
+        clientId cliId: String
+    ) async -> E2eeStickerSendOutcomeRecord {
+        do {
+            let res: SendMessageResult
+            if let sendE2EEStickerHostHandler {
+                let args: [String: Any] = [
+                    "conv_id": convId,
+                    "cate_id": Int(cateId),
+                    "sticker_id": Int(stickerId),
+                    "client_id": cliId,
+                ]
+                _ = traceHost("send_e2ee_sticker", args: args)
+                guard let hostRes = try await sendE2EEStickerHostHandler(args) else {
+                    return .e2eeFailed
+                }
+                res = hostRes
+            } else {
+                let myUid = profile?.userId ?? ""
+                guard !myUid.isEmpty,
+                      await e2eeManager.ensureSessions(
+                          forPeer: convId,
+                          myUid: myUid,
+                          webSocket: webSocket,
+                          store: sqliteStore
+                      ) else {
+                    EngineLog.shared.write("sendSticker e2ee failed: no open Signal session for peer=\(convId)")
+                    return .e2eeFailed
+                }
+                let encryptedDevices = await e2eeManager.encryptStickerMessage(
+                    peerUid: convId,
+                    myUid: myUid,
+                    stickerId: Int(stickerId),
+                    cateId: Int(cateId),
+                    stickerType: 7,
+                    store: sqliteStore
+                )
+                guard !encryptedDevices.isEmpty else {
+                    EngineLog.shared.write("sendSticker e2ee failed: encryption produced no peer payloads for peer=\(convId)")
+                    return .e2eeFailed
+                }
+                let senderIid = await e2eeManager.localRegistrationId()
+                let imei = await sessionClient.imei
+                let cliInt: Int64
+                if let parsed = Int64(cliId) {
+                    cliInt = parsed
+                } else {
+                    cliInt = await sessionClient.nextClientId()
+                }
+                let listParams: [[String: Any]] = encryptedDevices.compactMap { dev in
+                    guard dev.ciphers.count >= 3 else { return nil }
+                    let extra: [String: Any] = [
+                        "stickerId": dev.ciphers[0],
+                        "cateId": dev.ciphers[1],
+                        "type": dev.ciphers[2],
+                        "zsource": 101,
+                    ]
+                    return ZaloSessionClient.buildE2EEListParamEntry(
+                        toId: dev.toId,
+                        platform: dev.platform,
+                        clientId: cliInt,
+                        imei: imei,
+                        registrationId: dev.registrationId,
+                        senderIid: senderIid,
+                        extraFields: extra
+                    )
+                }
+                guard !listParams.isEmpty else {
+                    EngineLog.shared.write("sendSticker e2ee failed: empty listParams for peer=\(convId)")
+                    return .e2eeFailed
+                }
+                res = try await sessionClient.sendE2EEMessageAPI(
+                    endpoint: "sticker",
+                    threadId: convId,
+                    isGroup: false,
+                    clientId: cliInt,
+                    listParams: ZaloJSONArrayBox(listParams)
+                )
+            }
+            return .sent(msgId: res.msgId, cliMsgId: res.cliMsgId, tsMs: res.tsMs)
+        } catch {
+            EngineLog.shared.write("sendSticker failed: \(error.localizedDescription)")
+            return .apiFailed(message: error.localizedDescription)
+        }
+    }
+
+    internal func hostSendE2EEContactCard(
+        convId: String,
+        clientId cliId: String,
+        contactUid: String,
+        title: String,
+        phone: String,
+        avatar: String,
+        qrCodeUrl: String
+    ) async -> E2eeSendOutcomeRecord {
+        do {
+            let res: SendMessageResult
+            if let sendE2EEContactCardHostHandler {
+                let args: [String: Any] = [
+                    "conv_id": convId,
+                    "client_id": cliId,
+                    "contact_uid": contactUid,
+                    "title": title,
+                    "phone": phone,
+                    "avatar": avatar,
+                    "qr_code_url": qrCodeUrl,
+                ]
+                _ = traceHost("send_e2ee_contact_card", args: args)
+                res = try await sendE2EEContactCardHostHandler(args)
+            } else {
+                let myUid = profile?.userId ?? ""
+                guard !myUid.isEmpty else {
+                    EngineLog.shared.write("sendContactCard e2ee failed: missing local uid")
+                    return .aborted
+                }
+                let ready = await e2eeManager.ensureSessions(
+                    forPeer: convId,
+                    myUid: myUid,
+                    webSocket: webSocket,
+                    store: sqliteStore
+                )
+                guard ready else {
+                    EngineLog.shared.write("sendContactCard e2ee failed: no open Signal session for peer=\(convId)")
+                    return .aborted
+                }
+                let cliInt: Int64
+                if let parsed = Int64(cliId) {
+                    cliInt = parsed
+                } else {
+                    cliInt = await sessionClient.nextClientId()
+                }
+                let cleanContact = ZaloWireParser.stripUserPrefix(contactUid)
+                let gUid: String
+                if let cached = cachedFriendGlobalIds[cleanContact], !cached.isEmpty {
+                    gUid = cached
+                } else {
+                    let resolved = await sessionClient.encryptGlobalIds([cleanContact])[cleanContact] ?? ""
+                    gUid = resolved.isEmpty ? cleanContact : resolved
+                }
+                var descObj: [String: Any] = ["gUid": gUid]
+                if !phone.isEmpty { descObj["phone"] = phone }
+                if !qrCodeUrl.isEmpty { descObj["qrCodeUrl"] = qrCodeUrl }
+                let descJSON = Self.jsonString(for: descObj)
+
+                let encryptedDevices = await e2eeManager.encryptContactCardMessage(
+                    peerUid: convId,
+                    myUid: myUid,
+                    title: title,
+                    avatar: avatar,
+                    descJSON: descJSON,
+                    store: sqliteStore
+                )
+                guard !encryptedDevices.isEmpty else {
+                    EngineLog.shared.write("sendContactCard e2ee failed: encryption produced no peer payloads for peer=\(convId)")
+                    return .aborted
+                }
+                let senderIid = await e2eeManager.localRegistrationId()
+                let imei = await sessionClient.imei
+                let listParams: [[String: Any]] = encryptedDevices.compactMap { dev in
+                    guard dev.ciphers.count >= 4 else { return nil }
+                    let msgInfo: [String: Any] = [
+                        "title": dev.ciphers[0],
+                        "thumb": dev.ciphers[1],
+                        "desc": dev.ciphers[2],
+                        "href": dev.ciphers[3],
+                        "action": "recommened.user",
+                    ]
+                    let msgInfoJSON = Self.jsonString(for: msgInfo)
+                    return ZaloSessionClient.buildE2EEListParamEntry(
+                        toId: dev.toId,
+                        platform: dev.platform,
+                        clientId: cliInt,
+                        imei: imei,
+                        registrationId: dev.registrationId,
+                        senderIid: senderIid,
+                        version: 1,
+                        compatVersion: 0,
+                        extraFields: ["msgInfo": msgInfoJSON]
+                    )
+                }
+                guard !listParams.isEmpty else {
+                    EngineLog.shared.write("sendContactCard e2ee failed: empty listParams for peer=\(convId)")
+                    return .aborted
+                }
+                res = try await sessionClient.sendE2EEMessageAPI(
+                    endpoint: "forward",
+                    threadId: convId,
+                    isGroup: false,
+                    clientId: cliInt,
+                    listParams: ZaloJSONArrayBox(listParams),
+                    destType: 3,
+                    msgType: 6
+                )
+            }
+            return .sent(msgId: res.msgId, cliMsgId: res.cliMsgId, tsMs: res.tsMs)
+        } catch {
+            return .failed(message: error.localizedDescription)
+        }
+    }
+
+    internal func hostSleepConfirmPromote(delayMs: UInt64) async {
+        if let sleepSeam = composerConfirmSleep {
+            _ = await sleepSeam(Int(delayMs))
+        } else {
+            try? await Task.sleep(for: .milliseconds(Int64(delayMs)))
         }
     }
 

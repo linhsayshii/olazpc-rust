@@ -12,6 +12,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::changes::{ChangeHub, CoreChanges};
 use crate::cloud::{CloudActionResult, CloudFetch, CloudPage, MediaResolutionOutcome};
+use crate::composer::{ComposerOutcome, MyCardInfo, ReminderComposeInfo};
 use crate::conversations::{ConversationActionResult, IdentityTable, PinBoard};
 use crate::effect::{Effect, OpResult};
 use crate::forward::ForwardOutcome;
@@ -20,6 +21,7 @@ use crate::messages::IdentitySnapshot;
 use crate::reduce::reduce;
 use crate::runner::EffectRunner;
 use crate::state::{CoreSnapshot, CoreState, SessionSnapshot};
+use crate::stickers::{CardActionOutcome, StickerEntry, StickerSuggestSetting, StickerTab};
 
 enum ActorMsg {
     Input {
@@ -29,7 +31,7 @@ enum ActorMsg {
     CoalescedIdentities,
     OpRequest {
         cmd: Box<Command>,
-        reply: oneshot::Sender<OpResult>,
+        reply: oneshot::Sender<(OpResult, u64)>,
     },
     DrainChatPolling {
         max_batches: u32,
@@ -248,8 +250,8 @@ impl CoreHandle {
         ack_rx.await.ok()
     }
 
-    /// Sends a request-reply command and awaits its completion [`OpResult`].
-    pub async fn request(&self, command: Command) -> Option<OpResult> {
+    /// Sends a request-reply command and awaits its completion `(OpResult, settled_version)`.
+    pub async fn request_with_version(&self, command: Command) -> Option<(OpResult, u64)> {
         let (reply, rx) = oneshot::channel();
         self.tracker.increment();
         if self
@@ -264,6 +266,67 @@ impl CoreHandle {
             return None;
         }
         rx.await.ok()
+    }
+
+    /// Sends a request-reply command and awaits its completion [`OpResult`].
+    pub async fn request(&self, command: Command) -> Option<OpResult> {
+        self.request_with_version(command).await.map(|(res, _)| res)
+    }
+
+    /// U14: Searches in-memory and SQLite messages for `conv_id`, returning `(matches, settled_version)`.
+    pub async fn search_messages(
+        &self,
+        conv_id: String,
+        query: String,
+        limit: i64,
+    ) -> (Vec<olaz_wire::ChatMessage>, u64) {
+        match self
+            .request_with_version(Command::SearchMessages {
+                conv_id,
+                query,
+                limit,
+            })
+            .await
+        {
+            Some((OpResult::SearchMessages(msgs), ver)) => (msgs, ver),
+            _ => (Vec::new(), self.current_version()),
+        }
+    }
+
+    /// U14: Ensures `message` is loaded into `messages.windows[conv_id]`, returning `(loaded, settled_version)`.
+    pub async fn ensure_message_loaded(
+        &self,
+        conv_id: String,
+        message: olaz_wire::ChatMessage,
+    ) -> (bool, u64) {
+        match self
+            .request_with_version(Command::EnsureMessageLoaded {
+                conv_id,
+                message: Box::new(message),
+            })
+            .await
+        {
+            Some((OpResult::Bool(loaded), ver)) => (loaded, ver),
+            _ => (false, self.current_version()),
+        }
+    }
+
+    /// U14: Finds and loads the message quoted by `message` in `conv_id`, returning `(id, settled_version)`.
+    pub async fn load_quoted_message(
+        &self,
+        conv_id: String,
+        message: olaz_wire::ChatMessage,
+    ) -> (Option<String>, u64) {
+        match self
+            .request_with_version(Command::LoadQuotedMessage {
+                conv_id,
+                message: Box::new(message),
+            })
+            .await
+        {
+            Some((OpResult::OptionalString(id), ver)) => (id, ver),
+            _ => (None, self.current_version()),
+        }
     }
 
     /// Awaits a request-reply command that completes with `OpResult::Unit`.
@@ -408,6 +471,59 @@ impl CoreHandle {
         }
     }
 
+    // U13 typed request helpers
+    pub async fn request_sticker_tabs(&self) -> Option<Vec<StickerTab>> {
+        match self.request(Command::StickerTabs).await {
+            Some(OpResult::StickerTabs(v)) => v,
+            _ => None,
+        }
+    }
+
+    pub async fn request_sticker_entries(&self, command: Command) -> Option<Vec<StickerEntry>> {
+        match self.request(command).await {
+            Some(OpResult::StickerEntries(v)) => v,
+            _ => None,
+        }
+    }
+
+    pub async fn request_sticker_suggest_setting(
+        &self,
+        command: Command,
+    ) -> Option<StickerSuggestSetting> {
+        match self.request(command).await {
+            Some(OpResult::StickerSuggestSetting(s)) => s,
+            _ => None,
+        }
+    }
+
+    pub async fn request_card_action(&self, command: Command) -> CardActionOutcome {
+        match self.request(command).await {
+            Some(OpResult::CardActionOutcome(o)) => o,
+            _ => CardActionOutcome::Failed("Không gửi được sticker. Hãy thử lại.".to_owned()),
+        }
+    }
+
+    pub async fn request_composer_outcome(&self, command: Command) -> ComposerOutcome {
+        match self.request(command).await {
+            Some(OpResult::ComposerOutcome(o)) => o,
+            _ => ComposerOutcome::Failed(crate::composer::COMPOSER_GENERIC_FAILURE.to_owned()),
+        }
+    }
+
+    pub async fn request_my_card(&self) -> Option<MyCardInfo> {
+        match self.request(Command::MyCard).await {
+            Some(OpResult::MyCard(c)) => c,
+            _ => None,
+        }
+    }
+
+    pub async fn request_reminder_info(&self, conv_id: String) -> Option<ReminderComposeInfo> {
+        match self.request(Command::ReminderComposeInfo { conv_id }).await {
+            Some(OpResult::ReminderComposeInfo(r)) => r,
+            _ => None,
+        }
+    }
+
     /// Drains up to `max_batches` long-poll batches serialized behind any in-flight drain
     /// (ADR-018) and returns the total applied event count (`0` if long-poll or actor is stopped).
     pub async fn drain_chat_polling(&self, max_batches: u32, notify_incoming: bool) -> u32 {
@@ -547,7 +663,7 @@ impl Drop for CoreHandle {
 
 struct ActorWaiters {
     drains: HashMap<u64, oneshot::Sender<u32>>,
-    ops: HashMap<u64, oneshot::Sender<OpResult>>,
+    ops: HashMap<u64, oneshot::Sender<(OpResult, u64)>>,
     next_op_id: u64,
 }
 
@@ -611,7 +727,7 @@ fn dispatch_reduce_output(
                     after_store: false,
                 } => {
                     if let Some(waiter) = waiters.ops.remove(&op_id) {
-                        let _ = waiter.send(result);
+                        let _ = waiter.send((result, version));
                     }
                 }
                 other => runner_effects.push(other),

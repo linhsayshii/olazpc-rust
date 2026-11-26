@@ -26,6 +26,8 @@ mod history;
 mod messaging;
 mod poll;
 mod profiles;
+mod reminders;
+mod stickers;
 mod util;
 
 #[cfg(test)]
@@ -52,6 +54,11 @@ pub use messaging::{
     build_send_contact_card_request,
 };
 pub use poll::{PollQueueCursor, PollState};
+pub use reminders::{CreateReminderParams, build_create_reminder_request};
+pub use stickers::{
+    FetchedStickerCategories, SendStickerParams, StickerCategoryRow, build_send_sticker_request,
+    builtin_sticker_pack, parse_sticker_catalog_bytes,
+};
 
 // U12 (polls + shared group metadata helper for U10)
 pub use group_polls::{

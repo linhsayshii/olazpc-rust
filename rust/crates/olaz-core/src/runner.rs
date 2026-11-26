@@ -31,11 +31,12 @@ use crate::effect::{Effect, HistoryFetchPurpose, HostCall, OpResult, StoreOp};
 use crate::forward::{ComposerSendOutcome, FileResolutionOutcome, MediaResolutionOutcome};
 use crate::input::{
     BootstrapAliasesError, Command, CompletedLogin, E2eeQuoteArg, Input, LegacyCookie,
-    PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
+    PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StickerSendError, StoreToken,
 };
 use crate::messages::{MuteEntry, decode_db_stored};
 use crate::reduce::classify::MobileSyncEvent;
 use crate::state::PersistedTransportState;
+use crate::stickers::{parse_recent_stickers_bytes, update_recent_stickers_json};
 use crate::typed_chat::{
     PlainChatParse, TypedChatEnvelope, new_shared_parse, try_parse_plain_chat,
 };
@@ -536,6 +537,38 @@ pub trait Host: Send + Sync {
     }
     /// Cancels all pending host-owned poll debounce timers (`resetPolls` / `logOut` / `markExpired`).
     async fn cancel_all_poll_debounces(&self) {}
+
+    // --- Stickers & composer E2EE callbacks (U13) ---
+    async fn send_e2ee_sticker(
+        &self,
+        _conv_id: String,
+        _cate_id: i64,
+        _sticker_id: i64,
+        _client_id: String,
+    ) -> Result<olaz_api::SendMessageResult, StickerSendError> {
+        Err(StickerSendError::E2eeFailed)
+    }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Matches send_e2ee_contact_card host boundary args 1-for-1"
+    )]
+    async fn send_e2ee_contact_card(
+        &self,
+        _conv_id: String,
+        _client_id: String,
+        _contact_uid: String,
+        _title: String,
+        _phone: String,
+        _avatar: String,
+        _qr_code_url: String,
+    ) -> Result<olaz_api::SendMessageResult, String> {
+        Err("send_e2ee_contact_card not implemented by host".to_owned())
+    }
+    /// Waits for the composer-confirm promotion delay (default: real tokio sleep; tests can
+    /// override with a deterministic virtual clock).
+    async fn sleep_confirm_promote(&self, delay: Duration) {
+        tokio::time::sleep(delay).await;
+    }
 }
 
 enum HostJob {
@@ -805,6 +838,28 @@ enum HostJob {
         sink: ActorSink,
         _guard: InFlightGuard,
     },
+    // U13: queued behind earlier host calls without blocking the serial host worker on network I/O
+    SendE2eeSticker {
+        send_id: u64,
+        conv_id: String,
+        cate_id: i64,
+        sticker_id: i64,
+        client_id: String,
+        sink: ActorSink,
+        guard: InFlightGuard,
+    },
+    SendE2eeContactCard {
+        card_send_id: u64,
+        conv_id: String,
+        client_id: String,
+        contact_uid: String,
+        title: String,
+        phone: String,
+        avatar: String,
+        qr_code_url: String,
+        sink: ActorSink,
+        guard: InFlightGuard,
+    },
     Drain(oneshot::Sender<()>),
 }
 
@@ -816,6 +871,12 @@ enum StoreJob {
         op: StoreOp,
         sink: ActorSink,
         _guard: InFlightGuard,
+    },
+    LoadRecentStickers {
+        reply: oneshot::Sender<Vec<Value>>,
+    },
+    LoadStickerSuggestPref {
+        reply: oneshot::Sender<bool>,
     },
     ResolveMessageIdsLookup {
         conv_id: String,
@@ -895,6 +956,8 @@ pub struct SessionEffectRunner<T: Transport + 'static> {
     delete_undo_abort: Arc<Mutex<Option<(u64, AbortHandle)>>>,
     // U12: per-poll debounce timers (`poll_id -> (seq, AbortHandle)`).
     poll_debounce_aborts: Arc<Mutex<BTreeMap<String, (u64, AbortHandle)>>>,
+    // U13: pending 300ms composer confirm promotion timer (`(confirm_gen, AbortHandle)`).
+    confirm_promote_abort: Arc<Mutex<Option<(u64, AbortHandle)>>>,
     host_worker_abort: AbortHandle,
     store_worker_abort: AbortHandle,
     runtime: Handle,
@@ -993,6 +1056,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
             typing_expiry_aborts: Arc::new(Mutex::new(BTreeMap::new())),
             delete_undo_abort: Arc::new(Mutex::new(None)),
             poll_debounce_aborts: Arc::new(Mutex::new(BTreeMap::new())),
+            confirm_promote_abort: Arc::new(Mutex::new(None)),
             host_worker_abort: worker_handle.abort_handle(),
             store_worker_abort: store_handle.abort_handle(),
             runtime,
@@ -1085,6 +1149,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         }
         self.cancel_typing_expiry(None);
         self.cancel_delete_undo_timer();
+        self.cancel_confirm_promote_timer();
     }
 
     fn cancel_typing_expiry(&self, conv_id: Option<&str>) {
@@ -1129,6 +1194,17 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
     fn cancel_delete_undo_timer(&self) {
         if let Some((_, handle)) = self
             .delete_undo_abort
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            handle.abort();
+        }
+    }
+
+    fn cancel_confirm_promote_timer(&self) {
+        if let Some((_, handle)) = self
+            .confirm_promote_abort
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
@@ -2403,15 +2479,147 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         drop(guard);
                     });
                 }
-                // U8
-                Effect::AllocClientId { forward_id } => {
-                    let client_id = self.client.next_client_id();
-                    sink.send(Input::ForwardClientIdAllocated {
-                        forward_id,
-                        client_id,
+                // U13
+                Effect::FetchStickerCategories { op_id } => {
+                    let api = Arc::clone(&self.api);
+                    let store_tx = self.store_tx.clone();
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let res = match api.fetch_sticker_categories().await {
+                            Ok(fetched) => {
+                                let (tx, rx) = oneshot::channel();
+                                let _ = store_tx.send(StoreJob::LoadRecentStickers { reply: tx });
+                                let recents = rx.await.unwrap_or_default();
+                                Ok((fetched, recents.len()))
+                            }
+                            Err(err) => Err(err.display_without_url()),
+                        };
+                        sink.send(Input::StickerCategoriesFetched { op_id, result: res });
+                        drop(guard);
                     });
                 }
-                Effect::SendContactCardApi { forward_id, params } => {
+                Effect::LoadRecentStickersForTabs { op_id } => {
+                    let store_tx = self.store_tx.clone();
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let (tx, rx) = oneshot::channel();
+                        let _ = store_tx.send(StoreJob::LoadRecentStickers { reply: tx });
+                        let recents = rx.await.unwrap_or_default();
+                        sink.send(Input::StickerTabsRecentsLoaded {
+                            op_id,
+                            recent_count: recents.len(),
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::LoadRecentStickers { op_id } => {
+                    let store_tx = self.store_tx.clone();
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let (tx, rx) = oneshot::channel();
+                        let _ = store_tx.send(StoreJob::LoadRecentStickers { reply: tx });
+                        let rows = rx.await.unwrap_or_default();
+                        sink.send(Input::RecentStickersLoaded { op_id, rows });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchStickerCategoryDetail { op_id, cate_id } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = api
+                            .fetch_sticker_category_detail(cate_id)
+                            .await
+                            .map_err(|err| err.display_without_url());
+                        sink.send(Input::StickerCategoryDetailFetched {
+                            op_id,
+                            cate_id,
+                            result,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::SearchStickersApi {
+                    op_id,
+                    keyword,
+                    limit,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = api
+                            .search_stickers(&keyword, limit)
+                            .await
+                            .map_err(|err| err.display_without_url());
+                        sink.send(Input::StickerSearchFetched { op_id, result });
+                        drop(guard);
+                    });
+                }
+                Effect::SuggestStickersApi { op_id, keyword } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = api
+                            .suggest_stickers(&keyword)
+                            .await
+                            .map_err(|err| err.display_without_url());
+                        sink.send(Input::StickerSuggestFetched { op_id, result });
+                        drop(guard);
+                    });
+                }
+                Effect::SendStickerApi { send_id, params } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = api
+                            .send_sticker(&params)
+                            .await
+                            .map_err(|err| StickerSendError::Api(err.display_without_url()));
+                        sink.send(Input::SendStickerDone { send_id, result });
+                        drop(guard);
+                    });
+                }
+                Effect::Host(HostCall::SendE2eeSticker {
+                    send_id,
+                    conv_id,
+                    cate_id,
+                    sticker_id,
+                    client_id,
+                }) => {
+                    let guard = sink.track();
+                    self.send_host(HostJob::SendE2eeSticker {
+                        send_id,
+                        conv_id,
+                        cate_id,
+                        sticker_id,
+                        client_id,
+                        sink: sink.clone(),
+                        guard,
+                    });
+                }
+                Effect::LoadStickerSuggestPref { op_id } => {
+                    let store_tx = self.store_tx.clone();
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let (tx, rx) = oneshot::channel();
+                        let _ = store_tx.send(StoreJob::LoadStickerSuggestPref { reply: tx });
+                        let enabled = rx.await.unwrap_or(true);
+                        sink.send(Input::StickerSuggestPrefLoaded { op_id, enabled });
+                        drop(guard);
+                    });
+                }
+                Effect::SendContactCardApi {
+                    card_send_id,
+                    params,
+                } => {
                     let api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
@@ -2420,8 +2628,19 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             .send_contact_card(&params)
                             .await
                             .map_err(|err| err.display_without_url());
-                        sink.send(Input::ForwardContactCardDone { forward_id, result });
+                        sink.send(Input::ContactCardSendDone {
+                            card_send_id,
+                            result,
+                        });
                         drop(guard);
+                    });
+                }
+                // U8
+                Effect::AllocClientId { forward_id } => {
+                    let client_id = self.client.next_client_id();
+                    sink.send(Input::ForwardClientIdAllocated {
+                        forward_id,
+                        client_id,
                     });
                 }
                 Effect::Host(HostCall::ResolveMedia {
@@ -2441,6 +2660,77 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         });
                         drop(guard);
                     });
+                }
+                Effect::Host(HostCall::SendE2eeContactCard {
+                    card_send_id,
+                    conv_id,
+                    client_id,
+                    contact_uid,
+                    title,
+                    phone,
+                    avatar,
+                    qr_code_url,
+                }) => {
+                    let effective_cli = if client_id.is_empty() {
+                        self.client.next_client_id().to_string()
+                    } else {
+                        client_id
+                    };
+                    let guard = sink.track();
+                    self.send_host(HostJob::SendE2eeContactCard {
+                        card_send_id,
+                        conv_id,
+                        client_id: effective_cli,
+                        contact_uid,
+                        title,
+                        phone,
+                        avatar,
+                        qr_code_url,
+                        sink: sink.clone(),
+                        guard,
+                    });
+                }
+                Effect::CreateReminderApi { op_id, params } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let ok = api.create_reminder(&params).await.is_ok();
+                        sink.send(Input::CreateReminderDone { op_id, ok });
+                        drop(guard);
+                    });
+                }
+                Effect::StartConfirmPromoteDelay { confirm_gen, delay } => {
+                    // Untracked background timer (like StartDeleteUndoExpiry) so `wait_idle()`
+                    // does not block on the 300 ms confirm promotion delay.
+                    let timer_sink = sink.clone();
+                    let host = Arc::clone(&self.host);
+                    let aborts = Arc::clone(&self.confirm_promote_abort);
+                    let aborts_inner = Arc::clone(&aborts);
+                    let handle = self
+                        .runtime
+                        .spawn(async move {
+                            host.sleep_confirm_promote(delay).await;
+                            {
+                                let mut slot =
+                                    aborts_inner.lock().unwrap_or_else(PoisonError::into_inner);
+                                if slot.as_ref().is_some_and(|(g, _)| *g == confirm_gen) {
+                                    *slot = None;
+                                }
+                            }
+                            timer_sink.send(Input::ConfirmPromoteExpired { confirm_gen });
+                        })
+                        .abort_handle();
+                    let prev = {
+                        let mut slot = aborts.lock().unwrap_or_else(PoisonError::into_inner);
+                        slot.replace((confirm_gen, handle))
+                    };
+                    if let Some((_, prev_handle)) = prev {
+                        prev_handle.abort();
+                    }
+                }
+                Effect::CancelConfirmPromoteDelay => {
+                    self.cancel_confirm_promote_timer();
                 }
                 // U6
                 Effect::StartDeleteUndoExpiry { undo_gen, delay } => {
@@ -2702,6 +2992,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
                 Effect::CancelDeleteUndoExpiry => {
                     self.cancel_delete_undo_timer();
+                    self.cancel_confirm_promote_timer();
                 }
                 Effect::CommitDeleteBatch { items } => {
                     let client = Arc::clone(&self.client);
@@ -3188,6 +3479,8 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             _guard: guard,
                         },
                         HostCall::SendE2eeText { .. }
+                        | HostCall::SendE2eeSticker { .. }
+                        | HostCall::SendE2eeContactCard { .. }
                         | HostCall::ResolveMedia { .. }
                         | HostCall::ResolveFile { .. }
                         | HostCall::FetchMediaData { .. }
@@ -3344,6 +3637,117 @@ async fn run_store_worker(
                             had_before_cursor: true,
                             op_id,
                         });
+                    }
+                    // U14
+                    StoreOp::SearchMessagesPage {
+                        op_id,
+                        conv_id,
+                        query,
+                        before,
+                        limit,
+                    } => {
+                        let page_limit = usize::try_from(limit).unwrap_or(50);
+                        let rows = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let cursor = before.as_ref().map(|(ts, id)| (*ts, id.as_str()));
+                                    store
+                                        .search_messages_page(&conv_id, &query, cursor, limit)
+                                        .unwrap_or_default()
+                                })
+                                .await
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        sink.send(Input::SearchMessagesPageLoaded {
+                            op_id,
+                            rows,
+                            page_limit,
+                        });
+                    }
+                    StoreOp::LoadMessagesAround {
+                        op_id,
+                        conv_id,
+                        target_ts_ms,
+                        before_oldest_ts_ms,
+                    } => {
+                        let window = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    store
+                                        .messages_around(
+                                            &conv_id,
+                                            target_ts_ms,
+                                            before_oldest_ts_ms,
+                                            25,
+                                            3000,
+                                        )
+                                        .ok()
+                                })
+                                .await
+                                .ok()
+                                .flatten()
+                        } else {
+                            None
+                        };
+                        sink.send(Input::EnsureMessageWindowLoaded { op_id, window });
+                    }
+                    StoreOp::LookupMessage {
+                        op_id,
+                        conv_id,
+                        key,
+                    } => {
+                        let row = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    store.message(&conv_id, &key).ok().flatten()
+                                })
+                                .await
+                                .ok()
+                                .flatten()
+                        } else {
+                            None
+                        };
+                        sink.send(Input::QuotedLookupDone { op_id, row });
+                    }
+                    StoreOp::FindLegacyQuoted {
+                        op_id,
+                        conv_id,
+                        exclude_id,
+                        max_ts_ms,
+                        trimmed_text,
+                        mine_only,
+                        limit,
+                    } => {
+                        let rows = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    store
+                                        .find_legacy_quoted_candidates(
+                                            &conv_id,
+                                            &exclude_id,
+                                            max_ts_ms,
+                                            &trimmed_text,
+                                            mine_only,
+                                            limit,
+                                        )
+                                        .unwrap_or_default()
+                                })
+                                .await
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        sink.send(Input::LegacyQuotedLookupDone { op_id, rows });
                     }
                     // U4-bootstrap
                     StoreOp::LoadPreferenceString { key, boot_gen } => {
@@ -3595,6 +3999,24 @@ async fn run_store_worker(
                                         StoreOp::SetPreferenceData { key, data } => {
                                             let _ = store.set_preference_data(&key, &data);
                                         }
+                                        StoreOp::SetPreferenceBool { key, value } => {
+                                            let _ = store.set_preference_bool(&key, value);
+                                        }
+                                        StoreOp::SaveRecentSticker { sticker } => {
+                                            let existing_bytes = store
+                                                .get_preference_data("recentStickers")
+                                                .ok()
+                                                .flatten();
+                                            let existing = parse_recent_stickers_bytes(
+                                                existing_bytes.as_deref(),
+                                            );
+                                            let updated =
+                                                update_recent_stickers_json(&existing, &sticker);
+                                            if let Ok(bytes) = serde_json::to_vec(&updated) {
+                                                let _ = store
+                                                    .set_preference_data("recentStickers", &bytes);
+                                            }
+                                        }
                                         StoreOp::DeletePreference { key } => {
                                             let _ = store.delete_preference(&key);
                                         }
@@ -3687,6 +4109,10 @@ async fn run_store_worker(
                                         | StoreOp::ProbeAndSaveMessages { .. }
                                         | StoreOp::LoadOpenLocalMessages { .. }
                                         | StoreOp::LoadOlderStoreMessages { .. }
+                                        | StoreOp::SearchMessagesPage { .. }
+                                        | StoreOp::LoadMessagesAround { .. }
+                                        | StoreOp::LookupMessage { .. }
+                                        | StoreOp::FindLegacyQuoted { .. }
                                         | StoreOp::MarkRecalledAndCheckLatest { .. }
                                         | StoreOp::DeleteMessageAndCheckLatest { .. } => {}
                                     }
@@ -3695,6 +4121,45 @@ async fn run_store_worker(
                         }
                     }
                 }
+            }
+            StoreJob::LoadRecentStickers { reply } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let rows = if let Some(store_arc) = store_opt {
+                    runtime
+                        .spawn_blocking(move || {
+                            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                            let raw = store.get_preference_data("recentStickers").ok().flatten();
+                            parse_recent_stickers_bytes(raw.as_deref())
+                        })
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let _ = reply.send(rows);
+            }
+            StoreJob::LoadStickerSuggestPref { reply } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let enabled = if let Some(store_arc) = store_opt {
+                    runtime
+                        .spawn_blocking(move || {
+                            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                            store
+                                .get_preference_bool("stickerSuggest", true)
+                                .unwrap_or(true)
+                        })
+                        .await
+                        .unwrap_or(true)
+                } else {
+                    true
+                };
+                let _ = reply.send(enabled);
             }
             StoreJob::ResolveMessageIdsLookup {
                 conv_id,
@@ -4634,6 +5099,57 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                     op_id,
                     outcome,
                     file_size,
+                });
+            }
+            // U13
+            HostJob::SendE2eeSticker {
+                send_id,
+                conv_id,
+                cate_id,
+                sticker_id,
+                client_id,
+                sink,
+                guard,
+            } => {
+                let host = Arc::clone(&host);
+                tokio::spawn(async move {
+                    let result = host
+                        .send_e2ee_sticker(conv_id, cate_id, sticker_id, client_id)
+                        .await;
+                    sink.send(Input::SendStickerDone { send_id, result });
+                    drop(guard);
+                });
+            }
+            HostJob::SendE2eeContactCard {
+                card_send_id,
+                conv_id,
+                client_id,
+                contact_uid,
+                title,
+                phone,
+                avatar,
+                qr_code_url,
+                sink,
+                guard,
+            } => {
+                let host = Arc::clone(&host);
+                tokio::spawn(async move {
+                    let result = host
+                        .send_e2ee_contact_card(
+                            conv_id,
+                            client_id,
+                            contact_uid,
+                            title,
+                            phone,
+                            avatar,
+                            qr_code_url,
+                        )
+                        .await;
+                    sink.send(Input::ContactCardSendDone {
+                        card_send_id,
+                        result,
+                    });
+                    drop(guard);
                 });
             }
             HostJob::Drain(tx) => {

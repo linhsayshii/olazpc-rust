@@ -14,6 +14,7 @@ use tokio::sync::Notify;
 
 use crate::actions::{DeleteUndoSnapshot, MessageConfirmState};
 use crate::cloud::CloudSnapshotState;
+use crate::composer::ComposerConfirm;
 use crate::conversations::{
     CachedGroup, CachedProfile, ConversationActionUI, ConversationActionsState, ConversationExtras,
     ConversationPrompt, ConversationSummary,
@@ -23,6 +24,7 @@ use crate::messages::{
     ContactsState, HistoryFreshness, PendingWindowOp, WindowDelta, coalesce_window_op,
 };
 use crate::state::{CoreState, SessionSnapshot};
+use crate::stickers::StickerSuggestSetting;
 use crate::typing::TypingStatus;
 
 /// Upper bound on queued distinct session transitions; keeps hub memory strictly `O(1)`.
@@ -57,6 +59,9 @@ pub enum DirtyKey {
     Polls,
     // U11
     Cloud,
+    // U13
+    StickerSuggest,
+    ComposerConfirm,
 }
 
 /// Set of keys dirtied by one `reduce` step.
@@ -125,6 +130,13 @@ pub struct CoreChanges {
     // U11
     /// Updated zCloud snapshot (`cloud`).
     pub cloud: Option<CloudSnapshotState>,
+    // U13
+    /// Outer `Some(...)` means the sticker suggest setting changed; inner `Option` is the setting.
+    pub sticker_suggest: Option<Option<StickerSuggestSetting>>,
+    /// Outer `Some(...)` means the active composer confirm changed.
+    pub composer_confirm: Option<Option<ComposerConfirm>>,
+    /// Updated queued composer confirms.
+    pub queued_composer_confirms: Option<Vec<ComposerConfirm>>,
 }
 
 impl fmt::Debug for CoreChanges {
@@ -182,6 +194,10 @@ struct DirtyBuffer {
     polls: Option<crate::polls::PollsState>,
     // U11
     cloud: Option<CloudSnapshotState>,
+    // U13
+    sticker_suggest: Option<Option<StickerSuggestSetting>>,
+    composer_confirm: Option<Option<ComposerConfirm>>,
+    queued_composer_confirms: Option<Vec<ComposerConfirm>>,
     closed: bool,
 }
 
@@ -207,6 +223,9 @@ impl DirtyBuffer {
             || self.cached_groups.is_some()
             || self.polls.is_some()
             || self.cloud.is_some()
+            || self.sticker_suggest.is_some()
+            || self.composer_confirm.is_some()
+            || self.queued_composer_confirms.is_some()
     }
 }
 
@@ -359,6 +378,15 @@ impl ChangeHub {
                 DirtyKey::Cloud => {
                     buf.cloud = Some(state.cloud.snapshot.clone());
                 }
+                // U13
+                DirtyKey::StickerSuggest => {
+                    buf.sticker_suggest = Some(state.stickers.suggest_setting);
+                }
+                DirtyKey::ComposerConfirm => {
+                    buf.composer_confirm = Some(state.composer.active_confirm.clone());
+                    buf.queued_composer_confirms =
+                        Some(state.composer.queued_confirms.iter().cloned().collect());
+                }
             }
             buf.dirty.insert(key);
         }
@@ -452,6 +480,10 @@ impl ChangeHub {
                             polls: None,
                             // U11
                             cloud: None,
+                            // U13
+                            sticker_suggest: None,
+                            composer_confirm: None,
+                            queued_composer_confirms: None,
                         });
                     }
                 }
@@ -524,6 +556,10 @@ impl ChangeHub {
                         polls: buf.polls.take(),
                         // U11
                         cloud: buf.cloud.take(),
+                        // U13
+                        sticker_suggest: buf.sticker_suggest.take(),
+                        composer_confirm: buf.composer_confirm.take(),
+                        queued_composer_confirms: buf.queued_composer_confirms.take(),
                     });
                 }
                 if buf.closed {

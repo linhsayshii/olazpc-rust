@@ -15,7 +15,7 @@
 //! No I/O and no wall clock live here (D9): timestamps (`now_ms`) enter as command fields and
 //! timers / network calls execute as [`Effect`]s in [`crate::runner::SessionEffectRunner`].
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fmt;
 use std::time::Duration;
 
@@ -684,6 +684,38 @@ impl DeleteUndoState {
             items: active.items,
         });
         true
+    }
+
+    /// Non-empty message IDs and client IDs currently pending deletion in `conv_id`.
+    ///
+    /// Used by search, ensure-loaded, and quoted-message lookup so messages hidden by an active
+    /// delete-for-me undo window do not reappear from SQLite before the batch commits.
+    #[must_use]
+    pub fn pending_deleted_keys(&self, conv_id: &str) -> HashSet<String> {
+        let Some(active) = &self.active else {
+            return HashSet::new();
+        };
+        let mut keys = HashSet::new();
+        for item in &active.items {
+            if item.conv_id != conv_id {
+                continue;
+            }
+            if !item.msg_id.is_empty() {
+                keys.insert(item.msg_id.clone());
+            }
+            if !item.cli_msg_id.is_empty() {
+                keys.insert(item.cli_msg_id.clone());
+            }
+            if let Some(msg) = &item.message {
+                if !msg.id.is_empty() {
+                    keys.insert(msg.id.clone());
+                }
+                if !msg.client_id.is_empty() {
+                    keys.insert(msg.client_id.clone());
+                }
+            }
+        }
+        keys
     }
 
     /// Resets per-session undo state without touching `next_undo_gen`.
