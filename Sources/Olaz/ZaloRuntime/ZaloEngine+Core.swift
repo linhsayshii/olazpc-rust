@@ -87,12 +87,19 @@ final class CoreEngineLifecycle: Sendable {
     /// Installs a freshly created `CoreEngine` and its change-stream task. Returns `false` if
     /// `shutdown()` was already called before installation completed.
     func install(core: CoreEngine, changeTask: Task<Void, Never>) -> Bool {
-        state.withLock { st in
-            guard !st.isShutDown else { return false }
+        let (installed, previousCore, previousTask): (Bool, CoreEngine?, Task<Void, Never>?) = state.withLock { st in
+            guard !st.isShutDown else { return (false, nil, nil) }
+            let oldCore = st.core
+            let oldTask = st.changeTask
             st.core = core
             st.changeTask = changeTask
-            return true
+            return (true, oldCore, oldTask)
         }
+        previousTask?.cancel()
+        if let previousCore, previousCore !== core {
+            previousCore.stop()
+        }
+        return installed
     }
 
     /// Replaces the gate in `slot`, finishing any previous gate. Returns `nil` if already shut down.
@@ -230,13 +237,18 @@ internal struct OptimisticMessageOverlay {
     var kind: Kind
     var resolvedVersion: UInt64 = .max
 
-    var suppressedVersion: UInt64 = 0
+    var suppressedReactionsVersion: UInt64 = 0
     var suppressedReactions: [ChatMessage.Reaction]?
+    var suppressedMessagesVersion: UInt64 = 0
     var suppressedRestored: [ChatMessage] = []
     var suppressedRemovedIds: Set<String> = []
+    var suppressedUndoVersion: UInt64 = 0
     var suppressedHasUndo: Bool = false
     var suppressedUndo: DeleteUndo?
-    var suppressedStar: (starred: Bool, menuStar: MessageMenu.Star?, inCachedSet: Bool)?
+    var suppressedStarMsgVersion: UInt64 = 0
+    var suppressedStarMsg: (starred: Bool, menuStar: MessageMenu.Star?)?
+    var suppressedStarSetVersion: UInt64 = 0
+    var suppressedStarInSet: Bool?
 }
 
 /// Commands queued on the MainActor while `CoreEngine` completes its one-time async creation.
@@ -999,16 +1011,30 @@ extension ZaloEngine {
                 return nil
             }
 
+            await self.webSocket.attachCore(core)
+            guard !self.coreLifecycle.isShutDown else {
+                await self.webSocket.detachCore()
+                core.stop()
+                self.pendingCoreCommands.removeAll()
+                self.failAllMirrorWaiters()
+                self.coreLifecycle.finishAllGates()
+                return nil
+            }
+
+            self.appliedMirrorVersion = 0
             let lifecycle = self.coreLifecycle
             let changeTask = Task { @MainActor [weak self, core, lifecycle] in
                 defer {
-                    lifecycle.finishAllGates()
-                    self?.failAllMirrorWaiters()
+                    if lifecycle.core === core || lifecycle.core == nil {
+                        lifecycle.finishAllGates()
+                        self?.failAllMirrorWaiters()
+                    }
                 }
                 while !Task.isCancelled {
                     do {
                         guard let batch = try await core.nextChanges() else { break }
-                        guard let self else { break }
+                        guard !Task.isCancelled else { break }
+                        guard let self, self.coreLifecycle.core === core else { break }
                         self.applyCoreChanges(batch)
                     } catch {
                         break
@@ -1016,7 +1042,6 @@ extension ZaloEngine {
                 }
             }
 
-            await self.webSocket.attachCore(core)
             guard self.coreLifecycle.install(core: core, changeTask: changeTask) else {
                 await self.webSocket.detachCore()
                 changeTask.cancel()
@@ -1316,6 +1341,9 @@ extension ZaloEngine {
     }
 
     internal func applyCoreChanges(_ batch: CoreChangesRecord) {
+        if batch.version > 0 && batch.version < appliedMirrorVersion {
+            return
+        }
         if let session = batch.session {
             let qrPayload: String?
             if case .login(let login) = session.phase {
@@ -1718,7 +1746,6 @@ extension ZaloEngine {
             return
         }
         let overlay = optimisticMessageOverlays.remove(at: idx)
-        guard overlay.suppressedVersion >= targetVersion else { return }
         isApplyingCoreMirror = true
         isSuppressingDirectMessageSync = true
         defer {
@@ -1727,7 +1754,8 @@ extension ZaloEngine {
         }
         switch overlay.kind {
         case .reaction(let msgId, let clientId, _):
-            if let authReactions = overlay.suppressedReactions,
+            if overlay.suppressedReactionsVersion >= targetVersion,
+               let authReactions = overlay.suppressedReactions,
                var list = messages[overlay.convId],
                let msgIdx = list.firstIndex(where: { $0.id == msgId || (!clientId.isEmpty && $0.clientId == clientId) }),
                list[msgIdx].reactions != authReactions {
@@ -1735,7 +1763,7 @@ extension ZaloEngine {
                 messages[overlay.convId] = list
             }
         case .delete:
-            if !overlay.suppressedRestored.isEmpty {
+            if overlay.suppressedMessagesVersion >= targetVersion, !overlay.suppressedRestored.isEmpty {
                 var list = messages[overlay.convId] ?? []
                 let existing = Set(list.map(\.id))
                 let toAdd = overlay.suppressedRestored.filter { !existing.contains($0.id) }
@@ -1745,29 +1773,38 @@ extension ZaloEngine {
                     messages[overlay.convId] = list
                 }
             }
-            if overlay.suppressedHasUndo, deleteUndo != overlay.suppressedUndo {
+            if overlay.suppressedUndoVersion >= targetVersion,
+               overlay.suppressedHasUndo,
+               deleteUndo != overlay.suppressedUndo {
                 deleteUndo = overlay.suppressedUndo
             }
         case .undoDelete:
-            if !overlay.suppressedRemovedIds.isEmpty, var list = messages[overlay.convId] {
+            if overlay.suppressedMessagesVersion >= targetVersion,
+               !overlay.suppressedRemovedIds.isEmpty,
+               var list = messages[overlay.convId] {
                 let prev = list.count
                 list.removeAll { overlay.suppressedRemovedIds.contains($0.id) }
                 if list.count != prev { messages[overlay.convId] = list }
             }
-            if overlay.suppressedHasUndo, deleteUndo != overlay.suppressedUndo {
+            if overlay.suppressedUndoVersion >= targetVersion,
+               overlay.suppressedHasUndo,
+               deleteUndo != overlay.suppressedUndo {
                 deleteUndo = overlay.suppressedUndo
             }
         case .star(let msgId, _):
-            if let authStar = overlay.suppressedStar {
-                if var list = messages[overlay.convId],
-                   let msgIdx = list.firstIndex(where: { $0.id == msgId }) {
-                    if list[msgIdx].menu.starred != authStar.starred || list[msgIdx].menu.star != authStar.menuStar {
-                        list[msgIdx].menu.starred = authStar.starred
-                        list[msgIdx].menu.star = authStar.menuStar
-                        messages[overlay.convId] = list
-                    }
+            if overlay.suppressedStarMsgVersion >= targetVersion,
+               let authStar = overlay.suppressedStarMsg,
+               var list = messages[overlay.convId],
+               let msgIdx = list.firstIndex(where: { $0.id == msgId }) {
+                if list[msgIdx].menu.starred != authStar.starred || list[msgIdx].menu.star != authStar.menuStar {
+                    list[msgIdx].menu.starred = authStar.starred
+                    list[msgIdx].menu.star = authStar.menuStar
+                    messages[overlay.convId] = list
                 }
-                if authStar.inCachedSet {
+            }
+            if overlay.suppressedStarSetVersion >= targetVersion,
+               let inCachedSet = overlay.suppressedStarInSet {
+                if inCachedSet {
                     cachedStarredIds.insert(msgId)
                 } else {
                     cachedStarredIds.remove(msgId)
@@ -1776,59 +1813,130 @@ extension ZaloEngine {
         }
     }
 
-    private func reapplyActiveOptimisticOverlays(for batch: CoreChangesRecord) {
-        var touchedConvs: Set<String> = []
-        if !batch.messagesResetAll {
-            for delta in batch.windowDeltas {
-                switch delta {
-                case .reset(let convId, _), .append(let convId, _), .patch(let convId, _, _):
-                    touchedConvs.insert(convId)
-                case .remove:
-                    break
+    private static func batchTouchesMessage(
+        _ batch: CoreChangesRecord,
+        convId: String,
+        msgId: String,
+        clientId: String
+    ) -> Bool {
+        if batch.messagesResetAll { return true }
+        for delta in batch.windowDeltas {
+            switch delta {
+            case .reset(let cid, _) where cid == convId:
+                return true
+            case .remove(let cid) where cid == convId:
+                return true
+            case .append(let cid, let records) where cid == convId:
+                if records.contains(where: { $0.id == msgId || (!clientId.isEmpty && $0.clientId == clientId) }) {
+                    return true
                 }
+            case .patch(let cid, let upserts, let removedIds) where cid == convId:
+                if upserts.contains(where: { $0.id == msgId || (!clientId.isEmpty && $0.clientId == clientId) })
+                    || removedIds.contains(msgId) {
+                    return true
+                }
+            default:
+                break
             }
         }
+        return false
+    }
+
+    private static func batchTouchesAnyMessage(
+        _ batch: CoreChangesRecord,
+        convId: String,
+        msgIds: Set<String>
+    ) -> Bool {
+        if batch.messagesResetAll { return true }
+        for delta in batch.windowDeltas {
+            switch delta {
+            case .reset(let cid, _) where cid == convId:
+                return true
+            case .remove(let cid) where cid == convId:
+                return true
+            case .append(let cid, let records) where cid == convId:
+                if records.contains(where: { msgIds.contains($0.id) }) {
+                    return true
+                }
+            case .patch(let cid, let upserts, let removedIds) where cid == convId:
+                if upserts.contains(where: { msgIds.contains($0.id) })
+                    || removedIds.contains(where: { msgIds.contains($0) }) {
+                    return true
+                }
+            default:
+                break
+            }
+        }
+        return false
+    }
+
+    private static func shouldRecordSuppressed(batchVersion: UInt64, previousVersion: UInt64) -> Bool {
+        previousVersion == 0 || batchVersion > previousVersion
+    }
+
+    private func reapplyActiveOptimisticOverlays(for batch: CoreChangesRecord) {
         for i in optimisticMessageOverlays.indices {
             let overlay = optimisticMessageOverlays[i]
             guard batch.version < overlay.resolvedVersion else { continue }
-            let convTouched = batch.messagesResetAll || touchedConvs.contains(overlay.convId)
             switch overlay.kind {
             case .reaction(let msgId, let clientId, let expectedReactions):
-                if convTouched,
+                if Self.batchTouchesMessage(batch, convId: overlay.convId, msgId: msgId, clientId: clientId),
                    var list = messages[overlay.convId],
                    let idx = list.firstIndex(where: { $0.id == msgId || (!clientId.isEmpty && $0.clientId == clientId) }) {
-                    optimisticMessageOverlays[i].suppressedVersion = max(optimisticMessageOverlays[i].suppressedVersion, batch.version)
-                    optimisticMessageOverlays[i].suppressedReactions = list[idx].reactions
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedReactionsVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedReactionsVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedReactions = list[idx].reactions
+                    }
                     if list[idx].reactions != expectedReactions {
                         list[idx].reactions = expectedReactions
                         messages[overlay.convId] = list
                     }
                 }
             case .delete(let msgIds, let expectedUndo):
-                if convTouched, var list = messages[overlay.convId] {
+                if Self.batchTouchesAnyMessage(batch, convId: overlay.convId, msgIds: msgIds),
+                   var list = messages[overlay.convId] {
                     let present = list.filter { msgIds.contains($0.id) }
-                    optimisticMessageOverlays[i].suppressedVersion = max(optimisticMessageOverlays[i].suppressedVersion, batch.version)
-                    optimisticMessageOverlays[i].suppressedRestored = present
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedMessagesVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedMessagesVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedRestored = present
+                    }
                     if !present.isEmpty {
                         list.removeAll { msgIds.contains($0.id) }
                         messages[overlay.convId] = list
                     }
                 }
                 if batch.deleteUndo != nil {
-                    optimisticMessageOverlays[i].suppressedVersion = max(optimisticMessageOverlays[i].suppressedVersion, batch.version)
-                    optimisticMessageOverlays[i].suppressedHasUndo = true
-                    optimisticMessageOverlays[i].suppressedUndo = deleteUndo
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedUndoVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedUndoVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedHasUndo = true
+                        optimisticMessageOverlays[i].suppressedUndo = deleteUndo
+                    }
                     if deleteUndo != expectedUndo {
                         deleteUndo = expectedUndo
                     }
                 }
             case .undoDelete(let restored):
-                if convTouched {
+                let restoredIds = Set(restored.map(\.id))
+                if Self.batchTouchesAnyMessage(batch, convId: overlay.convId, msgIds: restoredIds) {
                     var list = messages[overlay.convId] ?? []
                     let existingIds = Set(list.map(\.id))
                     let missing = restored.filter { !existingIds.contains($0.id) }
-                    optimisticMessageOverlays[i].suppressedVersion = max(optimisticMessageOverlays[i].suppressedVersion, batch.version)
-                    optimisticMessageOverlays[i].suppressedRemovedIds = Set(missing.map(\.id))
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedMessagesVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedMessagesVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedRemovedIds = Set(missing.map(\.id))
+                    }
                     if !missing.isEmpty {
                         list.append(contentsOf: missing)
                         list.sort { a, b in a.date == b.date ? a.id < b.id : a.date < b.date }
@@ -1836,23 +1944,32 @@ extension ZaloEngine {
                     }
                 }
                 if batch.deleteUndo != nil {
-                    optimisticMessageOverlays[i].suppressedVersion = max(optimisticMessageOverlays[i].suppressedVersion, batch.version)
-                    optimisticMessageOverlays[i].suppressedHasUndo = true
-                    optimisticMessageOverlays[i].suppressedUndo = deleteUndo
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedUndoVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedUndoVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedHasUndo = true
+                        optimisticMessageOverlays[i].suppressedUndo = deleteUndo
+                    }
                     if deleteUndo != nil {
                         deleteUndo = nil
                     }
                 }
             case .star(let msgId, let on):
-                if convTouched,
+                if Self.batchTouchesMessage(batch, convId: overlay.convId, msgId: msgId, clientId: ""),
                    var list = messages[overlay.convId],
                    let idx = list.firstIndex(where: { $0.id == msgId }) {
-                    optimisticMessageOverlays[i].suppressedVersion = max(optimisticMessageOverlays[i].suppressedVersion, batch.version)
-                    optimisticMessageOverlays[i].suppressedStar = (
-                        list[idx].menu.starred,
-                        list[idx].menu.star,
-                        cachedStarredIds.contains(msgId)
-                    )
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedStarMsgVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedStarMsgVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedStarMsg = (
+                            list[idx].menu.starred,
+                            list[idx].menu.star
+                        )
+                    }
                     let targetMenuStar: MessageMenu.Star = on ? .unstar : .star
                     if list[idx].menu.starred != on || list[idx].menu.star != targetMenuStar {
                         list[idx].menu.starred = on
@@ -1861,14 +1978,12 @@ extension ZaloEngine {
                     }
                 }
                 if batch.starredIds != nil {
-                    optimisticMessageOverlays[i].suppressedVersion = max(optimisticMessageOverlays[i].suppressedVersion, batch.version)
-                    if optimisticMessageOverlays[i].suppressedStar == nil {
-                        let cur = messages[overlay.convId]?.first(where: { $0.id == msgId })
-                        optimisticMessageOverlays[i].suppressedStar = (
-                            cur?.menu.starred ?? on,
-                            cur?.menu.star,
-                            cachedStarredIds.contains(msgId)
-                        )
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedStarSetVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedStarSetVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedStarInSet = cachedStarredIds.contains(msgId)
                     }
                     if on {
                         cachedStarredIds.insert(msgId)
