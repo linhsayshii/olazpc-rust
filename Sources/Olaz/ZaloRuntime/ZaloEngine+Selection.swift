@@ -49,7 +49,7 @@ extension ZaloEngine {
             selection.anchor = id
         } else {
             guard selection.ids.count < MessageSelection.limit else {
-                CardActionCenter.shared.show("Bạn chỉ có thể chọn tối đa \(MessageSelection.limit) tin nhắn", in: selection.conversationId)
+                showActionCard("Bạn chỉ có thể chọn tối đa \(MessageSelection.limit) tin nhắn", in: selection.conversationId)
                 return
             }
             selection.ids.append(id)
@@ -67,8 +67,9 @@ extension ZaloEngine {
 
     /// "Thu hồi" is offered only when every selected message is the user's own, recallable and under 24 hours old.
     func selectionCanRecall(_ list: [ChatMessage]) -> Bool {
-        !list.isEmpty && list.allSatisfy {
-            $0.isMine && $0.menu.recall && $0.kind != .recalled && Date().timeIntervalSince($0.date) < 86_400
+        let now = Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
+        return !list.isEmpty && list.allSatisfy {
+            $0.isMine && $0.menu.recall && $0.kind != .recalled && now.timeIntervalSince($0.date) < 86_400
         }
     }
 
@@ -80,7 +81,7 @@ extension ZaloEngine {
         let list = selectedMessages()
         guard let first = list.first else { return }
         guard selectionCanForward(list) else {
-            CardActionCenter.shared.show("Có tin nhắn không thể chia sẻ", in: first.conversationId)
+            showActionCard("Có tin nhắn không thể chia sẻ", in: first.conversationId)
             return
         }
         forwardRequest = ForwardRequest(conversationId: first.conversationId, message: first, more: Array(list.dropFirst()))
@@ -114,8 +115,9 @@ extension ZaloEngine {
 
     func recallMessages(_ list: [ChatMessage]) {
         endSelection()
-        Task {
-            for message in list { await performRecall(message) }
+        trackMessageActionTask { [weak self] in
+            guard let self else { return }
+            for message in list { await self.performRecall(message) }
         }
     }
 }

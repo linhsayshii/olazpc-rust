@@ -178,6 +178,12 @@ final class ZaloEngine {
     @ObservationIgnored internal var cachedQRPNG: Data?
     @ObservationIgnored internal var hostTrace: ((String, [String: Any]) -> Bool)?
     @ObservationIgnored internal var sendE2EETextHostHandler: (([String: Any]) async throws -> SendMessageResult)?
+    @ObservationIgnored internal var resolveMediaHostHandler: (([String: Any]) async -> MediaResolution)?
+    @ObservationIgnored internal var resolveFileHostHandler: (([String: Any]) async -> FileResolution)?
+    @ObservationIgnored internal var fetchMediaDataHostHandler: (([String: Any]) async -> Data?)?
+    @ObservationIgnored internal var sendMediaHostHandler: (([String: Any]) async -> ComposerOutcome)?
+    @ObservationIgnored internal var sendFilesHostHandler: (([String: Any]) async -> ComposerOutcome)?
+    @ObservationIgnored internal var forwardTempPhotoURL: (() -> URL)?
     @ObservationIgnored internal var traceU4HostEnabled: Bool = false
     @ObservationIgnored internal var stateTrace: (() -> Void)?
     @ObservationIgnored private let transportSettleTraceActive = OSAllocatedUnfairLock<Bool>(initialState: false)
@@ -203,6 +209,12 @@ final class ZaloEngine {
     @ObservationIgnored internal var persistConversationsTask: Task<Void, Never>?
     @ObservationIgnored internal var notifyTypingTask: Task<Void, Never>?
     @ObservationIgnored internal var markReadTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored internal var deleteUndoTimerTask: Task<Void, Never>?
+    @ObservationIgnored internal var messageActionTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored internal var contactsTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored internal var pollRefreshTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored internal var cloudRefreshTask: Task<Void, Never>?
+    @ObservationIgnored internal var pollDebounceSleep: (@MainActor (Int) async -> Bool)?
     @ObservationIgnored internal var activeSendTask: Task<Bool, Never>?
     @ObservationIgnored internal var batchImportTask: Task<Void, Never>?
     @ObservationIgnored internal var activeSyncBatchTasks: [UUID: Task<Void, Never>] = [:]
@@ -1259,7 +1271,7 @@ final class ZaloEngine {
         if !changedRows.isEmpty {
             coreLifecycle.core?.refreshReactionNames(convId: targetConvId)
             if let store = sqliteStore {
-                Task {
+                trackMessageActionTask {
                     try? await store.saveMessages(changedRows, preserveExistingReactions: false)
                 }
             }
@@ -1472,7 +1484,7 @@ final class ZaloEngine {
             }
         }
 
-        let now = Date()
+        let now = Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
         pendingLocalReactions.removeAll { now.timeIntervalSince($0.createdAt) > 20 }
         if isMe, let matchIdx = pendingLocalReactions.firstIndex(where: { pending in
             guard pending.convId == trimmedConv || pending.convId == sanitizedConv else { return false }
