@@ -738,6 +738,11 @@ public protocol CoreApiProtocol: AnyObject, Sendable {
     func recallMessage(convId: String, msgId: String, cliMsgId: String, isE2ee: Bool) async throws 
     
     /**
+     * Sends a contact card (Swift `sendContactCardAPI`).
+     */
+    func sendContactCard(convId: String, cardUid: String, phone: String?) async throws  -> SendResultRecord
+    
+    /**
      * Sends a pre-built E2EE envelope. `list_params_json` holds one JSON object per entry
      * (`olaz_api::build_e2ee_list_param_entry` shape, built by the Signal layer in Swift).
      */
@@ -1086,6 +1091,25 @@ open func recallMessage(convId: String, msgId: String, cliMsgId: String, isE2ee:
 }
     
     /**
+     * Sends a contact card (Swift `sendContactCardAPI`).
+     */
+open func sendContactCard(convId: String, cardUid: String, phone: String?)async throws  -> SendResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreapi_send_contact_card(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(cardUid),FfiConverterOptionString.lower(phone)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeSendResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
      * Sends a pre-built E2EE envelope. `list_params_json` holds one JSON object per entry
      * (`olaz_api::build_e2ee_list_param_entry` shape, built by the Signal layer in Swift).
      */
@@ -1308,6 +1332,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func checkHiddenPin(pin: String) async throws  -> Bool
     
+    /**
+     * Dismisses the active forward picker request (e.g. sheet closed by user).
+     */
+    func clearForwardRequest() 
+    
     func closeConversation() 
     
     /**
@@ -1377,6 +1406,22 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func firePollDebounce(pollId: String, seq: UInt64, nowMs: Int64) 
     
     func flushAll() async throws  -> UInt64
+    
+    /**
+     * Forwards one message to `targets`, returning the outcome and settled mirror revision.
+     */
+    func forward(message: ChatMessageRecord, targets: [String], nowMs: Int64) async throws  -> ForwardOpResultRecord
+    
+    /**
+     * Forwards all messages in the active `forward_request` to `targets`, returning the outcome
+     * and settled mirror revision (after `show_card`, request clear, and `clear_selection`).
+     */
+    func forwardAll(targets: [String], nowMs: Int64) async throws  -> ForwardOpResultRecord
+    
+    /**
+     * Opens the forward picker for Swift's current multi-message selection (oldest first).
+     */
+    func forwardSelection(messages: [ChatMessageRecord]) 
     
     /**
      * Applies a `convActions` JSON state payload.
@@ -1611,6 +1656,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Opens the delete confirmation prompt for `id`.
      */
     func requestDeleteConversation(id: String) 
+    
+    /**
+     * Opens the forward picker for a single message (or emits a blocked `show_card`).
+     */
+    func requestForward(message: ChatMessageRecord) 
     
     /**
      * Computes the current [`PinBoardRecord`] for replacing pins.
@@ -2150,6 +2200,17 @@ open func checkHiddenPin(pin: String)async throws  -> Bool  {
         )
 }
     
+    /**
+     * Dismisses the active forward picker request (e.g. sheet closed by user).
+     */
+open func clearForwardRequest()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_clear_forward_request(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
 open func closeConversation()  {try! rustCall() {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_method_coreengine_close_conversation(
@@ -2358,6 +2419,57 @@ open func flushAll()async throws  -> UInt64  {
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
+}
+    
+    /**
+     * Forwards one message to `targets`, returning the outcome and settled mirror revision.
+     */
+open func forward(message: ChatMessageRecord, targets: [String], nowMs: Int64)async throws  -> ForwardOpResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_forward(
+                        self.uniffiCloneHandle(),FfiConverterTypeChatMessageRecord_lower(message),FfiConverterSequenceString.lower(targets),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeForwardOpResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Forwards all messages in the active `forward_request` to `targets`, returning the outcome
+     * and settled mirror revision (after `show_card`, request clear, and `clear_selection`).
+     */
+open func forwardAll(targets: [String], nowMs: Int64)async throws  -> ForwardOpResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_forward_all(
+                        self.uniffiCloneHandle(),FfiConverterSequenceString.lower(targets),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeForwardOpResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Opens the forward picker for Swift's current multi-message selection (oldest first).
+     */
+open func forwardSelection(messages: [ChatMessageRecord])  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_forward_selection(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceTypeChatMessageRecord.lower(messages),uniffiCallStatus
+    )
+}
 }
     
     /**
@@ -3150,6 +3262,18 @@ open func requestDeleteConversation(id: String)  {try! rustCall() {
     uniffi_olaz_ffi_fn_method_coreengine_request_delete_conversation(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(id),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Opens the forward picker for a single message (or emits a blocked `show_card`).
+     */
+open func requestForward(message: ChatMessageRecord)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_request_forward(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeChatMessageRecord_lower(message),uniffiCallStatus
     )
 }
 }
@@ -4167,7 +4291,17 @@ public protocol CoreHost: AnyObject, Sendable {
     
     func sendE2eeText(convId: String, text: String, clientId: String, quote: E2eeQuoteArgRecord?) async  -> E2eeSendOutcomeRecord
     
-    func showCard(convId: String, text: String) async 
+    func showCard(convId: String?, text: String) async 
+    
+    func resolveMedia(convId: String, msgId: String, kind: String) async  -> MediaResolutionRecord
+    
+    func resolveFile(convId: String, msgId: String, name: String, url: String?) async  -> FileResolutionRecord
+    
+    func fetchMediaData(url: String) async  -> String?
+    
+    func sendMedia(convId: String, paths: [String], cleanupAfter: Bool) async  -> ComposerSendOutcomeRecord
+    
+    func sendFiles(convId: String, paths: [String]) async  -> ComposerSendOutcomeRecord
     
     func ensureMessageLoaded(convId: String, message: ChatMessageRecord) async  -> Bool
     
@@ -4990,18 +5124,103 @@ open func sendE2eeText(convId: String, text: String, clientId: String, quote: E2
         )
 }
     
-open func showCard(convId: String, text: String)async   {
+open func showCard(convId: String?, text: String)async   {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_olaz_ffi_fn_method_corehost_show_card(
-                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(text)
+                        self.uniffiCloneHandle(),FfiConverterOptionString.lower(convId),FfiConverterString.lower(text)
                 )
             },
             pollFunc: ffi_olaz_ffi_rust_future_poll_void,
             completeFunc: ffi_olaz_ffi_rust_future_complete_void,
             freeFunc: ffi_olaz_ffi_rust_future_free_void,
             liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+open func resolveMedia(convId: String, msgId: String, kind: String)async  -> MediaResolutionRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_resolve_media(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(msgId),FfiConverterString.lower(kind)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeMediaResolutionRecord_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func resolveFile(convId: String, msgId: String, name: String, url: String?)async  -> FileResolutionRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_resolve_file(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(msgId),FfiConverterString.lower(name),FfiConverterOptionString.lower(url)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeFileResolutionRecord_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func fetchMediaData(url: String)async  -> String?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_fetch_media_data(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(url)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionString.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func sendMedia(convId: String, paths: [String], cleanupAfter: Bool)async  -> ComposerSendOutcomeRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_send_media(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterSequenceString.lower(paths),FfiConverterBool.lower(cleanupAfter)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeComposerSendOutcomeRecord_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func sendFiles(convId: String, paths: [String])async  -> ComposerSendOutcomeRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_send_files(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterSequenceString.lower(paths)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeComposerSendOutcomeRecord_lift,
             errorHandler: nil
             
         )
@@ -6956,7 +7175,7 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
                 return await uniffiObj.showCard(
-                     convId: try FfiConverterString.lift(convId),
+                     convId: try FfiConverterOptionString.lift(convId),
                      text: try FfiConverterString.lift(text)
                 )
             }
@@ -6973,6 +7192,232 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                 uniffiFutureCallback(
                     uniffiCallbackData,
                     UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        resolveMedia: { (
+            uniffiHandle: UInt64,
+            convId: RustBuffer,
+            msgId: RustBuffer,
+            kind: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> MediaResolutionRecord in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.resolveMedia(
+                     convId: try FfiConverterString.lift(convId),
+                     msgId: try FfiConverterString.lift(msgId),
+                     kind: try FfiConverterString.lift(kind)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: MediaResolutionRecord) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterTypeMediaResolutionRecord_lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        resolveFile: { (
+            uniffiHandle: UInt64,
+            convId: RustBuffer,
+            msgId: RustBuffer,
+            name: RustBuffer,
+            url: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> FileResolutionRecord in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.resolveFile(
+                     convId: try FfiConverterString.lift(convId),
+                     msgId: try FfiConverterString.lift(msgId),
+                     name: try FfiConverterString.lift(name),
+                     url: try FfiConverterOptionString.lift(url)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: FileResolutionRecord) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterTypeFileResolutionRecord_lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        fetchMediaData: { (
+            uniffiHandle: UInt64,
+            url: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> String? in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.fetchMediaData(
+                     url: try FfiConverterString.lift(url)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: String?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterOptionString.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        sendMedia: { (
+            uniffiHandle: UInt64,
+            convId: RustBuffer,
+            paths: RustBuffer,
+            cleanupAfter: Int8,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> ComposerSendOutcomeRecord in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.sendMedia(
+                     convId: try FfiConverterString.lift(convId),
+                     paths: try FfiConverterSequenceString.lift(paths),
+                     cleanupAfter: try FfiConverterBool.lift(cleanupAfter)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ComposerSendOutcomeRecord) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterTypeComposerSendOutcomeRecord_lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        sendFiles: { (
+            uniffiHandle: UInt64,
+            convId: RustBuffer,
+            paths: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> ComposerSendOutcomeRecord in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.sendFiles(
+                     convId: try FfiConverterString.lift(convId),
+                     paths: try FfiConverterSequenceString.lift(paths)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ComposerSendOutcomeRecord) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterTypeComposerSendOutcomeRecord_lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
                         callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
                     )
                 )
@@ -13256,6 +13701,8 @@ public struct CoreChangesRecord: Equatable, Hashable {
     public var messageMeta: MessageMetaRecord?
     public var contacts: ContactsStateRecord?
     public var typing: [TypingEntryRecord]?
+    public var forwardRequest: ForwardRequestUpdateRecord?
+    public var clearSelection: Bool
     public var deleteUndo: DeleteUndoUpdateRecord?
     public var messageConfirm: MessageConfirmUpdateRecord?
     public var autoDelete: AutoDeleteUpdateRecord?
@@ -13266,7 +13713,7 @@ public struct CoreChangesRecord: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, typing: [TypingEntryRecord]?, deleteUndo: DeleteUndoUpdateRecord?, messageConfirm: MessageConfirmUpdateRecord?, autoDelete: AutoDeleteUpdateRecord?, starredIds: [String]?, cachedProfiles: [CachedProfileEntry]?, pins: PinsSnapshotRecord? = nil, polls: PollsMirrorRecord? = nil) {
+    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, typing: [TypingEntryRecord]?, forwardRequest: ForwardRequestUpdateRecord?, clearSelection: Bool, deleteUndo: DeleteUndoUpdateRecord?, messageConfirm: MessageConfirmUpdateRecord?, autoDelete: AutoDeleteUpdateRecord?, starredIds: [String]?, cachedProfiles: [CachedProfileEntry]?, pins: PinsSnapshotRecord? = nil, polls: PollsMirrorRecord? = nil) {
         self.version = version
         self.session = session
         self.conversations = conversations
@@ -13279,6 +13726,8 @@ public struct CoreChangesRecord: Equatable, Hashable {
         self.messageMeta = messageMeta
         self.contacts = contacts
         self.typing = typing
+        self.forwardRequest = forwardRequest
+        self.clearSelection = clearSelection
         self.deleteUndo = deleteUndo
         self.messageConfirm = messageConfirm
         self.autoDelete = autoDelete
@@ -13316,6 +13765,8 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
                 messageMeta: FfiConverterOptionTypeMessageMetaRecord.read(from: &buf), 
                 contacts: FfiConverterOptionTypeContactsStateRecord.read(from: &buf), 
                 typing: FfiConverterOptionSequenceTypeTypingEntryRecord.read(from: &buf), 
+                forwardRequest: FfiConverterOptionTypeForwardRequestUpdateRecord.read(from: &buf), 
+                clearSelection: FfiConverterBool.read(from: &buf), 
                 deleteUndo: FfiConverterOptionTypeDeleteUndoUpdateRecord.read(from: &buf), 
                 messageConfirm: FfiConverterOptionTypeMessageConfirmUpdateRecord.read(from: &buf), 
                 autoDelete: FfiConverterOptionTypeAutoDeleteUpdateRecord.read(from: &buf), 
@@ -13339,6 +13790,8 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
         FfiConverterOptionTypeMessageMetaRecord.write(value.messageMeta, into: &buf)
         FfiConverterOptionTypeContactsStateRecord.write(value.contacts, into: &buf)
         FfiConverterOptionSequenceTypeTypingEntryRecord.write(value.typing, into: &buf)
+        FfiConverterOptionTypeForwardRequestUpdateRecord.write(value.forwardRequest, into: &buf)
+        FfiConverterBool.write(value.clearSelection, into: &buf)
         FfiConverterOptionTypeDeleteUndoUpdateRecord.write(value.deleteUndo, into: &buf)
         FfiConverterOptionTypeMessageConfirmUpdateRecord.write(value.messageConfirm, into: &buf)
         FfiConverterOptionTypeAutoDeleteUpdateRecord.write(value.autoDelete, into: &buf)
@@ -13750,6 +14203,181 @@ public func FfiConverterTypeFlagEntry_lift(_ buf: RustBuffer) throws -> FlagEntr
 #endif
 public func FfiConverterTypeFlagEntry_lower(_ value: FlagEntry) -> RustBuffer {
     return FfiConverterTypeFlagEntry.lower(value)
+}
+
+
+/**
+ * Return value of [`CoreEngine::forward`] and [`CoreEngine::forward_all`] (U8).
+ */
+public struct ForwardOpResultRecord: Equatable, Hashable {
+    public var outcome: ForwardOutcomeRecord
+    public var version: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(outcome: ForwardOutcomeRecord, version: UInt64) {
+        self.outcome = outcome
+        self.version = version
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ForwardOpResultRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeForwardOpResultRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ForwardOpResultRecord {
+        return
+            try ForwardOpResultRecord(
+                outcome: FfiConverterTypeForwardOutcomeRecord.read(from: &buf), 
+                version: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ForwardOpResultRecord, into buf: inout [UInt8]) {
+        FfiConverterTypeForwardOutcomeRecord.write(value.outcome, into: &buf)
+        FfiConverterUInt64.write(value.version, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeForwardOpResultRecord_lift(_ buf: RustBuffer) throws -> ForwardOpResultRecord {
+    return try FfiConverterTypeForwardOpResultRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeForwardOpResultRecord_lower(_ value: ForwardOpResultRecord) -> RustBuffer {
+    return FfiConverterTypeForwardOpResultRecord.lower(value)
+}
+
+
+/**
+ * Active forward picker request mirrored from `olaz-core` (U8).
+ */
+public struct ForwardRequestRecord: Equatable, Hashable {
+    public var id: UInt64
+    public var conversationId: String
+    public var message: ChatMessageRecord
+    public var more: [ChatMessageRecord]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: UInt64, conversationId: String, message: ChatMessageRecord, more: [ChatMessageRecord]) {
+        self.id = id
+        self.conversationId = conversationId
+        self.message = message
+        self.more = more
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ForwardRequestRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeForwardRequestRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ForwardRequestRecord {
+        return
+            try ForwardRequestRecord(
+                id: FfiConverterUInt64.read(from: &buf), 
+                conversationId: FfiConverterString.read(from: &buf), 
+                message: FfiConverterTypeChatMessageRecord.read(from: &buf), 
+                more: FfiConverterSequenceTypeChatMessageRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ForwardRequestRecord, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.id, into: &buf)
+        FfiConverterString.write(value.conversationId, into: &buf)
+        FfiConverterTypeChatMessageRecord.write(value.message, into: &buf)
+        FfiConverterSequenceTypeChatMessageRecord.write(value.more, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeForwardRequestRecord_lift(_ buf: RustBuffer) throws -> ForwardRequestRecord {
+    return try FfiConverterTypeForwardRequestRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeForwardRequestRecord_lower(_ value: ForwardRequestRecord) -> RustBuffer {
+    return FfiConverterTypeForwardRequestRecord.lower(value)
+}
+
+
+/**
+ * Optional wrapper so UniFFI can distinguish "unchanged" from "cleared to None" (U8).
+ */
+public struct ForwardRequestUpdateRecord: Equatable, Hashable {
+    public var request: ForwardRequestRecord?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(request: ForwardRequestRecord?) {
+        self.request = request
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ForwardRequestUpdateRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeForwardRequestUpdateRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ForwardRequestUpdateRecord {
+        return
+            try ForwardRequestUpdateRecord(
+                request: FfiConverterOptionTypeForwardRequestRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ForwardRequestUpdateRecord, into buf: inout [UInt8]) {
+        FfiConverterOptionTypeForwardRequestRecord.write(value.request, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeForwardRequestUpdateRecord_lift(_ buf: RustBuffer) throws -> ForwardRequestUpdateRecord {
+    return try FfiConverterTypeForwardRequestUpdateRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeForwardRequestUpdateRecord_lower(_ value: ForwardRequestUpdateRecord) -> RustBuffer {
+    return FfiConverterTypeForwardRequestUpdateRecord.lower(value)
 }
 
 
@@ -21059,6 +21687,95 @@ public func FfiConverterTypeAvailabilityRecord_lower(_ value: AvailabilityRecord
 
 
 /**
+ * Host return value for `send_media` / `send_files` (U8).
+ */
+
+public enum ComposerSendOutcomeRecord: Equatable, Hashable {
+    
+    case done
+    case cancelled
+    case pending(text: String
+    )
+    case failed(text: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ComposerSendOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeComposerSendOutcomeRecord: FfiConverterRustBuffer {
+    typealias SwiftType = ComposerSendOutcomeRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ComposerSendOutcomeRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .done
+        
+        case 2: return .cancelled
+        
+        case 3: return .pending(text: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .failed(text: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ComposerSendOutcomeRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .done:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .cancelled:
+            writeInt(&buf, Int32(2))
+        
+        
+        case let .pending(text):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(text, into: &buf)
+            
+        
+        case let .failed(text):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(text, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeComposerSendOutcomeRecord_lift(_ buf: RustBuffer) throws -> ComposerSendOutcomeRecord {
+    return try FfiConverterTypeComposerSendOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeComposerSendOutcomeRecord_lower(_ value: ComposerSendOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypeComposerSendOutcomeRecord.lower(value)
+}
+
+
+
+/**
  * Control routing decision returned by [`classify_control_envelope`] (pure FFI helper for
  * direct Swift unit tests of `ZaloEngine.processControlEnvelope`).
  */
@@ -22012,6 +22729,173 @@ public func FfiConverterTypeFailReasonRecord_lower(_ value: FailReasonRecord) ->
 
 
 
+/**
+ * Host return value for `resolve_file` (U8).
+ */
+
+public enum FileResolutionRecord: Equatable, Hashable {
+    
+    case ready(path: String
+    )
+    case expired
+    case failed(message: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FileResolutionRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFileResolutionRecord: FfiConverterRustBuffer {
+    typealias SwiftType = FileResolutionRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FileResolutionRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .ready(path: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .expired
+        
+        case 3: return .failed(message: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FileResolutionRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .ready(path):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(path, into: &buf)
+            
+        
+        case .expired:
+            writeInt(&buf, Int32(2))
+        
+        
+        case let .failed(message):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(message, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFileResolutionRecord_lift(_ buf: RustBuffer) throws -> FileResolutionRecord {
+    return try FfiConverterTypeFileResolutionRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFileResolutionRecord_lower(_ value: FileResolutionRecord) -> RustBuffer {
+    return FfiConverterTypeFileResolutionRecord.lower(value)
+}
+
+
+
+/**
+ * Outcome of `forward` / `forward_all` (U8).
+ */
+
+public enum ForwardOutcomeRecord: Equatable, Hashable {
+    
+    case done(text: String?
+    )
+    case pending(text: String
+    )
+    case failed(text: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ForwardOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeForwardOutcomeRecord: FfiConverterRustBuffer {
+    typealias SwiftType = ForwardOutcomeRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ForwardOutcomeRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .done(text: try FfiConverterOptionString.read(from: &buf)
+        )
+        
+        case 2: return .pending(text: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .failed(text: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ForwardOutcomeRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .done(text):
+            writeInt(&buf, Int32(1))
+            FfiConverterOptionString.write(text, into: &buf)
+            
+        
+        case let .pending(text):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(text, into: &buf)
+            
+        
+        case let .failed(text):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(text, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeForwardOutcomeRecord_lift(_ buf: RustBuffer) throws -> ForwardOutcomeRecord {
+    return try FfiConverterTypeForwardOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeForwardOutcomeRecord_lower(_ value: ForwardOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypeForwardOutcomeRecord.lower(value)
+}
+
+
+
 
 public enum HistoryFreshnessRecord: Equatable, Hashable {
     
@@ -22932,6 +23816,92 @@ public func FfiConverterTypeMediaNetKind_lift(_ buf: RustBuffer) throws -> Media
 #endif
 public func FfiConverterTypeMediaNetKind_lower(_ value: MediaNetKind) -> RustBuffer {
     return FfiConverterTypeMediaNetKind.lower(value)
+}
+
+
+
+/**
+ * Host return value for `resolve_media` (U8).
+ */
+
+public enum MediaResolutionRecord: Equatable, Hashable {
+    
+    case file(path: String
+    )
+    case expired
+    case unsupported
+    case unavailable
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MediaResolutionRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMediaResolutionRecord: FfiConverterRustBuffer {
+    typealias SwiftType = MediaResolutionRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MediaResolutionRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .file(path: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .expired
+        
+        case 3: return .unsupported
+        
+        case 4: return .unavailable
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MediaResolutionRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .file(path):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(path, into: &buf)
+            
+        
+        case .expired:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .unsupported:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .unavailable:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMediaResolutionRecord_lift(_ buf: RustBuffer) throws -> MediaResolutionRecord {
+    return try FfiConverterTypeMediaResolutionRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMediaResolutionRecord_lower(_ value: MediaResolutionRecord) -> RustBuffer {
+    return FfiConverterTypeMediaResolutionRecord.lower(value)
 }
 
 
@@ -24572,6 +25542,54 @@ fileprivate struct FfiConverterOptionTypeE2eeQuoteArgRecord: FfiConverterRustBuf
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeE2eeQuoteArgRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeForwardRequestRecord: FfiConverterRustBuffer {
+    typealias SwiftType = ForwardRequestRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeForwardRequestRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeForwardRequestRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeForwardRequestUpdateRecord: FfiConverterRustBuffer {
+    typealias SwiftType = ForwardRequestUpdateRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeForwardRequestUpdateRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeForwardRequestUpdateRecord.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -27784,6 +28802,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreapi_recall_message() != 45753) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreapi_send_contact_card() != 37004) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreapi_send_e2ee_message() != 8180) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -27844,6 +28865,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_check_hidden_pin() != 2625) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_clear_forward_request() != 21403) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_close_conversation() != 59647) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -27890,6 +28914,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_flush_all() != 42808) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_forward() != 47586) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_forward_all() != 8376) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_forward_selection() != 22307) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_handle_conversation_actions() != 55696) {
@@ -28052,6 +29085,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_request_delete_conversation() != 46253) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_request_forward() != 50455) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_request_pin_board() != 46027) {
@@ -28369,16 +29405,31 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_corehost_send_e2ee_text() != 23388) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_show_card() != 63222) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_show_card() != 43335) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_ensure_message_loaded() != 5258) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_resolve_media() != 17645) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_arm_poll_debounce() != 40171) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_resolve_file() != 18428) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_cancel_all_poll_debounces() != 50708) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_fetch_media_data() != 41317) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_send_media() != 11786) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_send_files() != 24736) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_ensure_message_loaded() != 61509) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_arm_poll_debounce() != 17050) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_cancel_all_poll_debounces() != 16845) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreofflineconversations_apply_preview_override() != 60866) {

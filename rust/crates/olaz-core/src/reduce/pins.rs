@@ -227,7 +227,7 @@ fn handle_pin_message(
         }
         PinLimitDecision::ChooseMany { need } => {
             out.effects.push(Effect::Host(HostCall::ShowCard {
-                conv_id: conv_id.to_owned(),
+                conv_id: Some(conv_id.to_owned()),
                 text: format!(
                     "Đã đạt giới hạn {limit} ghim. Vui lòng chọn ít nhất {need} ghim cần bỏ để cập nhật ghim mới."
                 ),
@@ -644,7 +644,7 @@ fn finish_refresh_followup(
             if let Some(in_flight) = state.pins.in_flight_pins.remove(&pin_op_id) {
                 state.pins.busy.remove(&in_flight.busy_key);
                 out.effects.push(Effect::Host(HostCall::ShowCard {
-                    conv_id: in_flight.conv_id,
+                    conv_id: Some(in_flight.conv_id),
                     text: PIN_FAILED_CARD_TEXT.to_owned(),
                 }));
                 complete_unit(in_flight.op_id, out);
@@ -660,7 +660,7 @@ fn finish_refresh_followup(
             if let Some(in_flight) = state.pins.in_flight_unpins.remove(&unpin_op_id) {
                 state.pins.busy.remove(&in_flight.busy_key);
                 out.effects.push(Effect::Host(HostCall::ShowCard {
-                    conv_id: in_flight.conv_id,
+                    conv_id: Some(in_flight.conv_id),
                     text: UNPIN_FAILED_CARD_TEXT.to_owned(),
                 }));
                 complete_unit(in_flight.op_id, out);

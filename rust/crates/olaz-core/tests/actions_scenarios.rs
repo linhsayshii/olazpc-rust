@@ -247,7 +247,8 @@ impl Host for ActionsScenarioHost {
     ) -> bool {
         true
     }
-    async fn show_card(&self, conv_id: String, text: String) {
+    async fn show_card(&self, conv_id: Option<String>, text: String) {
+        let conv_id = conv_id.unwrap_or_default();
         self.cards
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

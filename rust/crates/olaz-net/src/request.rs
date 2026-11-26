@@ -184,10 +184,11 @@ pub fn multipart_body(boundary: &str, part: &MultipartPart) -> Vec<u8> {
     body
 }
 
-/// `----OlazBoundary<32 uppercase hex>` (Swift: UUID without dashes).
+/// Chromium's multipart boundary shape, as the official Zalo PC (Chromium 108) sends it:
+/// `----WebKitFormBoundary<16 chars of [0-9A-Za-z]>`.
 pub fn new_multipart_boundary() -> String {
     format!(
-        "----OlazBoundary{}",
-        olaz_crypto::random_hex(32).to_uppercase()
+        "----WebKitFormBoundary{}",
+        olaz_crypto::random_alphanumeric(16)
     )
 }

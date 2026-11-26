@@ -478,6 +478,12 @@ actor ZaloE2EEManager {
         }
     }
 
+    nonisolated func e2eeThreadIdsSync() -> [String] {
+        threadCache.withLock { cache in
+            cache.e2eeThreads.filter { $0 != cache.loadedUid }
+        }
+    }
+
     nonisolated func isE2EEConversationSync(_ convId: String) -> Bool {
         let clean = ZaloWireParser.stripUserPrefix(convId)
         guard !clean.isEmpty, !ZaloWireParser.isGroupId(clean) else { return false }

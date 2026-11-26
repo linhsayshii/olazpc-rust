@@ -327,7 +327,7 @@ mod tests {
         assert!(text.contains("\"ok\""));
         let req = &c.transport().requests()[0];
         let ct = req.header("Content-Type").unwrap();
-        assert!(ct.starts_with("multipart/form-data; boundary=----OlazBoundary"));
+        assert!(ct.starts_with("multipart/form-data; boundary=----WebKitFormBoundary"));
         let body = req.body.clone().unwrap();
         assert!(body.windows(5).any(|w| w == b"23456"));
         assert!(req.url.contains("&params="));

@@ -75,12 +75,19 @@ struct DeleteUndo: Identifiable, Equatable {
 
 /// "Chia sẻ": the message waiting for the conversations to forward it to.
 struct ForwardRequest: Identifiable, Equatable {
-    let id = UUID()
+    let id: UUID
     var conversationId: String
     var message: ChatMessage
     /// "Chọn nhiều tin nhắn": the other selected messages, oldest first, forwarded after `message`.
     var more: [ChatMessage] = []
     var all: [ChatMessage] { [message] + more }
+
+    init(id: UUID = UUID(), conversationId: String, message: ChatMessage, more: [ChatMessage] = []) {
+        self.id = id
+        self.conversationId = conversationId
+        self.message = message
+        self.more = more
+    }
 }
 
 /// One pin of a conversation (official group board topic / 1:1 pin topic), newest first.
@@ -251,15 +258,54 @@ extension ZaloEngine {
 
     // MARK: Chia sẻ
 
+    internal func fetchMediaData(for url: URL) async -> Data? {
+        if let fetchMediaDataHostHandler {
+            let args: [String: Any] = ["url": url.absoluteString]
+            _ = traceHost("fetch_media_data", args: args)
+            return await fetchMediaDataHostHandler(args)
+        }
+        return try? await MediaLoader.shared.data(for: url)
+    }
+
+    internal func makeForwardTempPhotoURL() -> URL {
+        if let forwardTempPhotoURL {
+            return forwardTempPhotoURL()
+        }
+        return FileManager.default.temporaryDirectory.appendingPathComponent("fwd-\(UUID().uuidString.prefix(8)).jpg")
+    }
+
+    internal func dismissForwardRequest() {
+        forwardRequest = nil
+        coreLifecycle.core?.clearForwardRequest()
+    }
+
     func requestForward(_ message: ChatMessage) {
+        if let core = coreLifecycle.core {
+            core.requestForward(message: ChatMessageRecord(message: message))
+            return
+        }
         guard message.menu.forward == .available else {
-            if message.menu.forward == .blocked { CardActionCenter.shared.show("Trò chuyện này đã bật Chặn chia sẻ", in: message.conversationId) }
+            if message.menu.forward == .blocked { showActionCard("Trò chuyện này đã bật Chặn chia sẻ", in: message.conversationId) }
             return
         }
         forwardRequest = ForwardRequest(conversationId: message.conversationId, message: message)
     }
 
     func forward(_ message: ChatMessage, to targets: [String]) async -> MessageActionOutcome {
+        if let core = coreLifecycle.core {
+            core.setE2eeThreads(threads: e2eeManager.e2eeThreadIdsSync())
+            do {
+                let res = try await core.forward(
+                    message: ChatMessageRecord(message: message),
+                    targets: targets,
+                    nowMs: nowMs()
+                )
+                await waitForMirrorVersion(res.version)
+                return MessageActionOutcome(forwardRecord: res.outcome)
+            } catch {
+                return .failed("Có lỗi khi chia sẻ tin nhắn")
+            }
+        }
         guard !targets.isEmpty else { return .failed("Chưa chọn cuộc trò chuyện.") }
         var succeeded = 0
         for target in targets {
@@ -276,7 +322,7 @@ extension ZaloEngine {
                         id: res.msgId, conversationId: target,
                         senderId: profile?.userId ?? "", senderName: profile?.displayName ?? "Bạn", senderAvatar: profile?.avatar,
                         isMine: true, kind: .contactCard(card), text: "[Danh thiếp] \(card.name)",
-                        date: Date(), status: .sent, quote: nil, reactions: [], isE2EE: false,
+                        date: Date(timeIntervalSince1970: Double(nowMs()) / 1000.0), status: .sent, quote: nil, reactions: [], isE2EE: false,
                         mentions: [], cardButtons: [], suggestsStickers: false,
                         menu: MessageMenu(json: [
                             "forward": "ok",
@@ -298,8 +344,8 @@ extension ZaloEngine {
                 if case .file(let local) = await resolveMedia(conversationId: message.conversationId, messageId: message.id, kind: .photo),
                    await sendMedia([local], to: target) == .done {
                     succeeded += 1
-                } else if let url, let data = try? await MediaLoader.shared.data(for: url) {
-                    let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("fwd-\(UUID().uuidString.prefix(8)).jpg")
+                } else if let url, let data = await fetchMediaData(for: url) {
+                    let tmp = makeForwardTempPhotoURL()
                     try? data.write(to: tmp, options: .atomic)
                     defer { try? FileManager.default.removeItem(at: tmp) }
                     if await sendMedia([tmp], to: target) == .done { succeeded += 1 }
@@ -314,6 +360,40 @@ extension ZaloEngine {
             }
         }
         return succeeded > 0 ? .done(text: "Đã chia sẻ") : .failed("Có lỗi khi chia sẻ tin nhắn")
+    }
+
+    func forwardAll(to targets: [String]) async -> MessageActionOutcome {
+        if let core = coreLifecycle.core {
+            core.setE2eeThreads(threads: e2eeManager.e2eeThreadIdsSync())
+            do {
+                let res = try await core.forwardAll(targets: targets, nowMs: nowMs())
+                await waitForMirrorVersion(res.version)
+                return MessageActionOutcome(forwardRecord: res.outcome)
+            } catch {
+                return .failed("Có lỗi khi chia sẻ tin nhắn")
+            }
+        }
+        guard let request = forwardRequest else {
+            return .failed("Có lỗi khi chia sẻ tin nhắn")
+        }
+        var outcome = MessageActionOutcome.failed("Có lỗi khi chia sẻ tin nhắn")
+        for message in request.all {
+            let one = await forward(message, to: targets)
+            if case .done = outcome { continue }
+            outcome = one
+        }
+        if case .done = outcome, !request.more.isEmpty { endSelection() }
+        switch outcome {
+        case .done(let text):
+            showActionCard(text ?? "Đã chia sẻ tin nhắn", in: request.conversationId)
+            if forwardRequest?.id == request.id { forwardRequest = nil }
+        case .pending(let text):
+            showActionCard(text, in: request.conversationId)
+            if forwardRequest?.id == request.id { forwardRequest = nil }
+        case .failed, .confirm:
+            break
+        }
+        return outcome
     }
 
     // MARK: Thu hồi

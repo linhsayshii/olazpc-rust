@@ -188,6 +188,12 @@ final class ZaloEngine {
         }
     }
     @ObservationIgnored internal var sendE2EETextHostHandler: (([String: Any]) async throws -> SendMessageResult)?
+    @ObservationIgnored internal var resolveMediaHostHandler: (([String: Any]) async -> MediaResolution)?
+    @ObservationIgnored internal var resolveFileHostHandler: (([String: Any]) async -> FileResolution)?
+    @ObservationIgnored internal var fetchMediaDataHostHandler: (([String: Any]) async -> Data?)?
+    @ObservationIgnored internal var sendMediaHostHandler: (([String: Any]) async -> ComposerOutcome)?
+    @ObservationIgnored internal var sendFilesHostHandler: (([String: Any]) async -> ComposerOutcome)?
+    @ObservationIgnored internal var forwardTempPhotoURL: (() -> URL)?
     @ObservationIgnored internal var traceU4HostEnabled: Bool = false {
         didSet {
             let active = (hostTrace != nil) && traceU4HostEnabled
@@ -1780,6 +1786,7 @@ final class ZaloEngine {
                 deletedTsMs = existing.tsMs
             }
         }
+
 
         try? await sqliteStore?.deleteMessage(convId: convId, id: targetId)
         if !cliMsgId.isEmpty, cliMsgId != targetId {

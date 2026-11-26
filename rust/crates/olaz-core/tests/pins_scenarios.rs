@@ -239,7 +239,7 @@ fn p02_pin_limit_confirm_and_choose_many_card() {
     assert!(out_many.effects.iter().any(|e| matches!(
         e,
         Effect::Host(HostCall::ShowCard { conv_id, text })
-            if conv_id == "g901" && text.contains("ít nhất 2 ghim")
+            if conv_id.as_deref() == Some("g901") && text.contains("ít nhất 2 ghim")
     )));
 }
 
