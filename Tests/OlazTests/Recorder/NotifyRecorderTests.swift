@@ -503,7 +503,65 @@ final class NotifyRecorderTests: XCTestCase {
                 ]
             ),
 
-            // 6. mute: each duration incl. forever, expired mute not active, activeMutes order with equal start times, unmute, API failure still updates local state, 1-1 vs group flag
+            // 6. join_error_codes: today's joinGroup(url) result for error codes 178, 240, 227, 166, unknown 999, plus success
+            NotifyRecorderHarness.ScenarioDef(
+                name: "join_error_codes",
+                seed: NotifyRecorderHarness.readySessionSeed(
+                    userId: "2001601",
+                    displayName: "Notify User 11",
+                    extras: [
+                        "now_ms": .int(baseTs),
+                        "next_client_id": .int(661001),
+                    ]
+                ),
+                server: [
+                    NotifyRecorderHarness.loginInfoScript(uid: "2001601", displayName: "Notify User 11"),
+                    NotifyRecorderHarness.profileMeScript(uid: "2001601", displayName: "Notify User 11"),
+                    NotifyRecorderHarness.httpScript(
+                        path: "/api/group/link/join",
+                        method: "GET",
+                        json: .object(["error_code": .int(178), "error_message": .string("pending approval")])
+                    ),
+                    NotifyRecorderHarness.httpScript(
+                        path: "/api/group/link/join",
+                        method: "GET",
+                        json: .object(["error_code": .int(240), "error_message": .string("already in group")])
+                    ),
+                    NotifyRecorderHarness.httpScript(
+                        path: "/api/group/link/join",
+                        method: "GET",
+                        json: .object(["error_code": .int(227), "error_message": .string("invalid link")])
+                    ),
+                    NotifyRecorderHarness.httpScript(
+                        path: "/api/group/link/join",
+                        method: "GET",
+                        json: .object(["error_code": .int(166), "error_message": .string("cannot join")])
+                    ),
+                    NotifyRecorderHarness.httpScript(
+                        path: "/api/group/link/join",
+                        method: "GET",
+                        json: .object(["error_code": .int(999), "error_message": .string("unknown error")])
+                    ),
+                    NotifyRecorderHarness.httpScript(
+                        path: "/api/group/link/join",
+                        method: "GET",
+                        json: .object(["error_code": .int(0), "data": .object(["groupId": .string("1662")])])
+                    ),
+                ] + emptySyncScripts(),
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["await_host": .string("start_bootstrap"), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("join_group"), "args": .object(["url": .string("https://zalo.me/g/code178")])]),
+                    .object(["cmd": .string("join_group"), "args": .object(["url": .string("https://zalo.me/g/code240")])]),
+                    .object(["cmd": .string("join_group"), "args": .object(["url": .string("https://zalo.me/g/code227")])]),
+                    .object(["cmd": .string("join_group"), "args": .object(["url": .string("https://zalo.me/g/code166")])]),
+                    .object(["cmd": .string("join_group"), "args": .object(["url": .string("https://zalo.me/g/code999")])]),
+                    .object(["cmd": .string("join_group"), "args": .object(["url": .string("https://zalo.me/g/ok1662")])]),
+                ]
+            ),
+
+            // 7. mute: each duration incl. forever, expired mute not active, activeMutes order with equal start times, unmute, API failure still updates local state, 1-1 vs group flag
             NotifyRecorderHarness.ScenarioDef(
                 name: "mute",
                 seed: NotifyRecorderHarness.readySessionSeed(
@@ -551,7 +609,7 @@ final class NotifyRecorderTests: XCTestCase {
                 ]
             ),
 
-            // 7. policy: pure NotificationPolicy edges + MuteInfo UTC text helpers
+            // 8. policy: pure NotificationPolicy edges + MuteInfo UTC text helpers
             NotifyRecorderHarness.ScenarioDef(
                 name: "policy",
                 seed: NotifyRecorderHarness.readySessionSeed(
@@ -567,7 +625,7 @@ final class NotifyRecorderTests: XCTestCase {
                 ]
             ),
 
-            // 8. reminders: pin-ref + fallback id, normalize (each repeat), watch change before timeout + timeout (virtual 15s), respond accept/reject ok & fail, responders ("Bạn" + unknown + profile fetch quirk), resetCardState wakes waiters
+            // 9. reminders: pin-ref + fallback id, normalize (each repeat), watch change before timeout + timeout (virtual 15s), respond accept/reject ok & fail, responders ("Bạn" + unknown + profile fetch quirk), resetCardState wakes waiters
             NotifyRecorderHarness.ScenarioDef(
                 name: "reminders",
                 seed: NotifyRecorderHarness.readySessionSeed(
@@ -852,7 +910,7 @@ final class NotifyRecorderTests: XCTestCase {
                 ]
             ),
 
-            // 9. settings: defaults with no store rows, turn off then on (sound follows; authorization denied & notDetermined & default authorized), sound alone, preview off, settings_payload with & without mutes
+            // 10. settings: defaults with no store rows, turn off then on (sound follows; authorization denied & notDetermined & default authorized), sound alone, preview off, settings_payload with & without mutes
             NotifyRecorderHarness.ScenarioDef(
                 name: "settings",
                 seed: NotifyRecorderHarness.readySessionSeed(
@@ -923,7 +981,7 @@ final class NotifyRecorderTests: XCTestCase {
                 ]
             ),
 
-            // 10. suggested: birthday e-card vs other message, id fallbacks, > 8 rows capped at 8, API failure gives []
+            // 11. suggested: birthday e-card vs other message, id fallbacks, > 8 rows capped at 8, API failure gives []
             NotifyRecorderHarness.ScenarioDef(
                 name: "suggested",
                 seed: NotifyRecorderHarness.readySessionSeed(
