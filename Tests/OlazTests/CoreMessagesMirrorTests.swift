@@ -58,7 +58,7 @@ import Testing
             starredIds: nil,
             cachedProfiles: nil,
             notificationSettings: nil,
-            aliases: nil
+            aliases: nil,
             cloud: nil,
             stickerSuggest: nil,
             composerConfirm: nil,

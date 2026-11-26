@@ -745,8 +745,8 @@ import Testing
             let text: String
             switch i % 5 {
             case 0: kind = .text; text = "Tin nhắn burst số \(i) từ hệ thống"
-            case 1: kind = .photo(URL(string: "https://cdn.example/img/\(i).jpg")!, thumb: nil, width: 640, height: 480); text = ""
-            case 2: kind = .sticker(id: "s\(i)", cateId: "1", preview: nil); text = ""
+            case 1: kind = .photo(url: URL(string: "https://cdn.example/img/\(i).jpg"), width: 640, height: 480); text = ""
+            case 2: kind = .sticker(url: URL(string: "https://cdn.example/sticker/\(i).png")); text = ""
             case 3: kind = .text; text = "Cuộc họp lúc 15h hôm nay nhé (#\(i))"
             default: kind = .file(name: "bao-cao-\(i).pdf", size: 120_000, url: nil); text = ""
             }
