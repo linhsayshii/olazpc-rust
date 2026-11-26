@@ -67,8 +67,9 @@ extension ZaloEngine {
 
     /// "Thu hồi" is offered only when every selected message is the user's own, recallable and under 24 hours old.
     func selectionCanRecall(_ list: [ChatMessage]) -> Bool {
-        !list.isEmpty && list.allSatisfy {
-            $0.isMine && $0.menu.recall && $0.kind != .recalled && Date().timeIntervalSince($0.date) < 86_400
+        let now = Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
+        return !list.isEmpty && list.allSatisfy {
+            $0.isMine && $0.menu.recall && $0.kind != .recalled && now.timeIntervalSince($0.date) < 86_400
         }
     }
 
@@ -89,33 +90,74 @@ extension ZaloEngine {
     func recallSelection() {
         let list = selectedMessages()
         guard let first = list.first, selectionCanRecall(list) else { return }
-        ask(MessageActionConfirm(
+        let confirm = MessageActionConfirm(
             conversationId: first.conversationId,
             action: .recallMany(list),
             title: "Thu hồi tin nhắn",
             message: "Thu hồi các tin nhắn đã chọn cho tất cả mọi người?",
             ok: "Thu hồi",
             destructive: true
-        ))
+        )
+        if let core = coreLifecycle.core {
+            if openConversationId == confirm.conversationId, messageConfirm == nil {
+                mirroredMessageConfirmCoreId = nil
+                messageConfirm = confirm
+            }
+            core.recallMany(
+                convId: first.conversationId,
+                msgIds: list.map(\.id),
+                confirm: true,
+                nowMs: nowMs()
+            )
+            return
+        }
+        ask(confirm)
     }
 
     func deleteSelection() {
         let list = selectedMessages()
         guard let first = list.first else { return }
-        ask(MessageActionConfirm(
+        let confirm = MessageActionConfirm(
             conversationId: first.conversationId,
             action: .deleteMany(list),
             title: "Xóa tin nhắn",
             message: "Xóa các tin nhắn đã chọn chỉ ở phía bạn?",
             ok: "Xóa chỉ ở phía tôi",
             destructive: true
-        ))
+        )
+        if let core = coreLifecycle.core {
+            if openConversationId == confirm.conversationId, messageConfirm == nil {
+                mirroredMessageConfirmCoreId = nil
+                messageConfirm = confirm
+            }
+            core.deleteMany(
+                convId: first.conversationId,
+                msgIds: list.map(\.id),
+                confirm: true,
+                nowMs: nowMs()
+            )
+            return
+        }
+        ask(confirm)
     }
 
     func recallMessages(_ list: [ChatMessage]) {
         endSelection()
-        Task {
-            for message in list { await performRecall(message) }
+        if let core = coreLifecycle.core {
+            guard let convId = list.first?.conversationId else { return }
+            let tsMs = nowMs()
+            let ids = list.map(\.id)
+            trackMessageActionTask { [weak self] in
+                guard let self else { return }
+                if let v = try? await core.recallManyAsync(convId: convId, msgIds: ids, nowMs: tsMs) {
+                    await self.waitForMirrorVersion(v)
+                }
+            }
+            return
+        }
+        trackMessageActionTask { [weak self] in
+            guard let self else { return }
+            for message in list { await self.performRecall(message) }
         }
     }
 }

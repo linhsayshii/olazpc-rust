@@ -8,6 +8,12 @@ extension ZaloEngine {
     }
 
     func loadAutoDelete() async {
+        if let core = coreLifecycle.core {
+            if let v = try? await core.loadAutoDelete() {
+                await waitForMirrorVersion(v)
+            }
+            return
+        }
         guard let map = try? await sessionClient.fetchAutoDeleteAPI() else {
             if autoDelete == nil { autoDelete = [:] }
             return
@@ -18,11 +24,17 @@ extension ZaloEngine {
     /// "Cài đặt tin nhắn tự xóa": sets it on the server, then the official info line ("Bạn đã đặt thời gian tự xóa…").
     func setAutoDelete(_ convId: String, ttl: Int64) async {
         guard !convId.isEmpty, autoDeleteTTL(convId) != ttl else { return }
+        if let core = coreLifecycle.core {
+            if let v = try? await core.setAutoDelete(convId: convId, ttl: ttl, nowMs: nowMs()) {
+                await waitForMirrorVersion(v)
+            }
+            return
+        }
         do {
             try await sessionClient.updateAutoDeleteAPI(convId: convId, ttl: ttl)
         } catch {
             EngineLog.shared.write("autodelete: update failed \(type(of: error))")
-            CardActionCenter.shared.show("Không thể cài đặt tin nhắn tự xóa", in: convId)
+            showActionCard("Không thể cài đặt tin nhắn tự xóa", in: convId)
             return
         }
         var map = autoDelete ?? [:]
@@ -31,7 +43,7 @@ extension ZaloEngine {
         let text = ttl > 0
             ? "Bạn đã đặt thời gian tự xóa cho tin nhắn là \(AutoDelete.label(ttl))."
             : "Bạn đã tắt tin nhắn tự xóa."
-        let ms = Int64(Date().timeIntervalSince1970 * 1000)
+        let ms = nowMs()
         let msg = ChatMessage(
             id: "ttl-\(convId)-\(ms)", conversationId: convId, senderId: "", senderName: "", senderAvatar: nil, isMine: false,
             kind: .system, text: text, date: Date(timeIntervalSince1970: Double(ms) / 1000), status: .sent,
@@ -46,16 +58,29 @@ extension ZaloEngine {
 
     /// Removes the conversation's messages whose lifetime is over (memory and store); returns the next expiry, if any.
     @discardableResult
-    func pruneExpiredMessages(in convId: String, now: Date = Date()) -> Date? {
+    func pruneExpiredMessages(in convId: String, now: Date? = nil) -> Date? {
         guard let list = messages[convId], list.contains(where: { $0.ttlMs > 0 }) else { return nil }
-        let expired = list.filter { ($0.expiresAt ?? .distantFuture) <= now }
+        let effectiveNowMs = now.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) } ?? nowMs()
+        let effectiveNow = Date(timeIntervalSince1970: Double(effectiveNowMs) / 1000.0)
+        if let core = coreLifecycle.core {
+            let expired = list.filter { ($0.expiresAt ?? .distantFuture) <= effectiveNow }
+            if !expired.isEmpty {
+                let ids = Set(expired.map(\.id))
+                isSuppressingDirectMessageSync = true
+                messages[convId] = list.filter { !ids.contains($0.id) }
+                isSuppressingDirectMessageSync = false
+            }
+            core.pruneExpiredMessages(convId: convId, nowMs: effectiveNowMs)
+            return (messages[convId] ?? []).compactMap(\.expiresAt).min()
+        }
+        let expired = list.filter { ($0.expiresAt ?? .distantFuture) <= effectiveNow }
         if !expired.isEmpty {
             let ids = Set(expired.map(\.id))
             messages[convId] = list.filter { !ids.contains($0.id) }
             coreLifecycle.core?.writeThroughRemoveMessages(convId: convId, ids: Array(ids))
-            let store = sqliteStore
-            Task {
-                for m in expired { try? await store?.deleteMessage(convId: convId, id: m.id) }
+            trackMessageActionTask { [weak self] in
+                guard let store = self?.sqliteStore else { return }
+                for m in expired { try? await store.deleteMessage(convId: convId, id: m.id) }
             }
         }
         return (messages[convId] ?? []).compactMap(\.expiresAt).min()

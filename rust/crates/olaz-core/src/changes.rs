@@ -12,9 +12,10 @@ use std::sync::{Mutex, PoisonError};
 
 use tokio::sync::Notify;
 
+use crate::actions::{DeleteUndoSnapshot, MessageConfirmState};
 use crate::conversations::{
-    ConversationActionUI, ConversationActionsState, ConversationExtras, ConversationPrompt,
-    ConversationSummary,
+    CachedProfile, ConversationActionUI, ConversationActionsState, ConversationExtras,
+    ConversationPrompt, ConversationSummary,
 };
 use crate::messages::{
     ContactsState, HistoryFreshness, PendingWindowOp, WindowDelta, coalesce_window_op,
@@ -40,6 +41,12 @@ pub enum DirtyKey {
     Contacts,
     // U5
     Typing,
+    // U6
+    DeleteUndo,
+    MessageConfirm,
+    AutoDelete,
+    StarredIds,
+    CachedProfiles,
 }
 
 /// Set of keys dirtied by one `reduce` step.
@@ -85,6 +92,17 @@ pub struct CoreChanges {
     pub contacts: Option<ContactsState>,
     // U5
     pub typing: Option<BTreeMap<String, TypingStatus>>,
+    // U6
+    /// Outer `Some(...)` means the undo bar changed; inner `Option` is the new snapshot.
+    pub delete_undo: Option<Option<DeleteUndoSnapshot>>,
+    /// Outer `Some(...)` means the message-action confirmation dialog changed.
+    pub message_confirm: Option<Option<MessageConfirmState>>,
+    /// Outer `Some(...)` means auto-delete settings changed; inner `Option` is the new map.
+    pub auto_delete: Option<Option<BTreeMap<String, i64>>>,
+    /// Updated sorted starred message ids (`cachedStarredIds`).
+    pub starred_ids: Option<BTreeSet<String>>,
+    /// Updated cached profile map (`cachedProfiles`).
+    pub cached_profiles: Option<BTreeMap<String, CachedProfile>>,
 }
 
 impl fmt::Debug for CoreChanges {
@@ -123,6 +141,12 @@ struct DirtyBuffer {
     contacts: Option<ContactsState>,
     // U5
     typing: Option<BTreeMap<String, TypingStatus>>,
+    // U6
+    delete_undo: Option<Option<DeleteUndoSnapshot>>,
+    message_confirm: Option<Option<MessageConfirmState>>,
+    auto_delete: Option<Option<BTreeMap<String, i64>>>,
+    starred_ids: Option<BTreeSet<String>>,
+    cached_profiles: Option<BTreeMap<String, CachedProfile>>,
     closed: bool,
 }
 
@@ -138,6 +162,11 @@ impl DirtyBuffer {
             || self.message_meta.is_some()
             || self.contacts.is_some()
             || self.typing.is_some()
+            || self.delete_undo.is_some()
+            || self.message_confirm.is_some()
+            || self.auto_delete.is_some()
+            || self.starred_ids.is_some()
+            || self.cached_profiles.is_some()
     }
 }
 
@@ -256,6 +285,23 @@ impl ChangeHub {
                 DirtyKey::Typing => {
                     buf.typing = Some(state.typing.active.clone());
                 }
+                // U6
+                DirtyKey::DeleteUndo => {
+                    buf.delete_undo = Some(state.actions.delete_undo.snapshot());
+                }
+                DirtyKey::MessageConfirm => {
+                    buf.message_confirm = Some(state.actions.message_confirm.clone());
+                }
+                DirtyKey::AutoDelete => {
+                    buf.auto_delete = Some(state.actions.auto_delete.clone());
+                }
+                DirtyKey::StarredIds => {
+                    buf.starred_ids = Some(state.actions.starred_ids.clone());
+                }
+                DirtyKey::CachedProfiles => {
+                    buf.cached_profiles =
+                        Some(state.conversations.identities.cached_profiles.clone());
+                }
             }
             buf.dirty.insert(key);
         }
@@ -335,6 +381,12 @@ impl ChangeHub {
                             contacts: None,
                             // U5
                             typing: None,
+                            // U6
+                            delete_undo: None,
+                            message_confirm: None,
+                            auto_delete: None,
+                            starred_ids: None,
+                            cached_profiles: None,
                         });
                     }
                 }
@@ -393,6 +445,12 @@ impl ChangeHub {
                         contacts: buf.contacts.take(),
                         // U5
                         typing: buf.typing.take(),
+                        // U6
+                        delete_undo: buf.delete_undo.take(),
+                        message_confirm: buf.message_confirm.take(),
+                        auto_delete: buf.auto_delete.take(),
+                        starred_ids: buf.starred_ids.take(),
+                        cached_profiles: buf.cached_profiles.take(),
                     });
                 }
                 if buf.closed {

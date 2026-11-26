@@ -13,6 +13,21 @@ extension ZaloEngine {
         return traceHost(name, args: args())
     }
 
+    internal func showActionCard(_ text: String, in conversationId: String) {
+        if traceHost("show_card", args: ["conv_id": conversationId, "text": text]) {
+            CardActionCenter.shared.show(text, in: conversationId)
+        }
+    }
+
+    internal func trackMessageActionTask(_ body: @escaping @MainActor () async -> Void) {
+        let key = UUID()
+        let task = Task { @MainActor [weak self] in
+            defer { self?.messageActionTasks.removeValue(forKey: key) }
+            await body()
+        }
+        messageActionTasks[key] = task
+    }
+
     internal func syncSessionClientTrace() async {
         guard hostTrace != nil else {
             await sessionClient.setSessionTrace(nil)
@@ -45,6 +60,12 @@ extension ZaloEngine {
         markReadTasks.values.forEach { $0.cancel() }
         markReadTasks.removeAll()
         activeSendTask?.cancel()
+        deleteUndoTimerTask?.cancel()
+        deleteUndoTimerTask = nil
+        messageActionTasks.values.forEach { $0.cancel() }
+        messageActionTasks.removeAll()
+        optimisticOverlayFenceTasks.values.forEach { $0.cancel() }
+        optimisticOverlayFenceTasks.removeAll()
         typingResetTasks.values.forEach { $0.cancel() }
         typingResetTasks = [:]
     }
@@ -61,9 +82,23 @@ extension ZaloEngine {
         guard let core else { return }
         guard let version = try? await core.settle() else { return }
         await waitForMirrorVersion(version)
+        while !optimisticOverlayFenceTasks.isEmpty {
+            let pending = Array(optimisticOverlayFenceTasks.values)
+            for task in pending {
+                await task.value
+            }
+        }
+        if let maxResolved = optimisticMessageOverlays
+            .map(\.resolvedVersion)
+            .filter({ $0 != UInt64.max })
+            .max(),
+           appliedMirrorVersion < maxResolved {
+            await waitForMirrorVersion(maxResolved)
+        }
     }
 
     internal func awaitMarkReadTasksForRecording() async {
+        await settleForRecording()
         while !markReadTasks.isEmpty {
             let tasks = Array(markReadTasks.values)
             markReadTasks.removeAll()
@@ -96,6 +131,25 @@ extension ZaloEngine {
         }
     }
 
+    internal func awaitMessageActionTasksForRecording() async {
+        await settleForRecording()
+        while !messageActionTasks.isEmpty {
+            let tasks = Array(messageActionTasks.values)
+            messageActionTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
+        if let core = coreLifecycle.core {
+            if phase == .ready, activeSendTask == nil {
+                if let v = try? await core.waitIdle() {
+                    await waitForMirrorVersion(v)
+                }
+            } else if let v = try? await core.settle() {
+                await waitForMirrorVersion(v)
+            }
+        }
+        _ = await persistConversationsTask?.value
+    }
+
     internal func finishTearDownForRecording() async {
         await sessionClient.setSessionTrace(nil)
         _ = await bootTask?.value
@@ -107,6 +161,11 @@ extension ZaloEngine {
         while !markReadTasks.isEmpty {
             let tasks = Array(markReadTasks.values)
             markReadTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
+        while !messageActionTasks.isEmpty {
+            let tasks = Array(messageActionTasks.values)
+            messageActionTasks.removeAll()
             for task in tasks { _ = await task.value }
         }
         _ = await persistConversationsTask?.value

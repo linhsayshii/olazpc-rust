@@ -143,6 +143,7 @@ final class ZaloEngine {
     /// "Chọn nhiều tin nhắn" in progress (one conversation at a time).
     var messageSelection: MessageSelection?
     var messageConfirm: MessageActionConfirm?
+    @ObservationIgnored internal var mirroredMessageConfirmCoreId: UInt64?
     var deleteUndo: DeleteUndo?
     var pins: [String: PinnedList] = [:]
     @ObservationIgnored internal var messageActionsBusy: Set<String> = []
@@ -176,9 +177,26 @@ final class ZaloEngine {
     @ObservationIgnored internal var mirrorVersionWaiters: [(target: UInt64, continuation: CheckedContinuation<Void, Never>)] = []
     @ObservationIgnored internal var cachedQRPayload: String?
     @ObservationIgnored internal var cachedQRPNG: Data?
-    @ObservationIgnored internal var hostTrace: ((String, [String: Any]) -> Bool)?
+    @ObservationIgnored private let u4HostTraceActive = OSAllocatedUnfairLock<Bool>(initialState: false)
+    nonisolated internal var hasU4HostTrace: Bool {
+        u4HostTraceActive.withLock { $0 }
+    }
+    @ObservationIgnored internal var hostTrace: ((String, [String: Any]) -> Bool)? {
+        didSet {
+            let active = (hostTrace != nil) && traceU4HostEnabled
+            u4HostTraceActive.withLock { $0 = active }
+        }
+    }
     @ObservationIgnored internal var sendE2EETextHostHandler: (([String: Any]) async throws -> SendMessageResult)?
-    @ObservationIgnored internal var traceU4HostEnabled: Bool = false
+    @ObservationIgnored internal var traceU4HostEnabled: Bool = false {
+        didSet {
+            let active = (hostTrace != nil) && traceU4HostEnabled
+            u4HostTraceActive.withLock { $0 = active }
+        }
+    }
+    @ObservationIgnored internal var optimisticMessageOverlays: [OptimisticMessageOverlay] = []
+    @ObservationIgnored internal var optimisticOverlayFenceTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored internal var lastOptimisticDeletedMessages: [String: [ChatMessage]] = [:]
     @ObservationIgnored internal var stateTrace: (() -> Void)?
     @ObservationIgnored private let transportSettleTraceActive = OSAllocatedUnfairLock<Bool>(initialState: false)
     nonisolated internal var hasTransportSettleTrace: Bool {
@@ -203,6 +221,8 @@ final class ZaloEngine {
     @ObservationIgnored internal var persistConversationsTask: Task<Void, Never>?
     @ObservationIgnored internal var notifyTypingTask: Task<Void, Never>?
     @ObservationIgnored internal var markReadTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored internal var deleteUndoTimerTask: Task<Void, Never>?
+    @ObservationIgnored internal var messageActionTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var activeSendTask: Task<Bool, Never>?
     @ObservationIgnored internal var batchImportTask: Task<Void, Never>?
     @ObservationIgnored internal var activeSyncBatchTasks: [UUID: Task<Void, Never>] = [:]
@@ -542,6 +562,7 @@ final class ZaloEngine {
             let capped = Array(savedSeen.suffix(1000))
             seenReactionEventOrder = capped
             seenReactionEventIds = Set(capped)
+            coreLifecycle.core?.seedSeenReactionKeys(keys: capped)
         }
         if let pollData = try? await store.getPreferenceData(key: "pollState"),
            let savedPoll = try? JSONDecoder().decode(ZaloPollState.self, from: pollData) {
@@ -681,11 +702,10 @@ final class ZaloEngine {
             incrementUnread: incrementUnread,
             notifyIncoming: notifyIncoming,
             persistConversations: persistConversations,
-            probeFreshness: probeFreshness
+            probeFreshness: probeFreshness,
+            nowMs: nowMs()
         )) ?? 0
-        if let v = try? await core.flushAll() {
-            await waitForMirrorVersion(v)
-        }
+        await waitForMirrorVersion(core.currentVersion())
         return Int(count)
     }
 
@@ -706,9 +726,7 @@ final class ZaloEngine {
             notifyIncoming: notifyIncoming,
             persistConversations: persistConversations
         )) ?? 0
-        if let v = try? await core.flushAll() {
-            await waitForMirrorVersion(v)
-        }
+        await waitForMirrorVersion(core.currentVersion())
         return Int(count)
     }
 
@@ -1184,15 +1202,16 @@ final class ZaloEngine {
 
     internal func recordSeenReactionKeys(_ keys: [String]) async {
         var insertedAny = false
+        var trimmedKeys: [String] = []
         for rawKey in keys {
             let key = rawKey.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !key.isEmpty else { continue }
+            trimmedKeys.append(key)
             if seenReactionEventIds.insert(key).inserted {
                 seenReactionEventOrder.append(key)
                 insertedAny = true
             }
         }
-        guard insertedAny else { return }
         if seenReactionEventOrder.count > 1000 {
             let overflow = seenReactionEventOrder.count - 1000
             let evicted = seenReactionEventOrder.prefix(overflow)
@@ -1201,6 +1220,13 @@ final class ZaloEngine {
                 seenReactionEventIds.remove(old)
             }
         }
+        if let core = coreLifecycle.core {
+            if !trimmedKeys.isEmpty {
+                try? await core.recordSeenReactionKeys(keys: trimmedKeys)
+            }
+            return
+        }
+        guard insertedAny else { return }
         try? await sqliteStore?.setPreferenceStrings(key: "seenReactionEventIds", value: seenReactionEventOrder)
     }
 
@@ -1398,6 +1424,29 @@ final class ZaloEngine {
         reactClientId: String = "",
         senderName: String = ""
     ) async {
+        if let core = coreLifecycle.core {
+            let ev: ParsedWireEvent = .reaction(
+                convId: convId,
+                msgId: msgId,
+                cliMsgId: cliMsgId,
+                senderId: senderId,
+                rType: rType,
+                rIcon: rIcon,
+                eventId: eventId,
+                reactClientId: reactClientId,
+                tsMs: nowMs(),
+                seqId: 0,
+                senderName: senderName
+            )
+            _ = try? await core.applyParsedEventsDirect(
+                events: ZaloWireParser.wireEvents(from: [ev]),
+                incrementUnread: false,
+                notifyIncoming: false,
+                persistConversations: true
+            )
+            await waitForMirrorVersion(core.currentVersion())
+            return
+        }
         guard traceU4Host("apply_remote_reaction", args: [
             "conv_id": convId,
             "msg_id": msgId,
@@ -1472,7 +1521,7 @@ final class ZaloEngine {
             }
         }
 
-        let now = Date()
+        let now = Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
         pendingLocalReactions.removeAll { now.timeIntervalSince($0.createdAt) > 20 }
         if isMe, let matchIdx = pendingLocalReactions.firstIndex(where: { pending in
             guard pending.convId == trimmedConv || pending.convId == sanitizedConv else { return false }
@@ -1568,6 +1617,17 @@ final class ZaloEngine {
         updateConversationPreview: Bool = true,
         persistConversations: Bool = true
     ) async -> ConvPreviewOverrideRecord? {
+        if let core = coreLifecycle.core {
+            let ev: ParsedWireEvent = .undo(convId: convId, msgId: msgId, cliMsgId: cliMsgId)
+            _ = try? await core.applyParsedEventsDirect(
+                events: ZaloWireParser.wireEvents(from: [ev]),
+                incrementUnread: false,
+                notifyIncoming: false,
+                persistConversations: updateConversationPreview && persistConversations
+            )
+            await waitForMirrorVersion(core.currentVersion())
+            return nil
+        }
         guard traceU4Host("apply_remote_recall", args: [
             "conv_id": convId,
             "msg_id": msgId,
@@ -1649,6 +1709,17 @@ final class ZaloEngine {
         updateConversationPreview: Bool = true,
         persistConversations: Bool = true
     ) async -> ConvPreviewOverrideRecord? {
+        if let core = coreLifecycle.core {
+            let ev: ParsedWireEvent = .delete(convId: convId, msgId: msgId, cliMsgId: cliMsgId)
+            _ = try? await core.applyParsedEventsDirect(
+                events: ZaloWireParser.wireEvents(from: [ev]),
+                incrementUnread: false,
+                notifyIncoming: false,
+                persistConversations: updateConversationPreview && persistConversations
+            )
+            await waitForMirrorVersion(core.currentVersion())
+            return nil
+        }
         guard traceU4Host("apply_remote_delete", args: [
             "conv_id": convId,
             "msg_id": msgId,
@@ -1700,7 +1771,6 @@ final class ZaloEngine {
                 deletedTsMs = existing.tsMs
             }
         }
-
 
         try? await sqliteStore?.deleteMessage(convId: convId, id: targetId)
         if !cliMsgId.isEmpty, cliMsgId != targetId {
