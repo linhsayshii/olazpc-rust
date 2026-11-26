@@ -65,6 +65,12 @@ The oracle is what can be observed from outside the engine: the domain state the
 - `board_raw_topics` *(optional, `polls`, `pins`)*: map of `<convId>` to `{"version": <int64>, "topics": {"<topicId>": <raw topic JSON>}}` pre-seeding `ZaloEngine.cachedBoardRawTopics` before steps run.
 - `poll_clock` *(optional, `polls`)*: `{"watched": {"<pollId>": "<convId>"}, "last_attempt_ms": {"<pollId>": <int64>}, "seen_messages": ["<msgId>", ...]}` pre-seeding `PollClock` (`watched`, `lastAttempt`, `seenMessages`) before steps run.
 - `watched_check_ids` *(optional, `polls`)*: array of poll id strings (`["<pollId>", ...]`) used when `watchPoll` exceeds 500 watched entries and drops an arbitrary key; see `## Polls domain state`.
+- `cloud_plan` *(optional, `media`)*: `{"kind": "<str>", "name": "<str>", "file_limit": <int64>}` pre-seeding `ZaloEngine.cloud.plan` before steps run.
+- `memory_messages` *(optional, `media`)*: map of `<convId>` to `[<raw message JSON>]` pre-seeded directly into `ZaloEngine.messages` (used when `saved_session` is `null` and SQLite is absent).
+- `preseeded_media_cache` *(optional, `media`)*: array of `{"key", "ext", "data_b64" | "data_utf8"}` written into `<data>/MediaCache/<stableHash(key)>.<ext>`.
+- `allowed_local_files` *(optional, `media`)*: array of `{"rel_path", "data_b64" | "data_utf8"}` written under `<data>/` and registered in the allowed local-file set for `file://` resolution.
+- `existing_download_files` *(optional, `media`)*: array of filenames created under `<downloads>/` for `file_keys` testing.
+- `downloaded_file_paths` *(optional, `media`)*: map of `<fileKey>` to `"<downloads>/..."` pre-seeded into `ZaloEngine.downloadedFilePaths`.
 
 ### server
 
@@ -232,6 +238,16 @@ Run in order:
   - `forward_selection`: `{}` — calls `forwardSelection()`.
   - `forward`: `{"conv_id": "<convId>", "msg_id": "<msgId>", "targets": ["<convId>", ...]}` — locates the loaded message in `messages[conv_id]`, awaits `forward(message, to: targets)` + Core settle, and records the `MessageActionOutcome` JSON in `results["<stepIndex>"]`.
   - `forward_all`: `{"targets": ["<convId>", ...]}` — awaits `forwardAll(to: targets)` on the open `forwardRequest` + Core settle, and records the `MessageActionOutcome` JSON in `results["<stepIndex>"]`.
+- Media `cmd` steps (`media` domain):
+  - Optional `"now_ms": <int64>` on `cmd` steps seeds `nowMs` (and `MediaResolver.now`) for the duration of that step.
+  - Inherits `start`, `open`, `await_send` (awaits an async `send_files` task).
+  - `send_media`: `{"conv_id": "<convId>", "files": [{"name", "type"?: "image"|"video"|"file", "size", "readable", "is_dir"?: <bool>, "exists"?: <bool>}]}` — calls `sendMedia(_:to:)`, settles Core, and records the `ComposerOutcome` JSON in `results["<stepIndex>"]`.
+  - `send_files`: `{"conv_id": "<convId>", "files": [...], "async"?: <bool>}` — calls `sendFiles(_:to:)`; when `"async": true`, returns immediately so `await_host upload_file` and `{"snapshot": "optimistic"}` can inspect the `.sending` row before `{"upload_release": k}` + `await_send`.
+  - `resolve_media`: `{"conv_id": "<convId>", "msg_id": "<msgId>", "kind": "photo"|"video"|"videoThumb", "force"?: <bool>}` — awaits `resolveMedia(...)` and records `MediaResolution` in `results["<stepIndex>"]`.
+  - `resolve_file`: `{"conv_id"?: "<convId>", "msg_id"?: "<msgId>", "name": "<str>", "url"?: "<str>", "force"?: <bool>}` — awaits `resolveFile(...)` and records `FileResolution` in `results["<stepIndex>"]`.
+  - `shared_media`: `{"conv_id": "<convId>", "kind": "images"|"files"|"links", "after"?: "<str>", "after_prev"?: <bool>, "limit"?: <int>, "simulate_store_error"?: <bool>}` — awaits `sharedMedia(in:kind:after:limit:)` and records `SharedMediaPage?` in `results["<stepIndex>"]`.
+  - `file_key`: `{"conv_id": "<convId>", "msg_id": "<msgId>", "url"?: "<str>", "name": "<str>"}` — evaluates `fileDownloadKey` and `rememberedDownloadedFile(for:)` and records `{"key", "path"}` in `results["<stepIndex>"]`.
+- `{"upload_release": k}` *(`media` domain)*: resumes the next `k` held `upload_file` host handlers (`"hold": true` in `seed.host_results.upload_file`).
 - `{"await": {"phase": "<kind>", "step": "<login step, optional>"}, "timeout_ms": 5000}`: wait until the state matches. The Rust runner instead runs the core until no input or effect is pending, then checks the same predicate.
 - `{"await_host": "<call>", "timeout_ms": N}`: wait until the recorded `host` list contains `"<call>"` searching from the current host cursor, then advance the host cursor past that entry (`index + 1`). Used for deterministic ordering (for example awaiting `e2ee_connected` before `ws_push`).
 - `{"ws_push": k}` (optional `"timeout_ms": N`): instruct the fake server to send the next `k` scripted `ws_frame` or `ws_close` entries in script order.
@@ -282,6 +298,17 @@ Run in order:
     - `fetch_media_data {url}` *(photo CDN download fallback; scripted by `seed.host_results.fetch_media_data`)*
     - `send_media {conv_id, paths}` *(scripted by `seed.host_results.send_media`; temp CDN fallback photo paths are normalized to `"<tmp>/fwd-<n>.jpg"`)*
     - `send_files {conv_id, paths}` *(scripted by `seed.host_results.send_files`)*
+  - Media domain names (Swift-owned U15 I/O boundaries):
+    - `read_file {path, name, mode}` *(bytes length, readability, directory/existence, and media type; `mode` is `"media"` or `"file"`)*
+    - `image_dimensions {path, name, size}` *(scripted by `seed.host_results.image_dimensions`)*
+    - `video_metadata {path, name, size}` *(scripted by `seed.host_results.video_metadata`)*
+    - `video_poster {path}` *(extracts a poster image when `videoThumb` resolves to video bytes; scripted by `seed.host_results.video_poster`)*
+    - `upload_photo {conv_id, file_name, size, width, height}` *(scripted by `seed.host_results.upload_photo`)*
+    - `upload_video {conv_id, file_name, size, duration_ms, width, height, has_thumb}` *(scripted by `seed.host_results.upload_video`)*
+    - `upload_file {conv_id, file_name, size, client_id, is_e2ee}` *(scripted by `seed.host_results.upload_file`; supports `"hold": true`)*
+    - `media_cache_lookup {key, hash_prefix, conv_id, msg_id, kind}` *(cache-first lookup when `!force`)*
+    - `check_local_file {url}` *(local `file://` allowlist + existence check)*
+    - `loader_fetch {mode, url, force}` *(media/file loader fetch per URL; scripted by `seed.host_results.loader_fetch`)*
 
 ## Session domain state
 
@@ -809,6 +836,28 @@ Cases in `forward` extend the Message actions domain state with `forward_request
 - `selection`: `null` or `{"conv_id": <str>, "ids": [<str>, ...], "anchor": <str|null>}` mirroring `ZaloEngine.messageSelection` (`ids` preserves click order while `forwardSelection()` orders `forward_request` by the conversation window).
 - `results`: map of 0-based `steps` index string (`"0"`, `"1"`, ...) for each `forward` or `forward_all` step executed so far, encoded as `{"status": "done", "text": <str|null>}` | `{"status": "failed"|"pending", "text": <str>}` | `{"status": "confirm", "title": <str>, "message": <str>, "ok": <str>, "cancel": <str>, "ref": <str|null>}`.
 - `forwardTempPhotoURL` normalization: photo CDN fallbacks stage temp bytes under `"<tmp>/fwd-<n>.jpg"` (normalized from the per-run temp directory in `expect.host`).
+
+## Media domain state
+
+Cases in `media` extend the `message_actions` domain state object with `kind_detail` and `fallback_urls` on `messages[convId][]` and `store.messages[]`, plus:
+
+```json
+{
+  "cloud_file_limit": 209715200,
+  "downloaded_file_paths": {
+    "3000901|m1": "<downloads>/exists.pdf"
+  },
+  "results": {
+    "3": { "status": "done" },
+    "4": { "state": "file", "path": "<data>/MediaCache/37cb8a6d2fa50453.png" },
+    "5": { "state": "ready", "path": "<data>/zcloud-preview/Report-Q1.png" },
+    "6": { "items": [], "cursor": null, "more": false },
+    "7": { "key": "3000901|m1", "path": "<downloads>/exists.pdf" }
+  }
+}
+```
+
+- Path normalization: temporary per-run directories are normalized to `"<input>"` (outgoing files), `"<downloads>"` (saved downloads), and `"<data>"` (per-run engine data directory including `MediaCache` and `zcloud-preview`).
 
 ## Volatile
 

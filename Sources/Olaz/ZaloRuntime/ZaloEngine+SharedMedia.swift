@@ -55,6 +55,10 @@ extension ZaloEngine: SharedMediaSource {
     /// A page of the photos / videos, files or links ever shared in `conversationId`, older than `cursor` (nil = the newest),
     /// backed by Olaz's local SQLite message index.
     func sharedMedia(in conversationId: String, kind: SharedMediaKind, after cursor: String?, limit: Int) async -> SharedMediaPage? {
+        if simulateSharedMediaStoreErrorOnce {
+            simulateSharedMediaStoreErrorOnce = false
+            return nil
+        }
         guard let store = sqliteStore else {
             // Fall back to in-memory loaded messages if store is not open.
             let mem = (messages[conversationId] ?? [])

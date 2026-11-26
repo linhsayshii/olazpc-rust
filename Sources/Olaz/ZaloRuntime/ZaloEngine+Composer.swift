@@ -135,6 +135,15 @@ struct VideoMetadata: Sendable, Equatable {
     var thumbnailData: Data
 }
 
+struct OutgoingFileProbeResult: Sendable {
+    var exists: Bool = true
+    var isDirectory: Bool = false
+    var readable: Bool = true
+    var size: Int64 = 0
+    var mediaType: String? = nil
+    var data: Data = Data()
+}
+
 extension ZaloEngine {
     // MARK: Attachments
 
@@ -226,35 +235,114 @@ extension ZaloEngine {
         guard !urls.isEmpty, !id.isEmpty else { return .cancelled }
         var sentAny = false
         for url in urls {
-            let scoped = url.startAccessingSecurityScopedResource()
+            let scoped = readOutgoingFileHostHandler == nil ? url.startAccessingSecurityScopedResource() : false
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-            guard let data = try? Data(contentsOf: url) else { continue }
-            let utType = UTType(filenameExtension: url.pathExtension)
-            let isImage = utType?.conforms(to: .image) ?? false
-            let isVideo = !isImage && Self.isVideoURL(url)
+
+            let data: Data
+            let fileSize: Int64
+            let isImage: Bool
+            let isVideo: Bool
+            if let readOutgoingFileHostHandler {
+                let readArgs: [String: Any] = [
+                    "path": url.path,
+                    "name": url.lastPathComponent,
+                    "mode": "media",
+                ]
+                _ = traceHost("read_file", args: readArgs)
+                let probe = await readOutgoingFileHostHandler(readArgs)
+                guard probe.exists, !probe.isDirectory, probe.readable else { continue }
+                if let hint = probe.mediaType {
+                    isImage = hint == "image"
+                    isVideo = hint == "video"
+                } else {
+                    let utType = UTType(filenameExtension: url.pathExtension)
+                    isImage = utType?.conforms(to: .image) ?? false
+                    isVideo = !isImage && Self.isVideoURL(url)
+                }
+                data = probe.data
+                fileSize = probe.size
+            } else {
+                guard let raw = try? Data(contentsOf: url) else { continue }
+                let utType = UTType(filenameExtension: url.pathExtension)
+                isImage = utType?.conforms(to: .image) ?? false
+                isVideo = !isImage && Self.isVideoURL(url)
+                data = raw
+                fileSize = Int64(raw.count)
+            }
+
             do {
                 if isImage {
-                    let dims = imageDimensions(data)
-                    let res = try await sessionClient.uploadAndSendPhoto(
-                        convId: id, fileName: url.lastPathComponent, data: data, width: dims.width, height: dims.height
-                    )
+                    let dims: (width: Int, height: Int)
+                    if let imageDimensionsHostHandler {
+                        let dimArgs: [String: Any] = [
+                            "path": url.path,
+                            "name": url.lastPathComponent,
+                            "size": fileSize,
+                        ]
+                        _ = traceHost("image_dimensions", args: dimArgs)
+                        dims = await imageDimensionsHostHandler(dimArgs)
+                    } else {
+                        dims = imageDimensions(data)
+                    }
+                    let res: UploadedMediaResult
+                    if let uploadPhotoHostHandler {
+                        let uploadArgs: [String: Any] = [
+                            "conv_id": id,
+                            "file_name": url.lastPathComponent,
+                            "size": fileSize,
+                            "width": dims.width,
+                            "height": dims.height,
+                        ]
+                        _ = traceHost("upload_photo", args: uploadArgs)
+                        res = try await uploadPhotoHostHandler(uploadArgs)
+                    } else {
+                        res = try await sessionClient.uploadAndSendPhoto(
+                            convId: id, fileName: url.lastPathComponent, data: data, width: dims.width, height: dims.height
+                        )
+                    }
                     await recordUploadedMessage(
                         convId: id, msgId: res.msgId, cliId: res.cliMsgId,
                         kind: .photo(url: URL(string: res.url), width: res.width, height: res.height),
                         text: ""
                     )
                 } else if isVideo {
-                    let meta = await Self.extractVideoMetadata(from: url)
-                    let res = try await sessionClient.uploadAndSendVideo(
-                        convId: id,
-                        fileName: url.lastPathComponent,
-                        data: data,
-                        thumbnailData: meta.thumbnailData,
-                        durationMs: meta.durationMs,
-                        width: meta.width,
-                        height: meta.height,
-                        webSocket: webSocket
-                    )
+                    let meta: VideoMetadata
+                    if let videoMetadataHostHandler {
+                        let metaArgs: [String: Any] = [
+                            "path": url.path,
+                            "name": url.lastPathComponent,
+                            "size": fileSize,
+                        ]
+                        _ = traceHost("video_metadata", args: metaArgs)
+                        meta = await videoMetadataHostHandler(metaArgs)
+                    } else {
+                        meta = await Self.extractVideoMetadata(from: url)
+                    }
+                    let res: UploadedVideoResult
+                    if let uploadVideoHostHandler {
+                        let uploadArgs: [String: Any] = [
+                            "conv_id": id,
+                            "file_name": url.lastPathComponent,
+                            "size": fileSize,
+                            "duration_ms": meta.durationMs,
+                            "width": meta.width,
+                            "height": meta.height,
+                            "has_thumb": !meta.thumbnailData.isEmpty,
+                        ]
+                        _ = traceHost("upload_video", args: uploadArgs)
+                        res = try await uploadVideoHostHandler(uploadArgs)
+                    } else {
+                        res = try await sessionClient.uploadAndSendVideo(
+                            convId: id,
+                            fileName: url.lastPathComponent,
+                            data: data,
+                            thumbnailData: meta.thumbnailData,
+                            durationMs: meta.durationMs,
+                            width: meta.width,
+                            height: meta.height,
+                            webSocket: webSocket
+                        )
+                    }
                     let thumbURL = res.thumbUrl.isEmpty ? nil : URL(string: res.thumbUrl)
                     let videoURL = res.url.isEmpty ? nil : URL(string: res.url)
                     let durSec = res.durationMs > 0 ? max(1, Int((Double(res.durationMs) / 1000.0).rounded())) : 0
@@ -264,12 +352,25 @@ extension ZaloEngine {
                         text: ""
                     )
                 } else {
-                    let res = try await sessionClient.uploadAndSendFile(
-                        convId: id, fileName: url.lastPathComponent, data: data, webSocket: webSocket
-                    )
+                    let res: UploadedMediaResult
+                    if let uploadFileHostHandler {
+                        let uploadArgs: [String: Any] = [
+                            "conv_id": id,
+                            "file_name": url.lastPathComponent,
+                            "size": fileSize,
+                            "client_id": NSNull(),
+                            "is_e2ee": false,
+                        ]
+                        _ = traceHost("upload_file", args: uploadArgs)
+                        res = try await uploadFileHostHandler(uploadArgs)
+                    } else {
+                        res = try await sessionClient.uploadAndSendFile(
+                            convId: id, fileName: url.lastPathComponent, data: data, webSocket: webSocket
+                        )
+                    }
                     await recordUploadedMessage(
                         convId: id, msgId: res.msgId, cliId: res.cliMsgId,
-                        kind: .file(name: url.lastPathComponent, size: Int64(data.count), url: URL(string: res.url)),
+                        kind: .file(name: url.lastPathComponent, size: fileSize, url: URL(string: res.url)),
                         text: url.lastPathComponent
                     )
                 }
@@ -322,24 +423,60 @@ extension ZaloEngine {
         var lastFailure: String?
 
         for url in urls {
-            let scoped = url.startAccessingSecurityScopedResource()
+            let scoped = readOutgoingFileHostHandler == nil ? url.startAccessingSecurityScopedResource() : false
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
 
-            if let reason = Self.validateOutgoingFile(url, maxBytes: maxBytes) {
-                lastFailure = reason
-                continue
-            }
-
             let data: Data
-            do {
-                data = try Data(contentsOf: url)
-            } catch {
-                lastFailure = "Không đọc được tệp \(url.lastPathComponent)."
-                continue
-            }
-            guard !data.isEmpty else {
-                lastFailure = "Tệp \(url.lastPathComponent) rỗng (0 byte) nên không thể gửi."
-                continue
+            let fileSize: Int64
+            if let readOutgoingFileHostHandler {
+                let readArgs: [String: Any] = [
+                    "path": url.path,
+                    "name": url.lastPathComponent,
+                    "mode": "file",
+                ]
+                _ = traceHost("read_file", args: readArgs)
+                let probe = await readOutgoingFileHostHandler(readArgs)
+                if probe.isDirectory {
+                    lastFailure = "Chưa hỗ trợ gửi thư mục (\(url.lastPathComponent)). Hãy nén thành .zip trước."
+                    continue
+                }
+                guard probe.exists else {
+                    lastFailure = "Không đọc được tệp \(url.lastPathComponent)."
+                    continue
+                }
+                if probe.size <= 0 {
+                    lastFailure = "Tệp \(url.lastPathComponent) rỗng (0 byte) nên không thể gửi."
+                    continue
+                }
+                if maxBytes > 0 && probe.size > maxBytes {
+                    let limitMB = max(1, maxBytes / 1_048_576)
+                    lastFailure = "Tệp \(url.lastPathComponent) vượt quá giới hạn \(limitMB) MB."
+                    continue
+                }
+                guard probe.readable else {
+                    lastFailure = "Không đọc được tệp \(url.lastPathComponent)."
+                    continue
+                }
+                data = probe.data
+                fileSize = probe.size
+            } else {
+                if let reason = Self.validateOutgoingFile(url, maxBytes: maxBytes) {
+                    lastFailure = reason
+                    continue
+                }
+                let raw: Data
+                do {
+                    raw = try Data(contentsOf: url)
+                } catch {
+                    lastFailure = "Không đọc được tệp \(url.lastPathComponent)."
+                    continue
+                }
+                guard !raw.isEmpty else {
+                    lastFailure = "Tệp \(url.lastPathComponent) rỗng (0 byte) nên không thể gửi."
+                    continue
+                }
+                data = raw
+                fileSize = Int64(raw.count)
             }
 
             let cliInt = await sessionClient.nextClientId()
@@ -352,9 +489,9 @@ extension ZaloEngine {
                 senderName: profile?.displayName ?? "Bạn",
                 senderAvatar: profile?.avatar,
                 isMine: true,
-                kind: .file(name: url.lastPathComponent, size: Int64(data.count), url: nil),
+                kind: .file(name: url.lastPathComponent, size: fileSize, url: nil),
                 text: url.lastPathComponent,
-                date: Date(),
+                date: Date(timeIntervalSince1970: Double(nowMs()) / 1000.0),
                 status: .sending,
                 quote: nil,
                 reactions: [],
@@ -385,7 +522,17 @@ extension ZaloEngine {
 
             do {
                 let res: UploadedMediaResult
-                if isE2EE {
+                if let uploadFileHostHandler {
+                    let uploadArgs: [String: Any] = [
+                        "conv_id": id,
+                        "file_name": url.lastPathComponent,
+                        "size": fileSize,
+                        "client_id": cliId,
+                        "is_e2ee": isE2EE,
+                    ]
+                    _ = traceHost("upload_file", args: uploadArgs)
+                    res = try await uploadFileHostHandler(uploadArgs)
+                } else if isE2EE {
                     res = try await sessionClient.uploadAndSendE2EEFile(
                         convId: id,
                         fileName: url.lastPathComponent,
@@ -408,7 +555,7 @@ extension ZaloEngine {
                     convId: id,
                     msgId: res.msgId,
                     cliId: res.cliMsgId,
-                    kind: .file(name: url.lastPathComponent, size: Int64(data.count), url: URL(string: res.url)),
+                    kind: .file(name: url.lastPathComponent, size: fileSize, url: URL(string: res.url)),
                     text: url.lastPathComponent,
                     isE2EE: isE2EE
                 )
@@ -435,7 +582,7 @@ extension ZaloEngine {
         }
         if sentAny {
             if let lastFailure {
-                CardActionCenter.shared.show(lastFailure, in: id)
+                showActionCard(lastFailure, in: id)
             }
             return .done
         }
@@ -470,7 +617,7 @@ extension ZaloEngine {
             isMine: true,
             kind: kind,
             text: text,
-            date: Date(),
+            date: Date(timeIntervalSince1970: Double(nowMs()) / 1000.0),
             status: .sent,
             quote: nil,
             reactions: [],

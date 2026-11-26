@@ -53,6 +53,7 @@ final class MediaResolver {
     private var running = 0
     private var queue: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
     let maxConcurrent: Int
+    var now: () -> Date = { Date() }
 
     init(maxConcurrent: Int = 3) { self.maxConcurrent = maxConcurrent }
 
@@ -65,7 +66,7 @@ final class MediaResolver {
     /// `force` (the retry button) ignores any remembered verdict except a final "expired": a remembered
     /// "unavailable" is retried, and a remembered file that turned out not to be loadable is looked up again.
     func resolve(key: String, force: Bool = false, run: @escaping @MainActor () async -> MediaResolution) async -> MediaResolution {
-        if let known = settled[key], known.until > Date() {
+        if let known = settled[key], known.until > now() {
             switch known.resolution {
             case .unavailable where force: break
             case .file where force: break
@@ -97,7 +98,7 @@ final class MediaResolver {
         guard let resolution = outcome else { return .unavailable }          // dropped before it started
         if flights[key] === flight { flights[key] = nil }
         switch resolution {
-        case .unavailable: settled[key] = (resolution, Date().addingTimeInterval(Self.unavailableTTL))
+        case .unavailable: settled[key] = (resolution, now().addingTimeInterval(Self.unavailableTTL))
         case .file, .expired, .unsupported: settled[key] = (resolution, .distantFuture)
         }
         if settled.count > 2000 { settled = settled.filter { $0.value.until > Date() } }
@@ -135,6 +136,11 @@ final class MediaResolver {
     private func release() {
         if let next = queue.popLast() { next.continuation.resume(returning: true) } else { running -= 1 }
     }
+}
+
+enum MediaLoaderFetchResult: Sendable {
+    case data(Data)
+    case file(URL)
 }
 
 enum FileResolution: Equatable, Sendable {
@@ -317,7 +323,7 @@ extension ZaloEngine {
         }
     }
 
-    private nonisolated static func findCachedMediaFile(hashPrefix: String, in directory: URL, kind: MediaKind) -> URL? {
+    internal nonisolated static func findCachedMediaFile(hashPrefix: String, in directory: URL, kind: MediaKind) -> URL? {
         let fm = FileManager.default
         let exts = kind == .video ? ["mp4", "mov", "m4v"] : ["jpg", "jpeg", "jxl", "png", "webp", "gif", "heic", "mp4", "bin"]
         for ext in exts {
@@ -383,11 +389,27 @@ extension ZaloEngine {
             try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
             let hashPrefix = MediaLoader.stableHash(key)
 
-            if !force, let existing = Self.findCachedMediaFile(hashPrefix: hashPrefix, in: cacheDir, kind: kind) {
-                if kind == .videoThumb, VideoPoster.isVideo(existing) {
-                    return await VideoPoster.poster(for: existing).map(MediaResolution.file) ?? .unavailable
+            if !force {
+                let existing: URL?
+                if let mediaCacheLookupHostHandler {
+                    let cacheArgs: [String: Any] = [
+                        "key": key,
+                        "hash_prefix": hashPrefix,
+                        "conv_id": conversationId,
+                        "msg_id": messageId,
+                        "kind": kind.rawValue,
+                    ]
+                    _ = self.traceHost("media_cache_lookup", args: cacheArgs)
+                    existing = await mediaCacheLookupHostHandler(cacheArgs)
+                } else {
+                    existing = Self.findCachedMediaFile(hashPrefix: hashPrefix, in: cacheDir, kind: kind)
                 }
-                return .file(existing)
+                if let existing {
+                    if kind == .videoThumb, VideoPoster.isVideo(existing) {
+                        return await self.resolveVideoPoster(for: existing).map(MediaResolution.file) ?? .unavailable
+                    }
+                    return .file(existing)
+                }
             }
 
             var sawPermanentGone = false
@@ -395,9 +417,17 @@ extension ZaloEngine {
 
             for remoteURL in candidates {
                 if remoteURL.isFileURL {
-                    if MediaLoader.isAllowedLocalFile(remoteURL), FileManager.default.fileExists(atPath: remoteURL.path) {
+                    let allowed: Bool
+                    if let allowedLocalFileHostHandler = self.allowedLocalFileHostHandler {
+                        let checkArgs: [String: Any] = ["url": remoteURL.absoluteString]
+                        _ = self.traceHost("check_local_file", args: checkArgs)
+                        allowed = await allowedLocalFileHostHandler(checkArgs)
+                    } else {
+                        allowed = MediaLoader.isAllowedLocalFile(remoteURL) && FileManager.default.fileExists(atPath: remoteURL.path)
+                    }
+                    if allowed {
                         if kind == .videoThumb, VideoPoster.isVideo(remoteURL) {
-                            if let poster = await VideoPoster.poster(for: remoteURL) { return .file(poster) }
+                            if let poster = await self.resolveVideoPoster(for: remoteURL) { return .file(poster) }
                         } else {
                             return .file(remoteURL)
                         }
@@ -405,14 +435,37 @@ extension ZaloEngine {
                     continue
                 }
                 guard let scheme = remoteURL.scheme?.lowercased(), scheme == "https" || scheme == "http" else { continue }
-                if force {
+                if force && self.mediaLoaderFetchHostHandler == nil {
                     await MediaLoader.shared.forgetFailures(for: remoteURL)
                     await MediaLoader.shared.evictCachedFile(for: remoteURL)
                 }
 
                 if kind == .video {
                     do {
-                        let fetchedFile = try await MediaLoader.shared.localFile(for: remoteURL)
+                        let fetchedFile: URL
+                        if let mediaLoaderFetchHostHandler = self.mediaLoaderFetchHostHandler {
+                            let fetchArgs: [String: Any] = [
+                                "mode": "file",
+                                "url": remoteURL.absoluteString,
+                                "force": force,
+                            ]
+                            _ = self.traceHost("loader_fetch", args: fetchArgs)
+                            switch try await mediaLoaderFetchHostHandler(fetchArgs) {
+                            case .file(let u):
+                                fetchedFile = u
+                            case .data(let bytes):
+                                let probe = cacheDir.appendingPathComponent(".\(UUID().uuidString).probe")
+                                try bytes.write(to: probe, options: .atomic)
+                                let container = CloudContainer(fileAt: probe)
+                                let ext = Self.mediaExtension(for: container, fallbackKind: .video)
+                                let dest = cacheDir.appendingPathComponent("\(hashPrefix).\(ext)")
+                                try? FileManager.default.removeItem(at: dest)
+                                try FileManager.default.moveItem(at: probe, to: dest)
+                                return .file(dest)
+                            }
+                        } else {
+                            fetchedFile = try await MediaLoader.shared.localFile(for: remoteURL)
+                        }
                         let container = CloudContainer(fileAt: fetchedFile)
                         let ext = Self.mediaExtension(for: container, fallbackKind: .video)
                         let dest = cacheDir.appendingPathComponent("\(hashPrefix).\(ext)")
@@ -425,7 +478,23 @@ extension ZaloEngine {
                     }
                 } else {
                     do {
-                        let data = try await MediaLoader.shared.data(for: remoteURL)
+                        let data: Data
+                        if let mediaLoaderFetchHostHandler = self.mediaLoaderFetchHostHandler {
+                            let fetchArgs: [String: Any] = [
+                                "mode": "data",
+                                "url": remoteURL.absoluteString,
+                                "force": force,
+                            ]
+                            _ = self.traceHost("loader_fetch", args: fetchArgs)
+                            switch try await mediaLoaderFetchHostHandler(fetchArgs) {
+                            case .data(let bytes):
+                                data = bytes
+                            case .file(let u):
+                                data = try Data(contentsOf: u)
+                            }
+                        } else {
+                            data = try await MediaLoader.shared.data(for: remoteURL)
+                        }
                         guard !data.isEmpty else { sawTransientError = true; continue }
                         let tempProbe = cacheDir.appendingPathComponent(".\(UUID().uuidString).probe")
                         try data.write(to: tempProbe, options: .atomic)
@@ -441,7 +510,7 @@ extension ZaloEngine {
                         try FileManager.default.moveItem(at: tempProbe, to: dest)
 
                         if kind == .videoThumb, VideoPoster.isVideo(dest) {
-                            if let poster = await VideoPoster.poster(for: dest) {
+                            if let poster = await self.resolveVideoPoster(for: dest) {
                                 return .file(poster)
                             }
                             continue
@@ -459,6 +528,15 @@ extension ZaloEngine {
             }
             return .unavailable
         }
+    }
+
+    private func resolveVideoPoster(for video: URL) async -> URL? {
+        if let videoPosterHostHandler {
+            let args: [String: Any] = ["path": video.path]
+            _ = traceHost("video_poster", args: args)
+            return await videoPosterHostHandler(args)
+        }
+        return await VideoPoster.poster(for: video)
     }
 
     /// Downloads, decrypts (`?e2esession=...`), and stages a file attachment with its sanitized real filename + extension.
@@ -487,6 +565,53 @@ extension ZaloEngine {
            case .file(let dbName, _, let dbURL) = msg.kind {
             resolvedURL = dbURL
             if resolvedName.isEmpty { resolvedName = dbName }
+        }
+        if let mediaLoaderFetchHostHandler {
+            guard let remoteURL = resolvedURL else {
+                return .failed("Tin nhắn không có đường dẫn tải tệp.")
+            }
+            let fetchArgs: [String: Any] = [
+                "mode": "file",
+                "url": remoteURL.absoluteString,
+                "force": force,
+            ]
+            _ = traceHost("loader_fetch", args: fetchArgs)
+            let cachedFile: URL
+            do {
+                switch try await mediaLoaderFetchHostHandler(fetchArgs) {
+                case .file(let u):
+                    cachedFile = u
+                case .data(let bytes):
+                    let tempDir = dataDirectory.appendingPathComponent("MediaCache", isDirectory: true)
+                    try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+                    let temp = tempDir.appendingPathComponent(".\(UUID().uuidString).dl")
+                    try bytes.write(to: temp, options: .atomic)
+                    cachedFile = temp
+                }
+            } catch is CancellationError {
+                return .failed("Đã huỷ tải tệp.")
+            } catch {
+                if ChatFileResolver.isPermanentGone(error) {
+                    return .expired
+                }
+                return .failed(ChatFileResolver.userMessage(for: error))
+            }
+            let container = CloudContainer(fileAt: cachedFile)
+            let safeFull = ChatFileResolver.sanitizedFileName(resolvedName, fallbackExtension: container.fileExtension)
+            let ext = (safeFull as NSString).pathExtension
+            let stem = ext.isEmpty ? safeFull : (safeFull as NSString).deletingPathExtension
+            let cleanStem = stem.isEmpty ? "Tệp đính kèm" : stem
+            let cleanExt = ext.isEmpty ? nil : ext
+            if let stageFileHostHandler {
+                if let staged = await stageFileHostHandler(cachedFile, cleanStem, cleanExt) {
+                    return .ready(staged)
+                }
+                return .ready(cachedFile)
+            }
+            if let staged = CloudFiles.stage(cachedFile, name: cleanStem, ext: cleanExt) {
+                return .ready(staged)
+            }
+            return .ready(cachedFile)
         }
         return await ChatFileResolver.resolve(name: resolvedName, url: resolvedURL, force: force, progress: progress)
     }

@@ -184,6 +184,18 @@ final class ZaloEngine {
     @ObservationIgnored internal var sendMediaHostHandler: (([String: Any]) async -> ComposerOutcome)?
     @ObservationIgnored internal var sendFilesHostHandler: (([String: Any]) async -> ComposerOutcome)?
     @ObservationIgnored internal var forwardTempPhotoURL: (() -> URL)?
+    @ObservationIgnored internal var readOutgoingFileHostHandler: (([String: Any]) async -> OutgoingFileProbeResult)?
+    @ObservationIgnored internal var imageDimensionsHostHandler: (([String: Any]) async -> (width: Int, height: Int))?
+    @ObservationIgnored internal var videoMetadataHostHandler: (([String: Any]) async -> VideoMetadata)?
+    @ObservationIgnored internal var uploadPhotoHostHandler: (([String: Any]) async throws -> UploadedMediaResult)?
+    @ObservationIgnored internal var uploadVideoHostHandler: (([String: Any]) async throws -> UploadedVideoResult)?
+    @ObservationIgnored internal var uploadFileHostHandler: (([String: Any]) async throws -> UploadedMediaResult)?
+    @ObservationIgnored internal var mediaCacheLookupHostHandler: (([String: Any]) async -> URL?)?
+    @ObservationIgnored internal var videoPosterHostHandler: (([String: Any]) async -> URL?)?
+    @ObservationIgnored internal var allowedLocalFileHostHandler: (([String: Any]) async -> Bool)?
+    @ObservationIgnored internal var mediaLoaderFetchHostHandler: (([String: Any]) async throws -> MediaLoaderFetchResult)?
+    @ObservationIgnored internal var stageFileHostHandler: ((URL, String, String?) async -> URL?)?
+    @ObservationIgnored internal var simulateSharedMediaStoreErrorOnce: Bool = false
     @ObservationIgnored internal var traceU4HostEnabled: Bool = false
     @ObservationIgnored internal var stateTrace: (() -> Void)?
     @ObservationIgnored private let transportSettleTraceActive = OSAllocatedUnfairLock<Bool>(initialState: false)
