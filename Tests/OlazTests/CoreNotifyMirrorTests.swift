@@ -35,7 +35,10 @@ import Testing
             starredIds: nil,
             cachedProfiles: nil,
             notificationSettings: notificationSettings,
-            aliases: aliases
+            aliases: aliases,
+            stickerSuggest: nil,
+            composerConfirm: nil,
+            queuedComposerConfirms: nil
         )
     }
 
@@ -356,7 +359,6 @@ import Testing
         print(String(format: "[U16 notify_banner latency] n=%d p50=%.3f ms p95=%.3f ms max=%.3f ms", iterations, p50, p95, samplesMs.last ?? 0))
         #expect(deliveredBanners.count == iterations)
         #expect(deliveredBanners.first?.title == "Minh Peer")
-        // Generous sanity cap so debug builds on loaded hosts never flake while catching real stalls.
-        #expect(p50 < 50.0, "Expected notify_banner p50 < 50 ms, got \(p50) ms")
+        #expect(p95 < 25.0, "Expected notify_banner p95 < 25 ms, got \(p95) ms")
     }
 }

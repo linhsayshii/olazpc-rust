@@ -163,6 +163,11 @@ impl<T: Transport> SessionClient<T> {
         self.lock().clear();
     }
 
+    /// Clears cached zCloud viewer credentials (`cloud_viewer_key` and `cloud_enk`).
+    pub fn clear_cloud_viewer_key(&self) {
+        self.lock().clear_cloud_viewer_key();
+    }
+
     // MARK: low level
 
     /// Swift `rawRequest`: builds headers from the current session and sends.

@@ -19,6 +19,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use olaz_api::{PollState, SendMessageResult, ZaloApi};
 use olaz_core::actor::{ActorSink, CoreHandle};
+use olaz_core::cloud::{
+    CloudActionResult, CloudBreakdown, CloudConversation, CloudFetch, CloudItem, CloudItemKind,
+    CloudPage, CloudPlan, CloudSettings, CloudSnapshotState,
+};
+use olaz_core::composer::{ComposerConfirm, ComposerOutcome, MyCardInfo, ReminderComposeInfo};
 use olaz_core::conversations::{
     BatchApplyDelta, CachedGroup, CachedProfile, ConvMessageDelta, ConvPreviewOverride,
     ConversationPreview, FriendIdentity, GroupIdentity, IdentityTable, MessagePreviewInput,
@@ -28,7 +33,7 @@ use olaz_core::effect::{Effect, OpResult};
 use olaz_core::forward::{
     ComposerSendOutcome, FileResolutionOutcome, ForwardOutcome, MediaResolutionOutcome,
 };
-use olaz_core::input::{Command, E2eeQuoteArg, Input, LegacyCookie, SeenTarget};
+use olaz_core::input::{Command, E2eeQuoteArg, Input, LegacyCookie, SeenTarget, StickerSendError};
 use olaz_core::messages::{
     ContactsState, FriendEntry, FriendRequestEntry, GroupEntry, to_db_stored,
 };
@@ -43,6 +48,10 @@ use olaz_core::runner::{
 };
 use olaz_core::state::{
     CoreFailKind, CoreState, LoginStep, PersistedTransportState, Phase, SessionSnapshot,
+};
+use olaz_core::stickers::{
+    CardActionOutcome, StickerAnimation, StickerEntry, StickerSource, StickerSuggestSetting,
+    StickerTab,
 };
 use olaz_core::typed_chat::{
     PlainChatParse, TypedChatEnvelope, new_shared_parse, try_parse_plain_chat,
@@ -216,6 +225,15 @@ pub struct Seed {
     pub poll_clock: Option<Value>,
     #[serde(default)]
     pub watched_check_ids: Option<Vec<String>>,
+    // U13
+    #[serde(default)]
+    pub recent_stickers: Option<Value>,
+    #[serde(default)]
+    pub sticker_suggest: Option<bool>,
+    #[serde(default)]
+    pub composer_confirm: Option<Value>,
+    #[serde(default)]
+    pub queued_composer_confirms: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -583,24 +601,25 @@ fn derive_param_cipher_key(zcid: &str, zcid_ext: &str) -> Vec<u8> {
     key.into_bytes()
 }
 
+const VOLATILE_PARAM_KEYS: &[&str] = &["imei", "computer_name", "client_time", "ts"];
+
 fn is_volatile_key(key: &str) -> bool {
     VOLATILE_KEYS.contains(&key)
 }
 
-fn scrub_volatile_value(val: Value) -> Value {
+fn scrub_volatile_params(val: Value) -> Value {
     match val {
         Value::Object(map) => {
             let mut out = Map::new();
             for (k, v) in map {
-                if is_volatile_key(&k) {
+                if VOLATILE_PARAM_KEYS.contains(&k.as_str()) {
                     out.insert(k, Value::String("<volatile>".to_owned()));
                 } else {
-                    out.insert(k, scrub_volatile_value(v));
+                    out.insert(k, v);
                 }
             }
             Value::Object(out)
         }
-        Value::Array(arr) => Value::Array(arr.into_iter().map(scrub_volatile_value).collect()),
         other => other,
     }
 }
@@ -630,8 +649,8 @@ fn decrypt_request_params(
     let decrypted = decrypt_key
         .and_then(|k| decode_aes(k, &enc_params).ok())
         .and_then(|plain| parse_any(plain.as_bytes()))
-        .map(scrub_volatile_value)
-        .unwrap_or_else(|| Value::String("<volatile>".to_owned()));
+        .map(scrub_volatile_params)
+        .unwrap_or_else(|| Value::String("<undecryptable>".to_owned()));
 
     (decrypted, param_cipher_key)
 }
@@ -1322,6 +1341,54 @@ struct HostSelfProfile {
     self_conv_id: Option<String>,
 }
 
+#[derive(Default)]
+struct VirtualConfirmClockInner {
+    now_ms: u64,
+    waiters: Vec<(u64, oneshot::Sender<()>)>,
+}
+
+#[derive(Default)]
+struct VirtualConfirmClock {
+    inner: Mutex<VirtualConfirmClockInner>,
+}
+
+impl VirtualConfirmClock {
+    async fn sleep(&self, delay: Duration) {
+        let delta = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        if delta == 0 {
+            return;
+        }
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let deadline = inner.now_ms.saturating_add(delta);
+            inner.waiters.push((deadline, tx));
+        }
+        let _ = rx.await;
+    }
+
+    fn advance(&self, delta_ms: u64) {
+        let mut to_wake = Vec::new();
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            inner.now_ms = inner.now_ms.saturating_add(delta_ms);
+            let now = inner.now_ms;
+            let mut remaining = Vec::new();
+            for (deadline, tx) in inner.waiters.drain(..) {
+                if deadline <= now {
+                    to_wake.push(tx);
+                } else {
+                    remaining.push((deadline, tx));
+                }
+            }
+            inner.waiters = remaining;
+        }
+        for tx in to_wake {
+            let _ = tx.send(());
+        }
+    }
+}
+
 pub struct RecordingHost {
     saved_session: Option<String>,
     legacy_cookie: Option<LegacyCookie>,
@@ -1334,6 +1401,7 @@ pub struct RecordingHost {
     is_u6: bool,
     is_u16: bool,
     is_u12: bool,
+    is_u13: bool,
     data_dir: Option<PathBuf>,
     virtual_now_ms: Mutex<i64>,
     virtual_poll_timers: Mutex<Vec<(String, u64, i64)>>,
@@ -1351,6 +1419,9 @@ pub struct RecordingHost {
     send_media_results: Mutex<VecDeque<ComposerSendOutcome>>,
     send_files_results: Mutex<VecDeque<ComposerSendOutcome>>,
     fwd_photo_counter: Mutex<usize>,
+    e2ee_sticker_results: Mutex<VecDeque<Result<SendMessageResult, StickerSendError>>>,
+    e2ee_contact_card_results: Mutex<VecDeque<Result<SendMessageResult, String>>>,
+    confirm_clock: VirtualConfirmClock,
     messages: Mutex<HashMap<String, Vec<ChatMessage>>>,
     open_conversation_id: Mutex<Option<String>>,
     identities: Mutex<IdentityTable>,
@@ -1379,6 +1450,18 @@ impl RecordingHost {
         is_u3: bool,
         is_u4: bool,
         is_u6: bool,
+        is_u16: bool,
+        data_dir: Option<PathBuf>,
+    ) -> Self {
+        Self::from_seed_with_u13_modes(seed, is_u3, is_u4, is_u6, false, is_u16, data_dir)
+    }
+
+    pub fn from_seed_with_u13_modes(
+        seed: &Seed,
+        is_u3: bool,
+        is_u4: bool,
+        is_u6: bool,
+        is_u13: bool,
         is_u16: bool,
         data_dir: Option<PathBuf>,
     ) -> Self {
@@ -1487,6 +1570,108 @@ impl RecordingHost {
                 notif_auth_results.push_back(
                     NotifAuthorization::from_raw(raw).unwrap_or(NotifAuthorization::Authorized),
                 );
+            }
+        }
+        let mut e2ee_sticker_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("send_e2ee_sticker"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                if item.as_str() == Some("e2ee_failed")
+                    || item.get("status").and_then(Value::as_str) == Some("e2ee_failed")
+                {
+                    e2ee_sticker_results.push_back(Err(StickerSendError::E2eeFailed));
+                } else if let Some(err_obj) = item.get("error").and_then(Value::as_object) {
+                    let code = err_obj.get("code").and_then(Value::as_i64).unwrap_or(500);
+                    let msg = err_obj
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("E2EE error");
+                    let url = err_obj
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .unwrap_or("/api/e2ee/pc/message/sticker");
+                    let formatted = if url.is_empty() {
+                        format!("Zalo error {code}: {msg}")
+                    } else {
+                        format!("Zalo error {code}: {msg} ({url})")
+                    };
+                    e2ee_sticker_results.push_back(Err(StickerSendError::Api(formatted)));
+                } else if let Some(err_str) = item.get("error").and_then(Value::as_str) {
+                    e2ee_sticker_results.push_back(Err(StickerSendError::Api(format!(
+                        "Zalo error 500: {err_str} (/api/e2ee/pc/message/sticker)"
+                    ))));
+                } else {
+                    let msg_id = item
+                        .get("msg_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let cli_msg_id = item
+                        .get("cli_msg_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let ts_ms = item.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
+                    e2ee_sticker_results.push_back(Ok(SendMessageResult {
+                        msg_id,
+                        cli_msg_id,
+                        ts_ms,
+                    }));
+                }
+            }
+        }
+        let mut e2ee_contact_card_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("send_e2ee_contact_card"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                if item.as_str() == Some("e2ee_failed")
+                    || item.get("status").and_then(Value::as_str) == Some("e2ee_failed")
+                {
+                    e2ee_contact_card_results.push_back(Err("e2ee_failed".to_owned()));
+                } else if let Some(err_obj) = item.get("error").and_then(Value::as_object) {
+                    let code = err_obj.get("code").and_then(Value::as_i64).unwrap_or(500);
+                    let msg = err_obj
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("E2EE error");
+                    let url = err_obj
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .unwrap_or("/api/e2ee/pc/message/forward");
+                    let formatted = if url.is_empty() {
+                        format!("Zalo error {code}: {msg}")
+                    } else {
+                        format!("Zalo error {code}: {msg} ({url})")
+                    };
+                    e2ee_contact_card_results.push_back(Err(formatted));
+                } else if let Some(err_str) = item.get("error").and_then(Value::as_str) {
+                    e2ee_contact_card_results.push_back(Err(err_str.to_owned()));
+                } else {
+                    let msg_id = item
+                        .get("msg_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let cli_msg_id = item
+                        .get("cli_msg_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let ts_ms = item.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
+                    e2ee_contact_card_results.push_back(Ok(SendMessageResult {
+                        msg_id,
+                        cli_msg_id,
+                        ts_ms,
+                    }));
+                }
             }
         }
         let mut resolve_media_results = VecDeque::new();
@@ -1617,6 +1802,7 @@ impl RecordingHost {
             is_u6,
             is_u16,
             is_u12: false,
+            is_u13,
             data_dir,
             virtual_now_ms: Mutex::new(1_700_000_000_000),
             virtual_poll_timers: Mutex::new(Vec::new()),
@@ -1634,6 +1820,9 @@ impl RecordingHost {
             send_media_results: Mutex::new(send_media_results),
             send_files_results: Mutex::new(send_files_results),
             fwd_photo_counter: Mutex::new(0),
+            e2ee_sticker_results: Mutex::new(e2ee_sticker_results),
+            e2ee_contact_card_results: Mutex::new(e2ee_contact_card_results),
+            confirm_clock: VirtualConfirmClock::default(),
             messages: Mutex::new(HashMap::new()),
             open_conversation_id: Mutex::new(open_conv),
             identities: Mutex::new(identities),
@@ -1670,6 +1859,10 @@ impl RecordingHost {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    pub fn advance_confirm_ms(&self, delta_ms: u64) {
+        self.confirm_clock.advance(delta_ms);
     }
 
     pub fn bind_store_slot(&self, slot: SharedStoreSlot) {
@@ -2626,6 +2819,80 @@ impl Host for RecordingHost {
             .unwrap_or_else(|| ComposerSendOutcome::Failed("Có lỗi khi gửi tệp".to_owned()))
     }
 
+    async fn send_e2ee_sticker(
+        &self,
+        conv_id: String,
+        cate_id: i64,
+        sticker_id: i64,
+        client_id: String,
+    ) -> Result<SendMessageResult, StickerSendError> {
+        self.record(
+            "send_e2ee_sticker",
+            json!({
+                "conv_id": conv_id,
+                "cate_id": cate_id,
+                "sticker_id": sticker_id,
+                "client_id": client_id,
+            }),
+        );
+        self.e2ee_sticker_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or_else(|| {
+                Err(StickerSendError::Api(
+                    "Zalo error 500: No scripted send_e2ee_sticker result (/api/e2ee/pc/message/sticker)"
+                        .to_owned(),
+                ))
+            })
+    }
+
+    async fn send_e2ee_contact_card(
+        &self,
+        conv_id: String,
+        client_id: String,
+        contact_uid: String,
+        title: String,
+        phone: String,
+        avatar: String,
+        qr_code_url: String,
+    ) -> Result<SendMessageResult, String> {
+        self.record(
+            "send_e2ee_contact_card",
+            json!({
+                "conv_id": conv_id,
+                "client_id": client_id,
+                "contact_uid": contact_uid,
+                "title": title,
+                "phone": phone,
+                "avatar": avatar,
+                "qr_code_url": qr_code_url,
+            }),
+        );
+        if let Some(scripted) = self
+            .e2ee_contact_card_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+        {
+            return scripted;
+        }
+        // Deterministic fallback ONLY for unscripted send_e2ee_contact_card (approved for U13).
+        Ok(SendMessageResult {
+            msg_id: client_id.clone(),
+            cli_msg_id: client_id,
+            ts_ms: 0,
+        })
+    }
+
+    async fn sleep_confirm_promote(&self, delay: Duration) {
+        if self.is_u13 {
+            self.confirm_clock.sleep(delay).await;
+        } else {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     async fn apply_remote_reaction(
         &self,
         conv_id: String,
@@ -2774,7 +3041,16 @@ impl Host for RecordingHost {
             );
         };
         let api = ZaloApi::from_shared(client);
-        let Ok(res) = api.send_sticker(&conv_id, cate_id, sticker_id, 7).await else {
+        let Ok(res) = api
+            .send_sticker(&olaz_api::SendStickerParams {
+                conv_id: conv_id.clone(),
+                cate_id: i64::from(cate_id),
+                sticker_id: i64::from(sticker_id),
+                sticker_type: 7,
+                client_id: None,
+            })
+            .await
+        else {
             return CardActionOutcomeData::Failed(
                 "Không gửi được sticker. Hãy thử lại.".to_owned(),
             );
@@ -3511,6 +3787,20 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
             .set_preference_data("activityRanks", &bytes)
             .map_err(|e| format!("seed activityRanks: {e}"))?;
     }
+    // U13
+    if let Some(recents) = &seed.recent_stickers
+        && !recents.is_null()
+    {
+        let bytes = canonical_json_string(recents).into_bytes();
+        store
+            .set_preference_data("recentStickers", &bytes)
+            .map_err(|e| format!("seed recentStickers: {e}"))?;
+    }
+    if let Some(suggest) = seed.sticker_suggest {
+        store
+            .set_preference_bool("stickerSuggest", suggest)
+            .map_err(|e| format!("seed stickerSuggest: {e}"))?;
+    }
     // U4-bootstrap
     if let Some(ts) = &seed.history_full_refresh_at
         && !ts.is_empty()
@@ -3798,6 +4088,164 @@ fn enrich_send_message_json(m: &ChatMessage, base: &mut Map<String, Value>) {
             "protected": m.menu.is_protected,
         }),
     );
+}
+
+fn encode_cloud_breakdown(b: &CloudBreakdown) -> Value {
+    json!({
+        "photo": b.photo,
+        "video": b.video,
+        "file": b.file,
+        "voice": b.voice,
+        "total": b.total(),
+    })
+}
+
+fn encode_cloud_plan(p: &CloudPlan) -> Value {
+    json!({
+        "kind": p.kind.as_str(),
+        "name": p.name,
+        "quota": p.quota,
+        "usage": p.usage,
+        "family": p.family,
+        "cloud_media": p.cloud_media,
+        "message_backup": p.message_backup,
+        "my_cloud": p.my_cloud,
+        "expire_at_ms": p.expire_at_ms,
+        "auto_renew": p.auto_renew,
+        "months": p.months,
+        "has_key": p.has_key,
+        "backup_media": p.backup_media,
+        "backup_my_cloud": p.backup_my_cloud,
+        "backup_messages": p.backup_messages,
+        "file_limit": p.file_limit,
+    })
+}
+
+fn encode_cloud_conversation(c: &CloudConversation) -> Value {
+    json!({
+        "id": c.id,
+        "name": c.name,
+        "avatar": c.avatar,
+        "is_group": c.is_group,
+        "total": c.total,
+        "last_activity_ms": c.last_activity_ms,
+    })
+}
+
+fn encode_cloud_settings(s: &CloudSettings) -> Value {
+    json!({
+        "offload_enabled": s.offload_enabled,
+        "offload_available": s.offload_available,
+        "last_offload_at_ms": s.last_offload_at_ms,
+        "last_offload_size": s.last_offload_size,
+        "ttl_days": s.ttl_days,
+    })
+}
+
+fn encode_cloud_state(s: &CloudSnapshotState) -> Value {
+    json!({
+        "plan": s.plan.as_ref().map(encode_cloud_plan),
+        "media": encode_cloud_breakdown(&s.media),
+        "my_cloud_types": encode_cloud_breakdown(&s.my_cloud_types),
+        "conversations": s.conversations.iter().map(encode_cloud_conversation).collect::<Vec<_>>(),
+        "settings": encode_cloud_settings(&s.settings),
+        "changed": s.changed,
+        "loaded": s.loaded,
+        "hidden_lookup": s.hidden_lookup,
+        "self_id": s.self_id,
+    })
+}
+
+fn encode_cloud_item(item: &CloudItem) -> Value {
+    json!({
+        "id": item.id,
+        "kind": item.kind.as_str(),
+        "conv_id": item.conversation_id,
+        "conv_name": item.conversation_name,
+        "size": item.size,
+        "date_ms": item.date_ms,
+        "title": item.title,
+        "ext": item.ext,
+        "duration": item.duration.round() as i64,
+        "width": item.width,
+        "height": item.height,
+    })
+}
+
+fn encode_cloud_page(page: &CloudPage) -> Value {
+    json!({
+        "items": page.items.iter().map(encode_cloud_item).collect::<Vec<_>>(),
+        "has_more": page.has_more,
+        "error": page.error,
+    })
+}
+
+fn encode_cloud_fetch(fetch: &CloudFetch) -> Value {
+    match fetch {
+        CloudFetch::Ready(file) => {
+            let url = if file.path.starts_with('/') {
+                format!("file://{}", file.path)
+            } else {
+                format!("file:///{}", file.path)
+            };
+            json!({
+                "status": "ready",
+                "file": {
+                    "url": url,
+                    "kind": file.kind.as_str(),
+                    "title": file.title,
+                    "ext": file.ext,
+                    "size": file.size,
+                    "date_ms": file.date_ms,
+                },
+            })
+        }
+        CloudFetch::Expired => json!({ "status": "expired" }),
+        CloudFetch::Failed(err) => json!({ "status": "failed", "error": err }),
+    }
+}
+
+fn encode_media_resolution(res: &MediaResolutionOutcome) -> Value {
+    match res {
+        MediaResolutionOutcome::File(path) => json!({ "state": "file", "path": path }),
+        MediaResolutionOutcome::Expired => json!({ "state": "expired" }),
+        MediaResolutionOutcome::Unavailable => json!({ "state": "unavailable" }),
+        MediaResolutionOutcome::Unsupported => json!({ "state": "unsupported" }),
+    }
+}
+
+fn encode_cloud_action_result(res: &CloudActionResult) -> Value {
+    json!({
+        "ok": res.ok,
+        "deleted": res.deleted,
+        "failed": res.failed,
+        "error": res.error,
+    })
+}
+
+fn decode_step_message(msg_json: &Value, fallback_conv_id: &str) -> Option<ChatMessage> {
+    let mut obj = msg_json.as_object()?.clone();
+    let pairs = [
+        ("conversationId", "conv_id"),
+        ("clientId", "client_id"),
+        ("senderId", "sender_id"),
+        ("senderName", "sender_name"),
+        ("senderAvatar", "sender_avatar"),
+        ("isMine", "is_mine"),
+        ("isE2EE", "is_e2ee"),
+        ("date", "date_ms"),
+    ];
+    for (camel, snake) in pairs {
+        if !obj.contains_key(camel)
+            && let Some(v) = obj.get(snake).cloned()
+        {
+            obj.insert(camel.to_owned(), v);
+        }
+    }
+    if let Some(kind_str) = obj.get("kind").and_then(Value::as_str).map(str::to_owned) {
+        obj.insert("kind".to_owned(), json!({ "type": kind_str }));
+    }
+    ChatMessage::from_json(&obj, fallback_conv_id)
 }
 
 #[derive(Clone, Default)]
@@ -4605,6 +5053,9 @@ struct SnapshotOpts<'a> {
     current_now_ms: i64,
     is_u8: bool,
     is_u12: bool,
+    is_u11: bool,
+    is_u13: bool,
+    is_u14: bool,
     last_send_result: Option<bool>,
     send_logs: &'a Mutex<Vec<String>>,
     prune_next_expiry_ms: Option<i64>,
@@ -4615,6 +5066,182 @@ struct SnapshotOpts<'a> {
     u12_results: &'a BTreeMap<String, Value>,
     watched_check_ids: Option<&'a [String]>,
     seeded_member_cache: Option<&'a Value>,
+    search_results: &'a Map<String, Value>,
+    results: &'a Map<String, Value>,
+}
+
+fn encode_sticker_tabs(tabs: Option<Vec<StickerTab>>) -> Value {
+    match tabs {
+        None => Value::Null,
+        Some(list) => Value::Array(
+            list.into_iter()
+                .map(|t| {
+                    json!({
+                        "id": t.id,
+                        "name": t.name,
+                        "icon": t.icon,
+                        "count": t.count,
+                    })
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn encode_stickers(stickers: Option<Vec<StickerEntry>>) -> Value {
+    match stickers {
+        None => Value::Null,
+        Some(list) => Value::Array(
+            list.into_iter()
+                .map(|s| {
+                    let anim = match s.animation {
+                        None => Value::Null,
+                        Some(StickerAnimation::Sprite {
+                            url,
+                            frames,
+                            frame_ms,
+                        }) => json!({
+                            "kind": "sprite",
+                            "url": url,
+                            "frames": frames,
+                            "ms": frame_ms,
+                        }),
+                        Some(StickerAnimation::Animated { url }) => json!({
+                            "kind": "animated",
+                            "url": url,
+                        }),
+                    };
+                    json!({
+                        "cate_id": s.cate_id,
+                        "id": s.sticker_id,
+                        "url": s.url,
+                        "anim": anim,
+                    })
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn encode_suggest_setting(s: Option<StickerSuggestSetting>) -> Value {
+    match s {
+        None => Value::Null,
+        Some(v) => json!({
+            "enabled": v.enabled,
+            "debounce": v.debounce,
+        }),
+    }
+}
+
+fn encode_card_action_outcome(outcome: &CardActionOutcome) -> Value {
+    match outcome {
+        CardActionOutcome::Done => json!({"status": "done", "text": Value::Null}),
+        CardActionOutcome::OpenChat(s) => json!({"status": "open_chat", "text": s}),
+        CardActionOutcome::OpenProfile(s) => json!({"status": "open_profile", "text": s}),
+        CardActionOutcome::OpenUrl(s) => json!({"status": "open_url", "text": s}),
+        CardActionOutcome::Copy(s) => json!({"status": "copy", "text": s}),
+        CardActionOutcome::Present => json!({"status": "present", "text": Value::Null}),
+        CardActionOutcome::Unsupported(s) => json!({"status": "unsupported", "text": s}),
+        CardActionOutcome::Locked(s) => json!({"status": "locked", "text": s}),
+        CardActionOutcome::Failed(s) => json!({"status": "failed", "text": s}),
+        CardActionOutcome::Pending(s) => json!({"status": "pending", "text": s}),
+    }
+}
+
+fn encode_composer_outcome(outcome: &ComposerOutcome) -> Value {
+    match outcome {
+        ComposerOutcome::Done => json!({"status": "done", "text": Value::Null}),
+        ComposerOutcome::Cancelled => json!({"status": "cancelled", "text": Value::Null}),
+        ComposerOutcome::Failed(s) => json!({"status": "failed", "text": s}),
+        ComposerOutcome::Pending(s) => json!({"status": "pending", "text": s}),
+    }
+}
+
+fn decode_composer_outcome(v: &Value) -> ComposerOutcome {
+    let status = v.get("status").and_then(Value::as_str).unwrap_or("done");
+    let text = v
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    match status {
+        "cancelled" => ComposerOutcome::Cancelled,
+        "failed" => ComposerOutcome::Failed(text),
+        "pending" => ComposerOutcome::Pending(text),
+        _ => ComposerOutcome::Done,
+    }
+}
+
+fn encode_my_card(info: Option<MyCardInfo>) -> Value {
+    match info {
+        None => Value::Null,
+        Some(c) => json!({
+            "uid": c.uid,
+            "name": c.name,
+            "avatar": c.avatar,
+            "phone": c.phone,
+            "with_phone": c.with_phone,
+        }),
+    }
+}
+
+fn encode_reminder_info(info: Option<ReminderComposeInfo>) -> Value {
+    match info {
+        None => Value::Null,
+        Some(r) => json!({
+            "allowed": r.allowed,
+            "hidden": r.hidden,
+            "text": r.text,
+            "is_group": r.is_group,
+            "can_pin": r.can_pin,
+            "pin_toggle": r.pin_toggle,
+            "title_max_chars": r.title_max_chars,
+            "title_max_bytes": r.title_max_bytes,
+        }),
+    }
+}
+
+fn encode_composer_confirm(c: &ComposerConfirm) -> Value {
+    json!({
+        "id": c.id,
+        "conv_id": c.conv_id,
+        "title": c.title,
+        "message": c.message,
+        "ok": c.ok,
+        "cancel": c.cancel,
+    })
+}
+
+fn decode_composer_confirm(v: &Value) -> Option<ComposerConfirm> {
+    let id = v.get("id").and_then(Value::as_str)?.to_owned();
+    Some(ComposerConfirm {
+        id,
+        conv_id: v
+            .get("conv_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        title: v
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        message: v
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        ok: v
+            .get("ok")
+            .and_then(Value::as_str)
+            .unwrap_or("OK")
+            .to_owned(),
+        cancel: v
+            .get("cancel")
+            .and_then(Value::as_str)
+            .unwrap_or("Cancel")
+            .to_owned(),
+    })
 }
 
 async fn capture_case_snapshot(
@@ -4631,6 +5258,9 @@ async fn capture_case_snapshot(
         current_now_ms,
         is_u8,
         is_u12,
+        is_u11,
+        is_u13,
+        is_u14,
         last_send_result,
         send_logs,
         prune_next_expiry_ms,
@@ -4641,6 +5271,8 @@ async fn capture_case_snapshot(
         u12_results,
         watched_check_ids,
         seeded_member_cache,
+        results,
+        search_results,
     } = *opts;
     if !is_u3 {
         return core
@@ -5046,6 +5678,92 @@ async fn capture_case_snapshot(
         obj.insert("cached_aliases".to_owned(), Value::Object(aliases_map));
         obj.insert("results".to_owned(), Value::Object(u16_results.clone()));
     }
+    if is_u11 {
+        obj.insert("cloud".to_owned(), encode_cloud_state(&full.cloud));
+        obj.insert("results".to_owned(), Value::Object(results.clone()));
+    }
+    if is_u14 {
+        obj.insert("results".to_owned(), Value::Object(search_results.clone()));
+    }
+    if is_u13 {
+        if let Some(Value::Object(msgs_obj)) = obj.get_mut("messages") {
+            for (conv_id, list) in &full.messages.windows {
+                if let Some(Value::Array(arr)) = msgs_obj.get_mut(conv_id)
+                    && arr.len() == list.len()
+                {
+                    for (m, item) in list.iter().zip(arr.iter_mut()) {
+                        if let Value::Object(map) = item {
+                            match &m.kind {
+                                Kind::Sticker { url } => {
+                                    map.insert(
+                                        "sticker_url".to_owned(),
+                                        url.clone().map_or(Value::Null, Value::String),
+                                    );
+                                    map.insert("contact_card".to_owned(), Value::Null);
+                                }
+                                Kind::ContactCard(card) => {
+                                    map.insert("sticker_url".to_owned(), Value::Null);
+                                    map.insert(
+                                        "contact_card".to_owned(),
+                                        json!({
+                                            "name": card.name,
+                                            "uid": card.uid,
+                                            "avatar": card.avatar,
+                                            "phone": card.phone,
+                                        }),
+                                    );
+                                }
+                                _ => {
+                                    map.insert("sticker_url".to_owned(), Value::Null);
+                                    map.insert("contact_card".to_owned(), Value::Null);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(store_arc) = host.attached_store()
+            && let Some(Value::Object(store_obj)) = obj.get_mut("store")
+            && let Some(Value::Object(prefs_obj)) = store_obj.get_mut("prefs")
+        {
+            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+            let recent_val = store
+                .get_preference_data("recentStickers")
+                .ok()
+                .flatten()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .unwrap_or_else(|| Value::Array(Vec::new()));
+            prefs_obj.insert("recent_stickers".to_owned(), recent_val);
+            let suggest_val = store
+                .get_preference_data("stickerSuggest")
+                .ok()
+                .flatten()
+                .and_then(|bytes| serde_json::from_slice::<bool>(&bytes).ok())
+                .map_or(Value::Null, Value::Bool);
+            prefs_obj.insert("sticker_suggest".to_owned(), suggest_val);
+        }
+        obj.insert(
+            "sticker_suggest_state".to_owned(),
+            encode_suggest_setting(full.sticker_suggest_setting),
+        );
+        obj.insert(
+            "composer_confirm".to_owned(),
+            full.composer_confirm
+                .as_ref()
+                .map_or(Value::Null, encode_composer_confirm),
+        );
+        obj.insert(
+            "queued_composer_confirms".to_owned(),
+            Value::Array(
+                full.queued_composer_confirms
+                    .iter()
+                    .map(encode_composer_confirm)
+                    .collect(),
+            ),
+        );
+        obj.insert("results".to_owned(), Value::Object(results.clone()));
+    }
     Some(Value::Object(obj))
 }
 
@@ -5434,7 +6152,10 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let is_u16 = case.domain == "notify";
     let is_u8 = case.domain == "forward";
     let is_u12 = case.domain == "polls";
-    let is_u6 = case.domain == "message_actions" || is_u8 || is_u16;
+    let is_u11 = case.domain == "cloud";
+    let is_u13 = case.domain == "stickers";
+    let is_u14 = case.domain == "search";
+    let is_u6 = case.domain == "message_actions" || is_u8 || is_u11 || is_u13 || is_u14 || is_u16;
     let is_u5 = case.domain == "send" || is_u6 || is_u12;
     let is_u4 = case.domain == "bootstrap" || case.domain == "messages" || is_u5;
     let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions" || is_u4;
@@ -5493,11 +6214,12 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         client.seed_next_client_id(next_cid);
     }
 
-    let base_host = RecordingHost::from_seed_with_all_modes(
+    let base_host = RecordingHost::from_seed_with_u13_modes(
         &case.seed,
         is_u3,
         is_u4,
         is_u6,
+        is_u13,
         is_u16,
         temp_dir.as_ref().map(|d| d.path().to_path_buf()),
     );
@@ -5613,6 +6335,19 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                     }
                 }
             }
+        }
+    }
+    if is_u13 {
+        if let Some(active_val) = &case.seed.composer_confirm
+            && !active_val.is_null()
+        {
+            initial_state.composer.active_confirm = decode_composer_confirm(active_val);
+        }
+        if let Some(queued_arr) = &case.seed.queued_composer_confirms {
+            initial_state.composer.queued_confirms = queued_arr
+                .iter()
+                .filter_map(decode_composer_confirm)
+                .collect();
         }
     }
     if is_u12 {
@@ -5824,6 +6559,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     host.bind_u16_handles(Arc::clone(&client), Arc::clone(&core));
 
     let mut snapshots = BTreeMap::new();
+    let mut results = Map::<String, Value>::new();
     let mut host_cursor = 0usize;
     let mut last_send_result: Option<bool> = None;
     let mut prune_next_expiry_ms: Option<i64> = None;
@@ -5833,6 +6569,8 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let mut u16_results: Map<String, Value> = Map::new();
     let mut pending_watch_task: Option<(usize, tokio::task::JoinHandle<Value>)> = None;
     let mut u12_results: BTreeMap<String, Value> = BTreeMap::new();
+
+    let mut search_results: Map<String, Value> = Map::new();
     let mut selection: Option<TestSelection> = None;
     let mut forward_results: Map<String, Value> = Map::new();
 
@@ -6392,6 +7130,86 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         .await
                         .map_err(|_| format!("timed out awaiting typing expiry for `{id}`"))?;
                 }
+                "search" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let query = str_arg(args, "query");
+                    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(50);
+                    let (hits, _ver) = core.search_messages(conv_id, query, limit).await;
+                    search_results.insert(
+                        step_index.to_string(),
+                        Value::Array(hits.into_iter().map(|m| Value::String(m.id)).collect()),
+                    );
+                }
+                "ensure_loaded" => {
+                    if is_u11 {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                    let conv_id = str_arg(args, "conv_id");
+                    let target = if let Some(msg_json) = args.get("message") {
+                        decode_step_message(msg_json, &conv_id)
+                    } else if let Some(msg_id) = args.get("msg_id").and_then(Value::as_str) {
+                        let mem_hit = core.full_snapshot().await.and_then(|snap| {
+                            snap.messages.windows.get(&conv_id).and_then(|list| {
+                                list.iter()
+                                    .find(|m| m.id == msg_id || m.client_id == msg_id)
+                                    .cloned()
+                            })
+                        });
+                        if mem_hit.is_some() {
+                            mem_hit
+                        } else if let Some(store_arc) = host.attached_store() {
+                            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                            store
+                                .message(&conv_id, msg_id)
+                                .ok()
+                                .flatten()
+                                .and_then(|row| olaz_core::decode_db_stored(&row))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let msg = target.ok_or_else(|| {
+                        "ensure_loaded could not resolve target message".to_owned()
+                    })?;
+                    let (loaded, _ver) = core.ensure_message_loaded(conv_id, msg).await;
+                    if is_u11 {
+                        let _ = core.settle().await;
+                        results.insert(step_index.to_string(), Value::Bool(loaded));
+                    }
+                    search_results.insert(step_index.to_string(), Value::Bool(loaded));
+                }
+                "load_quoted" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let mem_hit = core.full_snapshot().await.and_then(|snap| {
+                        snap.messages
+                            .windows
+                            .get(&conv_id)
+                            .and_then(|list| list.iter().find(|m| m.id == msg_id).cloned())
+                    });
+                    let target = if mem_hit.is_some() {
+                        mem_hit
+                    } else if let Some(store_arc) = host.attached_store() {
+                        let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                        store
+                            .message(&conv_id, &msg_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|row| olaz_core::decode_db_stored(&row))
+                    } else {
+                        None
+                    };
+                    let msg = target
+                        .ok_or_else(|| format!("load_quoted could not find msg_id `{msg_id}`"))?;
+                    let (quoted_id, _ver) = core.load_quoted_message(conv_id, msg).await;
+                    search_results.insert(
+                        step_index.to_string(),
+                        quoted_id.map_or(Value::Null, Value::String),
+                    );
+                }
                 "request_forward" => {
                     let conv_id = str_arg(args, "conv_id");
                     let msg_id = str_arg(args, "msg_id");
@@ -6700,12 +7518,32 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 }
                 "answer_confirm" => {
                     let ok = args.get("ok").and_then(Value::as_bool).unwrap_or(false);
-                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
-                    core.request_unit(Command::AnswerMessageConfirm { ok, now_ms: ts_ms })
-                        .await;
-                    if pending_send_task.is_none() && pending_action_task.is_none() {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    if is_u13 {
+                        let confirm_id = if let Some(explicit) = args
+                            .get("confirm")
+                            .and_then(|c| c.get("id"))
+                            .and_then(Value::as_str)
+                        {
+                            explicit.to_owned()
+                        } else {
+                            core.full_snapshot()
+                                .await
+                                .and_then(|s| s.composer_confirm)
+                                .map(|c| c.id)
+                                .unwrap_or_default()
+                        };
+                        core.request_unit(Command::AnswerComposerConfirm { confirm_id, ok })
+                            .await;
+                        tokio::task::yield_now().await;
+                        tokio::task::yield_now().await;
+                    } else {
+                        let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                        core.request_unit(Command::AnswerMessageConfirm { ok, now_ms: ts_ms })
+                            .await;
+                        if pending_send_task.is_none() && pending_action_task.is_none() {
+                            let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
+                                .await;
+                        }
                     }
                 }
                 "star" => {
@@ -7505,6 +8343,229 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                     let check_results = run_u12_poll_model_checks(checks, &core).await;
                     u12_results.insert(step_index.to_string(), check_results);
                 }
+                // U11 cloud domain commands
+                "refresh_cloud" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    host.record("refresh_cloud", json!({}));
+                    core.request_unit(Command::RefreshCloud).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "cloud_list" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let conv_id = args
+                        .get("conv_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let kind = args
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .and_then(CloudItemKind::from_raw);
+                    let sort_by_size = args
+                        .get("sort_by_size")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let ascending = args
+                        .get("ascending")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let offset = args.get("offset").and_then(Value::as_i64).unwrap_or(0);
+                    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(60);
+                    let page = core
+                        .request_cloud_page(Command::CloudList {
+                            conv_id,
+                            kind,
+                            sort_by_size,
+                            ascending,
+                            offset,
+                            limit,
+                        })
+                        .await;
+                    results.insert(step_idx.to_string(), encode_cloud_page(&page));
+                }
+                "cloud_fetch" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let key = str_arg(args, "key");
+                    let fetch = core.request_cloud_fetch(Command::CloudFetch { key }).await;
+                    results.insert(step_idx.to_string(), encode_cloud_fetch(&fetch));
+                }
+                "cloud_thumbnail" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let key = str_arg(args, "key");
+                    let thumb = core
+                        .request_media_resolution(Command::CloudThumbnail { key })
+                        .await;
+                    results.insert(step_idx.to_string(), encode_media_resolution(&thumb));
+                }
+                "cloud_delete" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let keys = str_vec_arg(args, "keys");
+                    let res = core
+                        .request_cloud_action(Command::CloudDelete { keys })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    results.insert(step_idx.to_string(), encode_cloud_action_result(&res));
+                }
+                "cloud_set_offload" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let enabled = args
+                        .get("enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let res = core
+                        .request_cloud_action(Command::CloudSetOffload { enabled })
+                        .await;
+                    results.insert(step_idx.to_string(), encode_cloud_action_result(&res));
+                }
+                "reset_cloud" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    core.request_unit(Command::ResetCloud).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                // U13 stickers + composer side-actions commands
+                "sticker_tabs" => {
+                    let tabs = core.request_sticker_tabs().await;
+                    results.insert(step_index.to_string(), encode_sticker_tabs(tabs));
+                }
+                "stickers_in_tab" => {
+                    let id = args.get("id").and_then(Value::as_i64).unwrap_or(0);
+                    let list = core
+                        .request_sticker_entries(Command::StickersInTab { id })
+                        .await;
+                    results.insert(step_index.to_string(), encode_stickers(list));
+                }
+                "search_stickers" => {
+                    let text = str_arg(args, "text");
+                    let list = core
+                        .request_sticker_entries(Command::SearchStickers { text })
+                        .await;
+                    results.insert(step_index.to_string(), encode_stickers(list));
+                }
+                "typing_suggestions" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let text = str_arg(args, "text");
+                    let list = core
+                        .request_sticker_entries(Command::TypingStickerSuggestions {
+                            conv_id,
+                            text,
+                            is_e2ee: None,
+                        })
+                        .await;
+                    results.insert(step_index.to_string(), encode_stickers(list));
+                }
+                "send_sticker" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let st = args.get("sticker").unwrap_or(&Value::Null);
+                    let sticker = StickerEntry {
+                        cate_id: st.get("cate_id").and_then(Value::as_i64).unwrap_or(0),
+                        sticker_id: st.get("id").and_then(Value::as_i64).unwrap_or(0),
+                        url: st
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        animation: None,
+                    };
+                    let source = match args.get("source").and_then(Value::as_str) {
+                        Some("recent") => StickerSource::Recent,
+                        Some("search") => StickerSource::Search,
+                        Some("suggestion") => StickerSource::Suggestion,
+                        _ => StickerSource::Category,
+                    };
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    let client_id = client.next_client_id();
+                    let outcome = core
+                        .request_card_action(Command::SendSticker {
+                            conv_id,
+                            sticker,
+                            source,
+                            client_id,
+                            now_ms: ts_ms,
+                            is_e2ee: None,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    results.insert(step_index.to_string(), encode_card_action_outcome(&outcome));
+                }
+                "sticker_setting" => {
+                    let setting = core
+                        .request_sticker_suggest_setting(Command::StickerSetting)
+                        .await;
+                    results.insert(step_index.to_string(), encode_suggest_setting(setting));
+                }
+                "set_sticker_suggest" => {
+                    let enabled = args.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                    let setting = core
+                        .request_sticker_suggest_setting(Command::SetStickerSuggest { enabled })
+                        .await;
+                    results.insert(step_index.to_string(), encode_suggest_setting(setting));
+                }
+                "my_card" => {
+                    let info = core.request_my_card().await;
+                    results.insert(step_index.to_string(), encode_my_card(info));
+                }
+                "send_my_card" => {
+                    // Drain any in-flight boot HTTP/host work so `send_e2ee_contact_card`
+                    // lands deterministically after `start_bootstrap` in both Rust and Swift.
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let conv_id = str_arg(args, "conv_id");
+                    let with_phone = args
+                        .get("with_phone")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    let outcome = core
+                        .request_composer_outcome(Command::SendMyCard {
+                            conv_id,
+                            with_phone,
+                            client_id: None,
+                            now_ms: ts_ms,
+                            is_e2ee: None,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    results.insert(step_index.to_string(), encode_composer_outcome(&outcome));
+                }
+                "reminder_info" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let info = core.request_reminder_info(conv_id).await;
+                    results.insert(step_index.to_string(), encode_reminder_info(info));
+                }
+                "create_reminder" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let title = str_arg(args, "title");
+                    let start_ms = args.get("start_ms").and_then(Value::as_i64).unwrap_or(0);
+                    let repeat_mode = args.get("repeat").and_then(Value::as_i64).unwrap_or(0);
+                    let pin = args.get("pin").and_then(Value::as_bool).unwrap_or(false);
+                    let outcome = core
+                        .request_composer_outcome(Command::CreateReminder {
+                            conv_id,
+                            title,
+                            start_ms,
+                            repeat_mode,
+                            pin,
+                        })
+                        .await;
+                    results.insert(step_index.to_string(), encode_composer_outcome(&outcome));
+                }
+                "advance_confirm_ms" => {
+                    let ms = args.get("ms").and_then(Value::as_u64).unwrap_or(0);
+                    host.advance_confirm_ms(ms);
+                    tokio::task::yield_now().await;
+                    tokio::task::yield_now().await;
+                    let _ = core.settle().await;
+                }
+                "drop_confirms" => {
+                    core.request_unit(Command::DropComposerConfirms).await;
+                }
+                "composer_report" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let outcome = args
+                        .get("outcome")
+                        .map_or(ComposerOutcome::Done, decode_composer_outcome);
+                    core.request_unit(Command::ComposerReport { conv_id, outcome })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
                 other => return Err(format!("unknown step cmd: {other}")),
             },
             Step::Await {
@@ -7573,6 +8634,9 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         current_now_ms: baseline_now_ms,
                         is_u8,
                         is_u12,
+                        is_u11,
+                        is_u13,
+                        is_u14,
                         last_send_result,
                         send_logs: &send_logs,
                         prune_next_expiry_ms,
@@ -7583,6 +8647,8 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         u12_results: &u12_results,
                         watched_check_ids: case.seed.watched_check_ids.as_deref(),
                         seeded_member_cache: case.seed.group_member_cache.as_ref(),
+                        results: &results,
+                        search_results: &search_results,
                     },
                 )
                 .await
@@ -7641,6 +8707,9 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             current_now_ms: baseline_now_ms,
             is_u8,
             is_u12,
+            is_u11,
+            is_u13,
+            is_u14,
             last_send_result,
             send_logs: &send_logs,
             prune_next_expiry_ms,
@@ -7651,6 +8720,8 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             u12_results: &u12_results,
             watched_check_ids: case.seed.watched_check_ids.as_deref(),
             seeded_member_cache: case.seed.group_member_cache.as_ref(),
+            results: &results,
+            search_results: &search_results,
         },
     )
     .await

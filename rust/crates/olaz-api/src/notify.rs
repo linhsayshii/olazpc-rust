@@ -11,9 +11,8 @@
 //! - `respondReminderAPI` (`POST /api/board/topic/updateEventResponse`)
 //! - `fetchReminderRespondersAPI` (`GET /api/board/topic/listResponseEvent`)
 
-use crate::api::SendMessageResult;
 use olaz_net::{ApiRequest, Transport};
-use olaz_wire::{clean_group_id, is_group_id, strip_user_prefix};
+use olaz_wire::{clean_group_id, strip_user_prefix};
 use serde_json::{Value, json};
 
 use crate::api::{JsonObject, ZaloApi};
@@ -69,63 +68,6 @@ pub fn extract_suggested_sticker_rows(resp: &JsonObject) -> Vec<JsonObject> {
 }
 
 impl<T: Transport> ZaloApi<T> {
-    /// Swift `sendStickerAPI`: `POST /api/message/sticker` (1:1) or `/api/group/sticker` (group).
-    pub async fn send_sticker(
-        &self,
-        conv_id: &str,
-        cate_id: i32,
-        sticker_id: i32,
-        sticker_type: i32,
-    ) -> Result<SendMessageResult, ApiError> {
-        let is_group = is_group_id(conv_id);
-        let clean_id = if is_group {
-            clean_group_id(conv_id)
-        } else {
-            strip_user_prefix(conv_id)
-        };
-        let cli_int = self.client().next_client_id();
-        let cli_id = cli_int.to_string();
-        let mut payload = json!({
-            "stickerId": sticker_id,
-            "cateId": cate_id,
-            "type": sticker_type,
-            "clientId": cli_int,
-            "zsource": 101,
-            "imei": self.client().imei(),
-            "ttl": 0,
-        });
-        if let Some(obj) = payload.as_object_mut() {
-            if is_group {
-                obj.insert("grid".to_owned(), Value::String(clean_id));
-            } else {
-                obj.insert("toid".to_owned(), Value::String(clean_id));
-            }
-        }
-        let (service, path) = if is_group {
-            ("group", "/api/group/sticker")
-        } else {
-            ("chat", "/api/message/sticker")
-        };
-        let resp = self
-            .post(ApiRequest::new(service, path).payload(payload))
-            .await?;
-        let msg_id = resp
-            .get("data")
-            .and_then(Value::as_object)
-            .and_then(|d| d.get("msgId"))
-            .map(|v| olaz_json::string(Some(v)))
-            .unwrap_or_default();
-        Ok(SendMessageResult {
-            msg_id: if msg_id.is_empty() {
-                cli_id.clone()
-            } else {
-                msg_id
-            },
-            cli_msg_id: cli_id,
-            ts_ms: 0,
-        })
-    }
-
     /// Swift `setMuteAPI`: `POST /api/social/profile/setmute`.
     pub async fn set_mute(
         &self,
@@ -147,23 +89,6 @@ impl<T: Transport> ZaloApi<T> {
         self.post(ApiRequest::new("profile", "/api/social/profile/setmute").payload(payload))
             .await?;
         Ok(())
-    }
-
-    /// Swift `suggestStickersAPI`: `GET /api/message/sticker/suggest/stickers`.
-    pub async fn suggest_stickers(&self, keyword: &str) -> Result<Vec<JsonObject>, ApiError> {
-        let resp = self
-            .get(
-                ApiRequest::new("sticker", "/api/message/sticker/suggest/stickers").payload(
-                    json!({
-                        "keyword": keyword,
-                        "gif": 1,
-                        "guggy": 0,
-                        "imei": self.imei(),
-                    }),
-                ),
-            )
-            .await?;
-        Ok(extract_suggested_sticker_rows(&resp))
     }
 
     /// Swift `sendFriendRequestAPI`: `POST /api/friend/sendreq` (`reqsrc: 30` kept per user decision 16.5).

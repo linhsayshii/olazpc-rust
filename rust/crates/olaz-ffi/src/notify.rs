@@ -233,14 +233,7 @@ pub(crate) fn alias_map_to_records(map: BTreeMap<String, String>) -> Vec<AliasEn
 
 // --- Card action, sticker suggest, contact/friend, invite, reminder records ---
 
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
-pub enum CardActionOutcomeRecord {
-    Done,
-    Unsupported { text: String },
-    Locked { text: String },
-    Failed { text: String },
-    Pending { text: String },
-}
+use crate::core::CardActionOutcomeRecord;
 
 impl From<CardActionOutcomeData> for CardActionOutcomeRecord {
     fn from(d: CardActionOutcomeData) -> Self {
@@ -262,6 +255,11 @@ impl From<CardActionOutcomeRecord> for CardActionOutcomeData {
             CardActionOutcomeRecord::Locked { text } => Self::Locked(text),
             CardActionOutcomeRecord::Failed { text } => Self::Failed(text),
             CardActionOutcomeRecord::Pending { text } => Self::Pending(text),
+            CardActionOutcomeRecord::OpenChat { .. }
+            | CardActionOutcomeRecord::OpenProfile { .. }
+            | CardActionOutcomeRecord::OpenUrl { .. }
+            | CardActionOutcomeRecord::Copy { .. }
+            | CardActionOutcomeRecord::Present => Self::Done,
         }
     }
 }

@@ -1293,6 +1293,35 @@ enum StickerRecorderHarness {
             }
         }
 
+        let e2eeContactCardQueue = scenario.seed["host_results"]?["send_e2ee_contact_card"]?.arrayValue ?? []
+        let hasScriptedContactCard = scenario.seed["host_results"]?["send_e2ee_contact_card"] != nil
+        var e2eeContactCardIndex = 0
+        engine.sendE2EEContactCardHostHandler = { args in
+            let cliId = args["client_id"] as? String ?? ""
+            if hasScriptedContactCard {
+                guard e2eeContactCardIndex < e2eeContactCardQueue.count else {
+                    throw ZaloSessionError(code: 500, message: "No scripted send_e2ee_contact_card result", url: "/api/e2ee/pc/message/forward")
+                }
+                let item = e2eeContactCardQueue[e2eeContactCardIndex]
+                e2eeContactCardIndex += 1
+                if let errObj = item["error"]?.objectValue {
+                    let code = Int(errObj["code"]?.int64Value ?? 500)
+                    let msg = errObj["message"]?.stringValue ?? "E2EE error"
+                    let url = errObj["url"]?.stringValue ?? "/api/e2ee/pc/message/forward"
+                    throw ZaloSessionError(code: code, message: msg, url: url)
+                }
+                if let errMsg = item["error"]?.stringValue {
+                    throw ZaloSessionError(code: 500, message: errMsg, url: "/api/e2ee/pc/message/forward")
+                }
+                let msgId = item["msg_id"]?.stringValue ?? cliId
+                let cliMsgId = item["cli_msg_id"]?.stringValue ?? cliId
+                let tsMs = item["ts_ms"]?.int64Value ?? 0
+                return SendMessageResult(msgId: msgId, cliMsgId: cliMsgId, tsMs: tsMs)
+            }
+            // Deterministic fallback when unscripted (matches Rust test harness for U13 item 13.3).
+            return SendMessageResult(msgId: cliId, cliMsgId: cliId, tsMs: 0)
+        }
+
         var bootstrapLogs: [String] = []
         var sendLogs: [String] = []
         var actionLogs: [String] = []
@@ -1470,6 +1499,12 @@ enum StickerRecorderHarness {
                               let withPhone = args?["with_phone"]?.boolValue else {
                             throw RecorderError.invalidStep(scenario: scenario.name, detail: "send_my_card requires conv_id and with_phone")
                         }
+                        if engine.phase == .ready {
+                            try await waitForCondition(timeoutMs: 5000, description: "boot idle (start_bootstrap) before send_my_card") {
+                                hostCalls.contains { $0["call"]?.stringValue == "start_bootstrap" }
+                            }
+                            await engine.settleForRecording()
+                        }
                         let outcome = await engine.sendMyCard(to: convId, withPhone: withPhone)
                         await engine.settleForRecording()
                         results["\(stepIndex)"] = normalizeRecordedURLs(StickerSnapshot.encodeComposerOutcome(outcome))
@@ -1504,18 +1539,26 @@ enum StickerRecorderHarness {
                         guard let confirm else {
                             throw RecorderError.invalidStep(scenario: scenario.name, detail: "answer_confirm has no active confirm")
                         }
+                        let expectsPromoteTimer = (engine.composerConfirm?.id == confirm.id) && !engine.queuedComposerConfirms.isEmpty
                         engine.answerComposerConfirm(confirm, ok: ok)
-                        await Task.yield()
-                        await Task.yield()
+                        await engine.settleForRecording()
+                        if expectsPromoteTimer {
+                            await confirmClock.waitForTimerRegistration()
+                        }
                     case "advance_confirm_ms":
                         guard let ms = args?["ms"]?.int64Value else {
                             throw RecorderError.invalidStep(scenario: scenario.name, detail: "advance_confirm_ms requires args.ms")
                         }
-                        confirmClock.advance(by: ms)
-                        await Task.yield()
-                        await Task.yield()
+                        let fired = confirmClock.advance(by: ms)
+                        if fired {
+                            try await waitForCondition(timeoutMs: 2000, description: "composer confirm promotion") {
+                                engine.composerConfirm != nil
+                            }
+                        }
+                        await engine.settleForRecording()
                     case "drop_confirms":
                         engine.dropComposerConfirms()
+                        await engine.settleForRecording()
                     case "composer_report":
                         let convId = args?["conv_id"]?.stringValue ?? ""
                         let outcomeObj = args?["outcome"]?.toFoundation() as? [String: Any]
@@ -1875,6 +1918,7 @@ private final class VirtualConfirmClock {
 
     var currentMs: Int64 = 1_700_000_000_000
     private var timers: [TimerEntry] = []
+    private var registrationWaiters: [CheckedContinuation<Void, Never>] = []
 
     func sleep(ms: Int) async -> Bool {
         let targetMs = currentMs + Int64(ms)
@@ -1885,6 +1929,9 @@ private final class VirtualConfirmClock {
                     cont.resume(returning: false)
                 } else {
                     self.timers.append(TimerEntry(id: timerId, fireAtMs: targetMs, cont: cont))
+                    let waiters = self.registrationWaiters
+                    self.registrationWaiters.removeAll()
+                    for w in waiters { w.resume() }
                 }
             }
         } onCancel: {
@@ -1897,7 +1944,19 @@ private final class VirtualConfirmClock {
         }
     }
 
-    func advance(by ms: Int64) {
+    func waitForTimerRegistration() async {
+        if !timers.isEmpty { return }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            if !self.timers.isEmpty {
+                cont.resume()
+            } else {
+                self.registrationWaiters.append(cont)
+            }
+        }
+    }
+
+    @discardableResult
+    func advance(by ms: Int64) -> Bool {
         currentMs += ms
         var ready: [TimerEntry] = []
         var kept: [TimerEntry] = []
@@ -1912,6 +1971,7 @@ private final class VirtualConfirmClock {
         for entry in ready {
             entry.cont.resume(returning: true)
         }
+        return !ready.isEmpty
     }
 
     func cancelAll() {
@@ -1920,6 +1980,9 @@ private final class VirtualConfirmClock {
         for entry in pending {
             entry.cont.resume(returning: false)
         }
+        let waiters = registrationWaiters
+        registrationWaiters.removeAll()
+        for w in waiters { w.resume() }
     }
 }
 

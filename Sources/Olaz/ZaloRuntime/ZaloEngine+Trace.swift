@@ -81,6 +81,7 @@ extension ZaloEngine {
         hostTrace = nil
         sendE2EETextHostHandler = nil
         sendE2EEStickerHostHandler = nil
+        sendE2EEContactCardHostHandler = nil
         resolveMediaHostHandler = nil
         resolveFileHostHandler = nil
         fetchMediaDataHostHandler = nil
@@ -111,19 +112,19 @@ extension ZaloEngine {
         deleteUndoTimerTask = nil
         messageActionTasks.values.forEach { $0.cancel() }
         messageActionTasks.removeAll()
-        optimisticOverlayFenceTasks.values.forEach { $0.cancel() }
-        optimisticOverlayFenceTasks.removeAll()
         contactsTasks.values.forEach { $0.cancel() }
         contactsTasks.removeAll()
         pollDebounceSleep = nil
-        composerConfirmSleep = nil
-        composerConfirmTask?.cancel()
-        composerConfirmTask = nil
         resetPolls()
         pollRefreshTasks.values.forEach { $0.cancel() }
         pollRefreshTasks.removeAll()
         cloudRefreshTask?.cancel()
         cloudRefreshTask = nil
+        optimisticOverlayFenceTasks.values.forEach { $0.cancel() }
+        optimisticOverlayFenceTasks.removeAll()
+        composerConfirmSleep = nil
+        composerConfirmTask?.cancel()
+        composerConfirmTask = nil
         notifyBannerHook = nil
         requestNotifAuthHostHandler = nil
         notificationCalendar = .current

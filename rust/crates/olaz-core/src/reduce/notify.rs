@@ -1203,7 +1203,7 @@ fn handle_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                 "xin chào".to_owned()
             };
             out.effects
-                .push(Effect::SuggestStickersApi { op_id, keyword });
+                .push(Effect::CardSuggestStickersApi { op_id, keyword });
         }
 
         Command::ContactCardState { uid } => {

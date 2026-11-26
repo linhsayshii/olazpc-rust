@@ -34,6 +34,10 @@ import Testing
             cachedProfiles: nil,
             notificationSettings: nil,
             aliases: nil
+            cloud: nil,
+            stickerSuggest: nil,
+            composerConfirm: nil,
+            queuedComposerConfirms: nil
         )
     }
 

@@ -265,6 +265,9 @@ for DOMAIN in "${DOMAINS[@]}"; do
         polls)
             RECORDER_FILTER="PollRecorderTests"
             ;;
+        stickers)
+            RECORDER_FILTER="StickerRecorderTests"
+            ;;
         *)
             RECORDER_FILTER="${DOMAIN_CAP}RecorderTests"
             ;;

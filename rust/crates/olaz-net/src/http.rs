@@ -164,6 +164,11 @@ impl RequestOptions {
         self.timeout = Some(timeout);
         self
     }
+
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_headers.push((name.into(), value.into()));
+        self
+    }
 }
 
 /// True for hosts that receive the `zpw_sek` cookie (`zalo.me`, `zaloapp.com`, `zadn.vn`).

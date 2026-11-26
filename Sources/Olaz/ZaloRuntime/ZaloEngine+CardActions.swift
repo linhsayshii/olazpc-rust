@@ -24,13 +24,7 @@ extension ZaloEngine {
     }
 
     nonisolated internal static func mapCardActionOutcomeRecord(_ rec: CardActionOutcomeRecord) -> CardActionOutcome {
-        switch rec {
-        case .done: .done
-        case .unsupported(let text): .unsupported(text)
-        case .locked(let text): .locked(text)
-        case .failed(let text): .failed(text)
-        case .pending(let text): .pending(text)
-        }
+        CardActionOutcome(coreRecord: rec)
     }
 
     nonisolated internal static func mapCardActionOutcomeToRecord(_ outcome: CardActionOutcome) -> CardActionOutcomeRecord {

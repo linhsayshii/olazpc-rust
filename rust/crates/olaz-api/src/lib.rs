@@ -16,6 +16,7 @@
 
 mod api;
 mod autodelete;
+mod cloud;
 mod conversations;
 mod e2ee;
 mod error;
@@ -26,6 +27,8 @@ mod messaging;
 mod notify;
 mod poll;
 mod profiles;
+mod reminders;
+mod stickers;
 mod util;
 
 #[cfg(test)]
@@ -36,6 +39,7 @@ pub use autodelete::{
     AUTO_DELETE_OPTIONS, AutoDeleteFetchOutcome, auto_delete_label, auto_delete_remaining,
     build_update_auto_delete_payload, parse_auto_delete_settings,
 };
+pub use cloud::{CloudPlanKind, CloudServerSnapshot, parse_cloud_usage_snapshot};
 pub use conversations::{
     HiddenConversationsSnapshot, PollOutcome, parse_hidden_conversations_response,
     received_friend_request_rows,
@@ -52,6 +56,11 @@ pub use messaging::{
 };
 pub use notify::{build_set_mute_payload, extract_suggested_sticker_rows};
 pub use poll::{PollQueueCursor, PollState};
+pub use reminders::{CreateReminderParams, build_create_reminder_request};
+pub use stickers::{
+    FetchedStickerCategories, SendStickerParams, StickerCategoryRow, build_send_sticker_request,
+    builtin_sticker_pack, parse_sticker_catalog_bytes,
+};
 
 // U12 (polls + shared group metadata helper for U10)
 pub use group_polls::{

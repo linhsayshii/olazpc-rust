@@ -985,8 +985,13 @@ extension ZaloEngine {
 
         let oneOneGlobalIds = protoConvs.filter { !$0.isGroup }.map(\.globalId)
         let decryptedOneOne = await sessionClient.decryptGlobalIds(oneOneGlobalIds)
+        var nextGlobalIds = cachedFriendGlobalIds
+        nextGlobalIds.reserveCapacity(nextGlobalIds.count + decryptedOneOne.count)
         for (gid, uid) in decryptedOneOne {
-            cachedFriendGlobalIds[uid] = gid
+            nextGlobalIds[uid] = gid
+        }
+        if nextGlobalIds != cachedFriendGlobalIds {
+            cachedFriendGlobalIds = nextGlobalIds
         }
         await persistGlobalIdCacheToSQLite()
 
