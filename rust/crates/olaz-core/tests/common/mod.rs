@@ -3294,7 +3294,9 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let mut initial_state = CoreState::default();
     initial_state.session.prefs = case.seed.prefs.clone();
     if is_u3 {
-        initial_state.conversations.identities = host.current_identities();
+        initial_state
+            .contacts
+            .apply_identity_table(host.current_identities());
         initial_state.conversations.open_conversation_id = case
             .seed
             .open_conversation_id

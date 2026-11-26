@@ -429,6 +429,10 @@ impl From<ContactsStateRecord> for ContactsState {
                 .into_iter()
                 .map(|p| (p.key, p.value))
                 .collect(),
+            aliases: std::collections::BTreeMap::new(),
+            cached_profiles: std::collections::BTreeMap::new(),
+            cached_groups: std::collections::BTreeMap::new(),
+            activity_ranks: std::collections::BTreeMap::new(),
         }
     }
 }

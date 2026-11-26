@@ -58,7 +58,7 @@ impl CoreState {
             .profile
             .as_ref()
             .and_then(|p| p.avatar.as_deref());
-        IdentitySnapshot::from_core(my_uid, my_avatar, &self.conversations)
+        IdentitySnapshot::from_core(my_uid, my_avatar, &self.conversations, &self.contacts)
     }
 }
 

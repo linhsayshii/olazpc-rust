@@ -956,7 +956,7 @@ impl CoreOfflineConversations {
     ) {
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let (state, _) = &mut *guard;
-        state.conversations.identities = identities.into();
+        state.contacts.apply_identity_table(identities.into());
         state.conversations.open_conversation_id = open_conv_id;
         state.session.self_conversation_id = self_conv_id;
         if !my_uid.is_empty() {

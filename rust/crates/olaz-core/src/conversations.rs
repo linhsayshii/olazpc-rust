@@ -20,6 +20,8 @@ use olaz_wire::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::messages::ContactsState;
+
 /// Official bitmask flags of `ConversationActionFlags` (`ZaloEngine+ConversationActions.swift`).
 pub const FLAG_PINNED: i32 = 1;
 pub const FLAG_ARCHIVED: i32 = 2;
@@ -823,7 +825,6 @@ pub struct ConversationsState {
     pub ui: ConversationActionUI,
     pub extras: ConversationExtras,
     pub prompt: Option<ConversationPrompt>,
-    pub identities: IdentityTable,
     pub pinned_ids: BTreeSet<String>,
     pub archived_ids: BTreeSet<String>,
     pub unread_marks: BTreeSet<String>,
@@ -842,7 +843,6 @@ impl ConversationsState {
         self.ui.reset();
         self.extras = ConversationExtras::default();
         self.prompt = None;
-        self.identities = IdentityTable::default();
         self.pinned_ids.clear();
         self.archived_ids.clear();
         self.unread_marks.clear();
@@ -857,6 +857,7 @@ impl ConversationsState {
     #[must_use]
     pub fn lookup_person_info(
         &self,
+        contacts: &ContactsState,
         uid: &str,
         my_uid: &str,
         my_avatar: Option<&str>,
@@ -878,7 +879,7 @@ impl ConversationsState {
         }
         // Reverse lookup gid -> uid (first key matching value in BTreeMap order).
         if let Some(mapped_uid) = candidates.iter().find_map(|cand| {
-            self.identities
+            contacts
                 .friend_global_ids
                 .iter()
                 .find_map(|(u, g)| (g == cand).then(|| u.clone()))
@@ -898,13 +899,13 @@ impl ConversationsState {
         }
 
         for candidate in &candidates {
-            let alias = self.identities.aliases.get(candidate).map(String::as_str);
-            if let Some(f) = self.identities.friends.iter().find(|f| f.id == *candidate) {
+            let alias = contacts.aliases.get(candidate).map(String::as_str);
+            if let Some(f) = contacts.friends.iter().find(|f| f.id == *candidate) {
                 let avt = f
                     .avatar
                     .as_deref()
                     .or_else(|| {
-                        self.identities
+                        contacts
                             .cached_profiles
                             .get(candidate)
                             .map(|p| p.avatar.as_str())
@@ -917,7 +918,7 @@ impl ConversationsState {
                 };
                 return Some((name, avt));
             }
-            if let Some(p) = self.identities.cached_profiles.get(candidate) {
+            if let Some(p) = contacts.cached_profiles.get(candidate) {
                 let best = match alias {
                     Some(a) if !a.is_empty() => a,
                     _ => p.name.as_str(),
@@ -957,6 +958,7 @@ impl ConversationsState {
     #[must_use]
     pub fn mention_display_name(
         &self,
+        contacts: &ContactsState,
         uid: &str,
         my_uid: &str,
         my_avatar: Option<&str>,
@@ -965,7 +967,7 @@ impl ConversationsState {
         if clean.is_empty() || clean == "-1" || clean == strip_user_prefix(my_uid) {
             return None;
         }
-        let (raw_name, _) = self.lookup_person_info(&clean, my_uid, my_avatar)?;
+        let (raw_name, _) = self.lookup_person_info(contacts, &clean, my_uid, my_avatar)?;
         let name = raw_name.trim();
         if name.is_empty() || name == clean || name == "Bạn" || name == UNKNOWN_NAME {
             return None;
@@ -977,6 +979,7 @@ impl ConversationsState {
     #[must_use]
     pub fn lookup_conversation_identity(
         &self,
+        contacts: &ContactsState,
         conv_id: &str,
         self_conv_id: Option<&str>,
     ) -> (String, Option<String>, i64) {
@@ -984,10 +987,10 @@ impl ConversationsState {
             return ("Cloud của tôi".to_owned(), None, 0);
         }
         if is_group_id(conv_id) {
-            if let Some(g) = self.identities.groups.iter().find(|g| g.id == conv_id) {
+            if let Some(g) = contacts.groups.iter().find(|g| g.id == conv_id) {
                 return (g.name.clone(), g.avatar.clone(), g.members);
             }
-            if let Some(cg) = self.identities.cached_groups.get(conv_id) {
+            if let Some(cg) = contacts.cached_groups.get(conv_id) {
                 let name = if cg.name.is_empty() {
                     conv_id.to_owned()
                 } else {
@@ -1000,10 +1003,10 @@ impl ConversationsState {
         }
 
         let clean = strip_user_prefix(conv_id);
-        let alias = self.identities.aliases.get(&clean).map(String::as_str);
-        if let Some(f) = self.identities.friends.iter().find(|f| f.id == clean) {
+        let alias = contacts.aliases.get(&clean).map(String::as_str);
+        if let Some(f) = contacts.friends.iter().find(|f| f.id == clean) {
             let avt = f.avatar.clone().or_else(|| {
-                self.identities
+                contacts
                     .cached_profiles
                     .get(&clean)
                     .and_then(|p| (!p.avatar.is_empty()).then(|| p.avatar.clone()))
@@ -1014,7 +1017,7 @@ impl ConversationsState {
             };
             return (name, avt, 0);
         }
-        if let Some(p) = self.identities.cached_profiles.get(&clean) {
+        if let Some(p) = contacts.cached_profiles.get(&clean) {
             let best_name = match alias {
                 Some(a) if !a.is_empty() => a.to_owned(),
                 _ => p.name.clone(),
@@ -1071,7 +1074,11 @@ impl ConversationsState {
 
     /// Recomputes `extras` (stranger box, filtered list ids) (`rebuildConversationExtras`).
     /// Returns `true` if `extras` changed.
-    pub fn rebuild_conversation_extras(&mut self, self_conv_id: Option<&str>) -> bool {
+    pub fn rebuild_conversation_extras(
+        &mut self,
+        contacts: &ContactsState,
+        self_conv_id: Option<&str>,
+    ) -> bool {
         let mut next = self.extras.clone();
         next.loaded = true;
         next.archived_enabled = true;
@@ -1081,12 +1088,7 @@ impl ConversationsState {
             .iter()
             .filter(|c| !self.actions.is_hidden(&c.id))
             .collect();
-        let friend_ids: BTreeSet<&str> = self
-            .identities
-            .friends
-            .iter()
-            .map(|f| f.id.as_str())
-            .collect();
+        let friend_ids: BTreeSet<&str> = contacts.friends.iter().map(|f| f.id.as_str()).collect();
 
         let mut computed_strangers = BTreeSet::new();
         let mut stranger_folder = Vec::new();
@@ -1094,7 +1096,7 @@ impl ConversationsState {
         let mut unread_stranger_messages = 0_i64;
         let mut newest_stranger_id: Option<String> = None;
 
-        if self.identities.friends_loaded {
+        if contacts.friends_loaded {
             for conv in &visible {
                 if conv.is_group
                     || self_conv_id == Some(conv.id.as_str())
@@ -1188,6 +1190,7 @@ impl ConversationsState {
     /// Hydrates local state loaded from SQLite during `prepare_store` (`loadLocalAccountState`).
     pub fn hydrate_from_local(
         &mut self,
+        contacts: &mut ContactsState,
         data: LocalAccountHydration,
         my_uid: &str,
         my_avatar: Option<&str>,
@@ -1197,26 +1200,26 @@ impl ConversationsState {
         self.archived_ids = data.archived_ids.into_iter().collect();
         self.unread_marks = data.unread_marks.into_iter().collect();
         if !data.aliases.is_empty() {
-            self.identities.aliases = data.aliases;
+            contacts.aliases = data.aliases;
         }
         if !data.cached_profiles.is_empty() {
-            self.identities.cached_profiles = data.cached_profiles;
+            contacts.cached_profiles = data.cached_profiles;
         }
         if !data.cached_groups.is_empty() {
-            self.identities.cached_groups = data.cached_groups;
+            contacts.cached_groups = data.cached_groups;
         }
         if !data.activity_ranks.is_empty() {
-            self.identities.activity_ranks = data.activity_ranks;
+            contacts.activity_ranks = data.activity_ranks;
         }
         for (uid, gid) in data.friend_global_ids {
-            self.identities.friend_global_ids.insert(uid, gid);
+            contacts.friend_global_ids.insert(uid, gid);
         }
 
         let mut summaries: Vec<ConversationSummary> = data
             .conversations
             .into_iter()
             .map(|c| {
-                let ident = self.lookup_conversation_identity(&c.id, self_conv_id);
+                let ident = self.lookup_conversation_identity(contacts, &c.id, self_conv_id);
                 let effective_name = if !ident.0.is_empty() && ident.0 != c.id {
                     ident.0
                 } else if c.name.is_empty() {
@@ -1250,11 +1253,16 @@ impl ConversationsState {
                 }
             })
             .collect();
-        sort_conversations(&mut summaries, &self.identities.activity_ranks);
+        sort_conversations(&mut summaries, &contacts.activity_ranks);
         self.conversations = summaries;
 
         // Refresh @mention previews from the latest stored message per group conversation.
-        self.apply_mention_preview_messages(&data.group_latest_messages, my_uid, my_avatar);
+        self.apply_mention_preview_messages(
+            contacts,
+            &data.group_latest_messages,
+            my_uid,
+            my_avatar,
+        );
 
         self.hidden_pin_hash = data.hidden_pin_hash.filter(|s| !s.is_empty());
         self.hidden_pin_md5 = data.hidden_pin_md5.filter(|s| !s.is_empty());
@@ -1271,13 +1279,14 @@ impl ConversationsState {
         if !data.labels.is_empty() {
             self.set_labels_in_memory(data.labels);
         }
-        self.rebuild_conversation_extras(self_conv_id);
+        self.rebuild_conversation_extras(contacts, self_conv_id);
     }
 
     /// Rewrites in-memory group previews whose text contains `@` and matches `message_preview_label(latest)`.
     /// Does NOT persist to SQLite (matches Swift `refreshMentionPreviews`).
     pub fn apply_mention_preview_messages(
         &mut self,
+        contacts: &ContactsState,
         latest_by_conv: &BTreeMap<String, MessagePreviewInput>,
         my_uid: &str,
         my_avatar: Option<&str>,
@@ -1305,7 +1314,7 @@ impl ConversationsState {
                 continue;
             }
             let renamed = conversation_preview_text_for_input(latest, |uid| {
-                self.mention_display_name(uid, my_uid, my_avatar)
+                self.mention_display_name(contacts, uid, my_uid, my_avatar)
             });
             if renamed != preview.text {
                 replacements.push((idx, renamed));
@@ -1325,7 +1334,11 @@ impl ConversationsState {
     /// Merges self conversation, groups, pinned ids, and ranked active threads into `conversations`
     /// and updates metadata from contacts/aliases/groups (`ensureKnownContactsInConversations`).
     /// Returns `true` if `conversations` changed.
-    pub fn ensure_known_contacts(&mut self, self_conv_id: Option<&str>) -> bool {
+    pub fn ensure_known_contacts(
+        &mut self,
+        contacts: &ContactsState,
+        self_conv_id: Option<&str>,
+    ) -> bool {
         let mut existing: HashMap<String, ConversationSummary> = self
             .conversations
             .iter()
@@ -1352,7 +1365,7 @@ impl ConversationsState {
             );
         }
 
-        for grp in &self.identities.groups {
+        for grp in &contacts.groups {
             if !existing.contains_key(&grp.id) {
                 existing.insert(
                     grp.id.clone(),
@@ -1372,7 +1385,7 @@ impl ConversationsState {
 
         for pinned_id in &self.pinned_ids {
             if !existing.contains_key(pinned_id) {
-                let info = self.lookup_conversation_identity(pinned_id, self_conv_id);
+                let info = self.lookup_conversation_identity(contacts, pinned_id, self_conv_id);
                 existing.insert(
                     pinned_id.clone(),
                     ConversationSummary {
@@ -1393,24 +1406,20 @@ impl ConversationsState {
             }
         }
 
-        let known_group_set: BTreeSet<&str> = self
-            .identities
-            .groups
-            .iter()
-            .map(|g| g.id.as_str())
-            .collect();
-        for (active_id, &rank) in &self.identities.activity_ranks {
+        let known_group_set: BTreeSet<&str> =
+            contacts.groups.iter().map(|g| g.id.as_str()).collect();
+        for (active_id, &rank) in &contacts.activity_ranks {
             if rank <= 0 || existing.contains_key(active_id) {
                 continue;
             }
             let is_grp = is_group_id(active_id);
             if is_grp
                 && !known_group_set.contains(active_id.as_str())
-                && !self.identities.groups.is_empty()
+                && !contacts.groups.is_empty()
             {
                 continue;
             }
-            let info = self.lookup_conversation_identity(active_id, self_conv_id);
+            let info = self.lookup_conversation_identity(contacts, active_id, self_conv_id);
             existing.insert(
                 active_id.clone(),
                 ConversationSummary {
@@ -1433,7 +1442,7 @@ impl ConversationsState {
         // Apply updated friend/alias/group metadata to existing entries.
         let ids: Vec<String> = existing.keys().cloned().collect();
         for id in ids {
-            let info = self.lookup_conversation_identity(&id, self_conv_id);
+            let info = self.lookup_conversation_identity(contacts, &id, self_conv_id);
             if let Some(summary) = existing.get_mut(&id) {
                 if !info.0.is_empty() && summary.name != info.0 {
                     summary.name = info.0;
@@ -1449,7 +1458,7 @@ impl ConversationsState {
         }
 
         let mut list: Vec<ConversationSummary> = existing.into_values().collect();
-        sort_conversations(&mut list, &self.identities.activity_ranks);
+        sort_conversations(&mut list, &contacts.activity_ranks);
         if list != self.conversations {
             self.conversations = list;
             true
@@ -1462,6 +1471,7 @@ impl ConversationsState {
     /// Returns `(conversations_changed, flags_changed, extras_changed)`.
     pub fn apply_batch_delta(
         &mut self,
+        contacts: &ContactsState,
         delta: &BatchApplyDelta,
         self_conv_id: Option<&str>,
     ) -> (bool, bool, bool) {
@@ -1480,7 +1490,7 @@ impl ConversationsState {
 
         for upd in &delta.updates {
             let is_grp = is_group_id(&upd.conv_id);
-            let info = self.lookup_conversation_identity(&upd.conv_id, self_conv_id);
+            let info = self.lookup_conversation_identity(contacts, &upd.conv_id, self_conv_id);
             let prev = ConversationPreview {
                 text: upd.preview_text.clone(),
                 date_ms: Some(upd.preview_date_ms),
@@ -1545,7 +1555,7 @@ impl ConversationsState {
         }
 
         let mut list: Vec<ConversationSummary> = by_id.into_values().collect();
-        sort_conversations(&mut list, &self.identities.activity_ranks);
+        sort_conversations(&mut list, &contacts.activity_ranks);
         let convs_changed = if list != self.conversations {
             self.conversations = list;
             true
@@ -1553,7 +1563,7 @@ impl ConversationsState {
             false
         };
         let flags_changed = self.rebuild_conversation_flags(self_conv_id);
-        let extras_changed = self.rebuild_conversation_extras(self_conv_id);
+        let extras_changed = self.rebuild_conversation_extras(contacts, self_conv_id);
         (convs_changed, flags_changed, extras_changed)
     }
 
@@ -1561,6 +1571,7 @@ impl ConversationsState {
     /// Returns `true` if the conversation list mutated (caller should persist to SQLite).
     pub fn update_conversation_on_message(
         &mut self,
+        contacts: &ContactsState,
         input: &MessagePreviewInput,
         increment_unread: bool,
         my_uid: &str,
@@ -1569,7 +1580,7 @@ impl ConversationsState {
     ) -> bool {
         let is_grp = is_group_id(&input.conv_id);
         let preview_text = conversation_preview_text_for_input(input, |uid| {
-            self.mention_display_name(uid, my_uid, my_avatar)
+            self.mention_display_name(contacts, uid, my_uid, my_avatar)
         });
         let preview = ConversationPreview {
             text: preview_text,
@@ -1596,7 +1607,8 @@ impl ConversationsState {
             }
             list[idx] = item;
         } else {
-            let identity = self.lookup_conversation_identity(&input.conv_id, self_conv_id);
+            let identity =
+                self.lookup_conversation_identity(contacts, &input.conv_id, self_conv_id);
             list.push(ConversationSummary {
                 id: input.conv_id.clone(),
                 is_group: is_grp,
@@ -1612,10 +1624,10 @@ impl ConversationsState {
                 preview: Some(preview),
             });
         }
-        sort_conversations(&mut list, &self.identities.activity_ranks);
+        sort_conversations(&mut list, &contacts.activity_ranks);
         self.conversations = list;
         self.rebuild_conversation_flags(self_conv_id);
-        self.rebuild_conversation_extras(self_conv_id);
+        self.rebuild_conversation_extras(contacts, self_conv_id);
         true
     }
 
@@ -1645,7 +1657,11 @@ impl ConversationsState {
 
     /// Applies one chunk of fetched profile rows (`resolveMissingConversationNames` loop body).
     /// Returns `(profiles_cache_changed, conversations_changed)`.
-    pub fn apply_resolved_profiles(&mut self, profiles_map: &Map<String, Value>) -> (bool, bool) {
+    pub fn apply_resolved_profiles(
+        &mut self,
+        contacts: &mut ContactsState,
+        profiles_map: &Map<String, Value>,
+    ) -> (bool, bool) {
         if profiles_map.is_empty() {
             return (false, false);
         }
@@ -1658,7 +1674,7 @@ impl ConversationsState {
             let fetched_name = preferred_profile_name(row);
             let avt = string(row.get("avatar").or_else(|| row.get("avt")));
             if !clean.is_empty() && (!fetched_name.is_empty() || !avt.is_empty()) {
-                self.identities.cached_profiles.insert(
+                contacts.cached_profiles.insert(
                     clean,
                     CachedProfile {
                         name: fetched_name,
@@ -1677,7 +1693,7 @@ impl ConversationsState {
             let Some(row) = profiles_map.get(&conv.id).and_then(Value::as_object) else {
                 continue;
             };
-            let alias = self.identities.aliases.get(&conv.id).map(String::as_str);
+            let alias = contacts.aliases.get(&conv.id).map(String::as_str);
             let fetched_name = preferred_profile_name(row);
             let best_name = match alias {
                 Some(a) if !a.is_empty() => a.to_owned(),
@@ -1697,13 +1713,19 @@ impl ConversationsState {
     }
 
     /// Updates pinned status of `id`, re-sorts, and rebuilds flags & extras (`applyPinStatus`).
-    pub fn apply_pin_status(&mut self, id: &str, pinned: bool, self_conv_id: Option<&str>) {
+    pub fn apply_pin_status(
+        &mut self,
+        contacts: &ContactsState,
+        id: &str,
+        pinned: bool,
+        self_conv_id: Option<&str>,
+    ) {
         if let Some(conv) = self.conversations.iter_mut().find(|c| c.id == id) {
             conv.pinned = pinned;
         }
-        sort_conversations(&mut self.conversations, &self.identities.activity_ranks);
+        sort_conversations(&mut self.conversations, &contacts.activity_ranks);
         self.rebuild_conversation_flags(self_conv_id);
-        self.rebuild_conversation_extras(self_conv_id);
+        self.rebuild_conversation_extras(contacts, self_conv_id);
     }
 
     /// Computes the full-board dialog payload (`pinBoard(for:)`).
@@ -2637,23 +2659,23 @@ pub fn load_local_account_from_store(
     }
 
     // Build temporary lookup state for rescuing legacy "g0" messages.
-    let mut temp_state = ConversationsState {
-        identities: existing_identities.clone(),
+    let mut temp_contacts = ContactsState::default();
+    temp_contacts.apply_identity_table(existing_identities.clone());
+    let temp_state = ConversationsState {
         pinned_ids: out.pinned_ids.iter().cloned().collect(),
         ..ConversationsState::default()
     };
     if !out.aliases.is_empty() {
-        temp_state.identities.aliases = out.aliases.clone();
+        temp_contacts.aliases = out.aliases.clone();
     }
     if !out.cached_profiles.is_empty() {
-        temp_state.identities.cached_profiles = out.cached_profiles.clone();
+        temp_contacts.cached_profiles = out.cached_profiles.clone();
     }
     if !out.cached_groups.is_empty() {
-        temp_state.identities.cached_groups = out.cached_groups.clone();
+        temp_contacts.cached_groups = out.cached_groups.clone();
     }
     for (uid, gid) in &out.friend_global_ids {
-        temp_state
-            .identities
+        temp_contacts
             .friend_global_ids
             .insert(uid.clone(), gid.clone());
     }
@@ -2678,7 +2700,8 @@ pub fn load_local_account_from_store(
                 continue;
             }
             m.conv_id = peer_id.clone();
-            if let Some((name, avatar)) = temp_state.lookup_person_info(&peer_id, my_uid, my_avatar)
+            if let Some((name, avatar)) =
+                temp_state.lookup_person_info(&temp_contacts, &peer_id, my_uid, my_avatar)
             {
                 if !name.is_empty() {
                     m.sender_name = name;
@@ -2704,7 +2727,11 @@ pub fn load_local_account_from_store(
         if !rescued.is_empty() {
             let _ = store.save_messages(&rescued);
             for m in &rescued {
-                let ident = temp_state.lookup_conversation_identity(&m.conv_id, self_conv_id);
+                let ident = temp_state.lookup_conversation_identity(
+                    &temp_contacts,
+                    &m.conv_id,
+                    self_conv_id,
+                );
                 let conv = StoredConversation {
                     id: m.conv_id.clone(),
                     is_group: false,
@@ -3068,12 +3095,16 @@ mod tests {
     #[test]
     fn stranger_box_and_label_filters_match_swift_rules() {
         let mut st = ConversationsState::default();
-        st.identities.friends_loaded = true;
-        st.identities.friends = vec![FriendIdentity {
-            id: "f1".to_owned(),
-            name: "Friend".to_owned(),
-            avatar: None,
-        }];
+        let mut contacts = ContactsState::default();
+        contacts.apply_identity_table(IdentityTable {
+            friends_loaded: true,
+            friends: vec![FriendIdentity {
+                id: "f1".to_owned(),
+                name: "Friend".to_owned(),
+                avatar: None,
+            }],
+            ..IdentityTable::default()
+        });
         st.conversations = vec![
             ConversationSummary {
                 id: "f1".to_owned(),
@@ -3119,7 +3150,7 @@ mod tests {
             },
         ];
         st.rebuild_conversation_flags(Some("self"));
-        st.rebuild_conversation_extras(Some("self"));
+        st.rebuild_conversation_extras(&contacts, Some("self"));
         assert_eq!(
             st.extras.stranger_ids,
             BTreeSet::from(["s1".to_owned(), "s2".to_owned()])
@@ -3206,7 +3237,7 @@ mod tests {
             }],
             persist_conversations: true,
         };
-        let (changed, _, _) = st.apply_batch_delta(&older, None);
+        let (changed, _, _) = st.apply_batch_delta(&ContactsState::default(), &older, None);
         assert!(!changed);
         assert_eq!(
             st.conversations[0]
@@ -3231,7 +3262,7 @@ mod tests {
             }],
             persist_conversations: true,
         };
-        let (changed, _, _) = st.apply_batch_delta(&recall, None);
+        let (changed, _, _) = st.apply_batch_delta(&ContactsState::default(), &recall, None);
         assert!(changed);
         assert_eq!(
             st.conversations[0]
@@ -3256,7 +3287,8 @@ mod tests {
             }],
             persist_conversations: true,
         };
-        let (changed, _, _) = st.apply_batch_delta(&delete_to_older, None);
+        let (changed, _, _) =
+            st.apply_batch_delta(&ContactsState::default(), &delete_to_older, None);
         assert!(changed);
         assert_eq!(st.conversations[0].id, "c2");
         assert_eq!(st.conversations[1].id, "c1");
@@ -3280,7 +3312,7 @@ mod tests {
             }],
             persist_conversations: true,
         };
-        let (changed, _, _) = st.apply_batch_delta(&delete_all, None);
+        let (changed, _, _) = st.apply_batch_delta(&ContactsState::default(), &delete_all, None);
         assert!(changed);
         assert_eq!(st.conversations[1].preview, None);
     }

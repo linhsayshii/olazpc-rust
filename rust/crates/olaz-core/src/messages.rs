@@ -262,7 +262,7 @@ impl fmt::Debug for FriendRequestEntry {
     }
 }
 
-/// Partial U9 contacts state owned by `olaz-core` and mirrored via `DirtyKey::Contacts`.
+/// Unified contacts & identity state owned by `olaz-core` and mirrored via `DirtyKey::Contacts`.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactsState {
     pub friends: Vec<FriendEntry>,
@@ -281,6 +281,10 @@ pub struct ContactsState {
     pub sent_raw_json: Option<String>,
     /// UID -> globalId map discovered from friends list (`cachedFriendGlobalIds`).
     pub friend_global_ids: BTreeMap<String, String>,
+    pub aliases: BTreeMap<String, String>,
+    pub cached_profiles: BTreeMap<String, CachedProfile>,
+    pub cached_groups: BTreeMap<String, CachedGroup>,
+    pub activity_ranks: BTreeMap<String, i64>,
 }
 
 impl fmt::Debug for ContactsState {
@@ -292,6 +296,10 @@ impl fmt::Debug for ContactsState {
             .field("sent", &self.sent.len())
             .field("friends_loaded", &self.friends_loaded)
             .field("groups_loaded", &self.groups_loaded)
+            .field("aliases", &self.aliases.len())
+            .field("cached_profiles", &self.cached_profiles.len())
+            .field("cached_groups", &self.cached_groups.len())
+            .field("activity_ranks", &self.activity_ranks.len())
             .finish()
     }
 }
@@ -299,6 +307,145 @@ impl fmt::Debug for ContactsState {
 impl ContactsState {
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// Projects the [`IdentityTable`] view of this contacts state.
+    #[must_use]
+    pub fn to_identity_table(&self) -> IdentityTable {
+        IdentityTable {
+            friends: self
+                .friends
+                .iter()
+                .map(|f| FriendIdentity {
+                    id: f.id.clone(),
+                    name: f.name.clone(),
+                    avatar: f.avatar.clone(),
+                })
+                .collect(),
+            groups: self
+                .groups
+                .iter()
+                .map(|g| GroupIdentity {
+                    id: g.id.clone(),
+                    name: g.name.clone(),
+                    avatar: g.avatar.clone(),
+                    members: g.members,
+                })
+                .collect(),
+            friends_loaded: self.friends_loaded,
+            groups_loaded: self.groups_loaded,
+            aliases: self.aliases.clone(),
+            cached_profiles: self.cached_profiles.clone(),
+            cached_groups: self.cached_groups.clone(),
+            friend_global_ids: self.friend_global_ids.clone(),
+            activity_ranks: self.activity_ranks.clone(),
+        }
+    }
+
+    /// Applies an [`IdentityTable`] pushed by Swift / tests onto this state while preserving
+    /// contacts-specific fields (`received`, `sent`, `zalo_name`, `online`, `sort_key`, etc.)
+    /// for matching friend/group ids.
+    pub fn apply_identity_table(&mut self, table: IdentityTable) {
+        let existing_friends: HashMap<String, FriendEntry> =
+            self.friends.drain(..).map(|f| (f.id.clone(), f)).collect();
+        self.friends = table
+            .friends
+            .into_iter()
+            .map(|f| {
+                if let Some(prev) = existing_friends.get(&f.id) {
+                    let sort_key = if prev.name == f.name {
+                        prev.sort_key.clone()
+                    } else {
+                        fold_contact_str(&f.name).trim().to_owned()
+                    };
+                    let section = if prev.name == f.name {
+                        prev.section.clone()
+                    } else {
+                        sort_key
+                            .chars()
+                            .next()
+                            .map(|c| c.to_ascii_uppercase())
+                            .filter(char::is_ascii_uppercase)
+                            .map_or_else(|| "#".to_owned(), |c| c.to_string())
+                    };
+                    FriendEntry {
+                        id: f.id,
+                        name: f.name,
+                        zalo_name: prev.zalo_name.clone(),
+                        avatar: f.avatar,
+                        last_active_ms: prev.last_active_ms,
+                        online: prev.online,
+                        section,
+                        sort_key,
+                    }
+                } else {
+                    let sort_key = fold_contact_str(&f.name).trim().to_owned();
+                    let section = sort_key
+                        .chars()
+                        .next()
+                        .map(|c| c.to_ascii_uppercase())
+                        .filter(char::is_ascii_uppercase)
+                        .map_or_else(|| "#".to_owned(), |c| c.to_string());
+                    FriendEntry {
+                        id: f.id,
+                        name: f.name.clone(),
+                        zalo_name: f.name,
+                        avatar: f.avatar,
+                        last_active_ms: None,
+                        online: false,
+                        section,
+                        sort_key,
+                    }
+                }
+            })
+            .collect();
+
+        let existing_groups: HashMap<String, GroupEntry> =
+            self.groups.drain(..).map(|g| (g.id.clone(), g)).collect();
+        self.groups = table
+            .groups
+            .into_iter()
+            .map(|g| {
+                let sort_key = match existing_groups.get(&g.id) {
+                    Some(prev) if prev.name == g.name => prev.sort_key.clone(),
+                    _ => fold_contact_str(&g.name),
+                };
+                GroupEntry {
+                    id: g.id,
+                    name: g.name,
+                    avatar: g.avatar,
+                    members: g.members,
+                    sort_key,
+                }
+            })
+            .collect();
+
+        self.friends_loaded = table.friends_loaded;
+        self.groups_loaded = table.groups_loaded;
+        self.aliases = table.aliases;
+        self.cached_profiles = table.cached_profiles;
+        self.cached_groups = table.cached_groups;
+        self.friend_global_ids = table.friend_global_ids;
+        self.activity_ranks = table.activity_ranks;
+    }
+
+    /// Applies a seeded [`ContactsState`] (from `Command::SeedContacts`), preserving existing
+    /// identity caches (`aliases`, `cached_profiles`, `cached_groups`, `activity_ranks`) when the
+    /// incoming snapshot leaves them empty.
+    pub fn apply_seeded_contacts(&mut self, mut next: ContactsState) {
+        if next.aliases.is_empty() && !self.aliases.is_empty() {
+            next.aliases = std::mem::take(&mut self.aliases);
+        }
+        if next.cached_profiles.is_empty() && !self.cached_profiles.is_empty() {
+            next.cached_profiles = std::mem::take(&mut self.cached_profiles);
+        }
+        if next.cached_groups.is_empty() && !self.cached_groups.is_empty() {
+            next.cached_groups = std::mem::take(&mut self.cached_groups);
+        }
+        if next.activity_ranks.is_empty() && !self.activity_ranks.is_empty() {
+            next.activity_ranks = std::mem::take(&mut self.activity_ranks);
+        }
+        *self = next;
     }
 }
 
@@ -324,7 +471,12 @@ impl fmt::Debug for IdentitySnapshot {
 
 impl IdentitySnapshot {
     #[must_use]
-    pub fn from_core(my_uid: &str, my_avatar: Option<&str>, convs: &ConversationsState) -> Self {
+    pub fn from_core(
+        my_uid: &str,
+        my_avatar: Option<&str>,
+        convs: &ConversationsState,
+        contacts: &ContactsState,
+    ) -> Self {
         let mut conversation_fallbacks = HashMap::with_capacity(convs.conversations.len());
         for c in &convs.conversations {
             let trimmed = c.name.trim();
@@ -341,7 +493,7 @@ impl IdentitySnapshot {
         Self {
             my_uid: my_uid.to_owned(),
             my_avatar: my_avatar.map(str::to_owned),
-            identities: convs.identities.clone(),
+            identities: contacts.to_identity_table(),
             conversation_fallbacks,
         }
     }
@@ -1526,6 +1678,7 @@ pub fn parse_batch_events(
 pub fn apply_batch_pass1(
     messages: &mut MessagesState,
     conversations: &mut ConversationsState,
+    contacts: &ContactsState,
     events: &[ParsedWireEvent],
     increment_unread: bool,
     self_conv_id: Option<&str>,
@@ -1616,7 +1769,7 @@ pub fn apply_batch_pass1(
     for (conv_id, latest) in latest_by_conv {
         poll_messages.push(latest.clone());
         let is_grp = is_group_id(&conv_id);
-        let info = conversations.lookup_conversation_identity(&conv_id, self_conv_id);
+        let info = conversations.lookup_conversation_identity(contacts, &conv_id, self_conv_id);
         let prev = ConversationPreview {
             text: message_preview_label(&latest),
             date_ms: Some(latest.date_ms),
@@ -1669,7 +1822,7 @@ pub fn apply_batch_pass1(
     }
 
     let mut list: Vec<ConversationSummary> = by_id.into_values().collect();
-    sort_conversations(&mut list, &conversations.identities.activity_ranks);
+    sort_conversations(&mut list, &contacts.activity_ranks);
     let conversations_changed = if list != conversations.conversations {
         conversations.conversations = list;
         true
@@ -1677,7 +1830,7 @@ pub fn apply_batch_pass1(
         false
     };
     let flags_changed = conversations.rebuild_conversation_flags(self_conv_id);
-    let extras_changed = conversations.rebuild_conversation_extras(self_conv_id);
+    let extras_changed = conversations.rebuild_conversation_extras(contacts, self_conv_id);
 
     BatchPass1Outcome {
         stored_rows,
@@ -1945,10 +2098,9 @@ pub fn localized_standard_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
-/// Parses raw responses from the 4 contact endpoints into `ContactsState` and updates `IdentityTable`.
+/// Parses raw responses from the 4 contact endpoints into unified `ContactsState`.
 pub fn apply_fetched_contacts(
     contacts: &mut ContactsState,
-    identities: &mut IdentityTable,
     friends_rows: Option<Vec<Map<String, Value>>>,
     groups_dict: Option<Map<String, Value>>,
     sent_rows: Option<Vec<Map<String, Value>>>,
@@ -2001,8 +2153,7 @@ pub fn apply_fetched_contacts(
             });
         }
         for (uid, gid) in friend_global_map {
-            contacts.friend_global_ids.insert(uid.clone(), gid.clone());
-            identities.friend_global_ids.insert(uid, gid);
+            contacts.friend_global_ids.insert(uid, gid);
         }
         mapped_friends.sort_by(|a, b| {
             if a.section != b.section {
@@ -2016,15 +2167,6 @@ pub fn apply_fetched_contacts(
             }
             localized_standard_cmp(&a.sort_key, &b.sort_key)
         });
-        identities.friends = mapped_friends
-            .iter()
-            .map(|f| FriendIdentity {
-                id: f.id.clone(),
-                name: f.name.clone(),
-                avatar: f.avatar.clone(),
-            })
-            .collect();
-        identities.friends_loaded = true;
         contacts.friends = mapped_friends;
         contacts.friends_loaded = true;
     }
@@ -2070,16 +2212,6 @@ pub fn apply_fetched_contacts(
             });
         }
         mapped_groups.sort_by(|a, b| localized_standard_cmp(&a.sort_key, &b.sort_key));
-        identities.groups = mapped_groups
-            .iter()
-            .map(|g| GroupIdentity {
-                id: g.id.clone(),
-                name: g.name.clone(),
-                avatar: g.avatar.clone(),
-                members: g.members,
-            })
-            .collect();
-        identities.groups_loaded = true;
         contacts.group_details_json = detail_cache;
         contacts.groups = mapped_groups;
         contacts.groups_loaded = true;

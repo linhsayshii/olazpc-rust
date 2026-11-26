@@ -110,6 +110,7 @@ pub fn reduce_session(state: &mut CoreState, input: Input, out: &mut ReduceOutpu
                     .and_then(|p| p.avatar.clone());
                 let self_conv_id = state.session.self_conversation_id.clone();
                 state.conversations.hydrate_from_local(
+                    &mut state.contacts,
                     *hydration,
                     &my_uid,
                     my_avatar.as_deref(),
@@ -287,7 +288,7 @@ pub fn reduce_session(state: &mut CoreState, input: Input, out: &mut ReduceOutpu
                         token: StoreToken::Qr(qr_gen),
                         user_id: done.account.user_id.clone(),
                         account: Box::new(done.account),
-                        identities: Box::new(state.conversations.identities.clone()),
+                        identities: Box::new(state.contacts.to_identity_table()),
                     }));
                 }
                 Err(failure) => apply_qr_failure(&mut state.session, failure, out),
@@ -380,7 +381,7 @@ fn begin_store_prepare_for_boot(
         token: StoreToken::Boot(boot_gen),
         user_id: account.user_id.clone(),
         account: Box::new(account),
-        identities: Box::new(state.conversations.identities.clone()),
+        identities: Box::new(state.contacts.to_identity_table()),
     }));
 }
 

@@ -3616,18 +3616,21 @@ mod tests {
             avatar: None,
             phone: None,
         });
-        initial.conversations.identities.friends = vec![
-            FriendIdentity {
-                id: "3000515".to_owned(),
-                name: "Alice".to_owned(),
-                avatar: None,
-            },
-            FriendIdentity {
-                id: "3000516".to_owned(),
-                name: "Bob".to_owned(),
-                avatar: None,
-            },
-        ];
+        initial.contacts.apply_identity_table(IdentityTable {
+            friends: vec![
+                FriendIdentity {
+                    id: "3000515".to_owned(),
+                    name: "Alice".to_owned(),
+                    avatar: None,
+                },
+                FriendIdentity {
+                    id: "3000516".to_owned(),
+                    name: "Bob".to_owned(),
+                    avatar: None,
+                },
+            ],
+            ..IdentityTable::default()
+        });
         initial.transport.ws_phase = WsPhase::Running;
         initial.transport.ws_gen = 1;
 

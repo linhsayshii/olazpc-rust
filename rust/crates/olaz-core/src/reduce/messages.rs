@@ -306,7 +306,7 @@ pub(crate) fn reduce_messages(state: &mut CoreState, input: Input, out: &mut Red
                 let fetched_name = preferred_contact_name(row);
                 let avt = olaz_wire::lossless::string(row.get("avatar").or_else(|| row.get("avt")));
                 if !clean.is_empty() && (!fetched_name.is_empty() || !avt.is_empty()) {
-                    state.conversations.identities.cached_profiles.insert(
+                    state.contacts.cached_profiles.insert(
                         clean,
                         CachedProfile {
                             name: fetched_name,
@@ -332,8 +332,7 @@ pub(crate) fn reduce_messages(state: &mut CoreState, input: Input, out: &mut Red
 
             if cache_updated {
                 out.dirty.insert(DirtyKey::Conversations);
-                if let Some(data) =
-                    serialize_cached_profiles_json(&state.conversations.identities.cached_profiles)
+                if let Some(data) = serialize_cached_profiles_json(&state.contacts.cached_profiles)
                 {
                     out.effects.push(Effect::Store(StoreOp::SetPreferenceData {
                         key: "cachedProfiles".to_owned(),
@@ -745,7 +744,7 @@ fn reduce_message_command(
         }
 
         Command::SeedContacts(contacts) => {
-            state.contacts = *contacts;
+            state.contacts.apply_seeded_contacts(*contacts);
             out.dirty.insert(DirtyKey::Contacts);
             complete_op(op_id, out);
         }
@@ -959,13 +958,7 @@ fn finish_sender_resolve_followup(
             }
 
             let is_grp = is_group_id(&conv_id);
-            let is_friend = state
-                .conversations
-                .identities
-                .friends
-                .iter()
-                .any(|f| f.id == conv_id)
-                || state.contacts.friends.iter().any(|f| f.id == conv_id);
+            let is_friend = state.contacts.friends.iter().any(|f| f.id == conv_id);
             if is_grp || is_friend {
                 out.effects.push(Effect::Host(HostCall::RefreshBoardPins {
                     conv_id: conv_id.clone(),

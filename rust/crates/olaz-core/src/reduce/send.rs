@@ -417,6 +417,7 @@ fn update_conversation_after_send(
     let self_conv_id = state.session.self_conversation_id.clone();
     let preview_input = MessagePreviewInput::from_chat_message(msg);
     if state.conversations.update_conversation_on_message(
+        &state.contacts,
         &preview_input,
         false,
         &my_uid,
