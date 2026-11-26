@@ -12,7 +12,9 @@ pub use cipher::{
     decode_cloud_key, encode_aes, encode_aes_data, encode_aes_hex_upper, encode_cloud_aes,
     encode_cloud_aes_with_iv, parse_secret_key,
 };
-pub use digest::{md5_hex, random_hex, random_salt, sha256_hex, sha256_hex_upper};
+pub use digest::{
+    md5_hex, random_alphanumeric, random_hex, random_salt, sha256_hex, sha256_hex_upper,
+};
 pub use error::CryptoError;
 pub use frame::{
     decrypt_ws_frame, gcm_decrypt16, gcm_encrypt16, inflate_zlib_or_gzip, inflate_zlib_or_gzip_max,

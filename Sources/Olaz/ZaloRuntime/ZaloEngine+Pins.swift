@@ -205,12 +205,16 @@ extension ZaloEngine {
         )
         list.items.insert(item, at: 0)
         pins[conversation] = list
+        // U7: write-through optimistic pin board mutation until U7 owns board pins.
+        pushCoreBoardPinsIfRunning(for: conversation)
     }
 
     internal func removePinOptimistically(_ ref: String, in conversationId: String) {
         guard var list = pins[conversationId] else { return }
         list.items.removeAll { $0.ref == ref }
         pins[conversationId] = list
+        // U7: write-through optimistic pin board removal until U7 owns board pins.
+        pushCoreBoardPinsIfRunning(for: conversationId)
     }
 
     /// Loads the pinned message into the open chat (from the local store when it is older than what is shown); its row id, or nil.
@@ -234,6 +238,8 @@ extension ZaloEngine {
             }
         } else {
             pins[conversationId] = nil
+            // U7: write-through board cache invalidation until U7 owns board pins.
+            pushCoreBoardPinsIfRunning(for: conversationId)
         }
     }
 }

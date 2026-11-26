@@ -115,6 +115,64 @@ fn insert(payload: &mut Value, key: &str, value: Value) {
     }
 }
 
+/// Owned parameters for [`ZaloApi::send_contact_card`] (Swift `sendContactCardAPI`).
+///
+/// `Debug` is shape-only (ADR-008): conversation id, contact uid, and phone number are redacted.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SendContactCardParams {
+    pub conv_id: String,
+    pub card_uid: String,
+    pub phone: Option<String>,
+    /// Client id; when `None`, [`ZaloApi::send_contact_card`] allocates a fresh `next_client_id`.
+    pub client_id: Option<i64>,
+}
+
+impl std::fmt::Debug for SendContactCardParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendContactCardParams")
+            .field(
+                "has_phone",
+                &self.phone.as_deref().is_some_and(|p| !p.is_empty()),
+            )
+            .field("has_client_id", &self.client_id.is_some())
+            .finish()
+    }
+}
+
+/// Pure request builder for Swift `sendContactCardAPI`.
+#[must_use]
+pub fn build_send_contact_card_request(
+    conv_id: &str,
+    card_uid: &str,
+    phone: Option<&str>,
+    client_id: i64,
+    imei: &str,
+) -> CallSpec {
+    let (is_group, clean_id) = conv_target(conv_id);
+    let mut payload = json!({
+        "contactId": strip_user_prefix(card_uid),
+        "clientId": client_id,
+        "ttl": 0,
+        "imei": imei,
+    });
+    if let Some(p) = phone.filter(|p| !p.is_empty()) {
+        insert(&mut payload, "phone", Value::from(p));
+    }
+    let (service, path) = if is_group {
+        insert(&mut payload, "grid", Value::from(clean_id));
+        insert(&mut payload, "visibility", Value::from(0));
+        ("group", "/api/group/contact")
+    } else {
+        insert(&mut payload, "toId", Value::from(clean_id));
+        ("chat", "/api/message/contact")
+    };
+    CallSpec {
+        service: service.to_owned(),
+        path: path.to_owned(),
+        payload,
+    }
+}
+
 /// Inputs of [`build_recall_message_request`].
 #[derive(Debug, Clone)]
 pub struct RecallParams<'a> {
@@ -557,5 +615,38 @@ impl<T: Transport> ZaloApi<T> {
         self.post(ApiRequest::new(service, path).payload(payload))
             .await?;
         Ok(())
+    }
+
+    /// Swift `sendContactCardAPI`.
+    pub async fn send_contact_card(
+        &self,
+        params: &SendContactCardParams,
+    ) -> Result<SendMessageResult, ApiError> {
+        let cli_id = params
+            .client_id
+            .unwrap_or_else(|| self.client().next_client_id());
+        let cli_str = cli_id.to_string();
+        let imei = self.imei();
+        let spec = build_send_contact_card_request(
+            &params.conv_id,
+            &params.card_uid,
+            params.phone.as_deref(),
+            cli_id,
+            &imei,
+        );
+        let resp = self
+            .post(ApiRequest::new(spec.service, spec.path).payload(spec.payload))
+            .await?;
+        let d = resp.get("data");
+        let msg_id = string(d.and_then(|v| v.get("msgId")));
+        Ok(SendMessageResult {
+            msg_id: if msg_id.is_empty() {
+                cli_str.clone()
+            } else {
+                msg_id
+            },
+            cli_msg_id: cli_str,
+            ts_ms: self.now_ms(),
+        })
     }
 }

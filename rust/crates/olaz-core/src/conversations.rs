@@ -2598,22 +2598,30 @@ pub fn load_local_account_from_store(
         seen_reaction_event_ids: store
             .get_preference_strings("seenReactionEventIds")
             .unwrap_or_default(),
-        notif_enabled: store.get_preference_bool("notifEnabled", true).unwrap_or(true),
-        notif_sound: store.get_preference_bool("notifSound", true).unwrap_or(true),
-        muted_threads: store.get_preference_data("mutedThreads").ok().flatten().and_then(|data| {
-            let Some(Value::Array(rows)) = parse_any(&data) else {
-                return None;
-            };
-            let mut mutes = BTreeMap::new();
-            for row in rows {
-                if let Some(obj) = row.as_object()
-                    && let Some((id, info)) = crate::notify::MuteInfo::parse_row(obj)
-                {
-                    mutes.insert(id, info);
+        notif_enabled: store
+            .get_preference_bool("notifEnabled", true)
+            .unwrap_or(true),
+        notif_sound: store
+            .get_preference_bool("notifSound", true)
+            .unwrap_or(true),
+        muted_threads: store
+            .get_preference_data("mutedThreads")
+            .ok()
+            .flatten()
+            .and_then(|data| {
+                let Some(Value::Array(rows)) = parse_any(&data) else {
+                    return None;
+                };
+                let mut mutes = BTreeMap::new();
+                for row in rows {
+                    if let Some(obj) = row.as_object()
+                        && let Some((id, info)) = crate::notify::MuteInfo::parse_row(obj)
+                    {
+                        mutes.insert(id, info);
+                    }
                 }
-            }
-            Some(mutes)
-        }),
+                Some(mutes)
+            }),
         ..LocalAccountHydration::default()
     };
 

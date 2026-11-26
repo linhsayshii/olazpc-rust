@@ -236,6 +236,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var cloudRefreshTask: Task<Void, Never>?
     @ObservationIgnored internal var notificationTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var pollDebounceSleep: (@MainActor (Int) async -> Bool)?
+    @ObservationIgnored internal var localPollSyncEpoch: UInt64 = 0
     @ObservationIgnored internal var notifyBannerHook: ((NotifyBannerRecord) -> Void)?
     @ObservationIgnored internal var requestNotifAuthHostHandler: (@MainActor () async -> NotificationSettingsState.Authorization)?
     @ObservationIgnored internal var notificationCalendar: Calendar = .current
@@ -252,7 +253,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var syncStage2Progress = SyncStage2ProgressState()
     @ObservationIgnored internal var syncInitialEmptyDB = false
     @ObservationIgnored internal let phoneSync = ZaloPhoneSyncCoordinator()
-    @ObservationIgnored internal let e2eeManager = ZaloE2EEManager()
+    @ObservationIgnored internal let e2eeManager: ZaloE2EEManager
     @ObservationIgnored internal var isTransferHidden = false
     @ObservationIgnored internal var phoneSyncStatusSignal: ZaloMobileSyncEvent?
     @ObservationIgnored internal var pollState = ZaloPollState()
@@ -292,7 +293,8 @@ final class ZaloEngine {
     @ObservationIgnored internal var historyFullRefreshDue = false
     @ObservationIgnored internal var cachedBoardRawTopics: [String: (version: Int64, topics: [String: [String: Any]])] = [:]
 
-    @ObservationIgnored private var webkitMigrateTask: Task<Void, Never>?
+    @ObservationIgnored internal var webkitMigrateTask: Task<Void, Never>?
+    @ObservationIgnored internal var e2eePrepareTask: Task<Void, Never>?
 
     /// Kept for menu toggle binding compatibility; native engine has no hidden WebKit window.
     var isDebugRendererVisible = false
@@ -307,9 +309,10 @@ final class ZaloEngine {
         userDefaultsSuiteName: String? = nil,
         cookieStorage: HTTPCookieStorage = .shared
     ) {
-        let defaults = userDefaultsSuiteName.flatMap { UserDefaults(suiteName: $0) } ?? .standard
+        let resolvedDefaults = userDefaultsSuiteName.flatMap { UserDefaults(suiteName: $0) } ?? .standard
         self.dataDirectory = dataDirectory
-        self.userDefaults = defaults
+        self.userDefaults = resolvedDefaults
+        self.e2eeManager = ZaloE2EEManager(mode: E2EERustMode.resolve(defaults: resolvedDefaults))
         self.sessionClient = ZaloSessionClient(
             dataDirectory: dataDirectory,
             useKeychain: useKeychain,
@@ -317,7 +320,7 @@ final class ZaloEngine {
             userDefaultsSuiteName: userDefaultsSuiteName,
             cookieStorage: cookieStorage
         )
-        self.notificationSettings.showsPreview = defaults.object(forKey: NotificationSettingsState.previewDefaultsKey) as? Bool ?? true
+        self.notificationSettings.showsPreview = resolvedDefaults.object(forKey: NotificationSettingsState.previewDefaultsKey) as? Bool ?? true
         self.conversationUI.onRelock = { [weak self] in
             self?.coreLifecycle.core?.relockHidden()
         }
@@ -424,6 +427,7 @@ final class ZaloEngine {
         activeSyncBatchTasks.values.forEach { $0.cancel() }
         activeSyncBatchTasks = [:]
         webkitMigrateTask?.cancel(); webkitMigrateTask = nil
+        e2eePrepareTask?.cancel(); e2eePrepareTask = nil
         typingResetTasks.values.forEach { $0.cancel() }
         typingResetTasks = [:]
 
@@ -497,6 +501,8 @@ final class ZaloEngine {
         cachedUnreadMarks = []
         cachedAliases = [:]
         cachedBoardRawTopics = [:]
+        // U7: clear core's temporary board caches until U7 owns board pins.
+        coreLifecycle.core?.clearBoardCaches()
         failedDrafts = FailedDraftStore()
     }
 
@@ -608,7 +614,8 @@ final class ZaloEngine {
         if !effectiveMyUid.isEmpty {
             let myUid = effectiveMyUid
             let mgr = e2eeManager
-            Task.detached(priority: .utility) {
+            e2eePrepareTask?.cancel()
+            e2eePrepareTask = Task.detached(priority: .utility) {
                 await mgr.prepare(uid: myUid, store: store)
             }
         }
@@ -753,8 +760,6 @@ final class ZaloEngine {
 
     internal func notifyIncomingBatchMessages(_ incomingForNotice: [ChatMessage]) async {
         guard !incomingForNotice.isEmpty, let core = await ensureCoreEngine() else { return }
-        pushCoreIdentitiesIfRunning()
-        pushCoreContactsIfRunning()
         let records = incomingForNotice.map(ChatMessageRecord.init(message:))
         if let v = try? await core.notifyIncomingBatch(messages: records, nowMs: nowMs()) {
             await waitForMirrorVersion(v)

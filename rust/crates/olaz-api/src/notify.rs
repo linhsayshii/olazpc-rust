@@ -11,9 +11,9 @@
 //! - `respondReminderAPI` (`POST /api/board/topic/updateEventResponse`)
 //! - `fetchReminderRespondersAPI` (`GET /api/board/topic/listResponseEvent`)
 
+use crate::api::SendMessageResult;
 use olaz_net::{ApiRequest, Transport};
 use olaz_wire::{clean_group_id, is_group_id, strip_user_prefix};
-use crate::api::SendMessageResult;
 use serde_json::{Value, json};
 
 use crate::api::{JsonObject, ZaloApi};
@@ -49,11 +49,7 @@ pub fn build_set_mute_payload(
 pub fn extract_suggested_sticker_rows(resp: &JsonObject) -> Vec<JsonObject> {
     if let Some(d) = resp.get("data").and_then(Value::as_object) {
         if let Some(sugg) = d.get("sugg_sticker").and_then(Value::as_array) {
-            let objs: Vec<JsonObject> = sugg
-                .iter()
-                .filter_map(Value::as_object)
-                .cloned()
-                .collect();
+            let objs: Vec<JsonObject> = sugg.iter().filter_map(Value::as_object).cloned().collect();
             if !objs.is_empty() {
                 return objs;
             }
@@ -120,7 +116,11 @@ impl<T: Transport> ZaloApi<T> {
             .map(|v| olaz_json::string(Some(v)))
             .unwrap_or_default();
         Ok(SendMessageResult {
-            msg_id: if msg_id.is_empty() { cli_id.clone() } else { msg_id },
+            msg_id: if msg_id.is_empty() {
+                cli_id.clone()
+            } else {
+                msg_id
+            },
             cli_msg_id: cli_id,
             ts_ms: 0,
         })
@@ -153,12 +153,14 @@ impl<T: Transport> ZaloApi<T> {
     pub async fn suggest_stickers(&self, keyword: &str) -> Result<Vec<JsonObject>, ApiError> {
         let resp = self
             .get(
-                ApiRequest::new("sticker", "/api/message/sticker/suggest/stickers").payload(json!({
-                    "keyword": keyword,
-                    "gif": 1,
-                    "guggy": 0,
-                    "imei": self.imei(),
-                })),
+                ApiRequest::new("sticker", "/api/message/sticker/suggest/stickers").payload(
+                    json!({
+                        "keyword": keyword,
+                        "gif": 1,
+                        "guggy": 0,
+                        "imei": self.imei(),
+                    }),
+                ),
             )
             .await?;
         Ok(extract_suggested_sticker_rows(&resp))
@@ -218,15 +220,14 @@ impl<T: Transport> ZaloApi<T> {
     }
 
     /// Swift `joinGroupByLink`: `GET /api/group/link/join`.
+    /// Preserves non-zero `error_code` + `data` so `178` can read `data.groupId` when present.
     pub async fn join_group_by_link(&self, link: &str) -> Result<JsonObject, ApiError> {
         let client_id = self.client().next_client_id();
-        self.get(
-            ApiRequest::new("group", "/api/group/link/join").payload(json!({
-                "link": link,
-                "clientId": client_id,
-            })),
-        )
-        .await
+        let req = ApiRequest::new("group", "/api/group/link/join").payload(json!({
+            "link": link,
+            "clientId": client_id,
+        }));
+        Ok(self.client().get_unchecked(&req).await?)
     }
 
     /// Swift `fetchReminderDetail`: `GET /api/board/topic/getReminder`.

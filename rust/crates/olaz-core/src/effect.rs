@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
-use olaz_api::{PollState, SendTextParams};
+use olaz_api::{PollState, SendContactCardParams, SendTextParams};
 use olaz_net::{LoginAccount, QrTicket};
 use olaz_store::{StoredConversation, StoredMessage};
 use olaz_wire::ChatMessage;
@@ -15,6 +15,7 @@ use crate::actions::DeleteUndoItem;
 use crate::conversations::{
     ConversationActionResult, ConversationPreview, IdentityTable, PinBoard,
 };
+use crate::forward::ForwardOutcome;
 use crate::input::{E2eeQuoteArg, HiddenPinSyncKind, SeenTarget, StoreToken};
 use crate::messages::{IdentitySnapshot, MuteEntry};
 use crate::notify::{
@@ -31,6 +32,81 @@ use crate::typed_chat::TypedChatEnvelope;
 pub enum HistoryFetchPurpose {
     Open { open_seq: u64, op_id: Option<u64> },
     LoadOlder { load_seq: u64, op_id: Option<u64> },
+}
+
+// U12
+/// Distinguishes whether [`Effect::FetchPollDetailApi`] refreshes poll state or resolves voters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollDetailPurpose {
+    Refresh { now_ms: i64 },
+    Voters,
+}
+
+// U12
+/// `(ref_id, raw_topic, board_version)` for replacing an oldest board pin before pinning a poll.
+pub type ReplaceBoardPinSpec = (String, Option<Map<String, Value>>, i64);
+
+// U12
+/// Continuation executed after [`Effect::RefreshBoardPinsForPoll`] completes on the host FIFO.
+#[derive(Clone)]
+pub enum PollBoardContinuation {
+    FinishRefreshPin {
+        op_id: Option<u64>,
+        poll_id: String,
+        then_action_ok: bool,
+        then_pin_done: Option<bool>,
+    },
+    AfterPinSuccess {
+        op_id: Option<u64>,
+        poll_id: String,
+        for_create: bool,
+    },
+    AfterPinLimitError {
+        op_id: Option<u64>,
+        poll_id: String,
+        mapped: crate::polls::PollActionResult,
+        for_create: bool,
+    },
+    AfterUnpinSuccess {
+        op_id: Option<u64>,
+        poll_id: String,
+    },
+}
+
+impl fmt::Debug for PollBoardContinuation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FinishRefreshPin {
+                op_id,
+                then_action_ok,
+                then_pin_done,
+                ..
+            } => f
+                .debug_struct("FinishRefreshPin")
+                .field("op_id", op_id)
+                .field("then_action_ok", then_action_ok)
+                .field("then_pin_done", then_pin_done)
+                .finish(),
+            Self::AfterPinSuccess {
+                op_id, for_create, ..
+            } => f
+                .debug_struct("AfterPinSuccess")
+                .field("op_id", op_id)
+                .field("for_create", for_create)
+                .finish(),
+            Self::AfterPinLimitError {
+                op_id, for_create, ..
+            } => f
+                .debug_struct("AfterPinLimitError")
+                .field("op_id", op_id)
+                .field("for_create", for_create)
+                .finish(),
+            Self::AfterUnpinSuccess { op_id, .. } => f
+                .debug_struct("AfterUnpinSuccess")
+                .field("op_id", op_id)
+                .finish(),
+        }
+    }
 }
 
 /// Serial SQLite persistence operations executed by the core runner's store worker (U3).
@@ -290,6 +366,8 @@ pub enum OpResult {
     HiddenSearch(Option<Vec<String>>),
     Bool(bool),
     Int(i64),
+    // U8
+    Forward(ForwardOutcome),
     OptI64(Option<i64>),
     // U16
     SuggestedStickers(Vec<SuggestedStickerItem>),
@@ -304,6 +382,12 @@ pub enum OpResult {
     ReminderSnapshot(Option<ReminderSnapshotData>),
     RespondReminder(RespondReminderResult),
     ReminderResponders(Option<ReminderRespondersData>),
+    // U12
+    PollVoters(Option<crate::polls::PollVoters>),
+    PollPinState(crate::polls::PollPinState),
+    PollPinOutcome(crate::polls::PollPinOutcome),
+    PollActionResult(crate::polls::PollActionResult),
+    PollCapabilities(crate::polls::PollCapabilities),
 }
 
 impl fmt::Debug for OpResult {
@@ -318,8 +402,12 @@ impl fmt::Debug for OpResult {
                 .finish(),
             Self::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
             Self::Int(n) => f.debug_tuple("Int").field(n).finish(),
+            Self::Forward(o) => f.debug_tuple("Forward").field(o).finish(),
             Self::OptI64(n) => f.debug_tuple("OptI64").field(n).finish(),
-            Self::SuggestedStickers(v) => f.debug_struct("SuggestedStickers").field("count", &v.len()).finish(),
+            Self::SuggestedStickers(v) => f
+                .debug_struct("SuggestedStickers")
+                .field("count", &v.len())
+                .finish(),
             Self::ContactCardState(r) => f.debug_tuple("ContactCardState").field(r).finish(),
             Self::ContactProfile(r) => f.debug_tuple("ContactProfile").field(r).finish(),
             Self::FriendRequestPrep(r) => f.debug_tuple("FriendRequestPrep").field(r).finish(),
@@ -331,6 +419,15 @@ impl fmt::Debug for OpResult {
             Self::ReminderSnapshot(r) => f.debug_tuple("ReminderSnapshot").field(r).finish(),
             Self::RespondReminder(r) => f.debug_tuple("RespondReminder").field(r).finish(),
             Self::ReminderResponders(r) => f.debug_tuple("ReminderResponders").field(r).finish(),
+            // U12
+            Self::PollVoters(v) => f
+                .debug_struct("PollVoters")
+                .field("present", &v.is_some())
+                .finish(),
+            Self::PollPinState(s) => f.debug_tuple("PollPinState").field(s).finish(),
+            Self::PollPinOutcome(o) => f.debug_tuple("PollPinOutcome").field(o).finish(),
+            Self::PollActionResult(r) => f.debug_tuple("PollActionResult").field(r).finish(),
+            Self::PollCapabilities(c) => f.debug_tuple("PollCapabilities").field(c).finish(),
         }
     }
 }
@@ -501,9 +598,9 @@ pub enum HostCall {
         client_id: String,
         quote: Option<E2eeQuoteArg>,
     },
-    // U6
+    // U8
     ShowCard {
-        conv_id: String,
+        conv_id: Option<String>,
         text: String,
     },
     // U16
@@ -526,6 +623,34 @@ pub enum HostCall {
     RefreshContacts {
         op_id: Option<u64>,
         result: OpResult,
+    },
+    ResolveMedia {
+        forward_id: u64,
+        conv_id: String,
+        msg_id: String,
+        kind: String,
+    },
+    ResolveFile {
+        forward_id: u64,
+        conv_id: String,
+        msg_id: String,
+        name: String,
+        url: Option<String>,
+    },
+    FetchMediaData {
+        forward_id: u64,
+        url: String,
+    },
+    SendMedia {
+        forward_id: u64,
+        conv_id: String,
+        paths: Vec<String>,
+        cleanup_after: bool,
+    },
+    SendFiles {
+        forward_id: u64,
+        conv_id: String,
+        paths: Vec<String>,
     },
 }
 
@@ -661,21 +786,69 @@ impl fmt::Debug for HostCall {
                 .field("send_id", send_id)
                 .field("has_quote", &quote.is_some())
                 .finish(),
-            // U6
-            Self::ShowCard { text, .. } => f
+            // U8
+            Self::ShowCard { conv_id, .. } => f
                 .debug_struct("ShowCard")
-                .field("text_len", &text.len())
+                .field("has_conv_id", &conv_id.is_some())
+                .finish(),
+            Self::ResolveMedia {
+                forward_id, kind, ..
+            } => f
+                .debug_struct("ResolveMedia")
+                .field("forward_id", forward_id)
+                .field("kind", kind)
+                .finish(),
+            Self::ResolveFile {
+                forward_id, url, ..
+            } => f
+                .debug_struct("ResolveFile")
+                .field("forward_id", forward_id)
+                .field("has_url", &url.is_some())
+                .finish(),
+            Self::FetchMediaData { forward_id, .. } => f
+                .debug_struct("FetchMediaData")
+                .field("forward_id", forward_id)
+                .finish(),
+            Self::SendMedia {
+                forward_id,
+                paths,
+                cleanup_after,
+                ..
+            } => f
+                .debug_struct("SendMedia")
+                .field("forward_id", forward_id)
+                .field("paths_count", &paths.len())
+                .field("cleanup_after", cleanup_after)
+                .finish(),
+            Self::SendFiles {
+                forward_id, paths, ..
+            } => f
+                .debug_struct("SendFiles")
+                .field("forward_id", forward_id)
+                .field("paths_count", &paths.len())
                 .finish(),
             // U16
             Self::NotifyBanner(b) => f.debug_tuple("NotifyBanner").field(b).finish(),
-            Self::RequestNotifAuth { op_id } => f.debug_struct("RequestNotifAuth").field("op_id", op_id).finish(),
-            Self::StartCall { video, .. } => f.debug_struct("StartCall").field("video", video).finish(),
-            Self::SendCategorySticker { cate_id, sticker_id, .. } => f
+            Self::RequestNotifAuth { op_id } => f
+                .debug_struct("RequestNotifAuth")
+                .field("op_id", op_id)
+                .finish(),
+            Self::StartCall { video, .. } => {
+                f.debug_struct("StartCall").field("video", video).finish()
+            }
+            Self::SendCategorySticker {
+                cate_id,
+                sticker_id,
+                ..
+            } => f
                 .debug_struct("SendCategorySticker")
                 .field("cate_id", cate_id)
                 .field("sticker_id", sticker_id)
                 .finish(),
-            Self::RefreshContacts { op_id, .. } => f.debug_struct("RefreshContacts").field("op_id", op_id).finish(),
+            Self::RefreshContacts { op_id, .. } => f
+                .debug_struct("RefreshContacts")
+                .field("op_id", op_id)
+                .finish(),
         }
     }
 }
@@ -686,27 +859,49 @@ pub enum Effect {
     /// Aborts any in-flight QR / boot network tasks.
     CancelSessionTasks,
     /// Loads and restores the saved session via `Host::load_saved_session` + `SessionClient::restore`.
-    LoadSavedSession { boot_gen: u64 },
+    LoadSavedSession {
+        boot_gen: u64,
+    },
     /// Reads the legacy cookie via `Host::load_legacy_cookie` and runs `complete_login` if present.
-    LoadLegacyCookie { boot_gen: u64 },
+    LoadLegacyCookie {
+        boot_gen: u64,
+    },
     /// Validates the restored session against the server (`session_status_detailed`).
-    CheckSessionStatus { boot_gen: u64 },
+    CheckSessionStatus {
+        boot_gen: u64,
+    },
     /// Refreshes the signed-in user's profile (`sync_profile_me`).
-    SyncProfileMe { boot_gen: u64 },
+    SyncProfileMe {
+        boot_gen: u64,
+    },
     /// Requests a fresh QR login ticket (`request_qr`).
-    RequestQr { qr_gen: u64, language: String },
+    RequestQr {
+        qr_gen: u64,
+        language: String,
+    },
     /// Long-polls until the phone scans the QR code (rotations arrive as `Input::QrRotated`).
-    WaitQrScan { qr_gen: u64, ticket: QrTicket },
+    WaitQrScan {
+        qr_gen: u64,
+        ticket: QrTicket,
+    },
     /// Long-polls until the phone confirms the login.
-    WaitQrConfirm { qr_gen: u64, ticket: QrTicket },
+    WaitQrConfirm {
+        qr_gen: u64,
+        ticket: QrTicket,
+    },
     /// Finishes login (`getLoginInfo` + `syncProfileMe`).
-    CompleteLogin { qr_gen: u64 },
+    CompleteLogin {
+        qr_gen: u64,
+    },
     /// Clears the in-memory `SessionClient` credentials and domains before `HostCall::ClearSession`.
     ClearCoreSession,
     /// Marks `expired_at` on the in-memory `SessionClient` before `HostCall::MarkExpired`.
     MarkCoreSessionExpired,
     /// Writes a session-domain preference to the opened store (storage primitive, not in `hostTrace`).
-    SetPref { key: String, value: String },
+    SetPref {
+        key: String,
+        value: String,
+    },
 
     // --- Transport domain (U2) ---
     /// Starts the core-owned WebSocket client and emits the serial `start_ws` replay trace marker.
@@ -718,9 +913,14 @@ pub enum Effect {
         self_conv_id: Option<String>,
     },
     /// Stops the core-owned WebSocket client (optionally resetting cursors).
-    StopWs { reset_cursors: bool },
+    StopWs {
+        reset_cursors: bool,
+    },
     /// Records a `file_done` / `video_done` completion on the active WebSocket client.
-    RecordFileDone { file_id: String, url: String },
+    RecordFileDone {
+        file_id: String,
+        url: String,
+    },
     /// Arms the long-poll timer (`delay` = 4 s). When `initial` is true, also emits the serial
     /// `start_long_poll` replay trace marker on the host FIFO.
     StartLpTimer {
@@ -737,7 +937,10 @@ pub enum Effect {
         poll_state: PollState,
     },
     /// Resolves a `drain_chat_polling` waiter with `total_events` (handled directly by the actor).
-    CompleteDrain { drain_id: u64, total_events: u32 },
+    CompleteDrain {
+        drain_id: u64,
+        total_events: u32,
+    },
     /// Shape-only diagnostic log line routed via `tracing` (`olaz_core::engine_log`).
     EngineLog(String),
 
@@ -779,7 +982,10 @@ pub enum Effect {
         op_id: Option<u64>,
     },
     /// Calls `ZaloApi::set_unread_mark` (best-effort fire-and-forget).
-    SetUnreadMarkApi { conv_id: String, unread: bool },
+    SetUnreadMarkApi {
+        conv_id: String,
+        unread: bool,
+    },
     /// Calls `ZaloApi::send_seen` (best-effort fire-and-forget).
     SendSeenApi(SeenTarget),
     /// Calls `ZaloApi::set_hidden_conversation` (best-effort, optional op completion).
@@ -796,9 +1002,13 @@ pub enum Effect {
         op_id: Option<u64>,
     },
     /// Calls `ZaloApi::reset_hidden_pin` if authenticated.
-    ResetHiddenPinApi { op_id: Option<u64> },
+    ResetHiddenPinApi {
+        op_id: Option<u64>,
+    },
     /// Calls `ZaloApi::fetch_hidden_conversations` if authenticated.
-    FetchHiddenConversationsApi { op_id: Option<u64> },
+    FetchHiddenConversationsApi {
+        op_id: Option<u64>,
+    },
     /// Calls `ZaloApi::fetch_profiles` for one chunk of up to 50 missing-name UIDs.
     FetchProfilesChunkApi {
         op_id: Option<u64>,
@@ -812,21 +1022,33 @@ pub enum Effect {
         op_id: Option<u64>,
     },
     /// Calls `ZaloApi::fetch_conversation_labels`.
-    FetchConversationLabelsApi { op_id: Option<u64> },
+    FetchConversationLabelsApi {
+        op_id: Option<u64>,
+    },
 
     // --- Launch bootstrap network effects (U4-bootstrap) ---
     /// Aborts any in-flight bootstrap HTTP tasks.
     CancelBootstrapTasks,
     /// Step 1: fetches `/api/alias/list` (distinguishes auth vs other errors).
-    BootstrapFetchAliasesApi { boot_gen: u64 },
+    BootstrapFetchAliasesApi {
+        boot_gen: u64,
+    },
     /// Step 3: concurrently fetches pinned conversations, archived chats, and mute list.
-    BootstrapFetchPamApi { boot_gen: u64 },
+    BootstrapFetchPamApi {
+        boot_gen: u64,
+    },
     /// Step 4a: fetches `/api/convlabel/get`.
-    BootstrapFetchLabelsApi { boot_gen: u64 },
+    BootstrapFetchLabelsApi {
+        boot_gen: u64,
+    },
     /// Step 4b: fetches hidden conversations snapshot.
-    BootstrapFetchHiddenApi { boot_gen: u64 },
+    BootstrapFetchHiddenApi {
+        boot_gen: u64,
+    },
     /// Step 4c: concurrently fetches friends, groups list, sent requests, and received requests.
-    BootstrapFetchContactsApi { boot_gen: u64 },
+    BootstrapFetchContactsApi {
+        boot_gen: u64,
+    },
     /// Step 5: fetches `/api/preloadconvers/get-last-msgs` (overview or 25-ID chunk).
     BootstrapFetchPreloadApi {
         boot_gen: u64,
@@ -872,7 +1094,9 @@ pub enum Effect {
 
     // U5
     /// Calls `ZaloApi::send_typing` when `SessionClient::is_authenticated()` is true.
-    SendTypingApi { conv_id: String },
+    SendTypingApi {
+        conv_id: String,
+    },
     /// Starts or resets the incoming typing expiry timer for `conv_id`.
     StartTypingExpiry {
         conv_id: String,
@@ -880,13 +1104,103 @@ pub enum Effect {
         delay: Duration,
     },
     /// Cancels any active incoming typing expiry timer for `conv_id`.
-    CancelTypingExpiry { conv_id: String },
+    CancelTypingExpiry {
+        conv_id: String,
+    },
     // U5-send
     /// Calls `ZaloApi::send_text` for a plain-text send and returns [`Input::SendTextDone`].
     SendTextApi {
         send_id: u64,
         params: SendTextParams,
     },
+    // U8
+    /// Allocates a client id from `SessionClient::next_client_id` and returns [`Input::ForwardClientIdAllocated`].
+    AllocClientId {
+        forward_id: u64,
+    },
+    /// Calls `ZaloApi::send_contact_card` and returns [`Input::ForwardContactCardDone`].
+    SendContactCardApi {
+        forward_id: u64,
+        params: SendContactCardParams,
+    },
+    // U12
+    /// Calls `ZaloApi::fetch_poll_detail` for `Refresh` or `Voters`.
+    FetchPollDetailApi {
+        op_id: Option<u64>,
+        poll_id: String,
+        purpose: PollDetailPurpose,
+    },
+    /// Calls `ZaloApi::fetch_group_detail` when `refreshPoll` encounters an uncached group.
+    FetchPollGroupDetailApi {
+        op_id: Option<u64>,
+        poll_id: String,
+        group_id: String,
+        data_node: Map<String, Value>,
+        now_ms: i64,
+    },
+    /// Runs `Host::refresh_board_pins` on the serial host FIFO (when `!require_auth` or
+    /// `client.is_authenticated()`) and then sends [`Input::PollBoardRefreshed`].
+    RefreshBoardPinsForPoll {
+        conv_id: String,
+        require_auth: bool,
+        continuation: PollBoardContinuation,
+    },
+    /// Optionally unpins `replace_ref` and then pins `poll_id` (`topic_type = 3`) on the group board.
+    UnpinThenPinPollApi {
+        op_id: Option<u64>,
+        poll_id: String,
+        conv_id: String,
+        replace_ref: Option<ReplaceBoardPinSpec>,
+        for_create: bool,
+    },
+    /// Calls `ZaloApi::unpin_board_topic_api` for `poll_id`.
+    UnpinPollApi {
+        op_id: Option<u64>,
+        poll_id: String,
+        conv_id: String,
+        raw_topic: Option<Map<String, Value>>,
+        board_version: i64,
+    },
+    /// Calls `ZaloApi::add_poll_option_api` (if `!new_options.is_empty()`) or `ZaloApi::vote_poll_api`.
+    VotePollApi {
+        op_id: Option<u64>,
+        poll_id: String,
+        new_options: Vec<olaz_api::NewPollOptionPayload>,
+        voted_ids: Vec<String>,
+        now_ms: i64,
+    },
+    /// Calls `ZaloApi::lock_poll_api`.
+    LockPollApi {
+        op_id: Option<u64>,
+        poll_id: String,
+        now_ms: i64,
+    },
+    /// Calls `ZaloApi::share_poll_api`.
+    SharePollApi {
+        op_id: Option<u64>,
+        poll_id: String,
+    },
+    /// Calls `ZaloApi::create_poll_api`.
+    CreatePollApi {
+        op_id: Option<u64>,
+        conv_id: String,
+        question: String,
+        options: Vec<String>,
+        expired_time_ms: i64,
+        allow_multi: bool,
+        allow_add: bool,
+        hide_vote_preview: bool,
+        is_anonymous: bool,
+        should_pin: bool,
+    },
+    /// Arms a 1.5 s per-poll debounce timer (delegating to `Host::arm_poll_debounce` if handled).
+    ArmPollDebounce {
+        poll_id: String,
+        seq: u64,
+        delay: Duration,
+    },
+    /// Cancels all pending poll debounce timers (in Rust and via `Host::cancel_all_poll_debounces`).
+    CancelAllPollDebounces,
 
     // U6
     /// Resolves server `msg_id` and `cli_msg_id` via SQLite + `fetch_history(count=30)`.
@@ -916,13 +1230,20 @@ pub enum Effect {
         can_try_alt: bool,
     },
     /// Arms the 5 s delete-for-me undo expiry timer.
-    StartDeleteUndoExpiry { undo_gen: u64, delay: Duration },
+    StartDeleteUndoExpiry {
+        undo_gen: u64,
+        delay: Duration,
+    },
     /// Cancels any active delete-for-me undo expiry timer.
     CancelDeleteUndoExpiry,
     /// Commits a delete-for-me batch (`delete_message_for_me` API + SQLite delete per item).
-    CommitDeleteBatch { items: Vec<DeleteUndoItem> },
+    CommitDeleteBatch {
+        items: Vec<DeleteUndoItem>,
+    },
     /// Calls `ZaloApi::fetch_auto_delete` and reports `Input::AutoDeleteLoaded`.
-    FetchAutoDeleteApi { op_id: Option<u64> },
+    FetchAutoDeleteApi {
+        op_id: Option<u64>,
+    },
     /// Calls `ZaloApi::update_auto_delete` and reports `Input::AutoDeleteUpdated`.
     UpdateAutoDeleteApi {
         conv_id: String,
@@ -1236,6 +1557,16 @@ impl fmt::Debug for Effect {
                 .field("send_id", send_id)
                 .field("params", params)
                 .finish(),
+            // U8
+            Self::AllocClientId { forward_id } => f
+                .debug_struct("AllocClientId")
+                .field("forward_id", forward_id)
+                .finish(),
+            Self::SendContactCardApi { forward_id, params } => f
+                .debug_struct("SendContactCardApi")
+                .field("forward_id", forward_id)
+                .field("params", params)
+                .finish(),
             // U6
             Self::ResolveMessageIds { resolve_id, .. } => f
                 .debug_struct("ResolveMessageIds")
@@ -1286,7 +1617,12 @@ impl fmt::Debug for Effect {
                 .field("op_id", op_id)
                 .finish(),
             // U16
-            Self::SetMuteApi { req_id, unmute, duration_secs, .. } => f
+            Self::SetMuteApi {
+                req_id,
+                unmute,
+                duration_secs,
+                ..
+            } => f
                 .debug_struct("SetMuteApi")
                 .field("req_id", req_id)
                 .field("unmute", unmute)
@@ -1309,10 +1645,9 @@ impl fmt::Debug for Effect {
                 .debug_struct("SendFriendRequestApi")
                 .field("op_id", op_id)
                 .finish(),
-            Self::SetAliasApi { op_id, .. } => f
-                .debug_struct("SetAliasApi")
-                .field("op_id", op_id)
-                .finish(),
+            Self::SetAliasApi { op_id, .. } => {
+                f.debug_struct("SetAliasApi").field("op_id", op_id).finish()
+            }
             Self::FetchGroupInvitePreviewApi { op_id, .. } => f
                 .debug_struct("FetchGroupInvitePreviewApi")
                 .field("op_id", op_id)
@@ -1348,6 +1683,81 @@ impl fmt::Debug for Effect {
                 .field("op_id", op_id)
                 .field("uids_count", &uids.len())
                 .finish(),
+            // U12
+            Self::FetchPollDetailApi { op_id, purpose, .. } => f
+                .debug_struct("FetchPollDetailApi")
+                .field("op_id", op_id)
+                .field("purpose", purpose)
+                .finish(),
+            Self::FetchPollGroupDetailApi { op_id, now_ms, .. } => f
+                .debug_struct("FetchPollGroupDetailApi")
+                .field("op_id", op_id)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::RefreshBoardPinsForPoll {
+                require_auth,
+                continuation,
+                ..
+            } => f
+                .debug_struct("RefreshBoardPinsForPoll")
+                .field("require_auth", require_auth)
+                .field("continuation", continuation)
+                .finish(),
+            Self::UnpinThenPinPollApi {
+                op_id,
+                replace_ref,
+                for_create,
+                ..
+            } => f
+                .debug_struct("UnpinThenPinPollApi")
+                .field("op_id", op_id)
+                .field("has_replace", &replace_ref.is_some())
+                .field("for_create", for_create)
+                .finish(),
+            Self::UnpinPollApi {
+                op_id,
+                board_version,
+                ..
+            } => f
+                .debug_struct("UnpinPollApi")
+                .field("op_id", op_id)
+                .field("board_version", board_version)
+                .finish(),
+            Self::VotePollApi {
+                op_id,
+                new_options,
+                voted_ids,
+                ..
+            } => f
+                .debug_struct("VotePollApi")
+                .field("op_id", op_id)
+                .field("new_options", &new_options.len())
+                .field("voted_ids", &voted_ids.len())
+                .finish(),
+            Self::LockPollApi { op_id, .. } => {
+                f.debug_struct("LockPollApi").field("op_id", op_id).finish()
+            }
+            Self::SharePollApi { op_id, .. } => f
+                .debug_struct("SharePollApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::CreatePollApi {
+                op_id,
+                options,
+                should_pin,
+                ..
+            } => f
+                .debug_struct("CreatePollApi")
+                .field("op_id", op_id)
+                .field("options", &options.len())
+                .field("should_pin", should_pin)
+                .finish(),
+            Self::ArmPollDebounce { seq, delay, .. } => f
+                .debug_struct("ArmPollDebounce")
+                .field("seq", seq)
+                .field("delay_ms", &delay.as_millis())
+                .finish(),
+            Self::CancelAllPollDebounces => f.write_str("CancelAllPollDebounces"),
             Self::Host(call) => f.debug_tuple("Host").field(call).finish(),
         }
     }

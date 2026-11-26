@@ -209,7 +209,11 @@ impl MuteInfo {
 
     /// Formats the description string from Swift-formatted `HH:mm` and optional `dd/MM` (when not same day).
     #[must_use]
-    pub fn format_description(self, hh_mm: Option<&str>, dd_mm_if_other_day: Option<&str>) -> String {
+    pub fn format_description(
+        self,
+        hh_mm: Option<&str>,
+        dd_mm_if_other_day: Option<&str>,
+    ) -> String {
         if self.is_indefinite() {
             return "Cho đến khi được mở lại".to_owned();
         }
@@ -224,7 +228,11 @@ impl MuteInfo {
 
     /// Formats the status string from Swift-formatted `HH:mm` and optional `dd/MM` (when not same day).
     #[must_use]
-    pub fn format_status_text(self, hh_mm: Option<&str>, dd_mm_if_other_day: Option<&str>) -> String {
+    pub fn format_status_text(
+        self,
+        hh_mm: Option<&str>,
+        dd_mm_if_other_day: Option<&str>,
+    ) -> String {
         if self.is_indefinite() {
             return "Đang tắt cho đến khi được mở lại".to_owned();
         }
@@ -236,26 +244,6 @@ impl MuteInfo {
             Some(dm) => format!("Đang tắt đến {hm} ngày {dm}"),
         }
     }
-
-    /// Formats description at `now_ms` using fixed `utc_offset_secs` (`0` for UTC).
-    #[must_use]
-    pub fn description_at(self, now_ms: i64, utc_offset_secs: i32) -> String {
-        let Some(until_ms) = self.until_ms() else {
-            return self.format_description(None, None);
-        };
-        let (hm, dm) = hh_mm_and_dd_mm(until_ms, now_ms, utc_offset_secs);
-        self.format_description(Some(&hm), dm.as_deref())
-    }
-
-    /// Formats status text at `now_ms` using fixed `utc_offset_secs` (`0` for UTC).
-    #[must_use]
-    pub fn status_text_at(self, now_ms: i64, utc_offset_secs: i32) -> String {
-        let Some(until_ms) = self.until_ms() else {
-            return self.format_status_text(None, None);
-        };
-        let (hm, dm) = hh_mm_and_dd_mm(until_ms, now_ms, utc_offset_secs);
-        self.format_status_text(Some(&hm), dm.as_deref())
-    }
 }
 
 /// Active mute entry sorted longest-standing first (`(start_time, id)` ascending).
@@ -266,62 +254,6 @@ pub struct ActiveMuteEntry {
 }
 
 /// Observable notification settings state mirrored to Swift (`DirtyKey::NotificationSettings`).
-/// Howard Hinnant's civil-from-days algorithm: converts days since `1970-01-01` to `(year, month, day)`.
-fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
-    let z = days_since_epoch + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
-    (year as i32, m as u32, d as u32)
-}
-
-fn hh_mm_and_dd_mm(until_ms: i64, now_ms: i64, utc_offset_secs: i32) -> (String, Option<String>) {
-    let offset = i64::from(utc_offset_secs);
-    let until_local_sec = until_ms.div_euclid(1000) + offset;
-    let now_local_sec = now_ms.div_euclid(1000) + offset;
-    let until_days = until_local_sec.div_euclid(86_400);
-    let now_days = now_local_sec.div_euclid(86_400);
-    let sec_of_day = until_local_sec.rem_euclid(86_400);
-    let hh = sec_of_day / 3600;
-    let mm = (sec_of_day % 3600) / 60;
-    let hm = format!("{hh:02}:{mm:02}");
-    let until_ymd = civil_from_days(until_days);
-    let now_ymd = civil_from_days(now_days);
-    let dm = if until_ymd == now_ymd {
-        None
-    } else {
-        Some(format!("{:02}/{:02}", until_ymd.2, until_ymd.1))
-    };
-    (hm, dm)
-}
-
-/// Computes `duration_secs` for `MuteDuration` raw values (`1` = 1h, `2` = 4h, `3` = next 08:00, `4` = `-1`).
-#[must_use]
-pub fn mute_duration_secs(raw: i32, now_ms: i64, utc_offset_secs: i32) -> i64 {
-    match raw {
-        1 => 3600,
-        2 => 4 * 3600,
-        3 => {
-            let now_sec = now_ms.div_euclid(1000);
-            let local_sec = now_sec + i64::from(utc_offset_secs);
-            let sec_of_day = local_sec.rem_euclid(86_400);
-            let target_sec_of_day = 8 * 3600;
-            if sec_of_day < target_sec_of_day {
-                target_sec_of_day - sec_of_day
-            } else {
-                86_400 - sec_of_day + target_sec_of_day
-            }
-        }
-        _ => -1,
-    }
-}
-
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct NotificationSettingsSnapshot {
     pub is_loaded: bool,
@@ -882,10 +814,109 @@ pub fn parse_group_invite_preview(
 ///
 /// Returns `(result, should_refresh_contacts)`.
 #[must_use]
+fn map_join_error_code(code: i64, group_id: String) -> (GroupJoinResultData, bool) {
+    match code {
+        178 => (
+            GroupJoinResultData {
+                state: "already".to_owned(),
+                group_id,
+                text: "Đã là thành viên của nhóm".to_owned(),
+            },
+            false,
+        ),
+        240 => (
+            GroupJoinResultData {
+                state: "pending".to_owned(),
+                group_id: String::new(),
+                text: "Yêu cầu của bạn đã được gửi đến trưởng/phó nhóm chờ xét duyệt".to_owned(),
+            },
+            false,
+        ),
+        227 => (
+            GroupJoinResultData::error("Link tham gia không tồn tại."),
+            false,
+        ),
+        228 => (
+            GroupJoinResultData::error("Link tham gia đã hết hạn."),
+            false,
+        ),
+        177 => (
+            GroupJoinResultData::error("Bạn đã vượt quá số nhóm cho phép."),
+            false,
+        ),
+        257 => (
+            GroupJoinResultData::error("Bạn không có quyền tham gia nhóm vào lúc này"),
+            false,
+        ),
+        259 => (
+            GroupJoinResultData::error(
+                "Bạn không có quyền thực hiện thay đổi trong nhóm vào lúc này",
+            ),
+            false,
+        ),
+        166 => (
+            GroupJoinResultData::error("Bạn đã bị trưởng nhóm chặn tham gia nhóm này."),
+            false,
+        ),
+        280 | 282 => (
+            GroupJoinResultData::error(
+                "Nhóm đang bật Tin nhắn tự xóa. Cập nhật Zalo bản mới để tham gia nhóm.",
+            ),
+            false,
+        ),
+        281 => (
+            GroupJoinResultData::error(
+                "Không thể tham gia nhóm do bạn đã đạt giới hạn trò chuyện có Tin nhắn tự xóa.",
+            ),
+            false,
+        ),
+        283 => (
+            GroupJoinResultData::error(
+                "Không thể tham gia nhóm. Liên hệ trưởng hoặc phó nhóm để tham gia.",
+            ),
+            false,
+        ),
+        284 => (
+            GroupJoinResultData::error(
+                "Nhóm đang bật Tin nhắn tự xóa. Cập nhật bản mới Zalo PC và Zalo trên điện thoại để tham gia nhóm.",
+            ),
+            false,
+        ),
+        285 => (
+            GroupJoinResultData::error(
+                "Nhóm đang bật Tin nhắn tự xóa. Cập nhật Zalo PC bản mới để tham gia nhóm.",
+            ),
+            false,
+        ),
+        286 => (
+            GroupJoinResultData::error(
+                "Nhóm đang bật Tin nhắn tự xóa. Cập nhật Zalo bản mới trên điện thoại để tham gia nhóm.",
+            ),
+            false,
+        ),
+        833 => (
+            GroupJoinResultData::error(
+                "Không thể tham gia nhóm. Bạn đã đạt giới hạn trò chuyện có Chặn chia sẻ.",
+            ),
+            false,
+        ),
+        other => (
+            GroupJoinResultData::error(format!("Vào nhóm không thành công. ({other})")),
+            false,
+        ),
+    }
+}
+
 pub fn map_join_group_outcome(
     api_res: Result<&Map<String, Value>, &ApiError>,
     fallback_group_id: Option<&str>,
 ) -> (GroupJoinResultData, bool) {
+    let fallback_valid = || {
+        fallback_group_id
+            .filter(|g| is_valid_group_conv_id(g))
+            .unwrap_or("")
+            .to_owned()
+    };
     match api_res {
         Ok(resp) => {
             let d = resp.get("data").and_then(Value::as_object);
@@ -895,11 +926,12 @@ pub fn map_join_group_outcome(
             let gid = if is_valid_group_conv_id(&resp_gid) {
                 resp_gid
             } else {
-                fallback_group_id
-                    .filter(|g| is_valid_group_conv_id(g))
-                    .unwrap_or("")
-                    .to_owned()
+                fallback_valid()
             };
+            let code = int64(resp.get("error_code")).unwrap_or(0);
+            if code != 0 {
+                return map_join_error_code(code, gid);
+            }
             if is_valid_group_conv_id(&gid) {
                 (
                     GroupJoinResultData {
@@ -910,7 +942,10 @@ pub fn map_join_group_outcome(
                     true,
                 )
             } else {
-                (GroupJoinResultData::error("Vào nhóm không thành công."), true)
+                (
+                    GroupJoinResultData::error("Vào nhóm không thành công."),
+                    true,
+                )
             }
         }
         Err(err) => {
@@ -922,112 +957,7 @@ pub fn map_join_group_outcome(
                     false,
                 );
             };
-            let code = session_err.code;
-            match code {
-                178 => {
-                    let fallback = fallback_group_id
-                        .filter(|g| is_valid_group_conv_id(g))
-                        .unwrap_or("")
-                        .to_owned();
-                    (
-                        GroupJoinResultData {
-                            state: "already".to_owned(),
-                            group_id: fallback,
-                            text: "Đã là thành viên của nhóm".to_owned(),
-                        },
-                        false,
-                    )
-                }
-                240 => (
-                    GroupJoinResultData {
-                        state: "pending".to_owned(),
-                        group_id: String::new(),
-                        text: "Yêu cầu của bạn đã được gửi đến trưởng/phó nhóm chờ xét duyệt"
-                            .to_owned(),
-                    },
-                    false,
-                ),
-                227 => (
-                    GroupJoinResultData::error("Link tham gia không tồn tại."),
-                    false,
-                ),
-                228 => (
-                    GroupJoinResultData::error("Link tham gia đã hết hạn."),
-                    false,
-                ),
-                177 => (
-                    GroupJoinResultData::error("Bạn đã vượt quá số nhóm cho phép."),
-                    false,
-                ),
-                257 => (
-                    GroupJoinResultData::error("Bạn không có quyền tham gia nhóm vào lúc này"),
-                    false,
-                ),
-                259 => (
-                    GroupJoinResultData::error(
-                        "Bạn không có quyền thực hiện thay đổi trong nhóm vào lúc này",
-                    ),
-                    false,
-                ),
-                166 => (
-                    GroupJoinResultData::error("Bạn đã bị trưởng nhóm chặn tham gia nhóm này."),
-                    false,
-                ),
-                280 | 282 => (
-                    GroupJoinResultData::error(
-                        "Nhóm đang bật Tin nhắn tự xóa. Cập nhật Zalo bản mới để tham gia nhóm.",
-                    ),
-                    false,
-                ),
-                281 => (
-                    GroupJoinResultData::error(
-                        "Không thể tham gia nhóm do bạn đã đạt giới hạn trò chuyện có Tin nhắn tự xóa.",
-                    ),
-                    false,
-                ),
-                283 => (
-                    GroupJoinResultData::error(
-                        "Không thể tham gia nhóm. Liên hệ trưởng hoặc phó nhóm để tham gia.",
-                    ),
-                    false,
-                ),
-                284 => (
-                    GroupJoinResultData::error(
-                        "Nhóm đang bật Tin nhắn tự xóa. Cập nhật bản mới Zalo PC và Zalo trên điện thoại để tham gia nhóm.",
-                    ),
-                    false,
-                ),
-                285 => (
-                    GroupJoinResultData::error(
-                        "Nhóm đang bật Tin nhắn tự xóa. Cập nhật Zalo PC bản mới để tham gia nhóm.",
-                    ),
-                    false,
-                ),
-                286 => (
-                    GroupJoinResultData::error(
-                        "Nhóm đang bật Tin nhắn tự xóa. Cập nhật Zalo bản mới trên điện thoại để tham gia nhóm.",
-                    ),
-                    false,
-                ),
-                833 => (
-                    GroupJoinResultData::error(
-                        "Không thể tham gia nhóm. Bạn đã đạt giới hạn trò chuyện có Chặn chia sẻ.",
-                    ),
-                    false,
-                ),
-                other => {
-                    let msg = session_err.message.trim();
-                    let text = if !msg.is_empty() {
-                        // Note: official `r = t.translate(code) ?? n.error_message; ...`? Wait:
-                        // Check user-decisions item 16.2: "Mã khác thì kèm số mã."!
-                        let _ = msg;
-                        format!("Vào nhóm không thành công. ({other})")
-                    } else {
-                        format!("Vào nhóm không thành công. ({other})")
-                    };
-                    (GroupJoinResultData::error(text), false)
-                }
-            }
+            map_join_error_code(session_err.code, fallback_valid())
         }
     }
 }
@@ -1057,7 +987,7 @@ pub fn normalize_reminder_snapshot(
         _ => Map::new(),
     };
 
-    fn first_non_empty<'a>(candidates: &[Option<&'a str>]) -> String {
+    fn first_non_empty(candidates: &[Option<&str>]) -> String {
         for c in candidates.iter().flatten() {
             if !c.trim().is_empty() {
                 return (*c).to_owned();
@@ -1223,12 +1153,14 @@ pub fn normalize_reminder_snapshot(
         String::new()
     };
 
-    let can_rsvp =
-        bool_val(data.get("canRsvp")).unwrap_or(is_group && !only_me && !deleted);
+    let can_rsvp = bool_val(data.get("canRsvp")).unwrap_or(is_group && !only_me && !deleted);
     let can_view = bool_val(data.get("canView")).unwrap_or(!deleted);
-    let raw_variant = first_non_empty(&[data.get("variant").and_then(Value::as_str), Some("invite")]);
+    let raw_variant =
+        first_non_empty(&[data.get("variant").and_then(Value::as_str), Some("invite")]);
     let normalized_variant = match raw_variant.as_str() {
-        "hidden" | "pending" | "invite" | "alert" | "demotedCreate" | "demotedAlert" => raw_variant.clone(),
+        "hidden" | "pending" | "invite" | "alert" | "demotedCreate" | "demotedAlert" => {
+            raw_variant.clone()
+        }
         _ => "hidden".to_owned(),
     };
     let explicit_sig = string(data.get("sig"));
@@ -1282,15 +1214,22 @@ pub struct RawResponderBuckets {
 
 /// Extracts raw responder buckets from `listResponseEvent` JSON.
 #[must_use]
-pub fn extract_responder_buckets(response_dict: &Map<String, Value>) -> Option<RawResponderBuckets> {
-    let data: &Map<String, Value> = if let Some(d) = response_dict.get("data").and_then(Value::as_object)
-    {
-        d
-    } else if response_dict.get("data").and_then(Value::as_array).is_some() || !response_dict.is_empty() {
-        response_dict
-    } else {
-        return None;
-    };
+pub fn extract_responder_buckets(
+    response_dict: &Map<String, Value>,
+) -> Option<RawResponderBuckets> {
+    let data: &Map<String, Value> =
+        if let Some(d) = response_dict.get("data").and_then(Value::as_object) {
+            d
+        } else if response_dict
+            .get("data")
+            .and_then(Value::as_array)
+            .is_some()
+            || !response_dict.is_empty()
+        {
+            response_dict
+        } else {
+            return None;
+        };
 
     fn parse_entry(raw: &Value) -> Option<(RawResponderEntry, Option<i64>)> {
         if let Some(dict) = raw.as_object() {
@@ -1504,6 +1443,16 @@ mod tests {
             }))
         };
 
+        let mut resp_178_with_gid = Map::new();
+        resp_178_with_gid.insert("error_code".to_owned(), Value::from(178));
+        let mut data_178 = Map::new();
+        data_178.insert("groupId".to_owned(), Value::String("7777".to_owned()));
+        resp_178_with_gid.insert("data".to_owned(), Value::Object(data_178));
+        let (r178_data, ref178_data) = map_join_group_outcome(Ok(&resp_178_with_gid), None);
+        assert_eq!(r178_data.state, "already");
+        assert_eq!(r178_data.group_id, "g7777");
+        assert!(!ref178_data);
+
         let (r178, ref178) = map_join_group_outcome(Err(&err_for(178)), Some("g1660"));
         assert!(!ref178);
         assert_eq!(r178.state, "already");
@@ -1522,7 +1471,10 @@ mod tests {
             (228, "Link tham gia đã hết hạn."),
             (177, "Bạn đã vượt quá số nhóm cho phép."),
             (257, "Bạn không có quyền tham gia nhóm vào lúc này"),
-            (259, "Bạn không có quyền thực hiện thay đổi trong nhóm vào lúc này"),
+            (
+                259,
+                "Bạn không có quyền thực hiện thay đổi trong nhóm vào lúc này",
+            ),
             (166, "Bạn đã bị trưởng nhóm chặn tham gia nhóm này."),
             (
                 280,
@@ -1564,12 +1516,43 @@ mod tests {
 
     #[test]
     fn policy_helpers_match_swift() {
-        assert!(policy::should_suppress(true, true, Some("5"), "5", 4.0, 180.0));
-        assert!(policy::should_suppress(true, true, Some("5"), "5", 179.0, 180.0));
-        assert!(!policy::should_suppress(true, true, Some("5"), "5", 180.0, 180.0));
-        assert!(!policy::should_suppress(false, true, Some("5"), "5", 4.0, 180.0));
+        assert!(policy::should_suppress(
+            true,
+            true,
+            Some("5"),
+            "5",
+            4.0,
+            180.0
+        ));
+        assert!(policy::should_suppress(
+            true,
+            true,
+            Some("5"),
+            "5",
+            179.0,
+            180.0
+        ));
+        assert!(!policy::should_suppress(
+            true,
+            true,
+            Some("5"),
+            "5",
+            180.0,
+            180.0
+        ));
+        assert!(!policy::should_suppress(
+            false,
+            true,
+            Some("5"),
+            "5",
+            4.0,
+            180.0
+        ));
         assert_eq!(
-            policy::newly_hidden(&["1".into(), "2".into()], &["2".into(), "4".into(), "3".into()]),
+            policy::newly_hidden(
+                &["1".into(), "2".into()],
+                &["2".into(), "4".into(), "3".into()]
+            ),
             vec!["3".to_owned(), "4".to_owned()]
         );
         assert_eq!(policy::body("Hi", false), HIDDEN_PREVIEW_BODY);

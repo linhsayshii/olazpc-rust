@@ -651,7 +651,7 @@ impl DeleteUndoState {
         out.dirty.insert(DirtyKey::DeleteUndo);
         out.effects.push(Effect::CancelDeleteUndoExpiry);
         out.effects.push(Effect::Host(HostCall::ShowCard {
-            conv_id: active.conv_id.clone(),
+            conv_id: Some(active.conv_id.clone()),
             text: RESTORE_SUCCESS_CARD_TEXT.to_owned(),
         }));
         Some((active.conv_id, active.items))
@@ -2117,7 +2117,7 @@ fn handle_react_done(
                 flight.msg_type,
             )));
             out.effects.push(Effect::Host(HostCall::ShowCard {
-                conv_id: flight.conv_id,
+                conv_id: Some(flight.conv_id),
                 text: REACT_FAILED_CARD_TEXT.to_owned(),
             }));
             complete_unit(flight.op_id, out);
@@ -2156,7 +2156,7 @@ fn start_recall(state: &mut CoreState, args: RecallStartArgs, out: &mut ReduceOu
     }
     if is_over_recall_window(msg.date_ms, args.now_ms) {
         out.effects.push(Effect::Host(HostCall::ShowCard {
-            conv_id: args.conv_id,
+            conv_id: Some(args.conv_id),
             text: RECALL_OVER_24H_CARD_TEXT.to_owned(),
         }));
         finish_recall_step(state, args.op_id, args.recall_many_id, false, out);
@@ -2265,7 +2265,7 @@ fn handle_recall_done(
                 &flight.resolved_cli_id,
             )));
             out.effects.push(Effect::Host(HostCall::ShowCard {
-                conv_id: flight.conv_id,
+                conv_id: Some(flight.conv_id),
                 text: recall_error_card_text(&failure),
             }));
             finish_recall_step(state, flight.op_id, flight.recall_many_id, false, out);
@@ -2424,7 +2424,7 @@ fn handle_set_starred(
         .and_then(|m| m.menu.star);
     if on && existing_star == Some(StarMode::Blocked) {
         out.effects.push(Effect::Host(HostCall::ShowCard {
-            conv_id: conv_id.to_owned(),
+            conv_id: Some(conv_id.to_owned()),
             text: STAR_BLOCKED_CARD_TEXT.to_owned(),
         }));
         return false;
@@ -2468,7 +2468,7 @@ fn handle_set_starred(
         persisted = true;
     }
     out.effects.push(Effect::Host(HostCall::ShowCard {
-        conv_id: conv_id.to_owned(),
+        conv_id: Some(conv_id.to_owned()),
         text: if on {
             STAR_ADDED_CARD_TEXT.to_owned()
         } else {
@@ -2913,7 +2913,7 @@ fn apply_auto_delete_updated(
             "autodelete: update failed {err_type}"
         )));
         out.effects.push(Effect::Host(HostCall::ShowCard {
-            conv_id: conv_id.to_owned(),
+            conv_id: Some(conv_id.to_owned()),
             text: AUTO_DELETE_FAILED_CARD_TEXT.to_owned(),
         }));
         return false;
@@ -3345,7 +3345,7 @@ mod tests {
             undo_out.effects.as_slice(),
             [
                 Effect::CancelDeleteUndoExpiry,
-                Effect::Host(HostCall::ShowCard { conv_id, text })
+                Effect::Host(HostCall::ShowCard { conv_id: Some(conv_id), text })
             ] if conv_id == "3000620" && text == RESTORE_SUCCESS_CARD_TEXT
         ));
 
@@ -3488,7 +3488,7 @@ mod tests {
             upd_fail.effects.as_slice(),
             [
                 Effect::EngineLog(line),
-                Effect::Host(HostCall::ShowCard { conv_id, text })
+                Effect::Host(HostCall::ShowCard { conv_id: Some(conv_id), text })
             ] if line == "autodelete: update failed ZaloSessionError"
                 && conv_id == "3000628"
                 && text == AUTO_DELETE_FAILED_CARD_TEXT

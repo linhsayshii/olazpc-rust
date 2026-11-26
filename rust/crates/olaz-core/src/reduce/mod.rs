@@ -5,8 +5,11 @@
 pub mod bootstrap;
 pub mod classify;
 pub mod conversations;
+pub mod forward;
 pub mod messages;
 pub mod notify;
+// U12
+pub mod polls;
 pub mod send;
 pub mod session;
 pub mod transport;
@@ -163,6 +166,30 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
             ..
         }
         | Input::SendTextDone { .. } => send::reduce_send(state, input, &mut out),
+        // U8
+        Input::Command(
+            Command::RequestForward { .. }
+            | Command::ForwardSelection { .. }
+            | Command::ClearForwardRequest
+            | Command::Forward { .. }
+            | Command::ForwardAll { .. },
+        )
+        | Input::OpRequest {
+            cmd:
+                Command::RequestForward { .. }
+                | Command::ForwardSelection { .. }
+                | Command::ClearForwardRequest
+                | Command::Forward { .. }
+                | Command::ForwardAll { .. },
+            ..
+        }
+        | Input::ForwardClientIdAllocated { .. }
+        | Input::ForwardContactCardDone { .. }
+        | Input::ForwardMediaResolved { .. }
+        | Input::ForwardFileResolved { .. }
+        | Input::ForwardFetchMediaDone { .. }
+        | Input::ForwardSendMediaDone { .. }
+        | Input::ForwardSendFilesDone { .. } => forward::reduce_forward(state, input, &mut out),
 
         // U6
         Input::Command(ref cmd) if is_action_command(cmd) => {
@@ -183,6 +210,25 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::DeleteUndoExpired { .. }
         | Input::AutoDeleteLoaded { .. }
         | Input::AutoDeleteUpdated { .. } => crate::actions::reduce_actions(state, input, &mut out),
+        // U12
+        Input::Command(ref cmd) if polls::is_poll_command(cmd) => {
+            polls::reduce_polls(state, input, &mut out);
+        }
+        Input::OpRequest { ref cmd, .. } if polls::is_poll_command(cmd) => {
+            polls::reduce_polls(state, input, &mut out);
+        }
+        Input::PollDetailFetched { .. }
+        | Input::PollGroupDetailFetched { .. }
+        | Input::PollBoardRefreshed { .. }
+        | Input::PollPinApiDone { .. }
+        | Input::PollUnpinApiDone { .. }
+        | Input::PollVoteApiDone { .. }
+        | Input::PollLockApiDone { .. }
+        | Input::PollShareApiDone { .. }
+        | Input::PollCreateApiDone { .. }
+        | Input::PollDebounceFired { .. } => {
+            polls::reduce_polls(state, input, &mut out);
+        }
 
         // U16
         Input::Command(ref cmd) if notify::is_notify_command(cmd) => {

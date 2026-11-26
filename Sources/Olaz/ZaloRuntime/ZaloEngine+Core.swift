@@ -87,12 +87,19 @@ final class CoreEngineLifecycle: Sendable {
     /// Installs a freshly created `CoreEngine` and its change-stream task. Returns `false` if
     /// `shutdown()` was already called before installation completed.
     func install(core: CoreEngine, changeTask: Task<Void, Never>) -> Bool {
-        state.withLock { st in
-            guard !st.isShutDown else { return false }
+        let (installed, previousCore, previousTask): (Bool, CoreEngine?, Task<Void, Never>?) = state.withLock { st in
+            guard !st.isShutDown else { return (false, nil, nil) }
+            let oldCore = st.core
+            let oldTask = st.changeTask
             st.core = core
             st.changeTask = changeTask
-            return true
+            return (true, oldCore, oldTask)
         }
+        previousTask?.cancel()
+        if let previousCore, previousCore !== core {
+            previousCore.stop()
+        }
+        return installed
     }
 
     /// Replaces the gate in `slot`, finishing any previous gate. Returns `nil` if already shut down.
@@ -187,6 +194,28 @@ final class CoreEngineLifecycle: Sendable {
             gate.finish()
         }
     }
+
+    /// Stops the Rust actor, awaits its task + socket + host worker exit, awaits the change-mirror
+    /// task exit, and finishes all active gates so scenario teardown leaves zero lingering tasks.
+    func shutdownAsync() async {
+        let (core, task, gates): (CoreEngine?, Task<Void, Never>?, [CorePhaseGate]) = state.withLock { st in
+            st.isShutDown = true
+            let c = st.core
+            let t = st.changeTask
+            let g = [st.bootGate, st.qrGate, st.cleanupGate].compactMap { $0 }
+            st.core = nil
+            st.changeTask = nil
+            st.bootGate = nil
+            st.qrGate = nil
+            st.cleanupGate = nil
+            return (c, t, g)
+        }
+        core?.stop()
+        for gate in gates {
+            gate.finish()
+        }
+        await task?.value
+    }
 }
 
 /// Version-fenced MainActor overlay for optimistic U6 message actions (react, delete-for-me,
@@ -208,13 +237,18 @@ internal struct OptimisticMessageOverlay {
     var kind: Kind
     var resolvedVersion: UInt64 = .max
 
-    var suppressedVersion: UInt64 = 0
+    var suppressedReactionsVersion: UInt64 = 0
     var suppressedReactions: [ChatMessage.Reaction]?
+    var suppressedMessagesVersion: UInt64 = 0
     var suppressedRestored: [ChatMessage] = []
     var suppressedRemovedIds: Set<String> = []
+    var suppressedUndoVersion: UInt64 = 0
     var suppressedHasUndo: Bool = false
     var suppressedUndo: DeleteUndo?
-    var suppressedStar: (starred: Bool, menuStar: MessageMenu.Star?, inCachedSet: Bool)?
+    var suppressedStarMsgVersion: UInt64 = 0
+    var suppressedStarMsg: (starred: Bool, menuStar: MessageMenu.Star?)?
+    var suppressedStarSetVersion: UInt64 = 0
+    var suppressedStarInSet: Bool?
 }
 
 /// Commands queued on the MainActor while `CoreEngine` completes its one-time async creation.
@@ -481,7 +515,11 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
     func notifyIncomingMessages(messages: [ChatMessageRecord]) async {
         guard let engine, !messages.isEmpty else { return }
         let mapped = messages.map(ChatMessage.init(record:))
-        await engine.notifyIncomingBatchMessages(mapped)
+        await MainActor.run {
+            engine.trackNotificationTask { [weak engine] in
+                await engine?.notifyIncomingBatchMessages(mapped)
+            }
+        }
     }
 
     func showBatchTyping(convId: String, senderId: String) async {
@@ -683,7 +721,29 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         )
     }
 
-    func showCard(convId: String, text: String) async {
+    func armPollDebounce(pollId: String, seq: UInt64, delayMs: UInt64) async -> Bool {
+        guard let engine else { return false }
+        await MainActor.run {
+            PollClock.pendingRefresh[pollId] = seq
+            if seq > PollClock.nextDebounceSeq {
+                PollClock.nextDebounceSeq = seq
+            }
+            engine.armLocalPollDebounceTask(pollId: pollId, seq: seq, delayMs: delayMs)
+        }
+        return true
+    }
+
+    func cancelAllPollDebounces() async {
+        await MainActor.run {
+            PollClock.refreshTasks.values.forEach { $0.cancel() }
+            PollClock.refreshTasks = [:]
+            PollClock.pendingRefresh = [:]
+        }
+    }
+
+    // MARK: - Forward & Message Action Host Effects (U6/U8)
+
+    func showCard(convId: String?, text: String) async {
         guard let engine else { return }
         await engine.waitForCoreMirrorDrain()
         await MainActor.run {
@@ -691,11 +751,39 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         }
     }
 
-    func notifyBanner(banner: NotifyBannerPayloadRecord) async {
-        guard let engine else { return }
-        await engine.waitForCoreMirrorDrain()
+    func resolveMedia(convId: String, msgId: String, kind: String) async -> MediaResolutionRecord {
+        guard let engine else { return .unavailable }
+        return await engine.hostResolveMedia(convId: convId, msgId: msgId, kind: kind)
+    }
+
+    func resolveFile(convId: String, msgId: String, name: String, url: String?) async -> FileResolutionRecord {
+        guard let engine else { return .expired }
+        return await engine.hostResolveFile(convId: convId, msgId: msgId, name: name, url: url)
+    }
+
+    func fetchMediaData(url: String) async -> String? {
+        guard let engine else { return nil }
+        return await engine.hostFetchMediaData(url: url)
+    }
+
+    func sendMedia(convId: String, paths: [String], cleanupAfter: Bool) async -> ComposerSendOutcomeRecord {
+        guard let engine else { return .cancelled }
+        return await engine.hostSendMedia(convId: convId, paths: paths, cleanupAfter: cleanupAfter)
+    }
+
+    func sendFiles(convId: String, paths: [String]) async -> ComposerSendOutcomeRecord {
+        guard let engine else { return .cancelled }
+        return await engine.hostSendFiles(convId: convId, paths: paths)
+    }
+
+    // MARK: - Notification & Card-Action Host Effects (U16)
+
+    func notifyBanners(banners: [NotifyBannerPayloadRecord]) async {
+        guard let engine, !banners.isEmpty else { return }
         await MainActor.run {
-            engine.hostNotifyBanner(banner)
+            for banner in banners {
+                engine.hostNotifyBanner(banner)
+            }
         }
     }
 
@@ -747,6 +835,40 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         await MainActor.run {
             engine.reminderWatchTimerTasks[waiterId]?.cancel()
             engine.reminderWatchTimerTasks.removeValue(forKey: waiterId)
+        }
+    }
+}
+
+extension ForwardRequest {
+    init(coreRecord record: ForwardRequestRecord) {
+        var bytes: uuid_t = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        let v = record.id.bigEndian
+        bytes.8 = UInt8((v >> 56) & 0xFF)
+        bytes.9 = UInt8((v >> 48) & 0xFF)
+        bytes.10 = UInt8((v >> 40) & 0xFF)
+        bytes.11 = UInt8((v >> 32) & 0xFF)
+        bytes.12 = UInt8((v >> 24) & 0xFF)
+        bytes.13 = UInt8((v >> 16) & 0xFF)
+        bytes.14 = UInt8((v >> 8) & 0xFF)
+        bytes.15 = UInt8(v & 0xFF)
+        self.init(
+            id: UUID(uuid: bytes),
+            conversationId: record.conversationId,
+            message: ChatMessage(record: record.message),
+            more: record.more.map(ChatMessage.init(record:))
+        )
+    }
+}
+
+extension MessageActionOutcome {
+    init(forwardRecord record: ForwardOutcomeRecord) {
+        switch record {
+        case .done(let text):
+            self = .done(text: text)
+        case .pending(let text):
+            self = .pending(text)
+        case .failed(let text):
+            self = .failed(text)
         }
     }
 }
@@ -1016,16 +1138,30 @@ extension ZaloEngine {
                 return nil
             }
 
+            await self.webSocket.attachCore(core)
+            guard !self.coreLifecycle.isShutDown else {
+                await self.webSocket.detachCore()
+                core.stop()
+                self.pendingCoreCommands.removeAll()
+                self.failAllMirrorWaiters()
+                self.coreLifecycle.finishAllGates()
+                return nil
+            }
+
+            self.appliedMirrorVersion = 0
             let lifecycle = self.coreLifecycle
             let changeTask = Task { @MainActor [weak self, core, lifecycle] in
                 defer {
-                    lifecycle.finishAllGates()
-                    self?.failAllMirrorWaiters()
+                    if lifecycle.core === core || lifecycle.core == nil {
+                        lifecycle.finishAllGates()
+                        self?.failAllMirrorWaiters()
+                    }
                 }
                 while !Task.isCancelled {
                     do {
                         guard let batch = try await core.nextChanges() else { break }
-                        guard let self else { break }
+                        guard !Task.isCancelled else { break }
+                        guard let self, self.coreLifecycle.core === core else { break }
                         self.applyCoreChanges(batch)
                     } catch {
                         break
@@ -1033,7 +1169,6 @@ extension ZaloEngine {
                 }
             }
 
-            await self.webSocket.attachCore(core)
             guard self.coreLifecycle.install(core: core, changeTask: changeTask) else {
                 await self.webSocket.detachCore()
                 changeTask.cancel()
@@ -1094,6 +1229,30 @@ extension ZaloEngine {
                 for (convId, ttl) in autoDel where ttl > 0 {
                     core.setAutoDeleteTtl(convId: convId, ttlMs: ttl)
                 }
+            }
+            let initialPolls = self.currentPollsMirrorRecord()
+            if !initialPolls.details.isEmpty
+                || !initialPolls.pins.isEmpty
+                || !initialPolls.failed.isEmpty
+                || !initialPolls.watched.isEmpty
+                || !initialPolls.lastAttemptMs.isEmpty
+                || !initialPolls.seenMessages.isEmpty
+                || initialPolls.didEvictWatched
+                || !initialPolls.pendingRefresh.isEmpty
+                || initialPolls.syncEpoch > 0
+            {
+                core.seedPolls(polls: initialPolls)
+            }
+            // U7: seed temporary read-only board caches into core until U7 owns board pins.
+            for (convId, list) in self.pins {
+                core.syncBoardPins(convId: convId, list: list.boardPinListRecord)
+            }
+            for (convId, entry) in self.cachedBoardRawTopics {
+                core.syncBoardRawTopics(
+                    convId: convId,
+                    version: entry.version,
+                    topicsJson: Self.jsonString(for: entry.topics)
+                )
             }
 
             let queued = self.pendingCoreCommands
@@ -1313,6 +1472,65 @@ extension ZaloEngine {
         await saveNotificationPreferences()
     }
 
+    // MARK: - U8 Forward Host Helpers
+
+    internal func hostResolveMedia(convId: String, msgId: String, kind: String) async -> MediaResolutionRecord {
+        let mediaKind = MediaKind(rawValue: kind) ?? .photo
+        let res = await resolveMedia(conversationId: convId, messageId: msgId, kind: mediaKind)
+        switch res {
+        case .file(let url): return .file(path: url.path)
+        case .expired: return .expired
+        case .unsupported: return .unsupported
+        case .unavailable: return .unavailable
+        }
+    }
+
+    internal func hostResolveFile(convId: String, msgId: String, name: String, url: String?) async -> FileResolutionRecord {
+        let parsed = url.flatMap { $0.isEmpty ? nil : URL(string: $0) }
+        let res = await resolveFile(conversationId: convId, messageId: msgId, name: name, url: parsed)
+        switch res {
+        case .ready(let staged): return .ready(path: staged.path)
+        case .expired: return .expired
+        case .failed(let message): return .failed(message: message)
+        }
+    }
+
+    internal func hostFetchMediaData(url: String) async -> String? {
+        guard let parsed = URL(string: url),
+              let data = await fetchMediaData(for: parsed) else {
+            return nil
+        }
+        let tmp = makeForwardTempPhotoURL()
+        try? data.write(to: tmp, options: .atomic)
+        return tmp.path
+    }
+
+    internal func hostSendMedia(convId: String, paths: [String], cleanupAfter: Bool) async -> ComposerSendOutcomeRecord {
+        let urls = paths.map(URL.init(fileURLWithPath:))
+        defer {
+            if cleanupAfter {
+                for url in urls {
+                    try? FileManager.default.removeItem(at: url)
+                }
+            }
+        }
+        return Self.composerSendOutcomeRecord(await sendMedia(urls, to: convId))
+    }
+
+    internal func hostSendFiles(convId: String, paths: [String]) async -> ComposerSendOutcomeRecord {
+        let urls = paths.map(URL.init(fileURLWithPath:))
+        return Self.composerSendOutcomeRecord(await sendFiles(urls, to: convId))
+    }
+
+    nonisolated private static func composerSendOutcomeRecord(_ outcome: ComposerOutcome) -> ComposerSendOutcomeRecord {
+        switch outcome {
+        case .done: return .done
+        case .cancelled: return .cancelled
+        case .pending(let text): return .pending(text: text)
+        case .failed(let text): return .failed(text: text)
+        }
+    }
+
     private static func sendCommand(_ command: PendingCoreCommand, to core: CoreEngine) {
         switch command {
         case .start:
@@ -1327,6 +1545,9 @@ extension ZaloEngine {
     }
 
     internal func applyCoreChanges(_ batch: CoreChangesRecord) {
+        if batch.version > 0 && batch.version < appliedMirrorVersion {
+            return
+        }
         if let session = batch.session {
             let qrPayload: String?
             if case .login(let login) = session.phase {
@@ -1520,6 +1741,10 @@ extension ZaloEngine {
             applyContactsMirror(cRec)
         }
 
+        if let pRec = batch.polls {
+            applyPollsMirror(pRec, fromLocalPlan: false)
+        }
+
         if let typingEntries = batch.typing {
             var nextTyping: [String: TypingStatus] = [:]
             nextTyping.reserveCapacity(typingEntries.count)
@@ -1529,6 +1754,16 @@ extension ZaloEngine {
             if nextTyping != typing {
                 typing = nextTyping
             }
+        }
+
+        if let fwdUpdate = batch.forwardRequest {
+            let mapped = fwdUpdate.request.map(ForwardRequest.init(coreRecord:))
+            if mapped != forwardRequest {
+                forwardRequest = mapped
+            }
+        }
+        if batch.clearSelection {
+            endSelection()
         }
 
         if let undoUpdate = batch.deleteUndo {
@@ -1744,7 +1979,6 @@ extension ZaloEngine {
             return
         }
         let overlay = optimisticMessageOverlays.remove(at: idx)
-        guard overlay.suppressedVersion >= targetVersion else { return }
         isApplyingCoreMirror = true
         isSuppressingDirectMessageSync = true
         defer {
@@ -1753,7 +1987,8 @@ extension ZaloEngine {
         }
         switch overlay.kind {
         case .reaction(let msgId, let clientId, _):
-            if let authReactions = overlay.suppressedReactions,
+            if overlay.suppressedReactionsVersion >= targetVersion,
+               let authReactions = overlay.suppressedReactions,
                var list = messages[overlay.convId],
                let msgIdx = list.firstIndex(where: { $0.id == msgId || (!clientId.isEmpty && $0.clientId == clientId) }),
                list[msgIdx].reactions != authReactions {
@@ -1761,7 +1996,7 @@ extension ZaloEngine {
                 messages[overlay.convId] = list
             }
         case .delete:
-            if !overlay.suppressedRestored.isEmpty {
+            if overlay.suppressedMessagesVersion >= targetVersion, !overlay.suppressedRestored.isEmpty {
                 var list = messages[overlay.convId] ?? []
                 let existing = Set(list.map(\.id))
                 let toAdd = overlay.suppressedRestored.filter { !existing.contains($0.id) }
@@ -1771,29 +2006,38 @@ extension ZaloEngine {
                     messages[overlay.convId] = list
                 }
             }
-            if overlay.suppressedHasUndo, deleteUndo != overlay.suppressedUndo {
+            if overlay.suppressedUndoVersion >= targetVersion,
+               overlay.suppressedHasUndo,
+               deleteUndo != overlay.suppressedUndo {
                 deleteUndo = overlay.suppressedUndo
             }
         case .undoDelete:
-            if !overlay.suppressedRemovedIds.isEmpty, var list = messages[overlay.convId] {
+            if overlay.suppressedMessagesVersion >= targetVersion,
+               !overlay.suppressedRemovedIds.isEmpty,
+               var list = messages[overlay.convId] {
                 let prev = list.count
                 list.removeAll { overlay.suppressedRemovedIds.contains($0.id) }
                 if list.count != prev { messages[overlay.convId] = list }
             }
-            if overlay.suppressedHasUndo, deleteUndo != overlay.suppressedUndo {
+            if overlay.suppressedUndoVersion >= targetVersion,
+               overlay.suppressedHasUndo,
+               deleteUndo != overlay.suppressedUndo {
                 deleteUndo = overlay.suppressedUndo
             }
         case .star(let msgId, _):
-            if let authStar = overlay.suppressedStar {
-                if var list = messages[overlay.convId],
-                   let msgIdx = list.firstIndex(where: { $0.id == msgId }) {
-                    if list[msgIdx].menu.starred != authStar.starred || list[msgIdx].menu.star != authStar.menuStar {
-                        list[msgIdx].menu.starred = authStar.starred
-                        list[msgIdx].menu.star = authStar.menuStar
-                        messages[overlay.convId] = list
-                    }
+            if overlay.suppressedStarMsgVersion >= targetVersion,
+               let authStar = overlay.suppressedStarMsg,
+               var list = messages[overlay.convId],
+               let msgIdx = list.firstIndex(where: { $0.id == msgId }) {
+                if list[msgIdx].menu.starred != authStar.starred || list[msgIdx].menu.star != authStar.menuStar {
+                    list[msgIdx].menu.starred = authStar.starred
+                    list[msgIdx].menu.star = authStar.menuStar
+                    messages[overlay.convId] = list
                 }
-                if authStar.inCachedSet {
+            }
+            if overlay.suppressedStarSetVersion >= targetVersion,
+               let inCachedSet = overlay.suppressedStarInSet {
+                if inCachedSet {
                     cachedStarredIds.insert(msgId)
                 } else {
                     cachedStarredIds.remove(msgId)
@@ -1802,59 +2046,130 @@ extension ZaloEngine {
         }
     }
 
-    private func reapplyActiveOptimisticOverlays(for batch: CoreChangesRecord) {
-        var touchedConvs: Set<String> = []
-        if !batch.messagesResetAll {
-            for delta in batch.windowDeltas {
-                switch delta {
-                case .reset(let convId, _), .append(let convId, _), .patch(let convId, _, _):
-                    touchedConvs.insert(convId)
-                case .remove:
-                    break
+    private static func batchTouchesMessage(
+        _ batch: CoreChangesRecord,
+        convId: String,
+        msgId: String,
+        clientId: String
+    ) -> Bool {
+        if batch.messagesResetAll { return true }
+        for delta in batch.windowDeltas {
+            switch delta {
+            case .reset(let cid, _) where cid == convId:
+                return true
+            case .remove(let cid) where cid == convId:
+                return true
+            case .append(let cid, let records) where cid == convId:
+                if records.contains(where: { $0.id == msgId || (!clientId.isEmpty && $0.clientId == clientId) }) {
+                    return true
                 }
+            case .patch(let cid, let upserts, let removedIds) where cid == convId:
+                if upserts.contains(where: { $0.id == msgId || (!clientId.isEmpty && $0.clientId == clientId) })
+                    || removedIds.contains(msgId) {
+                    return true
+                }
+            default:
+                break
             }
         }
+        return false
+    }
+
+    private static func batchTouchesAnyMessage(
+        _ batch: CoreChangesRecord,
+        convId: String,
+        msgIds: Set<String>
+    ) -> Bool {
+        if batch.messagesResetAll { return true }
+        for delta in batch.windowDeltas {
+            switch delta {
+            case .reset(let cid, _) where cid == convId:
+                return true
+            case .remove(let cid) where cid == convId:
+                return true
+            case .append(let cid, let records) where cid == convId:
+                if records.contains(where: { msgIds.contains($0.id) }) {
+                    return true
+                }
+            case .patch(let cid, let upserts, let removedIds) where cid == convId:
+                if upserts.contains(where: { msgIds.contains($0.id) })
+                    || removedIds.contains(where: { msgIds.contains($0) }) {
+                    return true
+                }
+            default:
+                break
+            }
+        }
+        return false
+    }
+
+    private static func shouldRecordSuppressed(batchVersion: UInt64, previousVersion: UInt64) -> Bool {
+        previousVersion == 0 || batchVersion > previousVersion
+    }
+
+    private func reapplyActiveOptimisticOverlays(for batch: CoreChangesRecord) {
         for i in optimisticMessageOverlays.indices {
             let overlay = optimisticMessageOverlays[i]
             guard batch.version < overlay.resolvedVersion else { continue }
-            let convTouched = batch.messagesResetAll || touchedConvs.contains(overlay.convId)
             switch overlay.kind {
             case .reaction(let msgId, let clientId, let expectedReactions):
-                if convTouched,
+                if Self.batchTouchesMessage(batch, convId: overlay.convId, msgId: msgId, clientId: clientId),
                    var list = messages[overlay.convId],
                    let idx = list.firstIndex(where: { $0.id == msgId || (!clientId.isEmpty && $0.clientId == clientId) }) {
-                    optimisticMessageOverlays[i].suppressedVersion = max(optimisticMessageOverlays[i].suppressedVersion, batch.version)
-                    optimisticMessageOverlays[i].suppressedReactions = list[idx].reactions
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedReactionsVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedReactionsVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedReactions = list[idx].reactions
+                    }
                     if list[idx].reactions != expectedReactions {
                         list[idx].reactions = expectedReactions
                         messages[overlay.convId] = list
                     }
                 }
             case .delete(let msgIds, let expectedUndo):
-                if convTouched, var list = messages[overlay.convId] {
+                if Self.batchTouchesAnyMessage(batch, convId: overlay.convId, msgIds: msgIds),
+                   var list = messages[overlay.convId] {
                     let present = list.filter { msgIds.contains($0.id) }
-                    optimisticMessageOverlays[i].suppressedVersion = max(optimisticMessageOverlays[i].suppressedVersion, batch.version)
-                    optimisticMessageOverlays[i].suppressedRestored = present
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedMessagesVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedMessagesVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedRestored = present
+                    }
                     if !present.isEmpty {
                         list.removeAll { msgIds.contains($0.id) }
                         messages[overlay.convId] = list
                     }
                 }
                 if batch.deleteUndo != nil {
-                    optimisticMessageOverlays[i].suppressedVersion = max(optimisticMessageOverlays[i].suppressedVersion, batch.version)
-                    optimisticMessageOverlays[i].suppressedHasUndo = true
-                    optimisticMessageOverlays[i].suppressedUndo = deleteUndo
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedUndoVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedUndoVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedHasUndo = true
+                        optimisticMessageOverlays[i].suppressedUndo = deleteUndo
+                    }
                     if deleteUndo != expectedUndo {
                         deleteUndo = expectedUndo
                     }
                 }
             case .undoDelete(let restored):
-                if convTouched {
+                let restoredIds = Set(restored.map(\.id))
+                if Self.batchTouchesAnyMessage(batch, convId: overlay.convId, msgIds: restoredIds) {
                     var list = messages[overlay.convId] ?? []
                     let existingIds = Set(list.map(\.id))
                     let missing = restored.filter { !existingIds.contains($0.id) }
-                    optimisticMessageOverlays[i].suppressedVersion = max(optimisticMessageOverlays[i].suppressedVersion, batch.version)
-                    optimisticMessageOverlays[i].suppressedRemovedIds = Set(missing.map(\.id))
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedMessagesVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedMessagesVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedRemovedIds = Set(missing.map(\.id))
+                    }
                     if !missing.isEmpty {
                         list.append(contentsOf: missing)
                         list.sort { a, b in a.date == b.date ? a.id < b.id : a.date < b.date }
@@ -1862,23 +2177,32 @@ extension ZaloEngine {
                     }
                 }
                 if batch.deleteUndo != nil {
-                    optimisticMessageOverlays[i].suppressedVersion = max(optimisticMessageOverlays[i].suppressedVersion, batch.version)
-                    optimisticMessageOverlays[i].suppressedHasUndo = true
-                    optimisticMessageOverlays[i].suppressedUndo = deleteUndo
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedUndoVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedUndoVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedHasUndo = true
+                        optimisticMessageOverlays[i].suppressedUndo = deleteUndo
+                    }
                     if deleteUndo != nil {
                         deleteUndo = nil
                     }
                 }
             case .star(let msgId, let on):
-                if convTouched,
+                if Self.batchTouchesMessage(batch, convId: overlay.convId, msgId: msgId, clientId: ""),
                    var list = messages[overlay.convId],
                    let idx = list.firstIndex(where: { $0.id == msgId }) {
-                    optimisticMessageOverlays[i].suppressedVersion = max(optimisticMessageOverlays[i].suppressedVersion, batch.version)
-                    optimisticMessageOverlays[i].suppressedStar = (
-                        list[idx].menu.starred,
-                        list[idx].menu.star,
-                        cachedStarredIds.contains(msgId)
-                    )
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedStarMsgVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedStarMsgVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedStarMsg = (
+                            list[idx].menu.starred,
+                            list[idx].menu.star
+                        )
+                    }
                     let targetMenuStar: MessageMenu.Star = on ? .unstar : .star
                     if list[idx].menu.starred != on || list[idx].menu.star != targetMenuStar {
                         list[idx].menu.starred = on
@@ -1887,14 +2211,12 @@ extension ZaloEngine {
                     }
                 }
                 if batch.starredIds != nil {
-                    optimisticMessageOverlays[i].suppressedVersion = max(optimisticMessageOverlays[i].suppressedVersion, batch.version)
-                    if optimisticMessageOverlays[i].suppressedStar == nil {
-                        let cur = messages[overlay.convId]?.first(where: { $0.id == msgId })
-                        optimisticMessageOverlays[i].suppressedStar = (
-                            cur?.menu.starred ?? on,
-                            cur?.menu.star,
-                            cachedStarredIds.contains(msgId)
-                        )
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedStarSetVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedStarSetVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedStarInSet = cachedStarredIds.contains(msgId)
                     }
                     if on {
                         cachedStarredIds.insert(msgId)
@@ -2635,5 +2957,127 @@ extension ZaloEngine {
         for waiter in waiters {
             waiter.continuation.resume()
         }
+    }
+
+    // MARK: - U12 Group Polls Mirror & Temporary U7 Board Write-Through Helpers
+
+    internal func currentPollsMirrorRecord() -> PollsMirrorRecord {
+        var orderedSeen = PollClock.seenMessagesOrder.filter { PollClock.seenMessages.contains($0) }
+        let inOrder = Set(orderedSeen)
+        if inOrder.count < PollClock.seenMessages.count {
+            let missing = PollClock.seenMessages.subtracting(inOrder)
+                .sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
+            orderedSeen.append(contentsOf: missing)
+        }
+        PollClock.seenMessagesOrder = orderedSeen
+
+        return PollsMirrorRecord(
+            details: polls.details.keys.sorted().compactMap { id in
+                polls.details[id].map { PollDetailEntryRecord(id: id, detail: $0.coreRecord) }
+            },
+            pins: polls.pins.keys.sorted().compactMap { id in
+                polls.pins[id].map { PollPinEntryRecord(id: id, state: $0.coreRecord) }
+            },
+            failed: polls.failed.sorted(),
+            watched: PollClock.watched.keys.sorted().compactMap { pid in
+                PollClock.watched[pid].map { PollWatchedEntryRecord(pollId: pid, convId: $0) }
+            },
+            lastAttemptMs: PollClock.lastAttempt.keys.sorted().compactMap { pid in
+                PollClock.lastAttempt[pid].map {
+                    PollAttemptEntryRecord(
+                        pollId: pid,
+                        lastAttemptMs: Int64(($0.timeIntervalSince1970 * 1000.0).rounded())
+                    )
+                }
+            },
+            seenMessages: orderedSeen,
+            didEvictWatched: PollClock.didEvictWatched,
+            pendingRefresh: PollClock.pendingRefresh.keys.sorted().compactMap { pid in
+                PollClock.pendingRefresh[pid].map { PollPendingRefreshEntryRecord(pollId: pid, seq: $0) }
+            },
+            nextDebounceSeq: PollClock.nextDebounceSeq,
+            syncEpoch: localPollSyncEpoch
+        )
+    }
+
+    internal func applyPollsMirror(_ rec: PollsMirrorRecord, fromLocalPlan: Bool = true) {
+        guard rec.syncEpoch >= localPollSyncEpoch else { return }
+        let epochAdvanced = rec.syncEpoch > localPollSyncEpoch
+        localPollSyncEpoch = rec.syncEpoch
+
+        let nextStore = PollStore(
+            details: Dictionary(uniqueKeysWithValues: rec.details.map { ($0.id, PollDetail(coreRecord: $0.detail)) }),
+            pins: Dictionary(uniqueKeysWithValues: rec.pins.map { ($0.id, PollPinState(coreRecord: $0.state)) }),
+            failed: Set(rec.failed)
+        )
+        if nextStore != polls {
+            polls = nextStore
+        }
+
+        PollClock.watched = Dictionary(uniqueKeysWithValues: rec.watched.map { ($0.pollId, $0.convId) })
+        PollClock.lastAttempt = Dictionary(uniqueKeysWithValues: rec.lastAttemptMs.map {
+            ($0.pollId, Date(timeIntervalSince1970: Double($0.lastAttemptMs) / 1000.0))
+        })
+        PollClock.didEvictWatched = rec.didEvictWatched
+
+        if epochAdvanced || fromLocalPlan || rec.nextDebounceSeq >= PollClock.nextDebounceSeq {
+            PollClock.seenMessagesOrder = rec.seenMessages
+            PollClock.seenMessages = Set(rec.seenMessages)
+            PollClock.nextDebounceSeq = rec.nextDebounceSeq
+
+            let nextPending = Dictionary(uniqueKeysWithValues: rec.pendingRefresh.map { ($0.pollId, $0.seq) })
+            for pid in Array(PollClock.refreshTasks.keys) where nextPending[pid] == nil {
+                PollClock.refreshTasks[pid]?.cancel()
+                PollClock.refreshTasks.removeValue(forKey: pid)
+            }
+            if fromLocalPlan || epochAdvanced {
+                PollClock.pendingRefresh = nextPending
+            } else {
+                PollClock.pendingRefresh = nextPending.filter { PollClock.refreshTasks[$0.key] != nil }
+            }
+        }
+    }
+
+    // U7: push Swift's board pins for one conversation into core's read-only board mirror.
+    internal func pushCoreBoardPinsIfRunning(for convId: String) {
+        guard let core = coreLifecycle.core else { return }
+        core.syncBoardPins(convId: convId, list: pins[convId]?.boardPinListRecord)
+    }
+
+    // U7: push Swift's board pins & raw topics for one conversation into core's read-only board mirror.
+    internal func pushCoreBoardStateIfRunning(for convId: String) {
+        guard let core = coreLifecycle.core else { return }
+        core.syncBoardPins(convId: convId, list: pins[convId]?.boardPinListRecord)
+        if let raw = cachedBoardRawTopics[convId] {
+            core.syncBoardRawTopics(
+                convId: convId,
+                version: raw.version,
+                topicsJson: Self.jsonString(for: raw.topics)
+            )
+        } else {
+            core.syncBoardRawTopics(convId: convId, version: 0, topicsJson: nil)
+        }
+    }
+}
+
+// U7: temporary conversion into `BoardPinListRecord` until U7 owns board pins.
+extension PinnedList {
+    var boardPinListRecord: BoardPinListRecord {
+        BoardPinListRecord(
+            ready: ready,
+            canPin: canPin,
+            limit: Int64(limit),
+            items: items.map { item in
+                BoardPinItemRecord(
+                    refId: item.ref,
+                    kind: item.kind.rawValue,
+                    title: item.title,
+                    sender: item.sender,
+                    thumbnail: item.thumbnail?.absoluteString,
+                    msgId: item.msgId,
+                    cliMsgId: item.cliMsgId
+                )
+            }
+        )
     }
 }

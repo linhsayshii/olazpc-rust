@@ -1,17 +1,20 @@
 //! Reducer for notifications, mutes, incoming banner decisions, reminders, and card actions (U16).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use olaz_wire::lossless::string;
 use olaz_wire::{
-    ChatMessage, ECard, ECardStyle, Kind, UNKNOWN_NAME, is_group_id, strip_user_prefix,
-    web_link_sanitized,
+    ChatMessage, ECard, ECardStyle, Kind, UNKNOWN_NAME, is_group_id, sanitize_profile_uid,
+    strip_user_prefix, web_link_sanitized,
 };
 use serde_json::{Map, Value};
 
 use crate::changes::DirtyKey;
-use crate::conversations::{CachedProfile, message_preview_label, preferred_profile_name};
+use crate::conversations::{
+    CachedProfile, ConversationSummary, FriendIdentity, message_preview_label,
+    preferred_profile_name,
+};
 use crate::effect::{Effect, HostCall, OpResult, StoreOp};
 use crate::input::{Command, Input};
 use crate::notify::{
@@ -54,6 +57,7 @@ pub(crate) fn is_notify_command(cmd: &Command) -> bool {
             | Command::RespondReminder { .. }
             | Command::ReminderResponders { .. }
             | Command::ResetCardState
+            | Command::FireReminderWatchTimer { .. }
             | Command::SyncPinReminderRefs { .. }
     )
 }
@@ -143,8 +147,9 @@ fn wake_reminder_waiters_for_key(state: &mut CoreState, key: &str, out: &mut Red
         return;
     };
     for w in waiters {
-        out.effects
-            .push(Effect::CancelReminderWatchTimer { waiter_id: w.waiter_id });
+        out.effects.push(Effect::CancelReminderWatchTimer {
+            waiter_id: w.waiter_id,
+        });
         out.effects.push(Effect::FetchReminderDetailApi {
             op_id: w.op_id,
             conv_id: w.conv_id,
@@ -180,67 +185,279 @@ pub(crate) fn start_notify_incoming_batch(
     );
 }
 
+struct IncomingBurstIndex<'a> {
+    state: &'a CoreState,
+    conv_by_id: HashMap<&'a str, &'a ConversationSummary>,
+    friend_by_id: HashMap<&'a str, &'a FriendIdentity>,
+    gid_to_uid: HashMap<&'a str, &'a str>,
+    clean_my_uid: String,
+    sanitized_my_uid: String,
+    my_avatar: &'a str,
+}
+
+impl<'a> IncomingBurstIndex<'a> {
+    fn new(state: &'a CoreState) -> Self {
+        let mut conv_by_id = HashMap::with_capacity(state.conversations.conversations.len());
+        for c in &state.conversations.conversations {
+            conv_by_id.entry(c.id.as_str()).or_insert(c);
+        }
+        let mut friend_by_id = HashMap::with_capacity(state.conversations.identities.friends.len());
+        for f in &state.conversations.identities.friends {
+            friend_by_id.entry(f.id.as_str()).or_insert(f);
+        }
+        let mut gid_to_uid =
+            HashMap::with_capacity(state.conversations.identities.friend_global_ids.len());
+        for (uid, gid) in &state.conversations.identities.friend_global_ids {
+            gid_to_uid.entry(gid.as_str()).or_insert(uid.as_str());
+        }
+        let my_uid = state
+            .session
+            .profile
+            .as_ref()
+            .map_or("", |p| p.user_id.as_str());
+        let my_avatar = state
+            .session
+            .profile
+            .as_ref()
+            .and_then(|p| p.avatar.as_deref())
+            .unwrap_or("");
+        let clean_my_uid = strip_user_prefix(my_uid);
+        let sanitized_my_uid =
+            sanitize_profile_uid(&clean_my_uid).unwrap_or_else(|| clean_my_uid.clone());
+        Self {
+            state,
+            conv_by_id,
+            friend_by_id,
+            gid_to_uid,
+            clean_my_uid,
+            sanitized_my_uid,
+            my_avatar,
+        }
+    }
+
+    fn lookup_person(&self, clean: &str) -> Option<(String, String)> {
+        if matches!(clean, "" | "0" | "-1" | "__legacy__" | "unknown") {
+            return None;
+        }
+        let mut candidates = Vec::with_capacity(3);
+        candidates.push(clean.to_owned());
+        if let Some(sanitized) = sanitize_profile_uid(clean)
+            && sanitized != clean
+        {
+            candidates.push(sanitized);
+        }
+        if let Some(mapped_uid) = candidates
+            .iter()
+            .find_map(|cand| self.gid_to_uid.get(cand.as_str()).copied())
+            && !candidates.iter().any(|c| c == mapped_uid)
+        {
+            candidates.push(mapped_uid.to_owned());
+        }
+
+        if !self.clean_my_uid.is_empty()
+            && candidates
+                .iter()
+                .any(|c| c == &self.clean_my_uid || c == &self.sanitized_my_uid)
+        {
+            return Some(("Bạn".to_owned(), self.my_avatar.to_owned()));
+        }
+
+        let identities = &self.state.conversations.identities;
+        for candidate in &candidates {
+            let alias = identities.aliases.get(candidate).map(String::as_str);
+            if let Some(f) = self.friend_by_id.get(candidate.as_str()) {
+                let avt = f
+                    .avatar
+                    .as_deref()
+                    .or_else(|| {
+                        identities
+                            .cached_profiles
+                            .get(candidate)
+                            .map(|p| p.avatar.as_str())
+                    })
+                    .unwrap_or("")
+                    .to_owned();
+                let name = match alias {
+                    Some(a) if !a.is_empty() => a.to_owned(),
+                    _ => f.name.clone(),
+                };
+                return Some((name, avt));
+            }
+            if let Some(p) = identities.cached_profiles.get(candidate) {
+                let best = match alias {
+                    Some(a) if !a.is_empty() => a,
+                    _ => p.name.as_str(),
+                };
+                let valid_best = if best == UNKNOWN_NAME { "" } else { best };
+                if !valid_best.is_empty() || !p.avatar.is_empty() {
+                    return Some((valid_best.to_owned(), p.avatar.clone()));
+                }
+            }
+            if let Some(a) = alias
+                && !a.is_empty()
+                && a != UNKNOWN_NAME
+            {
+                return Some((a.to_owned(), String::new()));
+            }
+        }
+
+        for candidate in &candidates {
+            if let Some(conv) = self.conv_by_id.get(candidate.as_str()) {
+                let trimmed = conv.name.trim();
+                let valid_name =
+                    if !trimmed.is_empty() && trimmed != conv.id && trimmed != UNKNOWN_NAME {
+                        trimmed
+                    } else {
+                        ""
+                    };
+                let avt = conv.avatar.as_deref().unwrap_or("");
+                if !valid_name.is_empty() || !avt.is_empty() {
+                    return Some((valid_name.to_owned(), avt.to_owned()));
+                }
+            }
+        }
+        None
+    }
+}
+
+enum IncomingLookup<'a> {
+    Direct {
+        state: &'a CoreState,
+        my_uid: &'a str,
+        my_avatar: Option<&'a str>,
+    },
+    Indexed(IncomingBurstIndex<'a>),
+}
+
+impl<'a> IncomingLookup<'a> {
+    fn new(state: &'a CoreState, remaining: usize) -> Self {
+        if remaining > 2 {
+            Self::Indexed(IncomingBurstIndex::new(state))
+        } else {
+            let my_uid = state
+                .session
+                .profile
+                .as_ref()
+                .map_or("", |p| p.user_id.as_str());
+            let my_avatar = state
+                .session
+                .profile
+                .as_ref()
+                .and_then(|p| p.avatar.as_deref());
+            Self::Direct {
+                state,
+                my_uid,
+                my_avatar,
+            }
+        }
+    }
+
+    fn conversation(&self, conv_id: &str) -> Option<&'a ConversationSummary> {
+        match self {
+            Self::Direct { state, .. } => state
+                .conversations
+                .conversations
+                .iter()
+                .find(|c| c.id == conv_id),
+            Self::Indexed(idx) => idx.conv_by_id.get(conv_id).copied(),
+        }
+    }
+
+    fn lookup_person(&self, clean_uid: &str) -> Option<(String, String)> {
+        match self {
+            Self::Direct {
+                state,
+                my_uid,
+                my_avatar,
+            } => state
+                .conversations
+                .lookup_person_info(clean_uid, my_uid, *my_avatar),
+            Self::Indexed(idx) => idx.lookup_person(clean_uid),
+        }
+    }
+}
+
 fn step_incoming_batch(
     state: &mut CoreState,
     mut flight: IncomingBatchInFlight,
     mut already_fetched_current: bool,
     out: &mut ReduceOutput,
 ) {
-    while flight.cursor < flight.messages.len() {
-        if !state.notify.settings.enabled {
-            flight.cursor += 1;
-            already_fetched_current = false;
-            continue;
-        }
-        let msg = &flight.messages[flight.cursor];
-        let conv_id = &msg.conversation_id;
-        if conv_id.is_empty()
-            || msg.is_mine
-            || state.notify.settings.is_muted(conv_id, flight.now_ms)
-        {
-            flight.cursor += 1;
-            already_fetched_current = false;
-            continue;
-        }
-        let snap = state.identity_snapshot();
-        let is_group = is_group_id(conv_id);
-        let conv = state
-            .conversations
-            .conversations
-            .iter()
-            .find(|c| &c.id == conv_id);
-        let clean_sender_id = strip_user_prefix(&msg.sender_id);
-        let person = (!clean_sender_id.is_empty() && clean_sender_id != "0")
-            .then(|| snap.lookup_person(&clean_sender_id))
-            .flatten();
-        let local_avatar_url = resolve_local_avatar_url(msg, person.as_ref(), conv, is_group);
-
-        if !already_fetched_current
-            && local_avatar_url.is_none()
-            && !clean_sender_id.is_empty()
-            && clean_sender_id != "0"
-        {
-            state.notify.next_incoming_id = state.notify.next_incoming_id.wrapping_add(1);
-            let batch_id = state.notify.next_incoming_id;
-            state.notify.incoming_in_flight.insert(batch_id, flight);
-            out.effects.push(Effect::FetchNotifyProfilesApi {
-                batch_id,
-                uids: vec![clean_sender_id],
-            });
-            return;
-        }
-
-        emit_banner_for_single_message(state, msg, &snap, out);
-        flight.cursor += 1;
-        already_fetched_current = false;
+    if !state.notify.settings.enabled || flight.cursor >= flight.messages.len() {
+        complete_unit(flight.op_id, out);
+        return;
     }
+
+    let missing_uid: Option<String> = {
+        let remaining = flight.messages.len().saturating_sub(flight.cursor);
+        let lookup = IncomingLookup::new(state, remaining);
+        let shows_preview = state.notify.settings.shows_preview;
+        let silent = !state.notify.settings.sound;
+        let mut fetch_uid = None;
+
+        while flight.cursor < flight.messages.len() {
+            let msg = &flight.messages[flight.cursor];
+            let conv_id = &msg.conversation_id;
+            if conv_id.is_empty()
+                || msg.is_mine
+                || state.notify.settings.is_muted(conv_id, flight.now_ms)
+            {
+                flight.cursor += 1;
+                already_fetched_current = false;
+                continue;
+            }
+            let is_group = is_group_id(conv_id);
+            let conv = lookup.conversation(conv_id);
+            let clean_sender_id = strip_user_prefix(&msg.sender_id);
+            let person = (!clean_sender_id.is_empty() && clean_sender_id != "0")
+                .then(|| lookup.lookup_person(&clean_sender_id))
+                .flatten();
+            let local_avatar_url = resolve_local_avatar_url(msg, person.as_ref(), conv, is_group);
+
+            if !already_fetched_current
+                && local_avatar_url.is_none()
+                && !clean_sender_id.is_empty()
+                && clean_sender_id != "0"
+            {
+                fetch_uid = Some(clean_sender_id);
+                break;
+            }
+
+            emit_banner_for_single_message(
+                msg,
+                is_group,
+                conv,
+                clean_sender_id,
+                person.as_ref(),
+                local_avatar_url,
+                shows_preview,
+                silent,
+                out,
+            );
+            flight.cursor += 1;
+            already_fetched_current = false;
+        }
+        fetch_uid
+    };
+
+    if let Some(uid) = missing_uid {
+        state.notify.next_incoming_id = state.notify.next_incoming_id.wrapping_add(1);
+        let batch_id = state.notify.next_incoming_id;
+        state.notify.incoming_in_flight.insert(batch_id, flight);
+        out.effects.push(Effect::FetchNotifyProfilesApi {
+            batch_id,
+            uids: vec![uid],
+        });
+        return;
+    }
+
     complete_unit(flight.op_id, out);
 }
 
 fn resolve_local_avatar_url(
     msg: &ChatMessage,
-    person: Option<&olaz_wire::NameLookup>,
-    conv: Option<&crate::conversations::ConversationSummary>,
+    person: Option<&(String, String)>,
+    conv: Option<&ConversationSummary>,
     is_group: bool,
 ) -> Option<String> {
     if let Some(avt) = msg.sender_avatar.as_deref()
@@ -248,8 +465,8 @@ fn resolve_local_avatar_url(
     {
         return Some(u);
     }
-    if let Some(p) = person
-        && let Some(u) = non_empty_url(&p.avatar)
+    if let Some((_, avatar)) = person
+        && let Some(u) = non_empty_url(avatar)
     {
         return Some(u);
     }
@@ -276,36 +493,33 @@ fn non_empty_url(raw: &str) -> Option<String> {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "pre-resolved incoming banner fields avoid redundant lookups across a burst"
+)]
 fn emit_banner_for_single_message(
-    state: &CoreState,
     msg: &ChatMessage,
-    snap: &crate::messages::IdentitySnapshot,
+    is_group: bool,
+    conv: Option<&ConversationSummary>,
+    clean_sender_id: String,
+    person: Option<&(String, String)>,
+    resolved_avatar_url: Option<String>,
+    shows_preview: bool,
+    silent: bool,
     out: &mut ReduceOutput,
 ) {
     let conv_id = &msg.conversation_id;
-    let is_group = is_group_id(conv_id);
-    let conv = state
-        .conversations
-        .conversations
-        .iter()
-        .find(|c| &c.id == conv_id);
-    let clean_sender_id = strip_user_prefix(&msg.sender_id);
-    let person = (!clean_sender_id.is_empty() && clean_sender_id != "0")
-        .then(|| snap.lookup_person(&clean_sender_id))
-        .flatten();
-
-    let resolved_avatar_url = resolve_local_avatar_url(msg, person.as_ref(), conv, is_group);
 
     let title = if let Some(c) = conv
         && !c.name.is_empty()
         && c.name != *conv_id
     {
         c.name.clone()
-    } else if let Some(p) = person.as_ref()
-        && !p.name.is_empty()
-        && p.name != clean_sender_id
+    } else if let Some((p_name, _)) = person
+        && !p_name.is_empty()
+        && p_name != &clean_sender_id
     {
-        p.name.clone()
+        p_name.clone()
     } else if msg.sender_name.is_empty() {
         conv_id.clone()
     } else {
@@ -314,22 +528,21 @@ fn emit_banner_for_single_message(
 
     let sender_name = if !is_group {
         title.clone()
-    } else if let Some(p) = person.as_ref()
-        && !p.name.is_empty()
-        && p.name != clean_sender_id
-        && p.name != UNKNOWN_NAME
+    } else if let Some((p_name, _)) = person
+        && !p_name.is_empty()
+        && p_name != &clean_sender_id
+        && p_name != UNKNOWN_NAME
     {
-        p.name.clone()
+        p_name.clone()
     } else {
         msg.sender_name.clone()
     };
 
     let raw_preview = message_preview_label(msg);
-    let body = crate::notify::policy::body(&raw_preview, state.notify.settings.shows_preview);
-    let silent = !state.notify.settings.sound;
+    let body = crate::notify::policy::body(&raw_preview, shows_preview);
 
-    out.effects.push(Effect::Host(HostCall::NotifyBanner(
-        NotifyBannerPayload {
+    out.effects
+        .push(Effect::Host(HostCall::NotifyBanner(NotifyBannerPayload {
             title,
             body,
             conv_id: conv_id.clone(),
@@ -338,8 +551,7 @@ fn emit_banner_for_single_message(
             is_group,
             avatar_url: resolved_avatar_url,
             silent,
-        },
-    )));
+        })));
 }
 
 pub(crate) fn reduce_notify(state: &mut CoreState, input: Input, out: &mut ReduceOutput) {
@@ -397,7 +609,7 @@ pub(crate) fn reduce_notify(state: &mut CoreState, input: Input, out: &mut Reduc
             } else {
                 // Approved fix 16.1: keep previous mute state, skip SQLite write, show error toast.
                 out.effects.push(Effect::Host(HostCall::ShowCard {
-                    conv_id: flight.conv_id,
+                    conv_id: Some(flight.conv_id),
                     text: MUTE_ERROR_TOAST_TEXT.to_owned(),
                 }));
             }
@@ -410,7 +622,9 @@ pub(crate) fn reduce_notify(state: &mut CoreState, input: Input, out: &mut Reduc
             };
             let mut updated_any = false;
             for (uid, val) in profiles {
-                let Some(row) = val.as_object() else { continue; };
+                let Some(row) = val.as_object() else {
+                    continue;
+                };
                 let clean = strip_user_prefix(&uid);
                 let name = preferred_profile_name(row);
                 let avatar = string(row.get("avatar").or_else(|| row.get("avt")));
@@ -566,10 +780,8 @@ pub(crate) fn reduce_notify(state: &mut CoreState, input: Input, out: &mut Reduc
             fallback_group_id,
             result,
         } => {
-            let (mapped, should_refresh) = map_join_group_outcome(
-                result.as_ref(),
-                fallback_group_id.as_deref(),
-            );
+            let (mapped, should_refresh) =
+                map_join_group_outcome(result.as_ref(), fallback_group_id.as_deref());
             if should_refresh {
                 // U9: refresh contacts via host until U9 merges.
                 out.effects.push(Effect::Host(HostCall::RefreshContacts {
@@ -617,9 +829,8 @@ pub(crate) fn reduce_notify(state: &mut CoreState, input: Input, out: &mut Reduc
             event_id,
             resp,
         } => {
-            let snap = resp.and_then(|r| {
-                normalize_reminder_in_state(state, &r, &conv_id, &event_id, &msg_id)
-            });
+            let snap = resp
+                .and_then(|r| normalize_reminder_in_state(state, &r, &conv_id, &event_id, &msg_id));
             if let Some(ref s) = snap {
                 state
                     .notify
@@ -648,7 +859,10 @@ pub(crate) fn reduce_notify(state: &mut CoreState, input: Input, out: &mut Reduc
                     normalize_reminder_in_state(state, &r, &conv_id, &event_id, &msg_id)
                 });
                 if let Some(ref u) = updated {
-                    state.notify.reminder_watch_cache.insert(key.clone(), u.clone());
+                    state
+                        .notify
+                        .reminder_watch_cache
+                        .insert(key.clone(), u.clone());
                 } else {
                     state.notify.reminder_watch_cache.remove(&key);
                 }
@@ -735,7 +949,9 @@ pub(crate) fn reduce_notify(state: &mut CoreState, input: Input, out: &mut Reduc
         } => {
             let mut updated_any = false;
             for (uid, val) in profiles {
-                let Some(row) = val.as_object() else { continue; };
+                let Some(row) = val.as_object() else {
+                    continue;
+                };
                 let clean = strip_user_prefix(&uid);
                 let name = preferred_profile_name(row);
                 let avatar = string(row.get("avatar").or_else(|| row.get("avt")));
@@ -781,12 +997,7 @@ pub(crate) fn reduce_notify(state: &mut CoreState, input: Input, out: &mut Reduc
     }
 }
 
-fn handle_command(
-    state: &mut CoreState,
-    cmd: Command,
-    op_id: Option<u64>,
-    out: &mut ReduceOutput,
-) {
+fn handle_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: &mut ReduceOutput) {
     match cmd {
         Command::SetNotificationsEnabled { enabled } => {
             state.notify.settings.enabled = enabled;
@@ -950,16 +1161,18 @@ fn handle_command(
             // Swift `ref.split(separator: "_")` omits empty subsequences; replicate exact behavior:
             let parts: Vec<&str> = action_ref.split('_').filter(|s| !s.is_empty()).collect();
             if parts.len() == 2
-                && let (Ok(cate_id), Ok(sticker_id)) = (parts[0].parse::<i32>(), parts[1].parse::<i32>())
+                && let (Ok(cate_id), Ok(sticker_id)) =
+                    (parts[0].parse::<i32>(), parts[1].parse::<i32>())
                 && sticker_id > 0
             {
                 // U13: send category sticker via host until U13 merges.
-                out.effects.push(Effect::Host(HostCall::SendCategorySticker {
-                    op_id,
-                    conv_id,
-                    cate_id,
-                    sticker_id,
-                }));
+                out.effects
+                    .push(Effect::Host(HostCall::SendCategorySticker {
+                        op_id,
+                        conv_id,
+                        cate_id,
+                        sticker_id,
+                    }));
                 return;
             }
 
@@ -981,7 +1194,9 @@ fn handle_command(
                 .windows
                 .get(&conv_id)
                 .and_then(|list| list.iter().find(|m| m.id == msg_id))
-                .is_some_and(|m| matches!(&m.kind, Kind::Ecard(c) if c.style == ECardStyle::Birthday));
+                .is_some_and(
+                    |m| matches!(&m.kind, Kind::Ecard(c) if c.style == ECardStyle::Birthday),
+                );
             let keyword = if is_birthday {
                 "chúc mừng sinh nhật".to_owned()
             } else {
@@ -1163,8 +1378,11 @@ fn handle_command(
             let Some(op_id) = op_id else {
                 return;
             };
-            out.effects
-                .push(Effect::SendFriendRequestApi { op_id, uid, message });
+            out.effects.push(Effect::SendFriendRequestApi {
+                op_id,
+                uid,
+                message,
+            });
         }
 
         Command::SaveAlias { uid, name } => {
@@ -1299,8 +1517,9 @@ fn handle_command(
                 .flat_map(|(_, list)| list)
                 .collect();
             for w in all_waiters {
-                out.effects
-                    .push(Effect::CancelReminderWatchTimer { waiter_id: w.waiter_id });
+                out.effects.push(Effect::CancelReminderWatchTimer {
+                    waiter_id: w.waiter_id,
+                });
                 out.effects.push(Effect::FetchReminderDetailApi {
                     op_id: w.op_id,
                     conv_id: w.conv_id,
@@ -1400,7 +1619,7 @@ pub(crate) fn hydrate_notification_prefs(
     state: &mut CoreState,
     enabled: bool,
     sound: bool,
-    mutes: Option< std::collections::BTreeMap<String, MuteInfo> >,
+    mutes: Option<std::collections::BTreeMap<String, MuteInfo>>,
     auth: Option<NotifAuthorization>,
     out: &mut ReduceOutput,
 ) {
@@ -1415,4 +1634,209 @@ pub(crate) fn hydrate_notification_prefs(
         state.notify.settings.authorization = a;
     }
     out.dirty.insert(DirtyKey::NotificationSettings);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conversations::ConversationSummary;
+    use olaz_wire::{MessageMenu, Status};
+
+    fn sample_msg(
+        id: &str,
+        conv_id: &str,
+        sender_id: &str,
+        text: &str,
+        avt: Option<&str>,
+    ) -> ChatMessage {
+        ChatMessage {
+            id: id.to_owned(),
+            conversation_id: conv_id.to_owned(),
+            sender_id: sender_id.to_owned(),
+            sender_name: "Fallback Sender".to_owned(),
+            sender_avatar: avt.map(str::to_owned),
+            is_mine: false,
+            kind: Kind::Text,
+            text: text.to_owned(),
+            date_ms: 1_700_000_000_000,
+            status: Status::Sent,
+            quote: None,
+            reactions: Vec::new(),
+            is_e2ee: false,
+            mentions: Vec::new(),
+            text_styles: Vec::new(),
+            fallback_urls: Vec::new(),
+            ttl_ms: 0,
+            urgency: 0,
+            card_buttons: Vec::new(),
+            suggests_stickers: false,
+            menu: MessageMenu::default(),
+            client_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn fire_reminder_watch_timer_command_is_dispatched_and_wakes_waiter() {
+        let cmd = Command::FireReminderWatchTimer { waiter_id: 7 };
+        assert!(is_notify_command(&cmd));
+
+        let mut state = CoreState::default();
+        state.notify.reminder_waiters.insert(
+            "g900|m1".to_owned(),
+            vec![ReminderWatchWaiter {
+                waiter_id: 7,
+                op_id: 42,
+                conv_id: "g900".to_owned(),
+                msg_id: "m1".to_owned(),
+                event_id: "rem-1".to_owned(),
+            }],
+        );
+        let mut out = ReduceOutput::default();
+        reduce_notify(&mut state, Input::Command(cmd), &mut out);
+
+        assert!(state.notify.reminder_waiters.is_empty());
+        assert!(out.effects.iter().any(|e| matches!(
+            e,
+            Effect::FetchReminderDetailApi {
+                op_id: 42,
+                conv_id,
+                msg_id,
+                event_id,
+            } if conv_id == "g900" && msg_id == "m1" && event_id == "rem-1"
+        )));
+    }
+
+    #[test]
+    fn mute_failure_preserves_state_skips_store_and_shows_error_card() {
+        let mut state = CoreState::default();
+        let mut out = ReduceOutput::default();
+        reduce_notify(
+            &mut state,
+            Input::OpRequest {
+                op_id: 1,
+                cmd: Command::MuteConversation {
+                    conv_id: "3001".to_owned(),
+                    duration_secs: 3600,
+                    now_ms: 1_700_000_000_000,
+                },
+            },
+            &mut out,
+        );
+        assert!(state.notify.settings.mutes.is_empty());
+        let Some(req_id) = out.effects.iter().find_map(|e| match e {
+            Effect::SetMuteApi { req_id, .. } => Some(*req_id),
+            _ => None,
+        }) else {
+            panic!("SetMuteApi effect missing");
+        };
+
+        let mut out2 = ReduceOutput::default();
+        reduce_notify(
+            &mut state,
+            Input::SetMuteApiDone { req_id, ok: false },
+            &mut out2,
+        );
+        assert!(state.notify.settings.mutes.is_empty());
+        assert!(!out2.effects.iter().any(|e| matches!(
+            e,
+            Effect::Store(StoreOp::SetPreferenceData { .. } | StoreOp::SetPreferenceBool { .. })
+        )));
+        assert!(out2.effects.iter().any(|e| matches!(
+            e,
+            Effect::Host(HostCall::ShowCard { conv_id, text })
+            if conv_id.as_deref() == Some("3001") && text == MUTE_ERROR_TOAST_TEXT
+        )));
+    }
+
+    #[test]
+    fn incoming_burst_indexed_path_matches_direct_lookup_semantics() {
+        let mut state = CoreState::default();
+        state.notify.settings.enabled = true;
+        state.notify.settings.sound = true;
+        state.notify.settings.shows_preview = true;
+        state.notify.settings.mutes.insert(
+            "300001".to_owned(),
+            MuteInfo {
+                start_time: 1_700_000_000.0,
+                duration: 3600.0,
+            },
+        );
+        for i in 0..20 {
+            state.conversations.conversations.push(ConversationSummary {
+                id: format!("300{:03}", i),
+                is_group: false,
+                name: format!("Peer {i}"),
+                avatar: Some(format!("https://cdn.example/p{i}.jpg")),
+                pinned: false,
+                members: 0,
+                unread: 0,
+                preview: None,
+            });
+            state.conversations.identities.friends.push(FriendIdentity {
+                id: format!("300{:03}", i),
+                name: format!("Friend {i}"),
+                avatar: Some(format!("https://cdn.example/f{i}.jpg")),
+            });
+        }
+        state
+            .conversations
+            .identities
+            .aliases
+            .insert("300002".to_owned(), "Alias Two".to_owned());
+        state.conversations.conversations.push(ConversationSummary {
+            id: "g90001".to_owned(),
+            is_group: true,
+            name: "Group Alpha".to_owned(),
+            avatar: Some("https://cdn.example/g1.jpg".to_owned()),
+            pinned: false,
+            members: 10,
+            unread: 0,
+            preview: None,
+        });
+
+        let mut msgs = Vec::with_capacity(200);
+        for i in 0..200 {
+            let conv_id = if i % 5 == 0 {
+                "g90001".to_owned()
+            } else {
+                format!("300{:03}", i % 20)
+            };
+            let sender_id = format!("300{:03}", i % 20);
+            msgs.push(sample_msg(
+                &format!("m{i}"),
+                &conv_id,
+                &sender_id,
+                &format!("Hello {i}"),
+                None,
+            ));
+        }
+
+        let mut out = ReduceOutput::default();
+        start_notify_incoming_batch(&mut state, msgs, 1_700_000_100_000, Some(99), &mut out);
+
+        let banners: Vec<&NotifyBannerPayload> = out
+            .effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Host(HostCall::NotifyBanner(b)) => Some(b),
+                _ => None,
+            })
+            .collect();
+        // 10 of 200 messages target muted conv "300001" (i % 20 == 1, none have i % 5 == 0).
+        assert_eq!(banners.len(), 190);
+        // Group message from aliased friend 300002 uses alias for sender_name and group name for title.
+        let group_from_two = banners
+            .iter()
+            .find(|b| b.conv_id == "g90001" && b.sender_id == "300002");
+        assert!(group_from_two.is_none()); // i % 5 == 0 => i % 20 in {0, 5, 10, 15}
+        let Some(group_from_five) = banners
+            .iter()
+            .find(|b| b.conv_id == "g90001" && b.sender_id == "300005")
+        else {
+            panic!("group banner from 300005 missing");
+        };
+        assert_eq!(group_from_five.title, "Group Alpha");
+        assert_eq!(group_from_five.sender_name, "Friend 5");
+        assert!(!group_from_five.silent);
+    }
 }

@@ -50,6 +50,8 @@ import Testing
             messageMeta: messageMeta,
             contacts: contacts,
             typing: nil,
+            forwardRequest: nil,
+            clearSelection: false,
             deleteUndo: nil,
             messageConfirm: nil,
             autoDelete: nil,

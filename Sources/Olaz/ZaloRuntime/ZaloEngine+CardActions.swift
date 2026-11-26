@@ -265,6 +265,9 @@ extension ZaloEngine {
         pushCoreIdentitiesIfRunning()
         pushCoreContactsIfRunning()
         pushCorePinsIfRunning(for: conversationId)
+        if let existing = messages[conversationId], !existing.isEmpty {
+            core.writeThroughReplaceWindow(convId: conversationId, messages: existing.map(ChatMessageRecord.init(message:)))
+        }
         guard let rec = try? await core.reminderResponders(convId: conversationId, msgId: messageId) else {
             return nil
         }
