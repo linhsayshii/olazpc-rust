@@ -19,6 +19,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use olaz_api::{PollState, SendMessageResult, ZaloApi};
 use olaz_core::actor::{ActorSink, CoreHandle};
+use olaz_core::cloud::{
+    CloudActionResult, CloudBreakdown, CloudConversation, CloudFetch, CloudItem, CloudItemKind,
+    CloudPage, CloudPlan, CloudSettings, CloudSnapshotState,
+};
 use olaz_core::composer::{ComposerConfirm, ComposerOutcome, MyCardInfo, ReminderComposeInfo};
 use olaz_core::conversations::{
     BatchApplyDelta, CachedGroup, CachedProfile, ConvMessageDelta, ConvPreviewOverride,
@@ -3738,29 +3742,162 @@ fn enrich_send_message_json(m: &ChatMessage, base: &mut Map<String, Value>) {
     );
 }
 
-fn decode_step_message(msg_json: &Value, fallback_conv_id: &str) -> Option<olaz_wire::ChatMessage> {
-    let mut dict = msg_json.as_object()?.clone();
-    let aliases = [
-        ("conv_id", "conversationId"),
-        ("client_id", "clientId"),
-        ("sender_id", "senderId"),
-        ("sender_name", "senderName"),
-        ("sender_avatar", "senderAvatar"),
-        ("is_mine", "isMine"),
-        ("is_e2ee", "isE2EE"),
-        ("date_ms", "date"),
+fn encode_cloud_breakdown(b: &CloudBreakdown) -> Value {
+    json!({
+        "photo": b.photo,
+        "video": b.video,
+        "file": b.file,
+        "voice": b.voice,
+        "total": b.total(),
+    })
+}
+
+fn encode_cloud_plan(p: &CloudPlan) -> Value {
+    json!({
+        "kind": p.kind.as_str(),
+        "name": p.name,
+        "quota": p.quota,
+        "usage": p.usage,
+        "family": p.family,
+        "cloud_media": p.cloud_media,
+        "message_backup": p.message_backup,
+        "my_cloud": p.my_cloud,
+        "expire_at_ms": p.expire_at_ms,
+        "auto_renew": p.auto_renew,
+        "months": p.months,
+        "has_key": p.has_key,
+        "backup_media": p.backup_media,
+        "backup_my_cloud": p.backup_my_cloud,
+        "backup_messages": p.backup_messages,
+        "file_limit": p.file_limit,
+    })
+}
+
+fn encode_cloud_conversation(c: &CloudConversation) -> Value {
+    json!({
+        "id": c.id,
+        "name": c.name,
+        "avatar": c.avatar,
+        "is_group": c.is_group,
+        "total": c.total,
+        "last_activity_ms": c.last_activity_ms,
+    })
+}
+
+fn encode_cloud_settings(s: &CloudSettings) -> Value {
+    json!({
+        "offload_enabled": s.offload_enabled,
+        "offload_available": s.offload_available,
+        "last_offload_at_ms": s.last_offload_at_ms,
+        "last_offload_size": s.last_offload_size,
+        "ttl_days": s.ttl_days,
+    })
+}
+
+fn encode_cloud_state(s: &CloudSnapshotState) -> Value {
+    json!({
+        "plan": s.plan.as_ref().map(encode_cloud_plan),
+        "media": encode_cloud_breakdown(&s.media),
+        "my_cloud_types": encode_cloud_breakdown(&s.my_cloud_types),
+        "conversations": s.conversations.iter().map(encode_cloud_conversation).collect::<Vec<_>>(),
+        "settings": encode_cloud_settings(&s.settings),
+        "changed": s.changed,
+        "loaded": s.loaded,
+        "hidden_lookup": s.hidden_lookup,
+        "self_id": s.self_id,
+    })
+}
+
+fn encode_cloud_item(item: &CloudItem) -> Value {
+    json!({
+        "id": item.id,
+        "kind": item.kind.as_str(),
+        "conv_id": item.conversation_id,
+        "conv_name": item.conversation_name,
+        "size": item.size,
+        "date_ms": item.date_ms,
+        "title": item.title,
+        "ext": item.ext,
+        "duration": item.duration.round() as i64,
+        "width": item.width,
+        "height": item.height,
+    })
+}
+
+fn encode_cloud_page(page: &CloudPage) -> Value {
+    json!({
+        "items": page.items.iter().map(encode_cloud_item).collect::<Vec<_>>(),
+        "has_more": page.has_more,
+        "error": page.error,
+    })
+}
+
+fn encode_cloud_fetch(fetch: &CloudFetch) -> Value {
+    match fetch {
+        CloudFetch::Ready(file) => {
+            let url = if file.path.starts_with('/') {
+                format!("file://{}", file.path)
+            } else {
+                format!("file:///{}", file.path)
+            };
+            json!({
+                "status": "ready",
+                "file": {
+                    "url": url,
+                    "kind": file.kind.as_str(),
+                    "title": file.title,
+                    "ext": file.ext,
+                    "size": file.size,
+                    "date_ms": file.date_ms,
+                },
+            })
+        }
+        CloudFetch::Expired => json!({ "status": "expired" }),
+        CloudFetch::Failed(err) => json!({ "status": "failed", "error": err }),
+    }
+}
+
+fn encode_media_resolution(res: &MediaResolutionOutcome) -> Value {
+    match res {
+        MediaResolutionOutcome::File(path) => json!({ "state": "file", "path": path }),
+        MediaResolutionOutcome::Expired => json!({ "state": "expired" }),
+        MediaResolutionOutcome::Unavailable => json!({ "state": "unavailable" }),
+        MediaResolutionOutcome::Unsupported => json!({ "state": "unsupported" }),
+    }
+}
+
+fn encode_cloud_action_result(res: &CloudActionResult) -> Value {
+    json!({
+        "ok": res.ok,
+        "deleted": res.deleted,
+        "failed": res.failed,
+        "error": res.error,
+    })
+}
+
+fn decode_step_message(msg_json: &Value, fallback_conv_id: &str) -> Option<ChatMessage> {
+    let mut obj = msg_json.as_object()?.clone();
+    let pairs = [
+        ("conversationId", "conv_id"),
+        ("clientId", "client_id"),
+        ("senderId", "sender_id"),
+        ("senderName", "sender_name"),
+        ("senderAvatar", "sender_avatar"),
+        ("isMine", "is_mine"),
+        ("isE2EE", "is_e2ee"),
+        ("date", "date_ms"),
     ];
-    for (snake, camel) in aliases {
-        if !dict.contains_key(camel)
-            && let Some(v) = dict.get(snake).cloned()
+    for (camel, snake) in pairs {
+        if !obj.contains_key(camel)
+            && let Some(v) = obj.get(snake).cloned()
         {
-            dict.insert(camel.to_owned(), v);
+            obj.insert(camel.to_owned(), v);
         }
     }
-    if let Some(kind_str) = dict.get("kind").and_then(Value::as_str).map(str::to_owned) {
-        dict.insert("kind".to_owned(), json!({ "type": kind_str }));
+    if let Some(kind_str) = obj.get("kind").and_then(Value::as_str).map(str::to_owned) {
+        obj.insert("kind".to_owned(), json!({ "type": kind_str }));
     }
-    olaz_wire::ChatMessage::from_json(&dict, fallback_conv_id)
+    ChatMessage::from_json(&obj, fallback_conv_id)
 }
 
 #[derive(Clone, Default)]
@@ -4566,6 +4703,7 @@ struct SnapshotOpts<'a> {
     is_u6: bool,
     is_u8: bool,
     is_u12: bool,
+    is_u11: bool,
     is_u13: bool,
     is_u14: bool,
     last_send_result: Option<bool>,
@@ -4767,6 +4905,7 @@ async fn capture_case_snapshot(
         is_u6,
         is_u8,
         is_u12,
+        is_u11,
         is_u13,
         is_u14,
         last_send_result,
@@ -5072,6 +5211,10 @@ async fn capture_case_snapshot(
             obj.insert("results".to_owned(), Value::Object(forward_results.clone()));
         }
     }
+    if is_u11 {
+        obj.insert("cloud".to_owned(), encode_cloud_state(&full.cloud));
+        obj.insert("results".to_owned(), Value::Object(results.clone()));
+    }
     if is_u14 {
         obj.insert("results".to_owned(), Value::Object(search_results.clone()));
     }
@@ -5181,9 +5324,10 @@ fn str_vec_arg(args: &Value, key: &str) -> Vec<String> {
 pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let is_u8 = case.domain == "forward";
     let is_u12 = case.domain == "polls";
+    let is_u11 = case.domain == "cloud";
     let is_u13 = case.domain == "stickers";
     let is_u14 = case.domain == "search";
-    let is_u6 = case.domain == "message_actions" || is_u8 || is_u13 || is_u14;
+    let is_u6 = case.domain == "message_actions" || is_u8 || is_u11 || is_u13 || is_u14;
     let is_u5 = case.domain == "send" || is_u6 || is_u12;
     let is_u4 = case.domain == "bootstrap" || case.domain == "messages" || is_u5;
     let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions" || is_u4;
@@ -6109,15 +6253,20 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                     );
                 }
                 "ensure_loaded" => {
+                    if is_u11 {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
                     let conv_id = str_arg(args, "conv_id");
                     let target = if let Some(msg_json) = args.get("message") {
                         decode_step_message(msg_json, &conv_id)
                     } else if let Some(msg_id) = args.get("msg_id").and_then(Value::as_str) {
                         let mem_hit = core.full_snapshot().await.and_then(|snap| {
-                            snap.messages
-                                .windows
-                                .get(&conv_id)
-                                .and_then(|list| list.iter().find(|m| m.id == msg_id).cloned())
+                            snap.messages.windows.get(&conv_id).and_then(|list| {
+                                list.iter()
+                                    .find(|m| m.id == msg_id || m.client_id == msg_id)
+                                    .cloned()
+                            })
                         });
                         if mem_hit.is_some() {
                             mem_hit
@@ -6138,6 +6287,10 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         "ensure_loaded could not resolve target message".to_owned()
                     })?;
                     let (loaded, _ver) = core.ensure_message_loaded(conv_id, msg).await;
+                    if is_u11 {
+                        let _ = core.settle().await;
+                        results.insert(step_index.to_string(), Value::Bool(loaded));
+                    }
                     search_results.insert(step_index.to_string(), Value::Bool(loaded));
                 }
                 "load_quoted" => {
@@ -6962,6 +7115,84 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                     let check_results = run_u12_poll_model_checks(checks, &core).await;
                     u12_results.insert(step_index.to_string(), check_results);
                 }
+                // U11 cloud domain commands
+                "refresh_cloud" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    host.record("refresh_cloud", json!({}));
+                    core.request_unit(Command::RefreshCloud).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "cloud_list" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let conv_id = args
+                        .get("conv_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let kind = args
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .and_then(CloudItemKind::from_raw);
+                    let sort_by_size = args
+                        .get("sort_by_size")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let ascending = args
+                        .get("ascending")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let offset = args.get("offset").and_then(Value::as_i64).unwrap_or(0);
+                    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(60);
+                    let page = core
+                        .request_cloud_page(Command::CloudList {
+                            conv_id,
+                            kind,
+                            sort_by_size,
+                            ascending,
+                            offset,
+                            limit,
+                        })
+                        .await;
+                    results.insert(step_idx.to_string(), encode_cloud_page(&page));
+                }
+                "cloud_fetch" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let key = str_arg(args, "key");
+                    let fetch = core.request_cloud_fetch(Command::CloudFetch { key }).await;
+                    results.insert(step_idx.to_string(), encode_cloud_fetch(&fetch));
+                }
+                "cloud_thumbnail" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let key = str_arg(args, "key");
+                    let thumb = core
+                        .request_media_resolution(Command::CloudThumbnail { key })
+                        .await;
+                    results.insert(step_idx.to_string(), encode_media_resolution(&thumb));
+                }
+                "cloud_delete" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let keys = str_vec_arg(args, "keys");
+                    let res = core
+                        .request_cloud_action(Command::CloudDelete { keys })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    results.insert(step_idx.to_string(), encode_cloud_action_result(&res));
+                }
+                "cloud_set_offload" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let enabled = args
+                        .get("enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let res = core
+                        .request_cloud_action(Command::CloudSetOffload { enabled })
+                        .await;
+                    results.insert(step_idx.to_string(), encode_cloud_action_result(&res));
+                }
+                "reset_cloud" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    core.request_unit(Command::ResetCloud).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
                 // U13 stickers + composer side-actions commands
                 "sticker_tabs" => {
                     let tabs = core.request_sticker_tabs().await;
@@ -7170,6 +7401,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         is_u6,
                         is_u8,
                         is_u12,
+                        is_u11,
                         is_u13,
                         is_u14,
                         last_send_result,
@@ -7233,6 +7465,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             is_u6,
             is_u8,
             is_u12,
+            is_u11,
             is_u13,
             is_u14,
             last_send_result,

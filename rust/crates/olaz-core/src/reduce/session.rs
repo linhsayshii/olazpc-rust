@@ -340,6 +340,10 @@ fn reduce_command(state: &mut CoreState, cmd: Command, out: &mut ReduceOutput) {
             if state.forward.reset(out) {
                 out.dirty.insert(DirtyKey::ForwardRequest);
             }
+            // U11
+            if state.cloud.reset_session() {
+                out.dirty.insert(DirtyKey::Cloud);
+            }
             // U13
             if state.stickers.suggest_setting.is_some() {
                 out.dirty.insert(DirtyKey::StickerSuggest);

@@ -1207,6 +1207,52 @@ fn set_conversation_preview_allows_rollback_and_empty_clear() {
 }
 
 #[test]
+fn cloud_media_aggregation_null_is_group_falls_back_to_is_group_id() {
+    let mut store = Store::open_in_memory().unwrap();
+    // Explicit 1-1 conversation row (is_group = 0) and explicit group row (is_group = 1).
+    let dm = conv("3001001", false, "Alice", false, 100);
+    let grp = conv("g5001002", true, "Team", false, 100);
+    store.save_conversations(&[dm, grp]).unwrap();
+
+    // Media rows:
+    // - 3001001 (explicit is_group = 0)
+    // - g5001002 (explicit is_group = 1)
+    // - 3001003 (NO conversations row -> c.is_group IS NULL -> 1-1 via is_group_id)
+    // - g5001004 (NO conversations row -> c.is_group IS NULL -> group via is_group_id)
+    let mut m_dm = msg("m1", "3001001", "c1", "", 10, "photo", "sent");
+    m_dm.raw_json_data = br#"{"kind":{"type":"photo","size":1000}}"#.to_vec();
+    let mut m_grp = msg("m2", "g5001002", "c2", "", 20, "photo", "sent");
+    m_grp.raw_json_data = br#"{"kind":{"type":"photo","size":2000}}"#.to_vec();
+    let mut m_dm_null = msg("m3", "3001003", "c3", "", 30, "file", "sent");
+    m_dm_null.raw_json_data = br#"{"kind":{"type":"file","name":"a.pdf","size":3000}}"#.to_vec();
+    let mut m_grp_null = msg("m4", "g5001004", "c4", "", 40, "file", "sent");
+    m_grp_null.raw_json_data = br#"{"kind":{"type":"file","name":"b.pdf","size":4000}}"#.to_vec();
+    store
+        .save_messages(&[m_dm, m_grp, m_dm_null, m_grp_null])
+        .unwrap();
+
+    let agg = store.cloud_media_aggregation().unwrap();
+    let by_id: std::collections::HashMap<_, _> =
+        agg.iter().map(|s| (s.conv_id.as_str(), s)).collect();
+    assert!(
+        !by_id["3001001"].is_group,
+        "explicit 1-1 conv must stay is_group=false"
+    );
+    assert!(
+        by_id["g5001002"].is_group,
+        "explicit group conv must stay is_group=true"
+    );
+    assert!(
+        !by_id["3001003"].is_group,
+        "1-1 conv with NULL c.is_group must resolve is_group=false via is_group_id"
+    );
+    assert!(
+        by_id["g5001004"].is_group,
+        "group conv with NULL c.is_group must resolve is_group=true via is_group_id"
+    );
+}
+
+#[test]
 fn search_text_unicode_parity_with_swift_lowercased_contains() {
     use crate::search_text::{fold_search_text, search_text_contains_folded, trim_search_query};
 

@@ -835,6 +835,196 @@ extension ForwardRequest {
     }
 }
 
+// MARK: - U11 Cloud FFI Record Conversions
+
+extension CloudState.PlanKind {
+    init(coreRecord record: CloudPlanKindRecord) {
+        switch record {
+        case .paid: self = .paid
+        case .free: self = .free
+        case .grace: self = .grace
+        case .afterGrace: self = .afterGrace
+        }
+    }
+}
+
+extension CloudItemKind {
+    init(coreRecord record: CloudItemKindRecord) {
+        switch record {
+        case .photo: self = .photo
+        case .video: self = .video
+        case .file: self = .file
+        case .voice: self = .voice
+        case .other: self = .other
+        }
+    }
+
+    var coreRecord: CloudItemKindRecord {
+        switch self {
+        case .photo: .photo
+        case .video: .video
+        case .file: .file
+        case .voice: .voice
+        case .other: .other
+        }
+    }
+}
+
+extension CloudBreakdown {
+    init(coreRecord record: CloudBreakdownRecord) {
+        self.init(
+            photo: record.photo,
+            video: record.video,
+            file: record.file,
+            voice: record.voice
+        )
+    }
+}
+
+extension CloudState.Plan {
+    init(coreRecord record: CloudPlanRecord) {
+        self.init(
+            kind: CloudState.PlanKind(coreRecord: record.kind),
+            name: record.name,
+            quota: record.quota,
+            usage: record.usage,
+            family: record.family,
+            cloudMedia: record.cloudMedia,
+            messageBackup: record.messageBackup,
+            myCloud: record.myCloud,
+            expireAt: record.expireAtMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) },
+            autoRenew: record.autoRenew,
+            months: Int(record.months),
+            hasKey: record.hasKey,
+            backupMedia: record.backupMedia,
+            backupMyCloud: record.backupMyCloud,
+            backupMessages: record.backupMessages,
+            fileLimit: record.fileLimit
+        )
+    }
+}
+
+extension CloudState.Conversation {
+    init(coreRecord record: CloudConversationRecord) {
+        self.init(
+            id: record.id,
+            name: record.name,
+            avatar: record.avatar.flatMap { $0.isEmpty ? nil : URL(string: $0) },
+            isGroup: record.isGroup,
+            total: record.total,
+            lastActivity: record.lastActivityMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) }
+        )
+    }
+}
+
+extension CloudState.Settings {
+    init(coreRecord record: CloudSettingsRecord) {
+        self.init(
+            offloadEnabled: record.offloadEnabled,
+            offloadAvailable: record.offloadAvailable,
+            lastOffloadAt: record.lastOffloadAtMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) },
+            lastOffloadSize: record.lastOffloadSize,
+            ttlDays: Int(record.ttlDays)
+        )
+    }
+}
+
+extension CloudState {
+    init(coreRecord record: CloudStateRecord) {
+        self.init(
+            plan: record.plan.map(CloudState.Plan.init(coreRecord:)),
+            media: CloudBreakdown(coreRecord: record.media),
+            myCloudTypes: CloudBreakdown(coreRecord: record.myCloudTypes),
+            conversations: record.conversations.map(CloudState.Conversation.init(coreRecord:)),
+            settings: CloudState.Settings(coreRecord: record.settings),
+            changed: Int(record.changed),
+            loaded: record.loaded,
+            hiddenLookup: record.hiddenLookup,
+            selfId: record.selfId
+        )
+    }
+}
+
+extension CloudItem {
+    init(coreRecord record: CloudItemRecord) {
+        self.init(
+            id: record.id,
+            kind: CloudItemKind(coreRecord: record.kind),
+            conversationId: record.conversationId,
+            conversationName: record.conversationName,
+            size: record.size,
+            date: record.dateMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) },
+            title: record.title,
+            ext: record.ext,
+            duration: record.duration,
+            width: Int(record.width),
+            height: Int(record.height)
+        )
+    }
+}
+
+extension CloudPage {
+    init(coreRecord record: CloudPageRecord) {
+        self.init(
+            items: record.items.map(CloudItem.init(coreRecord:)),
+            hasMore: record.hasMore,
+            error: record.error
+        )
+    }
+}
+
+extension CloudFile {
+    init(coreRecord record: CloudFileRecord) {
+        self.init(
+            url: URL(fileURLWithPath: record.path),
+            kind: CloudItemKind(coreRecord: record.kind),
+            title: record.title,
+            ext: record.ext,
+            size: record.size,
+            date: record.dateMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) }
+        )
+    }
+}
+
+extension CloudFetch {
+    init(coreRecord record: CloudFetchRecord) {
+        switch record {
+        case .ready(let file):
+            self = .ready(CloudFile(coreRecord: file))
+        case .expired:
+            self = .expired
+        case .failed(let message):
+            self = .failed(message)
+        }
+    }
+}
+
+extension CloudActionResult {
+    init(coreRecord record: CloudActionResultRecord) {
+        self.init(
+            ok: record.ok,
+            deleted: record.deleted,
+            failed: record.failed,
+            error: record.error
+        )
+    }
+}
+
+extension MediaResolution {
+    init(coreRecord record: MediaResolutionRecord) {
+        switch record {
+        case .file(let path):
+            self = .file(URL(fileURLWithPath: path))
+        case .expired:
+            self = .expired
+        case .unsupported:
+            self = .unsupported
+        case .unavailable:
+            self = .unavailable
+        }
+    }
+}
+
 extension StickerAnimation {
     init?(coreRecord record: StickerAnimationRecord) {
         switch record {
@@ -1979,6 +2169,13 @@ extension ZaloEngine {
         if (batch.contacts != nil || batch.cachedProfiles != nil || batch.cachedGroups != nil),
            let core = coreLifecycle.core {
             lastPushedIdentityKey = currentIdentityPushKey(for: core)
+        }
+
+        if let cloudRecord = batch.cloud {
+            let nextCloud = CloudState(coreRecord: cloudRecord)
+            if cloud != nextCloud {
+                cloud = nextCloud
+            }
         }
 
         if let suggestUpdate = batch.stickerSuggest {

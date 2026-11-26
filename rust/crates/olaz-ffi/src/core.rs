@@ -9,6 +9,10 @@ use std::time::Duration;
 
 use olaz_api::{PollState, SendMessageResult};
 use olaz_core::changes::{DirtyKey, snapshot_message_meta};
+use olaz_core::cloud::{
+    CloudActionResult, CloudBreakdown, CloudConversation, CloudFetch, CloudFile, CloudItem,
+    CloudItemKind, CloudPage, CloudPlan, CloudPlanKind, CloudSettings, CloudSnapshotState,
+};
 use olaz_core::composer::{ComposerConfirm, ComposerOutcome, MyCardInfo, ReminderComposeInfo};
 use olaz_core::conversations::{BatchApplyDelta, ConversationSummary, sort_conversations};
 use olaz_core::input::{E2eeQuoteArg, StickerSendError};
@@ -758,7 +762,18 @@ impl From<MediaResolutionRecord> for MediaResolutionOutcome {
     }
 }
 
-/// Host return value for `resolve_file` (U8).
+impl From<MediaResolutionOutcome> for MediaResolutionRecord {
+    fn from(r: MediaResolutionOutcome) -> Self {
+        match r {
+            MediaResolutionOutcome::File(path) => Self::File { path },
+            MediaResolutionOutcome::Expired => Self::Expired,
+            MediaResolutionOutcome::Unsupported => Self::Unsupported,
+            MediaResolutionOutcome::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+/// Host return value for `resolve_file` (U8/U11).
 #[derive(Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum FileResolutionRecord {
     Ready { path: String },
@@ -842,6 +857,366 @@ impl fmt::Debug for AutoDeleteEntryRecord {
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct AutoDeleteUpdateRecord {
     pub entries: Option<Vec<AutoDeleteEntryRecord>>,
+}
+
+/// Subscription plan kind for zCloud (U11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum CloudPlanKindRecord {
+    Paid,
+    Free,
+    Grace,
+    AfterGrace,
+}
+
+impl From<CloudPlanKind> for CloudPlanKindRecord {
+    fn from(k: CloudPlanKind) -> Self {
+        match k {
+            CloudPlanKind::Paid => Self::Paid,
+            CloudPlanKind::Free => Self::Free,
+            CloudPlanKind::Grace => Self::Grace,
+            CloudPlanKind::AfterGrace => Self::AfterGrace,
+        }
+    }
+}
+
+/// Media category in zCloud (U11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum CloudItemKindRecord {
+    Photo,
+    Video,
+    File,
+    Voice,
+    Other,
+}
+
+impl From<CloudItemKind> for CloudItemKindRecord {
+    fn from(k: CloudItemKind) -> Self {
+        match k {
+            CloudItemKind::Photo => Self::Photo,
+            CloudItemKind::Video => Self::Video,
+            CloudItemKind::File => Self::File,
+            CloudItemKind::Voice => Self::Voice,
+            CloudItemKind::Other => Self::Other,
+        }
+    }
+}
+
+impl From<CloudItemKindRecord> for CloudItemKind {
+    fn from(k: CloudItemKindRecord) -> Self {
+        match k {
+            CloudItemKindRecord::Photo => Self::Photo,
+            CloudItemKindRecord::Video => Self::Video,
+            CloudItemKindRecord::File => Self::File,
+            CloudItemKindRecord::Voice => Self::Voice,
+            CloudItemKindRecord::Other => Self::Other,
+        }
+    }
+}
+
+/// Bytes per category in zCloud (U11).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, uniffi::Record)]
+pub struct CloudBreakdownRecord {
+    pub photo: i64,
+    pub video: i64,
+    pub file: i64,
+    pub voice: i64,
+}
+
+impl From<CloudBreakdown> for CloudBreakdownRecord {
+    fn from(b: CloudBreakdown) -> Self {
+        Self {
+            photo: b.photo,
+            video: b.video,
+            file: b.file,
+            voice: b.voice,
+        }
+    }
+}
+
+/// Subscription plan / quota snapshot for zCloud (U11).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CloudPlanRecord {
+    pub kind: CloudPlanKindRecord,
+    pub name: String,
+    pub quota: i64,
+    pub usage: i64,
+    pub family: i64,
+    pub cloud_media: i64,
+    pub message_backup: i64,
+    pub my_cloud: i64,
+    pub expire_at_ms: Option<i64>,
+    pub auto_renew: Option<bool>,
+    pub months: i64,
+    pub has_key: bool,
+    pub backup_media: bool,
+    pub backup_my_cloud: bool,
+    pub backup_messages: bool,
+    pub file_limit: i64,
+}
+
+impl From<CloudPlan> for CloudPlanRecord {
+    fn from(p: CloudPlan) -> Self {
+        Self {
+            kind: p.kind.into(),
+            name: p.name,
+            quota: p.quota,
+            usage: p.usage,
+            family: p.family,
+            cloud_media: p.cloud_media,
+            message_backup: p.message_backup,
+            my_cloud: p.my_cloud,
+            expire_at_ms: p.expire_at_ms,
+            auto_renew: p.auto_renew,
+            months: p.months,
+            has_key: p.has_key,
+            backup_media: p.backup_media,
+            backup_my_cloud: p.backup_my_cloud,
+            backup_messages: p.backup_messages,
+            file_limit: p.file_limit,
+        }
+    }
+}
+
+/// Per-conversation storage entry in zCloud (U11); `Debug` is shape-only (ADR-008).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CloudConversationRecord {
+    pub id: String,
+    pub name: String,
+    pub avatar: Option<String>,
+    pub is_group: bool,
+    pub total: i64,
+    pub last_activity_ms: Option<i64>,
+}
+
+impl fmt::Debug for CloudConversationRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CloudConversationRecord")
+            .field("is_group", &self.is_group)
+            .field("has_avatar", &self.avatar.is_some())
+            .field("total", &self.total)
+            .field("last_activity_ms", &self.last_activity_ms)
+            .finish()
+    }
+}
+
+impl From<CloudConversation> for CloudConversationRecord {
+    fn from(c: CloudConversation) -> Self {
+        Self {
+            id: c.id,
+            name: c.name,
+            avatar: c.avatar,
+            is_group: c.is_group,
+            total: c.total,
+            last_activity_ms: c.last_activity_ms,
+        }
+    }
+}
+
+/// Auto-offload settings in zCloud (U11).
+#[derive(Debug, Clone, Default, PartialEq, Eq, uniffi::Record)]
+pub struct CloudSettingsRecord {
+    pub offload_enabled: bool,
+    pub offload_available: bool,
+    pub last_offload_at_ms: Option<i64>,
+    pub last_offload_size: i64,
+    pub ttl_days: i64,
+}
+
+impl From<CloudSettings> for CloudSettingsRecord {
+    fn from(s: CloudSettings) -> Self {
+        Self {
+            offload_enabled: s.offload_enabled,
+            offload_available: s.offload_available,
+            last_offload_at_ms: s.last_offload_at_ms,
+            last_offload_size: s.last_offload_size,
+            ttl_days: s.ttl_days,
+        }
+    }
+}
+
+/// Observable zCloud state published to Swift UI mirror (U11); `Debug` is shape-only (ADR-008).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CloudStateRecord {
+    pub plan: Option<CloudPlanRecord>,
+    pub media: CloudBreakdownRecord,
+    pub my_cloud_types: CloudBreakdownRecord,
+    pub conversations: Vec<CloudConversationRecord>,
+    pub settings: CloudSettingsRecord,
+    pub changed: i64,
+    pub loaded: bool,
+    pub hidden_lookup: bool,
+    pub self_id: Option<String>,
+}
+
+impl fmt::Debug for CloudStateRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CloudStateRecord")
+            .field("has_plan", &self.plan.is_some())
+            .field("media", &self.media)
+            .field("my_cloud_types", &self.my_cloud_types)
+            .field("conversations_len", &self.conversations.len())
+            .field("settings", &self.settings)
+            .field("changed", &self.changed)
+            .field("loaded", &self.loaded)
+            .field("hidden_lookup", &self.hidden_lookup)
+            .field("has_self_id", &self.self_id.is_some())
+            .finish()
+    }
+}
+
+impl From<CloudSnapshotState> for CloudStateRecord {
+    fn from(s: CloudSnapshotState) -> Self {
+        Self {
+            plan: s.plan.map(Into::into),
+            media: s.media.into(),
+            my_cloud_types: s.my_cloud_types.into(),
+            conversations: s.conversations.into_iter().map(Into::into).collect(),
+            settings: s.settings.into(),
+            changed: s.changed,
+            loaded: s.loaded,
+            hidden_lookup: s.hidden_lookup,
+            self_id: s.self_id,
+        }
+    }
+}
+
+/// One media/file item in a zCloud page (U11); `Debug` is shape-only (ADR-008).
+#[derive(Clone, PartialEq, uniffi::Record)]
+pub struct CloudItemRecord {
+    pub id: String,
+    pub kind: CloudItemKindRecord,
+    pub conversation_id: String,
+    pub conversation_name: String,
+    pub size: i64,
+    pub date_ms: Option<i64>,
+    pub title: String,
+    pub ext: String,
+    pub duration: f64,
+    pub width: i64,
+    pub height: i64,
+}
+
+impl fmt::Debug for CloudItemRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CloudItemRecord")
+            .field("kind", &self.kind)
+            .field("size", &self.size)
+            .field("date_ms", &self.date_ms)
+            .field("ext", &self.ext)
+            .field("duration", &self.duration)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish()
+    }
+}
+
+impl From<CloudItem> for CloudItemRecord {
+    fn from(i: CloudItem) -> Self {
+        Self {
+            id: i.id,
+            kind: i.kind.into(),
+            conversation_id: i.conversation_id,
+            conversation_name: i.conversation_name,
+            size: i.size,
+            date_ms: i.date_ms,
+            title: i.title,
+            ext: i.ext,
+            duration: i.duration,
+            width: i.width,
+            height: i.height,
+        }
+    }
+}
+
+/// Paged zCloud media list (U11).
+#[derive(Debug, Clone, Default, PartialEq, uniffi::Record)]
+pub struct CloudPageRecord {
+    pub items: Vec<CloudItemRecord>,
+    pub has_more: bool,
+    pub error: Option<String>,
+}
+
+impl From<CloudPage> for CloudPageRecord {
+    fn from(p: CloudPage) -> Self {
+        Self {
+            items: p.items.into_iter().map(Into::into).collect(),
+            has_more: p.has_more,
+            error: p.error,
+        }
+    }
+}
+
+/// Downloaded/staged cloud file (U11); `Debug` is shape-only (ADR-008).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CloudFileRecord {
+    pub path: String,
+    pub kind: CloudItemKindRecord,
+    pub title: String,
+    pub ext: String,
+    pub size: i64,
+    pub date_ms: Option<i64>,
+}
+
+impl fmt::Debug for CloudFileRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CloudFileRecord")
+            .field("kind", &self.kind)
+            .field("ext", &self.ext)
+            .field("size", &self.size)
+            .field("date_ms", &self.date_ms)
+            .finish()
+    }
+}
+
+impl From<CloudFile> for CloudFileRecord {
+    fn from(f: CloudFile) -> Self {
+        Self {
+            path: f.path,
+            kind: f.kind.into(),
+            title: f.title,
+            ext: f.ext,
+            size: f.size,
+            date_ms: f.date_ms,
+        }
+    }
+}
+
+/// Outcome of [`CoreEngine::cloud_fetch`] (U11).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum CloudFetchRecord {
+    Ready { file: CloudFileRecord },
+    Expired,
+    Failed { message: String },
+}
+
+impl From<CloudFetch> for CloudFetchRecord {
+    fn from(f: CloudFetch) -> Self {
+        match f {
+            CloudFetch::Ready(file) => Self::Ready { file: file.into() },
+            CloudFetch::Expired => Self::Expired,
+            CloudFetch::Failed(message) => Self::Failed { message },
+        }
+    }
+}
+
+/// Outcome of [`CoreEngine::cloud_delete`] or [`CoreEngine::cloud_set_offload`] (U11).
+#[derive(Debug, Clone, Default, PartialEq, Eq, uniffi::Record)]
+pub struct CloudActionResultRecord {
+    pub ok: bool,
+    pub deleted: Vec<String>,
+    pub failed: Vec<String>,
+    pub error: Option<String>,
+}
+
+impl From<CloudActionResult> for CloudActionResultRecord {
+    fn from(r: CloudActionResult) -> Self {
+        Self {
+            ok: r.ok,
+            deleted: r.deleted,
+            failed: r.failed,
+            error: r.error,
+        }
+    }
 }
 
 // --- U13 stickers & composer side-actions records ---
@@ -1288,6 +1663,9 @@ pub struct CoreChangesRecord {
     // U12
     #[uniffi(default = None)]
     pub polls: Option<PollsMirrorRecord>,
+    // U11
+    #[uniffi(default = None)]
+    pub cloud: Option<CloudStateRecord>,
     // U13
     pub sticker_suggest: Option<StickerSuggestUpdateRecord>,
     pub composer_confirm: Option<ComposerConfirmUpdateRecord>,
@@ -1311,6 +1689,7 @@ impl fmt::Debug for CoreChangesRecord {
             .field("has_forward_request", &self.forward_request.is_some())
             .field("clear_selection", &self.clear_selection)
             .field("polls", &self.polls)
+            .field("cloud", &self.cloud)
             .finish()
     }
 }
@@ -1380,6 +1759,7 @@ impl From<CoreChanges> for CoreChangesRecord {
                     .collect()
             }),
             polls: c.polls.map(Into::into),
+            cloud: c.cloud.map(Into::into),
             sticker_suggest: c.sticker_suggest.map(|s| StickerSuggestUpdateRecord {
                 setting: s.map(Into::into),
             }),
@@ -1751,6 +2131,7 @@ impl CoreOfflineConversations {
             cached_profiles: None,
             cached_groups: None,
             polls: None,
+            cloud: None,
             sticker_suggest: None,
             composer_confirm: None,
             queued_composer_confirms: None,
@@ -1822,6 +2203,7 @@ impl CoreOfflineConversations {
                 | DirtyKey::StarredIds
                 | DirtyKey::CachedProfiles
                 | DirtyKey::CachedGroups
+                | DirtyKey::Cloud
                 | DirtyKey::StickerSuggest
                 | DirtyKey::ComposerConfirm => {}
                 DirtyKey::Polls => {
@@ -2058,7 +2440,8 @@ pub trait CoreHost: Send + Sync {
         client_id: String,
         quote: Option<E2eeQuoteArgRecord>,
     ) -> E2eeSendOutcomeRecord;
-    // --- Forward domain callbacks (U8) ---
+
+    // --- Forward & Cloud domain callbacks (U6/U8/U11) ---
     async fn show_card(&self, conv_id: Option<String>, text: String);
     async fn resolve_media(
         &self,
@@ -4170,6 +4553,105 @@ impl CoreEngine {
         let ws = Arc::clone(&self.ws_driver);
         let map = cursors_to_map(cursors);
         run(async move { ws.seed_cursors(map).await }).await
+    }
+
+    // --- Cloud domain commands (U11) ---
+
+    /// Refreshes zCloud quota/settings/storage snapshot (server API + SQLite + memory merge)
+    /// and returns the published version once reduced.
+    pub async fn refresh_cloud_async(&self) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle.request_unit(Command::RefreshCloud).await;
+            handle.current_version()
+        })
+        .await
+    }
+
+    /// Queries a sorted, paginated page of zCloud items (SQLite + unsynced in-memory merge).
+    pub async fn cloud_list(
+        &self,
+        conv_id: Option<String>,
+        kind: Option<CloudItemKindRecord>,
+        sort_by_size: bool,
+        ascending: bool,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CloudPageRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let page = run(async move {
+            handle
+                .request_cloud_page(Command::CloudList {
+                    conv_id,
+                    kind: kind.map(Into::into),
+                    sort_by_size,
+                    ascending,
+                    offset,
+                    limit,
+                })
+                .await
+        })
+        .await?;
+        Ok(page.into())
+    }
+
+    /// Resolves a cloud item's thumbnail via `Host::resolve_media`.
+    pub async fn cloud_thumbnail(&self, key: String) -> Result<MediaResolutionRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let res = run(async move {
+            handle
+                .request_media_resolution(Command::CloudThumbnail { key })
+                .await
+        })
+        .await?;
+        Ok(res.into())
+    }
+
+    /// Downloads/resolves a cloud item for preview/save via `Host::resolve_media`/`resolve_file`.
+    pub async fn cloud_fetch(&self, key: String) -> Result<CloudFetchRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let fetch = run(async move {
+            handle
+                .request_cloud_fetch(Command::CloudFetch { key })
+                .await
+        })
+        .await?;
+        Ok(fetch.into())
+    }
+
+    /// Deletes the specified zCloud item keys via server API + remote-delete + snapshot refresh.
+    pub async fn cloud_delete(
+        &self,
+        keys: Vec<String>,
+    ) -> Result<CloudActionResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let res = run(async move {
+            handle
+                .request_cloud_action(Command::CloudDelete { keys })
+                .await
+        })
+        .await?;
+        Ok(res.into())
+    }
+
+    /// Attempts to toggle zCloud auto-offload (unsupported on Olaz; clears offload flags).
+    pub async fn cloud_set_offload(
+        &self,
+        enabled: bool,
+    ) -> Result<CloudActionResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let res = run(async move {
+            handle
+                .request_cloud_action(Command::CloudSetOffload { enabled })
+                .await
+        })
+        .await?;
+        Ok(res.into())
+    }
+
+    /// Resets the zCloud state snapshot and clears the cached viewer key.
+    pub fn reset_cloud(&self) {
+        self.handle.send(Command::ResetCloud);
     }
 
     /// Pulls the next coalesced batch of dirty domain snapshots, or `None` after [`Self::stop`].

@@ -14,6 +14,7 @@ use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
 use crate::actions::DeleteUndoItem;
+use crate::cloud::{CloudActionResult, CloudFetch, CloudPage, MediaResolutionOutcome};
 use crate::composer::{ComposerOutcome, MyCardInfo, ReminderComposeInfo};
 use crate::conversations::{
     ConversationActionResult, ConversationPreview, IdentityTable, PinBoard,
@@ -248,6 +249,7 @@ pub enum StoreOp {
         mem_latest: Option<ConversationPreview>,
         update_conversation_preview: bool,
         persist_conversations: bool,
+        cloud_delete_op_id: Option<u64>,
     },
 }
 
@@ -448,6 +450,11 @@ pub enum OpResult {
     PollPinOutcome(crate::polls::PollPinOutcome),
     PollActionResult(crate::polls::PollActionResult),
     PollCapabilities(crate::polls::PollCapabilities),
+    // U11
+    CloudPage(CloudPage),
+    CloudFetch(CloudFetch),
+    CloudAction(CloudActionResult),
+    MediaResolution(MediaResolutionOutcome),
     // U13
     StickerTabs(Option<Vec<StickerTab>>),
     StickerEntries(Option<Vec<StickerEntry>>),
@@ -489,6 +496,11 @@ impl fmt::Debug for OpResult {
             Self::PollPinOutcome(o) => f.debug_tuple("PollPinOutcome").field(o).finish(),
             Self::PollActionResult(r) => f.debug_tuple("PollActionResult").field(r).finish(),
             Self::PollCapabilities(c) => f.debug_tuple("PollCapabilities").field(c).finish(),
+            // U11
+            Self::CloudPage(p) => f.debug_tuple("CloudPage").field(p).finish(),
+            Self::CloudFetch(r) => f.debug_tuple("CloudFetch").field(r).finish(),
+            Self::CloudAction(a) => f.debug_tuple("CloudAction").field(a).finish(),
+            Self::MediaResolution(m) => f.debug_tuple("MediaResolution").field(m).finish(),
             // U13
             Self::StickerTabs(v) => f
                 .debug_struct("StickerTabs")
@@ -639,6 +651,7 @@ pub enum HostCall {
         cli_msg_id: String,
         update_conversation_preview: bool,
         persist_conversations: bool,
+        cloud_delete_op_id: Option<u64>,
     },
     DecryptEnvelope {
         payload: Map<String, Value>,
@@ -707,6 +720,20 @@ pub enum HostCall {
         forward_id: u64,
         conv_id: String,
         paths: Vec<String>,
+    },
+    // U11 (reuses `Host::resolve_media` / `Host::resolve_file` serially on the host worker)
+    CloudResolveMedia {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
+        kind: String,
+    },
+    CloudResolveFile {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
+        name: String,
+        url: Option<String>,
     },
     // U13
     SendE2eeSticker {
@@ -900,6 +927,17 @@ impl fmt::Debug for HostCall {
                 .debug_struct("SendFiles")
                 .field("forward_id", forward_id)
                 .field("paths_count", &paths.len())
+                .finish(),
+            // U11
+            Self::CloudResolveMedia { op_id, kind, .. } => f
+                .debug_struct("CloudResolveMedia")
+                .field("op_id", op_id)
+                .field("kind", kind)
+                .finish(),
+            Self::CloudResolveFile { op_id, url, .. } => f
+                .debug_struct("CloudResolveFile")
+                .field("op_id", op_id)
+                .field("has_url", &url.is_some())
                 .finish(),
             // U13
             Self::SendE2eeSticker {
@@ -1314,6 +1352,41 @@ pub enum Effect {
         now_ms: i64,
         op_id: Option<u64>,
     },
+    // U11
+    /// Fetches zCloud server snapshot (when account/store allow) + SQLite aggregation/dedup.
+    RefreshCloudData {
+        op_id: Option<u64>,
+        media_ids_by_conv: Vec<(String, Vec<String>)>,
+        skip_api_if_no_store: bool,
+    },
+    /// Runs SQLite zCloud media listing + in-memory dedup probe on the serialized store worker.
+    CloudListStore {
+        op_id: u64,
+        conv_id: Option<String>,
+        excluding_self: Option<String>,
+        kind_tags: Vec<String>,
+        sort_by_size: bool,
+        ascending: bool,
+        offset: i64,
+        limit: i64,
+        memory_media: Vec<(String, Vec<String>, Vec<String>)>,
+    },
+    /// Looks up a decoded message in SQLite for `cloud_fetch` / `cloud_delete`.
+    CloudLookupMessage {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
+    },
+    /// Calls `ZaloApi::delete_message_for_me` for a single zCloud item (user-decisions item 12.3).
+    CloudDeleteMessageApi {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        sender_id: String,
+    },
+    /// Clears cached zCloud viewer key/enk credentials on `ResetCloud`.
+    ClearCloudViewerKey,
 
     // U13
     FetchStickerCategories {
@@ -1723,6 +1796,41 @@ impl fmt::Debug for Effect {
                 .field("delay_ms", &delay.as_millis())
                 .finish(),
             Self::CancelAllPollDebounces => f.write_str("CancelAllPollDebounces"),
+            // U11
+            Self::RefreshCloudData {
+                op_id,
+                media_ids_by_conv,
+                skip_api_if_no_store,
+            } => f
+                .debug_struct("RefreshCloudData")
+                .field("op_id", op_id)
+                .field("convs", &media_ids_by_conv.len())
+                .field("skip_api_if_no_store", skip_api_if_no_store)
+                .finish(),
+            Self::CloudListStore {
+                op_id,
+                sort_by_size,
+                ascending,
+                offset,
+                limit,
+                ..
+            } => f
+                .debug_struct("CloudListStore")
+                .field("op_id", op_id)
+                .field("sort_by_size", sort_by_size)
+                .field("ascending", ascending)
+                .field("offset", offset)
+                .field("limit", limit)
+                .finish(),
+            Self::CloudLookupMessage { op_id, .. } => f
+                .debug_struct("CloudLookupMessage")
+                .field("op_id", op_id)
+                .finish(),
+            Self::CloudDeleteMessageApi { op_id, .. } => f
+                .debug_struct("CloudDeleteMessageApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::ClearCloudViewerKey => f.write_str("ClearCloudViewerKey"),
             // U13
             Self::FetchStickerCategories { op_id } => f
                 .debug_struct("FetchStickerCategories")

@@ -13,6 +13,7 @@ use std::sync::{Mutex, PoisonError};
 use tokio::sync::Notify;
 
 use crate::actions::{DeleteUndoSnapshot, MessageConfirmState};
+use crate::cloud::CloudSnapshotState;
 use crate::composer::ComposerConfirm;
 use crate::conversations::{
     CachedGroup, CachedProfile, ConversationActionUI, ConversationActionsState, ConversationExtras,
@@ -56,6 +57,8 @@ pub enum DirtyKey {
     CachedGroups,
     // U12
     Polls,
+    // U11
+    Cloud,
     // U13
     StickerSuggest,
     ComposerConfirm,
@@ -124,6 +127,9 @@ pub struct CoreChanges {
     pub cached_groups: Option<BTreeMap<String, CachedGroup>>,
     // U12
     pub polls: Option<crate::polls::PollsState>,
+    // U11
+    /// Updated zCloud snapshot (`cloud`).
+    pub cloud: Option<CloudSnapshotState>,
     // U13
     /// Outer `Some(...)` means the sticker suggest setting changed; inner `Option` is the setting.
     pub sticker_suggest: Option<Option<StickerSuggestSetting>>,
@@ -148,6 +154,7 @@ impl fmt::Debug for CoreChanges {
             .field("clear_selection", &self.clear_selection)
             .field("has_cached_groups", &self.cached_groups.is_some())
             .field("has_polls", &self.polls.is_some())
+            .field("has_cloud", &self.cloud.is_some())
             .finish()
     }
 }
@@ -185,6 +192,8 @@ struct DirtyBuffer {
     cached_groups: Option<BTreeMap<String, CachedGroup>>,
     // U12
     polls: Option<crate::polls::PollsState>,
+    // U11
+    cloud: Option<CloudSnapshotState>,
     // U13
     sticker_suggest: Option<Option<StickerSuggestSetting>>,
     composer_confirm: Option<Option<ComposerConfirm>>,
@@ -213,6 +222,7 @@ impl DirtyBuffer {
             || self.cached_profiles.is_some()
             || self.cached_groups.is_some()
             || self.polls.is_some()
+            || self.cloud.is_some()
             || self.sticker_suggest.is_some()
             || self.composer_confirm.is_some()
             || self.queued_composer_confirms.is_some()
@@ -365,6 +375,9 @@ impl ChangeHub {
                 DirtyKey::CachedGroups => {
                     buf.cached_groups = Some(state.conversations.identities.cached_groups.clone());
                 }
+                DirtyKey::Cloud => {
+                    buf.cloud = Some(state.cloud.snapshot.clone());
+                }
                 // U13
                 DirtyKey::StickerSuggest => {
                     buf.sticker_suggest = Some(state.stickers.suggest_setting);
@@ -465,6 +478,8 @@ impl ChangeHub {
                             cached_groups: None,
                             // U12
                             polls: None,
+                            // U11
+                            cloud: None,
                             // U13
                             sticker_suggest: None,
                             composer_confirm: None,
@@ -539,6 +554,8 @@ impl ChangeHub {
                         cached_groups: buf.cached_groups.take(),
                         // U12
                         polls: buf.polls.take(),
+                        // U11
+                        cloud: buf.cloud.take(),
                         // U13
                         sticker_suggest: buf.sticker_suggest.take(),
                         composer_confirm: buf.composer_confirm.take(),

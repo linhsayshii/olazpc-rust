@@ -16,6 +16,7 @@
 
 mod api;
 mod autodelete;
+mod cloud;
 mod conversations;
 mod e2ee;
 mod error;
@@ -37,6 +38,7 @@ pub use autodelete::{
     AUTO_DELETE_OPTIONS, AutoDeleteFetchOutcome, auto_delete_label, auto_delete_remaining,
     build_update_auto_delete_payload, parse_auto_delete_settings,
 };
+pub use cloud::{CloudPlanKind, CloudServerSnapshot, parse_cloud_usage_snapshot};
 pub use conversations::{
     HiddenConversationsSnapshot, PollOutcome, parse_hidden_conversations_response,
     received_friend_request_rows,

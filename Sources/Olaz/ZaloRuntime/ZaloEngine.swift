@@ -235,6 +235,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var messageActionTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var contactsTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var pollRefreshTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored internal var cloudRefreshTask: Task<Void, Never>?
     @ObservationIgnored internal var pollDebounceSleep: (@MainActor (Int) async -> Bool)?
     @ObservationIgnored internal var localPollSyncEpoch: UInt64 = 0
     @ObservationIgnored internal var composerConfirmTask: Task<Void, Never>?
@@ -1823,7 +1824,6 @@ final class ZaloEngine {
                 deletedTsMs = existing.tsMs
             }
         }
-
 
         try? await sqliteStore?.deleteMessage(convId: convId, id: targetId)
         if !cliMsgId.isEmpty, cliMsgId != targetId {

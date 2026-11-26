@@ -2,7 +2,7 @@
 //! and the concrete [`SessionEffectRunner`] backed by `olaz_net::SessionClient`, `olaz_api::ZaloApi`,
 //! and `olaz_ws::WsClient`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,7 +12,7 @@ use olaz_api::{PollState, ZaloApi};
 use olaz_net::{
     LoginAccount, SessionClient, SessionSnapshot as NetSessionSnapshot, Transport, ZaloDomains,
 };
-use olaz_store::{SaveOptions, Store};
+use olaz_store::{CloudMediaQuery, SaveOptions, Store};
 use olaz_wire::{ChatMessage, decode_stored_message, extract_profiles_map};
 use olaz_ws::{CryptoDecryptor, CursorMap, WsClient, WsConfig, WsHandle};
 use serde_json::{Map, Value};
@@ -22,6 +22,7 @@ use tokio::task::AbortHandle;
 
 use crate::actions::swift_error_type_name;
 use crate::actor::{ActorSink, InFlightGuard};
+use crate::cloud::CloudServerSnapshot;
 use crate::conversations::{
     BatchApplyDelta, IdentityTable, MessagePreviewInput, hidden_pin_md5, hidden_pin_sha256,
     load_local_account_from_store, to_wire_stored,
@@ -32,7 +33,7 @@ use crate::input::{
     BootstrapAliasesError, Command, CompletedLogin, E2eeQuoteArg, Input, LegacyCookie,
     PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StickerSendError, StoreToken,
 };
-use crate::messages::MuteEntry;
+use crate::messages::{MuteEntry, decode_db_stored};
 use crate::reduce::classify::MobileSyncEvent;
 use crate::state::PersistedTransportState;
 use crate::stickers::{parse_recent_stickers_bytes, update_recent_stickers_json};
@@ -492,7 +493,7 @@ pub trait Host: Send + Sync {
     ) -> Result<olaz_api::SendMessageResult, String> {
         Err("send_e2ee_text not implemented by host".to_owned())
     }
-    // --- Forward domain callbacks (U8) ---
+    // --- Forward & message-action / cloud domain callbacks (U6/U8/U11) ---
     async fn show_card(&self, _conv_id: Option<String>, _text: String) {}
     async fn resolve_media(
         &self,
@@ -675,6 +676,7 @@ enum HostJob {
         cli_msg_id: String,
         update_conversation_preview: bool,
         persist_conversations: bool,
+        cloud_delete_op_id: Option<u64>,
         sink: ActorSink,
         _guard: InFlightGuard,
     },
@@ -818,6 +820,24 @@ enum HostJob {
         duration: i64,
         _guard: InFlightGuard,
     },
+    // U11
+    CloudResolveMedia {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
+        kind: String,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    CloudResolveFile {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
+        name: String,
+        url: Option<String>,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
     // U13: queued behind earlier host calls without blocking the serial host worker on network I/O
     SendE2eeSticker {
         send_id: u64,
@@ -874,6 +894,34 @@ enum StoreJob {
     FlushOp {
         op_id: u64,
         result: OpResult,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    // U11
+    CloudRefreshQuery {
+        op_id: Option<u64>,
+        server_snapshot: Option<CloudServerSnapshot>,
+        media_ids_by_conv: Vec<(String, Vec<String>)>,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    CloudListQuery {
+        op_id: u64,
+        conv_id: Option<String>,
+        excluding_self: Option<String>,
+        kind_tags: Vec<String>,
+        sort_by_size: bool,
+        ascending: bool,
+        offset: i64,
+        limit: i64,
+        memory_media: Vec<(String, Vec<String>, Vec<String>)>,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    CloudLookupMessage {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
         sink: ActorSink,
         _guard: InFlightGuard,
     },
@@ -3016,6 +3064,110 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         drop(guard);
                     });
                 }
+                // U11
+                Effect::RefreshCloudData {
+                    op_id,
+                    media_ids_by_conv,
+                    skip_api_if_no_store,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let client = Arc::clone(&self.client);
+                    let shared_store = Arc::clone(&self.shared_store);
+                    let store_tx = self.store_tx.clone();
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let has_store = shared_store
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .is_some();
+                        if skip_api_if_no_store && !has_store {
+                            sink.send(Input::CloudRefreshLoaded {
+                                op_id,
+                                server_snapshot: None,
+                                sql_summaries: Vec::new(),
+                                existing_ids_by_conv: BTreeMap::new(),
+                            });
+                            drop(guard);
+                            return;
+                        }
+                        let server_snapshot = if client.account().is_some() {
+                            api.fetch_cloud_server_snapshot().await
+                        } else {
+                            None
+                        };
+                        let _ = store_tx.send(StoreJob::CloudRefreshQuery {
+                            op_id,
+                            server_snapshot,
+                            media_ids_by_conv,
+                            sink,
+                            _guard: guard,
+                        });
+                    });
+                }
+                Effect::CloudListStore {
+                    op_id,
+                    conv_id,
+                    excluding_self,
+                    kind_tags,
+                    sort_by_size,
+                    ascending,
+                    offset,
+                    limit,
+                    memory_media,
+                } => {
+                    let guard = sink.track();
+                    self.send_store(StoreJob::CloudListQuery {
+                        op_id,
+                        conv_id,
+                        excluding_self,
+                        kind_tags,
+                        sort_by_size,
+                        ascending,
+                        offset,
+                        limit,
+                        memory_media,
+                        sink: sink.clone(),
+                        _guard: guard,
+                    });
+                }
+                Effect::CloudLookupMessage {
+                    op_id,
+                    conv_id,
+                    msg_id,
+                } => {
+                    let guard = sink.track();
+                    self.send_store(StoreJob::CloudLookupMessage {
+                        op_id,
+                        conv_id,
+                        msg_id,
+                        sink: sink.clone(),
+                        _guard: guard,
+                    });
+                }
+                Effect::CloudDeleteMessageApi {
+                    op_id,
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                    sender_id,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let error = api
+                            .delete_message_for_me(&conv_id, &msg_id, &cli_msg_id, &sender_id)
+                            .await
+                            .err()
+                            .map(|err| err.display_without_url());
+                        sink.send(Input::CloudDeleteMessageApiDone { op_id, error });
+                        drop(guard);
+                    });
+                }
+                Effect::ClearCloudViewerKey => {
+                    self.api.clear_cloud_viewer_key();
+                }
                 Effect::Host(call) => {
                     let guard = sink.track();
                     let job = match call {
@@ -3230,12 +3382,14 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             cli_msg_id,
                             update_conversation_preview,
                             persist_conversations,
+                            cloud_delete_op_id,
                         } => HostJob::ApplyRemoteDelete {
                             conv_id,
                             msg_id,
                             cli_msg_id,
                             update_conversation_preview,
                             persist_conversations,
+                            cloud_delete_op_id,
                             sink: sink.clone(),
                             _guard: guard,
                         },
@@ -3295,6 +3449,35 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             text,
                             _guard: guard,
                         },
+                        // U11
+                        HostCall::CloudResolveMedia {
+                            op_id,
+                            conv_id,
+                            msg_id,
+                            kind,
+                        } => HostJob::CloudResolveMedia {
+                            op_id,
+                            conv_id,
+                            msg_id,
+                            kind,
+                            sink: sink.clone(),
+                            _guard: guard,
+                        },
+                        HostCall::CloudResolveFile {
+                            op_id,
+                            conv_id,
+                            msg_id,
+                            name,
+                            url,
+                        } => HostJob::CloudResolveFile {
+                            op_id,
+                            conv_id,
+                            msg_id,
+                            name,
+                            url,
+                            sink: sink.clone(),
+                            _guard: guard,
+                        },
                         HostCall::SendE2eeText { .. }
                         | HostCall::SendE2eeSticker { .. }
                         | HostCall::SendE2eeContactCard { .. }
@@ -3304,7 +3487,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         | HostCall::SendMedia { .. }
                         | HostCall::SendFiles { .. } => {
                             continue;
-                        } // U6
+                        }
                     };
                     self.send_host(job);
                 }
@@ -3692,6 +3875,7 @@ async fn run_store_worker(
                         mem_latest,
                         update_conversation_preview,
                         persist_conversations,
+                        cloud_delete_op_id,
                     } => {
                         let conv_c = conv_id.clone();
                         let msg_c = msg_id.clone();
@@ -3766,6 +3950,7 @@ async fn run_store_worker(
                             store_latest,
                             update_conversation_preview,
                             persist_conversations,
+                            cloud_delete_op_id,
                         });
                     }
                     other => {
@@ -4087,6 +4272,163 @@ async fn run_store_worker(
                 _guard,
             } => {
                 sink.send(Input::OpStoreFlushed { op_id, result });
+            }
+            // U11
+            StoreJob::CloudRefreshQuery {
+                op_id,
+                server_snapshot,
+                media_ids_by_conv,
+                sink,
+                _guard,
+            } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let (sql_summaries, existing_ids_by_conv) = if let Some(store_arc) = store_opt {
+                    tokio::task::spawn_blocking(move || {
+                        let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                        let summaries = store.cloud_media_aggregation().unwrap_or_default();
+                        let mut existing: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+                        for (cid, ids) in media_ids_by_conv {
+                            if ids.is_empty() {
+                                continue;
+                            }
+                            let found = store
+                                .existing_message_ids(&cid, &ids)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .collect();
+                            existing.insert(cid, found);
+                        }
+                        (summaries, existing)
+                    })
+                    .await
+                    .unwrap_or_default()
+                } else {
+                    (Vec::new(), BTreeMap::new())
+                };
+                sink.send(Input::CloudRefreshLoaded {
+                    op_id,
+                    server_snapshot,
+                    sql_summaries,
+                    existing_ids_by_conv,
+                });
+            }
+            StoreJob::CloudListQuery {
+                op_id,
+                conv_id,
+                excluding_self,
+                kind_tags,
+                sort_by_size,
+                ascending,
+                offset,
+                limit,
+                memory_media,
+                sink,
+                _guard,
+            } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                if let Some(store_arc) = store_opt {
+                    let (existing_ids_by_conv, sql_items, sql_has_more, sql_error) =
+                        tokio::task::spawn_blocking(move || {
+                            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                            let mut existing: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+                            let mut has_unsynced = false;
+                            for (cid, all_ids, matching_ids) in memory_media {
+                                let found: BTreeSet<String> = store
+                                    .existing_message_ids(&cid, &all_ids)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .collect();
+                                if matching_ids.iter().any(|id| !found.contains(id)) {
+                                    has_unsynced = true;
+                                }
+                                existing.insert(cid, found);
+                            }
+                            if !has_unsynced {
+                                let q = CloudMediaQuery {
+                                    conv_id,
+                                    excluding_conv_id: excluding_self,
+                                    kind_tags,
+                                    sort_by_size,
+                                    ascending,
+                                    offset,
+                                    limit,
+                                };
+                                match store.cloud_media_items(&q) {
+                                    Ok((items, has_more)) => (existing, items, has_more, false),
+                                    Err(_) => (existing, Vec::new(), false, true),
+                                }
+                            } else {
+                                let q = CloudMediaQuery {
+                                    conv_id,
+                                    excluding_conv_id: excluding_self,
+                                    kind_tags,
+                                    sort_by_size,
+                                    ascending,
+                                    offset: 0,
+                                    limit: offset.saturating_add(limit),
+                                };
+                                let (items, has_more) =
+                                    store.cloud_media_items(&q).unwrap_or_default();
+                                (existing, items, has_more, false)
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|_| (BTreeMap::new(), Vec::new(), false, true));
+                    sink.send(Input::CloudListStoreDone {
+                        op_id,
+                        store_present: true,
+                        existing_ids_by_conv,
+                        sql_items,
+                        sql_has_more,
+                        sql_error,
+                    });
+                } else {
+                    sink.send(Input::CloudListStoreDone {
+                        op_id,
+                        store_present: false,
+                        existing_ids_by_conv: BTreeMap::new(),
+                        sql_items: Vec::new(),
+                        sql_has_more: false,
+                        sql_error: false,
+                    });
+                }
+            }
+            StoreJob::CloudLookupMessage {
+                op_id,
+                conv_id,
+                msg_id,
+                sink,
+                _guard,
+            } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let message = if let Some(store_arc) = store_opt {
+                    tokio::task::spawn_blocking(move || {
+                        let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                        store
+                            .message(&conv_id, &msg_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|row| decode_db_stored(&row))
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                } else {
+                    None
+                };
+                sink.send(Input::CloudLookupMessageDone {
+                    op_id,
+                    message: message.map(Box::new),
+                });
             }
             StoreJob::Drain(tx) => {
                 let _ = tx.send(());
@@ -4438,6 +4780,7 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 cli_msg_id,
                 update_conversation_preview,
                 persist_conversations,
+                cloud_delete_op_id,
                 sink,
                 _guard,
             } => {
@@ -4457,7 +4800,10 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                         cli_msg_id,
                         update_conversation_preview,
                         persist_conversations,
+                        cloud_delete_op_id,
                     });
+                } else if let Some(op_id) = cloud_delete_op_id {
+                    sink.send(Input::CloudRemoteDeleteDone { op_id });
                 }
             }
             HostJob::DecryptEnvelope {
@@ -4710,6 +5056,50 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
             } => {
                 host.mute(conv_id, set, start, start_explicit, duration)
                     .await;
+            }
+            // U11
+            HostJob::CloudResolveMedia {
+                op_id,
+                conv_id,
+                msg_id,
+                kind,
+                sink,
+                _guard,
+            } => {
+                let outcome = host.resolve_media(conv_id, msg_id, kind).await;
+                let file_size = match &outcome {
+                    MediaResolutionOutcome::File(path) => std::fs::metadata(path)
+                        .ok()
+                        .and_then(|m| i64::try_from(m.len()).ok()),
+                    _ => None,
+                };
+                sink.send(Input::CloudResolveMediaDone {
+                    op_id,
+                    outcome,
+                    file_size,
+                });
+            }
+            HostJob::CloudResolveFile {
+                op_id,
+                conv_id,
+                msg_id,
+                name,
+                url,
+                sink,
+                _guard,
+            } => {
+                let outcome = host.resolve_file(conv_id, msg_id, name, url).await;
+                let file_size = match &outcome {
+                    FileResolutionOutcome::Ready(path) => std::fs::metadata(path)
+                        .ok()
+                        .and_then(|m| i64::try_from(m.len()).ok()),
+                    _ => None,
+                };
+                sink.send(Input::CloudResolveFileDone {
+                    op_id,
+                    outcome,
+                    file_size,
+                });
             }
             // U13
             HostJob::SendE2eeSticker {

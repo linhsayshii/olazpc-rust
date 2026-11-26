@@ -12,6 +12,7 @@ use olaz_ws::CursorMap;
 use serde_json::{Map, Value, json};
 
 use crate::actions::{ActionsState, DeleteUndoSnapshot, MessageConfirmState};
+use crate::cloud::{CloudSnapshotState, CloudState};
 use crate::composer::{ComposerConfirm, ComposerState};
 use crate::conversations::{CachedProfile, ConversationsState};
 use crate::forward::{ForwardRequest, ForwardState};
@@ -45,6 +46,8 @@ pub struct CoreState {
     pub board_pins: BTreeMap<String, crate::polls::BoardPinList>,
     // U7: temporary read-only raw board topics mirror written through from Swift until U7 lands.
     pub board_raw_topics: BTreeMap<String, crate::polls::BoardRawTopics>,
+    // U11
+    pub cloud: CloudState,
     // U13
     pub stickers: StickerState,
     pub composer: ComposerState,
@@ -74,6 +77,8 @@ impl CoreState {
             // U12
             polls: self.polls.clone(),
             board_pins: self.board_pins.clone(),
+            // U11
+            cloud: self.cloud.snapshot.clone(),
             // U13
             sticker_suggest_setting: self.stickers.suggest_setting,
             composer_confirm: self.composer.active_confirm.clone(),
@@ -119,6 +124,8 @@ impl fmt::Debug for CoreState {
             .field("polls", &self.polls)
             .field("board_pins_count", &self.board_pins.len())
             .field("board_raw_topics_count", &self.board_raw_topics.len())
+            // U11
+            .field("cloud", &self.cloud)
             // U13
             .field("stickers", &self.stickers)
             .field("composer", &self.composer)
@@ -148,6 +155,8 @@ pub struct CoreSnapshot {
     // U12
     pub polls: crate::polls::PollsState,
     pub board_pins: BTreeMap<String, crate::polls::BoardPinList>,
+    // U11
+    pub cloud: CloudSnapshotState,
     // U13
     pub sticker_suggest_setting: Option<StickerSuggestSetting>,
     pub composer_confirm: Option<ComposerConfirm>,
@@ -178,6 +187,8 @@ impl fmt::Debug for CoreSnapshot {
             // U12
             .field("polls", &self.polls)
             .field("board_pins_count", &self.board_pins.len())
+            // U11
+            .field("cloud", &self.cloud)
             // U13
             .field("sticker_suggest_setting", &self.sticker_suggest_setting)
             .field("has_composer_confirm", &self.composer_confirm.is_some())

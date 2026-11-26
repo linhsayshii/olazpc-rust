@@ -1342,6 +1342,31 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func closeConversation() 
     
     /**
+     * Deletes the specified zCloud item keys via server API + remote-delete + snapshot refresh.
+     */
+    func cloudDelete(keys: [String]) async throws  -> CloudActionResultRecord
+    
+    /**
+     * Downloads/resolves a cloud item for preview/save via `Host::resolve_media`/`resolve_file`.
+     */
+    func cloudFetch(key: String) async throws  -> CloudFetchRecord
+    
+    /**
+     * Queries a sorted, paginated page of zCloud items (SQLite + unsynced in-memory merge).
+     */
+    func cloudList(convId: String?, kind: CloudItemKindRecord?, sortBySize: Bool, ascending: Bool, offset: Int64, limit: Int64) async throws  -> CloudPageRecord
+    
+    /**
+     * Attempts to toggle zCloud auto-offload (unsupported on Olaz; clears offload flags).
+     */
+    func cloudSetOffload(enabled: Bool) async throws  -> CloudActionResultRecord
+    
+    /**
+     * Resolves a cloud item's thumbnail via `Host::resolve_media`.
+     */
+    func cloudThumbnail(key: String) async throws  -> MediaResolutionRecord
+    
+    /**
      * Reports a composer outcome (`Failed` / `Pending` emit `show_card`).
      */
     func composerReport(convId: String, outcome: ComposerOutcomeRecord) 
@@ -1611,6 +1636,12 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func recordSeenReactionKeys(keys: [String]) async throws 
     
     /**
+     * Refreshes zCloud quota/settings/storage snapshot (server API + SQLite + memory merge)
+     * and returns the published version once reduced.
+     */
+    func refreshCloudAsync() async throws  -> UInt64
+    
+    /**
      * Refreshes group `@mention` previews from the attached SQLite store.
      */
     func refreshMentionPreviews() async throws  -> UInt64
@@ -1670,6 +1701,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Computes the current [`PinBoardRecord`] for replacing pins.
      */
     func requestPinBoard(id: String) async throws  -> PinBoardRecord?
+    
+    /**
+     * Resets the zCloud state snapshot and clears the cached viewer key.
+     */
+    func resetCloud() 
     
     /**
      * Resets composer state (cancels timers, drops confirms, fails in-flight contact cards).
@@ -2267,6 +2303,101 @@ open func closeConversation()  {try! rustCall() {
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
+}
+    
+    /**
+     * Deletes the specified zCloud item keys via server API + remote-delete + snapshot refresh.
+     */
+open func cloudDelete(keys: [String])async throws  -> CloudActionResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_cloud_delete(
+                        self.uniffiCloneHandle(),FfiConverterSequenceString.lower(keys)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCloudActionResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Downloads/resolves a cloud item for preview/save via `Host::resolve_media`/`resolve_file`.
+     */
+open func cloudFetch(key: String)async throws  -> CloudFetchRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_cloud_fetch(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(key)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCloudFetchRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Queries a sorted, paginated page of zCloud items (SQLite + unsynced in-memory merge).
+     */
+open func cloudList(convId: String?, kind: CloudItemKindRecord?, sortBySize: Bool, ascending: Bool, offset: Int64, limit: Int64)async throws  -> CloudPageRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_cloud_list(
+                        self.uniffiCloneHandle(),FfiConverterOptionString.lower(convId),FfiConverterOptionTypeCloudItemKindRecord.lower(kind),FfiConverterBool.lower(sortBySize),FfiConverterBool.lower(ascending),FfiConverterInt64.lower(offset),FfiConverterInt64.lower(limit)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCloudPageRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Attempts to toggle zCloud auto-offload (unsupported on Olaz; clears offload flags).
+     */
+open func cloudSetOffload(enabled: Bool)async throws  -> CloudActionResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_cloud_set_offload(
+                        self.uniffiCloneHandle(),FfiConverterBool.lower(enabled)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCloudActionResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Resolves a cloud item's thumbnail via `Host::resolve_media`.
+     */
+open func cloudThumbnail(key: String)async throws  -> MediaResolutionRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_cloud_thumbnail(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(key)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeMediaResolutionRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -3164,6 +3295,26 @@ open func recordSeenReactionKeys(keys: [String])async throws   {
 }
     
     /**
+     * Refreshes zCloud quota/settings/storage snapshot (server API + SQLite + memory merge)
+     * and returns the published version once reduced.
+     */
+open func refreshCloudAsync()async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_refresh_cloud_async(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
      * Refreshes group `@mention` previews from the attached SQLite store.
      */
 open func refreshMentionPreviews()async throws  -> UInt64  {
@@ -3353,6 +3504,17 @@ open func requestPinBoard(id: String)async throws  -> PinBoardRecord?  {
             liftFunc: FfiConverterOptionTypePinBoardRecord.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
+}
+    
+    /**
+     * Resets the zCloud state snapshot and clears the cached viewer key.
+     */
+open func resetCloud()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_reset_cloud(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
 }
     
     /**
@@ -13239,6 +13401,703 @@ public func FfiConverterTypeChatMessageRecord_lower(_ value: ChatMessageRecord) 
 }
 
 
+/**
+ * Outcome of [`CoreEngine::cloud_delete`] or [`CoreEngine::cloud_set_offload`] (U11).
+ */
+public struct CloudActionResultRecord: Equatable, Hashable {
+    public var ok: Bool
+    public var deleted: [String]
+    public var failed: [String]
+    public var error: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(ok: Bool, deleted: [String], failed: [String], error: String?) {
+        self.ok = ok
+        self.deleted = deleted
+        self.failed = failed
+        self.error = error
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CloudActionResultRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCloudActionResultRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CloudActionResultRecord {
+        return
+            try CloudActionResultRecord(
+                ok: FfiConverterBool.read(from: &buf), 
+                deleted: FfiConverterSequenceString.read(from: &buf), 
+                failed: FfiConverterSequenceString.read(from: &buf), 
+                error: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CloudActionResultRecord, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.ok, into: &buf)
+        FfiConverterSequenceString.write(value.deleted, into: &buf)
+        FfiConverterSequenceString.write(value.failed, into: &buf)
+        FfiConverterOptionString.write(value.error, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudActionResultRecord_lift(_ buf: RustBuffer) throws -> CloudActionResultRecord {
+    return try FfiConverterTypeCloudActionResultRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudActionResultRecord_lower(_ value: CloudActionResultRecord) -> RustBuffer {
+    return FfiConverterTypeCloudActionResultRecord.lower(value)
+}
+
+
+/**
+ * Bytes per category in zCloud (U11).
+ */
+public struct CloudBreakdownRecord: Equatable, Hashable {
+    public var photo: Int64
+    public var video: Int64
+    public var file: Int64
+    public var voice: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(photo: Int64, video: Int64, file: Int64, voice: Int64) {
+        self.photo = photo
+        self.video = video
+        self.file = file
+        self.voice = voice
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CloudBreakdownRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCloudBreakdownRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CloudBreakdownRecord {
+        return
+            try CloudBreakdownRecord(
+                photo: FfiConverterInt64.read(from: &buf), 
+                video: FfiConverterInt64.read(from: &buf), 
+                file: FfiConverterInt64.read(from: &buf), 
+                voice: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CloudBreakdownRecord, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.photo, into: &buf)
+        FfiConverterInt64.write(value.video, into: &buf)
+        FfiConverterInt64.write(value.file, into: &buf)
+        FfiConverterInt64.write(value.voice, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudBreakdownRecord_lift(_ buf: RustBuffer) throws -> CloudBreakdownRecord {
+    return try FfiConverterTypeCloudBreakdownRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudBreakdownRecord_lower(_ value: CloudBreakdownRecord) -> RustBuffer {
+    return FfiConverterTypeCloudBreakdownRecord.lower(value)
+}
+
+
+/**
+ * Per-conversation storage entry in zCloud (U11); `Debug` is shape-only (ADR-008).
+ */
+public struct CloudConversationRecord: Equatable, Hashable {
+    public var id: String
+    public var name: String
+    public var avatar: String?
+    public var isGroup: Bool
+    public var total: Int64
+    public var lastActivityMs: Int64?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, name: String, avatar: String?, isGroup: Bool, total: Int64, lastActivityMs: Int64?) {
+        self.id = id
+        self.name = name
+        self.avatar = avatar
+        self.isGroup = isGroup
+        self.total = total
+        self.lastActivityMs = lastActivityMs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CloudConversationRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCloudConversationRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CloudConversationRecord {
+        return
+            try CloudConversationRecord(
+                id: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                avatar: FfiConverterOptionString.read(from: &buf), 
+                isGroup: FfiConverterBool.read(from: &buf), 
+                total: FfiConverterInt64.read(from: &buf), 
+                lastActivityMs: FfiConverterOptionInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CloudConversationRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterOptionString.write(value.avatar, into: &buf)
+        FfiConverterBool.write(value.isGroup, into: &buf)
+        FfiConverterInt64.write(value.total, into: &buf)
+        FfiConverterOptionInt64.write(value.lastActivityMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudConversationRecord_lift(_ buf: RustBuffer) throws -> CloudConversationRecord {
+    return try FfiConverterTypeCloudConversationRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudConversationRecord_lower(_ value: CloudConversationRecord) -> RustBuffer {
+    return FfiConverterTypeCloudConversationRecord.lower(value)
+}
+
+
+/**
+ * Downloaded/staged cloud file (U11); `Debug` is shape-only (ADR-008).
+ */
+public struct CloudFileRecord: Equatable, Hashable {
+    public var path: String
+    public var kind: CloudItemKindRecord
+    public var title: String
+    public var ext: String
+    public var size: Int64
+    public var dateMs: Int64?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(path: String, kind: CloudItemKindRecord, title: String, ext: String, size: Int64, dateMs: Int64?) {
+        self.path = path
+        self.kind = kind
+        self.title = title
+        self.ext = ext
+        self.size = size
+        self.dateMs = dateMs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CloudFileRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCloudFileRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CloudFileRecord {
+        return
+            try CloudFileRecord(
+                path: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterTypeCloudItemKindRecord.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                ext: FfiConverterString.read(from: &buf), 
+                size: FfiConverterInt64.read(from: &buf), 
+                dateMs: FfiConverterOptionInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CloudFileRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterTypeCloudItemKindRecord.write(value.kind, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterString.write(value.ext, into: &buf)
+        FfiConverterInt64.write(value.size, into: &buf)
+        FfiConverterOptionInt64.write(value.dateMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudFileRecord_lift(_ buf: RustBuffer) throws -> CloudFileRecord {
+    return try FfiConverterTypeCloudFileRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudFileRecord_lower(_ value: CloudFileRecord) -> RustBuffer {
+    return FfiConverterTypeCloudFileRecord.lower(value)
+}
+
+
+/**
+ * One media/file item in a zCloud page (U11); `Debug` is shape-only (ADR-008).
+ */
+public struct CloudItemRecord: Equatable, Hashable {
+    public var id: String
+    public var kind: CloudItemKindRecord
+    public var conversationId: String
+    public var conversationName: String
+    public var size: Int64
+    public var dateMs: Int64?
+    public var title: String
+    public var ext: String
+    public var duration: Double
+    public var width: Int64
+    public var height: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, kind: CloudItemKindRecord, conversationId: String, conversationName: String, size: Int64, dateMs: Int64?, title: String, ext: String, duration: Double, width: Int64, height: Int64) {
+        self.id = id
+        self.kind = kind
+        self.conversationId = conversationId
+        self.conversationName = conversationName
+        self.size = size
+        self.dateMs = dateMs
+        self.title = title
+        self.ext = ext
+        self.duration = duration
+        self.width = width
+        self.height = height
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CloudItemRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCloudItemRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CloudItemRecord {
+        return
+            try CloudItemRecord(
+                id: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterTypeCloudItemKindRecord.read(from: &buf), 
+                conversationId: FfiConverterString.read(from: &buf), 
+                conversationName: FfiConverterString.read(from: &buf), 
+                size: FfiConverterInt64.read(from: &buf), 
+                dateMs: FfiConverterOptionInt64.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                ext: FfiConverterString.read(from: &buf), 
+                duration: FfiConverterDouble.read(from: &buf), 
+                width: FfiConverterInt64.read(from: &buf), 
+                height: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CloudItemRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterTypeCloudItemKindRecord.write(value.kind, into: &buf)
+        FfiConverterString.write(value.conversationId, into: &buf)
+        FfiConverterString.write(value.conversationName, into: &buf)
+        FfiConverterInt64.write(value.size, into: &buf)
+        FfiConverterOptionInt64.write(value.dateMs, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterString.write(value.ext, into: &buf)
+        FfiConverterDouble.write(value.duration, into: &buf)
+        FfiConverterInt64.write(value.width, into: &buf)
+        FfiConverterInt64.write(value.height, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudItemRecord_lift(_ buf: RustBuffer) throws -> CloudItemRecord {
+    return try FfiConverterTypeCloudItemRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudItemRecord_lower(_ value: CloudItemRecord) -> RustBuffer {
+    return FfiConverterTypeCloudItemRecord.lower(value)
+}
+
+
+/**
+ * Paged zCloud media list (U11).
+ */
+public struct CloudPageRecord: Equatable, Hashable {
+    public var items: [CloudItemRecord]
+    public var hasMore: Bool
+    public var error: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(items: [CloudItemRecord], hasMore: Bool, error: String?) {
+        self.items = items
+        self.hasMore = hasMore
+        self.error = error
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CloudPageRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCloudPageRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CloudPageRecord {
+        return
+            try CloudPageRecord(
+                items: FfiConverterSequenceTypeCloudItemRecord.read(from: &buf), 
+                hasMore: FfiConverterBool.read(from: &buf), 
+                error: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CloudPageRecord, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeCloudItemRecord.write(value.items, into: &buf)
+        FfiConverterBool.write(value.hasMore, into: &buf)
+        FfiConverterOptionString.write(value.error, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudPageRecord_lift(_ buf: RustBuffer) throws -> CloudPageRecord {
+    return try FfiConverterTypeCloudPageRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudPageRecord_lower(_ value: CloudPageRecord) -> RustBuffer {
+    return FfiConverterTypeCloudPageRecord.lower(value)
+}
+
+
+/**
+ * Subscription plan / quota snapshot for zCloud (U11).
+ */
+public struct CloudPlanRecord: Equatable, Hashable {
+    public var kind: CloudPlanKindRecord
+    public var name: String
+    public var quota: Int64
+    public var usage: Int64
+    public var family: Int64
+    public var cloudMedia: Int64
+    public var messageBackup: Int64
+    public var myCloud: Int64
+    public var expireAtMs: Int64?
+    public var autoRenew: Bool?
+    public var months: Int64
+    public var hasKey: Bool
+    public var backupMedia: Bool
+    public var backupMyCloud: Bool
+    public var backupMessages: Bool
+    public var fileLimit: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(kind: CloudPlanKindRecord, name: String, quota: Int64, usage: Int64, family: Int64, cloudMedia: Int64, messageBackup: Int64, myCloud: Int64, expireAtMs: Int64?, autoRenew: Bool?, months: Int64, hasKey: Bool, backupMedia: Bool, backupMyCloud: Bool, backupMessages: Bool, fileLimit: Int64) {
+        self.kind = kind
+        self.name = name
+        self.quota = quota
+        self.usage = usage
+        self.family = family
+        self.cloudMedia = cloudMedia
+        self.messageBackup = messageBackup
+        self.myCloud = myCloud
+        self.expireAtMs = expireAtMs
+        self.autoRenew = autoRenew
+        self.months = months
+        self.hasKey = hasKey
+        self.backupMedia = backupMedia
+        self.backupMyCloud = backupMyCloud
+        self.backupMessages = backupMessages
+        self.fileLimit = fileLimit
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CloudPlanRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCloudPlanRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CloudPlanRecord {
+        return
+            try CloudPlanRecord(
+                kind: FfiConverterTypeCloudPlanKindRecord.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                quota: FfiConverterInt64.read(from: &buf), 
+                usage: FfiConverterInt64.read(from: &buf), 
+                family: FfiConverterInt64.read(from: &buf), 
+                cloudMedia: FfiConverterInt64.read(from: &buf), 
+                messageBackup: FfiConverterInt64.read(from: &buf), 
+                myCloud: FfiConverterInt64.read(from: &buf), 
+                expireAtMs: FfiConverterOptionInt64.read(from: &buf), 
+                autoRenew: FfiConverterOptionBool.read(from: &buf), 
+                months: FfiConverterInt64.read(from: &buf), 
+                hasKey: FfiConverterBool.read(from: &buf), 
+                backupMedia: FfiConverterBool.read(from: &buf), 
+                backupMyCloud: FfiConverterBool.read(from: &buf), 
+                backupMessages: FfiConverterBool.read(from: &buf), 
+                fileLimit: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CloudPlanRecord, into buf: inout [UInt8]) {
+        FfiConverterTypeCloudPlanKindRecord.write(value.kind, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterInt64.write(value.quota, into: &buf)
+        FfiConverterInt64.write(value.usage, into: &buf)
+        FfiConverterInt64.write(value.family, into: &buf)
+        FfiConverterInt64.write(value.cloudMedia, into: &buf)
+        FfiConverterInt64.write(value.messageBackup, into: &buf)
+        FfiConverterInt64.write(value.myCloud, into: &buf)
+        FfiConverterOptionInt64.write(value.expireAtMs, into: &buf)
+        FfiConverterOptionBool.write(value.autoRenew, into: &buf)
+        FfiConverterInt64.write(value.months, into: &buf)
+        FfiConverterBool.write(value.hasKey, into: &buf)
+        FfiConverterBool.write(value.backupMedia, into: &buf)
+        FfiConverterBool.write(value.backupMyCloud, into: &buf)
+        FfiConverterBool.write(value.backupMessages, into: &buf)
+        FfiConverterInt64.write(value.fileLimit, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudPlanRecord_lift(_ buf: RustBuffer) throws -> CloudPlanRecord {
+    return try FfiConverterTypeCloudPlanRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudPlanRecord_lower(_ value: CloudPlanRecord) -> RustBuffer {
+    return FfiConverterTypeCloudPlanRecord.lower(value)
+}
+
+
+/**
+ * Auto-offload settings in zCloud (U11).
+ */
+public struct CloudSettingsRecord: Equatable, Hashable {
+    public var offloadEnabled: Bool
+    public var offloadAvailable: Bool
+    public var lastOffloadAtMs: Int64?
+    public var lastOffloadSize: Int64
+    public var ttlDays: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(offloadEnabled: Bool, offloadAvailable: Bool, lastOffloadAtMs: Int64?, lastOffloadSize: Int64, ttlDays: Int64) {
+        self.offloadEnabled = offloadEnabled
+        self.offloadAvailable = offloadAvailable
+        self.lastOffloadAtMs = lastOffloadAtMs
+        self.lastOffloadSize = lastOffloadSize
+        self.ttlDays = ttlDays
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CloudSettingsRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCloudSettingsRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CloudSettingsRecord {
+        return
+            try CloudSettingsRecord(
+                offloadEnabled: FfiConverterBool.read(from: &buf), 
+                offloadAvailable: FfiConverterBool.read(from: &buf), 
+                lastOffloadAtMs: FfiConverterOptionInt64.read(from: &buf), 
+                lastOffloadSize: FfiConverterInt64.read(from: &buf), 
+                ttlDays: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CloudSettingsRecord, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.offloadEnabled, into: &buf)
+        FfiConverterBool.write(value.offloadAvailable, into: &buf)
+        FfiConverterOptionInt64.write(value.lastOffloadAtMs, into: &buf)
+        FfiConverterInt64.write(value.lastOffloadSize, into: &buf)
+        FfiConverterInt64.write(value.ttlDays, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudSettingsRecord_lift(_ buf: RustBuffer) throws -> CloudSettingsRecord {
+    return try FfiConverterTypeCloudSettingsRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudSettingsRecord_lower(_ value: CloudSettingsRecord) -> RustBuffer {
+    return FfiConverterTypeCloudSettingsRecord.lower(value)
+}
+
+
+/**
+ * Observable zCloud state published to Swift UI mirror (U11); `Debug` is shape-only (ADR-008).
+ */
+public struct CloudStateRecord: Equatable, Hashable {
+    public var plan: CloudPlanRecord?
+    public var media: CloudBreakdownRecord
+    public var myCloudTypes: CloudBreakdownRecord
+    public var conversations: [CloudConversationRecord]
+    public var settings: CloudSettingsRecord
+    public var changed: Int64
+    public var loaded: Bool
+    public var hiddenLookup: Bool
+    public var selfId: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(plan: CloudPlanRecord?, media: CloudBreakdownRecord, myCloudTypes: CloudBreakdownRecord, conversations: [CloudConversationRecord], settings: CloudSettingsRecord, changed: Int64, loaded: Bool, hiddenLookup: Bool, selfId: String?) {
+        self.plan = plan
+        self.media = media
+        self.myCloudTypes = myCloudTypes
+        self.conversations = conversations
+        self.settings = settings
+        self.changed = changed
+        self.loaded = loaded
+        self.hiddenLookup = hiddenLookup
+        self.selfId = selfId
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CloudStateRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCloudStateRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CloudStateRecord {
+        return
+            try CloudStateRecord(
+                plan: FfiConverterOptionTypeCloudPlanRecord.read(from: &buf), 
+                media: FfiConverterTypeCloudBreakdownRecord.read(from: &buf), 
+                myCloudTypes: FfiConverterTypeCloudBreakdownRecord.read(from: &buf), 
+                conversations: FfiConverterSequenceTypeCloudConversationRecord.read(from: &buf), 
+                settings: FfiConverterTypeCloudSettingsRecord.read(from: &buf), 
+                changed: FfiConverterInt64.read(from: &buf), 
+                loaded: FfiConverterBool.read(from: &buf), 
+                hiddenLookup: FfiConverterBool.read(from: &buf), 
+                selfId: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CloudStateRecord, into buf: inout [UInt8]) {
+        FfiConverterOptionTypeCloudPlanRecord.write(value.plan, into: &buf)
+        FfiConverterTypeCloudBreakdownRecord.write(value.media, into: &buf)
+        FfiConverterTypeCloudBreakdownRecord.write(value.myCloudTypes, into: &buf)
+        FfiConverterSequenceTypeCloudConversationRecord.write(value.conversations, into: &buf)
+        FfiConverterTypeCloudSettingsRecord.write(value.settings, into: &buf)
+        FfiConverterInt64.write(value.changed, into: &buf)
+        FfiConverterBool.write(value.loaded, into: &buf)
+        FfiConverterBool.write(value.hiddenLookup, into: &buf)
+        FfiConverterOptionString.write(value.selfId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudStateRecord_lift(_ buf: RustBuffer) throws -> CloudStateRecord {
+    return try FfiConverterTypeCloudStateRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudStateRecord_lower(_ value: CloudStateRecord) -> RustBuffer {
+    return FfiConverterTypeCloudStateRecord.lower(value)
+}
+
+
 public struct ComposerConfirmRecord: Equatable, Hashable {
     public var id: String
     public var convId: String
@@ -14262,13 +15121,14 @@ public struct CoreChangesRecord: Equatable, Hashable {
     public var cachedProfiles: [CachedProfileEntry]?
     public var cachedGroups: [CachedGroupEntry]?
     public var polls: PollsMirrorRecord?
+    public var cloud: CloudStateRecord?
     public var stickerSuggest: StickerSuggestUpdateRecord?
     public var composerConfirm: ComposerConfirmUpdateRecord?
     public var queuedComposerConfirms: [ComposerConfirmRecord]?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, typing: [TypingEntryRecord]?, forwardRequest: ForwardRequestUpdateRecord?, clearSelection: Bool, deleteUndo: DeleteUndoUpdateRecord?, messageConfirm: MessageConfirmUpdateRecord?, autoDelete: AutoDeleteUpdateRecord?, starredIds: [String]?, cachedProfiles: [CachedProfileEntry]?, cachedGroups: [CachedGroupEntry]? = nil, polls: PollsMirrorRecord? = nil, stickerSuggest: StickerSuggestUpdateRecord?, composerConfirm: ComposerConfirmUpdateRecord?, queuedComposerConfirms: [ComposerConfirmRecord]?) {
+    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, typing: [TypingEntryRecord]?, forwardRequest: ForwardRequestUpdateRecord?, clearSelection: Bool, deleteUndo: DeleteUndoUpdateRecord?, messageConfirm: MessageConfirmUpdateRecord?, autoDelete: AutoDeleteUpdateRecord?, starredIds: [String]?, cachedProfiles: [CachedProfileEntry]?, cachedGroups: [CachedGroupEntry]? = nil, polls: PollsMirrorRecord? = nil, cloud: CloudStateRecord? = nil, stickerSuggest: StickerSuggestUpdateRecord?, composerConfirm: ComposerConfirmUpdateRecord?, queuedComposerConfirms: [ComposerConfirmRecord]?) {
         self.version = version
         self.session = session
         self.conversations = conversations
@@ -14290,6 +15150,7 @@ public struct CoreChangesRecord: Equatable, Hashable {
         self.cachedProfiles = cachedProfiles
         self.cachedGroups = cachedGroups
         self.polls = polls
+        self.cloud = cloud
         self.stickerSuggest = stickerSuggest
         self.composerConfirm = composerConfirm
         self.queuedComposerConfirms = queuedComposerConfirms
@@ -14332,6 +15193,7 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
                 cachedProfiles: FfiConverterOptionSequenceTypeCachedProfileEntry.read(from: &buf), 
                 cachedGroups: FfiConverterOptionSequenceTypeCachedGroupEntry.read(from: &buf), 
                 polls: FfiConverterOptionTypePollsMirrorRecord.read(from: &buf), 
+                cloud: FfiConverterOptionTypeCloudStateRecord.read(from: &buf), 
                 stickerSuggest: FfiConverterOptionTypeStickerSuggestUpdateRecord.read(from: &buf), 
                 composerConfirm: FfiConverterOptionTypeComposerConfirmUpdateRecord.read(from: &buf), 
                 queuedComposerConfirms: FfiConverterOptionSequenceTypeComposerConfirmRecord.read(from: &buf)
@@ -14360,6 +15222,7 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
         FfiConverterOptionSequenceTypeCachedProfileEntry.write(value.cachedProfiles, into: &buf)
         FfiConverterOptionSequenceTypeCachedGroupEntry.write(value.cachedGroups, into: &buf)
         FfiConverterOptionTypePollsMirrorRecord.write(value.polls, into: &buf)
+        FfiConverterOptionTypeCloudStateRecord.write(value.cloud, into: &buf)
         FfiConverterOptionTypeStickerSuggestUpdateRecord.write(value.stickerSuggest, into: &buf)
         FfiConverterOptionTypeComposerConfirmUpdateRecord.write(value.composerConfirm, into: &buf)
         FfiConverterOptionSequenceTypeComposerConfirmRecord.write(value.queuedComposerConfirms, into: &buf)
@@ -22745,6 +23608,261 @@ public func FfiConverterTypeCardActionOutcomeRecord_lower(_ value: CardActionOut
 
 
 
+/**
+ * Outcome of [`CoreEngine::cloud_fetch`] (U11).
+ */
+
+public enum CloudFetchRecord: Equatable, Hashable {
+    
+    case ready(file: CloudFileRecord
+    )
+    case expired
+    case failed(message: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension CloudFetchRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCloudFetchRecord: FfiConverterRustBuffer {
+    typealias SwiftType = CloudFetchRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CloudFetchRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .ready(file: try FfiConverterTypeCloudFileRecord.read(from: &buf)
+        )
+        
+        case 2: return .expired
+        
+        case 3: return .failed(message: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CloudFetchRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .ready(file):
+            writeInt(&buf, Int32(1))
+            FfiConverterTypeCloudFileRecord.write(file, into: &buf)
+            
+        
+        case .expired:
+            writeInt(&buf, Int32(2))
+        
+        
+        case let .failed(message):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(message, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudFetchRecord_lift(_ buf: RustBuffer) throws -> CloudFetchRecord {
+    return try FfiConverterTypeCloudFetchRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudFetchRecord_lower(_ value: CloudFetchRecord) -> RustBuffer {
+    return FfiConverterTypeCloudFetchRecord.lower(value)
+}
+
+
+
+/**
+ * Media category in zCloud (U11).
+ */
+
+public enum CloudItemKindRecord: Equatable, Hashable {
+    
+    case photo
+    case video
+    case file
+    case voice
+    case other
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension CloudItemKindRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCloudItemKindRecord: FfiConverterRustBuffer {
+    typealias SwiftType = CloudItemKindRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CloudItemKindRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .photo
+        
+        case 2: return .video
+        
+        case 3: return .file
+        
+        case 4: return .voice
+        
+        case 5: return .other
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CloudItemKindRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .photo:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .video:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .file:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .voice:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .other:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudItemKindRecord_lift(_ buf: RustBuffer) throws -> CloudItemKindRecord {
+    return try FfiConverterTypeCloudItemKindRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudItemKindRecord_lower(_ value: CloudItemKindRecord) -> RustBuffer {
+    return FfiConverterTypeCloudItemKindRecord.lower(value)
+}
+
+
+
+/**
+ * Subscription plan kind for zCloud (U11).
+ */
+
+public enum CloudPlanKindRecord: Equatable, Hashable {
+    
+    case paid
+    case free
+    case grace
+    case afterGrace
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension CloudPlanKindRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCloudPlanKindRecord: FfiConverterRustBuffer {
+    typealias SwiftType = CloudPlanKindRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CloudPlanKindRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .paid
+        
+        case 2: return .free
+        
+        case 3: return .grace
+        
+        case 4: return .afterGrace
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CloudPlanKindRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .paid:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .free:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .grace:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .afterGrace:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudPlanKindRecord_lift(_ buf: RustBuffer) throws -> CloudPlanKindRecord {
+    return try FfiConverterTypeCloudPlanKindRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloudPlanKindRecord_lower(_ value: CloudPlanKindRecord) -> RustBuffer {
+    return FfiConverterTypeCloudPlanKindRecord.lower(value)
+}
+
+
+
 
 public enum ComposerOutcomeRecord: Equatable, Hashable {
     
@@ -23959,7 +25077,7 @@ public func FfiConverterTypeFailReasonRecord_lower(_ value: FailReasonRecord) ->
 
 
 /**
- * Host return value for `resolve_file` (U8).
+ * Host return value for `resolve_file` (U8/U11).
  */
 
 public enum FileResolutionRecord: Equatable, Hashable {
@@ -26717,6 +27835,54 @@ fileprivate struct FfiConverterOptionTypeBoardPinListRecord: FfiConverterRustBuf
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeCloudPlanRecord: FfiConverterRustBuffer {
+    typealias SwiftType = CloudPlanRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCloudPlanRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCloudPlanRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeCloudStateRecord: FfiConverterRustBuffer {
+    typealias SwiftType = CloudStateRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCloudStateRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCloudStateRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeComposerConfirmRecord: FfiConverterRustBuffer {
     typealias SwiftType = ComposerConfirmRecord?
 
@@ -27677,6 +28843,30 @@ fileprivate struct FfiConverterOptionTypeTypedEnvelope: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeCloudItemKindRecord: FfiConverterRustBuffer {
+    typealias SwiftType = CloudItemKindRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCloudItemKindRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCloudItemKindRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeConversationPromptRecord: FfiConverterRustBuffer {
     typealias SwiftType = ConversationPromptRecord?
 
@@ -28278,6 +29468,56 @@ fileprivate struct FfiConverterSequenceTypeChatMessageRecord: FfiConverterRustBu
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeChatMessageRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCloudConversationRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [CloudConversationRecord]
+
+    public static func write(_ value: [CloudConversationRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCloudConversationRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CloudConversationRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CloudConversationRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCloudConversationRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCloudItemRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [CloudItemRecord]
+
+    public static func write(_ value: [CloudItemRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCloudItemRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CloudItemRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CloudItemRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCloudItemRecord.read(from: &buf))
         }
         return seq
     }
@@ -30561,6 +31801,21 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_close_conversation() != 59647) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_cloud_delete() != 46259) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_cloud_fetch() != 11298) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_cloud_list() != 22831) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_cloud_set_offload() != 55832) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_cloud_thumbnail() != 38133) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_composer_report() != 54178) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -30744,6 +31999,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_record_seen_reaction_keys() != 29165) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_refresh_cloud_async() != 58373) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_refresh_mention_previews() != 8415) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -30784,6 +32042,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_request_pin_board() != 46027) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_reset_cloud() != 36306) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_reset_composer() != 43900) {

@@ -323,7 +323,6 @@ Consequences:
     - `remote-react-burst-batch` (`n=200`): `main` **250.22 ms** (`1.251 ms/ev`) -> U6 **64.28 ms** (`0.321 ms/ev`, −74.3%, 3.89x).
     - U6 beats baseline on every metric on all 5 pairs.
 
-
 ## ADR-023: Forward domain in `olaz-core` and contact-card endpoint in `olaz-api` (U8)
 Status: accepted (2026-11-26)
 Context: After U5 moved text/E2EE send orchestration into `olaz-core`, message forwarding (`requestForward`, `forwardSelection`, `forward`, `forwardAll`, and `sendContactCardAPI`) still lived in Swift (`ZaloEngine+MessageActions.swift`, `ZaloEngine+Selection.swift`, `ZaloAPIService.swift`). Multi-message selection state (`messageSelection`, `beginSelection`, `toggleSelection`, `endSelection`) belongs to U6 and is actively being ported on a parallel branch; media resolution and media/file upload remain Swift-owned until U15/U13.
@@ -378,6 +377,24 @@ Consequences:
   - `searchMessages[ascii]` (median of 5): `main` p50=**36.623 ms** / p95=**37.527 ms** -> U14 p50=**31.757 ms** (−13.3%) / p95=**32.355 ms** (−13.8%)
   - `searchMessages[unicode]` (median of 5): `main` p50=**36.366 ms** / p95=**37.315 ms** -> U14 p50=**34.104 ms** (−6.2%) / p95=**34.655 ms** (−7.1%) — faster even while upgrading SQLite from ASCII `LIKE` to full Unicode NFC/case folding and Fix 2 field inspection
   - `ensureMessageLoaded[cold-600]` (median of 5): `main` p50=**11.434 ms** / p95=**11.668 ms** -> U14 p50=**9.210 ms** (−19.5%) / p95=**9.405 ms** (−19.4%) — faster on 5/5 pairs
+
+## ADR-026: U11 zCloud domain in `olaz-core` (2026-11-26)
+
+- **Context**: `ZaloEngine+Cloud.swift` and `ZaloAPIService+Cloud.swift` previously owned zCloud quota/settings API fetching, `cloud-viewer-key` caching, SQLite + unsynced in-memory storage aggregation, sorted/paginated item listing, thumbnail/file download dispatch, item deletion, and offload/reset state in Swift.
+- **Decision**:
+  - Port zCloud API endpoints (`fetch_cloud_server_snapshot` over `zcloud` `/v2/storage/quota`, `/v2/cloud-settings/all`, `/v2/backup/key/get-meta`, `/v2/storage/my-cloud/meta`, plus viewer-key acquisition/caching on `SessionClient` cleared on logout and `reset_cloud`) into `olaz-api/src/cloud.rs` and `olaz-net`.
+  - Port zCloud state (`CloudState`, `CloudSnapshotState`), pure snapshot aggregation/merge/sorting (`olaz-core/src/cloud.rs`), and reducer (`olaz-core/src/reduce/cloud.rs`) into `olaz-core`, publishing `DirtyKey::Cloud` (`CoreChanges.cloud`) to Swift.
+  - Reuse U6's remote-delete pipeline (`HostCall::ApplyRemoteDelete` + `StoreOp::DeleteMessageAndCheckLatest` with optional `cloud_delete_op_id` completion hook) for `Command::CloudDelete` so deleting zCloud items removes them from memory, SQLite, and conversation previews before refreshing the cloud snapshot.
+  - Reuse the U8-aligned host callbacks `Host::resolve_media` (`MediaResolutionRecord`) and `Host::resolve_file` (`FileResolutionRecord`) for `Command::CloudThumbnail` and `Command::CloudFetch`, keeping disk cache / media resolution on the Swift host until media resolution moves to Rust.
+  - Preserve legacy Swift fallback in `ZaloEngine+Cloud.swift` only when `coreLifecycle.core == nil` (for standalone non-booted unit tests such as `Stage4FeaturesTests`), while all live and recorder flows delegate to `CoreEngine`.
+  - Apply the 4 user-approved fixes (`user-decisions` item 12.1–12.4):
+    1. Equal-total conversations in `apply_cloud_snapshot` tie-break by `name` (then `id`) (`cloud::tests::equal_totals_tie_break_by_name_item_12_1`).
+    2. `olaz-store::Store::cloud_media_aggregation` selects raw `c.is_group` (removing `COALESCE(c.is_group, 0)`) so groups without a `conversations` row resolve via `is_group_id` and display `"Nhóm"` (2 `known-diffs` in `aggregation` + `olaz-store` unit test `cloud_media_aggregation_null_is_group_falls_back_to_is_group_id`).
+    3. `cloudDelete` sends the message's `client_id` as `cli_msg_id` and, on API error, keeps the item locally and surfaces the error in `CloudActionResult` instead of deleting locally (62 `known-diffs` in `delete`).
+    4. `cloudFetch` falls back to per-kind message sizes (`ESTIMATED_PHOTO_BYTES`, `ESTIMATED_VIDEO_BYTES`, `ESTIMATED_VOICE_BYTES`) when the resolved local file is missing on disk (3 `known-diffs` in `fetch_and_thumbnail`).
+- **Verification**:
+  - `cargo test -p olaz-core --test cases -- cloud`: 8/8 cases match (`aggregation`, `delete`, `fetch_and_thumbnail`, `list_memory_merge`, `list_store_only`, `offload_and_reset`, `refresh_server_snapshot`, `refresh_signed_out_and_no_store`) with 67 approved `known-diffs.jsonl` entries (`user-decisions` item 12.2–12.4) and 0 unexpected diffs.
+  - `olaz-core` unit tests (including `equal_totals_tie_break_by_name_item_12_1`) + `olaz-store` unit tests (including `cloud_media_aggregation_null_is_group_falls_back_to_is_group_id`) + `olaz-api` cloud parser tests + `olaz-ffi` tests + `scripts/gate-core.sh all` (including `CloudRecorderTests` with `OLAZ_SLOW_CASES=1`).
 
 ## ADR-027: Stickers & composer side actions domain in `olaz-core` (U13)
 Status: accepted (2026-11-26)
