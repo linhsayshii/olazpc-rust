@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 /// Stages dragged attachments (Finder files, macOS floating screenshot/screen-recording thumbnails,
 /// file promises, and raw image drags) into Olaz-owned temporary files synchronously inside each
 /// `NSItemProvider` completion callback so ephemeral system temp files never vanish before upload.
+/// Regular Finder files outside temp locations pass through untouched with no copy.
 enum ChatDropLoader {
     /// Content types accepted by `ChatView.onDrop`.
     /// - `.fileURL`: Finder files of any kind (images, videos, documents, folders).
@@ -14,10 +15,13 @@ enum ChatDropLoader {
     ///   never trigger the attachment drop overlay.
     static let supportedTypes: [UTType] = [.fileURL, .image, .movie, .pdf]
 
+    /// Maximum age for staged directories left behind by `.pending` uploads before being swept.
+    static let stagingRetentionInterval: TimeInterval = 24 * 60 * 60
+
     struct StagedFile: Equatable, Sendable {
         let url: URL
-        /// Olaz-owned staging subdirectory holding `url`; nil for pass-through items (e.g. directories)
-        /// that must never be deleted on cleanup.
+        /// Olaz-owned staging subdirectory holding `url`; nil for pass-through items (non-temp Finder files
+        /// and directories) that must never be deleted on cleanup.
         let ownedDirectory: URL?
 
         var isMedia: Bool { ChatDropLoader.isMediaURL(url) }
@@ -38,14 +42,59 @@ enum ChatDropLoader {
         return ZaloEngine.isVideoURL(url)
     }
 
+    /// True when `url` resides inside a system temp directory where drag sources (such as floating
+    /// screenshot thumbnails or promised files) may delete the file before an upload finishes.
+    nonisolated static func isEphemeralLocation(_ url: URL) -> Bool {
+        guard url.isFileURL else { return false }
+        let resolved = url.resolvingSymlinksInPath().standardizedFileURL.path
+        let roots = [
+            FileManager.default.temporaryDirectory,
+            URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true),
+            URL(fileURLWithPath: "/private/var/folders", isDirectory: true),
+            URL(fileURLWithPath: "/var/folders", isDirectory: true),
+        ].map { $0.resolvingSymlinksInPath().standardizedFileURL.path }
+
+        return roots.contains { root in
+            let prefix = root.hasSuffix("/") ? root : root + "/"
+            return resolved == root || resolved.hasPrefix(prefix)
+        }
+    }
+
     nonisolated static func cleanup(_ files: [StagedFile]) {
         for dir in Set(files.compactMap(\.ownedDirectory)) {
             try? FileManager.default.removeItem(at: dir)
         }
     }
 
+    /// Best-effort cleanup of stale staging subdirectories (e.g. left by `.pending` sends) older than `maxAge`.
+    nonisolated static func sweepExpiredStaging(
+        in stagingRoot: URL = defaultStagingRoot,
+        maxAge: TimeInterval = stagingRetentionInterval,
+        now: Date = .now
+    ) {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(
+            at: stagingRoot,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+        let cutoff = now.addingTimeInterval(-maxAge)
+        for entry in entries {
+            guard let values = try? entry.resourceValues(forKeys: [.contentModificationDateKey, .isDirectoryKey]),
+                  values.isDirectory == true,
+                  let modified = values.contentModificationDate,
+                  modified < cutoff else {
+                continue
+            }
+            try? fm.removeItem(at: entry)
+        }
+    }
+
     @MainActor
     static func stage(_ providers: [NSItemProvider], stagingRoot: URL = defaultStagingRoot) async -> [StagedFile] {
+        sweepExpiredStaging(in: stagingRoot)
         var staged: [StagedFile] = []
         for provider in providers {
             if let file = await stageOne(provider, stagingRoot: stagingRoot) {
@@ -59,8 +108,8 @@ enum ChatDropLoader {
     private static func stageOne(_ provider: NSItemProvider, stagingRoot: URL) async -> StagedFile? {
         let suggestedName = provider.suggestedName
 
-        // 1. Regular file URLs (Finder drops and file-backed drags). Copy synchronously inside the callback
-        //    so ephemeral temp URLs survive after the drag source dismisses.
+        // 1. Regular file URLs (Finder drops and file-backed drags). Non-temp Finder files pass through untouched
+        //    (no copy); only URLs under temp locations are copied synchronously inside the callback.
         if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
             if let file = await loadFromFileURL(provider, suggestedName: suggestedName, stagingRoot: stagingRoot) {
                 return file
@@ -91,6 +140,10 @@ enum ChatDropLoader {
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
                 guard let url = Self.extractFileURL(from: item) else {
                     continuation.resume(returning: nil)
+                    return
+                }
+                guard Self.isEphemeralLocation(url) else {
+                    continuation.resume(returning: StagedFile(url: url, ownedDirectory: nil))
                     return
                 }
                 let staged = Self.stageFileOnDisk(

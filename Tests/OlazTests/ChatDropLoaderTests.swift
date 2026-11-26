@@ -12,6 +12,13 @@ import UniformTypeIdentifiers
         return dir
     }
 
+    private func makeNonTempDirectory() throws -> URL {
+        let caches = try #require(FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first)
+        let dir = caches.appendingPathComponent("olaz-drop-nontemp-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
     private func sampleBitmap() throws -> NSBitmapImageRep {
         let rep = try #require(NSBitmapImageRep(
             bitmapDataPlanes: nil,
@@ -68,23 +75,25 @@ import UniformTypeIdentifiers
         #expect(!ChatDropLoader.canAccept(textProvider))
     }
 
-    // MARK: - Finder fileURL drops (preserves media vs file split)
+    // MARK: - Finder fileURL drops (no-copy pass-through outside temp, staged inside temp)
 
-    @Test func finderDropsStageAndPreserveMediaVsFileSplit() async throws {
+    @Test func nonTempFinderFilesPassThroughWithoutCopyAndPreserveMediaSplit() async throws {
         let stagingRoot = try makeStagingRoot()
-        let sourceDir = try makeStagingRoot()
+        let finderDir = try makeNonTempDirectory()
         defer {
             try? FileManager.default.removeItem(at: stagingRoot)
-            try? FileManager.default.removeItem(at: sourceDir)
+            try? FileManager.default.removeItem(at: finderDir)
         }
+
+        #expect(!ChatDropLoader.isEphemeralLocation(finderDir))
 
         let pngData = try samplePNG()
         let mp4Data = Data("fake-mp4-bytes".utf8)
         let pdfData = Data("%PDF-1.4\nbody".utf8)
 
-        let pngURL = sourceDir.appendingPathComponent("photo.png")
-        let mp4URL = sourceDir.appendingPathComponent("clip.mp4")
-        let pdfURL = sourceDir.appendingPathComponent("report.pdf")
+        let pngURL = finderDir.appendingPathComponent("photo.png")
+        let mp4URL = finderDir.appendingPathComponent("clip.mp4")
+        let pdfURL = finderDir.appendingPathComponent("report.pdf")
         try pngData.write(to: pngURL)
         try mp4Data.write(to: mp4URL)
         try pdfData.write(to: pdfURL)
@@ -93,26 +102,19 @@ import UniformTypeIdentifiers
         let staged = await ChatDropLoader.stage(providers, stagingRoot: stagingRoot)
 
         #expect(staged.count == 3)
+        #expect(staged[0] == ChatDropLoader.StagedFile(url: pngURL, ownedDirectory: nil))
         #expect(staged[0].isMedia)
-        #expect(staged[0].url.lastPathComponent == "photo.png")
-        #expect(try Data(contentsOf: staged[0].url) == pngData)
+        #expect(staged[1] == ChatDropLoader.StagedFile(url: mp4URL, ownedDirectory: nil))
         #expect(staged[1].isMedia)
-        #expect(staged[1].url.lastPathComponent == "clip.mp4")
-        #expect(try Data(contentsOf: staged[1].url) == mp4Data)
+        #expect(staged[2] == ChatDropLoader.StagedFile(url: pdfURL, ownedDirectory: nil))
         #expect(!staged[2].isMedia)
-        #expect(staged[2].url.lastPathComponent == "report.pdf")
-        #expect(try Data(contentsOf: staged[2].url) == pdfData)
 
-        for file in staged {
-            #expect(file.ownedDirectory != nil)
-            #expect(file.url.path.hasPrefix(stagingRoot.path))
-        }
+        // Nothing should have been copied into stagingRoot.
+        let stagingContents = try FileManager.default.contentsOfDirectory(atPath: stagingRoot.path)
+        #expect(stagingContents.isEmpty)
 
+        // Cleanup leaves original Finder files untouched.
         ChatDropLoader.cleanup(staged)
-        for file in staged {
-            #expect(!FileManager.default.fileExists(atPath: file.url.path))
-        }
-        // Source Finder files are untouched.
         #expect(FileManager.default.fileExists(atPath: pngURL.path))
         #expect(FileManager.default.fileExists(atPath: mp4URL.path))
         #expect(FileManager.default.fileExists(atPath: pdfURL.path))
@@ -138,7 +140,7 @@ import UniformTypeIdentifiers
         #expect(FileManager.default.fileExists(atPath: folder.path))
     }
 
-    // MARK: - Ephemeral file representation (macOS floating screenshot thumbnail / NSFilePromiseProvider)
+    // MARK: - Ephemeral temp files & file representations (macOS floating screenshot thumbnail / NSFilePromiseProvider)
 
     @Test func ephemeralFileRepresentationSurvivesDeletionWhenCallbackReturns() async throws {
         let stagingRoot = try makeStagingRoot()
@@ -171,6 +173,7 @@ import UniformTypeIdentifiers
         #expect(!FileManager.default.fileExists(atPath: ephemeralFile.path))
         let file = try #require(staged.first)
         #expect(file.isMedia)
+        #expect(file.ownedDirectory != nil)
         #expect(file.url.pathExtension.lowercased() == "png")
         #expect(FileManager.default.fileExists(atPath: file.url.path))
         #expect(try Data(contentsOf: file.url) == pngData)
@@ -179,7 +182,7 @@ import UniformTypeIdentifiers
         #expect(!FileManager.default.fileExists(atPath: file.url.path))
     }
 
-    @Test func stagedFileURLCopySurvivesSourceDeletionAfterDrop() async throws {
+    @Test func tempFileURLIsStagedAndSurvivesSourceDeletionAfterDrop() async throws {
         let stagingRoot = try makeStagingRoot()
         let ephemeralDir = try makeStagingRoot()
         defer {
@@ -191,6 +194,8 @@ import UniformTypeIdentifiers
         let transientFile = ephemeralDir.appendingPathComponent("transient-shot.png")
         try pngData.write(to: transientFile)
 
+        #expect(ChatDropLoader.isEphemeralLocation(transientFile))
+
         let provider = NSItemProvider(object: transientFile as NSURL)
         let staged = await ChatDropLoader.stage([provider], stagingRoot: stagingRoot)
 
@@ -200,12 +205,36 @@ import UniformTypeIdentifiers
 
         let file = try #require(staged.first)
         #expect(file.isMedia)
+        #expect(file.ownedDirectory != nil)
+        #expect(file.url.path.hasPrefix(stagingRoot.path))
         #expect(file.url.lastPathComponent == "transient-shot.png")
         #expect(FileManager.default.fileExists(atPath: file.url.path))
         #expect(try Data(contentsOf: file.url) == pngData)
 
         ChatDropLoader.cleanup(staged)
         #expect(!FileManager.default.fileExists(atPath: file.url.path))
+    }
+
+    // MARK: - Stale staging sweep
+
+    @Test func stageSweepsBackdatedStagingDirectoriesOlderThan24Hours() async throws {
+        let stagingRoot = try makeStagingRoot()
+        defer { try? FileManager.default.removeItem(at: stagingRoot) }
+
+        let staleDir = stagingRoot.appendingPathComponent("stale-\(UUID().uuidString)", isDirectory: true)
+        let freshDir = stagingRoot.appendingPathComponent("fresh-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: staleDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: freshDir, withIntermediateDirectories: true)
+        try Data("old".utf8).write(to: staleDir.appendingPathComponent("shot.png"))
+        try Data("new".utf8).write(to: freshDir.appendingPathComponent("shot.png"))
+
+        let twentyFiveHoursAgo = Date().addingTimeInterval(-25 * 60 * 60)
+        try FileManager.default.setAttributes([.modificationDate: twentyFiveHoursAgo], ofItemAtPath: staleDir.path)
+
+        _ = await ChatDropLoader.stage([], stagingRoot: stagingRoot)
+
+        #expect(!FileManager.default.fileExists(atPath: staleDir.path))
+        #expect(FileManager.default.fileExists(atPath: freshDir.path))
     }
 
     // MARK: - In-memory image & movie drags
