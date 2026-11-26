@@ -116,10 +116,18 @@ extension ZaloEngine {
         if cachedGroupDetails[cleanGrid] == nil,
            let gBox = try? await sessionClient.fetchGroupsList(),
            let infoMap = gBox.dict["gridInfoMap"] as? [String: Any] {
+            var nextDetails = cachedGroupDetails
+            var detailsChanged = false
             for (rawId, rawInfo) in infoMap {
                 guard let info = rawInfo as? [String: Any] else { continue }
                 let cid = ZaloWireParser.cleanGroupId(rawId)
-                if !cid.isEmpty { cachedGroupDetails[cid] = info }
+                if !cid.isEmpty {
+                    nextDetails[cid] = info
+                    detailsChanged = true
+                }
+            }
+            if detailsChanged {
+                cachedGroupDetails = nextDetails
             }
         }
 
@@ -147,13 +155,17 @@ extension ZaloEngine {
             for offset in stride(from: 0, to: min(missing.count, 100), by: 50) {
                 let slice = Array(missing[offset..<min(offset + 50, missing.count)])
                 if let profBox = try? await sessionClient.fetchProfiles(uids: slice) {
+                    var nextProfiles = cachedProfiles
                     for (uid, row) in ZaloWireParser.extractProfilesMap(profBox.dict) {
                         let c = ZaloWireParser.stripUserPrefix(uid)
                         let n = ZaloWireParser.preferredName(row)
                         let a = JSONLossless.string(row["avatar"] ?? row["avt"])
                         if !c.isEmpty, (!n.isEmpty || !a.isEmpty) {
-                            cachedProfiles[c] = ZaloWebKitMigrator.CachedProfile(name: n, avatar: a)
+                            nextProfiles[c] = ZaloWebKitMigrator.CachedProfile(name: n, avatar: a)
                         }
+                    }
+                    if nextProfiles != cachedProfiles {
+                        cachedProfiles = nextProfiles
                     }
                 }
             }
