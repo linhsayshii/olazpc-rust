@@ -44,17 +44,23 @@ extension ZaloEngine {
         }
     }
 
+    /// Ids of messages deleted "for me" in `convId` whose undo bar has not committed yet: they stay in SQLite until the
+    /// commit, so search and the load-around window must skip them. With the core, the batch is in
+    /// `lastOptimisticDeletedMessages` (U6); without it, in `pendingDeletedMessages`.
+    // U14: read the pending delete from core state once search moves into olaz-core.
+    private func pendingDeletedIds(in convId: String) -> Set<String> {
+        var ids = Set(pendingDeletedMessages.values.joined().filter { $0.conversationId == convId }.map(\.id))
+        ids.formUnion((lastOptimisticDeletedMessages[convId] ?? []).map(\.id))
+        return ids
+    }
+
     /// Searches in-memory messages and SQLite history for `convId`, deduplicated by message/client ID and ordered newest-first.
     func searchMessages(in convId: String, query: String, limit: Int = 50) async -> [ChatMessage] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !convId.isEmpty, !trimmed.isEmpty, limit > 0 else { return [] }
         let clampedLimit = max(1, min(limit, 500))
 
-        let pendingDeletedIds = Set(
-            pendingDeletedMessages.values.joined()
-                .filter { $0.conversationId == convId }
-                .map(\.id)
-        )
+        let pendingDeletedIds = pendingDeletedIds(in: convId)
         let inMemory = messages[convId] ?? []
         var memoryById: [String: ChatMessage] = [:]
         memoryById.reserveCapacity(inMemory.count)
@@ -122,11 +128,7 @@ extension ZaloEngine {
                targetTsMs: targetTsMs,
                beforeOldestTsMs: oldestTsMs
            ) {
-            let pendingDeletedIds = Set(
-                pendingDeletedMessages.values.joined()
-                    .filter { $0.conversationId == convId }
-                    .map(\.id)
-            )
+            let pendingDeletedIds = pendingDeletedIds(in: convId)
             mergeMessagesIntoMemory(
                 window.rows
                     .filter { !pendingDeletedIds.contains($0.rowId) }

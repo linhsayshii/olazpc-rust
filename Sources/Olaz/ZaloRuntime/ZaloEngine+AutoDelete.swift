@@ -8,6 +8,12 @@ extension ZaloEngine {
     }
 
     func loadAutoDelete() async {
+        if let core = coreLifecycle.core {
+            if let v = try? await core.loadAutoDelete() {
+                await waitForMirrorVersion(v)
+            }
+            return
+        }
         guard let map = try? await sessionClient.fetchAutoDeleteAPI() else {
             if autoDelete == nil { autoDelete = [:] }
             return
@@ -18,6 +24,12 @@ extension ZaloEngine {
     /// "Cài đặt tin nhắn tự xóa": sets it on the server, then the official info line ("Bạn đã đặt thời gian tự xóa…").
     func setAutoDelete(_ convId: String, ttl: Int64) async {
         guard !convId.isEmpty, autoDeleteTTL(convId) != ttl else { return }
+        if let core = coreLifecycle.core {
+            if let v = try? await core.setAutoDelete(convId: convId, ttl: ttl, nowMs: nowMs()) {
+                await waitForMirrorVersion(v)
+            }
+            return
+        }
         do {
             try await sessionClient.updateAutoDeleteAPI(convId: convId, ttl: ttl)
         } catch {
@@ -48,7 +60,19 @@ extension ZaloEngine {
     @discardableResult
     func pruneExpiredMessages(in convId: String, now: Date? = nil) -> Date? {
         guard let list = messages[convId], list.contains(where: { $0.ttlMs > 0 }) else { return nil }
-        let effectiveNow = now ?? Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
+        let effectiveNowMs = now.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) } ?? nowMs()
+        let effectiveNow = Date(timeIntervalSince1970: Double(effectiveNowMs) / 1000.0)
+        if let core = coreLifecycle.core {
+            let expired = list.filter { ($0.expiresAt ?? .distantFuture) <= effectiveNow }
+            if !expired.isEmpty {
+                let ids = Set(expired.map(\.id))
+                isSuppressingDirectMessageSync = true
+                messages[convId] = list.filter { !ids.contains($0.id) }
+                isSuppressingDirectMessageSync = false
+            }
+            core.pruneExpiredMessages(convId: convId, nowMs: effectiveNowMs)
+            return (messages[convId] ?? []).compactMap(\.expiresAt).min()
+        }
         let expired = list.filter { ($0.expiresAt ?? .distantFuture) <= effectiveNow }
         if !expired.isEmpty {
             let ids = Set(expired.map(\.id))

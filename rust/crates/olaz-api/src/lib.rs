@@ -4,7 +4,7 @@
 //! conversation lists (preload, pins, archive, mute, labels, groups, friends, friend-request lists,
 //! aliases, profiles, hidden chats, delete), message history (1-1 preload, group and self cloud
 //! paging), the HTTP long-poll queue, sending text (plain, quoted, E2EE envelope), typing, seen,
-//! unread marks, recall, delete-for-me and reactions.
+//! unread marks, recall, delete-for-me, reactions, and auto-delete settings.
 //!
 //! Every method is a request builder (service, path, params payload with the exact Swift keys and
 //! JSON types) plus a response parser. The pure builders ([`build_recall_message_request`],
@@ -19,6 +19,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod api;
+mod autodelete;
 mod conversations;
 mod e2ee;
 mod error;
@@ -32,6 +33,10 @@ mod util;
 mod tests;
 
 pub use api::{JsonObject, SendMessageResult, ZaloApi};
+pub use autodelete::{
+    AUTO_DELETE_OPTIONS, AutoDeleteFetchOutcome, auto_delete_label, auto_delete_remaining,
+    build_update_auto_delete_payload, parse_auto_delete_settings,
+};
 pub use conversations::{
     HiddenConversationsSnapshot, PollOutcome, parse_hidden_conversations_response,
     received_friend_request_rows,

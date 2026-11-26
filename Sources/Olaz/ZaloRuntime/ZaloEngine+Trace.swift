@@ -106,6 +106,8 @@ extension ZaloEngine {
         deleteUndoTimerTask = nil
         messageActionTasks.values.forEach { $0.cancel() }
         messageActionTasks.removeAll()
+        optimisticOverlayFenceTasks.values.forEach { $0.cancel() }
+        optimisticOverlayFenceTasks.removeAll()
         contactsTasks.values.forEach { $0.cancel() }
         contactsTasks.removeAll()
         pollDebounceSleep = nil
@@ -139,6 +141,19 @@ extension ZaloEngine {
         guard let core else { return }
         guard let version = try? await core.settle() else { return }
         await waitForMirrorVersion(version)
+        while !optimisticOverlayFenceTasks.isEmpty {
+            let pending = Array(optimisticOverlayFenceTasks.values)
+            for task in pending {
+                await task.value
+            }
+        }
+        if let maxResolved = optimisticMessageOverlays
+            .map(\.resolvedVersion)
+            .filter({ $0 != UInt64.max })
+            .max(),
+           appliedMirrorVersion < maxResolved {
+            await waitForMirrorVersion(maxResolved)
+        }
     }
 
     internal func awaitMarkReadTasksForRecording() async {
@@ -176,10 +191,25 @@ extension ZaloEngine {
     }
 
     internal func awaitMessageActionTasksForRecording() async {
+        await settleForRecording()
         while !messageActionTasks.isEmpty {
             let tasks = Array(messageActionTasks.values)
             messageActionTasks.removeAll()
             for task in tasks { _ = await task.value }
+        }
+        while !optimisticOverlayFenceTasks.isEmpty {
+            let tasks = Array(optimisticOverlayFenceTasks.values)
+            optimisticOverlayFenceTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
+        if let core = coreLifecycle.core {
+            if phase == .ready, activeSendTask == nil {
+                if let v = try? await core.waitIdle() {
+                    await waitForMirrorVersion(v)
+                }
+            } else if let v = try? await core.settle() {
+                await waitForMirrorVersion(v)
+            }
         }
         _ = await persistConversationsTask?.value
     }

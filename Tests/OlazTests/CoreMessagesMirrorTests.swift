@@ -49,7 +49,12 @@ import Testing
             messagesResetAll: messagesResetAll,
             messageMeta: messageMeta,
             contacts: contacts,
-            typing: nil
+            typing: nil,
+            deleteUndo: nil,
+            messageConfirm: nil,
+            autoDelete: nil,
+            starredIds: nil,
+            cachedProfiles: nil
         )
     }
 
