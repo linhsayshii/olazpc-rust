@@ -1306,7 +1306,7 @@ extension ZaloEngine {
             if let store = self.sqliteStore {
                 core.attachStore(store: store.coreStoreHandle)
             }
-            core.updateIdentities(table: self.currentIdentityTableRecord())
+            self.sendIdentitiesToCore(core, force: true)
             if !self.seenReactionEventOrder.isEmpty {
                 core.seedSeenReactionKeys(keys: self.seenReactionEventOrder)
             }
@@ -1453,6 +1453,7 @@ extension ZaloEngine {
     /// Stops `CoreEngine` and its change-mirror loop (used in tests and teardown).
     internal func stopCoreEngine() {
         pendingCoreCommands.removeAll()
+        lastPushedIdentityKey = nil
         coreLifecycle.shutdown()
         let ws = webSocket
         Task { await ws.detachCore() }
@@ -1955,7 +1956,29 @@ extension ZaloEngine {
             for entry in profiles {
                 next[entry.uid] = ZaloWebKitMigrator.CachedProfile(name: entry.name, avatar: entry.avatar)
             }
-            cachedProfiles = next
+            if next != cachedProfiles {
+                cachedProfiles = next
+            }
+        }
+
+        if let groups = batch.cachedGroups {
+            var next: [String: ZaloWebKitMigrator.CachedGroup] = [:]
+            next.reserveCapacity(groups.count)
+            for entry in groups {
+                next[entry.gid] = ZaloWebKitMigrator.CachedGroup(
+                    name: entry.name,
+                    avatar: entry.avatar,
+                    members: Int(entry.members)
+                )
+            }
+            if next != cachedGroups {
+                cachedGroups = next
+            }
+        }
+
+        if (batch.contacts != nil || batch.cachedProfiles != nil || batch.cachedGroups != nil),
+           let core = coreLifecycle.core {
+            lastPushedIdentityKey = currentIdentityPushKey(for: core)
         }
 
         if let suggestUpdate = batch.stickerSuggest {
@@ -2767,9 +2790,47 @@ extension ZaloEngine {
         }
     }
 
+    internal struct IdentityPushKey: Equatable {
+        let coreId: ObjectIdentifier
+        let friends: [ContactsState.Friend]
+        let groups: [ContactsState.Group]
+        let friendsLoaded: Bool
+        let groupsLoaded: Bool
+        let aliases: [String: String]
+        let cachedProfiles: [String: ZaloWebKitMigrator.CachedProfile]
+        let cachedGroups: [String: ZaloWebKitMigrator.CachedGroup]
+        let activityRanks: [String: Int64]
+        let friendGlobalIds: [String: String]
+    }
+
+    internal func currentIdentityPushKey(for core: CoreEngine) -> IdentityPushKey {
+        IdentityPushKey(
+            coreId: ObjectIdentifier(core),
+            friends: contacts.friends,
+            groups: contacts.groups,
+            friendsLoaded: contacts.friendsLoaded,
+            groupsLoaded: contacts.groupsLoaded,
+            aliases: cachedAliases,
+            cachedProfiles: cachedProfiles,
+            cachedGroups: cachedGroups,
+            activityRanks: cachedActivityRanks,
+            friendGlobalIds: cachedFriendGlobalIds
+        )
+    }
+
+    internal func sendIdentitiesToCore(_ core: CoreEngine, force: Bool = false) {
+        let key = currentIdentityPushKey(for: core)
+        if !force, lastPushedIdentityKey == key {
+            return
+        }
+        lastPushedIdentityKey = key
+        onCoreUpdateIdentities?()
+        core.updateIdentities(table: currentIdentityTableRecord())
+    }
+
     internal func pushCoreIdentitiesIfRunning() {
         guard !isApplyingCoreMirror, let core = coreLifecycle.core else { return }
-        core.updateIdentities(table: currentIdentityTableRecord())
+        sendIdentitiesToCore(core, force: false)
     }
 
     internal func currentContactsStateRecord() -> ContactsStateRecord {
@@ -2981,35 +3042,58 @@ extension ZaloEngine {
         let ranksData = try? await store.getPreferenceData(key: "activityRanks")
         let gidData = try? await store.getPreferenceData(key: "gidToUidMap")
 
-        isApplyingCoreMirror = true
-        defer { isApplyingCoreMirror = false }
-
-        if let aliasesData,
-           let dict = (try? JSONSerialization.jsonObject(with: aliasesData)) as? [String: String] {
-            cachedAliases = dict
+        let decodedAliases = aliasesData.flatMap {
+            (try? JSONSerialization.jsonObject(with: $0)) as? [String: String]
         }
-        if let profData,
-           let decoded = try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedProfile].self, from: profData) {
-            cachedProfiles = decoded
+        let decodedProfiles = profData.flatMap {
+            try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedProfile].self, from: $0)
         }
-        if let grpData,
-           let decoded = try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedGroup].self, from: grpData) {
-            cachedGroups = decoded
+        let decodedGroups = grpData.flatMap {
+            try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedGroup].self, from: $0)
         }
-        if let ranksData,
-           let rawRanks = (try? JSONSerialization.jsonObject(with: ranksData)) as? [String: Any] {
+        let decodedRanks: [String: Int64]? = ranksData.flatMap { data in
+            guard let rawRanks = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
             var parsed: [String: Int64] = [:]
             for (k, v) in rawRanks {
                 if let val = JSONLossless.int64(v), val > 0 { parsed[k] = val }
             }
-            cachedActivityRanks = parsed
+            return parsed
         }
-        if let gidData,
-           let gidToUid = (try? JSONSerialization.jsonObject(with: gidData)) as? [String: String] {
-            await sessionClient.seedGlobalIdMappings(gidToUid)
-            for (gid, uid) in gidToUid where !gid.isEmpty && !uid.isEmpty {
-                cachedFriendGlobalIds[uid] = gid
+        let decodedGidToUid = gidData.flatMap {
+            (try? JSONSerialization.jsonObject(with: $0)) as? [String: String]
+        }
+        if let decodedGidToUid {
+            await sessionClient.seedGlobalIdMappings(decodedGidToUid)
+        }
+
+        // Keep all awaits outside the non-reentrant `isApplyingCoreMirror` guard.
+        isApplyingCoreMirror = true
+        defer { isApplyingCoreMirror = false }
+
+        if let decodedAliases, decodedAliases != cachedAliases {
+            cachedAliases = decodedAliases
+        }
+        if let decodedProfiles, decodedProfiles != cachedProfiles {
+            cachedProfiles = decodedProfiles
+        }
+        if let decodedGroups, decodedGroups != cachedGroups {
+            cachedGroups = decodedGroups
+        }
+        if let decodedRanks, decodedRanks != cachedActivityRanks {
+            cachedActivityRanks = decodedRanks
+        }
+        if let decodedGidToUid {
+            var nextGlobalIds = cachedFriendGlobalIds
+            nextGlobalIds.reserveCapacity(nextGlobalIds.count + decodedGidToUid.count)
+            for (gid, uid) in decodedGidToUid where !gid.isEmpty && !uid.isEmpty {
+                nextGlobalIds[uid] = gid
             }
+            if nextGlobalIds != cachedFriendGlobalIds {
+                cachedFriendGlobalIds = nextGlobalIds
+            }
+        }
+        if let core = coreLifecycle.core {
+            lastPushedIdentityKey = currentIdentityPushKey(for: core)
         }
     }
 
