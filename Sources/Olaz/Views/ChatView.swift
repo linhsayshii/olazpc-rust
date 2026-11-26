@@ -183,60 +183,40 @@ struct ChatView: View {
                     .transition(.opacity)
             }
         }
-        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted, perform: handleDrop)
+        .onDrop(of: ChatDropLoader.supportedTypes, isTargeted: $isDropTargeted, perform: handleDrop)
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
         let targetId = id
         guard !targetId.isEmpty else { return false }
-        let fileProviders = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
-        guard !fileProviders.isEmpty else { return false }
+        let accepted = providers.filter { ChatDropLoader.canAccept($0) }
+        guard !accepted.isEmpty else { return false }
 
         Task {
-            var urls: [URL] = []
-            for provider in fileProviders {
-                if let url = await Self.loadDroppedFileURL(from: provider) {
-                    urls.append(url)
+            let staged = await ChatDropLoader.stage(accepted)
+            guard !staged.isEmpty else { return }
+            let media = staged.filter(\.isMedia)
+            let files = staged.filter { !$0.isMedia }
+            if !media.isEmpty {
+                let outcome = await engine.sendMedia(media.map(\.url), to: targetId)
+                if case .pending = outcome {
+                    // Keep staged copies until the pending upload finishes.
+                } else {
+                    ChatDropLoader.cleanup(media)
                 }
-            }
-            guard !urls.isEmpty else { return }
-            let mediaURLs = urls.filter { Self.isMediaURL($0) }
-            let fileURLs = urls.filter { !Self.isMediaURL($0) }
-            if !mediaURLs.isEmpty {
-                let outcome = await engine.sendMedia(mediaURLs, to: targetId)
                 engine.report(outcome, in: targetId)
             }
-            if !fileURLs.isEmpty {
-                let outcome = await engine.sendFiles(fileURLs, to: targetId)
+            if !files.isEmpty {
+                let outcome = await engine.sendFiles(files.map(\.url), to: targetId)
+                if case .pending = outcome {
+                    // Keep staged copies until the pending upload finishes.
+                } else {
+                    ChatDropLoader.cleanup(files)
+                }
                 engine.report(outcome, in: targetId)
             }
         }
         return true
-    }
-
-    private static func isMediaURL(_ url: URL) -> Bool {
-        if let ut = UTType(filenameExtension: url.pathExtension), ut.conforms(to: .image) {
-            return true
-        }
-        return ZaloEngine.isVideoURL(url)
-    }
-
-    private static func loadDroppedFileURL(from provider: NSItemProvider) async -> URL? {
-        await withCheckedContinuation { continuation in
-            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                if let data = item as? Data,
-                   let str = String(data: data, encoding: .utf8),
-                   let url = URL(string: str) {
-                    continuation.resume(returning: url)
-                } else if let url = item as? URL {
-                    continuation.resume(returning: url)
-                } else if let nsurl = item as? NSURL {
-                    continuation.resume(returning: nsurl as URL)
-                } else {
-                    continuation.resume(returning: nil)
-                }
-            }
-        }
     }
 
     private func startConversation() {
