@@ -442,6 +442,33 @@ final class FakeZaloServer: @unchecked Sendable {
         for w in pendingWaiters { w() }
     }
 
+    private final class TimeoutTaskBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var task: Task<Void, Never>?
+        private var cancelled = false
+
+        func set(_ task: Task<Void, Never>) {
+            lock.lock()
+            let shouldCancel = cancelled
+            if !shouldCancel {
+                self.task = task
+            }
+            lock.unlock()
+            if shouldCancel {
+                task.cancel()
+            }
+        }
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            let task = self.task
+            self.task = nil
+            lock.unlock()
+            task?.cancel()
+        }
+    }
+
     @discardableResult
     private func waitUntil(timeoutMs: Int, conditionLocked: () -> Bool) async -> Bool {
         func check() -> Bool {
@@ -456,8 +483,12 @@ final class FakeZaloServer: @unchecked Sendable {
             if remaining <= .zero { return false }
             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                 let once = OnceFlag()
+                let timeoutBox = TimeoutTaskBox()
                 let finish: @Sendable () -> Void = {
-                    if once.first() { cont.resume() }
+                    if once.first() {
+                        timeoutBox.cancel()
+                        cont.resume()
+                    }
                 }
                 lock.lock()
                 if conditionLocked() {
@@ -468,10 +499,11 @@ final class FakeZaloServer: @unchecked Sendable {
                 waiters.append(finish)
                 lock.unlock()
 
-                Task {
-                    try? await Task.sleep(for: min(remaining, .milliseconds(50)))
+                let task = Task {
+                    try? await Task.sleep(for: remaining)
                     finish()
                 }
+                timeoutBox.set(task)
             }
         }
         return true

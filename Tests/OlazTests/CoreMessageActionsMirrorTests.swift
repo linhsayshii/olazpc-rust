@@ -244,155 +244,163 @@ import Testing
 
     @MainActor
     @Test func olderCorePatchCannotRevertOptimisticReaction() async throws {
-        let convId = "3000777"
-        let (engine, _, cleanup) = try await Self.makeBootedEngine(convId: convId, reactDelayMs: 80)
-        defer { cleanup() }
-        defer {
-            engine.cancelTasksForRecording()
+        try await RecorderSuiteLock.shared.withLock {
+            let convId = "3000777"
+            let (engine, _, cleanup) = try await Self.makeBootedEngine(convId: convId, reactDelayMs: 80)
+            defer { cleanup() }
+            defer {
+                engine.cancelTasksForRecording()
+            }
+
+            let originalMsg = try #require(engine.messages[convId]?.last)
+            #expect(originalMsg.reactions.isEmpty)
+            let olderVersion = engine.appliedMirrorVersion
+
+            // Start react; optimistic MainActor write runs synchronously before the first suspension point.
+            let reactTask = Task { @MainActor in
+                await engine.performReact("❤️", to: originalMsg.id, in: convId)
+            }
+            await Task.yield()
+
+            // Optimistic ❤️ must already be visible while the HTTP request is still in-flight.
+            let afterOptimistic = try #require(engine.messages[convId]?.first(where: { $0.id == originalMsg.id }))
+            #expect(afterOptimistic.reactions.contains(where: { $0.includesMe && $0.icon.type == "5" }))
+
+            // Deliver a stale CoreChangesRecord carrying the pre-react message (empty reactions).
+            let staleBatch = Self.emptyChanges(
+                version: olderVersion,
+                windowDeltas: [
+                    .patch(convId: convId, upserts: [ChatMessageRecord(message: originalMsg)], removedIds: []),
+                ]
+            )
+            engine.applyCoreChanges(staleBatch)
+
+            // The stale patch must NOT revert the optimistic ❤️ even momentarily.
+            let afterStale = try #require(engine.messages[convId]?.first(where: { $0.id == originalMsg.id }))
+            #expect(afterStale.reactions.contains(where: { $0.includesMe && $0.icon.type == "5" }))
+
+            // Let core finish and settle; the mirror must end with ❤️ and zero leaked overlays.
+            await reactTask.value
+            await engine.settleForRecording()
+            let finalMsg = try #require(engine.messages[convId]?.first(where: { $0.id == originalMsg.id }))
+            #expect(finalMsg.reactions.contains(where: { $0.includesMe && $0.icon.type == "5" }))
+            #expect(engine.optimisticMessageOverlays.isEmpty)
+
+            await engine.finishTearDownForRecording()
         }
-
-        let originalMsg = try #require(engine.messages[convId]?.last)
-        #expect(originalMsg.reactions.isEmpty)
-        let olderVersion = engine.appliedMirrorVersion
-
-        // Start react; optimistic MainActor write runs synchronously before the first suspension point.
-        let reactTask = Task { @MainActor in
-            await engine.performReact("❤️", to: originalMsg.id, in: convId)
-        }
-        await Task.yield()
-
-        // Optimistic ❤️ must already be visible while the HTTP request is still in-flight.
-        let afterOptimistic = try #require(engine.messages[convId]?.first(where: { $0.id == originalMsg.id }))
-        #expect(afterOptimistic.reactions.contains(where: { $0.includesMe && $0.icon.type == "5" }))
-
-        // Deliver a stale CoreChangesRecord carrying the pre-react message (empty reactions).
-        let staleBatch = Self.emptyChanges(
-            version: olderVersion,
-            windowDeltas: [
-                .patch(convId: convId, upserts: [ChatMessageRecord(message: originalMsg)], removedIds: []),
-            ]
-        )
-        engine.applyCoreChanges(staleBatch)
-
-        // The stale patch must NOT revert the optimistic ❤️ even momentarily.
-        let afterStale = try #require(engine.messages[convId]?.first(where: { $0.id == originalMsg.id }))
-        #expect(afterStale.reactions.contains(where: { $0.includesMe && $0.icon.type == "5" }))
-
-        // Let core finish and settle; the mirror must end with ❤️ and zero leaked overlays.
-        await reactTask.value
-        await engine.settleForRecording()
-        let finalMsg = try #require(engine.messages[convId]?.first(where: { $0.id == originalMsg.id }))
-        #expect(finalMsg.reactions.contains(where: { $0.includesMe && $0.icon.type == "5" }))
-        #expect(engine.optimisticMessageOverlays.isEmpty)
-
-        await engine.finishTearDownForRecording()
     }
 
     @MainActor
     @Test func failedReactRollsBackAuthoritativelyOnError() async throws {
-        let convId = "3000777"
-        let (engine, _, cleanup) = try await Self.makeBootedEngine(convId: convId, reactErrorCode: -1)
-        defer { cleanup() }
-        defer {
-            engine.cancelTasksForRecording()
+        try await RecorderSuiteLock.shared.withLock {
+            let convId = "3000777"
+            let (engine, _, cleanup) = try await Self.makeBootedEngine(convId: convId, reactErrorCode: -1)
+            defer { cleanup() }
+            defer {
+                engine.cancelTasksForRecording()
+            }
+
+            let originalMsg = try #require(engine.messages[convId]?.last)
+            await engine.performReact("❤️", to: originalMsg.id, in: convId)
+            await engine.settleForRecording()
+
+            let finalMsg = try #require(engine.messages[convId]?.first(where: { $0.id == originalMsg.id }))
+            #expect(finalMsg.reactions.isEmpty)
+            #expect(engine.optimisticMessageOverlays.isEmpty)
+
+            await engine.finishTearDownForRecording()
         }
-
-        let originalMsg = try #require(engine.messages[convId]?.last)
-        await engine.performReact("❤️", to: originalMsg.id, in: convId)
-        await engine.settleForRecording()
-
-        let finalMsg = try #require(engine.messages[convId]?.first(where: { $0.id == originalMsg.id }))
-        #expect(finalMsg.reactions.isEmpty)
-        #expect(engine.optimisticMessageOverlays.isEmpty)
-
-        await engine.finishTearDownForRecording()
     }
 
     @MainActor
     @Test func olderCorePatchCannotRevertOptimisticDeleteForMe() async throws {
-        let convId = "3000777"
-        let (engine, _, cleanup) = try await Self.makeBootedEngine(convId: convId)
-        defer { cleanup() }
-        defer {
-            engine.cancelTasksForRecording()
+        try await RecorderSuiteLock.shared.withLock {
+            let convId = "3000777"
+            let (engine, _, cleanup) = try await Self.makeBootedEngine(convId: convId)
+            defer { cleanup() }
+            defer {
+                engine.cancelTasksForRecording()
+            }
+
+            let targetMsg = try #require(engine.messages[convId]?.last)
+            let olderVersion = engine.appliedMirrorVersion
+
+            // Optimistically delete targetMsg (confirmed).
+            engine.deleteForMe(targetMsg, confirmed: true)
+            #expect(engine.messages[convId]?.contains(where: { $0.id == targetMsg.id }) == false)
+            #expect(engine.deleteUndo?.conversationId == convId)
+
+            // Immediately inject an older CoreChangesRecord that still contains targetMsg and deleteUndo=nil.
+            let staleBatch = Self.emptyChanges(
+                version: olderVersion,
+                windowDeltas: [
+                    .patch(convId: convId, upserts: [ChatMessageRecord(message: targetMsg)], removedIds: []),
+                ],
+                deleteUndo: DeleteUndoUpdateRecord(undo: nil)
+            )
+            engine.applyCoreChanges(staleBatch)
+
+            // Must stay hidden and undo banner must stay visible even immediately after the stale patch.
+            #expect(engine.messages[convId]?.contains(where: { $0.id == targetMsg.id }) == false)
+            #expect(engine.deleteUndo?.conversationId == convId)
+
+            // After core settles, targetMsg remains deleted and overlays are drained.
+            await engine.settleForRecording()
+            #expect(engine.messages[convId]?.contains(where: { $0.id == targetMsg.id }) == false)
+            #expect(engine.deleteUndo?.conversationId == convId)
+            #expect(engine.optimisticMessageOverlays.isEmpty)
+
+            await engine.finishTearDownForRecording()
         }
-
-        let targetMsg = try #require(engine.messages[convId]?.last)
-        let olderVersion = engine.appliedMirrorVersion
-
-        // Optimistically delete targetMsg (confirmed).
-        engine.deleteForMe(targetMsg, confirmed: true)
-        #expect(engine.messages[convId]?.contains(where: { $0.id == targetMsg.id }) == false)
-        #expect(engine.deleteUndo?.conversationId == convId)
-
-        // Immediately inject an older CoreChangesRecord that still contains targetMsg and deleteUndo=nil.
-        let staleBatch = Self.emptyChanges(
-            version: olderVersion,
-            windowDeltas: [
-                .patch(convId: convId, upserts: [ChatMessageRecord(message: targetMsg)], removedIds: []),
-            ],
-            deleteUndo: DeleteUndoUpdateRecord(undo: nil)
-        )
-        engine.applyCoreChanges(staleBatch)
-
-        // Must stay hidden and undo banner must stay visible even immediately after the stale patch.
-        #expect(engine.messages[convId]?.contains(where: { $0.id == targetMsg.id }) == false)
-        #expect(engine.deleteUndo?.conversationId == convId)
-
-        // After core settles, targetMsg remains deleted and overlays are drained.
-        await engine.settleForRecording()
-        #expect(engine.messages[convId]?.contains(where: { $0.id == targetMsg.id }) == false)
-        #expect(engine.deleteUndo?.conversationId == convId)
-        #expect(engine.optimisticMessageOverlays.isEmpty)
-
-        await engine.finishTearDownForRecording()
     }
 
     @MainActor
     @Test func olderCorePatchCannotRevertOptimisticUndoDelete() async throws {
-        let convId = "3000777"
-        let (engine, _, cleanup) = try await Self.makeBootedEngine(convId: convId)
-        defer { cleanup() }
-        defer {
-            engine.cancelTasksForRecording()
+        try await RecorderSuiteLock.shared.withLock {
+            let convId = "3000777"
+            let (engine, _, cleanup) = try await Self.makeBootedEngine(convId: convId)
+            defer { cleanup() }
+            defer {
+                engine.cancelTasksForRecording()
+            }
+
+            let targetMsg = try #require(engine.messages[convId]?.last)
+            engine.deleteForMe(targetMsg, confirmed: true)
+            await engine.settleForRecording()
+            #expect(engine.messages[convId]?.contains(where: { $0.id == targetMsg.id }) == false)
+            let preUndoVersion = engine.appliedMirrorVersion
+            let staleUndoRec = DeleteUndoSnapshotRecord(
+                convId: convId,
+                count: 1,
+                deadlineMs: engine.nowMs() + 5_000
+            )
+
+            // Optimistically undo delete.
+            engine.undoDelete()
+            #expect(engine.messages[convId]?.contains(where: { $0.id == targetMsg.id }) == true)
+            #expect(engine.deleteUndo == nil)
+
+            // Immediately inject an older CoreChangesRecord where targetMsg is still removed and undo is still set.
+            let staleBatch = Self.emptyChanges(
+                version: preUndoVersion,
+                windowDeltas: [
+                    .patch(convId: convId, upserts: [], removedIds: [targetMsg.id]),
+                ],
+                deleteUndo: DeleteUndoUpdateRecord(undo: staleUndoRec)
+            )
+            engine.applyCoreChanges(staleBatch)
+
+            // Must remain restored and deleteUndo must stay nil immediately after the stale patch.
+            #expect(engine.messages[convId]?.contains(where: { $0.id == targetMsg.id }) == true)
+            #expect(engine.deleteUndo == nil)
+
+            // After core settles, targetMsg remains present, deleteUndo stays nil, and overlays are drained.
+            await engine.settleForRecording()
+            #expect(engine.messages[convId]?.contains(where: { $0.id == targetMsg.id }) == true)
+            #expect(engine.deleteUndo == nil)
+            #expect(engine.optimisticMessageOverlays.isEmpty)
+
+            await engine.finishTearDownForRecording()
         }
-
-        let targetMsg = try #require(engine.messages[convId]?.last)
-        engine.deleteForMe(targetMsg, confirmed: true)
-        await engine.settleForRecording()
-        #expect(engine.messages[convId]?.contains(where: { $0.id == targetMsg.id }) == false)
-        let preUndoVersion = engine.appliedMirrorVersion
-        let staleUndoRec = DeleteUndoSnapshotRecord(
-            convId: convId,
-            count: 1,
-            deadlineMs: engine.nowMs() + 5_000
-        )
-
-        // Optimistically undo delete.
-        engine.undoDelete()
-        #expect(engine.messages[convId]?.contains(where: { $0.id == targetMsg.id }) == true)
-        #expect(engine.deleteUndo == nil)
-
-        // Immediately inject an older CoreChangesRecord where targetMsg is still removed and undo is still set.
-        let staleBatch = Self.emptyChanges(
-            version: preUndoVersion,
-            windowDeltas: [
-                .patch(convId: convId, upserts: [], removedIds: [targetMsg.id]),
-            ],
-            deleteUndo: DeleteUndoUpdateRecord(undo: staleUndoRec)
-        )
-        engine.applyCoreChanges(staleBatch)
-
-        // Must remain restored and deleteUndo must stay nil immediately after the stale patch.
-        #expect(engine.messages[convId]?.contains(where: { $0.id == targetMsg.id }) == true)
-        #expect(engine.deleteUndo == nil)
-
-        // After core settles, targetMsg remains present, deleteUndo stays nil, and overlays are drained.
-        await engine.settleForRecording()
-        #expect(engine.messages[convId]?.contains(where: { $0.id == targetMsg.id }) == true)
-        #expect(engine.deleteUndo == nil)
-        #expect(engine.optimisticMessageOverlays.isEmpty)
-
-        await engine.finishTearDownForRecording()
     }
 }

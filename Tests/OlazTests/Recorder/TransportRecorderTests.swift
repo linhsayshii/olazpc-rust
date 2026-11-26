@@ -324,9 +324,7 @@ struct TransportRecorderTests {
             _ = await engine.bootTask?.value
             _ = await engine.pendingCleanupTask?.value
             await server.waitForScriptedRequests(timeoutMs: 2000)
-            if !suppressedTransports.contains("ws") {
-                try? await Task.sleep(for: .milliseconds(50))
-            }
+            await engine.awaitCoreIdleAndMirrorForRecording()
             await engine.settleForRecording()
             await Task.yield()
 

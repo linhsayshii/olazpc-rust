@@ -153,6 +153,7 @@ final class ZaloEngine {
     @ObservationIgnored internal let webSocket = ZaloWebSocket()
     @ObservationIgnored internal let dataDirectory: URL
     @ObservationIgnored internal let userDefaults: UserDefaults
+    @ObservationIgnored internal var testPreOpenedStore: ZaloSQLiteStore?
     @ObservationIgnored internal var sqliteStore: ZaloSQLiteStore? {
         didSet {
             if let core = coreLifecycle.core {
@@ -198,6 +199,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var optimisticOverlayFenceTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var lastOptimisticDeletedMessages: [String: [ChatMessage]] = [:]
     @ObservationIgnored internal var stateTrace: (() -> Void)?
+    @ObservationIgnored internal var mirrorAppliedTrace: (() -> Void)?
     @ObservationIgnored private let transportSettleTraceActive = OSAllocatedUnfairLock<Bool>(initialState: false)
     nonisolated internal var hasTransportSettleTrace: Bool {
         transportSettleTraceActive.withLock { $0 }
@@ -494,7 +496,13 @@ final class ZaloEngine {
             .appendingPathComponent(account.userId, isDirectory: true)
             .appendingPathComponent("history.sqlite3")
         do {
-            let store = try ZaloSQLiteStore(path: dbURL.path)
+            let store: ZaloSQLiteStore
+            if let pre = testPreOpenedStore, pre.path == dbURL.path {
+                testPreOpenedStore = nil
+                store = pre
+            } else {
+                store = try ZaloSQLiteStore(path: dbURL.path)
+            }
             self.sqliteStore = store
 
             var preAliases: [String: String] = [:]

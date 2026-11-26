@@ -48,6 +48,8 @@ extension ZaloEngine {
         sendE2EETextHostHandler = nil
         traceU4HostEnabled = false
         stateTrace = nil
+        mirrorAppliedTrace = nil
+        testPreOpenedStore = nil
         EngineLog.shared.onAppend = nil
         stopCoreEngine()
         bootTask?.cancel()
@@ -95,6 +97,20 @@ extension ZaloEngine {
            appliedMirrorVersion < maxResolved {
             await waitForMirrorVersion(maxResolved)
         }
+    }
+
+    internal func awaitCoreIdleAndMirrorForRecording() async {
+        await settleForRecording()
+        if let core = coreLifecycle.core {
+            if phase == .ready, activeSendTask == nil {
+                if let v = try? await core.waitIdle() {
+                    await waitForMirrorVersion(v)
+                }
+            } else if let v = try? await core.settle() {
+                await waitForMirrorVersion(v)
+            }
+        }
+        _ = await persistConversationsTask?.value
     }
 
     internal func awaitMarkReadTasksForRecording() async {

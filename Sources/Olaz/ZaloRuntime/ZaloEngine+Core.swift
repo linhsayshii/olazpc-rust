@@ -1543,6 +1543,7 @@ extension ZaloEngine {
             appliedMirrorVersion = batch.version
         }
         resumeMirrorWaiters(upTo: appliedMirrorVersion)
+        mirrorAppliedTrace?()
     }
 
     // MARK: - U6 Version-Fenced Optimistic Overlays

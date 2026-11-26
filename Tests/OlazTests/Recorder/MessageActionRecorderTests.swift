@@ -2217,7 +2217,7 @@ private final class MessageActionTransitionRecorder {
             }
             let waiterId = UUID()
             let timeoutTask = Task { @MainActor in
-                try? await Task.sleep(for: min(remaining, .milliseconds(50)))
+                try? await Task.sleep(for: remaining)
                 if let cont = self.waiters.removeValue(forKey: waiterId) {
                     cont.resume()
                 }
@@ -2231,6 +2231,7 @@ private final class MessageActionTransitionRecorder {
 }
 
 enum MessageActionRecorderHarness {
+    private static let sqliteTemplate = RecorderSQLiteTemplate(name: "message-action")
     enum RecorderError: Error, CustomStringConvertible {
         case timeout(scenario: String, detail: String)
         case unscriptedRequest(scenario: String, detail: String)
@@ -2393,8 +2394,9 @@ enum MessageActionRecorderHarness {
             try Data(sub.canonicalString().utf8).write(to: fileURL, options: .atomic)
         }
 
+        var preOpenedStore: ZaloSQLiteStore?
         if let uid = seededUserId, !uid.isEmpty {
-            try await seedSQLiteStore(userId: uid, dataDir: dataDir, seed: substituteRuntimeURLs(scenario.seed))
+            preOpenedStore = try await seedSQLiteStore(userId: uid, dataDir: dataDir, seed: substituteRuntimeURLs(scenario.seed))
         }
 
         let domainsJSON = substituteRuntimeURLs(scenario.seed["domains"] ?? defaultFakeDomainsJSON())
@@ -2409,6 +2411,8 @@ enum MessageActionRecorderHarness {
             userDefaultsSuiteName: storage.userDefaultsSuiteName,
             cookieStorage: storage.cookieStorage
         )
+        engine.testPreOpenedStore = preOpenedStore
+        preOpenedStore = nil
         if let nextClientId = scenario.seed["next_client_id"]?.int64Value {
             await engine.sessionClient.seedNextClientId(nextClientId)
         }
@@ -2557,6 +2561,9 @@ enum MessageActionRecorderHarness {
             settleCount += 1
             notifySignal()
         }
+        engine.mirrorAppliedTrace = {
+            notifySignal()
+        }
 
         var snapshots: [String: CaseJSON] = [:]
 
@@ -2569,7 +2576,7 @@ enum MessageActionRecorderHarness {
                 }
                 let waiterId = UUID()
                 let timeoutTask = Task { @MainActor in
-                    try? await Task.sleep(for: min(remaining, .milliseconds(25)))
+                    try? await Task.sleep(for: remaining)
                     if let cont = signalWaiters.removeValue(forKey: waiterId) {
                         cont.resume()
                     }
@@ -2940,9 +2947,7 @@ enum MessageActionRecorderHarness {
             _ = await engine.persistConversationsTask?.value
             _ = await engine.pendingCleanupTask?.value
             await server.waitForScriptedRequests(timeoutMs: 2000)
-            if !suppressedTransports.contains("ws") {
-                try? await Task.sleep(for: .milliseconds(50))
-            }
+            await engine.awaitCoreIdleAndMirrorForRecording()
             await engine.settleForRecording()
             await Task.yield()
 
@@ -3004,13 +3009,41 @@ enum MessageActionRecorderHarness {
 
     // MARK: - Seed & Script Helpers
 
-    private static func seedSQLiteStore(userId: String, dataDir: URL, seed: CaseJSON) async throws {
+    private static func seedSQLiteStore(userId: String, dataDir: URL, seed: CaseJSON) async throws -> ZaloSQLiteStore? {
         let dbURL = dataDir
             .appendingPathComponent("accounts", isDirectory: true)
             .appendingPathComponent(userId, isDirectory: true)
             .appendingPathComponent("history.sqlite3")
+        try await sqliteTemplate.clone(to: dbURL)
+
+        let pinned = seed["pinned_ids"]?.arrayValue?.compactMap(\.stringValue)
+        let archived = seed["archived_ids"]?.arrayValue?.compactMap(\.stringValue)
+        let unreadMarks = seed["unread_marks"]?.arrayValue?.compactMap(\.stringValue)
+        let hidden = seed["hidden_ids"]?.arrayValue?.compactMap(\.stringValue)
+        let starred = seed["starred_ids"]?.arrayValue?.compactMap(\.stringValue)
+        let seenReactions = seed["seen_reaction_event_ids"]?.arrayValue?.compactMap(\.stringValue)
+        let e2eeThreads = seed["e2ee_threads"]?.arrayValue?.compactMap(\.stringValue)
+        let ranks = seed["activity_ranks"].flatMap { $0 == .null ? nil : $0 }
+        let refreshAtVal: String? = seed["history_full_refresh_at"].flatMap {
+            $0 == .null ? nil : ($0.stringValue ?? $0.int64Value.map(String.init))
+        }.flatMap { $0.isEmpty ? nil : $0 }
+        let contacts = seed["contacts"]
+        let aliases = contacts?["aliases"].flatMap { $0 == .null ? nil : $0 }
+        let profiles = contacts?["cached_profiles"].flatMap { $0 == .null ? nil : $0 }
+        let groups = contacts?["cached_groups"].flatMap { $0 == .null ? nil : $0 }
+        let gids = contacts?["friend_global_ids"].flatMap { $0 == .null ? nil : $0 }
+        let convRows = (seed["local_conversations"]?.arrayValue).flatMap { $0.isEmpty ? nil : $0 }
+        let msgRows = (seed["local_messages"]?.arrayValue).flatMap { $0.isEmpty ? nil : $0 }
+
+        guard pinned != nil || archived != nil || unreadMarks != nil || hidden != nil ||
+              starred != nil || seenReactions != nil || e2eeThreads != nil ||
+              ranks != nil || refreshAtVal != nil ||
+              aliases != nil || profiles != nil || groups != nil || gids != nil ||
+              convRows != nil || msgRows != nil else {
+            return nil
+        }
+
         let store = try ZaloSQLiteStore(path: dbURL.path)
-        try await store.setPreferenceString(key: ZaloWebKitMigrator.donePrefKey, value: "1")
 
         if let pinned = seed["pinned_ids"]?.arrayValue?.compactMap(\.stringValue) {
             try await store.setPreferenceStrings(key: "pinnedIds", value: pinned)
@@ -3119,7 +3152,7 @@ enum MessageActionRecorderHarness {
             }
             try await store.saveMessages(stored)
         }
-        await store.close()
+        return store
     }
 
     @MainActor

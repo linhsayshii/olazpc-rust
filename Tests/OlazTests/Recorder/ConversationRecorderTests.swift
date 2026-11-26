@@ -83,6 +83,8 @@ final class ConversationRecorderTests: XCTestCase {
 
     // MARK: - Harness
 
+    private static let sqliteTemplate = RecorderSQLiteTemplate(name: "conversation")
+
     struct ScenarioDef {
         let name: String
         let slow: Bool
@@ -179,8 +181,9 @@ final class ConversationRecorderTests: XCTestCase {
         }
 
         // Seed SQLite store before boot when userId is known.
+        var preOpenedStore: ZaloSQLiteStore?
         if let uid = seededUserId, !uid.isEmpty {
-            try await seedSQLiteStore(userId: uid, dataDir: dataDir, seed: substituteRuntimeURLs(scenario.seed))
+            preOpenedStore = try await seedSQLiteStore(userId: uid, dataDir: dataDir, seed: substituteRuntimeURLs(scenario.seed))
         }
 
         // Decode seed.domains and enforce local-only fake hosts + isolated=true.
@@ -196,6 +199,8 @@ final class ConversationRecorderTests: XCTestCase {
             userDefaultsSuiteName: storage.userDefaultsSuiteName,
             cookieStorage: storage.cookieStorage
         )
+        engine.testPreOpenedStore = preOpenedStore
+        preOpenedStore = nil
         if let prefsObj = scenario.seed["prefs"]?.objectValue {
             for (k, v) in prefsObj {
                 if let s = v.stringValue {
@@ -267,6 +272,9 @@ final class ConversationRecorderTests: XCTestCase {
             settleCount += 1
             notifySignal()
         }
+        engine.mirrorAppliedTrace = {
+            notifySignal()
+        }
 
         var snapshots: [String: CaseJSON] = [:]
         var lastPinBoard: PinBoard?
@@ -281,7 +289,7 @@ final class ConversationRecorderTests: XCTestCase {
                 }
                 let waiterId = UUID()
                 let timeoutTask = Task { @MainActor in
-                    try? await Task.sleep(for: min(remaining, .milliseconds(25)))
+                    try? await Task.sleep(for: remaining)
                     if let cont = signalWaiters.removeValue(forKey: waiterId) {
                         cont.resume()
                     }
@@ -295,18 +303,14 @@ final class ConversationRecorderTests: XCTestCase {
 
         func waitForAsyncUIAction(timeoutMs: Int = 5000, prevToastSeq: Int?, prevPrompt: ConversationPrompt?, trigger: () -> Void) async throws {
             trigger()
-            let deadline = ContinuousClock.now + .milliseconds(timeoutMs)
-            while true {
+            try await waitForCondition(timeoutMs: timeoutMs, description: "async conversation UI action") {
                 if engine.conversationUI.toast?.seq != prevToastSeq {
-                    return
+                    return true
                 }
                 if case .pinBoard = engine.conversationPrompt, engine.conversationPrompt != prevPrompt {
-                    return
+                    return true
                 }
-                if ContinuousClock.now >= deadline {
-                    throw RecorderError.timeout(scenario: scenario.name, detail: "timed out awaiting async conversation UI action")
-                }
-                try? await Task.sleep(for: .milliseconds(5))
+                return false
             }
         }
 
@@ -382,7 +386,8 @@ final class ConversationRecorderTests: XCTestCase {
                             let prevCount = server.httpRequestCount(path: "/api/preloadconvers/get-last-msgs")
                             engine.openConversation(id)
                             await server.waitForHTTPRequests(path: "/api/preloadconvers/get-last-msgs", atLeast: prevCount + 1, timeoutMs: 2000)
-                            try? await Task.sleep(for: .milliseconds(40))
+                            _ = await engine.openConversationTask?.value
+                            await engine.awaitCoreIdleAndMirrorForRecording()
                         } else {
                             engine.openConversationId = args?["id"]?.stringValue
                         }
@@ -433,13 +438,13 @@ final class ConversationRecorderTests: XCTestCase {
                         if hadUnreadMark {
                             await server.waitForHTTPRequests(path: "/api/conv/removeUnreadMark", atLeast: prevRemoveCount + 1, timeoutMs: 2000)
                         }
-                        try? await Task.sleep(for: .milliseconds(30))
+                        await engine.awaitMarkReadTasksForRecording()
                     case "mark_unread":
                         let id = args?["id"]?.stringValue ?? ""
                         let prevAddCount = server.httpRequestCount(path: "/api/conv/addUnreadMark")
                         engine.markConversationUnread(id)
                         await server.waitForHTTPRequests(path: "/api/conv/addUnreadMark", atLeast: prevAddCount + 1, timeoutMs: 2000)
-                        try? await Task.sleep(for: .milliseconds(30))
+                        await engine.awaitCoreIdleAndMirrorForRecording()
                     case "hide":
                         let id = args?["id"]?.stringValue ?? ""
                         let pin = args?["pin"]?.stringValue ?? ""
@@ -484,7 +489,7 @@ final class ConversationRecorderTests: XCTestCase {
                         if !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             await server.waitForHTTPRequests(path: "/api/convlabel/update", atLeast: prevLabelCount + 1, timeoutMs: 2000)
                         }
-                        try? await Task.sleep(for: .milliseconds(30))
+                        await engine.awaitCoreIdleAndMirrorForRecording()
                     case "label_update":
                         let id = args?["id"]?.stringValue ?? ""
                         let name = args?["name"]?.stringValue ?? ""
@@ -492,26 +497,26 @@ final class ConversationRecorderTests: XCTestCase {
                         let prevLabelCount = server.httpRequestCount(path: "/api/convlabel/update")
                         engine.updateConversationLabel(id, name: name, colorHex: colorHex)
                         await server.waitForHTTPRequests(path: "/api/convlabel/update", atLeast: prevLabelCount + 1, timeoutMs: 2000)
-                        try? await Task.sleep(for: .milliseconds(30))
+                        await engine.awaitCoreIdleAndMirrorForRecording()
                     case "label_delete":
                         let id = args?["id"]?.stringValue ?? ""
                         let prevLabelCount = server.httpRequestCount(path: "/api/convlabel/update")
                         engine.deleteConversationLabel(id)
                         await server.waitForHTTPRequests(path: "/api/convlabel/update", atLeast: prevLabelCount + 1, timeoutMs: 2000)
-                        try? await Task.sleep(for: .milliseconds(30))
+                        await engine.awaitCoreIdleAndMirrorForRecording()
                     case "label_assign":
                         let convId = args?["conversation_id"]?.stringValue ?? ""
                         let labelId = args?["label_id"]?.stringValue
                         let prevLabelCount = server.httpRequestCount(path: "/api/convlabel/update")
                         engine.setConversationLabel(convId, labelId: labelId)
                         await server.waitForHTTPRequests(path: "/api/convlabel/update", atLeast: prevLabelCount + 1, timeoutMs: 2000)
-                        try? await Task.sleep(for: .milliseconds(30))
+                        await engine.awaitCoreIdleAndMirrorForRecording()
                     case "label_reorder":
                         let ids = args?["ids"]?.arrayValue?.compactMap(\.stringValue) ?? []
                         let prevLabelCount = server.httpRequestCount(path: "/api/convlabel/update")
                         engine.reorderConversationLabels(ids)
                         await server.waitForHTTPRequests(path: "/api/convlabel/update", atLeast: prevLabelCount + 1, timeoutMs: 2000)
-                        try? await Task.sleep(for: .milliseconds(30))
+                        await engine.awaitCoreIdleAndMirrorForRecording()
                     case "set_filter":
                         let typeVal = Int(args?["type"]?.int64Value ?? 0)
                         let labelIds = args?["label_ids"]?.arrayValue?.compactMap(\.stringValue) ?? []
@@ -577,9 +582,7 @@ final class ConversationRecorderTests: XCTestCase {
             _ = await engine.bootTask?.value
             _ = await engine.pendingCleanupTask?.value
             await server.waitForScriptedRequests(timeoutMs: 2000)
-            if !suppressedTransports.contains("ws") {
-                try? await Task.sleep(for: .milliseconds(50))
-            }
+            await engine.awaitCoreIdleAndMirrorForRecording()
             await engine.settleForRecording()
             await Task.yield()
 
@@ -636,14 +639,37 @@ final class ConversationRecorderTests: XCTestCase {
 
     // MARK: - Seed Helpers
 
-    private static func seedSQLiteStore(userId: String, dataDir: URL, seed: CaseJSON) async throws {
+    private static func seedSQLiteStore(userId: String, dataDir: URL, seed: CaseJSON) async throws -> ZaloSQLiteStore? {
         let dbURL = dataDir
             .appendingPathComponent("accounts", isDirectory: true)
             .appendingPathComponent(userId, isDirectory: true)
             .appendingPathComponent("history.sqlite3")
+        try await sqliteTemplate.clone(to: dbURL)
+
+        let pinned = seed["pinned_ids"]?.arrayValue?.compactMap(\.stringValue)
+        let archived = seed["archived_ids"]?.arrayValue?.compactMap(\.stringValue)
+        let unreadMarks = seed["unread_marks"]?.arrayValue?.compactMap(\.stringValue)
+        let hidden = seed["hidden_ids"]?.arrayValue?.compactMap(\.stringValue)
+        let md5 = (seed["hidden_pin_md5"]?.stringValue).flatMap { $0.isEmpty ? nil : $0 }
+        let sha = (seed["hidden_pin_hash"]?.stringValue).flatMap { $0.isEmpty ? nil : $0 }
+        let labelsPref = seed["labels_pref"].flatMap { $0 == .null ? nil : $0 }
+        let ranks = seed["activity_ranks"].flatMap { $0 == .null ? nil : $0 }
+        let contacts = seed["contacts"]
+        let aliases = contacts?["aliases"].flatMap { $0 == .null ? nil : $0 }
+        let profiles = contacts?["cached_profiles"].flatMap { $0 == .null ? nil : $0 }
+        let groups = contacts?["cached_groups"].flatMap { $0 == .null ? nil : $0 }
+        let gids = contacts?["friend_global_ids"].flatMap { $0 == .null ? nil : $0 }
+        let convRows = (seed["local_conversations"]?.arrayValue).flatMap { $0.isEmpty ? nil : $0 }
+        let msgRows = (seed["local_messages"]?.arrayValue).flatMap { $0.isEmpty ? nil : $0 }
+
+        guard pinned != nil || archived != nil || unreadMarks != nil || hidden != nil ||
+              md5 != nil || sha != nil || labelsPref != nil || ranks != nil ||
+              aliases != nil || profiles != nil || groups != nil || gids != nil ||
+              convRows != nil || msgRows != nil else {
+            return nil
+        }
+
         let store = try ZaloSQLiteStore(path: dbURL.path)
-        // Ensure ZDB migration never scans the host machine's ~/Library/WebKit directory.
-        try await store.setPreferenceString(key: ZaloWebKitMigrator.donePrefKey, value: "1")
 
         if let pinned = seed["pinned_ids"]?.arrayValue?.compactMap(\.stringValue) {
             try await store.setPreferenceStrings(key: "pinnedIds", value: pinned)
@@ -740,7 +766,7 @@ final class ConversationRecorderTests: XCTestCase {
             }
             try await store.saveMessages(stored)
         }
-        await store.close()
+        return store
     }
 
     @MainActor
