@@ -329,7 +329,14 @@ pub fn parse_board_topics(
         let params = board_topic_params(row);
         let kind = match int64(row.get("type")).unwrap_or(2) {
             3 => "poll",
-            0 => "note",
+            // Official topic types: 0 TEXT_TOPIC (note when startTime <= 0, reminder when startTime > 0), 1 reminder/link.
+            0 => {
+                if int64(row.get("startTime")).unwrap_or(0) > 0 {
+                    "reminder"
+                } else {
+                    "note"
+                }
+            }
             1 => "reminder",
             _ => "message",
         };
@@ -714,6 +721,28 @@ mod tests {
         assert_eq!(parsed.list.items[3].kind, "reminder");
         assert_eq!(parsed.raw_topics.version, 7);
         assert_eq!(parsed.raw_topics.topics.len(), 4);
+    }
+
+    #[test]
+    fn parse_board_topics_text_topic_with_start_time_parses_as_reminder() {
+        let box_obj = json!({
+            "boardVersion": 2,
+            "pinLimit": 3,
+            "items": [
+                {"id": "r1", "type": 0, "startTime": 1_700_003_000_000_i64, "params": r#"{"title":"hello"}"#},
+                {"id": "n1", "type": 0, "startTime": -1, "params": r#"{"title":"note"}"#},
+            ]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let parsed = parse_board_topics(&box_obj, |_| None);
+        assert_eq!(parsed.list.items.len(), 2);
+        assert_eq!(parsed.list.items[0].ref_id, "r1");
+        assert_eq!(parsed.list.items[0].kind, "reminder");
+        assert_eq!(parsed.list.items[1].ref_id, "n1");
+        assert_eq!(parsed.list.items[1].kind, "note");
     }
 
     #[test]

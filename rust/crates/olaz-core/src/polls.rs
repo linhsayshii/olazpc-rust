@@ -137,7 +137,7 @@ fn json_value_type(val: &Value) -> &'static str {
 }
 
 /// Formats a shape-only diagnostic line for `/api/poll/detail` `data` objects:
-/// sorted top-level keys plus the JSON value type of each `is_*` flag.
+/// sorted top-level keys plus the JSON value type of each `allow_*` / `is_*` flag.
 /// Never logs poll question/option text, IDs, or tokens.
 #[must_use]
 pub fn poll_detail_shape_log_line(d: &Map<String, Value>) -> String {
@@ -145,7 +145,7 @@ pub fn poll_detail_shape_log_line(d: &Map<String, Value>) -> String {
     keys.sort_unstable();
     let flags: Vec<String> = keys
         .iter()
-        .filter(|k| k.starts_with("is_"))
+        .filter(|k| k.starts_with("allow_") || k.starts_with("is_"))
         .filter_map(|k| d.get(*k).map(|v| format!("{k}:{}", json_value_type(v))))
         .collect();
     format!(
@@ -153,6 +153,24 @@ pub fn poll_detail_shape_log_line(d: &Map<String, Value>) -> String {
         keys.join(","),
         flags.join(",")
     )
+}
+
+/// Returns a shape-only diagnostic log line only when one of the expected poll detail
+/// boolean flags (`allow_add_new_option`/`is_add_new_option`,
+/// `allow_multi_choices`/`is_multi_choice`, `is_anonymous`, `is_hide_vote_preview`)
+/// is missing or not a JSON boolean.
+#[must_use]
+pub fn poll_detail_shape_anomaly_log_line(d: &Map<String, Value>) -> Option<String> {
+    let is_bool = |key: &str| matches!(d.get(key), Some(Value::Bool(_)));
+    let has_add = is_bool("allow_add_new_option") || is_bool("is_add_new_option");
+    let has_multi = is_bool("allow_multi_choices") || is_bool("is_multi_choice");
+    let has_anon = is_bool("is_anonymous");
+    let has_hide = is_bool("is_hide_vote_preview");
+    if has_add && has_multi && has_anon && has_hide {
+        None
+    } else {
+        Some(poll_detail_shape_log_line(d))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1483,8 +1501,16 @@ pub fn normalize_poll_detail(
         "question": lossless::string(d.get("question")),
         "creator": creator_id,
         "creatorName": creator_name,
-        "multi": swift_json_bool(d.get("is_multi_choice")).unwrap_or(false),
-        "allowAdd": swift_json_bool(d.get("is_add_new_option")).unwrap_or(false),
+        "multi": swift_json_bool(
+            d.get("allow_multi_choices")
+                .or_else(|| d.get("is_multi_choice")),
+        )
+        .unwrap_or(false),
+        "allowAdd": swift_json_bool(
+            d.get("allow_add_new_option")
+                .or_else(|| d.get("is_add_new_option")),
+        )
+        .unwrap_or(false),
         "anonymous": swift_json_bool(d.get("is_anonymous")).unwrap_or(false),
         "hidePreview": swift_json_bool(d.get("is_hide_vote_preview")).unwrap_or(false),
         "closed": lossless::int64(d.get("status")) == Some(0),
@@ -2338,5 +2364,97 @@ mod tests {
         assert!(!line.contains("SECRET_QUESTION_TEXT"));
         assert!(!line.contains("SECRET_CREATOR_999"));
         assert!(!line.contains("SECRET_OPTION"));
+    }
+
+    #[test]
+    fn normalize_poll_detail_reads_live_allow_flags_and_silences_shape_log() {
+        // Exact top-level key set observed on live `/api/poll/detail` responses (synthetic values).
+        let payload = json!({
+            "allow_add_new_option": true,
+            "allow_multi_choices": true,
+            "closed": false,
+            "created_time": 1_700_000_000_i64,
+            "creator": "2001001",
+            "expired_time": 0,
+            "is_anonymous": false,
+            "is_hide_vote_preview": false,
+            "joined": true,
+            "num_vote": 1,
+            "options": [
+                {"option_id": 1, "content": "Opt A", "voters": ["2001001"]},
+                {"option_id": 2, "content": "Opt B", "voters": []},
+            ],
+            "poll_id": 9901,
+            "poll_type": 0,
+            "question": "Live shape question",
+            "updated_time": 1_700_000_100_i64,
+        });
+        let obj = payload.as_object().unwrap();
+        let polls = PollsState::default();
+        let contacts = ContactsState::default();
+        let convs = ConversationsState::default();
+        let messages = MessagesState::default();
+        let detail = normalize_poll_detail(
+            obj,
+            "9901",
+            Some("g500100"),
+            "2001001",
+            None,
+            &polls,
+            &contacts,
+            &convs,
+            &messages,
+        )
+        .unwrap();
+        assert!(detail.allow_add);
+        assert!(detail.multi);
+        assert!(!detail.anonymous);
+        assert!(!detail.hide_preview);
+        assert!(
+            poll_detail_shape_anomaly_log_line(obj).is_none(),
+            "all-bool live payload must not emit shape anomaly log"
+        );
+
+        // `allow_*` takes precedence over legacy `is_*` keys when both are present.
+        let precedence = json!({
+            "poll_id": 9902,
+            "question": "Precedence",
+            "creator": "2001001",
+            "allow_add_new_option": true,
+            "is_add_new_option": false,
+            "allow_multi_choices": false,
+            "is_multi_choice": true,
+            "is_anonymous": true,
+            "is_hide_vote_preview": true,
+            "options": [],
+        });
+        let prec_detail = normalize_poll_detail(
+            precedence.as_object().unwrap(),
+            "9902",
+            Some("g500100"),
+            "2001001",
+            None,
+            &polls,
+            &contacts,
+            &convs,
+            &messages,
+        )
+        .unwrap();
+        assert!(prec_detail.allow_add);
+        assert!(!prec_detail.multi);
+        assert!(prec_detail.anonymous);
+        assert!(prec_detail.hide_preview);
+
+        // Missing or non-bool expected flag triggers shape anomaly log.
+        let mut missing_flag = obj.clone();
+        missing_flag.remove("allow_add_new_option");
+        let missing_line = poll_detail_shape_anomaly_log_line(&missing_flag).unwrap();
+        assert!(missing_line.starts_with("poll detail shape: "));
+        assert!(missing_line.contains("allow_multi_choices:bool"));
+
+        let mut non_bool_flag = obj.clone();
+        non_bool_flag.insert("allow_add_new_option".to_owned(), json!(1));
+        let non_bool_line = poll_detail_shape_anomaly_log_line(&non_bool_flag).unwrap();
+        assert!(non_bool_line.contains("allow_add_new_option:number"));
     }
 }

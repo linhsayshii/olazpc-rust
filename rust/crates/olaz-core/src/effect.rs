@@ -1388,6 +1388,12 @@ pub enum Effect {
         req_gen: u64,
         followup: RefreshBoardFollowup,
     },
+    /// Calls `ZaloApi::fetch_board_pins` directly after `HostCall::RefreshBoardPins` was approved.
+    FetchBoardPinsApi {
+        conv_id: String,
+        req_gen: u64,
+        followup: RefreshBoardFollowup,
+    },
     /// Calls `ZaloApi::pin_board_message` and reports `Input::PinBoardMessageDone`.
     PinBoardMessageApi {
         pin_op_id: u64,
@@ -1778,6 +1784,13 @@ impl fmt::Debug for Effect {
                 req_gen, followup, ..
             } => f
                 .debug_struct("RefreshBoardPins")
+                .field("req_gen", req_gen)
+                .field("followup", followup)
+                .finish(),
+            Self::FetchBoardPinsApi {
+                req_gen, followup, ..
+            } => f
+                .debug_struct("FetchBoardPinsApi")
                 .field("req_gen", req_gen)
                 .field("followup", followup)
                 .finish(),

@@ -369,6 +369,7 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::UnpinBoardTopicDone { .. }
         | Input::PinBoardMessageDone { .. }
         | Input::PinTopicApproved { .. }
+        | Input::RefreshBoardPinsApproved { .. }
         | Input::PinnedMessageLookupDone { .. }
         | Input::PinnedEnsureMessageLoadedDone { .. } => {
             pins::reduce_pins(state, input, &mut out);

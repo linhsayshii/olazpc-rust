@@ -50,8 +50,9 @@ struct ChatRowModel: Equatable {
             case .text: m.quote == nil ? 1 : 2
             case .photo: 3
             case .sticker: 4
-            case .system, .notice, .ecard: 5
-            default: 6
+            case .gif: 5
+            case .system, .notice, .ecard: 6
+            default: 7
             }
         }
     }
@@ -718,6 +719,7 @@ final class ChatListController: NSObject {
                 let scale = min(280 / CGFloat(w), 340 / CGFloat(h), 1.5)
                 return top + max(60, CGFloat(h) * scale)
             case .sticker: return top + 130
+            case .gif: return top + GifView.displaySize(width: 0, height: 0).height
             case .video: return top + 160
             case .system, .notice: return 40
             default: return top + 64
@@ -971,6 +973,11 @@ final class ChatListController: NSObject {
 
     /// Scrolled to the end (within a point).
     var isAtBottom: Bool { maxOriginY - clip.bounds.origin.y < 1 }
+
+    /// Document-space frame of row `id` (nil when there is no such row).
+    func rowFrameForTesting(of id: String) -> NSRect? {
+        indexById[id].map { NSRect(x: 0, y: tops[$0], width: width, height: heights[$0]) }
+    }
 
     /// Scrolls so that the content offset `y` is at the top of the clip view (as a reader would).
     func scrollForTesting(to y: CGFloat) {

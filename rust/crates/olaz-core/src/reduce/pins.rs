@@ -43,6 +43,16 @@ pub fn reduce_pins(state: &mut CoreState, input: Input, out: &mut ReduceOutput) 
         Input::PinTopicApproved { conv_id } => {
             handle_pin_topic_event(state, conv_id, None, out);
         }
+        Input::RefreshBoardPinsApproved { conv_id } => {
+            if !conv_id.is_empty() {
+                let req_gen = state.pins.current_gen(&conv_id);
+                out.effects.push(Effect::FetchBoardPinsApi {
+                    conv_id,
+                    req_gen,
+                    followup: RefreshBoardFollowup::Standalone { op_id: None },
+                });
+            }
+        }
         Input::PinnedMessageLookupDone {
             conv_id,
             row,

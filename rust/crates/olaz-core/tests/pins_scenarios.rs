@@ -279,3 +279,22 @@ fn p03_logout_resets_pins_and_hub_coalesces_pins_snapshot() {
     assert!(pins.lists.is_empty());
     assert!(pins.raw_topics.is_empty());
 }
+
+#[test]
+fn p04_refresh_board_pins_approved_dispatches_fetch_board_pins_api() {
+    let mut state = ready_state_with_board("g903", vec![], 3);
+    let out = reduce(
+        &mut state,
+        Input::RefreshBoardPinsApproved {
+            conv_id: "g903".to_owned(),
+        },
+    );
+    assert!(out.effects.iter().any(|e| matches!(
+        e,
+        Effect::FetchBoardPinsApi {
+            conv_id,
+            req_gen: 0,
+            followup: RefreshBoardFollowup::Standalone { op_id: None },
+        } if conv_id == "g903"
+    )));
+}
