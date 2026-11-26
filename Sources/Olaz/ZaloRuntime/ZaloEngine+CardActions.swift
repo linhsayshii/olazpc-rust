@@ -4,6 +4,9 @@ import OlazCore
 
 // Card buttons (e-card actions, suggested stickers, contact card, info-message links, reminder cards), delegated to
 // `olaz-core` (U16). Swift retains only UI sheet/navigation views and sticker-category sheet projection.
+// Official adapter reference: `HostScripts/card-actions-adapter.js` (`window.__zaloChat.performAction` & co.;
+// contract in ChatModels.swift). Requests start only after a click or when a card is shown.
+// Message content never goes to the log.
 extension ZaloEngine {
     func performCardAction(in conversationId: String, message messageId: String, ref: String) async -> CardActionOutcome {
         guard let core = await ensureCoreEngine() else {
@@ -288,10 +291,13 @@ extension ZaloEngine {
     }
 }
 
-/// How the add-friend form was reached; it decides which request source the official client records.
+/// How the add-friend form was reached; it decides which request source the official client records (card-actions-adapter.js).
 enum FriendRequestOrigin: String, Sendable {
+    /// The contact card's KẾT BẠN (`_onAddFriend`).
     case add
+    /// The profile opened by tapping the card (`_showUserInfo` with the e-card source).
     case card
+    /// A profile action (`action.open.profile`): no source is recorded.
     case none
 }
 

@@ -2,9 +2,20 @@ import AppKit
 import Foundation
 import OlazCore
 
-// MARK: - Notification settings & per-conversation mute (U16, Rust `olaz-core` owner)
+// Native macOS notifications + notification settings, forwarded to and mirrored from `olaz-core`.
+// Official adapter reference: `HostScripts/notification-adapter.js` (`window.__zaloNotification`;
+// posts {page:'main', notification:{kind, …}}).
+//
+// Who decides what:
+//   * `olaz-core` owns settings, timed/per-conversation mutes, incoming banner decisions and text.
+//     Swift forwards actions and mirrors the resulting state; local calendar formatting stays here.
+//   * `NativeNotifier` applies native delivery/focus policy and shows UNUserNotificationCenter banners
+//     (the official client delivers notifications through the `_noti_*` IPC channels).
+//   * Core persists preferences corresponding to the official `askNoti` / `z_sound` settings and drives
+//     the server-synced mute service (`MuteDataManager.onMute/onUnMute`). Swift owns macOS authorization.
 
-/// How long to silence a conversation (`MuteDuration` raw values match the official menu).
+/// How long a conversation stays muted — the four choices of the official "Tắt thông báo" menu.
+/// Raw values are the official `MuteDataManager.onMute(convId, mode)` modes.
 enum MuteDuration: Int, CaseIterable, Identifiable, Sendable {
     case oneHour = 1
     case fourHours = 2
@@ -24,6 +35,7 @@ enum MuteDuration: Int, CaseIterable, Identifiable, Sendable {
     }
 
     /// When the mute ends, nil = until the user turns notifications back on.
+    /// "Until 8 AM" is the next 8:00 local time (official `_getNowTo8Am`: today's 8:00, or tomorrow's once past).
     func expiry(from now: Date, calendar: Calendar = .current) -> Date? {
         switch self {
         case .oneHour: return now.addingTimeInterval(3600)
@@ -35,12 +47,14 @@ enum MuteDuration: Int, CaseIterable, Identifiable, Sendable {
     }
 }
 
-/// A conversation mute as stored by `olaz-core` (seconds; `duration` -1 = until reopened).
+/// A conversation mute as the official `MuteDataManager` stores it, mirrored from `olaz-core`
+/// (seconds; `duration` -1 = until reopened).
 struct MuteInfo: Equatable, Sendable {
     var startTime: TimeInterval
     var duration: TimeInterval
 
     var isIndefinite: Bool { duration < 0 }
+    /// Official `getHMTime`: start + duration.
     var until: Date? { isIndefinite ? nil : Date(timeIntervalSince1970: startTime + duration) }
 
     func isActive(at now: Date = .now) -> Bool {
@@ -63,7 +77,8 @@ struct MuteInfo: Equatable, Sendable {
         return (hm, formatter.string(from: until))
     }
 
-    /// "Cho đến 14:30" / "Cho đến khi được mở lại" (delegated to `OlazCore.muteInfoFormatDescription`).
+    /// "Cho đến 14:30" / "Cho đến khi được mở lại" (official `STR_MUTE_TIME_LIMIT_V2` wording).
+    /// Swift supplies local-calendar parts; `OlazCore.muteInfoFormatDescription` assembles the text.
     func description(now: Date = .now, calendar: Calendar = .current) -> String {
         let parts = formattedTimeParts(now: now, calendar: calendar)
         return OlazCore.muteInfoFormatDescription(
@@ -75,6 +90,7 @@ struct MuteInfo: Equatable, Sendable {
     }
 
     /// Menu status line: "Đang tắt đến 14:30" / "Đang tắt đến 14:30 ngày 27/10" / "Đang tắt cho đến khi được mở lại".
+    /// Core derives the status wording from the same "Cho đến …" description and local-calendar parts.
     func statusText(now: Date = .now, calendar: Calendar = .current) -> String {
         let parts = formattedTimeParts(now: now, calendar: calendar)
         return OlazCore.muteInfoFormatStatusText(
@@ -104,10 +120,12 @@ internal struct NotifyBannerRecord: Equatable, Sendable {
     var silent: Bool
 }
 
-/// Notification preferences mirrored from `olaz-core` (`DirtyKey::NotificationSettings`).
+/// Official notification preferences mirrored from `olaz-core` (`DirtyKey::NotificationSettings`).
 struct NotificationSettingsState: Equatable {
     enum Authorization: String, Equatable, Sendable {
+        /// Not queried yet.
         case unknown
+        /// Running outside an app bundle (tests, probe).
         case unavailable
         case notDetermined, denied, authorized
 
@@ -134,14 +152,23 @@ struct NotificationSettingsState: Equatable {
 
     static let previewDefaultsKey = "olaz.notifications.showsPreview"
 
+    /// A settings snapshot has arrived from core preferences or the official settings adapter.
     var isLoaded = false
+    /// Official "Cài đặt thông báo ▸ Bật" (`askNoti`).
     var enabled = true
+    /// Official "Phát âm thanh khi có tin nhắn & thông báo mới" (`z_sound`).
     var sound = false
+    /// Whether `z_sound` was ever written (the official page defaults it on first visit).
     var hasSoundSetting = false
+    /// Show message text in banners; off → "Bạn có tin nhắn mới" (native option, the official client
+    /// only hides content while the app lock is on).
     var showsPreview = UserDefaults.standard.object(forKey: previewDefaultsKey) as? Bool ?? true
+    /// macOS permission for banners.
     var authorization: Authorization = .unknown
+    /// Conversation id → mute, as stored by the official mute service (may include expired entries).
     var mutes: [String: MuteInfo] = [:]
 
+    /// Active mute of a conversation, nil when notifications are on.
     func mute(for conversationId: String, now: Date = .now) -> MuteInfo? {
         guard let mute = mutes[conversationId], mute.isActive(at: now) else { return nil }
         return mute
@@ -149,12 +176,14 @@ struct NotificationSettingsState: Equatable {
 
     func isMuted(_ conversationId: String, now: Date = .now) -> Bool { mute(for: conversationId, now: now) != nil }
 
+    /// Active mutes, longest-standing first.
     func activeMutes(now: Date = .now) -> [(id: String, info: MuteInfo)] {
         mutes.filter { $0.value.isActive(at: now) }
             .map { (id: $0.key, info: $0.value) }
             .sorted { ($0.info.startTime, $0.id) < ($1.info.startTime, $1.id) }
     }
 
+    /// Applies a `{kind:'settings'}` payload from the adapter.
     mutating func apply(settings json: [String: Any]) {
         isLoaded = true
         if let value = json["enabled"] as? NSNumber { enabled = value.boolValue }
