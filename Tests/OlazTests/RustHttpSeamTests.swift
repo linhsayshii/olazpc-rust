@@ -104,7 +104,7 @@ private extension ZaloSessionClient {
         let resp = try await client.multipartBox(file: file.path, offset: 2, length: 5)
         #expect(JSONLossless.int64((resp.dict["data"] as? [String: Any])?["ok"]) == 1)
         let req = try #require(captured.withLock { $0 })
-        #expect((req.header("content-type") ?? "").hasPrefix("multipart/form-data; boundary=----OlazBoundary"))
+        #expect((req.header("content-type") ?? "").hasPrefix("multipart/form-data; boundary=----WebKitFormBoundary"))
         #expect(req.body.range(of: Data("23456".utf8)) != nil)
         #expect(req.body.range(of: Data("0123456".utf8)) == nil)
     }

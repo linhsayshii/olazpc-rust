@@ -110,7 +110,8 @@ async fn generic_multipart_matches_typed_and_swift_body_shape() {
     assert_eq!(r.header("X-Ignored"), None);
     let ct = r.header("Content-Type").unwrap();
     let boundary = ct.strip_prefix("multipart/form-data; boundary=").unwrap();
-    assert!(boundary.starts_with("----OlazBoundary") && boundary.len() == 16 + 32);
+    let suffix = boundary.strip_prefix("----WebKitFormBoundary").unwrap();
+    assert!(suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_alphanumeric()));
     let expected = olaz_net::request::multipart_body(boundary, &part);
     assert_eq!(r.body.as_deref(), Some(expected.as_slice()));
 }

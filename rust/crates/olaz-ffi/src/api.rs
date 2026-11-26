@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use olaz_api::{JsonObject, PollQueueCursor, PollState, SendTextArgs, ZaloApi};
+use olaz_api::{
+    JsonObject, PollQueueCursor, PollState, SendContactCardParams, SendTextArgs, ZaloApi,
+};
 use olaz_json::{parse_object_str, to_swift_json_string};
 use olaz_net::ReqwestTransport;
 use olaz_wire::{Mention, collect_name_uids, extract_batch_events};
@@ -369,6 +371,31 @@ impl CoreApi {
                 text_properties: args.text_properties.as_deref(),
                 ttl: args.ttl,
                 urgency: args.urgency,
+            })
+            .await
+        })
+        .await??;
+        Ok(SendResultRecord {
+            msg_id: r.msg_id,
+            cli_msg_id: r.cli_msg_id,
+            ts_ms: r.ts_ms,
+        })
+    }
+
+    /// Sends a contact card (Swift `sendContactCardAPI`).
+    pub async fn send_contact_card(
+        &self,
+        conv_id: String,
+        card_uid: String,
+        phone: Option<String>,
+    ) -> Result<SendResultRecord, CoreError> {
+        let api = Arc::clone(&self.api);
+        let r = run(async move {
+            api.send_contact_card(&SendContactCardParams {
+                conv_id,
+                card_uid,
+                phone,
+                client_id: None,
             })
             .await
         })

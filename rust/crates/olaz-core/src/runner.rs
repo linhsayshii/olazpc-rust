@@ -27,6 +27,7 @@ use crate::conversations::{
     load_local_account_from_store, to_wire_stored,
 };
 use crate::effect::{Effect, HistoryFetchPurpose, HostCall, OpResult, StoreOp};
+use crate::forward::{ComposerSendOutcome, FileResolutionOutcome, MediaResolutionOutcome};
 use crate::input::{
     BootstrapAliasesError, Command, CompletedLogin, E2eeQuoteArg, Input, LegacyCookie,
     PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
@@ -500,9 +501,40 @@ pub trait Host: Send + Sync {
     ) -> Result<olaz_api::SendMessageResult, String> {
         Err("send_e2ee_text not implemented by host".to_owned())
     }
-    // U6: transient in-chat card toast (`CardActionCenter.shared.show`).
-    // Default no-op until U4+U6 cut over Swift `CoreHost`.
-    async fn show_card(&self, _conv_id: String, _text: String) {}
+
+    // --- Forward domain callbacks (U8) ---
+    async fn show_card(&self, _conv_id: Option<String>, _text: String) {}
+    async fn resolve_media(
+        &self,
+        _conv_id: String,
+        _msg_id: String,
+        _kind: String,
+    ) -> MediaResolutionOutcome {
+        MediaResolutionOutcome::Unavailable
+    }
+    async fn resolve_file(
+        &self,
+        _conv_id: String,
+        _msg_id: String,
+        _name: String,
+        _url: Option<String>,
+    ) -> FileResolutionOutcome {
+        FileResolutionOutcome::Failed("resolve_file not implemented by host".to_owned())
+    }
+    async fn fetch_media_data(&self, _url: String) -> Option<String> {
+        None
+    }
+    async fn send_media(
+        &self,
+        _conv_id: String,
+        _paths: Vec<String>,
+        _cleanup_after: bool,
+    ) -> ComposerSendOutcome {
+        ComposerSendOutcome::Failed("send_media not implemented by host".to_owned())
+    }
+    async fn send_files(&self, _conv_id: String, _paths: Vec<String>) -> ComposerSendOutcome {
+        ComposerSendOutcome::Failed("send_files not implemented by host".to_owned())
+    }
 
     // --- Group polls callbacks (U12) ---
     /// Arms a per-poll incoming-message debounce timer on the host. Return `true` when the host
@@ -741,6 +773,11 @@ enum HostJob {
         on_pc: bool,
         _guard: InFlightGuard,
     },
+    ShowCard {
+        conv_id: Option<String>,
+        text: String,
+        _guard: InFlightGuard,
+    },
     PinTopic {
         conv_id: String,
         _guard: InFlightGuard,
@@ -760,11 +797,6 @@ enum HostJob {
         _guard: InFlightGuard,
     },
     // U6
-    ShowCard {
-        conv_id: String,
-        text: String,
-        _guard: InFlightGuard,
-    },
     Drain(oneshot::Sender<()>),
 }
 
@@ -2327,6 +2359,45 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         drop(guard);
                     });
                 }
+                // U8
+                Effect::AllocClientId { forward_id } => {
+                    let client_id = self.client.next_client_id();
+                    sink.send(Input::ForwardClientIdAllocated {
+                        forward_id,
+                        client_id,
+                    });
+                }
+                Effect::SendContactCardApi { forward_id, params } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = api
+                            .send_contact_card(&params)
+                            .await
+                            .map_err(|err| err.display_without_url());
+                        sink.send(Input::ForwardContactCardDone { forward_id, result });
+                        drop(guard);
+                    });
+                }
+                Effect::Host(HostCall::ResolveMedia {
+                    forward_id,
+                    conv_id,
+                    msg_id,
+                    kind,
+                }) => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let resolution = host.resolve_media(conv_id, msg_id, kind).await;
+                        sink.send(Input::ForwardMediaResolved {
+                            forward_id,
+                            resolution,
+                        });
+                        drop(guard);
+                    });
+                }
                 // U6
                 Effect::StartDeleteUndoExpiry { undo_gen, delay } => {
                     // Untracked background timer (like StartTypingExpiry / StartLpTimer) so
@@ -2514,6 +2585,73 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             recall_id,
                             retried_alt,
                             error,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::Host(HostCall::ResolveFile {
+                    forward_id,
+                    conv_id,
+                    msg_id,
+                    name,
+                    url,
+                }) => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let resolution = host.resolve_file(conv_id, msg_id, name, url).await;
+                        sink.send(Input::ForwardFileResolved {
+                            forward_id,
+                            resolution,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::Host(HostCall::FetchMediaData { forward_id, url }) => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let temp_path = host.fetch_media_data(url).await;
+                        sink.send(Input::ForwardFetchMediaDone {
+                            forward_id,
+                            temp_path,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::Host(HostCall::SendMedia {
+                    forward_id,
+                    conv_id,
+                    paths,
+                    cleanup_after,
+                }) => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let outcome = host.send_media(conv_id, paths, cleanup_after).await;
+                        sink.send(Input::ForwardSendMediaDone {
+                            forward_id,
+                            outcome,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::Host(HostCall::SendFiles {
+                    forward_id,
+                    conv_id,
+                    paths,
+                }) => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let outcome = host.send_files(conv_id, paths).await;
+                        sink.send(Input::ForwardSendFilesDone {
+                            forward_id,
+                            outcome,
                         });
                         drop(guard);
                     });
@@ -2865,15 +3003,19 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         HostCall::TransportBatchSettled => {
                             HostJob::TransportBatchSettled { _guard: guard }
                         }
-                        HostCall::SendE2eeText { .. } => {
-                            continue;
-                        }
-                        // U6
                         HostCall::ShowCard { conv_id, text } => HostJob::ShowCard {
                             conv_id,
                             text,
                             _guard: guard,
                         },
+                        HostCall::SendE2eeText { .. }
+                        | HostCall::ResolveMedia { .. }
+                        | HostCall::ResolveFile { .. }
+                        | HostCall::FetchMediaData { .. }
+                        | HostCall::SendMedia { .. }
+                        | HostCall::SendFiles { .. } => {
+                            continue;
+                        } // U6
                     };
                     self.send_host(job);
                 }
@@ -4079,6 +4221,13 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
             } => {
                 host.show_typing(conv_id, uid, on_pc).await;
             }
+            HostJob::ShowCard {
+                conv_id,
+                text,
+                _guard,
+            } => {
+                host.show_card(conv_id, text).await;
+            }
             HostJob::PinTopic { conv_id, _guard } => {
                 host.pin_topic(conv_id).await;
             }
@@ -4102,13 +4251,6 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                     .await;
             }
             // U6
-            HostJob::ShowCard {
-                conv_id,
-                text,
-                _guard,
-            } => {
-                host.show_card(conv_id, text).await;
-            }
             HostJob::Drain(tx) => {
                 let _ = tx.send(());
             }
@@ -5029,7 +5171,8 @@ mod tests {
             _duration: i64,
         ) {
         }
-        async fn show_card(&self, conv_id: String, text: String) {
+        async fn show_card(&self, conv_id: Option<String>, text: String) {
+            let conv_id = conv_id.unwrap_or_default();
             self.cards
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)

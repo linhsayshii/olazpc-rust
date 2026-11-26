@@ -13,10 +13,10 @@ This repository (<https://github.com/linhsayshii/olazpc-rust>) is an independent
 
 From the original project:
 
-- the Olaz app, its name and the original Swift codebase;
-- the original Zalo reverse-engineering work: wire protocol notes, QR login, `zpw_ws` framing, `ParamCipher`, request signing, service-map failover (see [REVERSE-ENGINEERING-NOTES.md](REVERSE-ENGINEERING-NOTES.md)).
+- the Olaz app, its name and the original Swift codebase, which hosted the official Zalo PC renderer (`app.asar`) in a `WKWebView` and emulated Electron's preload bridge and main process;
+- the original analysis of the official Zalo PC package and its preload bridge (`reanalysis/bridge-spec.md`, `reanalysis/bridge-table.json`).
 
-The history starts with Quan Nguyen's first commit `76eb26d` (2026-11-07). Later work, including the Rust core (`rust/`, UniFFI bindings in `Sources/OlazCore`) and many features, is by linhsayshii.
+The history starts with Quan Nguyen's first commit `76eb26d` (2026-11-07). The native Zalo protocol engine is by linhsayshii, first added in `74ec78f` (2026-11-22): `zpw_ws` framing, `ParamCipher`, request signing (`signkey`), native QR login and service-map failover (see [REVERSE-ENGINEERING-NOTES.md](REVERSE-ENGINEERING-NOTES.md)). Later work, including the Rust core (`rust/`, UniFFI bindings in `Sources/OlazCore`) and many features, is also by linhsayshii.
 
 ## Third-party components
 

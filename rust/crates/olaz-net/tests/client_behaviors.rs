@@ -159,8 +159,9 @@ async fn multipart_boundary_in_header_matches_body() {
     let req = c.transport().requests().pop().unwrap();
     let ct = req.header("Content-Type").unwrap();
     let boundary = ct.strip_prefix("multipart/form-data; boundary=").unwrap();
-    assert!(boundary.starts_with("----OlazBoundary"));
-    assert_eq!(boundary.len(), "----OlazBoundary".len() + 32);
+    let suffix = boundary.strip_prefix("----WebKitFormBoundary").unwrap();
+    assert_eq!(suffix.len(), 16);
+    assert!(suffix.bytes().all(|b| b.is_ascii_alphanumeric()));
     let body = req.body.clone().unwrap();
     assert!(body.starts_with(format!("--{boundary}\r\n").as_bytes()));
     assert!(body.ends_with(format!("\r\n--{boundary}--\r\n").as_bytes()));
