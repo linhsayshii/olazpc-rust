@@ -124,6 +124,7 @@ pub(crate) fn reduce_bootstrap(state: &mut CoreState, input: Input, out: &mut Re
                         for (k, v) in aliases {
                             state.conversations.identities.aliases.insert(k, v);
                         }
+                        out.dirty.insert(DirtyKey::Aliases);
                         if let Ok(bytes) =
                             serde_json::to_vec(&state.conversations.identities.aliases)
                         {
@@ -211,6 +212,7 @@ pub(crate) fn reduce_bootstrap(state: &mut CoreState, input: Input, out: &mut Re
 
             if let Some(rows) = mute_rows {
                 let mutes = parse_mute_entries(&rows, now_ms);
+                crate::reduce::notify::apply_bootstrap_mutes(state, &mutes, out);
                 out.effects
                     .push(Effect::Host(HostCall::ApplyMutes { mutes }));
             }

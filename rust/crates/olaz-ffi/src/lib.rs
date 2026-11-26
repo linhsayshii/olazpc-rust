@@ -46,6 +46,7 @@ mod error;
 mod http;
 mod media;
 mod messages;
+mod notify;
 mod raw_http;
 mod runtime;
 mod session;
@@ -74,6 +75,7 @@ pub use error::{CoreError, NetworkKind};
 pub use http::{CoreHttp, HttpMethod, HttpRequestRecord, UploadPartRecord};
 pub use media::*;
 pub use messages::*;
+pub use notify::*;
 pub use raw_http::{CoreRawHttp, RawRequestRecord, RawResponseRecord};
 pub use session::{CoreSession, CoreSessionStatus, QrListener, QrScanRecord, QrTicketRecord};
 pub use signal::{

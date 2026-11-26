@@ -111,6 +111,9 @@ pub fn reduce_session(state: &mut CoreState, input: Input, out: &mut ReduceOutpu
                 let self_conv_id = state.session.self_conversation_id.clone();
                 let starred_ids = hydration.starred_ids.clone();
                 let seen_reaction_event_ids = hydration.seen_reaction_event_ids.clone();
+                let notif_enabled = hydration.notif_enabled;
+                let notif_sound = hydration.notif_sound;
+                let muted_threads = hydration.muted_threads.clone();
                 state.conversations.hydrate_from_local(
                     *hydration,
                     &my_uid,
@@ -128,6 +131,18 @@ pub fn reduce_session(state: &mut CoreState, input: Input, out: &mut ReduceOutpu
                 if !state.actions.starred_ids.is_empty() {
                     out.dirty.insert(DirtyKey::StarredIds);
                 }
+                // U16: hydrate notification preferences from SQLite.
+                let init_auth = (state.notify.settings.authorization
+                    == crate::notify::NotifAuthorization::Unknown)
+                    .then_some(crate::notify::NotifAuthorization::Unavailable);
+                crate::reduce::notify::hydrate_notification_prefs(
+                    state,
+                    notif_enabled,
+                    notif_sound,
+                    muted_threads,
+                    init_auth,
+                    out,
+                );
             }
             match pending {
                 PendingStore::Boot {
@@ -352,6 +367,10 @@ fn reduce_command(state: &mut CoreState, cmd: Command, out: &mut ReduceOutput) {
             if starred_changed {
                 out.dirty.insert(DirtyKey::StarredIds);
             }
+            // U16
+            state.notify.reset_on_logout();
+            out.dirty.insert(DirtyKey::NotificationSettings);
+            out.dirty.insert(DirtyKey::Aliases);
             state.session.sign_out_notice = None;
             state.session.qr_gen = state.session.qr_gen.saturating_add(1);
             state.session.phase = Phase::Login(LoginState::generating());
@@ -448,6 +467,10 @@ pub(crate) fn enter_session_expired(state: &mut CoreState, reason: String, out: 
     if starred_changed {
         out.dirty.insert(DirtyKey::StarredIds);
     }
+    // U16
+    state.notify.reset_on_logout();
+    out.dirty.insert(DirtyKey::NotificationSettings);
+    out.dirty.insert(DirtyKey::Aliases);
     state.session.sign_out_notice = Some(reason);
     state.session.qr_gen = state.session.qr_gen.saturating_add(1);
     state.session.phase = Phase::Login(LoginState::generating());

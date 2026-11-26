@@ -25,6 +25,7 @@ mod e2ee;
 mod error;
 mod history;
 mod messaging;
+mod notify;
 mod poll;
 mod profiles;
 mod util;
@@ -50,4 +51,5 @@ pub use messaging::{
     CallSpec, ReactionParams, ReactionRequestSpec, RecallParams, SendTextArgs, SendTextParams,
     build_reaction_request, build_recall_message_request,
 };
+pub use notify::{build_set_mute_payload, extract_suggested_sticker_rows};
 pub use poll::{PollQueueCursor, PollState};

@@ -17,6 +17,12 @@ use crate::conversations::{
 };
 use crate::input::{E2eeQuoteArg, HiddenPinSyncKind, SeenTarget, StoreToken};
 use crate::messages::{IdentitySnapshot, MuteEntry};
+use crate::notify::{
+    CardActionOutcomeData, ContactCardStateResult, ContactProfileResult, FriendRequestPrepResult,
+    GroupInvitePreviewResult, GroupJoinResultData, NotifyBannerPayload, RawResponderBuckets,
+    ReminderRespondersData, ReminderSnapshotData, RespondReminderResult, SaveAliasResult,
+    SubmitFriendRequestResult, SuggestedStickerItem,
+};
 use crate::reduce::classify::MobileSyncEvent;
 use crate::typed_chat::TypedChatEnvelope;
 
@@ -56,9 +62,16 @@ pub enum StoreOp {
         key: String,
         values: Vec<String>,
     },
+    SetPreferenceBool {
+        key: String,
+        value: bool,
+    },
     SetPreferenceData {
         key: String,
         data: Vec<u8>,
+    },
+    LoadNotificationPrefs {
+        op_id: Option<u64>,
     },
     DeletePreference {
         key: String,
@@ -172,10 +185,19 @@ impl fmt::Debug for StoreOp {
                 .field("key", key)
                 .field("count", &values.len())
                 .finish(),
+            Self::SetPreferenceBool { key, value } => f
+                .debug_struct("SetPreferenceBool")
+                .field("key", key)
+                .field("value", value)
+                .finish(),
             Self::SetPreferenceData { key, data } => f
                 .debug_struct("SetPreferenceData")
                 .field("key", key)
                 .field("bytes", &data.len())
+                .finish(),
+            Self::LoadNotificationPrefs { op_id } => f
+                .debug_struct("LoadNotificationPrefs")
+                .field("op_id", op_id)
                 .finish(),
             Self::DeletePreference { key } => f
                 .debug_struct("DeletePreference")
@@ -269,6 +291,19 @@ pub enum OpResult {
     Bool(bool),
     Int(i64),
     OptI64(Option<i64>),
+    // U16
+    SuggestedStickers(Vec<SuggestedStickerItem>),
+    ContactCardState(ContactCardStateResult),
+    ContactProfile(Option<ContactProfileResult>),
+    FriendRequestPrep(FriendRequestPrepResult),
+    SubmitFriend(SubmitFriendRequestResult),
+    SaveAlias(SaveAliasResult),
+    GroupInvitePreview(GroupInvitePreviewResult),
+    JoinGroup(GroupJoinResultData),
+    CardAction(CardActionOutcomeData),
+    ReminderSnapshot(Option<ReminderSnapshotData>),
+    RespondReminder(RespondReminderResult),
+    ReminderResponders(Option<ReminderRespondersData>),
 }
 
 impl fmt::Debug for OpResult {
@@ -284,6 +319,18 @@ impl fmt::Debug for OpResult {
             Self::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
             Self::Int(n) => f.debug_tuple("Int").field(n).finish(),
             Self::OptI64(n) => f.debug_tuple("OptI64").field(n).finish(),
+            Self::SuggestedStickers(v) => f.debug_struct("SuggestedStickers").field("count", &v.len()).finish(),
+            Self::ContactCardState(r) => f.debug_tuple("ContactCardState").field(r).finish(),
+            Self::ContactProfile(r) => f.debug_tuple("ContactProfile").field(r).finish(),
+            Self::FriendRequestPrep(r) => f.debug_tuple("FriendRequestPrep").field(r).finish(),
+            Self::SubmitFriend(r) => f.debug_tuple("SubmitFriend").field(r).finish(),
+            Self::SaveAlias(r) => f.debug_tuple("SaveAlias").field(r).finish(),
+            Self::GroupInvitePreview(r) => f.debug_tuple("GroupInvitePreview").field(r).finish(),
+            Self::JoinGroup(r) => f.debug_tuple("JoinGroup").field(r).finish(),
+            Self::CardAction(r) => f.debug_tuple("CardAction").field(r).finish(),
+            Self::ReminderSnapshot(r) => f.debug_tuple("ReminderSnapshot").field(r).finish(),
+            Self::RespondReminder(r) => f.debug_tuple("RespondReminder").field(r).finish(),
+            Self::ReminderResponders(r) => f.debug_tuple("ReminderResponders").field(r).finish(),
         }
     }
 }
@@ -459,6 +506,27 @@ pub enum HostCall {
         conv_id: String,
         text: String,
     },
+    // U16
+    NotifyBanner(NotifyBannerPayload),
+    RequestNotifAuth {
+        op_id: Option<u64>,
+    },
+    StartCall {
+        uid: String,
+        video: bool,
+    },
+    // U13: Send category sticker via Swift host until U13 merges.
+    SendCategorySticker {
+        op_id: u64,
+        conv_id: String,
+        cate_id: i32,
+        sticker_id: i32,
+    },
+    // U9: Refresh contacts via Swift host until U9 merges, then complete `op_id` with `result`.
+    RefreshContacts {
+        op_id: Option<u64>,
+        result: OpResult,
+    },
 }
 
 impl fmt::Debug for HostCall {
@@ -598,6 +666,16 @@ impl fmt::Debug for HostCall {
                 .debug_struct("ShowCard")
                 .field("text_len", &text.len())
                 .finish(),
+            // U16
+            Self::NotifyBanner(b) => f.debug_tuple("NotifyBanner").field(b).finish(),
+            Self::RequestNotifAuth { op_id } => f.debug_struct("RequestNotifAuth").field("op_id", op_id).finish(),
+            Self::StartCall { video, .. } => f.debug_struct("StartCall").field("video", video).finish(),
+            Self::SendCategorySticker { cate_id, sticker_id, .. } => f
+                .debug_struct("SendCategorySticker")
+                .field("cate_id", cate_id)
+                .field("sticker_id", sticker_id)
+                .finish(),
+            Self::RefreshContacts { op_id, .. } => f.debug_struct("RefreshContacts").field("op_id", op_id).finish(),
         }
     }
 }
@@ -851,6 +929,76 @@ pub enum Effect {
         ttl: i64,
         now_ms: i64,
         op_id: Option<u64>,
+    },
+
+    // U16
+    SetMuteApi {
+        req_id: u64,
+        conv_id: String,
+        is_group: bool,
+        duration_secs: i64,
+        unmute: bool,
+        start_time_sec: i64,
+    },
+    FetchNotifyProfilesApi {
+        batch_id: u64,
+        uids: Vec<String>,
+    },
+    SuggestStickersApi {
+        op_id: u64,
+        keyword: String,
+    },
+    FetchContactProfileApi {
+        op_id: u64,
+        uid: String,
+    },
+    SendFriendRequestApi {
+        op_id: u64,
+        uid: String,
+        message: String,
+    },
+    SetAliasApi {
+        op_id: u64,
+        uid: String,
+        trimmed_name: String,
+    },
+    FetchGroupInvitePreviewApi {
+        op_id: u64,
+        url: String,
+    },
+    JoinGroupByLinkApi {
+        op_id: u64,
+        url: String,
+        fallback_group_id: Option<String>,
+    },
+    StartReminderWatchTimer {
+        waiter_id: u64,
+        delay: Duration,
+    },
+    CancelReminderWatchTimer {
+        waiter_id: u64,
+    },
+    FetchReminderDetailApi {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
+        event_id: String,
+    },
+    RespondReminderApi {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
+        event_id: String,
+        accept: bool,
+    },
+    FetchReminderRespondersApi {
+        op_id: u64,
+        event_id: String,
+    },
+    FetchResponderProfilesApi {
+        op_id: u64,
+        buckets: RawResponderBuckets,
+        uids: Vec<String>,
     },
 
     /// Domain activity delegated to Swift via `CoreHost`.
@@ -1136,6 +1284,69 @@ impl fmt::Debug for Effect {
                 .field("ttl", ttl)
                 .field("now_ms", now_ms)
                 .field("op_id", op_id)
+                .finish(),
+            // U16
+            Self::SetMuteApi { req_id, unmute, duration_secs, .. } => f
+                .debug_struct("SetMuteApi")
+                .field("req_id", req_id)
+                .field("unmute", unmute)
+                .field("duration_secs", duration_secs)
+                .finish(),
+            Self::FetchNotifyProfilesApi { batch_id, uids } => f
+                .debug_struct("FetchNotifyProfilesApi")
+                .field("batch_id", batch_id)
+                .field("uids_count", &uids.len())
+                .finish(),
+            Self::SuggestStickersApi { op_id, .. } => f
+                .debug_struct("SuggestStickersApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::FetchContactProfileApi { op_id, .. } => f
+                .debug_struct("FetchContactProfileApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::SendFriendRequestApi { op_id, .. } => f
+                .debug_struct("SendFriendRequestApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::SetAliasApi { op_id, .. } => f
+                .debug_struct("SetAliasApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::FetchGroupInvitePreviewApi { op_id, .. } => f
+                .debug_struct("FetchGroupInvitePreviewApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::JoinGroupByLinkApi { op_id, .. } => f
+                .debug_struct("JoinGroupByLinkApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::StartReminderWatchTimer { waiter_id, delay } => f
+                .debug_struct("StartReminderWatchTimer")
+                .field("waiter_id", waiter_id)
+                .field("delay", delay)
+                .finish(),
+            Self::CancelReminderWatchTimer { waiter_id } => f
+                .debug_struct("CancelReminderWatchTimer")
+                .field("waiter_id", waiter_id)
+                .finish(),
+            Self::FetchReminderDetailApi { op_id, .. } => f
+                .debug_struct("FetchReminderDetailApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::RespondReminderApi { op_id, accept, .. } => f
+                .debug_struct("RespondReminderApi")
+                .field("op_id", op_id)
+                .field("accept", accept)
+                .finish(),
+            Self::FetchReminderRespondersApi { op_id, .. } => f
+                .debug_struct("FetchReminderRespondersApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::FetchResponderProfilesApi { op_id, uids, .. } => f
+                .debug_struct("FetchResponderProfilesApi")
+                .field("op_id", op_id)
+                .field("uids_count", &uids.len())
                 .finish(),
             Self::Host(call) => f.debug_tuple("Host").field(call).finish(),
         }

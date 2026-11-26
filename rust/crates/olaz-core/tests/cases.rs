@@ -22,7 +22,6 @@ const PENDING_DOMAINS: &[&str] = &[
     "contacts",
     "forward",
     "groups",
-    "notify",
     "pins",
     "polls",
     "search",

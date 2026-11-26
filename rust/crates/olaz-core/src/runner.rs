@@ -32,6 +32,10 @@ use crate::input::{
     PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
 };
 use crate::messages::MuteEntry;
+use crate::notify::{
+    CARD_DEFAULT_UNSUPPORTED, CardActionOutcomeData, MuteInfo, NotifAuthorization,
+    NotifyBannerPayload,
+};
 use crate::reduce::classify::MobileSyncEvent;
 use crate::state::PersistedTransportState;
 use crate::typed_chat::{
@@ -493,6 +497,27 @@ pub trait Host: Send + Sync {
     // U6: transient in-chat card toast (`CardActionCenter.shared.show`).
     // Default no-op until U4+U6 cut over Swift `CoreHost`.
     async fn show_card(&self, _conv_id: String, _text: String) {}
+    // U16
+    async fn notify_banner(&self, _banner: NotifyBannerPayload) {}
+    async fn request_notif_auth(&self) -> NotifAuthorization {
+        NotifAuthorization::Unavailable
+    }
+    async fn start_call(&self, _uid: String, _video: bool) {}
+    // U13: Send category sticker via Swift host until U13 merges.
+    async fn send_category_sticker(
+        &self,
+        _conv_id: String,
+        _cate_id: i32,
+        _sticker_id: i32,
+    ) -> CardActionOutcomeData {
+        CardActionOutcomeData::Unsupported(CARD_DEFAULT_UNSUPPORTED.to_owned())
+    }
+    // U9: Refresh contacts via Swift host until U9 merges.
+    async fn refresh_contacts(&self) {}
+    async fn arm_reminder_watch_timer(&self, _waiter_id: u64, _delay_secs: f64) -> bool {
+        false
+    }
+    async fn cancel_reminder_watch_timer(&self, _waiter_id: u64) {}
 }
 
 enum HostJob {
@@ -734,6 +759,35 @@ enum HostJob {
         text: String,
         _guard: InFlightGuard,
     },
+    // U16
+    NotifyBanner {
+        banner: NotifyBannerPayload,
+        _guard: InFlightGuard,
+    },
+    RequestNotifAuth {
+        op_id: Option<u64>,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    StartCall {
+        uid: String,
+        video: bool,
+        _guard: InFlightGuard,
+    },
+    SendCategorySticker {
+        op_id: u64,
+        conv_id: String,
+        cate_id: i32,
+        sticker_id: i32,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    RefreshContacts {
+        op_id: Option<u64>,
+        result: OpResult,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
     Drain(oneshot::Sender<()>),
 }
 
@@ -794,6 +848,8 @@ pub struct SessionEffectRunner<T: Transport + 'static> {
     typing_expiry_aborts: Arc<Mutex<BTreeMap<String, (u64, AbortHandle)>>>,
     // U6: active delete-for-me undo bar expiry timer (`(undo_gen, AbortHandle)`).
     delete_undo_abort: Arc<Mutex<Option<(u64, AbortHandle)>>>,
+    // U16: active reminder watch timers (`waiter_id -> AbortHandle`).
+    reminder_watch_aborts: Arc<Mutex<BTreeMap<u64, AbortHandle>>>,
     host_worker_abort: AbortHandle,
     store_worker_abort: AbortHandle,
     runtime: Handle,
@@ -891,6 +947,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
             lp_fetch_abort: Mutex::new(None),
             typing_expiry_aborts: Arc::new(Mutex::new(BTreeMap::new())),
             delete_undo_abort: Arc::new(Mutex::new(None)),
+            reminder_watch_aborts: Arc::new(Mutex::new(BTreeMap::new())),
             host_worker_abort: worker_handle.abort_handle(),
             store_worker_abort: store_handle.abort_handle(),
             runtime,
@@ -982,6 +1039,14 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
             handle.abort();
         }
         self.cancel_typing_expiry(None);
+        for (_, h) in std::mem::take(
+            &mut *self
+                .reminder_watch_aborts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        ) {
+            h.abort();
+        }
         self.cancel_delete_undo_timer();
     }
 
@@ -2223,6 +2288,254 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         drop(guard);
                     });
                 }
+                // U16
+                Effect::SetMuteApi {
+                    req_id,
+                    conv_id,
+                    is_group,
+                    duration_secs,
+                    unmute,
+                    start_time_sec,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let ok = api
+                            .set_mute(&conv_id, is_group, duration_secs, unmute, Some(start_time_sec))
+                            .await
+                            .is_ok();
+                        sink.send(Input::SetMuteApiDone { req_id, ok });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchNotifyProfilesApi { batch_id, uids } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let profiles = match api.fetch_profiles(&uids).await {
+                            Ok(resp) => olaz_wire::extract_profiles_map(&resp),
+                            Err(_) => Map::new(),
+                        };
+                        sink.send(Input::NotifyProfilesFetched { batch_id, profiles });
+                        drop(guard);
+                    });
+                }
+                Effect::SuggestStickersApi { op_id, keyword } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let rows = api.suggest_stickers(&keyword).await.ok();
+                        sink.send(Input::SuggestedStickersFetched { op_id, rows });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchContactProfileApi { op_id, uid } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let row = match api.fetch_profiles(std::slice::from_ref(&uid)).await {
+                            Ok(resp) => olaz_wire::extract_profiles_map(&resp)
+                                .remove(&uid)
+                                .and_then(|v| match v {
+                                    Value::Object(m) => Some(m),
+                                    _ => None,
+                                }),
+                            Err(_) => None,
+                        };
+                        sink.send(Input::ContactProfileFetched { op_id, uid, row });
+                        drop(guard);
+                    });
+                }
+                Effect::SendFriendRequestApi { op_id, uid, message } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let ok = api.send_friend_request(&uid, &message).await.is_ok();
+                        sink.send(Input::SubmitFriendDone { op_id, ok });
+                        drop(guard);
+                    });
+                }
+                Effect::SetAliasApi {
+                    op_id,
+                    uid,
+                    trimmed_name,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let ok = api.set_alias(&uid, &trimmed_name).await.is_ok();
+                        sink.send(Input::SaveAliasDone {
+                            op_id,
+                            uid,
+                            trimmed_name,
+                            ok,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchGroupInvitePreviewApi { op_id, url } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let resp = api.fetch_group_link_detail(&url).await.ok();
+                        sink.send(Input::GroupInvitePreviewDone { op_id, url, resp });
+                        drop(guard);
+                    });
+                }
+                Effect::JoinGroupByLinkApi {
+                    op_id,
+                    url,
+                    fallback_group_id,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = api.join_group_by_link(&url).await;
+                        sink.send(Input::JoinGroupDone {
+                            op_id,
+                            fallback_group_id,
+                            result,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::StartReminderWatchTimer { waiter_id, delay } => {
+                    let deadline = tokio::time::Instant::now() + delay;
+                    let delay_secs = delay.as_secs_f64();
+                    let host = Arc::clone(&self.host);
+                    let timer_sink = sink.clone();
+                    let aborts = Arc::clone(&self.reminder_watch_aborts);
+                    let aborts_inner = Arc::clone(&aborts);
+                    let arm_guard = sink.track();
+                    let handle = self
+                        .runtime
+                        .spawn(async move {
+                            let handled = host.arm_reminder_watch_timer(waiter_id, delay_secs).await;
+                            drop(arm_guard);
+                            if handled {
+                                return;
+                            }
+                            tokio::time::sleep_until(deadline).await;
+                            aborts_inner
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .remove(&waiter_id);
+                            timer_sink.send(Input::ReminderWatchTimeout { waiter_id });
+                        })
+                        .abort_handle();
+                    if let Some(prev) = aborts
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(waiter_id, handle)
+                    {
+                        prev.abort();
+                    }
+                }
+                Effect::CancelReminderWatchTimer { waiter_id } => {
+                    if let Some(prev) = self
+                        .reminder_watch_aborts
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&waiter_id)
+                    {
+                        prev.abort();
+                    }
+                    let host = Arc::clone(&self.host);
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        host.cancel_reminder_watch_timer(waiter_id).await;
+                        drop(guard);
+                    });
+                }
+                Effect::FetchReminderDetailApi {
+                    op_id,
+                    conv_id,
+                    msg_id,
+                    event_id,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let resp = api.fetch_reminder_detail(&event_id).await.ok();
+                        sink.send(Input::ReminderDetailFetched {
+                            op_id,
+                            conv_id,
+                            msg_id,
+                            event_id,
+                            resp,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::RespondReminderApi {
+                    op_id,
+                    conv_id,
+                    msg_id,
+                    event_id,
+                    accept,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let ok = api.respond_reminder(&conv_id, &event_id, accept).await.is_ok();
+                        let detail_resp = if ok {
+                            api.fetch_reminder_detail(&event_id).await.ok()
+                        } else {
+                            None
+                        };
+                        sink.send(Input::RespondReminderDone {
+                            op_id,
+                            conv_id,
+                            msg_id,
+                            event_id,
+                            accept,
+                            ok,
+                            detail_resp,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchReminderRespondersApi { op_id, event_id } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let resp = api.fetch_reminder_responders(&event_id).await.ok();
+                        sink.send(Input::ReminderRespondersFetched { op_id, resp });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchResponderProfilesApi {
+                    op_id,
+                    buckets,
+                    uids,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let profiles = match api.fetch_profiles(&uids).await {
+                            Ok(resp) => olaz_wire::extract_profiles_map(&resp),
+                            Err(_) => Map::new(),
+                        };
+                        sink.send(Input::ReminderResponderProfilesFetched {
+                            op_id,
+                            buckets,
+                            profiles,
+                        });
+                        drop(guard);
+                    });
+                }
                 Effect::UpdateAutoDeleteApi {
                     conv_id,
                     ttl,
@@ -2531,6 +2844,40 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             text,
                             _guard: guard,
                         },
+                        // U16
+                        HostCall::NotifyBanner(banner) => HostJob::NotifyBanner {
+                            banner,
+                            _guard: guard,
+                        },
+                        HostCall::RequestNotifAuth { op_id } => HostJob::RequestNotifAuth {
+                            op_id,
+                            sink: sink.clone(),
+                            _guard: guard,
+                        },
+                        HostCall::StartCall { uid, video } => HostJob::StartCall {
+                            uid,
+                            video,
+                            _guard: guard,
+                        },
+                        HostCall::SendCategorySticker {
+                            op_id,
+                            conv_id,
+                            cate_id,
+                            sticker_id,
+                        } => HostJob::SendCategorySticker {
+                            op_id,
+                            conv_id,
+                            cate_id,
+                            sticker_id,
+                            sink: sink.clone(),
+                            _guard: guard,
+                        },
+                        HostCall::RefreshContacts { op_id, result } => HostJob::RefreshContacts {
+                            op_id,
+                            result,
+                            sink: sink.clone(),
+                            _guard: guard,
+                        },
                     };
                     self.send_host(job);
                 }
@@ -2550,6 +2897,14 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
         self.cancel_active_tasks();
         self.cancel_bootstrap_tasks();
         self.cancel_typing_expiry(None);
+        for (_, h) in std::mem::take(
+            &mut *self
+                .reminder_watch_aborts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        ) {
+            h.abort();
+        }
         self.cancel_long_poll();
         self.ws_driver.stop(false);
         self.host_worker_abort.abort();
@@ -2882,6 +3237,50 @@ async fn run_store_worker(
                             persist_conversations,
                         });
                     }
+                    StoreOp::LoadNotificationPrefs { op_id } => {
+                        let (enabled, sound, mutes) = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let enabled =
+                                        store.get_preference_bool("notifEnabled", true).unwrap_or(true);
+                                    let sound =
+                                        store.get_preference_bool("notifSound", true).unwrap_or(true);
+                                    let mutes = store
+                                        .get_preference_data("mutedThreads")
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|data| {
+                                            let Some(Value::Array(rows)) =
+                                                olaz_wire::lossless::parse_any(&data)
+                                            else {
+                                                return None;
+                                            };
+                                            let mut map = BTreeMap::new();
+                                            for row in rows {
+                                                if let Some(obj) = row.as_object()
+                                                    && let Some((id, info)) = MuteInfo::parse_row(obj)
+                                                {
+                                                    map.insert(id, info);
+                                                }
+                                            }
+                                            Some(map)
+                                        });
+                                    (enabled, sound, mutes)
+                                })
+                                .await
+                                .unwrap_or((true, true, None))
+                        } else {
+                            (true, true, None)
+                        };
+                        sink.send(Input::NotificationPrefsLoaded {
+                            enabled,
+                            sound,
+                            mutes,
+                            op_id,
+                        });
+                    }
                     other => {
                         if let Some(store_arc) = store_opt {
                             let _ = runtime
@@ -2924,6 +3323,9 @@ async fn run_store_worker(
                                         }
                                         StoreOp::SetPreferenceStrings { key, values } => {
                                             let _ = store.set_preference_strings(&key, &values);
+                                        }
+                                        StoreOp::SetPreferenceBool { key, value } => {
+                                            let _ = store.set_preference_bool(&key, value);
                                         }
                                         StoreOp::SetPreferenceData { key, data } => {
                                             let _ = store.set_preference_data(&key, &data);
@@ -3021,7 +3423,8 @@ async fn run_store_worker(
                                         | StoreOp::LoadOpenLocalMessages { .. }
                                         | StoreOp::LoadOlderStoreMessages { .. }
                                         | StoreOp::MarkRecalledAndCheckLatest { .. }
-                                        | StoreOp::DeleteMessageAndCheckLatest { .. } => {}
+                                        | StoreOp::DeleteMessageAndCheckLatest { .. }
+                                        | StoreOp::LoadNotificationPrefs { .. } => {}
                                     }
                                 })
                                 .await;
@@ -3748,6 +4151,47 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 _guard,
             } => {
                 host.show_card(conv_id, text).await;
+            }
+            // U16
+            HostJob::NotifyBanner { banner, _guard } => {
+                host.notify_banner(banner).await;
+            }
+            HostJob::RequestNotifAuth {
+                op_id,
+                sink,
+                _guard,
+            } => {
+                let auth = host.request_notif_auth().await;
+                sink.send(Input::NotifAuthResolved { auth, op_id });
+            }
+            HostJob::StartCall {
+                uid,
+                video,
+                _guard,
+            } => {
+                host.start_call(uid, video).await;
+            }
+            HostJob::SendCategorySticker {
+                op_id,
+                conv_id,
+                cate_id,
+                sticker_id,
+                sink,
+                _guard,
+            } => {
+                let outcome = host.send_category_sticker(conv_id, cate_id, sticker_id).await;
+                sink.send(Input::CategoryStickerSent { op_id, outcome });
+            }
+            HostJob::RefreshContacts {
+                op_id,
+                result,
+                sink,
+                _guard,
+            } => {
+                host.refresh_contacts().await;
+                if let Some(id) = op_id {
+                    sink.send(Input::OpApiDone { op_id: id, result });
+                }
             }
             HostJob::Drain(tx) => {
                 let _ = tx.send(());

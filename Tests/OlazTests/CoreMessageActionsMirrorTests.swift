@@ -29,7 +29,9 @@ import Testing
             messageConfirm: nil,
             autoDelete: nil,
             starredIds: nil,
-            cachedProfiles: nil
+            cachedProfiles: nil,
+            notificationSettings: nil,
+            aliases: nil
         )
     }
 

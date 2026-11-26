@@ -122,6 +122,8 @@ extension ZaloEngine {
         requestNotifAuthHostHandler = nil
         notificationCalendar = .current
         reminderWatchSleep = nil
+        reminderWatchTimerTasks.values.forEach { $0.cancel() }
+        reminderWatchTimerTasks.removeAll()
         notificationTasks.values.forEach { $0.cancel() }
         notificationTasks.removeAll()
         resetCardState()

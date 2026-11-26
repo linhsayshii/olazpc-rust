@@ -37,6 +37,14 @@ use crate::conversations::{
     MessagePreviewInputRecord, PinBoardRecord, PromptUpdateRecord, RankEntry, SeenTargetRecord,
 };
 use crate::error::{CoreError, NetworkKind};
+use crate::notify::{
+    AliasEntryRecord, CardActionOutcomeRecord, ContactCardStateRecord, ContactProfileRecord,
+    FriendRequestOriginRecord, FriendRequestPrepRecord, GroupInvitePreviewRecord, GroupJoinRecord,
+    NotifAuthorizationRecord, NotificationSettingsRecord, NotifyBannerPayloadRecord,
+    PinReminderRefRecord, ReminderRespondersRecord, ReminderSnapshotRecord, RespondReminderRecord,
+    SaveAliasRecord, SubmitFriendRecord, SuggestedStickerRecord, alias_map_to_records,
+    default_failed_respond_reminder_record, default_unsupported_card_record,
+};
 use crate::messages::{
     ContactsStateRecord, FreshnessMapEntry, MessageMetaRecord, MuteEntryRecord, WindowDeltaRecord,
     records_to_chat_messages,
@@ -660,6 +668,8 @@ pub struct CoreChangesRecord {
     pub auto_delete: Option<AutoDeleteUpdateRecord>,
     pub starred_ids: Option<Vec<String>>,
     pub cached_profiles: Option<Vec<CachedProfileEntry>>,
+    pub notification_settings: Option<NotificationSettingsRecord>,
+    pub aliases: Option<Vec<AliasEntryRecord>>,
 }
 
 impl fmt::Debug for CoreChangesRecord {
@@ -730,6 +740,8 @@ impl From<CoreChanges> for CoreChangesRecord {
                     })
                     .collect()
             }),
+            notification_settings: c.notification_settings.map(Into::into),
+            aliases: c.aliases.map(alias_map_to_records),
         }
     }
 }
@@ -1088,6 +1100,8 @@ impl CoreOfflineConversations {
             auto_delete: None,
             starred_ids: None,
             cached_profiles: None,
+            notification_settings: None,
+            aliases: None,
         };
         for key in out.dirty {
             match key {
@@ -1146,7 +1160,9 @@ impl CoreOfflineConversations {
                 | DirtyKey::MessageConfirm
                 | DirtyKey::AutoDelete
                 | DirtyKey::StarredIds
-                | DirtyKey::CachedProfiles => {}
+                | DirtyKey::CachedProfiles
+                | DirtyKey::NotificationSettings
+                | DirtyKey::Aliases => {}
             }
         }
         rec
@@ -1379,6 +1395,20 @@ pub trait CoreHost: Send + Sync {
         quote: Option<E2eeQuoteArgRecord>,
     ) -> E2eeSendOutcomeRecord;
     async fn show_card(&self, conv_id: String, text: String);
+
+    // --- U16 notification & card-action host callbacks ---
+    async fn notify_banner(&self, banner: NotifyBannerPayloadRecord);
+    async fn request_notif_auth(&self) -> NotifAuthorizationRecord;
+    async fn start_call(&self, uid: String, video: bool);
+    async fn send_category_sticker(
+        &self,
+        conv_id: String,
+        cate_id: i32,
+        sticker_id: i32,
+    ) -> CardActionOutcomeRecord;
+    async fn refresh_contacts(&self);
+    async fn arm_reminder_watch_timer(&self, waiter_id: u64, delay_secs: f64) -> bool;
+    async fn cancel_reminder_watch_timer(&self, waiter_id: u64);
 }
 
 struct FfiHostBridge(Arc<dyn CoreHost>);
@@ -1746,6 +1776,42 @@ impl Host for FfiHostBridge {
 
     async fn show_card(&self, conv_id: String, text: String) {
         self.0.show_card(conv_id, text).await;
+    }
+
+    async fn notify_banner(&self, banner: olaz_core::NotifyBannerPayload) {
+        self.0.notify_banner(banner.into()).await;
+    }
+
+    async fn request_notif_auth(&self) -> olaz_core::NotifAuthorization {
+        self.0.request_notif_auth().await.into()
+    }
+
+    async fn start_call(&self, uid: String, video: bool) {
+        self.0.start_call(uid, video).await;
+    }
+
+    async fn send_category_sticker(
+        &self,
+        conv_id: String,
+        cate_id: i32,
+        sticker_id: i32,
+    ) -> olaz_core::CardActionOutcomeData {
+        self.0
+            .send_category_sticker(conv_id, cate_id, sticker_id)
+            .await
+            .into()
+    }
+
+    async fn refresh_contacts(&self) {
+        self.0.refresh_contacts().await;
+    }
+
+    async fn arm_reminder_watch_timer(&self, waiter_id: u64, delay_secs: f64) -> bool {
+        self.0.arm_reminder_watch_timer(waiter_id, delay_secs).await
+    }
+
+    async fn cancel_reminder_watch_timer(&self, waiter_id: u64) {
+        self.0.cancel_reminder_watch_timer(waiter_id).await;
     }
 }
 
@@ -2876,6 +2942,440 @@ impl CoreEngine {
         .await
     }
 
+    // --- U16 notifications, card actions, invites, reminders, and sticker suggestions ---
+
+    pub fn set_initial_notification_auth(&self, auth: NotifAuthorizationRecord) {
+        self.handle
+            .send(Command::SetNotifAuthorization { auth: auth.into() });
+    }
+
+    pub fn set_notifications_enabled(&self, enabled: bool) {
+        self.handle.send(Command::SetNotificationsEnabled { enabled });
+    }
+
+    pub async fn set_notifications_enabled_and_wait(&self, enabled: bool) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            handle
+                .request_unit(Command::SetNotificationsEnabled { enabled })
+                .await;
+            runner.flush_host().await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn set_notification_sound(&self, enabled: bool) {
+        self.handle.send(Command::SetNotificationSound { enabled });
+    }
+
+    pub async fn set_notification_sound_and_wait(&self, enabled: bool) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            handle
+                .request_unit(Command::SetNotificationSound { enabled })
+                .await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn set_message_preview(&self, shown: bool) {
+        self.handle.send(Command::SetMessagePreview { shown });
+    }
+
+    pub fn mute_conversation(&self, conv_id: String, duration_secs: i64, now_ms: i64) {
+        self.handle.send(Command::MuteConversation {
+            conv_id,
+            duration_secs,
+            now_ms,
+        });
+    }
+
+    pub async fn mute_conversation_and_wait(
+        &self,
+        conv_id: String,
+        duration_secs: i64,
+        now_ms: i64,
+    ) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            handle
+                .request_unit(Command::MuteConversation {
+                    conv_id,
+                    duration_secs,
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn unmute_conversation(&self, conv_id: String, now_ms: i64) {
+        self.handle.send(Command::UnmuteConversation {
+            conv_id,
+            now_ms,
+        });
+    }
+
+    pub async fn unmute_conversation_and_wait(
+        &self,
+        conv_id: String,
+        now_ms: i64,
+    ) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            handle
+                .request_unit(Command::UnmuteConversation { conv_id, now_ms })
+                .await;
+            runner.flush_host().await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn handle_notification_settings_payload(&self, payload_json: String) {
+        let payload = olaz_json::parse_object_str(&payload_json).unwrap_or_default();
+        self.handle
+            .send(Command::HandleNotificationSettingsPayload { payload });
+    }
+
+    pub async fn load_notification_preferences(&self) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            handle
+                .request_unit(Command::LoadNotificationPreferences)
+                .await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub async fn notify_incoming_batch(
+        &self,
+        messages: Vec<ChatMessageRecord>,
+        now_ms: i64,
+    ) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        let msgs = records_to_chat_messages(messages);
+        run(async move {
+            handle
+                .request_unit(Command::NotifyIncomingBatch {
+                    messages: msgs,
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub async fn perform_card_action(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        action_ref: String,
+    ) -> Result<CardActionOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let out = match handle
+                .request(Command::PerformCardAction {
+                    conv_id,
+                    msg_id,
+                    action_ref,
+                })
+                .await
+            {
+                Some(olaz_core::OpResult::CardAction(d)) => d.into(),
+                _ => default_unsupported_card_record(),
+            };
+            runner.flush_host().await;
+            runner.flush_store().await;
+            out
+        })
+        .await
+    }
+
+    pub async fn suggested_stickers(
+        &self,
+        conv_id: String,
+        msg_id: String,
+    ) -> Result<Vec<SuggestedStickerRecord>, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            match handle
+                .request(Command::SuggestedStickers { conv_id, msg_id })
+                .await
+            {
+                Some(olaz_core::OpResult::SuggestedStickers(list)) => {
+                    list.into_iter().map(Into::into).collect()
+                }
+                _ => Vec::new(),
+            }
+        })
+        .await
+    }
+
+    pub async fn contact_card_state(&self, uid: String) -> Result<ContactCardStateRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            match handle.request(Command::ContactCardState { uid }).await {
+                Some(olaz_core::OpResult::ContactCardState(s)) => s.into(),
+                _ => ContactCardStateRecord {
+                    is_self: false,
+                    is_friend: false,
+                },
+            }
+        })
+        .await
+    }
+
+    pub async fn contact_profile(
+        &self,
+        uid: String,
+    ) -> Result<Option<ContactProfileRecord>, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let out = match handle.request(Command::ContactProfile { uid }).await {
+                Some(olaz_core::OpResult::ContactProfile(opt)) => opt.map(Into::into),
+                _ => None,
+            };
+            runner.flush_store().await;
+            out
+        })
+        .await
+    }
+
+    pub async fn prepare_friend_request(
+        &self,
+        uid: String,
+        conv_id: String,
+        via: FriendRequestOriginRecord,
+    ) -> Result<FriendRequestPrepRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            match handle
+                .request(Command::PrepareFriendRequest {
+                    uid,
+                    conv_id,
+                    via: via.into(),
+                })
+                .await
+            {
+                Some(olaz_core::OpResult::FriendRequestPrep(p)) => p.into(),
+                _ => FriendRequestPrepRecord {
+                    state: "none".to_owned(),
+                    default_message: String::new(),
+                    max_message: 150,
+                },
+            }
+        })
+        .await
+    }
+
+    pub async fn submit_friend_request(
+        &self,
+        uid: String,
+        message: String,
+    ) -> Result<SubmitFriendRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let out = match handle
+                .request(Command::SubmitFriendRequest { uid, message })
+                .await
+            {
+                Some(olaz_core::OpResult::SubmitFriend(r)) => r.into(),
+                _ => SubmitFriendRecord {
+                    ok: false,
+                    text: "Không gửi được lời mời kết bạn.".to_owned(),
+                    pending: false,
+                },
+            };
+            runner.flush_host().await;
+            out
+        })
+        .await
+    }
+
+    pub async fn save_alias(&self, uid: String, name: String) -> Result<SaveAliasRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let out = match handle.request(Command::SaveAlias { uid, name }).await {
+                Some(olaz_core::OpResult::SaveAlias(r)) => r.into(),
+                _ => SaveAliasRecord {
+                    ok: false,
+                    text: "Không lưu được tên gợi nhớ.".to_owned(),
+                },
+            };
+            runner.flush_store().await;
+            let _ = handle.settle().await;
+            out
+        })
+        .await
+    }
+
+    pub async fn group_invite_preview(
+        &self,
+        url: String,
+    ) -> Result<GroupInvitePreviewRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            match handle.request(Command::GroupInvitePreview { url }).await {
+                Some(olaz_core::OpResult::GroupInvitePreview(p)) => p.into(),
+                _ => GroupInvitePreviewRecord::from(olaz_core::GroupInvitePreviewResult::default()),
+            }
+        })
+        .await
+    }
+
+    pub async fn join_group(
+        &self,
+        url: String,
+        preview_group_id: Option<String>,
+    ) -> Result<GroupJoinRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let out = match handle
+                .request(Command::JoinGroup {
+                    url,
+                    preview_group_id,
+                })
+                .await
+            {
+                Some(olaz_core::OpResult::JoinGroup(r)) => r.into(),
+                _ => GroupJoinRecord {
+                    state: "error".to_owned(),
+                    group_id: String::new(),
+                    text: "Vào nhóm không thành công.".to_owned(),
+                },
+            };
+            runner.flush_host().await;
+            out
+        })
+        .await
+    }
+
+    pub fn sync_pin_reminder_refs(&self, conv_id: String, items: Vec<PinReminderRefRecord>) {
+        self.handle.send(Command::SyncPinReminderRefs {
+            conv_id,
+            refs: items.into_iter().map(Into::into).collect(),
+        });
+    }
+
+    pub async fn reminder_watch(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        signature: String,
+    ) -> Result<Option<ReminderSnapshotRecord>, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            match handle
+                .request(Command::ReminderWatch {
+                    conv_id,
+                    msg_id,
+                    signature,
+                })
+                .await
+            {
+                Some(olaz_core::OpResult::ReminderSnapshot(opt)) => opt.map(Into::into),
+                _ => None,
+            }
+        })
+        .await
+    }
+
+    pub async fn respond_reminder(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        accept: bool,
+    ) -> Result<RespondReminderRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            match handle
+                .request(Command::RespondReminder {
+                    conv_id,
+                    msg_id,
+                    accept,
+                })
+                .await
+            {
+                Some(olaz_core::OpResult::RespondReminder(r)) => r.into(),
+                _ => default_failed_respond_reminder_record(),
+            }
+        })
+        .await
+    }
+
+    pub async fn reminder_responders(
+        &self,
+        conv_id: String,
+        msg_id: String,
+    ) -> Result<Option<ReminderRespondersRecord>, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let out = match handle
+                .request(Command::ReminderResponders { conv_id, msg_id })
+                .await
+            {
+                Some(olaz_core::OpResult::ReminderResponders(opt)) => opt.map(Into::into),
+                _ => None,
+            };
+            runner.flush_store().await;
+            out
+        })
+        .await
+    }
+
+    pub fn reset_card_state(&self) {
+        self.handle.send(Command::ResetCardState);
+    }
+
+    pub fn fire_reminder_watch_timer(&self, waiter_id: u64) {
+        self.handle
+            .send(Command::FireReminderWatchTimer { waiter_id });
+    }
+
     // --- Core-owned WebSocket pass-throughs for Swift feature domains ---
 
     /// Sends a raw WebSocket frame. `false` unless authenticated and the write succeeded.
@@ -3153,6 +3653,24 @@ mod tests {
             E2eeSendOutcomeRecord::Aborted
         }
         async fn show_card(&self, _conv_id: String, _text: String) {}
+        async fn notify_banner(&self, _banner: NotifyBannerPayloadRecord) {}
+        async fn request_notif_auth(&self) -> NotifAuthorizationRecord {
+            NotifAuthorizationRecord::Unavailable
+        }
+        async fn start_call(&self, _uid: String, _video: bool) {}
+        async fn send_category_sticker(
+            &self,
+            _conv_id: String,
+            _cate_id: i32,
+            _sticker_id: i32,
+        ) -> CardActionOutcomeRecord {
+            default_unsupported_card_record()
+        }
+        async fn refresh_contacts(&self) {}
+        async fn arm_reminder_watch_timer(&self, _waiter_id: u64, _delay_secs: f64) -> bool {
+            false
+        }
+        async fn cancel_reminder_watch_timer(&self, _waiter_id: u64) {}
     }
 
     #[test]

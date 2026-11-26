@@ -13,6 +13,7 @@ use std::sync::{Mutex, PoisonError};
 use tokio::sync::Notify;
 
 use crate::actions::{DeleteUndoSnapshot, MessageConfirmState};
+use crate::notify::NotificationSettingsSnapshot;
 use crate::conversations::{
     CachedProfile, ConversationActionUI, ConversationActionsState, ConversationExtras,
     ConversationPrompt, ConversationSummary,
@@ -47,6 +48,9 @@ pub enum DirtyKey {
     AutoDelete,
     StarredIds,
     CachedProfiles,
+    // U16
+    NotificationSettings,
+    Aliases,
 }
 
 /// Set of keys dirtied by one `reduce` step.
@@ -103,6 +107,9 @@ pub struct CoreChanges {
     pub starred_ids: Option<BTreeSet<String>>,
     /// Updated cached profile map (`cachedProfiles`).
     pub cached_profiles: Option<BTreeMap<String, CachedProfile>>,
+    // U16
+    pub notification_settings: Option<NotificationSettingsSnapshot>,
+    pub aliases: Option<BTreeMap<String, String>>,
 }
 
 impl fmt::Debug for CoreChanges {
@@ -147,6 +154,9 @@ struct DirtyBuffer {
     auto_delete: Option<Option<BTreeMap<String, i64>>>,
     starred_ids: Option<BTreeSet<String>>,
     cached_profiles: Option<BTreeMap<String, CachedProfile>>,
+    // U16
+    notification_settings: Option<NotificationSettingsSnapshot>,
+    aliases: Option<BTreeMap<String, String>>,
     closed: bool,
 }
 
@@ -167,6 +177,8 @@ impl DirtyBuffer {
             || self.auto_delete.is_some()
             || self.starred_ids.is_some()
             || self.cached_profiles.is_some()
+            || self.notification_settings.is_some()
+            || self.aliases.is_some()
     }
 }
 
@@ -302,6 +314,13 @@ impl ChangeHub {
                     buf.cached_profiles =
                         Some(state.conversations.identities.cached_profiles.clone());
                 }
+                // U16
+                DirtyKey::NotificationSettings => {
+                    buf.notification_settings = Some(state.notify.settings.clone());
+                }
+                DirtyKey::Aliases => {
+                    buf.aliases = Some(state.conversations.identities.aliases.clone());
+                }
             }
             buf.dirty.insert(key);
         }
@@ -387,6 +406,9 @@ impl ChangeHub {
                             auto_delete: None,
                             starred_ids: None,
                             cached_profiles: None,
+                            // U16
+                            notification_settings: None,
+                            aliases: None,
                         });
                     }
                 }
@@ -451,6 +473,9 @@ impl ChangeHub {
                         auto_delete: buf.auto_delete.take(),
                         starred_ids: buf.starred_ids.take(),
                         cached_profiles: buf.cached_profiles.take(),
+                        // U16
+                        notification_settings: buf.notification_settings.take(),
+                        aliases: buf.aliases.take(),
                     });
                 }
                 if buf.closed {

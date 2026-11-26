@@ -145,7 +145,7 @@ final class ZaloEngine {
     var messageConfirm: MessageActionConfirm?
     @ObservationIgnored internal var mirroredMessageConfirmCoreId: UInt64?
     var deleteUndo: DeleteUndo?
-    var pins: [String: PinnedList] = [:]
+    var pins: [String: PinnedList] = [:] { didSet { pushAllCorePinsIfRunning() } }
     @ObservationIgnored internal var messageActionsBusy: Set<String> = []
 
     @ObservationIgnored internal let mediaResolver = MediaResolver()
@@ -240,6 +240,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var requestNotifAuthHostHandler: (@MainActor () async -> NotificationSettingsState.Authorization)?
     @ObservationIgnored internal var notificationCalendar: Calendar = .current
     @ObservationIgnored internal var reminderWatchSleep: (@MainActor (Double) async -> Bool)?
+    @ObservationIgnored internal var reminderWatchTimerTasks: [UInt64: Task<Void, Never>] = [:]
     @ObservationIgnored internal var composerConfirmTask: Task<Void, Never>?
     @ObservationIgnored internal var composerConfirmSleep: (@MainActor (Int) async -> Bool)?
     @ObservationIgnored internal var activeSendTask: Task<Bool, Never>?
@@ -291,8 +292,6 @@ final class ZaloEngine {
     @ObservationIgnored internal var historyFullRefreshDue = false
     @ObservationIgnored internal var cachedBoardRawTopics: [String: (version: Int64, topics: [String: [String: Any]])] = [:]
 
-    @ObservationIgnored internal var reminderWatchCache: [String: (sig: String, snapshot: ReminderSnapshot)] = [:]
-    @ObservationIgnored internal var reminderWatchWaiters: [String: [UUID: @Sendable () -> Void]] = [:]
     @ObservationIgnored private var webkitMigrateTask: Task<Void, Never>?
 
     /// Kept for menu toggle binding compatibility; native engine has no hidden WebKit window.
@@ -753,93 +752,12 @@ final class ZaloEngine {
     }
 
     internal func notifyIncomingBatchMessages(_ incomingForNotice: [ChatMessage]) async {
-        do {
-            for msg in incomingForNotice where !isConversationMuted(msg.conversationId) && notificationSettings.enabled {
-                let convId = msg.conversationId
-                let isGroup = ZaloWireParser.isGroupId(convId)
-                let cleanSenderId = ZaloWireParser.stripUserPrefix(msg.senderId)
-                let convSummary = conversations.first(where: { $0.id == convId })
-                var person = (!cleanSenderId.isEmpty && cleanSenderId != "0") ? lookupPersonInfo(cleanSenderId) : nil
-
-                var resolvedAvatarURL: URL? = msg.senderAvatar
-                    ?? (person?.avatar.isEmpty == false ? URL(string: person!.avatar) : nil)
-                    ?? (!isGroup ? convSummary?.avatar : nil)
-
-                if resolvedAvatarURL == nil, !cleanSenderId.isEmpty, cleanSenderId != "0" {
-                    if let profBox = try? await sessionClient.fetchProfiles(uids: [cleanSenderId]) {
-                        let profilesMap = ZaloWireParser.extractProfilesMap(profBox.dict)
-                        if let row = profilesMap[cleanSenderId] {
-                            let fetchedName = ZaloWireParser.preferredName(row)
-                            let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
-                            if !fetchedName.isEmpty || !avt.isEmpty {
-                                cachedProfiles[cleanSenderId] = ZaloWebKitMigrator.CachedProfile(name: fetchedName, avatar: avt)
-                                if let data = try? JSONEncoder().encode(cachedProfiles) {
-                                    try? await sqliteStore?.setPreferenceData(key: "cachedProfiles", data: data)
-                                }
-                            }
-                            if !avt.isEmpty, let url = URL(string: avt) {
-                                resolvedAvatarURL = url
-                            }
-                            person = lookupPersonInfo(cleanSenderId)
-                        }
-                    }
-                }
-
-                let title: String = {
-                    if let convName = convSummary?.displayName, !convName.isEmpty, convName != convId {
-                        return convName
-                    }
-                    if let pName = person?.name, !pName.isEmpty, pName != cleanSenderId {
-                        return pName
-                    }
-                    return msg.senderName.isEmpty ? convId : msg.senderName
-                }()
-
-                let senderName: String = {
-                    if !isGroup {
-                        return title
-                    }
-                    if let pName = person?.name, !pName.isEmpty, pName != cleanSenderId, pName != "Người dùng Zalo" {
-                        return pName
-                    }
-                    return msg.senderName
-                }()
-
-                let rawBody = Self.messagePreviewLabel(msg)
-                let body = notificationSettings.showsPreview ? rawBody : NotificationPolicy.hiddenPreviewBody
-                let record = NotifyBannerRecord(
-                    title: title,
-                    body: body,
-                    convId: convId,
-                    senderId: cleanSenderId,
-                    senderName: senderName,
-                    isGroup: isGroup,
-                    avatarURL: resolvedAvatarURL?.absoluteString,
-                    silent: !notificationSettings.sound
-                )
-                notifyBannerHook?(record)
-                if traceNotifyHost("notify_banner", args: [
-                    "conv_id": convId,
-                    "sender_id": cleanSenderId,
-                    "is_group": isGroup,
-                    "has_avatar": resolvedAvatarURL != nil,
-                    "silent": !notificationSettings.sound,
-                    "title_len": title.count,
-                    "sender_name_len": senderName.count,
-                    "body_len": body.count,
-                ]) {
-                    NativeNotifier.shared.notifyIncomingMessage(
-                        title: title,
-                        body: body,
-                        conversationId: convId,
-                        senderId: cleanSenderId,
-                        senderName: senderName,
-                        isGroup: isGroup,
-                        avatarURL: resolvedAvatarURL,
-                        silent: !notificationSettings.sound
-                    )
-                }
-            }
+        guard !incomingForNotice.isEmpty, let core = await ensureCoreEngine() else { return }
+        pushCoreIdentitiesIfRunning()
+        pushCoreContactsIfRunning()
+        let records = incomingForNotice.map(ChatMessageRecord.init(message:))
+        if let v = try? await core.notifyIncomingBatch(messages: records, nowMs: nowMs()) {
+            await waitForMirrorVersion(v)
         }
     }
 

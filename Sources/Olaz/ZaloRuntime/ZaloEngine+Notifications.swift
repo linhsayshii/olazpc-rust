@@ -1,18 +1,10 @@
 import AppKit
 import Foundation
+import OlazCore
 
-// Native macOS notifications + notification settings. Bridged to `HostScripts/notification-adapter.js`
-// (`window.__zaloNotification`; posts {page:'main', notification:{kind, …}}) and `NativeNotifier`.
-//
-// Who decides what:
-//   * The official renderer decides *whether* a message notifies (global toggle, per-conversation mute incl.
-//     timed mute, group/1-1/stranger rules, sound setting, "app is focused") and builds the text.
-//   * `NativeNotifier` shows it as a UNUserNotificationCenter banner (`_noti_*` IPC channels).
-//   * Settings live in the official client's storage (`askNoti`, `z_sound`) and mute service
-//     (`MuteDataManager.onMute/onUnMute`, synced with the Zalo server); this file mirrors and drives them.
+// MARK: - Notification settings & per-conversation mute (U16, Rust `olaz-core` owner)
 
-/// How long a conversation stays muted — the four choices of the official "Tắt thông báo" menu.
-/// Raw values are the official `MuteDataManager.onMute(convId, mode)` modes.
+/// How long to silence a conversation (`MuteDuration` raw values match the official menu).
 enum MuteDuration: Int, CaseIterable, Identifiable, Sendable {
     case oneHour = 1
     case fourHours = 2
@@ -32,7 +24,6 @@ enum MuteDuration: Int, CaseIterable, Identifiable, Sendable {
     }
 
     /// When the mute ends, nil = until the user turns notifications back on.
-    /// "Until 8 AM" is the next 8:00 local time (official `_getNowTo8Am`: today's 8:00, or tomorrow's once past).
     func expiry(from now: Date, calendar: Calendar = .current) -> Date? {
         switch self {
         case .oneHour: return now.addingTimeInterval(3600)
@@ -44,13 +35,12 @@ enum MuteDuration: Int, CaseIterable, Identifiable, Sendable {
     }
 }
 
-/// A conversation mute as the official `MuteDataManager` stores it (seconds; `duration` -1 = until reopened).
+/// A conversation mute as stored by `olaz-core` (seconds; `duration` -1 = until reopened).
 struct MuteInfo: Equatable, Sendable {
     var startTime: TimeInterval
     var duration: TimeInterval
 
     var isIndefinite: Bool { duration < 0 }
-    /// Official `getHMTime`: start + duration.
     var until: Date? { isIndefinite ? nil : Date(timeIntervalSince1970: startTime + duration) }
 
     func isActive(at now: Date = .now) -> Bool {
@@ -58,25 +48,41 @@ struct MuteInfo: Equatable, Sendable {
         return until > now
     }
 
-    /// "Cho đến 14:30" / "Cho đến khi được mở lại" (official `STR_MUTE_TIME_LIMIT_V2` wording).
-    func description(now: Date = .now, calendar: Calendar = .current) -> String {
-        guard let until else { return "Cho đến khi được mở lại" }
+    private func formattedTimeParts(now: Date, calendar: Calendar) -> (hhMm: String?, ddMm: String?) {
+        guard let until else { return (nil, nil) }
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "vi_VN")
         formatter.calendar = calendar
         formatter.timeZone = calendar.timeZone
         formatter.dateFormat = "HH:mm"
-        let time = formatter.string(from: until)
-        if calendar.isDate(until, inSameDayAs: now) { return "Cho đến \(time)" }
+        let hm = formatter.string(from: until)
+        if calendar.isDate(until, inSameDayAs: now) {
+            return (hm, nil)
+        }
         formatter.dateFormat = "dd/MM"
-        return "Cho đến \(time) ngày \(formatter.string(from: until))"
+        return (hm, formatter.string(from: until))
+    }
+
+    /// "Cho đến 14:30" / "Cho đến khi được mở lại" (delegated to `OlazCore.muteInfoFormatDescription`).
+    func description(now: Date = .now, calendar: Calendar = .current) -> String {
+        let parts = formattedTimeParts(now: now, calendar: calendar)
+        return OlazCore.muteInfoFormatDescription(
+            startTime: startTime,
+            duration: duration,
+            hhMm: parts.hhMm,
+            ddMmIfOtherDay: parts.ddMm
+        )
     }
 
     /// Menu status line: "Đang tắt đến 14:30" / "Đang tắt đến 14:30 ngày 27/10" / "Đang tắt cho đến khi được mở lại".
     func statusText(now: Date = .now, calendar: Calendar = .current) -> String {
-        guard until != nil else { return "Đang tắt cho đến khi được mở lại" }
-        let text = description(now: now, calendar: calendar)   // "Cho đến …"
-        return "Đang tắt đến" + text.dropFirst("Cho đến".count)
+        let parts = formattedTimeParts(now: now, calendar: calendar)
+        return OlazCore.muteInfoFormatStatusText(
+            startTime: startTime,
+            duration: duration,
+            hhMm: parts.hhMm,
+            ddMmIfOtherDay: parts.ddMm
+        )
     }
 
     static func parse(_ json: [String: Any]) -> (id: String, info: MuteInfo)? {
@@ -98,35 +104,44 @@ internal struct NotifyBannerRecord: Equatable, Sendable {
     var silent: Bool
 }
 
-/// Notification preferences mirrored from the official client.
+/// Notification preferences mirrored from `olaz-core` (`DirtyKey::NotificationSettings`).
 struct NotificationSettingsState: Equatable {
     enum Authorization: String, Equatable, Sendable {
-        /// Not queried yet.
         case unknown
-        /// Running outside an app bundle (tests, probe).
         case unavailable
         case notDetermined, denied, authorized
+
+        init(coreRecord: NotifAuthorizationRecord) {
+            switch coreRecord {
+            case .unknown: self = .unknown
+            case .unavailable: self = .unavailable
+            case .notDetermined: self = .notDetermined
+            case .denied: self = .denied
+            case .authorized: self = .authorized
+            }
+        }
+
+        var coreRecord: NotifAuthorizationRecord {
+            switch self {
+            case .unknown: .unknown
+            case .unavailable: .unavailable
+            case .notDetermined: .notDetermined
+            case .denied: .denied
+            case .authorized: .authorized
+            }
+        }
     }
 
     static let previewDefaultsKey = "olaz.notifications.showsPreview"
 
-    /// A settings snapshot from the official client has arrived.
     var isLoaded = false
-    /// Official "Cài đặt thông báo ▸ Bật" (`askNoti`).
     var enabled = true
-    /// Official "Phát âm thanh khi có tin nhắn & thông báo mới" (`z_sound`).
     var sound = false
-    /// Whether `z_sound` was ever written (the official page defaults it on first visit).
     var hasSoundSetting = false
-    /// Show message text in banners; off → "Bạn có tin nhắn mới" (native option, the official client
-    /// only hides content while the app lock is on).
     var showsPreview = UserDefaults.standard.object(forKey: previewDefaultsKey) as? Bool ?? true
-    /// macOS permission for banners.
     var authorization: Authorization = .unknown
-    /// Conversation id → mute, as stored by the official mute service (may include expired entries).
     var mutes: [String: MuteInfo] = [:]
 
-    /// Active mute of a conversation, nil when notifications are on.
     func mute(for conversationId: String, now: Date = .now) -> MuteInfo? {
         guard let mute = mutes[conversationId], mute.isActive(at: now) else { return nil }
         return mute
@@ -134,14 +149,12 @@ struct NotificationSettingsState: Equatable {
 
     func isMuted(_ conversationId: String, now: Date = .now) -> Bool { mute(for: conversationId, now: now) != nil }
 
-    /// Active mutes, longest-standing first.
     func activeMutes(now: Date = .now) -> [(id: String, info: MuteInfo)] {
         mutes.filter { $0.value.isActive(at: now) }
             .map { (id: $0.key, info: $0.value) }
             .sorted { ($0.info.startTime, $0.id) < ($1.info.startTime, $1.id) }
     }
 
-    /// Applies a `{kind:'settings'}` payload from the adapter.
     mutating func apply(settings json: [String: Any]) {
         isLoaded = true
         if let value = json["enabled"] as? NSNumber { enabled = value.boolValue }
@@ -153,22 +166,35 @@ struct NotificationSettingsState: Equatable {
         }
         mutes = next
     }
+
+    mutating func applyCoreRecord(_ record: NotificationSettingsRecord) {
+        isLoaded = record.isLoaded
+        enabled = record.enabled
+        sound = record.sound
+        hasSoundSetting = record.hasSoundSetting
+        showsPreview = record.showsPreview
+        authorization = Authorization(coreRecord: record.authorization)
+        var next: [String: MuteInfo] = [:]
+        next.reserveCapacity(record.mutes.count)
+        for entry in record.mutes {
+            next[entry.id] = MuteInfo(startTime: entry.startTime, duration: entry.duration)
+        }
+        mutes = next
+    }
 }
 
 extension ZaloEngine {
-    // MARK: Actions — settings
+    // MARK: Actions — settings (thin `CoreEngine` forwarders)
 
     func setNotificationsEnabled(_ enabled: Bool) {
         notificationSettings.enabled = enabled
         notificationSettings.sound = enabled
         notificationSettings.hasSoundSetting = true
-        if enabled {
-            trackNotificationTask { [weak self] in
-                await self?.requestNotificationAuthorization()
-            }
-        }
         trackNotificationTask { [weak self] in
-            await self?.saveNotificationPreferences()
+            guard let self, let core = await self.ensureCoreEngine() else { return }
+            if let v = try? await core.setNotificationsEnabledAndWait(enabled: enabled) {
+                await self.waitForMirrorVersion(v)
+            }
         }
     }
 
@@ -176,13 +202,19 @@ extension ZaloEngine {
         notificationSettings.sound = enabled
         notificationSettings.hasSoundSetting = true
         trackNotificationTask { [weak self] in
-            await self?.saveNotificationPreferences()
+            guard let self, let core = await self.ensureCoreEngine() else { return }
+            if let v = try? await core.setNotificationSoundAndWait(enabled: enabled) {
+                await self.waitForMirrorVersion(v)
+            }
         }
     }
 
     func setMessagePreview(_ shown: Bool) {
         notificationSettings.showsPreview = shown
         userDefaults.set(shown, forKey: NotificationSettingsState.previewDefaultsKey)
+        if let core = coreLifecycle.core {
+            core.setMessagePreview(shown: shown)
+        }
     }
 
     func notificationSettingsDidAppear() {
@@ -191,7 +223,7 @@ extension ZaloEngine {
         }
     }
 
-    // MARK: Actions — per-conversation mute
+    // MARK: Actions — per-conversation mute (server-confirmed via `olaz-core`)
 
     func isConversationMuted(_ id: String) -> Bool {
         notificationSettings.isMuted(id, now: Date(timeIntervalSince1970: Double(nowMs()) / 1000.0))
@@ -201,43 +233,39 @@ extension ZaloEngine {
         let currentMs = nowMs()
         let now = Date(timeIntervalSince1970: Double(currentMs) / 1000.0)
         let until = duration.expiry(from: now, calendar: notificationCalendar)
-        let sec = until.map { Int($0.timeIntervalSince(now)) } ?? -1
-        notificationSettings.mutes[id] = MuteInfo(startTime: now.timeIntervalSince1970, duration: sec < 0 ? -1 : Double(sec))
-        let isGroup = ZaloWireParser.isGroupId(id)
-        let startTimeSec = currentMs / 1000
+        let sec = Int64(until.map { Int($0.timeIntervalSince(now)) } ?? -1)
         trackNotificationTask { [weak self] in
-            guard let self else { return }
-            try? await self.sessionClient.setMuteAPI(
+            guard let self, let core = await self.ensureCoreEngine() else { return }
+            if let v = try? await core.muteConversationAndWait(
                 convId: id,
-                isGroup: isGroup,
-                durationSeconds: sec,
-                unmute: false,
-                startTimeSec: startTimeSec
-            )
-            await self.saveNotificationPreferences()
+                durationSecs: sec,
+                nowMs: currentMs
+            ) {
+                await self.waitForMirrorVersion(v)
+            }
         }
     }
 
     func unmuteConversation(_ id: String) {
-        notificationSettings.mutes[id] = nil
-        let isGroup = ZaloWireParser.isGroupId(id)
-        let startTimeSec = nowMs() / 1000
+        let currentMs = nowMs()
         trackNotificationTask { [weak self] in
-            guard let self else { return }
-            try? await self.sessionClient.setMuteAPI(
-                convId: id,
-                isGroup: isGroup,
-                durationSeconds: 0,
-                unmute: true,
-                startTimeSec: startTimeSec
-            )
-            await self.saveNotificationPreferences()
+            guard let self, let core = await self.ensureCoreEngine() else { return }
+            if let v = try? await core.unmuteConversationAndWait(convId: id, nowMs: currentMs) {
+                await self.waitForMirrorVersion(v)
+            }
         }
     }
 
     // MARK: SQLite persistence
 
     internal func loadNotificationPreferences(from store: ZaloSQLiteStore) async {
+        if let core = await ensureCoreEngine() {
+            core.attachStore(store: store.coreStoreHandle)
+            if let v = try? await core.loadNotificationPreferences() {
+                await waitForMirrorVersion(v)
+            }
+            return
+        }
         var next = notificationSettings
         next.isLoaded = true
         next.enabled = (try? await store.getPreferenceBool(key: "notifEnabled", default: true)) ?? true
@@ -270,20 +298,26 @@ extension ZaloEngine {
 
     @discardableResult
     func requestNotificationAuthorization() async -> NotificationSettingsState.Authorization {
+        let mapped: NotificationSettingsState.Authorization
         if !traceNotifyHost("request_notif_auth"), let handler = requestNotifAuthHostHandler {
-            let auth = await handler()
-            if notificationSettings.authorization != auth {
-                notificationSettings.authorization = auth
-            }
-            return notificationSettings.authorization
+            mapped = await handler()
+        } else {
+            let result = await NativeNotifier.shared.requestAuthorization()
+            mapped = Self.mapNativeAuthorization(result)
         }
-        let result = await NativeNotifier.shared.requestAuthorization()
-        applyAuthorization(result)
+        if notificationSettings.authorization != mapped {
+            notificationSettings.authorization = mapped
+        }
+        coreLifecycle.core?.setInitialNotificationAuth(auth: mapped.coreRecord)
         return notificationSettings.authorization
     }
 
     func refreshNotificationAuthorization() async {
-        applyAuthorization(await NativeNotifier.shared.authorizationStatus())
+        let mapped = Self.mapNativeAuthorization(await NativeNotifier.shared.authorizationStatus())
+        if notificationSettings.authorization != mapped {
+            notificationSettings.authorization = mapped
+        }
+        coreLifecycle.core?.setInitialNotificationAuth(auth: mapped.coreRecord)
     }
 
     func openSystemNotificationSettings() {
@@ -292,24 +326,25 @@ extension ZaloEngine {
         }
     }
 
-    private func applyAuthorization(_ status: NativeNotifier.Authorization) {
-        let mapped: NotificationSettingsState.Authorization = switch status {
+    private static func mapNativeAuthorization(_ status: NativeNotifier.Authorization) -> NotificationSettingsState.Authorization {
+        switch status {
         case .unavailable: .unavailable
         case .notDetermined: .notDetermined
         case .denied: .denied
         case .authorized: .authorized
         }
-        if notificationSettings.authorization != mapped { notificationSettings.authorization = mapped }
     }
 
-    // MARK: Legacy state adapter no-op
+    // MARK: Adapter settings payload
 
     func handleNotification(state: [String: Any]) {
-        guard let payload = state["notification"] as? [String: Any] else { return }
-        if payload["kind"] as? String == "settings" {
-            var next = notificationSettings
-            next.apply(settings: payload)
-            if next != notificationSettings { notificationSettings = next }
+        guard let payload = state["notification"] as? [String: Any],
+              payload["kind"] as? String == "settings" else { return }
+        var next = notificationSettings
+        next.apply(settings: payload)
+        if next != notificationSettings { notificationSettings = next }
+        if let core = coreLifecycle.core {
+            core.handleNotificationSettingsPayload(payloadJson: Self.jsonString(for: payload))
         }
     }
 }
