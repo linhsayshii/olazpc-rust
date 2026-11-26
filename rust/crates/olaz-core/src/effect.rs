@@ -28,6 +28,81 @@ pub enum HistoryFetchPurpose {
     LoadOlder { load_seq: u64, op_id: Option<u64> },
 }
 
+// U12
+/// Distinguishes whether [`Effect::FetchPollDetailApi`] refreshes poll state or resolves voters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollDetailPurpose {
+    Refresh { now_ms: i64 },
+    Voters,
+}
+
+// U12
+/// `(ref_id, raw_topic, board_version)` for replacing an oldest board pin before pinning a poll.
+pub type ReplaceBoardPinSpec = (String, Option<Map<String, Value>>, i64);
+
+// U12
+/// Continuation executed after [`Effect::RefreshBoardPinsForPoll`] completes on the host FIFO.
+#[derive(Clone)]
+pub enum PollBoardContinuation {
+    FinishRefreshPin {
+        op_id: Option<u64>,
+        poll_id: String,
+        then_action_ok: bool,
+        then_pin_done: Option<bool>,
+    },
+    AfterPinSuccess {
+        op_id: Option<u64>,
+        poll_id: String,
+        for_create: bool,
+    },
+    AfterPinLimitError {
+        op_id: Option<u64>,
+        poll_id: String,
+        mapped: crate::polls::PollActionResult,
+        for_create: bool,
+    },
+    AfterUnpinSuccess {
+        op_id: Option<u64>,
+        poll_id: String,
+    },
+}
+
+impl fmt::Debug for PollBoardContinuation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FinishRefreshPin {
+                op_id,
+                then_action_ok,
+                then_pin_done,
+                ..
+            } => f
+                .debug_struct("FinishRefreshPin")
+                .field("op_id", op_id)
+                .field("then_action_ok", then_action_ok)
+                .field("then_pin_done", then_pin_done)
+                .finish(),
+            Self::AfterPinSuccess {
+                op_id, for_create, ..
+            } => f
+                .debug_struct("AfterPinSuccess")
+                .field("op_id", op_id)
+                .field("for_create", for_create)
+                .finish(),
+            Self::AfterPinLimitError {
+                op_id, for_create, ..
+            } => f
+                .debug_struct("AfterPinLimitError")
+                .field("op_id", op_id)
+                .field("for_create", for_create)
+                .finish(),
+            Self::AfterUnpinSuccess { op_id, .. } => f
+                .debug_struct("AfterUnpinSuccess")
+                .field("op_id", op_id)
+                .finish(),
+        }
+    }
+}
+
 /// Serial SQLite persistence operations executed by the core runner's store worker (U3).
 #[derive(Clone)]
 pub enum StoreOp {
@@ -272,6 +347,12 @@ pub enum OpResult {
     // U8
     Forward(ForwardOutcome),
     OptI64(Option<i64>),
+    // U12
+    PollVoters(Option<crate::polls::PollVoters>),
+    PollPinState(crate::polls::PollPinState),
+    PollPinOutcome(crate::polls::PollPinOutcome),
+    PollActionResult(crate::polls::PollActionResult),
+    PollCapabilities(crate::polls::PollCapabilities),
 }
 
 impl fmt::Debug for OpResult {
@@ -288,6 +369,15 @@ impl fmt::Debug for OpResult {
             Self::Int(n) => f.debug_tuple("Int").field(n).finish(),
             Self::Forward(o) => f.debug_tuple("Forward").field(o).finish(),
             Self::OptI64(n) => f.debug_tuple("OptI64").field(n).finish(),
+            // U12
+            Self::PollVoters(v) => f
+                .debug_struct("PollVoters")
+                .field("present", &v.is_some())
+                .finish(),
+            Self::PollPinState(s) => f.debug_tuple("PollPinState").field(s).finish(),
+            Self::PollPinOutcome(o) => f.debug_tuple("PollPinOutcome").field(o).finish(),
+            Self::PollActionResult(r) => f.debug_tuple("PollActionResult").field(r).finish(),
+            Self::PollCapabilities(c) => f.debug_tuple("PollCapabilities").field(c).finish(),
         }
     }
 }
@@ -885,6 +975,81 @@ pub enum Effect {
         forward_id: u64,
         params: SendContactCardParams,
     },
+    // U12
+    /// Calls `ZaloApi::fetch_poll_detail` for `Refresh` or `Voters`.
+    FetchPollDetailApi {
+        op_id: Option<u64>,
+        poll_id: String,
+        purpose: PollDetailPurpose,
+    },
+    /// Calls `ZaloApi::fetch_group_detail` when `refreshPoll` encounters an uncached group.
+    FetchPollGroupDetailApi {
+        op_id: Option<u64>,
+        poll_id: String,
+        group_id: String,
+        data_node: Map<String, Value>,
+        now_ms: i64,
+    },
+    /// Runs `Host::refresh_board_pins` on the serial host FIFO (when `!require_auth` or
+    /// `client.is_authenticated()`) and then sends [`Input::PollBoardRefreshed`].
+    RefreshBoardPinsForPoll {
+        conv_id: String,
+        require_auth: bool,
+        continuation: PollBoardContinuation,
+    },
+    /// Optionally unpins `replace_ref` and then pins `poll_id` (`topic_type = 3`) on the group board.
+    UnpinThenPinPollApi {
+        op_id: Option<u64>,
+        poll_id: String,
+        conv_id: String,
+        replace_ref: Option<ReplaceBoardPinSpec>,
+        for_create: bool,
+    },
+    /// Calls `ZaloApi::unpin_board_topic_api` for `poll_id`.
+    UnpinPollApi {
+        op_id: Option<u64>,
+        poll_id: String,
+        conv_id: String,
+        raw_topic: Option<Map<String, Value>>,
+        board_version: i64,
+    },
+    /// Calls `ZaloApi::add_poll_option_api` (if `!new_options.is_empty()`) or `ZaloApi::vote_poll_api`.
+    VotePollApi {
+        op_id: Option<u64>,
+        poll_id: String,
+        new_options: Vec<olaz_api::NewPollOptionPayload>,
+        voted_ids: Vec<String>,
+        now_ms: i64,
+    },
+    /// Calls `ZaloApi::lock_poll_api`.
+    LockPollApi {
+        op_id: Option<u64>,
+        poll_id: String,
+        now_ms: i64,
+    },
+    /// Calls `ZaloApi::share_poll_api`.
+    SharePollApi { op_id: Option<u64>, poll_id: String },
+    /// Calls `ZaloApi::create_poll_api`.
+    CreatePollApi {
+        op_id: Option<u64>,
+        conv_id: String,
+        question: String,
+        options: Vec<String>,
+        expired_time_ms: i64,
+        allow_multi: bool,
+        allow_add: bool,
+        hide_vote_preview: bool,
+        is_anonymous: bool,
+        should_pin: bool,
+    },
+    /// Arms a 1.5 s per-poll debounce timer (delegating to `Host::arm_poll_debounce` if handled).
+    ArmPollDebounce {
+        poll_id: String,
+        seq: u64,
+        delay: Duration,
+    },
+    /// Cancels all pending poll debounce timers (in Rust and via `Host::cancel_all_poll_debounces`).
+    CancelAllPollDebounces,
 
     // U6
     /// Resolves server `msg_id` and `cli_msg_id` via SQLite + `fetch_history(count=30)`.
@@ -1223,6 +1388,81 @@ impl fmt::Debug for Effect {
                 .field("now_ms", now_ms)
                 .field("op_id", op_id)
                 .finish(),
+            // U12
+            Self::FetchPollDetailApi { op_id, purpose, .. } => f
+                .debug_struct("FetchPollDetailApi")
+                .field("op_id", op_id)
+                .field("purpose", purpose)
+                .finish(),
+            Self::FetchPollGroupDetailApi { op_id, now_ms, .. } => f
+                .debug_struct("FetchPollGroupDetailApi")
+                .field("op_id", op_id)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::RefreshBoardPinsForPoll {
+                require_auth,
+                continuation,
+                ..
+            } => f
+                .debug_struct("RefreshBoardPinsForPoll")
+                .field("require_auth", require_auth)
+                .field("continuation", continuation)
+                .finish(),
+            Self::UnpinThenPinPollApi {
+                op_id,
+                replace_ref,
+                for_create,
+                ..
+            } => f
+                .debug_struct("UnpinThenPinPollApi")
+                .field("op_id", op_id)
+                .field("has_replace", &replace_ref.is_some())
+                .field("for_create", for_create)
+                .finish(),
+            Self::UnpinPollApi {
+                op_id,
+                board_version,
+                ..
+            } => f
+                .debug_struct("UnpinPollApi")
+                .field("op_id", op_id)
+                .field("board_version", board_version)
+                .finish(),
+            Self::VotePollApi {
+                op_id,
+                new_options,
+                voted_ids,
+                ..
+            } => f
+                .debug_struct("VotePollApi")
+                .field("op_id", op_id)
+                .field("new_options", &new_options.len())
+                .field("voted_ids", &voted_ids.len())
+                .finish(),
+            Self::LockPollApi { op_id, .. } => {
+                f.debug_struct("LockPollApi").field("op_id", op_id).finish()
+            }
+            Self::SharePollApi { op_id, .. } => f
+                .debug_struct("SharePollApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::CreatePollApi {
+                op_id,
+                options,
+                should_pin,
+                ..
+            } => f
+                .debug_struct("CreatePollApi")
+                .field("op_id", op_id)
+                .field("options", &options.len())
+                .field("should_pin", should_pin)
+                .finish(),
+            Self::ArmPollDebounce { seq, delay, .. } => f
+                .debug_struct("ArmPollDebounce")
+                .field("seq", seq)
+                .field("delay_ms", &delay.as_millis())
+                .finish(),
+            Self::CancelAllPollDebounces => f.write_str("CancelAllPollDebounces"),
             Self::Host(call) => f.debug_tuple("Host").field(call).finish(),
         }
     }

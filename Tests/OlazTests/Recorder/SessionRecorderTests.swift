@@ -1,40 +1,49 @@
 import Foundation
-import Testing
+import XCTest
 @testable import Olaz
 
-@Suite(.serialized)
-struct SessionRecorderTests {
-    @Test
+final class SessionRecorderTests: XCTestCase {
     @MainActor
-    func sessionCases() async throws {
+    func testSessionCases() async throws {
         let isRecord = ProcessInfo.processInfo.environment["OLAZ_RECORD"] == "1"
         let runSlow = isRecord || ProcessInfo.processInfo.environment["OLAZ_SLOW_CASES"] == "1"
+        let onlyFilter = ProcessInfo.processInfo.environment["OLAZ_CASE_FILTER"]
         let casesURL = CaseFile.casesURL(domain: "session")
 
         if isRecord {
             var recorded: [CaseJSON] = []
             for scenario in Self.scenarios() {
+                if let onlyFilter, !onlyFilter.isEmpty, !scenario.name.contains(onlyFilter) {
+                    continue
+                }
                 let caseJSON = try await Self.recordScenario(scenario)
                 recorded.append(caseJSON)
             }
             try CaseFile.write(recorded, to: casesURL)
         } else {
             let committed = try CaseFile.load(url: casesURL)
-            #expect(!committed.isEmpty, "No committed cases found at \(casesURL.path)")
+            XCTAssertFalse(committed.isEmpty, "No committed cases found at \(casesURL.path)")
 
             let byName = Dictionary(uniqueKeysWithValues: committed.compactMap { item -> (String, CaseJSON)? in
                 guard let name = item["name"]?.stringValue else { return nil }
                 return (name, item)
             })
             let expectedScenarios = Self.scenarios()
-            #expect(committed.count == expectedScenarios.count, "Committed case count \(committed.count) != scenario count \(expectedScenarios.count)")
+            XCTAssertEqual(
+                committed.count,
+                expectedScenarios.count,
+                "Committed case count \(committed.count) != scenario count \(expectedScenarios.count)"
+            )
 
             let knownDiffs = try CaseFile.loadKnownDiffs()
             var usedKnownDiffs = Array(repeating: false, count: knownDiffs.count)
             var executedNames: Set<String> = []
 
             for scenario in expectedScenarios {
-                let expected = try #require(byName[scenario.name], "Missing committed case for \(scenario.name)")
+                if let onlyFilter, !onlyFilter.isEmpty, !scenario.name.contains(onlyFilter) {
+                    continue
+                }
+                let expected = try XCTUnwrap(byName[scenario.name], "Missing committed case for \(scenario.name)")
                 if scenario.slow && !runSlow {
                     print("skipped slow: \(scenario.name)")
                     continue
@@ -50,17 +59,19 @@ struct SessionRecorderTests {
                     usedKnownDiffs: &usedKnownDiffs
                 )
                 for diff in diffs {
-                    Issue.record("\(scenario.name): \(diff)")
+                    XCTFail("\(scenario.name): \(diff)")
                 }
             }
-            for stale in CaseFile.staleKnownDiffs(
-                domain: "session",
-                executedNames: executedNames,
-                allCaseNames: Set(byName.keys),
-                knownDiffs: knownDiffs,
-                usedKnownDiffs: usedKnownDiffs
-            ) {
-                Issue.record("\(stale)")
+            if onlyFilter == nil || onlyFilter?.isEmpty == true {
+                for stale in CaseFile.staleKnownDiffs(
+                    domain: "session",
+                    executedNames: executedNames,
+                    allCaseNames: Set(byName.keys),
+                    knownDiffs: knownDiffs,
+                    usedKnownDiffs: usedKnownDiffs
+                ) {
+                    XCTFail("\(stale)")
+                }
             }
         }
     }

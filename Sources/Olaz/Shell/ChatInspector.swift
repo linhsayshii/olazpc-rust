@@ -322,7 +322,8 @@ struct ChatInspector: View {
                 Button {
                     Task { await engine.setAutoDelete(id, ttl: option.ttl) }
                 } label: {
-                    if option.ttl == ttl { Label(option.label, systemImage: "checkmark") } else { Text(option.label) }
+                    let title = option.plan.map { "\(option.label)  ·  \($0)" } ?? option.label
+                    if option.ttl == ttl { Label(title, systemImage: "checkmark") } else { Text(title) }
                 }
             }
         } label: {

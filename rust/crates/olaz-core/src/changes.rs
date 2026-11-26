@@ -51,6 +51,8 @@ pub enum DirtyKey {
     AutoDelete,
     StarredIds,
     CachedProfiles,
+    // U12
+    Polls,
 }
 
 /// Set of keys dirtied by one `reduce` step.
@@ -112,6 +114,8 @@ pub struct CoreChanges {
     pub starred_ids: Option<BTreeSet<String>>,
     /// Updated cached profile map (`cachedProfiles`).
     pub cached_profiles: Option<BTreeMap<String, CachedProfile>>,
+    // U12
+    pub polls: Option<crate::polls::PollsState>,
 }
 
 impl fmt::Debug for CoreChanges {
@@ -127,6 +131,7 @@ impl fmt::Debug for CoreChanges {
             .field("has_typing", &self.typing.is_some())
             .field("has_forward_request", &self.forward_request.is_some())
             .field("clear_selection", &self.clear_selection)
+            .field("has_polls", &self.polls.is_some())
             .finish()
     }
 }
@@ -161,6 +166,8 @@ struct DirtyBuffer {
     auto_delete: Option<Option<BTreeMap<String, i64>>>,
     starred_ids: Option<BTreeSet<String>>,
     cached_profiles: Option<BTreeMap<String, CachedProfile>>,
+    // U12
+    polls: Option<crate::polls::PollsState>,
     closed: bool,
 }
 
@@ -183,6 +190,7 @@ impl DirtyBuffer {
             || self.auto_delete.is_some()
             || self.starred_ids.is_some()
             || self.cached_profiles.is_some()
+            || self.polls.is_some()
     }
 }
 
@@ -308,6 +316,10 @@ impl ChangeHub {
                 DirtyKey::ForwardClearSelection => {
                     buf.clear_selection = true;
                 }
+                // U12
+                DirtyKey::Polls => {
+                    buf.polls = Some(state.polls.clone());
+                }
                 // U6
                 DirtyKey::DeleteUndo => {
                     buf.delete_undo = Some(state.actions.delete_undo.snapshot());
@@ -413,6 +425,8 @@ impl ChangeHub {
                             auto_delete: None,
                             starred_ids: None,
                             cached_profiles: None,
+                            // U12
+                            polls: None,
                         });
                     }
                 }
@@ -480,6 +494,8 @@ impl ChangeHub {
                         auto_delete: buf.auto_delete.take(),
                         starred_ids: buf.starred_ids.take(),
                         cached_profiles: buf.cached_profiles.take(),
+                        // U12
+                        polls: buf.polls.take(),
                     });
                 }
                 if buf.closed {

@@ -69,6 +69,7 @@ final class JSRuntime: @unchecked Sendable {
     private var pendingException: JSValue?
     private var timers: [Int: (fn: JSValue, interval: Int?)] = [:]
     private var nextTimerID = 1
+    private var closed = false
 
     init(name: String) throws {
         self.name = name
@@ -78,13 +79,34 @@ final class JSRuntime: @unchecked Sendable {
         try queue.sync { try bootstrap() }
     }
 
+    /// Cancels pending JS timers and tears down the underlying `JSContext` / `JSVirtualMachine`
+    /// on the runtime's serial queue so JSC heap and VM threads are reclaimed deterministically.
+    func close() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            queue.async { [self] in
+                if !self.closed {
+                    self.closed = true
+                    self.timers.removeAll()
+                    self.pendingException = nil
+                    self.context?.exceptionHandler = nil
+                    self.context?.setObject(nil, forKeyedSubscript: "__zhost" as NSString)
+                    self.context = nil
+                }
+                cont.resume()
+            }
+        }
+    }
+
     // MARK: Public API
 
     /// Evaluates a script in the global scope and returns its completion value.
     @discardableResult
     func evaluate(_ script: String, sourceURL: String = "inline.js") async throws -> JSBridgeValue {
         try await perform { rt in
-            let value = rt.context.evaluateScript(script, withSourceURL: URL(string: sourceURL))
+            guard !rt.closed, let ctx = rt.context else {
+                throw JSRuntimeError(message: "JSRuntime is closed")
+            }
+            let value = ctx.evaluateScript(script, withSourceURL: URL(string: sourceURL))
             try rt.throwPendingException()
             return rt.bridge(value)
         }
@@ -113,7 +135,7 @@ final class JSRuntime: @unchecked Sendable {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<JSBridgeValue, Error>) in
             queue.async { [weak self] in
                 let once = ResumeOnce(cont)
-                guard let self else {
+                guard let self, !self.closed, self.context != nil else {
                     once.resume(.failure(JSRuntimeError(message: "JSRuntime was deallocated")))
                     return
                 }
@@ -152,6 +174,7 @@ final class JSRuntime: @unchecked Sendable {
     }
 
     private func invoke(_ path: String, _ args: [JSBridgeValue]) throws -> JSValue {
+        guard !closed, let context else { throw JSRuntimeError(message: "JSRuntime is closed") }
         let parts = path.split(separator: ".").map(String.init)
         guard let last = parts.last else { throw JSRuntimeError(message: "Empty JS path") }
         var owner: JSValue = context.globalObject
@@ -209,7 +232,7 @@ final class JSRuntime: @unchecked Sendable {
     }
 
     func bridge(_ value: JSValue?) -> JSBridgeValue {
-        guard let value, !value.isUndefined, !value.isNull else { return .null }
+        guard !closed, let context, let value, !value.isUndefined, !value.isNull else { return .null }
         if value.isBoolean { return .bool(value.toBool()) }
         if value.isNumber { return .number(value.toDouble()) }
         if value.isString { return .string(value.toString()) }
@@ -273,6 +296,7 @@ final class JSRuntime: @unchecked Sendable {
     // MARK: Timers (queue-confined)
 
     private func addTimer(_ fn: JSValue, delay: Int, repeats: Bool) -> Int {
+        guard !closed else { return 0 }
         let id = nextTimerID
         nextTimerID += 1
         timers[id] = (fn, repeats ? max(delay, 1) : nil)
@@ -287,7 +311,7 @@ final class JSRuntime: @unchecked Sendable {
     }
 
     private func fire(_ id: Int) {
-        guard let timer = timers[id] else { return }
+        guard !closed, let timer = timers[id] else { return }
         if let interval = timer.interval { schedule(id, after: interval) } else { timers[id] = nil }
         timer.fn.call(withArguments: [])
         if let exception = pendingException {
