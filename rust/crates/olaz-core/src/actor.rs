@@ -188,8 +188,66 @@ impl CoreHandle {
         )
     }
 
+    fn sync_identity_snapshot_before_send(&self, command: &Command) {
+        match command {
+            Command::UpdateIdentities(table) => {
+                let mut guard = self
+                    .identity_snapshot
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let mut next = (**guard).clone();
+                next.identities = table.clone();
+                *guard = Arc::new(next);
+            }
+            Command::SyncConversationsSnapshot(list) => {
+                let mut guard = self
+                    .identity_snapshot
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let mut next = (**guard).clone();
+                next.conversation_fallbacks = IdentitySnapshot::build_conversation_fallbacks(list);
+                *guard = Arc::new(next);
+            }
+            Command::SeedContacts(contacts) => {
+                let mut guard = self
+                    .identity_snapshot
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let mut next = (**guard).clone();
+                let mut merged = contacts.to_identity_table();
+                if merged.aliases.is_empty() && !next.identities.aliases.is_empty() {
+                    merged.aliases = next.identities.aliases.clone();
+                }
+                if merged.cached_profiles.is_empty() && !next.identities.cached_profiles.is_empty()
+                {
+                    merged.cached_profiles = next.identities.cached_profiles.clone();
+                }
+                if merged.cached_groups.is_empty() && !next.identities.cached_groups.is_empty() {
+                    merged.cached_groups = next.identities.cached_groups.clone();
+                }
+                if merged.activity_ranks.is_empty() && !next.identities.activity_ranks.is_empty() {
+                    merged.activity_ranks = next.identities.activity_ranks.clone();
+                }
+                next.identities = merged;
+                *guard = Arc::new(next);
+            }
+            Command::ApplyAccountProfile(acc) => {
+                let mut guard = self
+                    .identity_snapshot
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let mut next = (**guard).clone();
+                next.my_uid.clone_from(&acc.user_id);
+                next.my_avatar = (!acc.avatar.is_empty()).then(|| acc.avatar.clone());
+                *guard = Arc::new(next);
+            }
+            _ => {}
+        }
+    }
+
     /// Enqueues a command without blocking.
     pub fn send(&self, command: Command) {
+        self.sync_identity_snapshot_before_send(&command);
         self.tracker.increment();
         if self
             .tx
@@ -342,6 +400,21 @@ impl CoreHandle {
         match self.request(Command::PollCapabilities { conv_id }).await {
             Some(OpResult::PollCapabilities(c)) => c,
             _ => crate::polls::PollCapabilities::default(),
+        }
+    }
+
+    /// Awaits [`Command::SaveAlias`] and returns [`crate::messages::SaveAliasOutcome`].
+    pub async fn request_save_alias(
+        &self,
+        uid: String,
+        name: String,
+    ) -> crate::messages::SaveAliasOutcome {
+        match self.request(Command::SaveAlias { uid, name }).await {
+            Some(OpResult::SaveAlias(res)) => res,
+            _ => crate::messages::SaveAliasOutcome {
+                ok: false,
+                text: "Không lưu được tên gợi nhớ.".to_owned(),
+            },
         }
     }
 
@@ -518,10 +591,14 @@ fn dispatch_reduce_output(
     waiters: &mut ActorWaiters,
 ) -> u64 {
     let window_ops = state.messages.take_pending_window_ops();
-    // Refresh the lock-free IdentitySnapshot whenever session, conversations, or contacts mutated.
-    if out.dirty.contains(&crate::changes::DirtyKey::Session)
+    // Refresh the lock-free IdentitySnapshot whenever session, conversations, contacts, or cached profiles mutated.
+    if out.refresh_identity_snapshot
+        || out.dirty.contains(&crate::changes::DirtyKey::Session)
         || out.dirty.contains(&crate::changes::DirtyKey::Conversations)
         || out.dirty.contains(&crate::changes::DirtyKey::Contacts)
+        || out
+            .dirty
+            .contains(&crate::changes::DirtyKey::CachedProfiles)
     {
         let next_snap = Arc::new(state.identity_snapshot());
         *identity_snapshot
@@ -731,5 +808,43 @@ mod tests {
         assert_eq!(core.drain_chat_polling(4, false).await, 0);
         core.stop();
         assert_eq!(core.drain_chat_polling(4, false).await, 0);
+    }
+
+    #[tokio::test]
+    async fn update_identities_refreshes_snapshot_synchronously_and_after_settle() {
+        let core = CoreHandle::start(Arc::new(NoopRunner), Handle::current());
+        let mut table = crate::conversations::IdentityTable::default();
+        table.cached_profiles.insert(
+            "202".to_owned(),
+            crate::conversations::CachedProfile {
+                name: "Hùng".to_owned(),
+                avatar: "https://cdn.example/hung.jpg".to_owned(),
+            },
+        );
+        core.send(Command::UpdateIdentities(table));
+
+        // Synchronous lookup before yielding to the actor task must already see cached_profiles["202"].
+        let immediate = core.identity_snapshot().lookup_person("202");
+        assert_eq!(immediate.as_ref().map(|h| h.name.as_str()), Some("Hùng"));
+        assert_eq!(
+            immediate.as_ref().map(|h| h.avatar.as_str()),
+            Some("https://cdn.example/hung.jpg")
+        );
+
+        // After actor reduce + settle, authoritative snapshot must also retain it across subsequent updates.
+        let _ = core.settle().await;
+        let _ = core
+            .send_and_ack(Command::ApplyAccountProfile(LoginAccount {
+                user_id: "100".to_owned(),
+                display_name: "Minh".to_owned(),
+                avatar: "https://cdn.example/me.jpg".to_owned(),
+                ..LoginAccount::default()
+            }))
+            .await;
+        let post_settle = core.identity_snapshot().lookup_person("202");
+        assert_eq!(post_settle.as_ref().map(|h| h.name.as_str()), Some("Hùng"));
+        let me = core.identity_snapshot().lookup_person("100");
+        assert_eq!(me.as_ref().map(|h| h.name.as_str()), Some("Bạn"));
+        core.stop();
     }
 }

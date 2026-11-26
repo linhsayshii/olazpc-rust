@@ -4,6 +4,7 @@
 
 pub mod bootstrap;
 pub mod classify;
+pub mod contacts;
 pub mod conversations;
 pub mod messages;
 // U12
@@ -22,6 +23,7 @@ use crate::state::CoreState;
 pub struct ReduceOutput {
     pub effects: Vec<Effect>,
     pub dirty: DirtySet,
+    pub refresh_identity_snapshot: bool,
 }
 
 fn is_message_command(cmd: &Command) -> bool {
@@ -40,6 +42,25 @@ fn is_message_command(cmd: &Command) -> bool {
             | Command::RefreshReactionNames { .. }
             | Command::SeedHistoryFreshness(_)
             | Command::SeedContacts(_)
+    )
+}
+
+fn is_contacts_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::RefreshContacts
+            | Command::PerformContactsSync
+            | Command::AcceptFriendRequest { .. }
+            | Command::DeclineFriendRequest { .. }
+            | Command::CancelFriendRequest { .. }
+            | Command::SendFriendRequest { .. }
+            | Command::FindFriendByPhone { .. }
+            | Command::ResetFriendSearch
+            | Command::HandleContactsState { .. }
+            | Command::LoadBlockedUsers
+            | Command::SetBlocked { .. }
+            | Command::SaveAlias { .. }
+            | Command::SeedBlockedUsers(_)
     )
 }
 
@@ -202,6 +223,24 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::PollCreateApiDone { .. }
         | Input::PollDebounceFired { .. } => {
             polls::reduce_polls(state, input, &mut out);
+        }
+        // U9
+        Input::Command(cmd) if is_contacts_command(&cmd) => {
+            contacts::reduce_contacts_command(state, cmd, None, &mut out);
+        }
+        Input::OpRequest { op_id, cmd } if is_contacts_command(&cmd) => {
+            contacts::reduce_contacts_command(state, cmd, Some(op_id), &mut out);
+        }
+        Input::ContactsSyncDone { .. }
+        | Input::FriendRequestAccepted { .. }
+        | Input::FriendRequestDeclined { .. }
+        | Input::FriendRequestCancelled { .. }
+        | Input::FriendRequestSent { .. }
+        | Input::FriendFoundByPhone { .. }
+        | Input::BlockedUsersLoaded { .. }
+        | Input::BlockedUserUpdated { .. }
+        | Input::AliasSaved { .. } => {
+            contacts::reduce_contacts_input(state, input, &mut out);
         }
 
         Input::Command(_)

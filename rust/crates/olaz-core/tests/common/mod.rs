@@ -180,6 +180,9 @@ pub struct Seed {
     pub auto_delete: Option<BTreeMap<String, i64>>,
     #[serde(default)]
     pub host_results: Option<Value>,
+    // U9
+    #[serde(default)]
+    pub blocked_users: Option<Vec<Value>>,
     // U6
     #[serde(default)]
     pub starred_ids: Option<Vec<String>>,
@@ -2389,10 +2392,15 @@ impl Host for RecordingHost {
 
     async fn show_card(&self, conv_id: String, text: String) {
         if self.is_u6 {
+            let cid_val = if conv_id.is_empty() {
+                Value::Null
+            } else {
+                Value::String(conv_id)
+            };
             self.record(
                 "show_card",
                 json!({
-                    "conv_id": conv_id,
+                    "conv_id": cid_val,
                     "text": text,
                 }),
             );
@@ -2863,12 +2871,12 @@ fn apply_contacts_json(contacts: &Value, table: &mut IdentityTable) {
         }
     }
     if let Some(obj) = contacts.get("friend_global_ids").and_then(Value::as_object) {
-        for (gid, v) in obj {
-            if let Some(uid) = v.as_str()
-                && !gid.is_empty()
+        for (uid, v) in obj {
+            if let Some(gid) = v.as_str()
                 && !uid.is_empty()
+                && !gid.is_empty()
             {
-                table.friend_global_ids.insert(uid.to_owned(), gid.clone());
+                table.friend_global_ids.insert(uid.clone(), gid.to_owned());
             }
         }
     }
@@ -3726,6 +3734,238 @@ fn enrich_u12_snapshot(
     clippy::too_many_lines,
     reason = "mirrors PollRecorderTests.swift poll_model_checks switch 1:1"
 )]
+fn enrich_u9_snapshot(
+    obj: &mut Map<String, Value>,
+    full: &olaz_core::state::CoreSnapshot,
+    host: &RecordingHost,
+    u9_lookups: &BTreeMap<String, Value>,
+    last_alias_result: Option<&olaz_core::SaveAliasOutcome>,
+) {
+    // Message buttons + reaction names enrichment
+    if let Some(Value::Object(msgs_obj)) = obj.get_mut("messages") {
+        for (conv_id, list) in &full.messages.windows {
+            if let Some(Value::Array(arr)) = msgs_obj.get_mut(conv_id)
+                && arr.len() == list.len()
+            {
+                for (m, item) in list.iter().zip(arr.iter_mut()) {
+                    if let Value::Object(map) = item {
+                        let buttons: Vec<Value> = m
+                            .card_buttons
+                            .iter()
+                            .map(|b| {
+                                json!({
+                                    "ref": b.r#ref,
+                                    "label": b.label,
+                                    "enabled": b.enabled,
+                                    "help": b.help,
+                                })
+                            })
+                            .collect();
+                        map.insert("buttons".to_owned(), Value::Array(buttons));
+                        if let Some(Value::Array(r_arr)) = map.get_mut("reactions")
+                            && r_arr.len() == m.reactions.len()
+                        {
+                            for (r, r_item) in m.reactions.iter().zip(r_arr.iter_mut()) {
+                                if let Value::Object(r_map) = r_item {
+                                    let names: Vec<Value> =
+                                        r.names.iter().cloned().map(Value::String).collect();
+                                    r_map.insert("names".to_owned(), Value::Array(names));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Store messages reaction names enrichment (overrides U6 reactions without `names`)
+    if let Some(store_arc) = host.attached_store()
+        && let Some(Value::Object(store_obj)) = obj.get_mut("store")
+    {
+        let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut stored_msgs = store.load_all_messages().unwrap_or_default();
+        stored_msgs.sort_by(|a, b| {
+            a.conv_id
+                .as_bytes()
+                .cmp(b.conv_id.as_bytes())
+                .then_with(|| a.ts_ms.cmp(&b.ts_ms))
+                .then_with(|| a.id.as_bytes().cmp(b.id.as_bytes()))
+        });
+        if let Some(Value::Array(existing)) = store_obj.get_mut("messages")
+            && existing.len() == stored_msgs.len()
+        {
+            for (row, item) in stored_msgs.iter().zip(existing.iter_mut()) {
+                if let Value::Object(map) = item {
+                    let decoded = decode_stored_message(&to_wire_stored(row));
+                    let reactions_json: Vec<Value> = decoded
+                        .as_ref()
+                        .map(|d| {
+                            d.reactions
+                                .iter()
+                                .map(|r| {
+                                    let icon = if !r.icon.emoji.is_empty() {
+                                        &r.icon.emoji
+                                    } else if !r.icon.key.is_empty() {
+                                        &r.icon.key
+                                    } else {
+                                        &r.icon.r#type
+                                    };
+                                    json!({
+                                        "icon": icon,
+                                        "count": r.count,
+                                        "includes_me": r.includes_me,
+                                        "names": r.names,
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    map.insert("reactions".to_owned(), Value::Array(reactions_json));
+                    map.insert(
+                        "starred".to_owned(),
+                        Value::Bool(decoded.as_ref().is_some_and(|d| d.menu.starred)),
+                    );
+                }
+            }
+        }
+    }
+
+    let friends_json: Vec<Value> = full
+        .contacts
+        .friends
+        .iter()
+        .map(|f| {
+            json!({
+                "id": f.id,
+                "name": f.name,
+                "zalo_name": f.zalo_name,
+                "avatar": f.avatar,
+                "last_active_ms": f.last_active_ms,
+                "online": f.online,
+                "section": f.section,
+                "sort_key": f.sort_key,
+            })
+        })
+        .collect();
+    let groups_json: Vec<Value> = full
+        .contacts
+        .groups
+        .iter()
+        .map(|g| {
+            json!({
+                "id": g.id,
+                "name": g.name,
+                "avatar": g.avatar,
+                "members": g.members,
+                "sort_key": g.sort_key,
+            })
+        })
+        .collect();
+    let req_json = |r: &olaz_core::messages::FriendRequestEntry| -> Value {
+        json!({
+            "id": r.id,
+            "name": r.name,
+            "avatar": r.avatar,
+            "message": r.message,
+            "date_ms": r.time_ms,
+        })
+    };
+    let search_user_json = full.contacts.search.user.as_ref().map(|u| {
+        json!({
+            "id": u.id,
+            "name": u.name,
+            "zalo_name": u.zalo_name,
+            "avatar": u.avatar,
+            "bio": u.bio,
+            "is_friend": u.is_friend,
+            "is_self": u.is_self,
+            "requested": u.requested,
+            "requesting": u.requesting,
+            "default_message": u.default_message,
+            "max_message": u.max_message,
+        })
+    });
+    let notice_json = full.contacts.notice.as_ref().map(|n| {
+        json!({
+            "seq": n.seq,
+            "ok": n.ok,
+            "text": n.text,
+        })
+    });
+    obj.insert(
+        "contacts".to_owned(),
+        json!({
+            "friends": friends_json,
+            "groups": groups_json,
+            "received": full.contacts.received.iter().map(req_json).collect::<Vec<_>>(),
+            "sent": full.contacts.sent.iter().map(req_json).collect::<Vec<_>>(),
+            "pending_request_count": full.contacts.pending_request_count,
+            "loading_requests": full.contacts.loading_requests,
+            "search": {
+                "status": full.contacts.search.status.as_str(),
+                "error": full.contacts.search.error,
+                "user": search_user_json,
+            },
+            "notice": notice_json,
+            "friends_loaded": full.contacts.friends_loaded,
+            "groups_loaded": full.contacts.groups_loaded,
+        }),
+    );
+
+    let blocked_val = match &full.contacts.blocked_users {
+        Some(list) => Value::Array(
+            list.iter()
+                .map(|b| {
+                    json!({
+                        "id": b.id,
+                        "name": b.name,
+                        "avatar": b.avatar,
+                    })
+                })
+                .collect(),
+        ),
+        None => Value::Null,
+    };
+    obj.insert("blocked_users".to_owned(), blocked_val);
+
+    let mut aliases_obj = Map::new();
+    for (k, v) in &full.contacts.aliases {
+        aliases_obj.insert(k.clone(), Value::String(v.clone()));
+    }
+    obj.insert("aliases".to_owned(), Value::Object(aliases_obj));
+
+    let group_detail_keys: Vec<Value> = full
+        .contacts
+        .group_details_json
+        .keys()
+        .cloned()
+        .map(Value::String)
+        .collect();
+    obj.insert(
+        "cached_group_details".to_owned(),
+        Value::Array(group_detail_keys),
+    );
+
+    let mut fg_obj = Map::new();
+    for (uid, gid) in &full.contacts.friend_global_ids {
+        fg_obj.insert(uid.clone(), Value::String(gid.clone()));
+    }
+    obj.insert("friend_global_ids".to_owned(), Value::Object(fg_obj));
+
+    let mut lookups_obj = Map::new();
+    for (k, v) in u9_lookups {
+        lookups_obj.insert(k.clone(), v.clone());
+    }
+    obj.insert("lookups".to_owned(), Value::Object(lookups_obj));
+
+    let alias_res_val = match last_alias_result {
+        Some(r) => json!({ "ok": r.ok, "text": r.text }),
+        None => Value::Null,
+    };
+    obj.insert("last_alias_result".to_owned(), alias_res_val);
+}
+
 async fn run_u12_poll_model_checks(checks: &[Value], core: &CoreHandle) -> Value {
     let snap = core.full_snapshot().await.unwrap_or_default();
     let mut check_results = Vec::with_capacity(checks.len());
@@ -4004,11 +4244,14 @@ struct SnapshotOpts<'a> {
     is_u4: bool,
     is_u5: bool,
     is_u6: bool,
+    is_u9: bool,
     is_u12: bool,
     last_send_result: Option<bool>,
     send_logs: &'a Mutex<Vec<String>>,
     prune_next_expiry_ms: Option<i64>,
     action_logs: &'a Mutex<Vec<String>>,
+    u9_lookups: &'a BTreeMap<String, Value>,
+    last_alias_result: Option<&'a olaz_core::SaveAliasOutcome>,
     u12_results: &'a BTreeMap<String, Value>,
     watched_check_ids: Option<&'a [String]>,
     seeded_member_cache: Option<&'a Value>,
@@ -4024,11 +4267,14 @@ async fn capture_case_snapshot(
         is_u4,
         is_u5,
         is_u6,
+        is_u9,
         is_u12,
         last_send_result,
         send_logs,
         prune_next_expiry_ms,
         action_logs,
+        u9_lookups,
+        last_alias_result,
         u12_results,
         watched_check_ids,
         seeded_member_cache,
@@ -4299,6 +4545,9 @@ async fn capture_case_snapshot(
             }
         }
     }
+    if is_u9 {
+        enrich_u9_snapshot(&mut obj, &full, host, u9_lookups, last_alias_result);
+    }
     Some(Value::Object(obj))
 }
 
@@ -4325,7 +4574,8 @@ fn str_vec_arg(args: &Value, key: &str) -> Vec<String> {
 /// snapshots, final state, sorted canonical requests, and ordered host calls.
 pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let is_u12 = case.domain == "polls";
-    let is_u6 = case.domain == "message_actions";
+    let is_u9 = case.domain == "contacts";
+    let is_u6 = case.domain == "message_actions" || is_u9;
     let is_u5 = case.domain == "send" || is_u6 || is_u12;
     let is_u4 = case.domain == "bootstrap" || case.domain == "messages" || is_u5;
     let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions" || is_u4;
@@ -4453,15 +4703,20 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         }
         initial_state.actions.auto_delete = Some(map);
     }
-    if is_u12 {
+    if is_u9 {
         if let Some(contacts) = &case.seed.contacts {
-            if let Some(b) = contacts.get("friends_loaded").and_then(Value::as_bool) {
-                initial_state.contacts.friends_loaded = b;
+            if let Some(count) = contacts
+                .get("pending_request_count")
+                .and_then(Value::as_i64)
+            {
+                initial_state.contacts.pending_request_count =
+                    usize::try_from(count.max(0)).unwrap_or(0);
             }
-            if let Some(b) = contacts.get("groups_loaded").and_then(Value::as_bool) {
-                initial_state.contacts.groups_loaded = b;
+            if let Some(loading) = contacts.get("loading_requests").and_then(Value::as_bool) {
+                initial_state.contacts.loading_requests = loading;
             }
             if let Some(arr) = contacts.get("friends").and_then(Value::as_array) {
+                initial_state.contacts.friends.clear();
                 for row in arr {
                     let Some(id) = row.get("id").and_then(Value::as_str) else {
                         continue;
@@ -4512,6 +4767,192 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 }
             }
             if let Some(arr) = contacts.get("groups").and_then(Value::as_array) {
+                initial_state.contacts.groups.clear();
+                for row in arr {
+                    let Some(id) = row.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let name = row
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(id)
+                        .to_owned();
+                    let avatar = row
+                        .get("avatar")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    let members = row.get("members").and_then(Value::as_i64).unwrap_or(0);
+                    let sort_key = row
+                        .get("sort_key")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| name.to_lowercase());
+                    initial_state
+                        .contacts
+                        .groups
+                        .push(olaz_core::messages::GroupEntry {
+                            id: id.to_owned(),
+                            name,
+                            avatar,
+                            members,
+                            sort_key,
+                        });
+                }
+            }
+            if let Some(arr) = contacts.get("received").and_then(Value::as_array) {
+                for row in arr {
+                    if let Some(id) = row.get("id").and_then(Value::as_str)
+                        && !id.is_empty()
+                    {
+                        initial_state.contacts.received.push(
+                            olaz_core::messages::FriendRequestEntry {
+                                id: id.to_owned(),
+                                name: row
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                                avatar: row
+                                    .get("avatar")
+                                    .and_then(Value::as_str)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_owned),
+                                message: row
+                                    .get("message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                                time_ms: row
+                                    .get("date_ms")
+                                    .or_else(|| row.get("time"))
+                                    .and_then(Value::as_i64)
+                                    .filter(|&v| v > 0),
+                            },
+                        );
+                    }
+                }
+            }
+            if let Some(arr) = contacts.get("sent").and_then(Value::as_array) {
+                for row in arr {
+                    if let Some(id) = row.get("id").and_then(Value::as_str)
+                        && !id.is_empty()
+                    {
+                        initial_state
+                            .contacts
+                            .sent
+                            .push(olaz_core::messages::FriendRequestEntry {
+                                id: id.to_owned(),
+                                name: row
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                                avatar: row
+                                    .get("avatar")
+                                    .and_then(Value::as_str)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_owned),
+                                message: row
+                                    .get("message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                                time_ms: row
+                                    .get("date_ms")
+                                    .or_else(|| row.get("time"))
+                                    .and_then(Value::as_i64)
+                                    .filter(|&v| v > 0),
+                            });
+                    }
+                }
+            }
+        }
+        if let Some(blocked) = &case.seed.blocked_users {
+            let mut list = Vec::new();
+            for row in blocked {
+                if let Some(id) = row.get("id").and_then(Value::as_str)
+                    && !id.is_empty()
+                {
+                    list.push(olaz_core::BlockedUserState {
+                        id: id.to_owned(),
+                        name: row
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        avatar: row
+                            .get("avatar")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned),
+                    });
+                }
+            }
+            initial_state.contacts.blocked_users = Some(list);
+        }
+    }
+    if is_u12 {
+        if let Some(contacts) = &case.seed.contacts {
+            if let Some(b) = contacts.get("friends_loaded").and_then(Value::as_bool) {
+                initial_state.contacts.friends_loaded = b;
+            }
+            if let Some(b) = contacts.get("groups_loaded").and_then(Value::as_bool) {
+                initial_state.contacts.groups_loaded = b;
+            }
+            if let Some(arr) = contacts.get("friends").and_then(Value::as_array) {
+                initial_state.contacts.friends.clear();
+                for row in arr {
+                    let Some(id) = row.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let name = row
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(id)
+                        .to_owned();
+                    let zalo_name = row
+                        .get("zalo_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&name)
+                        .to_owned();
+                    let avatar = row
+                        .get("avatar")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    let last_active_ms = row.get("last_active_ms").and_then(Value::as_i64);
+                    let online = row.get("online").and_then(Value::as_bool).unwrap_or(false);
+                    let section = row
+                        .get("section")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| {
+                            let s: String = name.chars().take(1).collect::<String>().to_uppercase();
+                            if s.is_empty() { "#".to_owned() } else { s }
+                        });
+                    let sort_key = row
+                        .get("sort_key")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| name.to_lowercase());
+                    initial_state
+                        .contacts
+                        .friends
+                        .push(olaz_core::messages::FriendEntry {
+                            id: id.to_owned(),
+                            name,
+                            zalo_name,
+                            avatar,
+                            last_active_ms,
+                            online,
+                            section,
+                            sort_key,
+                        });
+                }
+            }
+            if let Some(arr) = contacts.get("groups").and_then(Value::as_array) {
+                initial_state.contacts.groups.clear();
                 for row in arr {
                     let Some(id) = row.get("id").and_then(Value::as_str) else {
                         continue;
@@ -4666,6 +5107,9 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let mut prune_next_expiry_ms: Option<i64> = None;
     let mut pending_send_task: Option<tokio::task::JoinHandle<bool>> = None;
     let mut pending_action_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut pending_contacts_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut u9_lookups: BTreeMap<String, Value> = BTreeMap::new();
+    let mut last_alias_result: Option<olaz_core::SaveAliasOutcome> = None;
     let mut u12_results: BTreeMap<String, Value> = BTreeMap::new();
 
     for (step_index, step) in case.steps.iter().enumerate() {
@@ -5857,6 +6301,130 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                     let check_results = run_u12_poll_model_checks(checks, &core).await;
                     u12_results.insert(step_index.to_string(), check_results);
                 }
+                // U9 contacts domain commands
+                "contacts_sync" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    core.request_unit(Command::PerformContactsSync).await;
+                    inner_runner.flush_host().await;
+                    let _ = core.settle().await;
+                    inner_runner.flush_store().await;
+                    let _ = core.settle().await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "accept_request" => {
+                    let id = str_arg(args, "id");
+                    core.request_unit(Command::AcceptFriendRequest { uid: id })
+                        .await;
+                    inner_runner.flush_store().await;
+                    let _ = core.settle().await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "decline_request" => {
+                    let id = str_arg(args, "id");
+                    core.request_unit(Command::DeclineFriendRequest { uid: id })
+                        .await;
+                    let _ = core.settle().await;
+                }
+                "cancel_request" => {
+                    let id = str_arg(args, "id");
+                    core.request_unit(Command::CancelFriendRequest { uid: id })
+                        .await;
+                    let _ = core.settle().await;
+                }
+                "send_request" => {
+                    let id = str_arg(args, "id");
+                    let message = str_arg(args, "message");
+                    core.request_unit(Command::SendFriendRequest { uid: id, message })
+                        .await;
+                    inner_runner.flush_store().await;
+                    let _ = core.settle().await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "find_by_phone" => {
+                    let phone = str_arg(args, "phone");
+                    let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
+                    if is_async {
+                        let target_held = transport.held_arrived_count() + 1;
+                        let core_bg = Arc::clone(&core);
+                        pending_contacts_task = Some(tokio::spawn(async move {
+                            core_bg
+                                .request_unit(Command::FindFriendByPhone { phone })
+                                .await;
+                        }));
+                        let _ = core.settle().await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(200),
+                            transport.wait_for_held_arrival(target_held),
+                        )
+                        .await;
+                    } else {
+                        core.request_unit(Command::FindFriendByPhone { phone })
+                            .await;
+                        let _ = core.settle().await;
+                    }
+                }
+                "await_contacts" => {
+                    if let Some(handle) = pending_contacts_task.take() {
+                        handle
+                            .await
+                            .map_err(|e| format!("await_contacts join error: {e}"))?;
+                    }
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "reset_search" => {
+                    core.request_unit(Command::ResetFriendSearch).await;
+                }
+                "contacts_state" => {
+                    let state_val = args.get("json").cloned().unwrap_or_else(|| json!({}));
+                    let state_json = serde_json::to_string(&state_val).unwrap_or_default();
+                    core.request_unit(Command::HandleContactsState { state_json })
+                        .await;
+                }
+                "lookup" => {
+                    let _ = core.settle().await;
+                    let uid = str_arg(args, "uid");
+                    let val = match core.identity_snapshot().lookup_person(&uid) {
+                        Some(hit) => json!({ "name": hit.name, "avatar": hit.avatar }),
+                        None => Value::Null,
+                    };
+                    u9_lookups.insert(step_index.to_string(), val);
+                }
+                "mention_name" => {
+                    let _ = core.settle().await;
+                    let uid = str_arg(args, "uid");
+                    let val = match core.identity_snapshot().mention_display_name(&uid) {
+                        Some(name) => json!({ "name": name, "avatar": "" }),
+                        None => Value::Null,
+                    };
+                    u9_lookups.insert(step_index.to_string(), val);
+                }
+                "load_blocked" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    core.request_unit(Command::LoadBlockedUsers).await;
+                    let _ = core.settle().await;
+                }
+                "set_blocked" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let uid = str_arg(args, "uid");
+                    let blocked = args
+                        .get("blocked")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let name = str_arg(args, "name");
+                    core.request_unit(Command::SetBlocked { uid, blocked, name })
+                        .await;
+                    inner_runner.flush_host().await;
+                    let _ = core.settle().await;
+                }
+                "save_alias" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let uid = str_arg(args, "uid");
+                    let name = str_arg(args, "name");
+                    let res = core.request_save_alias(uid, name).await;
+                    inner_runner.flush_store().await;
+                    let _ = core.settle().await;
+                    last_alias_result = Some(res);
+                }
                 other => return Err(format!("unknown step cmd: {other}")),
             },
             Step::Await {
@@ -5900,7 +6468,10 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             }
             Step::Snapshot { snapshot } => {
                 if is_u3 {
-                    if pending_send_task.is_some() || pending_action_task.is_some() {
+                    if pending_send_task.is_some()
+                        || pending_action_task.is_some()
+                        || pending_contacts_task.is_some()
+                    {
                         inner_runner.flush_host().await;
                         let _ = core.settle().await;
                         inner_runner.flush_store().await;
@@ -5918,11 +6489,14 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         is_u4,
                         is_u5,
                         is_u6,
+                        is_u9,
                         is_u12,
                         last_send_result,
                         send_logs: &send_logs,
                         prune_next_expiry_ms,
                         action_logs: &action_logs,
+                        u9_lookups: &u9_lookups,
+                        last_alias_result: last_alias_result.as_ref(),
                         u12_results: &u12_results,
                         watched_check_ids: case.seed.watched_check_ids.as_deref(),
                         seeded_member_cache: case.seed.group_member_cache.as_ref(),
@@ -5966,6 +6540,11 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             .await
             .map_err(|e| format!("trailing action task join error: {e}"))?;
     }
+    if let Some(handle) = pending_contacts_task.take() {
+        handle
+            .await
+            .map_err(|e| format!("trailing contacts task join error: {e}"))?;
+    }
     let final_state = capture_case_snapshot(
         &core,
         &host,
@@ -5974,11 +6553,14 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             is_u4,
             is_u5,
             is_u6,
+            is_u9,
             is_u12,
             last_send_result,
             send_logs: &send_logs,
             prune_next_expiry_ms,
             action_logs: &action_logs,
+            u9_lookups: &u9_lookups,
+            last_alias_result: last_alias_result.as_ref(),
             u12_results: &u12_results,
             watched_check_ids: case.seed.watched_check_ids.as_deref(),
             seeded_member_cache: case.seed.group_member_cache.as_ref(),

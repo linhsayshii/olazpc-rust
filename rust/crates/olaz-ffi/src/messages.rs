@@ -6,8 +6,9 @@ use std::fmt;
 
 use olaz_core::changes::MessageMetaSnapshot;
 use olaz_core::messages::{
-    ContactsState, FriendEntry, FriendRequestEntry, GroupEntry, HistoryFreshness, MuteEntry,
-    WindowDelta,
+    BlockedUserState, ContactNotice, ContactSearchState, ContactSearchStatus, ContactsState,
+    FoundUserEntry, FriendEntry, FriendRequestEntry, GroupEntry, HistoryFreshness, MuteEntry,
+    SaveAliasOutcome, WindowDelta, contact_fold, localized_standard_cmp,
 };
 use olaz_wire::ChatMessage;
 
@@ -352,7 +353,197 @@ impl From<FriendRequestEntryRecord> for FriendRequestEntry {
     }
 }
 
-/// Partial-U9 contacts state snapshot delivered via `CoreChangesRecord.contacts`.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FoundUserRecord {
+    pub id: String,
+    pub name: String,
+    pub zalo_name: String,
+    pub avatar: Option<String>,
+    pub bio: String,
+    pub is_friend: bool,
+    pub is_self: bool,
+    pub requested: bool,
+    pub requesting: bool,
+    pub default_message: String,
+    pub max_message: i64,
+}
+
+impl fmt::Debug for FoundUserRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FoundUserRecord")
+            .field("is_friend", &self.is_friend)
+            .field("is_self", &self.is_self)
+            .finish()
+    }
+}
+
+impl From<FoundUserEntry> for FoundUserRecord {
+    fn from(u: FoundUserEntry) -> Self {
+        Self {
+            id: u.id,
+            name: u.name,
+            zalo_name: u.zalo_name,
+            avatar: u.avatar,
+            bio: u.bio,
+            is_friend: u.is_friend,
+            is_self: u.is_self,
+            requested: u.requested,
+            requesting: u.requesting,
+            default_message: u.default_message,
+            max_message: u.max_message,
+        }
+    }
+}
+
+impl From<FoundUserRecord> for FoundUserEntry {
+    fn from(u: FoundUserRecord) -> Self {
+        Self {
+            id: u.id,
+            name: u.name,
+            zalo_name: u.zalo_name,
+            avatar: u.avatar,
+            bio: u.bio,
+            is_friend: u.is_friend,
+            is_self: u.is_self,
+            requested: u.requested,
+            requesting: u.requesting,
+            default_message: u.default_message,
+            max_message: u.max_message,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ContactSearchRecord {
+    pub status: String,
+    pub error: Option<String>,
+    pub user: Option<FoundUserRecord>,
+}
+
+impl fmt::Debug for ContactSearchRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContactSearchRecord")
+            .field("status", &self.status)
+            .field("has_user", &self.user.is_some())
+            .finish()
+    }
+}
+
+impl From<ContactSearchState> for ContactSearchRecord {
+    fn from(s: ContactSearchState) -> Self {
+        Self {
+            status: s.status.as_str().to_owned(),
+            error: s.error,
+            user: s.user.map(Into::into),
+        }
+    }
+}
+
+impl From<ContactSearchRecord> for ContactSearchState {
+    fn from(s: ContactSearchRecord) -> Self {
+        Self {
+            status: ContactSearchStatus::parse(&s.status),
+            error: s.error,
+            user: s.user.map(Into::into),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ContactNoticeRecord {
+    pub seq: i64,
+    pub ok: bool,
+    pub text: String,
+}
+
+impl fmt::Debug for ContactNoticeRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContactNoticeRecord")
+            .field("seq", &self.seq)
+            .field("ok", &self.ok)
+            .finish()
+    }
+}
+
+impl From<ContactNotice> for ContactNoticeRecord {
+    fn from(n: ContactNotice) -> Self {
+        Self {
+            seq: n.seq,
+            ok: n.ok,
+            text: n.text,
+        }
+    }
+}
+
+impl From<ContactNoticeRecord> for ContactNotice {
+    fn from(n: ContactNoticeRecord) -> Self {
+        Self {
+            seq: n.seq,
+            ok: n.ok,
+            text: n.text,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct BlockedUserRecord {
+    pub id: String,
+    pub name: String,
+    pub avatar: Option<String>,
+}
+
+impl fmt::Debug for BlockedUserRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BlockedUserRecord")
+            .field("has_avatar", &self.avatar.is_some())
+            .finish()
+    }
+}
+
+impl From<BlockedUserState> for BlockedUserRecord {
+    fn from(b: BlockedUserState) -> Self {
+        Self {
+            id: b.id,
+            name: b.name,
+            avatar: b.avatar,
+        }
+    }
+}
+
+impl From<BlockedUserRecord> for BlockedUserState {
+    fn from(b: BlockedUserRecord) -> Self {
+        Self {
+            id: b.id,
+            name: b.name,
+            avatar: b.avatar,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SaveAliasResultRecord {
+    pub ok: bool,
+    pub text: String,
+}
+
+impl fmt::Debug for SaveAliasResultRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SaveAliasResultRecord")
+            .field("ok", &self.ok)
+            .finish()
+    }
+}
+
+impl From<SaveAliasOutcome> for SaveAliasResultRecord {
+    fn from(o: SaveAliasOutcome) -> Self {
+        Self {
+            ok: o.ok,
+            text: o.text,
+        }
+    }
+}
+
+/// Full U9 contacts state snapshot delivered via `CoreChangesRecord.contacts`.
 #[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ContactsStateRecord {
     pub friends: Vec<FriendEntryRecord>,
@@ -363,6 +554,10 @@ pub struct ContactsStateRecord {
     pub friends_loaded: bool,
     pub groups_loaded: bool,
     pub loading_requests: bool,
+    pub search: ContactSearchRecord,
+    pub notice: Option<ContactNoticeRecord>,
+    pub blocked_users: Option<Vec<BlockedUserRecord>>,
+    pub aliases: Vec<StringPairEntry>,
     pub group_details_json: Vec<StringPairEntry>,
     pub received_raw_json: Option<String>,
     pub sent_raw_json: Option<String>,
@@ -390,6 +585,16 @@ impl From<ContactsState> for ContactsStateRecord {
             friends_loaded: c.friends_loaded,
             groups_loaded: c.groups_loaded,
             loading_requests: c.loading_requests,
+            search: c.search.into(),
+            notice: c.notice.map(Into::into),
+            blocked_users: c
+                .blocked_users
+                .map(|v| v.into_iter().map(Into::into).collect()),
+            aliases: c
+                .aliases
+                .into_iter()
+                .map(|(key, value)| StringPairEntry { key, value })
+                .collect(),
             group_details_json: c
                 .group_details_json
                 .into_iter()
@@ -417,6 +622,12 @@ impl From<ContactsStateRecord> for ContactsState {
             friends_loaded: c.friends_loaded,
             groups_loaded: c.groups_loaded,
             loading_requests: c.loading_requests,
+            search: c.search.into(),
+            notice: c.notice.map(Into::into),
+            blocked_users: c
+                .blocked_users
+                .map(|v| v.into_iter().map(Into::into).collect()),
+            aliases: c.aliases.into_iter().map(|p| (p.key, p.value)).collect(),
             group_details_json: c
                 .group_details_json
                 .into_iter()
@@ -429,11 +640,42 @@ impl From<ContactsStateRecord> for ContactsState {
                 .into_iter()
                 .map(|p| (p.key, p.value))
                 .collect(),
-            aliases: std::collections::BTreeMap::new(),
             cached_profiles: std::collections::BTreeMap::new(),
             cached_groups: std::collections::BTreeMap::new(),
             activity_ranks: std::collections::BTreeMap::new(),
+            search_gen: 0,
+            sync_in_flight: 0,
         }
+    }
+}
+
+#[uniffi::export]
+#[must_use]
+pub fn contact_fold_ffi(text: String) -> String {
+    contact_fold(&text)
+}
+
+#[uniffi::export]
+#[must_use]
+pub fn localized_standard_cmp_ffi(a: String, b: String) -> i8 {
+    match localized_standard_cmp(&a, &b) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PersonLookupRecord {
+    pub name: String,
+    pub avatar: String,
+}
+
+impl fmt::Debug for PersonLookupRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PersonLookupRecord")
+            .field("has_avatar", &!self.avatar.is_empty())
+            .finish()
     }
 }
 

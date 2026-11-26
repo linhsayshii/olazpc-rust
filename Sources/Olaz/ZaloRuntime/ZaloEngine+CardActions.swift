@@ -100,18 +100,14 @@ extension ZaloEngine {
     // MARK: Native sheets of card actions
 
     func saveAlias(uid: String, name: String) async -> (ok: Bool, text: String) {
-        let clean = ZaloWireParser.stripUserPrefix(uid)
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        do {
-            _ = try await sessionClient.setAliasAPI(uid: clean, alias: trimmed)
-            if trimmed.isEmpty { cachedAliases.removeValue(forKey: clean) } else { cachedAliases[clean] = trimmed }
-            if let data = try? JSONSerialization.data(withJSONObject: cachedAliases) {
-                try? await sqliteStore?.setPreferenceData(key: "aliases", data: data)
-            }
-            return (true, trimmed.isEmpty ? "Đã xóa tên gợi nhớ." : "Đã lưu tên gợi nhớ.")
-        } catch {
+        guard let core = await ensureCoreEngine(),
+              let res = try? await core.saveAlias(uid: uid, name: name) else {
             return (false, "Không lưu được tên gợi nhớ.")
         }
+        if let v = try? await core.settle() {
+            await waitForMirrorVersion(v)
+        }
+        return (res.ok, res.text)
     }
 
     func groupInvitePreview(_ url: URL) async -> GroupInvitePreview {

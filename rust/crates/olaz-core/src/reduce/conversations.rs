@@ -538,6 +538,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
     match cmd {
         Command::UpdateIdentities(table) => {
             state.contacts.apply_identity_table(table);
+            out.refresh_identity_snapshot = true;
             complete_op(op_id, OpResult::Unit, false, out);
         }
 
@@ -1126,6 +1127,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
 
         Command::SyncConversationsSnapshot(list) => {
             state.conversations.conversations = list;
+            out.refresh_identity_snapshot = true;
             complete_op(op_id, OpResult::Unit, false, out);
         }
 

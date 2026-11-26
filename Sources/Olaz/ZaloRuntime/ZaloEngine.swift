@@ -90,7 +90,9 @@ final class ZaloEngine {
         }
     }
     /// Accounts I blocked (messages and calls), from `/api/friend/blocklistv2`; nil until loaded.
-    var blockedUsers: [BlockedUser]?
+    var blockedUsers: [BlockedUser]? {
+        didSet { pushCoreBlockedUsersIfRunning() }
+    }
     /// "Tin nhắn tự xóa" per conversation (ms); nil until loaded.
     var autoDelete: [String: Int64]? {
         didSet { syncAutoDeleteToCore(from: oldValue, to: autoDelete) }
@@ -911,6 +913,10 @@ final class ZaloEngine {
     }
 
     internal func lookupPersonInfo(_ uid: String) -> (name: String, avatar: String)? {
+        if let core = coreLifecycle.core {
+            guard let rec = core.lookupPersonInfo(uid: uid) else { return nil }
+            return (rec.name, rec.avatar)
+        }
         let clean = ZaloWireParser.stripUserPrefix(uid)
         guard !clean.isEmpty, clean != "0", clean != "-1", clean != "__legacy__", clean != "unknown" else {
             return nil
