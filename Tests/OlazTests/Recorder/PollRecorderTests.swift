@@ -1666,6 +1666,10 @@ enum PollRecorderHarness {
         }
         XCTAssertEqual(byName.count, sorted.count, "\(domain).jsonl case count mismatch (run with OLAZ_RECORD=1 to regenerate)")
 
+        let knownDiffs = try CaseFile.loadKnownDiffs()
+        var usedKnownDiffs = Array(repeating: false, count: knownDiffs.count)
+        var executedNames: Set<String> = []
+
         for scenario in sorted {
             if scenario.slow && !shouldRunSlowCases {
                 print("skipped slow: \(scenario.name)")
@@ -1675,10 +1679,30 @@ enum PollRecorderHarness {
                 XCTFail("Missing recorded case '\(scenario.name)' in \(url.path)")
                 continue
             }
+            executedNames.insert(scenario.name)
             let actual = try await recordScenario(domain: domain, scenario)
-            if let diff = CaseJSON.firstDiff(expected: expected, actual: actual) {
+            let diffs = CaseFile.compareCase(
+                domain: domain,
+                name: scenario.name,
+                expected: expected,
+                actual: actual,
+                knownDiffs: knownDiffs,
+                usedKnownDiffs: &usedKnownDiffs
+            )
+            for diff in diffs {
                 XCTFail("\(scenario.name): \(diff)")
             }
+        }
+
+        let stale = CaseFile.staleKnownDiffs(
+            domain: domain,
+            executedNames: executedNames,
+            allCaseNames: Set(byName.keys),
+            knownDiffs: knownDiffs,
+            usedKnownDiffs: usedKnownDiffs
+        )
+        for msg in stale {
+            XCTFail(msg)
         }
     }
 
@@ -1959,7 +1983,7 @@ enum PollRecorderHarness {
         }
 
         let transitionRecorder = PollTransitionRecorder(scenarioName: scenario.name) {
-            normalizeRecordedURLs(await PollSnapshot.capture(from: engine, watchedCheckIds: watchedCheckIds))
+            normalizeRecordedURLs(SessionSnapshot.capture(from: engine))
         }
 
         engine.stateTrace = { [weak transitionRecorder] in
@@ -1996,6 +2020,7 @@ enum PollRecorderHarness {
 
         var snapshots: [String: CaseJSON] = [:]
 
+        do {
         for (stepIndex, step) in scenario.steps.enumerated() {
             if let cmd = step["cmd"]?.stringValue {
                 let args = step["args"]
@@ -2615,6 +2640,19 @@ enum PollRecorderHarness {
             caseDict["slow"] = .bool(true)
         }
         return .object(caseDict)
+        } catch {
+            transitionRecorder.cancelWaiters()
+            let pending = signalWaiters
+            signalWaiters.removeAll()
+            for cont in pending.values { cont.resume() }
+            virtualClock.cancelAll()
+            engine.resetPolls()
+            engine.cancelTasksForRecording()
+            engine.transportSettleTrace = nil
+            server.stop()
+            await engine.finishTearDownForRecording()
+            throw error
+        }
     }
 
     @MainActor
@@ -2854,34 +2892,29 @@ enum PollRecorderHarness {
     }
 }
 
-private final class PollTransitionRecorder: @unchecked Sendable {
+@MainActor
+private final class PollTransitionRecorder {
     private let scenarioName: String
-    private let captureState: @MainActor () async -> CaseJSON
+    private let captureState: () -> CaseJSON
     private var history: [CaseJSON] = []
-    private var lastSerialized: String?
     private var searchFromIndex = 0
     private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
 
-    init(scenarioName: String, captureState: @escaping @MainActor () async -> CaseJSON) {
+    init(scenarioName: String, captureState: @escaping () -> CaseJSON) {
         self.scenarioName = scenarioName
         self.captureState = captureState
     }
 
-    @MainActor
     func recordTransition() {
-        Task { @MainActor in
-            let state = await captureState()
-            let canonical = state.canonicalString()
-            if canonical == self.lastSerialized {
-                return
-            }
-            self.lastSerialized = canonical
-            self.history.append(state)
-            let pending = self.waiters
-            self.waiters.removeAll()
-            for cont in pending.values {
-                cont.resume()
-            }
+        let state = captureState()
+        if history.last == state {
+            return
+        }
+        history.append(state)
+        let pending = waiters
+        waiters.removeAll()
+        for cont in pending.values {
+            cont.resume()
         }
     }
 

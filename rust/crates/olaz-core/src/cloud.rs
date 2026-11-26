@@ -37,43 +37,7 @@ pub const CLOUD_LOCAL_READ_ERROR: &str = "Không đọc được dữ liệu zCl
 /// User-facing error for unsupported offload toggle on Olaz.
 pub const CLOUD_OFFLOAD_UNSUPPORTED_ERROR: &str = "Tự động giải phóng dung lượng zCloud hiện chưa được hỗ trợ trên Olaz. Vui lòng quản lý trên Zalo điện thoại.";
 
-/// Host return value for `HostCall::ResolveMedia` (Swift `MediaResolution`).
-#[derive(Clone, PartialEq, Eq)]
-pub enum MediaResolutionOutcome {
-    File(String),
-    Expired,
-    Unsupported,
-    Unavailable,
-}
-
-impl fmt::Debug for MediaResolutionOutcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::File(_) => f.write_str("File"),
-            Self::Expired => f.write_str("Expired"),
-            Self::Unsupported => f.write_str("Unsupported"),
-            Self::Unavailable => f.write_str("Unavailable"),
-        }
-    }
-}
-
-/// Host return value for `HostCall::ResolveFile` (Swift `FileResolution`).
-#[derive(Clone, PartialEq, Eq)]
-pub enum FileResolutionOutcome {
-    Ready(String),
-    Expired,
-    Failed(String),
-}
-
-impl fmt::Debug for FileResolutionOutcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Ready(_) => f.write_str("Ready"),
-            Self::Expired => f.write_str("Expired"),
-            Self::Failed(_) => f.write_str("Failed"),
-        }
-    }
-}
+pub use crate::forward::{FileResolutionOutcome, MediaResolutionOutcome};
 
 /// Media category stored in zCloud (Swift `CloudItemKind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

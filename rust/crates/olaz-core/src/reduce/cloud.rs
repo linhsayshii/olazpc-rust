@@ -173,7 +173,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                 "photo"
             };
             state.cloud.pending_thumbnails.insert(op_id);
-            out.effects.push(Effect::Host(HostCall::ResolveMedia {
+            out.effects.push(Effect::Host(HostCall::CloudResolveMedia {
                 op_id,
                 conv_id: (*cid).to_owned(),
                 msg_id: (*mid).to_owned(),
@@ -494,7 +494,7 @@ fn start_fetch_with_message(
                     fallback_size: ESTIMATED_PHOTO_BYTES,
                 },
             );
-            out.effects.push(Effect::Host(HostCall::ResolveMedia {
+            out.effects.push(Effect::Host(HostCall::CloudResolveMedia {
                 op_id,
                 conv_id: cid.to_owned(),
                 msg_id: mid.to_owned(),
@@ -511,7 +511,7 @@ fn start_fetch_with_message(
                     fallback_size: ESTIMATED_VIDEO_BYTES,
                 },
             );
-            out.effects.push(Effect::Host(HostCall::ResolveMedia {
+            out.effects.push(Effect::Host(HostCall::CloudResolveMedia {
                 op_id,
                 conv_id: cid.to_owned(),
                 msg_id: mid.to_owned(),
@@ -528,7 +528,7 @@ fn start_fetch_with_message(
                     fallback_size: ESTIMATED_VOICE_BYTES,
                 },
             );
-            out.effects.push(Effect::Host(HostCall::ResolveFile {
+            out.effects.push(Effect::Host(HostCall::CloudResolveFile {
                 op_id,
                 conv_id: cid.to_owned(),
                 msg_id: mid.to_owned(),
@@ -546,7 +546,7 @@ fn start_fetch_with_message(
                     fallback_size: (*size).max(0),
                 },
             );
-            out.effects.push(Effect::Host(HostCall::ResolveFile {
+            out.effects.push(Effect::Host(HostCall::CloudResolveFile {
                 op_id,
                 conv_id: cid.to_owned(),
                 msg_id: mid.to_owned(),

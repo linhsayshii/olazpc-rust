@@ -13,8 +13,11 @@ pub mod changes;
 pub mod cloud;
 pub mod conversations;
 pub mod effect;
+pub mod forward;
 pub mod input;
 pub mod messages;
+// U12
+pub mod polls;
 pub mod reduce;
 pub mod runner;
 pub mod state;
@@ -45,9 +48,9 @@ pub use cloud::{
     CloudFetch, CloudFile, CloudItem, CloudItemKind, CloudPage, CloudPlan, CloudPlanKind,
     CloudServerSnapshot, CloudSettings, CloudSnapshotState, CloudState, DEFAULT_FREE_CLOUD_QUOTA,
     DEFAULT_FREE_FILE_LIMIT, ESTIMATED_PHOTO_BYTES, ESTIMATED_VIDEO_BYTES, ESTIMATED_VOICE_BYTES,
-    FileResolutionOutcome, MediaResolutionOutcome, apply_cloud_snapshot, cloud_item_from_message,
-    cloud_item_from_stored, conversation_display_name, message_cloud_kind, path_extension,
-    resolve_cloud_conversation_meta, sort_cloud_items, split_cloud_key,
+    apply_cloud_snapshot, cloud_item_from_message, cloud_item_from_stored,
+    conversation_display_name, message_cloud_kind, path_extension, resolve_cloud_conversation_meta,
+    sort_cloud_items, split_cloud_key,
 };
 pub use conversations::{
     BatchApplyDelta, CachedGroup, CachedProfile, ConvMessageDelta, ConvPreviewOverride,
@@ -57,7 +60,14 @@ pub use conversations::{
     FriendIdentity, GroupIdentity, IdentityTable, LocalAccountHydration, MessagePreviewInput,
     PinBoard, StrangerBox, ToastKind, message_preview_label, to_wire_stored,
 };
-pub use effect::{Effect, HistoryFetchPurpose, HostCall, OpResult, StoreOp};
+pub use effect::{
+    Effect, HistoryFetchPurpose, HostCall, OpResult, PollBoardContinuation, PollDetailPurpose,
+    StoreOp,
+};
+pub use forward::{
+    ComposerSendOutcome, FileResolutionOutcome, ForwardOutcome, ForwardRequest, ForwardState,
+    MediaResolutionOutcome,
+};
 pub use input::{
     BootstrapAliasesError, Command, CompletedLogin, E2eeQuoteArg, HiddenPinSyncKind, Input,
     LegacyCookie, PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
@@ -74,7 +84,20 @@ pub use messages::{
     preferred_contact_name, serialize_cached_groups_json, serialize_cached_profiles_json,
     to_db_stored,
 };
+// U12
+pub use polls::{
+    AddedPollOption, BoardPinItem, BoardPinList, BoardRawTopics, MAX_SEEN_POLL_MESSAGES,
+    MAX_WATCHED_POLLS, MergedGroupMetadataPersistence, POLL_DEBOUNCE_DELAY_MS,
+    POLL_MESSAGE_MAX_AGE_MS, PollAction, PollActionResult, PollCapabilities, PollClock, PollConfig,
+    PollCreateDraft, PollCreateIssue, PollDetail, PollMessageNotice, PollOption, PollPinConfirm,
+    PollPinOutcome, PollPinState, PollVoteDraft, PollVoterGroup, PollVoterUser, PollVoters,
+    PollsState, UNKNOWN_POLL_USER_NAME, WATCH_POLL_THROTTLE_MS, build_pin_limit_confirm,
+    build_poll_voters, clamped_int64, is_group_admin_or_creator, map_create_poll_net_error,
+    map_poll_pin_net_error, map_poll_pin_session_error, merge_fetched_group_metadata,
+    normalize_poll_detail, normalize_poll_uid, refresh_poll_pin_state, resolve_poll_group_id,
+};
 pub use reduce::classify::{MobileSyncEvent, Route, classify, classify_poll};
+pub use reduce::polls::{DEFAULT_BOARD_PIN_LIMIT, apply_pins_state_event};
 pub use reduce::send::SendState;
 pub use reduce::{ReduceOutput, reduce};
 pub use runner::{

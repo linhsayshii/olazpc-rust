@@ -255,7 +255,7 @@ actor ZaloWebSocket {
     }
 
     func start(endpoints: [String], zpwSek: String, myUid: String? = nil, selfConvId: String? = nil) -> AsyncStream<ZaloWSEvent> {
-        stop(resetCursors: false)
+        stopSync(resetCursors: false)
         let (stream, continuation) = AsyncStream.makeStream(of: ZaloWSEvent.self)
         self.continuation = continuation
 
@@ -280,7 +280,7 @@ actor ZaloWebSocket {
         return stream
     }
 
-    func stop(resetCursors: Bool = true) {
+    private func stopSync(resetCursors: Bool) {
         if let session = rustSession {
             rustSession = nil
             Task.detached { _ = try? await session.stop(resetCursors: resetCursors) }
@@ -289,6 +289,18 @@ actor ZaloWebSocket {
         if resetCursors { rustCursors.clear() }
         continuation?.finish()
         continuation = nil
+    }
+
+    func stop(resetCursors: Bool = true) async {
+        let session = rustSession
+        rustSession = nil
+        completedFileURLs.removeAll()
+        if resetCursors { rustCursors.clear() }
+        continuation?.finish()
+        continuation = nil
+        if let session {
+            _ = try? await session.stop(resetCursors: resetCursors)
+        }
     }
 
     func waitForFileDone(fileId: String, timeoutSeconds: Double = 12) async -> String? {

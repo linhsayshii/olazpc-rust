@@ -22,12 +22,13 @@ use tokio::task::AbortHandle;
 
 use crate::actions::swift_error_type_name;
 use crate::actor::{ActorSink, InFlightGuard};
-use crate::cloud::{CloudServerSnapshot, FileResolutionOutcome, MediaResolutionOutcome};
+use crate::cloud::CloudServerSnapshot;
 use crate::conversations::{
     BatchApplyDelta, IdentityTable, MessagePreviewInput, hidden_pin_md5, hidden_pin_sha256,
     load_local_account_from_store, to_wire_stored,
 };
 use crate::effect::{Effect, HistoryFetchPurpose, HostCall, OpResult, StoreOp};
+use crate::forward::{ComposerSendOutcome, FileResolutionOutcome, MediaResolutionOutcome};
 use crate::input::{
     BootstrapAliasesError, Command, CompletedLogin, E2eeQuoteArg, Input, LegacyCookie,
     PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
@@ -491,11 +492,8 @@ pub trait Host: Send + Sync {
     ) -> Result<olaz_api::SendMessageResult, String> {
         Err("send_e2ee_text not implemented by host".to_owned())
     }
-    // U6: transient in-chat card toast (`CardActionCenter.shared.show`).
-    // Default no-op until U4+U6 cut over Swift `CoreHost`.
-    async fn show_card(&self, _conv_id: String, _text: String) {}
-
-    // U11 (aligned with U8)
+    // --- Forward & message-action / cloud domain callbacks (U6/U8/U11) ---
+    async fn show_card(&self, _conv_id: Option<String>, _text: String) {}
     async fn resolve_media(
         &self,
         _conv_id: String,
@@ -511,8 +509,33 @@ pub trait Host: Send + Sync {
         _name: String,
         _url: Option<String>,
     ) -> FileResolutionOutcome {
-        FileResolutionOutcome::Expired
+        FileResolutionOutcome::Failed("resolve_file not implemented by host".to_owned())
     }
+    async fn fetch_media_data(&self, _url: String) -> Option<String> {
+        None
+    }
+    async fn send_media(
+        &self,
+        _conv_id: String,
+        _paths: Vec<String>,
+        _cleanup_after: bool,
+    ) -> ComposerSendOutcome {
+        ComposerSendOutcome::Failed("send_media not implemented by host".to_owned())
+    }
+    async fn send_files(&self, _conv_id: String, _paths: Vec<String>) -> ComposerSendOutcome {
+        ComposerSendOutcome::Failed("send_files not implemented by host".to_owned())
+    }
+
+    // --- Group polls callbacks (U12) ---
+    /// Arms a per-poll incoming-message debounce timer on the host. Return `true` when the host
+    /// owns the sleep (e.g. Swift `ZaloEngine.pollDebounceSleep` seam) and will call back with
+    /// `Command::FirePollDebounce`; return `false` (default) to sleep inside `SessionEffectRunner`
+    /// on `tokio::time`.
+    async fn arm_poll_debounce(&self, _poll_id: String, _seq: u64, _delay_ms: u64) -> bool {
+        false
+    }
+    /// Cancels all pending host-owned poll debounce timers (`resetPolls` / `logOut` / `markExpired`).
+    async fn cancel_all_poll_debounces(&self) {}
 }
 
 enum HostJob {
@@ -572,6 +595,16 @@ enum HostJob {
     },
     RefreshBoardPins {
         conv_id: String,
+        _guard: InFlightGuard,
+    },
+    // U12
+    RefreshBoardPinsThen {
+        conv_id: String,
+        continuation: crate::effect::PollBoardContinuation,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    CancelAllPollDebounces {
         _guard: InFlightGuard,
     },
     MarkReadBoundary {
@@ -731,6 +764,11 @@ enum HostJob {
         on_pc: bool,
         _guard: InFlightGuard,
     },
+    ShowCard {
+        conv_id: Option<String>,
+        text: String,
+        _guard: InFlightGuard,
+    },
     PinTopic {
         conv_id: String,
         _guard: InFlightGuard,
@@ -749,14 +787,8 @@ enum HostJob {
         duration: i64,
         _guard: InFlightGuard,
     },
-    // U6
-    ShowCard {
-        conv_id: String,
-        text: String,
-        _guard: InFlightGuard,
-    },
     // U11
-    ResolveMedia {
+    CloudResolveMedia {
         op_id: u64,
         conv_id: String,
         msg_id: String,
@@ -764,7 +796,7 @@ enum HostJob {
         sink: ActorSink,
         _guard: InFlightGuard,
     },
-    ResolveFile {
+    CloudResolveFile {
         op_id: u64,
         conv_id: String,
         msg_id: String,
@@ -861,6 +893,8 @@ pub struct SessionEffectRunner<T: Transport + 'static> {
     typing_expiry_aborts: Arc<Mutex<BTreeMap<String, (u64, AbortHandle)>>>,
     // U6: active delete-for-me undo bar expiry timer (`(undo_gen, AbortHandle)`).
     delete_undo_abort: Arc<Mutex<Option<(u64, AbortHandle)>>>,
+    // U12: per-poll debounce timers (`poll_id -> (seq, AbortHandle)`).
+    poll_debounce_aborts: Arc<Mutex<BTreeMap<String, (u64, AbortHandle)>>>,
     host_worker_abort: AbortHandle,
     store_worker_abort: AbortHandle,
     runtime: Handle,
@@ -958,6 +992,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
             lp_fetch_abort: Mutex::new(None),
             typing_expiry_aborts: Arc::new(Mutex::new(BTreeMap::new())),
             delete_undo_abort: Arc::new(Mutex::new(None)),
+            poll_debounce_aborts: Arc::new(Mutex::new(BTreeMap::new())),
             host_worker_abort: worker_handle.abort_handle(),
             store_worker_abort: store_handle.abort_handle(),
             runtime,
@@ -1071,6 +1106,26 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         }
     }
 
+    // U12
+    fn cancel_poll_debounces(&self, poll_id: Option<&str>) {
+        let mut map = self
+            .poll_debounce_aborts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match poll_id {
+            Some(id) => {
+                if let Some((_, abort)) = map.remove(id) {
+                    abort.abort();
+                }
+            }
+            None => {
+                for (_, (_, abort)) in std::mem::take(&mut *map) {
+                    abort.abort();
+                }
+            }
+        }
+    }
+
     fn cancel_delete_undo_timer(&self) {
         if let Some((_, handle)) = self
             .delete_undo_abort
@@ -1153,6 +1208,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 Effect::CancelSessionTasks => {
                     self.cancel_active_tasks();
                     self.cancel_bootstrap_tasks();
+                    self.cancel_poll_debounces(None);
                 }
                 Effect::ClearCoreSession => {
                     self.api.reset_state();
@@ -2035,6 +2091,302 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         drop(guard);
                     });
                 }
+                // U12
+                Effect::FetchPollDetailApi {
+                    op_id,
+                    poll_id,
+                    purpose,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let payload = api.fetch_poll_detail(&poll_id).await.ok();
+                        let is_authenticated = client.is_authenticated();
+                        sink.send(Input::PollDetailFetched {
+                            op_id,
+                            poll_id,
+                            purpose,
+                            payload,
+                            is_authenticated,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchPollGroupDetailApi {
+                    op_id,
+                    poll_id,
+                    group_id,
+                    data_node,
+                    now_ms,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let group_info = api.fetch_group_detail(&group_id).await.ok();
+                        sink.send(Input::PollGroupDetailFetched {
+                            op_id,
+                            poll_id,
+                            group_id,
+                            data_node,
+                            group_info,
+                            now_ms,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::RefreshBoardPinsForPoll {
+                    conv_id,
+                    require_auth,
+                    continuation,
+                } => {
+                    if require_auth && !self.client.is_authenticated() {
+                        sink.send(Input::PollBoardRefreshed {
+                            conv_id,
+                            continuation,
+                        });
+                    } else {
+                        let guard = sink.track();
+                        self.send_host(HostJob::RefreshBoardPinsThen {
+                            conv_id,
+                            continuation,
+                            sink: sink.clone(),
+                            _guard: guard,
+                        });
+                    }
+                }
+                Effect::UnpinThenPinPollApi {
+                    op_id,
+                    poll_id,
+                    conv_id,
+                    replace_ref,
+                    for_create,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let did_unpin_old =
+                            if let Some((ref_id, raw_topic, board_version)) = replace_ref {
+                                if let Err(err) = api
+                                    .unpin_board_topic_api(
+                                        &conv_id,
+                                        &ref_id,
+                                        raw_topic.as_ref(),
+                                        board_version,
+                                    )
+                                    .await
+                                {
+                                    let olaz_api::ApiError::Net(ref net_err) = err;
+                                    sink.send(Input::PollPinApiDone {
+                                        op_id,
+                                        poll_id,
+                                        conv_id,
+                                        for_create,
+                                        step_result: Err(crate::polls::map_poll_pin_net_error(
+                                            net_err, false,
+                                        )),
+                                    });
+                                    drop(guard);
+                                    return;
+                                }
+                                true
+                            } else {
+                                false
+                            };
+                        let step_result = api
+                            .pin_board_item_api(&conv_id, &poll_id, 3)
+                            .await
+                            .map(|_| ())
+                            .map_err(|olaz_api::ApiError::Net(ref net_err)| {
+                                crate::polls::map_poll_pin_net_error(net_err, did_unpin_old)
+                            });
+                        sink.send(Input::PollPinApiDone {
+                            op_id,
+                            poll_id,
+                            conv_id,
+                            for_create,
+                            step_result,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::UnpinPollApi {
+                    op_id,
+                    poll_id,
+                    conv_id,
+                    raw_topic,
+                    board_version,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let ok = api
+                            .unpin_board_topic_api(
+                                &conv_id,
+                                &poll_id,
+                                raw_topic.as_ref(),
+                                board_version,
+                            )
+                            .await
+                            .is_ok();
+                        sink.send(Input::PollUnpinApiDone {
+                            op_id,
+                            poll_id,
+                            conv_id,
+                            ok,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::VotePollApi {
+                    op_id,
+                    poll_id,
+                    new_options,
+                    voted_ids,
+                    now_ms,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let ok = if !new_options.is_empty() {
+                            api.add_poll_option_api(&poll_id, &new_options, &voted_ids)
+                                .await
+                                .is_ok()
+                        } else {
+                            api.vote_poll_api(&poll_id, &voted_ids).await.is_ok()
+                        };
+                        sink.send(Input::PollVoteApiDone {
+                            op_id,
+                            poll_id,
+                            ok,
+                            now_ms,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::LockPollApi {
+                    op_id,
+                    poll_id,
+                    now_ms,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let ok = api.lock_poll_api(&poll_id).await.is_ok();
+                        sink.send(Input::PollLockApiDone {
+                            op_id,
+                            poll_id,
+                            ok,
+                            now_ms,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::SharePollApi { op_id, poll_id } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let ok = api.share_poll_api(&poll_id).await.is_ok();
+                        sink.send(Input::PollShareApiDone { op_id, ok });
+                        drop(guard);
+                    });
+                }
+                Effect::CreatePollApi {
+                    op_id,
+                    conv_id,
+                    question,
+                    options,
+                    expired_time_ms,
+                    allow_multi,
+                    allow_add,
+                    hide_vote_preview,
+                    is_anonymous,
+                    should_pin,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let result = api
+                            .create_poll_api(
+                                &conv_id,
+                                &question,
+                                &options,
+                                expired_time_ms,
+                                allow_multi,
+                                allow_add,
+                                hide_vote_preview,
+                                is_anonymous,
+                            )
+                            .await
+                            .map(|box_map| olaz_api::extract_created_poll_id(&box_map))
+                            .map_err(|olaz_api::ApiError::Net(ref net_err)| {
+                                crate::polls::map_create_poll_net_error(net_err)
+                            });
+                        sink.send(Input::PollCreateApiDone {
+                            op_id,
+                            conv_id,
+                            should_pin,
+                            result,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::ArmPollDebounce {
+                    poll_id,
+                    seq,
+                    delay,
+                } => {
+                    let deadline = tokio::time::Instant::now() + delay;
+                    let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                    let aborts = Arc::clone(&self.poll_debounce_aborts);
+                    let aborts_inner = Arc::clone(&aborts);
+                    let host = Arc::clone(&self.host);
+                    let timer_sink = sink.clone();
+                    let poll_key = poll_id.clone();
+                    let arm_guard = sink.track();
+                    let handle = self
+                        .runtime
+                        .spawn(async move {
+                            let handled = host
+                                .arm_poll_debounce(poll_key.clone(), seq, delay_ms)
+                                .await;
+                            drop(arm_guard);
+                            if handled {
+                                return;
+                            }
+                            tokio::time::sleep_until(deadline).await;
+                            {
+                                let mut map =
+                                    aborts_inner.lock().unwrap_or_else(PoisonError::into_inner);
+                                if map.get(&poll_key).is_some_and(|(s, _)| *s == seq) {
+                                    map.remove(&poll_key);
+                                }
+                            }
+                            timer_sink.send(Input::PollDebounceFired {
+                                poll_id: poll_key,
+                                seq,
+                                now_ms: unix_now_ms(),
+                            });
+                        })
+                        .abort_handle();
+                    let mut map = aborts.lock().unwrap_or_else(PoisonError::into_inner);
+                    if let Some((_, prev)) = map.insert(poll_id, (seq, handle)) {
+                        prev.abort();
+                    }
+                }
+                Effect::CancelAllPollDebounces => {
+                    self.cancel_poll_debounces(None);
+                    let guard = sink.track();
+                    self.send_host(HostJob::CancelAllPollDebounces { _guard: guard });
+                }
                 Effect::Host(HostCall::SendE2eeText {
                     send_id,
                     conv_id,
@@ -2048,6 +2400,45 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     self.runtime.spawn(async move {
                         let result = host.send_e2ee_text(conv_id, text, client_id, quote).await;
                         sink.send(Input::SendTextDone { send_id, result });
+                        drop(guard);
+                    });
+                }
+                // U8
+                Effect::AllocClientId { forward_id } => {
+                    let client_id = self.client.next_client_id();
+                    sink.send(Input::ForwardClientIdAllocated {
+                        forward_id,
+                        client_id,
+                    });
+                }
+                Effect::SendContactCardApi { forward_id, params } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = api
+                            .send_contact_card(&params)
+                            .await
+                            .map_err(|err| err.display_without_url());
+                        sink.send(Input::ForwardContactCardDone { forward_id, result });
+                        drop(guard);
+                    });
+                }
+                Effect::Host(HostCall::ResolveMedia {
+                    forward_id,
+                    conv_id,
+                    msg_id,
+                    kind,
+                }) => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let resolution = host.resolve_media(conv_id, msg_id, kind).await;
+                        sink.send(Input::ForwardMediaResolved {
+                            forward_id,
+                            resolution,
+                        });
                         drop(guard);
                     });
                 }
@@ -2238,6 +2629,73 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             recall_id,
                             retried_alt,
                             error,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::Host(HostCall::ResolveFile {
+                    forward_id,
+                    conv_id,
+                    msg_id,
+                    name,
+                    url,
+                }) => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let resolution = host.resolve_file(conv_id, msg_id, name, url).await;
+                        sink.send(Input::ForwardFileResolved {
+                            forward_id,
+                            resolution,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::Host(HostCall::FetchMediaData { forward_id, url }) => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let temp_path = host.fetch_media_data(url).await;
+                        sink.send(Input::ForwardFetchMediaDone {
+                            forward_id,
+                            temp_path,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::Host(HostCall::SendMedia {
+                    forward_id,
+                    conv_id,
+                    paths,
+                    cleanup_after,
+                }) => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let outcome = host.send_media(conv_id, paths, cleanup_after).await;
+                        sink.send(Input::ForwardSendMediaDone {
+                            forward_id,
+                            outcome,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::Host(HostCall::SendFiles {
+                    forward_id,
+                    conv_id,
+                    paths,
+                }) => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let outcome = host.send_files(conv_id, paths).await;
+                        sink.send(Input::ForwardSendFilesDone {
+                            forward_id,
+                            outcome,
                         });
                         drop(guard);
                     });
@@ -2695,22 +3153,18 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         HostCall::TransportBatchSettled => {
                             HostJob::TransportBatchSettled { _guard: guard }
                         }
-                        HostCall::SendE2eeText { .. } => {
-                            continue;
-                        }
-                        // U6
                         HostCall::ShowCard { conv_id, text } => HostJob::ShowCard {
                             conv_id,
                             text,
                             _guard: guard,
                         },
                         // U11
-                        HostCall::ResolveMedia {
+                        HostCall::CloudResolveMedia {
                             op_id,
                             conv_id,
                             msg_id,
                             kind,
-                        } => HostJob::ResolveMedia {
+                        } => HostJob::CloudResolveMedia {
                             op_id,
                             conv_id,
                             msg_id,
@@ -2718,13 +3172,13 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             sink: sink.clone(),
                             _guard: guard,
                         },
-                        HostCall::ResolveFile {
+                        HostCall::CloudResolveFile {
                             op_id,
                             conv_id,
                             msg_id,
                             name,
                             url,
-                        } => HostJob::ResolveFile {
+                        } => HostJob::CloudResolveFile {
                             op_id,
                             conv_id,
                             msg_id,
@@ -2733,6 +3187,14 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             sink: sink.clone(),
                             _guard: guard,
                         },
+                        HostCall::SendE2eeText { .. }
+                        | HostCall::ResolveMedia { .. }
+                        | HostCall::ResolveFile { .. }
+                        | HostCall::FetchMediaData { .. }
+                        | HostCall::SendMedia { .. }
+                        | HostCall::SendFiles { .. } => {
+                            continue;
+                        }
                     };
                     self.send_host(job);
                 }
@@ -2752,6 +3214,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
         self.cancel_active_tasks();
         self.cancel_bootstrap_tasks();
         self.cancel_typing_expiry(None);
+        self.cancel_poll_debounces(None);
         self.cancel_long_poll();
         self.ws_driver.stop(false);
         self.host_worker_abort.abort();
@@ -3743,6 +4206,22 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
             HostJob::RefreshBoardPins { conv_id, _guard } => {
                 host.refresh_board_pins(conv_id).await;
             }
+            // U12
+            HostJob::RefreshBoardPinsThen {
+                conv_id,
+                continuation,
+                sink,
+                _guard,
+            } => {
+                host.refresh_board_pins(conv_id.clone()).await;
+                sink.send(Input::PollBoardRefreshed {
+                    conv_id,
+                    continuation,
+                });
+            }
+            HostJob::CancelAllPollDebounces { _guard } => {
+                host.cancel_all_poll_debounces().await;
+            }
             HostJob::MarkReadBoundary {
                 conv_id,
                 seen_target,
@@ -4084,6 +4563,13 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
             } => {
                 host.show_typing(conv_id, uid, on_pc).await;
             }
+            HostJob::ShowCard {
+                conv_id,
+                text,
+                _guard,
+            } => {
+                host.show_card(conv_id, text).await;
+            }
             HostJob::PinTopic { conv_id, _guard } => {
                 host.pin_topic(conv_id).await;
             }
@@ -4106,16 +4592,8 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 host.mute(conv_id, set, start, start_explicit, duration)
                     .await;
             }
-            // U6
-            HostJob::ShowCard {
-                conv_id,
-                text,
-                _guard,
-            } => {
-                host.show_card(conv_id, text).await;
-            }
             // U11
-            HostJob::ResolveMedia {
+            HostJob::CloudResolveMedia {
                 op_id,
                 conv_id,
                 msg_id,
@@ -4136,7 +4614,7 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                     file_size,
                 });
             }
-            HostJob::ResolveFile {
+            HostJob::CloudResolveFile {
                 op_id,
                 conv_id,
                 msg_id,
@@ -4889,6 +5367,136 @@ mod tests {
         core.stop();
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn poll_debounce_timer_coalesces_and_cancels_on_reset() {
+        use olaz_net::http::RawResponse;
+        use olaz_net::mock::MockTransport;
+
+        use crate::actor::CoreHandle;
+        use crate::input::Command;
+        use crate::polls::{POLL_DEBOUNCE_DELAY_MS, PollDetail, PollMessageNotice};
+        use crate::state::{CoreState, Phase, Profile};
+
+        let transport = MockTransport::from_fn(|_| {
+            Ok(RawResponse::new(
+                200,
+                br#"{"error_code":0,"data":{"group_id":"5001","question":"Q","creator":"2001","status":1,"expired_time":0,"options":[]}}"#.to_vec(),
+            ))
+        });
+        let client = Arc::new(SessionClient::new(
+            transport,
+            "imei-poll-timer".to_owned(),
+            "Mac".to_owned(),
+        ));
+        client.update_credentials(
+            LoginAccount {
+                user_id: "2001".to_owned(),
+                ..LoginAccount::default()
+            },
+            b"0123456789abcdef".to_vec(),
+            "sek.1".to_owned(),
+            Some(ZaloDomains::default()),
+        );
+        // RecordingTypingHost uses the default Host::arm_poll_debounce -> false,
+        // exercising SessionEffectRunner's native tokio::time::sleep_until timer.
+        let runner = Arc::new(SessionEffectRunner::new(
+            Arc::clone(&client),
+            Arc::new(RecordingTypingHost::default()),
+            tokio::runtime::Handle::current(),
+        ));
+        let mut initial = CoreState::default();
+        initial.session.phase = Phase::Ready;
+        initial.session.profile = Some(Profile {
+            user_id: "2001".to_owned(),
+            display_name: "Tester".to_owned(),
+            avatar: None,
+            phone: None,
+        });
+        initial.contacts.group_details_json.insert(
+            "5001".to_owned(),
+            r#"{"groupId":"5001","creatorId":"2001"}"#.to_owned(),
+        );
+        let seeded_detail = serde_json::json!({
+            "id": "p1",
+            "groupId": "g5001",
+            "question": "Old",
+        });
+        if let Some(d) = seeded_detail.as_object().and_then(PollDetail::from_json) {
+            initial.polls.details.insert("p1".to_owned(), d);
+        }
+        let core = CoreHandle::start_with_state(initial, runner, tokio::runtime::Handle::current());
+
+        let now_ms = 1_700_000_000_000_i64;
+        core.send(Command::NotePollMessages {
+            notices: vec![PollMessageNotice {
+                msg_id: "m1".to_owned(),
+                poll_id: "p1".to_owned(),
+                conv_id: "g5001".to_owned(),
+                date_ms: now_ms,
+            }],
+            now_ms,
+            host_already_armed: false,
+        });
+        core.wait_idle().await;
+        tokio::task::yield_now().await;
+
+        // Second message 500 ms later re-arms p1; original 1.5 s deadline must not fire early.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        core.send(Command::NotePollMessages {
+            notices: vec![PollMessageNotice {
+                msg_id: "m2".to_owned(),
+                poll_id: "p1".to_owned(),
+                conv_id: "g5001".to_owned(),
+                date_ms: now_ms + 500,
+            }],
+            now_ms: now_ms + 500,
+            host_already_armed: false,
+        });
+        core.wait_idle().await;
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_millis(1_100)).await;
+        tokio::task::yield_now().await;
+        core.wait_idle().await;
+        assert_eq!(client.transport().requests().len(), 0);
+
+        // Reaching 1.5 s after m2 fires exactly one refresh.
+        tokio::time::advance(Duration::from_millis(POLL_DEBOUNCE_DELAY_MS - 1_100)).await;
+        tokio::task::yield_now().await;
+        core.wait_idle().await;
+        assert_eq!(client.transport().requests().len(), 1);
+        assert_eq!(
+            core.full_snapshot()
+                .await
+                .and_then(|s| s.polls.details.get("p1").map(|d| d.question.clone()))
+                .as_deref(),
+            Some("Q")
+        );
+
+        // ResetPolls cancels an armed native timer before it can fire.
+        core.send(Command::NotePollMessages {
+            notices: vec![PollMessageNotice {
+                msg_id: "m3".to_owned(),
+                poll_id: "p1".to_owned(),
+                conv_id: "g5001".to_owned(),
+                date_ms: now_ms + 2_000,
+            }],
+            now_ms: now_ms + 2_000,
+            host_already_armed: false,
+        });
+        core.wait_idle().await;
+        tokio::task::yield_now().await;
+        core.send(Command::ResetPolls { sync_epoch: 0 });
+        core.wait_idle().await;
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        core.wait_idle().await;
+        assert_eq!(client.transport().requests().len(), 1);
+
+        core.stop();
+    }
+
     #[derive(Default)]
     struct RecordingCardHost {
         cards: Mutex<Vec<(String, String)>>,
@@ -4948,7 +5556,8 @@ mod tests {
             _duration: i64,
         ) {
         }
-        async fn show_card(&self, conv_id: String, text: String) {
+        async fn show_card(&self, conv_id: Option<String>, text: String) {
+            let conv_id = conv_id.unwrap_or_default();
             self.cards
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)

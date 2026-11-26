@@ -220,4 +220,263 @@ import Testing
         print(Self.row("(d) load 700 conversations", ms: rust))
         #expect(b == 700)
     }
+
+    // MARK: (e) poll detail render path: 10 options, 200 voters, 1,000 iterations
+
+    private struct OriginMainPollDetail {
+        struct Option {
+            var id: String
+            var content: String
+            var votes: Int
+            var voted: Bool
+        }
+        var id: String
+        var groupId: String
+        var question: String
+        var creator: String
+        var creatorName: String
+        var created: Date?
+        var expires: Date?
+        var closed: Bool
+        var joined: Bool
+        var multi: Bool
+        var allowAdd: Bool
+        var anonymous: Bool
+        var hidePreview: Bool
+        var voterCount: Int
+        var canClose: Bool
+        var options: [Option]
+
+        var totalVotes: Int { options.reduce(0) { $0 + $1.votes } }
+        func isExpired(at now: Date) -> Bool { expires.map { $0 < now } ?? false }
+        func isVotingLocked(at now: Date) -> Bool { closed || isExpired(at: now) || (hidePreview && joined) }
+        var resultsHidden: Bool { hidePreview && !joined }
+        var votersVisible: Bool { !anonymous && !resultsHidden && totalVotes > 0 }
+        func weight(of option: Option) -> Double { totalVotes > 0 ? Double(option.votes) / Double(totalVotes) : 0 }
+    }
+
+    private struct OriginMainPollVoteDraft {
+        struct Added: Identifiable, Equatable {
+            var id = UUID()
+            var text = ""
+            var voted = false
+        }
+        private(set) var selected: Set<String>
+        private let original: Set<String>
+        private let multi: Bool
+        var added: [Added] = []
+
+        init(_ detail: OriginMainPollDetail) {
+            let voted = Set(detail.options.filter(\.voted).map(\.id))
+            selected = voted
+            original = voted
+            multi = detail.multi
+        }
+        mutating func toggle(_ optionId: String) {
+            if selected.contains(optionId) { selected.remove(optionId); return }
+            if !multi { selected = []; for i in added.indices { added[i].voted = false } }
+            selected.insert(optionId)
+        }
+        mutating func addRow() { added.append(Added()) }
+        private var filled: [Added] {
+            added.map { Added(id: $0.id, text: $0.text.trimmingCharacters(in: .whitespacesAndNewlines), voted: $0.voted) }.filter { !$0.text.isEmpty }
+        }
+        var hasChanges: Bool { selected != original || !filled.isEmpty }
+        var votesNothing: Bool { selected.isEmpty && !filled.contains(where: \.voted) }
+        func hasDuplicates(in detail: OriginMainPollDetail) -> Bool {
+            let all = detail.options.map { $0.content.trimmingCharacters(in: .whitespacesAndNewlines) } + filled.map(\.text)
+            return Set(all).count != all.count
+        }
+        func isDuplicate(_ id: UUID, in detail: OriginMainPollDetail) -> Bool {
+            guard let row = filled.first(where: { $0.id == id }) else { return false }
+            let others = detail.options.map { $0.content.trimmingCharacters(in: .whitespacesAndNewlines) } + filled.filter { $0.id != id }.map(\.text)
+            return others.contains(row.text)
+        }
+        func applied(to detail: OriginMainPollDetail) -> OriginMainPollDetail {
+            var next = detail
+            for i in next.options.indices {
+                let was = detail.options[i].voted, now = selected.contains(detail.options[i].id)
+                next.options[i].voted = now
+                if was != now { next.options[i].votes = max(0, next.options[i].votes + (now ? 1 : -1)) }
+            }
+            return next
+        }
+        var canSubmit: Bool { hasChanges }
+    }
+
+    @Test func pollRender10Options200Voters() throws {
+        let rawOptions: [[String: Any]] = (0..<10).map { i in
+            [
+                "id": "opt_\(i + 1)",
+                "content": "Phương án lựa chọn số \(i + 1) cho cuộc họp nhóm tuần này",
+                "votes": 16 + i,
+                "voted": i < 2
+            ]
+        }
+        let rawJson: [String: Any] = [
+            "id": "poll_9001",
+            "groupId": "g_8800112233",
+            "question": "Tuần này nhóm mình họp offline ở địa điểm nào thuận tiện nhất?",
+            "creator": "1000000001",
+            "creatorName": "Nguyễn Thị Lan",
+            "created": 1_700_000_000_000,
+            "expired": 1_900_000_000_000,
+            "closed": false,
+            "joined": true,
+            "multi": true,
+            "allowAdd": true,
+            "anonymous": false,
+            "hidePreview": false,
+            "voters": 200,
+            "canClose": true,
+            "options": rawOptions
+        ]
+        let detail = try #require(PollDetail(json: rawJson))
+        let baseline = OriginMainPollDetail(
+            id: detail.id, groupId: detail.groupId, question: detail.question,
+            creator: detail.creator, creatorName: detail.creatorName,
+            created: detail.created, expires: detail.expires,
+            closed: detail.closed, joined: detail.joined, multi: detail.multi,
+            allowAdd: detail.allowAdd, anonymous: detail.anonymous, hidePreview: detail.hidePreview,
+            voterCount: detail.voterCount, canClose: detail.canClose,
+            options: detail.options.map { .init(id: $0.id, content: $0.content, votes: $0.votes, voted: $0.voted) }
+        )
+        let fixedNow = Date(timeIntervalSince1970: 1_800_000_000)
+        var draft = PollVoteDraft(detail)
+        draft.toggle("opt_3")
+        draft.addRow()
+        draft.added[0].text = "Phương án bổ sung 1"
+        draft.setAddedVoted(draft.added[0].id, true)
+
+        var baseDraft = OriginMainPollVoteDraft(baseline)
+        baseDraft.toggle("opt_3")
+        baseDraft.addRow()
+        baseDraft.added[0].text = "Phương án bổ sung 1"
+        baseDraft.added[0].voted = true
+
+        let iterations = 1_000
+        var coreAcc = 0.0
+        var coreFlags = 0
+        let coreDetailMs = Self.median {
+            var acc = 0.0
+            var flags = 0
+            for _ in 0..<iterations {
+                for opt in detail.options {
+                    acc += detail.weight(of: opt)
+                }
+                acc += Double(detail.totalVotes)
+                if detail.isVotingLocked(at: fixedNow) { flags &+= 1 }
+                if detail.resultsHidden { flags &+= 2 }
+                if detail.votersVisible { flags &+= 4 }
+            }
+            coreAcc = acc
+            coreFlags = flags
+        }
+
+        var perGetterAcc = 0.0
+        var perGetterFlags = 0
+        let perGetterFfiMs = Self.median {
+            var acc = 0.0
+            var flags = 0
+            for _ in 0..<iterations {
+                for opt in detail.options {
+                    acc += pollDetailOptionWeight(detail: detail.coreRecord, option: opt.coreRecord)
+                }
+                acc += Double(pollDetailTotalVotes(detail: detail.coreRecord))
+                let nowMs = Int64((fixedNow.timeIntervalSince1970 * 1000.0).rounded())
+                if pollDetailIsVotingLocked(detail: detail.coreRecord, nowMs: nowMs) { flags &+= 1 }
+                if pollDetailResultsHidden(detail: detail.coreRecord) { flags &+= 2 }
+                if pollDetailVotersVisible(detail: detail.coreRecord) { flags &+= 4 }
+            }
+            perGetterAcc = acc
+            perGetterFlags = flags
+        }
+
+        var baseAcc = 0.0
+        var baseFlags = 0
+        let baseDetailMs = Self.median {
+            var acc = 0.0
+            var flags = 0
+            for _ in 0..<iterations {
+                for opt in baseline.options {
+                    acc += baseline.weight(of: opt)
+                }
+                acc += Double(baseline.totalVotes)
+                if baseline.isVotingLocked(at: fixedNow) { flags &+= 1 }
+                if baseline.resultsHidden { flags &+= 2 }
+                if baseline.votersVisible { flags &+= 4 }
+            }
+            baseAcc = acc
+            baseFlags = flags
+        }
+
+        // Interleaved rounds for PollVoteDraft + votePage render (core vs origin/main)
+        var coreSheetSamples: [Double] = []
+        var baseSheetSamples: [Double] = []
+        var sheetAcc = 0.0
+        var baseSheetAcc = 0.0
+        for round in 0..<8 {
+            let runCore = {
+                var acc = 0.0
+                for _ in 0..<iterations {
+                    let preview = draft.applied(to: detail)
+                    for opt in detail.options {
+                        let shown = preview.options.first { $0.id == opt.id } ?? opt
+                        acc += preview.weight(of: shown)
+                    }
+                    for row in draft.added where draft.isDuplicate(row.id, in: detail) { acc += 1 }
+                    if detail.isVotingLocked(at: fixedNow) { acc += 1 }
+                    if detail.resultsHidden { acc += 1 }
+                    if detail.votersVisible { acc += 1 }
+                    if !draft.votesNothing { acc += 1 }
+                    if draft.canSubmit && !draft.hasDuplicates(in: detail) { acc += 1 }
+                }
+                sheetAcc = acc
+            }
+            let runBase = {
+                var acc = 0.0
+                for _ in 0..<iterations {
+                    let preview = baseDraft.applied(to: baseline)
+                    for opt in baseline.options {
+                        let shown = preview.options.first { $0.id == opt.id } ?? opt
+                        acc += preview.weight(of: shown)
+                    }
+                    for row in baseDraft.added where baseDraft.isDuplicate(row.id, in: baseline) { acc += 1 }
+                    if baseline.isVotingLocked(at: fixedNow) { acc += 1 }
+                    if baseline.resultsHidden { acc += 1 }
+                    if baseline.votersVisible { acc += 1 }
+                    if !baseDraft.votesNothing { acc += 1 }
+                    if baseDraft.canSubmit && !baseDraft.hasDuplicates(in: baseline) { acc += 1 }
+                }
+                baseSheetAcc = acc
+            }
+            if round == 0 {
+                runCore()
+                runBase()
+                continue
+            }
+            if round % 2 == 1 {
+                let t1 = ContinuousClock.now; runCore(); let d1 = ContinuousClock.now - t1
+                let t2 = ContinuousClock.now; runBase(); let d2 = ContinuousClock.now - t2
+                coreSheetSamples.append(Double(d1.components.seconds) * 1000 + Double(d1.components.attoseconds) / 1e15)
+                baseSheetSamples.append(Double(d2.components.seconds) * 1000 + Double(d2.components.attoseconds) / 1e15)
+            } else {
+                let t2 = ContinuousClock.now; runBase(); let d2 = ContinuousClock.now - t2
+                let t1 = ContinuousClock.now; runCore(); let d1 = ContinuousClock.now - t1
+                baseSheetSamples.append(Double(d2.components.seconds) * 1000 + Double(d2.components.attoseconds) / 1e15)
+                coreSheetSamples.append(Double(d1.components.seconds) * 1000 + Double(d1.components.attoseconds) / 1e15)
+            }
+        }
+        let coreVoteSheetMs = coreSheetSamples.sorted()[coreSheetSamples.count / 2]
+        let baseVoteSheetMs = baseSheetSamples.sorted()[baseSheetSamples.count / 2]
+
+        // 1,000 iterations in `ms` == per-render `µs` (`ms * 1000 / 1000 == ms`).
+        print(Self.row("(e) 1000x PollDetail render (core record fields)", ms: coreDetailMs, note: String(format: "%.3f µs/render", coreDetailMs)))
+        print(Self.row("(e) .. before (25658d9 per-getter FFI)", ms: perGetterFfiMs, note: String(format: "%.3f µs/render", perGetterFfiMs)))
+        print(Self.row("(e) .. origin/main PollDetail baseline", ms: baseDetailMs, note: String(format: "%.3f µs/render", baseDetailMs)))
+        print(Self.row("(e') 1000x PollVoteDraft + votePage render (core)", ms: coreVoteSheetMs, note: String(format: "%.3f µs/render", coreVoteSheetMs)))
+        print(Self.row("(e') .. origin/main PollVoteDraft + votePage baseline", ms: baseVoteSheetMs, note: String(format: "%.3f µs/render", baseVoteSheetMs)))
+        #expect(abs(coreAcc - baseAcc) < 1e-6 && abs(perGetterAcc - baseAcc) < 1e-6 && abs(sheetAcc - baseSheetAcc) < 1e-6)
+        #expect(coreFlags == baseFlags && perGetterFlags == baseFlags && sheetAcc > 0)
+    }
 }

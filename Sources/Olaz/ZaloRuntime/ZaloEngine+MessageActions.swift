@@ -75,12 +75,19 @@ struct DeleteUndo: Identifiable, Equatable {
 
 /// "Chia sẻ": the message waiting for the conversations to forward it to.
 struct ForwardRequest: Identifiable, Equatable {
-    let id = UUID()
+    let id: UUID
     var conversationId: String
     var message: ChatMessage
     /// "Chọn nhiều tin nhắn": the other selected messages, oldest first, forwarded after `message`.
     var more: [ChatMessage] = []
     var all: [ChatMessage] { [message] + more }
+
+    init(id: UUID = UUID(), conversationId: String, message: ChatMessage, more: [ChatMessage] = []) {
+        self.id = id
+        self.conversationId = conversationId
+        self.message = message
+        self.more = more
+    }
 }
 
 /// One pin of a conversation (official group board topic / 1:1 pin topic), newest first.
@@ -253,14 +260,23 @@ extension ZaloEngine {
         return try? await MediaLoader.shared.data(for: url)
     }
 
-    private func makeForwardTempPhotoURL() -> URL {
+    internal func makeForwardTempPhotoURL() -> URL {
         if let forwardTempPhotoURL {
             return forwardTempPhotoURL()
         }
         return FileManager.default.temporaryDirectory.appendingPathComponent("fwd-\(UUID().uuidString.prefix(8)).jpg")
     }
 
+    internal func dismissForwardRequest() {
+        forwardRequest = nil
+        coreLifecycle.core?.clearForwardRequest()
+    }
+
     func requestForward(_ message: ChatMessage) {
+        if let core = coreLifecycle.core {
+            core.requestForward(message: ChatMessageRecord(message: message))
+            return
+        }
         guard message.menu.forward == .available else {
             if message.menu.forward == .blocked { showActionCard("Trò chuyện này đã bật Chặn chia sẻ", in: message.conversationId) }
             return
@@ -269,6 +285,20 @@ extension ZaloEngine {
     }
 
     func forward(_ message: ChatMessage, to targets: [String]) async -> MessageActionOutcome {
+        if let core = coreLifecycle.core {
+            core.setE2eeThreads(threads: e2eeManager.e2eeThreadIdsSync())
+            do {
+                let res = try await core.forward(
+                    message: ChatMessageRecord(message: message),
+                    targets: targets,
+                    nowMs: nowMs()
+                )
+                await waitForMirrorVersion(res.version)
+                return MessageActionOutcome(forwardRecord: res.outcome)
+            } catch {
+                return .failed("Có lỗi khi chia sẻ tin nhắn")
+            }
+        }
         guard !targets.isEmpty else { return .failed("Chưa chọn cuộc trò chuyện.") }
         var succeeded = 0
         for target in targets {
@@ -326,6 +356,16 @@ extension ZaloEngine {
     }
 
     func forwardAll(to targets: [String]) async -> MessageActionOutcome {
+        if let core = coreLifecycle.core {
+            core.setE2eeThreads(threads: e2eeManager.e2eeThreadIdsSync())
+            do {
+                let res = try await core.forwardAll(targets: targets, nowMs: nowMs())
+                await waitForMirrorVersion(res.version)
+                return MessageActionOutcome(forwardRecord: res.outcome)
+            } catch {
+                return .failed("Có lỗi khi chia sẻ tin nhắn")
+            }
+        }
         guard let request = forwardRequest else {
             return .failed("Có lỗi khi chia sẻ tin nhắn")
         }
@@ -928,6 +968,8 @@ extension ZaloEngine {
     // MARK: Pins of the open conversation
 
     internal func refreshBoardPins(for convId: String) async {
+        // U7: push current Swift board pins & raw topics into core before tracing/fetching.
+        pushCoreBoardStateIfRunning(for: convId)
         guard traceU4Host("refresh_board_pins", args: ["conv_id": convId]) else {
             return
         }
@@ -945,6 +987,8 @@ extension ZaloEngine {
         EngineLog.shared.write("pins: list ok group=\(group) rows=\((box.dict["items"] as? [Any])?.count ?? -1) items=\(parsed.list.items.count)")
         cachedBoardRawTopics[convId] = (version: parsed.version, topics: parsed.raw)
         if pins[convId] != parsed.list { pins[convId] = parsed.list }
+        // U7: write-through fetched board pins & raw topics into core before returning to CoreHost.
+        pushCoreBoardStateIfRunning(for: convId)
     }
 
     /// Log shape of a board request error: the server code and the API path, never ids or text.
@@ -958,6 +1002,8 @@ extension ZaloEngine {
         guard let json = state["pins"] as? [String: Any], let conversation = json["convId"] as? String, !conversation.isEmpty else { return }
         let list = PinnedList(json: json)
         if pins[conversation] != list { pins[conversation] = list }
+        // U7: write-through pins_state event into core until U7 owns board pins.
+        pushCoreBoardPinsIfRunning(for: conversation)
     }
 
     func rewatchPins() {
@@ -981,6 +1027,8 @@ extension ZaloEngine {
         mirroredMessageConfirmCoreId = nil
         deleteUndo = nil
         pins = [:]
+        // U7: clear core's temporary board caches until U7 owns board pins.
+        coreLifecycle.core?.clearBoardCaches()
         messageActionsBusy = []
         pendingDeletedMessages = [:]
         optimisticOverlayFenceTasks.values.forEach { $0.cancel() }

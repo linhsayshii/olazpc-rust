@@ -186,6 +186,17 @@ fn random_helpers_have_expected_shape() {
 }
 
 #[test]
+fn random_alphanumeric_has_expected_shape() {
+    assert_eq!(random_alphanumeric(0), "");
+    for n in [1usize, 16, 64] {
+        let s = random_alphanumeric(n);
+        assert_eq!(s.len(), n);
+        assert!(s.bytes().all(|b| b.is_ascii_alphanumeric()));
+    }
+    assert_ne!(random_alphanumeric(16), random_alphanumeric(16));
+}
+
+#[test]
 fn param_cipher_random_ext_is_10_hex_and_key_matches_swift_derivation() {
     let c = ParamCipher::new("30", "imei", 1).unwrap();
     assert_eq!(c.zcid_ext().len(), 10);

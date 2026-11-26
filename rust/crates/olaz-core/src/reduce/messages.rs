@@ -506,6 +506,9 @@ fn reduce_message_command(
                 }
             }
 
+            if changed && state.forward.clear_request() {
+                out.dirty.insert(DirtyKey::ForwardRequest);
+            }
             out.effects
                 .push(Effect::Host(HostCall::OnOpenConversationSync {
                     conv_id: id.clone(),
@@ -537,6 +540,9 @@ fn reduce_message_command(
             state.messages.open_seq = state.messages.open_seq.saturating_add(1);
             state.messages.active_open = None;
             state.conversations.open_conversation_id = None;
+            if state.forward.clear_request() {
+                out.dirty.insert(DirtyKey::ForwardRequest);
+            }
             out.effects
                 .push(Effect::Host(HostCall::OnCloseConversation));
             complete_op(op_id, out);

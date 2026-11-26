@@ -168,6 +168,20 @@ import Foundation
         #expect(PollActionResult(ok: false, error: nil).message(for: .vote).contains("bình chọn"))
     }
 
+    @Test func friendBoardDefaultHostAndHeal() {
+        var domains = ZaloDomains()
+        #expect(!ZaloDomains.defaultServiceMapV3.keys.contains("friend_board"))
+        #expect(domains.candidates(for: "friend_board") == ["https://friendboard-wpa.chat.zalo.me"])
+        domains.rememberWinner(for: "friend_board", host: "https://friendboard-wpa.chat.zalo.me")
+        domains.rememberWinner(for: "chat", host: "https://tt-chat3-wpa.chat.zalo.me")
+        domains.healFromVerified()
+        #expect(domains.preferredHosts["friend_board"] == "https://friendboard-wpa.chat.zalo.me")
+        #expect(domains.preferredHosts["chat"] == nil)
+
+        let isolated = ZaloDomains(isolated: true)
+        #expect(isolated.candidates(for: "friend_board").isEmpty)
+    }
+
     @MainActor @Test func engineKeepsLatestSnapshotAndFailures() throws {
         let engine = ZaloEngine()
         engine.handlePoll(state: ["page": "main", "poll": ["id": "77", "error": "fetch"]])

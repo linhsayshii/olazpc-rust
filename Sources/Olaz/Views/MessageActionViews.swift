@@ -416,7 +416,7 @@ private struct MessageActionPresenter: ViewModifier {
     func body(content: Content) -> some View {
         content
             .sheet(item: Binding(get: { engine.forwardRequest?.conversationId == conversationId ? engine.forwardRequest : nil },
-                                 set: { engine.forwardRequest = $0 })) { request in
+                                 set: { if $0 == nil { engine.dismissForwardRequest() } else { engine.forwardRequest = $0 } })) { request in
                 ForwardSheet(request: request).cardNoticeOverlay()
             }
             // Answered only by its buttons (the dismissal binding must not answer first and turn an OK into a cancel).

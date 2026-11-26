@@ -24,6 +24,7 @@ pub fn default_service_hosts(service: &str) -> Option<&'static [&'static str]> {
     Some(match service {
         "profile" => &["https://tt-profile-wpa.zaloapp.com"],
         "friend" => &["https://tt-friend-wpa.zaloapp.com"],
+        "friend_board" => &["https://friendboard-wpa.chat.zalo.me"],
         "conversation" => &["https://tt-convers-wpa.api.zaloapp.com"],
         "chat" | "chat_e2e" => CHAT_HOSTS,
         "group" | "group_e2e" | "group_poll" => &["https://tt-group-wpa.zaloapp.com"],
@@ -169,10 +170,12 @@ fn first_url(raw: Option<&Value>) -> Option<String> {
 
 impl ZaloDomains {
     /// Clears stale `.chat.zalo.me` HTTP preferred hosts left over from legacy `zpw_type=30`
-    /// sessions (except `zcloud`) and rewrites old `-msg.zaloapp.com` WebSocket hosts.
+    /// sessions (except `zcloud` and `friend_board`) and rewrites old `-msg.zaloapp.com`
+    /// WebSocket hosts.
     pub fn heal_from_verified(&mut self) {
-        self.preferred_hosts
-            .retain(|key, current| !(current.contains(".chat.zalo.me") && key != "zcloud"));
+        self.preferred_hosts.retain(|key, current| {
+            !(current.contains(".chat.zalo.me") && key != "zcloud" && key != "friend_board")
+        });
         for host in &mut self.ws {
             *host = host.replace("-msg.zaloapp.com", "-msg.chat.zalo.me");
         }
@@ -290,6 +293,29 @@ impl ZaloDomains {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn friend_board_default_host_is_present_when_not_isolated() {
+        let mut d = ZaloDomains::default();
+        assert_eq!(
+            d.candidates("friend_board"),
+            vec!["https://friendboard-wpa.chat.zalo.me".to_owned()]
+        );
+        d.remember_winner("friend_board", "https://friendboard-wpa.chat.zalo.me");
+        d.remember_winner("chat", "https://tt-chat3-wpa.chat.zalo.me");
+        d.heal_from_verified();
+        assert_eq!(
+            d.preferred_hosts.get("friend_board"),
+            Some(&"https://friendboard-wpa.chat.zalo.me".to_owned())
+        );
+        assert!(!d.preferred_hosts.contains_key("chat"));
+
+        let isolated = ZaloDomains {
+            isolated: true,
+            ..Default::default()
+        };
+        assert!(isolated.candidates("friend_board").is_empty());
+    }
 
     #[test]
     fn isolated_omits_defaults_and_fallbacks_while_default_is_unchanged() {
