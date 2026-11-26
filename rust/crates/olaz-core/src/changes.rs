@@ -14,7 +14,7 @@ use tokio::sync::Notify;
 
 use crate::actions::{DeleteUndoSnapshot, MessageConfirmState};
 use crate::conversations::{
-    CachedProfile, ConversationActionUI, ConversationActionsState, ConversationExtras,
+    CachedGroup, CachedProfile, ConversationActionUI, ConversationActionsState, ConversationExtras,
     ConversationPrompt, ConversationSummary,
 };
 use crate::forward::ForwardRequest;
@@ -51,6 +51,7 @@ pub enum DirtyKey {
     AutoDelete,
     StarredIds,
     CachedProfiles,
+    CachedGroups,
     // U12
     Polls,
 }
@@ -114,6 +115,8 @@ pub struct CoreChanges {
     pub starred_ids: Option<BTreeSet<String>>,
     /// Updated cached profile map (`cachedProfiles`).
     pub cached_profiles: Option<BTreeMap<String, CachedProfile>>,
+    /// Updated cached group map (`cachedGroups`).
+    pub cached_groups: Option<BTreeMap<String, CachedGroup>>,
     // U12
     pub polls: Option<crate::polls::PollsState>,
 }
@@ -131,6 +134,7 @@ impl fmt::Debug for CoreChanges {
             .field("has_typing", &self.typing.is_some())
             .field("has_forward_request", &self.forward_request.is_some())
             .field("clear_selection", &self.clear_selection)
+            .field("has_cached_groups", &self.cached_groups.is_some())
             .field("has_polls", &self.polls.is_some())
             .finish()
     }
@@ -166,6 +170,7 @@ struct DirtyBuffer {
     auto_delete: Option<Option<BTreeMap<String, i64>>>,
     starred_ids: Option<BTreeSet<String>>,
     cached_profiles: Option<BTreeMap<String, CachedProfile>>,
+    cached_groups: Option<BTreeMap<String, CachedGroup>>,
     // U12
     polls: Option<crate::polls::PollsState>,
     closed: bool,
@@ -190,6 +195,7 @@ impl DirtyBuffer {
             || self.auto_delete.is_some()
             || self.starred_ids.is_some()
             || self.cached_profiles.is_some()
+            || self.cached_groups.is_some()
             || self.polls.is_some()
     }
 }
@@ -337,6 +343,9 @@ impl ChangeHub {
                     buf.cached_profiles =
                         Some(state.conversations.identities.cached_profiles.clone());
                 }
+                DirtyKey::CachedGroups => {
+                    buf.cached_groups = Some(state.conversations.identities.cached_groups.clone());
+                }
             }
             buf.dirty.insert(key);
         }
@@ -425,6 +434,7 @@ impl ChangeHub {
                             auto_delete: None,
                             starred_ids: None,
                             cached_profiles: None,
+                            cached_groups: None,
                             // U12
                             polls: None,
                         });
@@ -494,6 +504,7 @@ impl ChangeHub {
                         auto_delete: buf.auto_delete.take(),
                         starred_ids: buf.starred_ids.take(),
                         cached_profiles: buf.cached_profiles.take(),
+                        cached_groups: buf.cached_groups.take(),
                         // U12
                         polls: buf.polls.take(),
                     });

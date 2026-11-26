@@ -32,10 +32,11 @@ use serde_json::{Map, Value};
 use crate::api::PollStateRecord;
 use crate::chat::{ChatMessageRecord, MessageMention, TextStyleRecord};
 use crate::conversations::{
-    CachedProfileEntry, ConvPreviewOverrideRecord, ConversationActionResultRecord,
-    ConversationActionUiRecord, ConversationActionsRecord, ConversationExtrasRecord,
-    ConversationPromptRecord, ConversationSummaryRecord, IdentityTableRecord,
-    MessagePreviewInputRecord, PinBoardRecord, PromptUpdateRecord, RankEntry, SeenTargetRecord,
+    CachedGroupEntry, CachedProfileEntry, ConvPreviewOverrideRecord,
+    ConversationActionResultRecord, ConversationActionUiRecord, ConversationActionsRecord,
+    ConversationExtrasRecord, ConversationPromptRecord, ConversationSummaryRecord,
+    IdentityTableRecord, MessagePreviewInputRecord, PinBoardRecord, PromptUpdateRecord, RankEntry,
+    SeenTargetRecord,
 };
 use crate::error::{CoreError, NetworkKind};
 use crate::messages::{
@@ -860,6 +861,8 @@ pub struct CoreChangesRecord {
     pub auto_delete: Option<AutoDeleteUpdateRecord>,
     pub starred_ids: Option<Vec<String>>,
     pub cached_profiles: Option<Vec<CachedProfileEntry>>,
+    #[uniffi(default = None)]
+    pub cached_groups: Option<Vec<CachedGroupEntry>>,
     // U12
     #[uniffi(default = None)]
     pub polls: Option<PollsMirrorRecord>,
@@ -937,6 +940,16 @@ impl From<CoreChanges> for CoreChangesRecord {
                         uid,
                         name: p.name,
                         avatar: p.avatar,
+                    })
+                    .collect()
+            }),
+            cached_groups: c.cached_groups.map(|map| {
+                map.into_iter()
+                    .map(|(gid, g)| CachedGroupEntry {
+                        gid,
+                        name: g.name,
+                        avatar: g.avatar,
+                        members: g.members,
                     })
                     .collect()
             }),
@@ -1301,6 +1314,7 @@ impl CoreOfflineConversations {
             auto_delete: None,
             starred_ids: None,
             cached_profiles: None,
+            cached_groups: None,
             polls: None,
         };
         for key in out.dirty {
@@ -1368,7 +1382,8 @@ impl CoreOfflineConversations {
                 | DirtyKey::MessageConfirm
                 | DirtyKey::AutoDelete
                 | DirtyKey::StarredIds
-                | DirtyKey::CachedProfiles => {}
+                | DirtyKey::CachedProfiles
+                | DirtyKey::CachedGroups => {}
                 DirtyKey::Polls => {
                     rec.polls = Some(state.polls.clone().into());
                 }
