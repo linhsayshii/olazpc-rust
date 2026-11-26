@@ -758,13 +758,22 @@ extension ZaloEngine {
 
     func pin(_ message: ChatMessage, replacing ref: String? = nil) {
         if let core = coreLifecycle.core {
-            let key = "\(message.conversationId)|\(message.id)|pin"
+            let conversation = message.conversationId
+            let key = "\(conversation)|\(message.id)|pin"
             guard messageActionsBusy.insert(key).inserted else { return }
+            let overlayToken: UUID? = insertPinOptimistically(message, replacing: ref).map { item in
+                beginOptimisticPinOverlay(convId: conversation, item: item, replacingRef: ref)
+            }
             trackMessageActionTask { [weak self] in
                 guard let self else { return }
                 defer { self.messageActionsBusy.remove(key) }
-                if let v = try? await core.pin(convId: message.conversationId, msgId: message.id, replacing: ref) {
+                if let v = try? await core.pin(convId: conversation, msgId: message.id, replacing: ref) {
+                    if let token = overlayToken {
+                        self.resolveOptimisticOverlay(token: token, targetVersion: v)
+                    }
                     await self.waitForMirrorVersion(v)
+                } else if let token = overlayToken {
+                    self.cancelOptimisticOverlay(token: token)
                 }
             }
             return
@@ -893,11 +902,37 @@ extension ZaloEngine {
                     overlayToken = applyOptimisticDeleteMirror(list, nowMs: tsMs)
                 case .recallMany:
                     endSelection()
-                case .pin, .unpin:
+                case .pin(let message, let replacing):
+                    let pinOverlayToken: UUID? = insertPinOptimistically(message, replacing: replacing).map { item in
+                        beginOptimisticPinOverlay(convId: confirm.conversationId, item: item, replacingRef: replacing)
+                    }
                     trackMessageActionTask { [weak self] in
                         guard let self else { return }
                         if let v = try? await core.answerMessageConfirmAsync(ok: ok, nowMs: tsMs) {
+                            if let token = pinOverlayToken {
+                                self.resolveOptimisticOverlay(token: token, targetVersion: v)
+                            }
                             await self.waitForMirrorVersion(v)
+                        } else if let token = pinOverlayToken {
+                            self.cancelOptimisticOverlay(token: token)
+                        }
+                    }
+                    return
+                case .unpin(let ref):
+                    var unpinOverlayToken: UUID?
+                    if pins[confirm.conversationId]?.items.contains(where: { $0.ref == ref }) == true {
+                        removePinOptimistically(ref, in: confirm.conversationId)
+                        unpinOverlayToken = beginOptimisticUnpinOverlay(convId: confirm.conversationId, ref: ref)
+                    }
+                    trackMessageActionTask { [weak self] in
+                        guard let self else { return }
+                        if let v = try? await core.answerMessageConfirmAsync(ok: ok, nowMs: tsMs) {
+                            if let token = unpinOverlayToken {
+                                self.resolveOptimisticOverlay(token: token, targetVersion: v)
+                            }
+                            await self.waitForMirrorVersion(v)
+                        } else if let token = unpinOverlayToken {
+                            self.cancelOptimisticOverlay(token: token)
                         }
                     }
                     return

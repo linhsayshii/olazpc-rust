@@ -201,6 +201,8 @@ internal struct OptimisticMessageOverlay {
         case delete(msgIds: Set<String>, undo: DeleteUndo)
         case undoDelete(restored: [ChatMessage])
         case star(msgId: String, on: Bool)
+        case pin(item: PinnedItem, replacingRef: String?)
+        case unpin(ref: String)
     }
 
     let token: UUID
@@ -215,6 +217,8 @@ internal struct OptimisticMessageOverlay {
     var suppressedHasUndo: Bool = false
     var suppressedUndo: DeleteUndo?
     var suppressedStar: (starred: Bool, menuStar: MessageMenu.Star?, inCachedSet: Bool)?
+    var suppressedHasPinList: Bool = false
+    var suppressedPinList: PinnedList?
 }
 
 /// Commands queued on the MainActor while `CoreEngine` completes its one-time async creation.
@@ -1672,6 +1676,35 @@ extension ZaloEngine {
         return token
     }
 
+    @discardableResult
+    internal func beginOptimisticPinOverlay(
+        convId: String,
+        item: PinnedItem,
+        replacingRef: String?
+    ) -> UUID {
+        let token = UUID()
+        optimisticMessageOverlays.append(OptimisticMessageOverlay(
+            token: token,
+            convId: convId,
+            kind: .pin(item: item, replacingRef: replacingRef)
+        ))
+        return token
+    }
+
+    @discardableResult
+    internal func beginOptimisticUnpinOverlay(
+        convId: String,
+        ref: String
+    ) -> UUID {
+        let token = UUID()
+        optimisticMessageOverlays.append(OptimisticMessageOverlay(
+            token: token,
+            convId: convId,
+            kind: .unpin(ref: ref)
+        ))
+        return token
+    }
+
     internal func scheduleOptimisticOverlayFence(token: UUID, core: CoreEngine) {
         let task = Task { @MainActor [weak self, core] in
             defer { self?.optimisticOverlayFenceTasks.removeValue(forKey: token) }
@@ -1750,6 +1783,10 @@ extension ZaloEngine {
                 } else {
                     cachedStarredIds.remove(msgId)
                 }
+            }
+        case .pin, .unpin:
+            if overlay.suppressedHasPinList, pins[overlay.convId] != overlay.suppressedPinList {
+                pins[overlay.convId] = overlay.suppressedPinList
             }
         }
     }
@@ -1852,6 +1889,43 @@ extension ZaloEngine {
                         cachedStarredIds.insert(msgId)
                     } else {
                         cachedStarredIds.remove(msgId)
+                    }
+                }
+            case .pin(let item, let replacingRef):
+                if batch.pins != nil {
+                    optimisticMessageOverlays[i].suppressedVersion = max(optimisticMessageOverlays[i].suppressedVersion, batch.version)
+                    optimisticMessageOverlays[i].suppressedHasPinList = true
+                    optimisticMessageOverlays[i].suppressedPinList = pins[overlay.convId]
+                    if var list = pins[overlay.convId] {
+                        var changed = false
+                        if let replacingRef {
+                            let prev = list.items.count
+                            list.items.removeAll { $0.ref == replacingRef }
+                            if list.items.count != prev { changed = true }
+                        }
+                        let alreadyPresent = list.items.contains {
+                            $0.ref == item.ref || (!item.msgId.isEmpty && $0.msgId == item.msgId)
+                        }
+                        if !alreadyPresent {
+                            list.items.insert(item, at: 0)
+                            changed = true
+                        }
+                        if changed {
+                            pins[overlay.convId] = list
+                        }
+                    }
+                }
+            case .unpin(let ref):
+                if batch.pins != nil {
+                    optimisticMessageOverlays[i].suppressedVersion = max(optimisticMessageOverlays[i].suppressedVersion, batch.version)
+                    optimisticMessageOverlays[i].suppressedHasPinList = true
+                    optimisticMessageOverlays[i].suppressedPinList = pins[overlay.convId]
+                    if var list = pins[overlay.convId] {
+                        let prev = list.items.count
+                        list.items.removeAll { $0.ref == ref }
+                        if list.items.count != prev {
+                            pins[overlay.convId] = list
+                        }
                     }
                 }
             }

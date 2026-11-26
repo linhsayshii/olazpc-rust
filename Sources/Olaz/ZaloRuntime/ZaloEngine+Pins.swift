@@ -168,9 +168,18 @@ extension ZaloEngine {
     /// "Ghim tin nhắn" from the message menu: the official limit check first (`checkPinTopic`), then the pin.
     func pinMessage(_ message: ChatMessage) {
         if let core = coreLifecycle.core {
+            let conversation = message.conversationId
+            guard !isPinned(message) else { return }
+            let list = pins[conversation]
+            let items = list?.items ?? []
+            let limit = list?.limit ?? ZaloWireParser.defaultPinLimit
+            if case .allowed = PinLimitDecision.decide(count: items.count, limit: limit) {
+                pin(message)
+                return
+            }
             trackMessageActionTask { [weak self] in
                 guard let self else { return }
-                if let v = try? await core.pinMessageAsync(convId: message.conversationId, msgId: message.id) {
+                if let v = try? await core.pinMessageAsync(convId: conversation, msgId: message.id) {
                     await self.waitForMirrorVersion(v)
                 }
             }
@@ -203,9 +212,10 @@ extension ZaloEngine {
     }
 
     /// Shows the pin at once (newest first, the replaced one gone); the board re-fetch that follows the request settles it.
-    internal func insertPinOptimistically(_ message: ChatMessage, replacing ref: String?) {
+    @discardableResult
+    internal func insertPinOptimistically(_ message: ChatMessage, replacing ref: String?) -> PinnedItem? {
         let conversation = message.conversationId
-        guard var list = pins[conversation] else { return }
+        guard var list = pins[conversation] else { return nil }
         if let ref { list.items.removeAll { $0.ref == ref } }
         let item = PinnedItem(
             ref: "local:\(message.id)", kind: .message, title: Self.messagePreviewLabel(message),
@@ -214,6 +224,7 @@ extension ZaloEngine {
         )
         list.items.insert(item, at: 0)
         pins[conversation] = list
+        return item
     }
 
     internal func removePinOptimistically(_ ref: String, in conversationId: String) {
