@@ -418,6 +418,84 @@ pub enum Command {
         lists: BTreeMap<String, PinnedList>,
         raw_topics: BTreeMap<String, BoardRawTopics>,
     },
+    // U12
+    WatchPoll {
+        id: String,
+        conv_id: String,
+        now_ms: i64,
+    },
+    RetryPoll {
+        id: String,
+        conv_id: String,
+        now_ms: i64,
+    },
+    RewatchPolls {
+        now_ms: i64,
+    },
+    RefreshPoll {
+        id: String,
+        now_ms: i64,
+    },
+    PollVoters {
+        id: String,
+    },
+    RefreshPollPin {
+        id: String,
+        conv_id: String,
+    },
+    PinPoll {
+        id: String,
+        conv_id: String,
+        confirming: Option<String>,
+    },
+    UnpinPoll {
+        id: String,
+        conv_id: String,
+    },
+    PollCapabilities {
+        conv_id: String,
+    },
+    VotePoll {
+        id: String,
+        conv_id: String,
+        draft: crate::polls::PollVoteDraft,
+        detail: Option<crate::polls::PollDetail>,
+        now_ms: i64,
+    },
+    LockPoll {
+        id: String,
+        conv_id: String,
+        now_ms: i64,
+    },
+    SharePoll {
+        id: String,
+        conv_id: String,
+    },
+    CreatePoll {
+        conv_id: String,
+        draft: crate::polls::PollCreateDraft,
+        config: crate::polls::PollConfig,
+        can_pin: bool,
+    },
+    NotePollMessages {
+        notices: Vec<crate::polls::PollMessageNotice>,
+        now_ms: i64,
+        host_already_armed: bool,
+    },
+    FirePollDebounce {
+        poll_id: String,
+        seq: u64,
+        now_ms: i64,
+    },
+    HandlePollState {
+        state: Map<String, Value>,
+    },
+    ResetPolls {
+        sync_epoch: u64,
+    },
+    SeedPolls {
+        polls: Box<crate::polls::PollsState>,
+    },
 }
 
 impl fmt::Debug for Command {
@@ -736,6 +814,73 @@ impl fmt::Debug for Command {
                 .field("lists", &lists.len())
                 .field("raw_topics", &raw_topics.len())
                 .finish(),
+            // U12
+            Self::WatchPoll { now_ms, .. } => {
+                f.debug_struct("WatchPoll").field("now_ms", now_ms).finish()
+            }
+            Self::RetryPoll { now_ms, .. } => {
+                f.debug_struct("RetryPoll").field("now_ms", now_ms).finish()
+            }
+            Self::RewatchPolls { now_ms } => f
+                .debug_struct("RewatchPolls")
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::RefreshPoll { now_ms, .. } => f
+                .debug_struct("RefreshPoll")
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::PollVoters { .. } => f.write_str("PollVoters"),
+            Self::RefreshPollPin { .. } => f.write_str("RefreshPollPin"),
+            Self::PinPoll { confirming, .. } => f
+                .debug_struct("PinPoll")
+                .field("has_confirming", &confirming.is_some())
+                .finish(),
+            Self::UnpinPoll { .. } => f.write_str("UnpinPoll"),
+            Self::PollCapabilities { .. } => f.write_str("PollCapabilities"),
+            Self::VotePoll { draft, now_ms, .. } => f
+                .debug_struct("VotePoll")
+                .field("draft", draft)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::LockPoll { now_ms, .. } => {
+                f.debug_struct("LockPoll").field("now_ms", now_ms).finish()
+            }
+            Self::SharePoll { .. } => f.write_str("SharePoll"),
+            Self::CreatePoll {
+                draft,
+                config,
+                can_pin,
+                ..
+            } => f
+                .debug_struct("CreatePoll")
+                .field("draft", draft)
+                .field("config", config)
+                .field("can_pin", can_pin)
+                .finish(),
+            Self::NotePollMessages {
+                notices,
+                now_ms,
+                host_already_armed,
+            } => f
+                .debug_struct("NotePollMessages")
+                .field("count", &notices.len())
+                .field("now_ms", now_ms)
+                .field("host_already_armed", host_already_armed)
+                .finish(),
+            Self::FirePollDebounce { seq, now_ms, .. } => f
+                .debug_struct("FirePollDebounce")
+                .field("seq", seq)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::HandlePollState { state } => f
+                .debug_struct("HandlePollState")
+                .field("keys", &state.len())
+                .finish(),
+            Self::ResetPolls { sync_epoch } => f
+                .debug_struct("ResetPolls")
+                .field("sync_epoch", sync_epoch)
+                .finish(),
+            Self::SeedPolls { polls } => f.debug_tuple("SeedPolls").field(polls).finish(),
         }
     }
 }
@@ -1128,6 +1273,66 @@ pub enum Input {
     SendTextDone {
         send_id: u64,
         result: Result<SendMessageResult, String>,
+    },
+    // U12
+    PollDetailFetched {
+        op_id: Option<u64>,
+        poll_id: String,
+        purpose: crate::effect::PollDetailPurpose,
+        payload: Option<Map<String, Value>>,
+        is_authenticated: bool,
+    },
+    PollGroupDetailFetched {
+        op_id: Option<u64>,
+        poll_id: String,
+        group_id: String,
+        data_node: Map<String, Value>,
+        group_info: Option<Map<String, Value>>,
+        now_ms: i64,
+    },
+    PollBoardRefreshed {
+        conv_id: String,
+        continuation: crate::effect::PollBoardContinuation,
+    },
+    PollPinApiDone {
+        op_id: Option<u64>,
+        poll_id: String,
+        conv_id: String,
+        for_create: bool,
+        step_result: Result<(), crate::polls::PollActionResult>,
+    },
+    PollUnpinApiDone {
+        op_id: Option<u64>,
+        poll_id: String,
+        conv_id: String,
+        ok: bool,
+    },
+    PollVoteApiDone {
+        op_id: Option<u64>,
+        poll_id: String,
+        ok: bool,
+        now_ms: i64,
+    },
+    PollLockApiDone {
+        op_id: Option<u64>,
+        poll_id: String,
+        ok: bool,
+        now_ms: i64,
+    },
+    PollShareApiDone {
+        op_id: Option<u64>,
+        ok: bool,
+    },
+    PollCreateApiDone {
+        op_id: Option<u64>,
+        conv_id: String,
+        should_pin: bool,
+        result: Result<String, crate::polls::PollActionResult>,
+    },
+    PollDebounceFired {
+        poll_id: String,
+        seq: u64,
+        now_ms: i64,
     },
 
     // U6
@@ -1609,6 +1814,88 @@ impl fmt::Debug for Input {
                 .debug_struct("SendTextDone")
                 .field("send_id", send_id)
                 .field("ok", &result.is_ok())
+                .finish(),
+            // U12
+            Self::PollDetailFetched {
+                op_id,
+                purpose,
+                payload,
+                is_authenticated,
+                ..
+            } => f
+                .debug_struct("PollDetailFetched")
+                .field("op_id", op_id)
+                .field("purpose", purpose)
+                .field("has_payload", &payload.is_some())
+                .field("is_authenticated", is_authenticated)
+                .finish(),
+            Self::PollGroupDetailFetched {
+                op_id,
+                group_info,
+                now_ms,
+                ..
+            } => f
+                .debug_struct("PollGroupDetailFetched")
+                .field("op_id", op_id)
+                .field("has_group_info", &group_info.is_some())
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::PollBoardRefreshed { continuation, .. } => f
+                .debug_struct("PollBoardRefreshed")
+                .field("continuation", continuation)
+                .finish(),
+            Self::PollPinApiDone {
+                op_id,
+                for_create,
+                step_result,
+                ..
+            } => f
+                .debug_struct("PollPinApiDone")
+                .field("op_id", op_id)
+                .field("for_create", for_create)
+                .field("ok", &step_result.is_ok())
+                .finish(),
+            Self::PollUnpinApiDone { op_id, ok, .. } => f
+                .debug_struct("PollUnpinApiDone")
+                .field("op_id", op_id)
+                .field("ok", ok)
+                .finish(),
+            Self::PollVoteApiDone {
+                op_id, ok, now_ms, ..
+            } => f
+                .debug_struct("PollVoteApiDone")
+                .field("op_id", op_id)
+                .field("ok", ok)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::PollLockApiDone {
+                op_id, ok, now_ms, ..
+            } => f
+                .debug_struct("PollLockApiDone")
+                .field("op_id", op_id)
+                .field("ok", ok)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::PollShareApiDone { op_id, ok } => f
+                .debug_struct("PollShareApiDone")
+                .field("op_id", op_id)
+                .field("ok", ok)
+                .finish(),
+            Self::PollCreateApiDone {
+                op_id,
+                should_pin,
+                result,
+                ..
+            } => f
+                .debug_struct("PollCreateApiDone")
+                .field("op_id", op_id)
+                .field("should_pin", should_pin)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::PollDebounceFired { seq, now_ms, .. } => f
+                .debug_struct("PollDebounceFired")
+                .field("seq", seq)
+                .field("now_ms", now_ms)
                 .finish(),
             // U6
             Self::MessageIdsResolved {

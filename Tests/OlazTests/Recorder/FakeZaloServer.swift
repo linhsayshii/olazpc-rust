@@ -174,6 +174,10 @@ final class FakeZaloServer: @unchecked Sendable {
         self.listener = try NWListener(using: .tcp)
     }
 
+    deinit {
+        stop()
+    }
+
     var baseURLString: String { "http://127.0.0.1:\(port)" }
     var wsBaseURLString: String { "ws://127.0.0.1:\(port)" }
 

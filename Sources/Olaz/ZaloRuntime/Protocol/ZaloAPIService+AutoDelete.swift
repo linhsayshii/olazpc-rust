@@ -3,13 +3,14 @@ import Foundation
 /// "Tin nhắn tự xóa" (official `getAutoDeleteConvers` / `updateAutoDeleteConvers`).
 enum AutoDelete {
     /// The official choices (ms): 1 giờ, 1 ngày, 7 ngày, 14 ngày, 30 ngày; 0 = off.
-    static let options: [(ttl: Int64, label: String)] = [
-        (0, "Không bao giờ"),
-        (3_600_000, "1 giờ"),
-        (86_400_000, "1 ngày"),
-        (604_800_000, "7 ngày"),
-        (1_209_600_000, "14 ngày"),
-        (2_592_000_000, "30 ngày"),
+    /// `plan`: the paid plan a choice needs; the server refuses it for other accounts.
+    static let options: [(ttl: Int64, label: String, plan: String?)] = [
+        (0, "Không bao giờ", nil),
+        (3_600_000, "1 giờ", "zBusiness Max"),
+        (86_400_000, "1 ngày", nil),
+        (604_800_000, "7 ngày", nil),
+        (1_209_600_000, "14 ngày", nil),
+        (2_592_000_000, "30 ngày", nil),
     ]
 
     static func label(_ ttl: Int64) -> String {

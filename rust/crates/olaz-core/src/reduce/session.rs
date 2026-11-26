@@ -356,6 +356,8 @@ fn reduce_command(state: &mut CoreState, cmd: Command, out: &mut ReduceOutput) {
             if state.pins.reset_session() {
                 out.dirty.insert(DirtyKey::Pins);
             }
+            // U12
+            state.polls.reset();
             state.session.sign_out_notice = None;
             state.session.qr_gen = state.session.qr_gen.saturating_add(1);
             state.session.phase = Phase::Login(LoginState::generating());
@@ -367,6 +369,8 @@ fn reduce_command(state: &mut CoreState, cmd: Command, out: &mut ReduceOutput) {
             out.dirty.insert(DirtyKey::ConversationPrompt);
             out.dirty.insert(DirtyKey::MessagesResetAll);
             out.dirty.insert(DirtyKey::Contacts);
+            // U12
+            out.dirty.insert(DirtyKey::Polls);
 
             // Order matches Swift `logOut`: cancel tasks, stop transport, clear session,
             // detach SQLite store, reset domains, start QR.
@@ -456,6 +460,8 @@ pub(crate) fn enter_session_expired(state: &mut CoreState, reason: String, out: 
     if state.pins.reset_session() {
         out.dirty.insert(DirtyKey::Pins);
     }
+    // U12
+    state.polls.reset();
     state.session.sign_out_notice = Some(reason);
     state.session.qr_gen = state.session.qr_gen.saturating_add(1);
     state.session.phase = Phase::Login(LoginState::generating());
@@ -467,6 +473,8 @@ pub(crate) fn enter_session_expired(state: &mut CoreState, reason: String, out: 
     out.dirty.insert(DirtyKey::ConversationPrompt);
     out.dirty.insert(DirtyKey::MessagesResetAll);
     out.dirty.insert(DirtyKey::Contacts);
+    // U12
+    out.dirty.insert(DirtyKey::Polls);
 
     // Order matches Swift `handleSessionExpiredNotice`: cancel, stop transport, mark_expired, QR.
     // Unlike `logOut`, session expiry does not reset `ZaloDomains`.

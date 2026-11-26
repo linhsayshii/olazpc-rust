@@ -7,6 +7,8 @@ pub mod classify;
 pub mod conversations;
 pub mod messages;
 pub mod pins;
+// U12
+pub mod polls;
 pub mod send;
 pub mod session;
 pub mod transport;
@@ -200,6 +202,25 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::DeleteUndoExpired { .. }
         | Input::AutoDeleteLoaded { .. }
         | Input::AutoDeleteUpdated { .. } => crate::actions::reduce_actions(state, input, &mut out),
+        // U12
+        Input::Command(ref cmd) if polls::is_poll_command(cmd) => {
+            polls::reduce_polls(state, input, &mut out);
+        }
+        Input::OpRequest { ref cmd, .. } if polls::is_poll_command(cmd) => {
+            polls::reduce_polls(state, input, &mut out);
+        }
+        Input::PollDetailFetched { .. }
+        | Input::PollGroupDetailFetched { .. }
+        | Input::PollBoardRefreshed { .. }
+        | Input::PollPinApiDone { .. }
+        | Input::PollUnpinApiDone { .. }
+        | Input::PollVoteApiDone { .. }
+        | Input::PollLockApiDone { .. }
+        | Input::PollShareApiDone { .. }
+        | Input::PollCreateApiDone { .. }
+        | Input::PollDebounceFired { .. } => {
+            polls::reduce_polls(state, input, &mut out);
+        }
 
         // U7
         Input::Command(ref cmd) if is_pin_command(cmd) => {

@@ -5,6 +5,7 @@
 //! aliases, profiles, hidden chats, delete), message history (1-1 preload, group and self cloud
 //! paging), the HTTP long-poll queue, sending text (plain, quoted, E2EE envelope), typing, seen,
 //! unread marks, recall, delete-for-me, reactions, auto-delete settings, and board pins.
+//! unread marks, recall, delete-for-me, reactions, auto-delete settings, and group polls.
 //!
 //! Every method is a request builder (service, path, params payload with the exact Swift keys and
 //! JSON types) plus a response parser. The pure builders ([`build_recall_message_request`],
@@ -23,6 +24,8 @@ mod autodelete;
 mod conversations;
 mod e2ee;
 mod error;
+mod group_polls;
+mod groups;
 mod history;
 mod messaging;
 mod pins;
@@ -55,3 +58,14 @@ pub use pins::{
     board_topic_params, friend_board_list_box, friend_board_unpin_topics, pin_topic_params,
 };
 pub use poll::{PollQueueCursor, PollState};
+
+// U12 (polls + shared group metadata helper for U10)
+pub use group_polls::{
+    CreatePollArgs, NewPollOptionPayload, build_add_poll_option_request, build_create_poll_request,
+    build_fetch_poll_detail_request, build_lock_poll_request, build_pin_board_item_request,
+    build_share_poll_request, build_unpin_board_topic_request, build_vote_poll_request,
+    extract_created_poll_id,
+};
+pub use groups::{
+    build_fetch_group_detail_request, clean_group_member_ids, parse_fetch_group_detail_response,
+};

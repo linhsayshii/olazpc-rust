@@ -524,6 +524,11 @@ pub enum RefreshBoardFollowup {
     UnpinSucceeded { unpin_op_id: u64 },
     /// After `unpinBoardTopic` failed: show card, release busy key & complete `op_id`.
     UnpinFailed { unpin_op_id: u64 },
+    /// After poll-triggered board refresh: resume the poll pin continuation.
+    Poll {
+        conv_id: String,
+        continuation: crate::effect::PollBoardContinuation,
+    },
 }
 
 impl fmt::Debug for RefreshBoardFollowup {
@@ -555,6 +560,10 @@ impl fmt::Debug for RefreshBoardFollowup {
             Self::UnpinFailed { unpin_op_id } => f
                 .debug_struct("UnpinFailed")
                 .field("unpin_op_id", unpin_op_id)
+                .finish(),
+            Self::Poll { continuation, .. } => f
+                .debug_struct("Poll")
+                .field("continuation", continuation)
                 .finish(),
         }
     }

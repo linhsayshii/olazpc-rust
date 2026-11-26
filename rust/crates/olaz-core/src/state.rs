@@ -35,6 +35,8 @@ pub struct CoreState {
     pub actions: ActionsState,
     // U7
     pub pins: PinsState,
+    // U12
+    pub polls: crate::polls::PollsState,
 }
 
 impl CoreState {
@@ -57,6 +59,8 @@ impl CoreState {
             last_prune_next_expiry_ms: self.actions.last_prune_next_expiry_ms,
             // U7
             pins: self.pins.snapshot(),
+            // U12
+            polls: self.polls.clone(),
         }
     }
 
@@ -94,11 +98,13 @@ impl fmt::Debug for CoreState {
             .field("actions", &self.actions)
             // U7
             .field("pins", &self.pins)
+            // U12
+            .field("polls", &self.polls)
             .finish()
     }
 }
 
-/// Full observable snapshot across session + conversations + messages + contacts + typing domains.
+/// Full observable snapshot across session + conversations + messages + contacts + typing + polls domains.
 #[derive(Clone, Default)]
 pub struct CoreSnapshot {
     pub session: SessionSnapshot,
@@ -116,6 +122,8 @@ pub struct CoreSnapshot {
     pub last_prune_next_expiry_ms: Option<i64>,
     // U7
     pub pins: PinsSnapshot,
+    // U12
+    pub polls: crate::polls::PollsState,
 }
 
 impl fmt::Debug for CoreSnapshot {
@@ -139,6 +147,8 @@ impl fmt::Debug for CoreSnapshot {
             .field("last_prune_next_expiry_ms", &self.last_prune_next_expiry_ms)
             // U7
             .field("pins", &self.pins)
+            // U12
+            .field("polls", &self.polls)
             .finish()
     }
 }

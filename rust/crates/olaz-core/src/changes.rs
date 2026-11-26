@@ -50,6 +50,8 @@ pub enum DirtyKey {
     CachedProfiles,
     // U7
     Pins,
+    // U12
+    Polls,
 }
 
 /// Set of keys dirtied by one `reduce` step.
@@ -109,6 +111,8 @@ pub struct CoreChanges {
     // U7
     /// Updated board pins lists + raw topics snapshot.
     pub pins: Option<PinsSnapshot>,
+    // U12
+    pub polls: Option<crate::polls::PollsState>,
 }
 
 impl fmt::Debug for CoreChanges {
@@ -123,6 +127,7 @@ impl fmt::Debug for CoreChanges {
             .field("has_contacts", &self.contacts.is_some())
             .field("has_typing", &self.typing.is_some())
             .field("has_pins", &self.pins.is_some())
+            .field("has_polls", &self.polls.is_some())
             .finish()
     }
 }
@@ -156,6 +161,8 @@ struct DirtyBuffer {
     cached_profiles: Option<BTreeMap<String, CachedProfile>>,
     // U7
     pins: Option<PinsSnapshot>,
+    // U12
+    polls: Option<crate::polls::PollsState>,
     closed: bool,
 }
 
@@ -177,6 +184,7 @@ impl DirtyBuffer {
             || self.starred_ids.is_some()
             || self.cached_profiles.is_some()
             || self.pins.is_some()
+            || self.polls.is_some()
     }
 }
 
@@ -295,6 +303,10 @@ impl ChangeHub {
                 DirtyKey::Typing => {
                     buf.typing = Some(state.typing.active.clone());
                 }
+                // U12
+                DirtyKey::Polls => {
+                    buf.polls = Some(state.polls.clone());
+                }
                 // U6
                 DirtyKey::DeleteUndo => {
                     buf.delete_undo = Some(state.actions.delete_undo.snapshot());
@@ -403,6 +415,8 @@ impl ChangeHub {
                             cached_profiles: None,
                             // U7
                             pins: None,
+                            // U12
+                            polls: None,
                         });
                     }
                 }
@@ -469,6 +483,8 @@ impl ChangeHub {
                         cached_profiles: buf.cached_profiles.take(),
                         // U7
                         pins: buf.pins.take(),
+                        // U12
+                        polls: buf.polls.take(),
                     });
                 }
                 if buf.closed {

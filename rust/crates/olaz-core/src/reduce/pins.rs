@@ -666,6 +666,12 @@ fn finish_refresh_followup(
                 complete_unit(in_flight.op_id, out);
             }
         }
+        RefreshBoardFollowup::Poll {
+            conv_id,
+            continuation,
+        } => {
+            crate::reduce::polls::handle_poll_board_refreshed(state, conv_id, continuation, out);
+        }
     }
 }
 

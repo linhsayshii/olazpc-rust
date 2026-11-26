@@ -41,6 +41,11 @@ use crate::messages::{
     ContactsStateRecord, FreshnessMapEntry, MessageMetaRecord, MuteEntryRecord, WindowDeltaRecord,
     records_to_chat_messages,
 };
+use crate::polls::{
+    PollActionOutcomeRecord, PollCapabilitiesOutcomeRecord, PollConfigRecord,
+    PollCreateDraftRecord, PollDetailRecord, PollMessageNoticeRecord, PollPinActionOutcomeRecord,
+    PollPinStateOutcomeRecord, PollVoteDraftRecord, PollVotersOutcomeRecord, PollsMirrorRecord,
+};
 use crate::runtime::{run, runtime};
 use crate::session::CoreSession;
 use crate::store::CoreStore;
@@ -781,7 +786,11 @@ pub struct CoreChangesRecord {
     pub auto_delete: Option<AutoDeleteUpdateRecord>,
     pub starred_ids: Option<Vec<String>>,
     pub cached_profiles: Option<Vec<CachedProfileEntry>>,
+    #[uniffi(default = None)]
     pub pins: Option<PinsSnapshotRecord>,
+    // U12
+    #[uniffi(default = None)]
+    pub polls: Option<PollsMirrorRecord>,
 }
 
 impl fmt::Debug for CoreChangesRecord {
@@ -798,6 +807,7 @@ impl fmt::Debug for CoreChangesRecord {
             .field("conversation_ui", &self.conversation_ui)
             .field("conversation_prompt", &self.conversation_prompt)
             .field("typing_count", &self.typing.as_ref().map(Vec::len))
+            .field("polls", &self.polls)
             .finish()
     }
 }
@@ -853,6 +863,7 @@ impl From<CoreChanges> for CoreChangesRecord {
                     .collect()
             }),
             pins: c.pins.map(Into::into),
+            polls: c.polls.map(Into::into),
         }
     }
 }
@@ -1212,6 +1223,7 @@ impl CoreOfflineConversations {
             starred_ids: None,
             cached_profiles: None,
             pins: None,
+            polls: None,
         };
         for key in out.dirty {
             match key {
@@ -1273,6 +1285,9 @@ impl CoreOfflineConversations {
                 | DirtyKey::CachedProfiles => {}
                 DirtyKey::Pins => {
                     rec.pins = Some(state.pins.snapshot().into());
+                }
+                DirtyKey::Polls => {
+                    rec.polls = Some(state.polls.clone().into());
                 }
             }
         }
@@ -1508,6 +1523,10 @@ pub trait CoreHost: Send + Sync {
     async fn show_card(&self, conv_id: String, text: String);
     // U14: temporary host boundary until U14's core `ensure_message_loaded` lands on main.
     async fn ensure_message_loaded(&self, conv_id: String, message: ChatMessageRecord) -> bool;
+
+    // --- Group polls domain callbacks (U12) ---
+    async fn arm_poll_debounce(&self, poll_id: String, seq: u64, delay_ms: u64) -> bool;
+    async fn cancel_all_poll_debounces(&self);
 }
 
 struct FfiHostBridge(Arc<dyn CoreHost>);
@@ -1871,6 +1890,14 @@ impl Host for FfiHostBridge {
             E2eeSendOutcomeRecord::Failed { message } => Err(message),
             E2eeSendOutcomeRecord::Aborted => Err(String::new()),
         }
+    }
+
+    async fn arm_poll_debounce(&self, poll_id: String, seq: u64, delay_ms: u64) -> bool {
+        self.0.arm_poll_debounce(poll_id, seq, delay_ms).await
+    }
+
+    async fn cancel_all_poll_debounces(&self) {
+        self.0.cancel_all_poll_debounces().await;
     }
 
     async fn show_card(&self, conv_id: String, text: String) {
@@ -3348,6 +3375,285 @@ impl CoreEngine {
         .await
     }
 
+    // --- Group polls domain (U12) ---
+
+    pub fn watch_poll(&self, id: String, conv_id: String, now_ms: i64) {
+        self.handle.send(Command::WatchPoll {
+            id,
+            conv_id,
+            now_ms,
+        });
+    }
+
+    pub fn retry_poll(&self, id: String, conv_id: String, now_ms: i64) {
+        self.handle.send(Command::RetryPoll {
+            id,
+            conv_id,
+            now_ms,
+        });
+    }
+
+    pub fn rewatch_polls(&self, now_ms: i64) {
+        self.handle.send(Command::RewatchPolls { now_ms });
+    }
+
+    pub fn refresh_poll(&self, id: String, now_ms: i64) {
+        self.handle.send(Command::RefreshPoll { id, now_ms });
+    }
+
+    pub async fn poll_voters(&self, id: String) -> Result<PollVotersOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            let voters = handle.request_poll_voters(id).await;
+            let version = handle.current_version();
+            PollVotersOutcomeRecord {
+                voters: voters.map(Into::into),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn refresh_poll_pin(
+        &self,
+        id: String,
+        conv_id: String,
+    ) -> Result<PollPinStateOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let state = handle.request_poll_pin_state(id, conv_id).await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            PollPinStateOutcomeRecord {
+                state: state.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn pin_poll(
+        &self,
+        id: String,
+        conv_id: String,
+        confirming: Option<String>,
+    ) -> Result<PollPinActionOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let outcome = handle
+                .request_poll_pin_outcome(id, conv_id, confirming)
+                .await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            PollPinActionOutcomeRecord {
+                outcome: outcome.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn unpin_poll(
+        &self,
+        id: String,
+        conv_id: String,
+    ) -> Result<PollActionOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let result = handle
+                .request_poll_action(Command::UnpinPoll { id, conv_id })
+                .await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            PollActionOutcomeRecord {
+                result: result.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn poll_capabilities(
+        &self,
+        conv_id: String,
+    ) -> Result<PollCapabilitiesOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            let caps = handle.request_poll_capabilities(conv_id).await;
+            let version = handle.current_version();
+            PollCapabilitiesOutcomeRecord {
+                capabilities: caps.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn vote_poll(
+        &self,
+        id: String,
+        conv_id: String,
+        draft: PollVoteDraftRecord,
+        detail: Option<PollDetailRecord>,
+        now_ms: i64,
+    ) -> Result<PollActionOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let result = handle
+                .request_poll_action(Command::VotePoll {
+                    id,
+                    conv_id,
+                    draft: draft.into(),
+                    detail: detail.map(Into::into),
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            PollActionOutcomeRecord {
+                result: result.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn lock_poll(
+        &self,
+        id: String,
+        conv_id: String,
+        now_ms: i64,
+    ) -> Result<PollActionOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let result = handle
+                .request_poll_action(Command::LockPoll {
+                    id,
+                    conv_id,
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            PollActionOutcomeRecord {
+                result: result.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn share_poll(
+        &self,
+        id: String,
+        conv_id: String,
+    ) -> Result<PollActionOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let result = handle
+                .request_poll_action(Command::SharePoll { id, conv_id })
+                .await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            PollActionOutcomeRecord {
+                result: result.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn create_poll(
+        &self,
+        conv_id: String,
+        draft: PollCreateDraftRecord,
+        config: PollConfigRecord,
+        can_pin: bool,
+    ) -> Result<PollActionOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let result = handle
+                .request_poll_action(Command::CreatePoll {
+                    conv_id,
+                    draft: draft.into(),
+                    config: config.into(),
+                    can_pin,
+                })
+                .await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            PollActionOutcomeRecord {
+                result: result.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub fn note_poll_messages(
+        &self,
+        notices: Vec<PollMessageNoticeRecord>,
+        now_ms: i64,
+        host_already_armed: bool,
+    ) {
+        self.handle.send(Command::NotePollMessages {
+            notices: notices.into_iter().map(Into::into).collect(),
+            now_ms,
+            host_already_armed,
+        });
+    }
+
+    pub fn fire_poll_debounce(&self, poll_id: String, seq: u64, now_ms: i64) {
+        self.handle.send(Command::FirePollDebounce {
+            poll_id,
+            seq,
+            now_ms,
+        });
+    }
+
+    pub fn handle_poll_state(&self, state_json: String) {
+        let state = olaz_json::parse_object_str(&state_json).unwrap_or_default();
+        self.handle.send(Command::HandlePollState { state });
+    }
+
+    pub fn reset_polls(&self, sync_epoch: u64) {
+        self.handle.send(Command::ResetPolls { sync_epoch });
+    }
+
+    pub fn seed_polls(&self, polls: PollsMirrorRecord) {
+        self.handle.send(Command::SeedPolls {
+            polls: Box::new(polls.into()),
+        });
+    }
+
     /// Stops the actor, aborts in-flight session & transport tasks, and closes `next_changes()`.
     pub fn stop(&self) {
         self.handle.stop();
@@ -3503,6 +3809,10 @@ mod tests {
         ) -> bool {
             false
         }
+        async fn arm_poll_debounce(&self, _poll_id: String, _seq: u64, _delay_ms: u64) -> bool {
+            false
+        }
+        async fn cancel_all_poll_debounces(&self) {}
     }
 
     #[test]
