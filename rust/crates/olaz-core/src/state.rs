@@ -14,6 +14,7 @@ use serde_json::{Map, Value, json};
 use crate::actions::{ActionsState, DeleteUndoSnapshot, MessageConfirmState};
 use crate::composer::{ComposerConfirm, ComposerState};
 use crate::conversations::{CachedProfile, ConversationsState};
+use crate::forward::{ForwardRequest, ForwardState};
 use crate::messages::{ContactsState, IdentitySnapshot, MessagesState};
 use crate::stickers::{StickerState, StickerSuggestSetting};
 use crate::typing::{TypingState, TypingStatus};
@@ -32,8 +33,16 @@ pub struct CoreState {
     pub typing: TypingState,
     // U5-send
     pub send: crate::reduce::send::SendState,
+    // U8
+    pub forward: ForwardState,
     // U6
     pub actions: ActionsState,
+    // U12
+    pub polls: crate::polls::PollsState,
+    // U7: temporary read-only board pin mirror written through from Swift until U7 lands.
+    pub board_pins: BTreeMap<String, crate::polls::BoardPinList>,
+    // U7: temporary read-only raw board topics mirror written through from Swift until U7 lands.
+    pub board_raw_topics: BTreeMap<String, crate::polls::BoardRawTopics>,
     // U13
     pub stickers: StickerState,
     pub composer: ComposerState,
@@ -50,6 +59,9 @@ impl CoreState {
             contacts: self.contacts.clone(),
             // U5
             typing: self.typing.active.clone(),
+            // U8
+            forward_request: self.forward.request.clone(),
+            send_auto_delete: self.send.auto_delete_ttl_ms.clone(),
             // U6
             delete_undo: self.actions.delete_undo.snapshot(),
             message_confirm: self.actions.message_confirm.clone(),
@@ -57,6 +69,9 @@ impl CoreState {
             starred_ids: self.actions.starred_ids.clone(),
             cached_profiles: self.conversations.identities.cached_profiles.clone(),
             last_prune_next_expiry_ms: self.actions.last_prune_next_expiry_ms,
+            // U12
+            polls: self.polls.clone(),
+            board_pins: self.board_pins.clone(),
             // U13
             sticker_suggest_setting: self.stickers.suggest_setting,
             composer_confirm: self.composer.active_confirm.clone(),
@@ -94,8 +109,14 @@ impl fmt::Debug for CoreState {
             .field("typing", &self.typing)
             // U5-send
             .field("send", &self.send)
+            // U8
+            .field("forward", &self.forward)
             // U6
             .field("actions", &self.actions)
+            // U12
+            .field("polls", &self.polls)
+            .field("board_pins_count", &self.board_pins.len())
+            .field("board_raw_topics_count", &self.board_raw_topics.len())
             // U13
             .field("stickers", &self.stickers)
             .field("composer", &self.composer)
@@ -103,7 +124,7 @@ impl fmt::Debug for CoreState {
     }
 }
 
-/// Full observable snapshot across session + conversations + messages + contacts + typing domains.
+/// Full observable snapshot across session + conversations + messages + contacts + typing + polls domains.
 #[derive(Clone, Default)]
 pub struct CoreSnapshot {
     pub session: SessionSnapshot,
@@ -112,6 +133,9 @@ pub struct CoreSnapshot {
     pub contacts: ContactsState,
     // U5
     pub typing: BTreeMap<String, TypingStatus>,
+    // U8
+    pub forward_request: Option<ForwardRequest>,
+    pub send_auto_delete: BTreeMap<String, i64>,
     // U6
     pub delete_undo: Option<DeleteUndoSnapshot>,
     pub message_confirm: Option<MessageConfirmState>,
@@ -119,6 +143,9 @@ pub struct CoreSnapshot {
     pub starred_ids: BTreeSet<String>,
     pub cached_profiles: BTreeMap<String, CachedProfile>,
     pub last_prune_next_expiry_ms: Option<i64>,
+    // U12
+    pub polls: crate::polls::PollsState,
+    pub board_pins: BTreeMap<String, crate::polls::BoardPinList>,
     // U13
     pub sticker_suggest_setting: Option<StickerSuggestSetting>,
     pub composer_confirm: Option<ComposerConfirm>,
@@ -134,6 +161,8 @@ impl fmt::Debug for CoreSnapshot {
             .field("contacts", &self.contacts)
             // U5
             .field("typing_count", &self.typing.len())
+            // U8
+            .field("has_forward_request", &self.forward_request.is_some())
             // U6
             .field("delete_undo", &self.delete_undo)
             .field("message_confirm", &self.message_confirm)
@@ -144,6 +173,9 @@ impl fmt::Debug for CoreSnapshot {
             .field("starred_ids_count", &self.starred_ids.len())
             .field("cached_profiles_count", &self.cached_profiles.len())
             .field("last_prune_next_expiry_ms", &self.last_prune_next_expiry_ms)
+            // U12
+            .field("polls", &self.polls)
+            .field("board_pins_count", &self.board_pins.len())
             // U13
             .field("sticker_suggest_setting", &self.sticker_suggest_setting)
             .field("has_composer_confirm", &self.composer_confirm.is_some())

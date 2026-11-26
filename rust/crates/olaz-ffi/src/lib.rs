@@ -7,6 +7,7 @@
 //! | misc | [`core_version`] |
 //! | core | [`CoreEngine`], [`CoreHost`], [`CoreChangesRecord`], [`SessionStateRecord`] (ADR-016) |
 //! | conversations | U3 conversation summary, flags, extras, UI, prompt, action result, pin board records |
+//! | polls | U12 group polls records, drafts, capabilities, pin states, and pure model helpers |
 //! | store | [`CoreStore`] (+ [`ConversationRow`], [`MessageRow`], [`MessagesAroundRow`]) |
 //! | session | [`CoreSession`] (restore/snapshot, QR login, status), [`QrListener`] |
 //! | api | [`CoreApi`] over a shared [`CoreSession`], [`poll_state_initial`] |
@@ -46,6 +47,7 @@ mod error;
 mod http;
 mod media;
 mod messages;
+mod polls;
 mod raw_http;
 mod runtime;
 mod session;
@@ -78,6 +80,7 @@ pub use error::{CoreError, NetworkKind};
 pub use http::{CoreHttp, HttpMethod, HttpRequestRecord, UploadPartRecord};
 pub use media::*;
 pub use messages::*;
+pub use polls::*;
 pub use raw_http::{CoreRawHttp, RawRequestRecord, RawResponseRecord};
 pub use session::{CoreSession, CoreSessionStatus, QrListener, QrScanRecord, QrTicketRecord};
 pub use signal::{

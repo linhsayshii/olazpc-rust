@@ -72,7 +72,7 @@ pub(crate) fn start_contact_card_send(
                 qr_code_url: spec.qr_code_url,
             }));
     } else {
-        out.effects.push(Effect::SendContactCardApi {
+        out.effects.push(Effect::SendComposerContactCardApi {
             card_send_id,
             params: SendContactCardParams {
                 conv_id: spec.conv_id,
@@ -291,8 +291,10 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
         Command::ComposerReport { conv_id, outcome } => {
             match outcome {
                 ComposerOutcome::Failed(text) | ComposerOutcome::Pending(text) => {
-                    out.effects
-                        .push(Effect::Host(HostCall::ShowCard { conv_id, text }));
+                    out.effects.push(Effect::Host(HostCall::ShowCard {
+                        conv_id: Some(conv_id),
+                        text,
+                    }));
                 }
                 ComposerOutcome::Done | ComposerOutcome::Cancelled => {}
             }

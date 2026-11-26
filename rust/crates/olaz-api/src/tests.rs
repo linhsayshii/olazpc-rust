@@ -1877,3 +1877,69 @@ async fn api_error_display_without_url_matches_swift_send_fail_log() {
     let unauth_err = ApiError::Net(NetError::NotAuthenticated);
     assert_eq!(unauth_err.display_without_url(), unauth_err.to_string());
 }
+
+#[tokio::test]
+async fn send_contact_card_direct_group_phone_and_fallback() {
+    // 1-1 with phone and explicit client_id
+    let api = api_with(|_| ok(json!({"msgId": "88001"})));
+    let res = api
+        .send_contact_card(&SendContactCardParams {
+            conv_id: " 30001 ".to_owned(),
+            card_uid: " 90001 ".to_owned(),
+            phone: Some("+84901234567".to_owned()),
+            client_id: Some(7_000_001),
+        })
+        .await
+        .unwrap();
+    assert_eq!(res.msg_id, "88001");
+    assert_eq!(res.cli_msg_id, "7000001");
+    let req = last(&api);
+    assert_eq!(req.path(), "/api/message/contact");
+    let p = params_of(&req);
+    assert_eq!(p["toId"], "30001");
+    assert_eq!(p["contactId"], "90001");
+    assert_eq!(p["clientId"], 7_000_001i64);
+    assert_eq!(p["ttl"], 0);
+    assert_eq!(p["phone"], "+84901234567");
+    assert!(p.get("grid").is_none());
+    assert!(p.get("visibility").is_none());
+
+    // Group without phone (empty phone omitted) + empty msgId falls back to cli_msg_id
+    let api_grp = api_with(|_| ok(json!({})));
+    let res_grp = api_grp
+        .send_contact_card(&SendContactCardParams {
+            conv_id: "g555".to_owned(),
+            card_uid: "90002".to_owned(),
+            phone: Some(String::new()),
+            client_id: Some(7_000_002),
+        })
+        .await
+        .unwrap();
+    assert_eq!(res_grp.msg_id, "7000002");
+    assert_eq!(res_grp.cli_msg_id, "7000002");
+    let req_grp = last(&api_grp);
+    assert_eq!(req_grp.path(), "/api/group/contact");
+    let pg = params_of(&req_grp);
+    assert_eq!(pg["grid"], "555");
+    assert_eq!(pg["visibility"], 0);
+    assert_eq!(pg["contactId"], "90002");
+    assert_eq!(pg["clientId"], 7_000_002i64);
+    assert!(pg.get("toId").is_none());
+    assert!(pg.get("phone").is_none());
+
+    // Debug impl is shape-only (ADR-008)
+    let dbg = format!(
+        "{:?}",
+        SendContactCardParams {
+            conv_id: "secret-conv".to_owned(),
+            card_uid: "secret-uid".to_owned(),
+            phone: Some("+84999999999".to_owned()),
+            client_id: Some(12345),
+        }
+    );
+    assert!(!dbg.contains("secret-conv"));
+    assert!(!dbg.contains("secret-uid"));
+    assert!(!dbg.contains("84999999999"));
+    assert!(dbg.contains("has_phone: true"));
+    assert!(dbg.contains("has_client_id: true"));
+}

@@ -14,9 +14,18 @@ extension ZaloEngine {
     }
 
     internal func showActionCard(_ text: String, in conversationId: String?) {
-        if traceHost("show_card", args: ["conv_id": conversationId ?? "", "text": text]) {
+        if traceHost("show_card", args: ["conv_id": conversationId ?? NSNull(), "text": text]) {
             CardActionCenter.shared.show(text, in: conversationId)
         }
+    }
+
+    internal func trackContactsTask(_ body: @escaping @MainActor () async -> Void) {
+        let key = UUID()
+        let task = Task { @MainActor [weak self] in
+            defer { self?.contactsTasks.removeValue(forKey: key) }
+            await body()
+        }
+        contactsTasks[key] = task
     }
 
     internal func trackMessageActionTask(_ body: @escaping @MainActor () async -> Void) {
@@ -26,6 +35,15 @@ extension ZaloEngine {
             await body()
         }
         messageActionTasks[key] = task
+    }
+
+    internal func trackPollTask(_ body: @escaping @MainActor () async -> Void) {
+        let key = UUID()
+        let task = Task { @MainActor [weak self] in
+            defer { self?.pollRefreshTasks.removeValue(forKey: key) }
+            await body()
+        }
+        pollRefreshTasks[key] = task
     }
 
     internal func syncSessionClientTrace() async {
@@ -48,13 +66,24 @@ extension ZaloEngine {
         sendE2EETextHostHandler = nil
         sendE2EEStickerHostHandler = nil
         sendE2EEContactCardHostHandler = nil
+        resolveMediaHostHandler = nil
+        resolveFileHostHandler = nil
+        fetchMediaDataHostHandler = nil
+        sendMediaHostHandler = nil
+        sendFilesHostHandler = nil
+        forwardTempPhotoURL = nil
         traceU4HostEnabled = false
         stateTrace = nil
+        transportSettleTrace = nil
         EngineLog.shared.onAppend = nil
-        stopCoreEngine()
+        pendingCoreCommands.removeAll()
         bootTask?.cancel()
         qrTask?.cancel()
         transferTask?.cancel()
+        batchImportTask?.cancel()
+        activeSyncBatchTasks.values.forEach { $0.cancel() }
+        e2eePrepareTask?.cancel()
+        webkitMigrateTask?.cancel()
         openConversationTask?.cancel()
         loadOlderTask?.cancel()
         persistConversationsTask?.cancel()
@@ -66,13 +95,27 @@ extension ZaloEngine {
         deleteUndoTimerTask = nil
         messageActionTasks.values.forEach { $0.cancel() }
         messageActionTasks.removeAll()
+        contactsTasks.values.forEach { $0.cancel() }
+        contactsTasks.removeAll()
+        pollDebounceSleep = nil
+        resetPolls()
+        pollRefreshTasks.values.forEach { $0.cancel() }
         optimisticOverlayFenceTasks.values.forEach { $0.cancel() }
         optimisticOverlayFenceTasks.removeAll()
         composerConfirmSleep = nil
         composerConfirmTask?.cancel()
         composerConfirmTask = nil
+        contactsTasks.values.forEach { $0.cancel() }
+        contactsTasks.removeAll()
+        pollDebounceSleep = nil
+        resetPolls()
+        pollRefreshTasks.values.forEach { $0.cancel() }
+        pollRefreshTasks.removeAll()
         typingResetTasks.values.forEach { $0.cancel() }
         typingResetTasks = [:]
+        callBridge?.shutdown()
+        callBridge = nil
+        failAllMirrorWaiters()
     }
 
     internal func settleForRecording() async {
@@ -155,17 +198,70 @@ extension ZaloEngine {
         _ = await persistConversationsTask?.value
     }
 
+    internal func awaitContactsTasksForRecording() async {
+        while !contactsTasks.isEmpty {
+            let tasks = Array(contactsTasks.values)
+            contactsTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
+        await awaitMessageActionTasksForRecording()
+    }
+
+    internal func awaitPollTasksForRecording() async {
+        while !pollRefreshTasks.isEmpty {
+            let tasks = Array(pollRefreshTasks.values)
+            pollRefreshTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
+        if let core = coreLifecycle.core {
+            await drainCorePollWork(core)
+        }
+        _ = await persistConversationsTask?.value
+    }
+
     internal func finishTearDownForRecording() async {
         await sessionClient.setSessionTrace(nil)
+        if let initTask = coreInitTask {
+            _ = await initTask.value
+            coreInitTask = nil
+        }
+        await coreLifecycle.shutdownAsync()
+        await webSocket.detachCore()
+        failAllMirrorWaiters()
+
         _ = await bootTask?.value
+        bootTask = nil
         _ = await qrTask?.value
+        qrTask = nil
+        _ = await transferTask?.value
+        transferTask = nil
+        _ = await batchImportTask?.value
+        batchImportTask = nil
+        while !activeSyncBatchTasks.isEmpty {
+            let tasks = Array(activeSyncBatchTasks.values)
+            activeSyncBatchTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
+        _ = await e2eePrepareTask?.value
+        e2eePrepareTask = nil
+        _ = await webkitMigrateTask?.value
+        webkitMigrateTask = nil
         _ = await openConversationTask?.value
+        openConversationTask = nil
         _ = await loadOlderTask?.value
+        loadOlderTask = nil
         _ = await activeSendTask?.value
+        activeSendTask = nil
         _ = await notifyTypingTask?.value
+        notifyTypingTask = nil
         while !markReadTasks.isEmpty {
             let tasks = Array(markReadTasks.values)
             markReadTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
+        while !contactsTasks.isEmpty {
+            let tasks = Array(contactsTasks.values)
+            contactsTasks.removeAll()
             for task in tasks { _ = await task.value }
         }
         while !messageActionTasks.isEmpty {
@@ -173,8 +269,26 @@ extension ZaloEngine {
             messageActionTasks.removeAll()
             for task in tasks { _ = await task.value }
         }
+        while !optimisticOverlayFenceTasks.isEmpty {
+            let tasks = Array(optimisticOverlayFenceTasks.values)
+            optimisticOverlayFenceTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
+        while !pollRefreshTasks.isEmpty {
+            let tasks = Array(pollRefreshTasks.values)
+            pollRefreshTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
         _ = await persistConversationsTask?.value
+        persistConversationsTask = nil
         _ = await pendingCleanupTask?.value
+        pendingCleanupTask = nil
+        await phoneSync.resetAll()
+        await e2eeManager.reset()
+        await webSocket.stop()
+        let oldStore = sqliteStore
+        sqliteStore = nil
+        await oldStore?.close()
     }
 
     internal static func serializeMobileSyncEvents(_ events: [ZaloMobileSyncEvent]) -> [[String: Any]] {

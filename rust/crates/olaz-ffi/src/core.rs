@@ -23,9 +23,10 @@ use olaz_core::stickers::{
 };
 use olaz_core::typed_chat::{TypedChatEnvelope, WirePayloadHandle};
 use olaz_core::{
-    Command, CoreChanges, CoreFailKind, CoreHandle, CoreState, DeleteUndoSnapshot, FailReason,
-    Host, Input, LegacyCookie, LoginState, LoginStep, MessageConfirmAction, MessageConfirmState,
-    Phase, Profile, SessionEffectRunner, SessionSnapshot,
+    Command, ComposerSendOutcome, CoreChanges, CoreFailKind, CoreHandle, CoreState,
+    DeleteUndoSnapshot, FailReason, FileResolutionOutcome, ForwardOutcome, ForwardRequest, Host,
+    Input, LegacyCookie, LoginState, LoginStep, MediaResolutionOutcome, MessageConfirmAction,
+    MessageConfirmState, Phase, Profile, SessionEffectRunner, SessionSnapshot,
 };
 use olaz_json::to_swift_json_string;
 use olaz_net::{LoginAccount, NetworkErrorKind, ReqwestTransport, SessionClient};
@@ -45,6 +46,12 @@ use crate::error::{CoreError, NetworkKind};
 use crate::messages::{
     ContactsStateRecord, FreshnessMapEntry, MessageMetaRecord, MuteEntryRecord, WindowDeltaRecord,
     records_to_chat_messages,
+};
+use crate::polls::{
+    BoardPinListRecord, PollActionOutcomeRecord, PollCapabilitiesOutcomeRecord, PollConfigRecord,
+    PollCreateDraftRecord, PollDetailRecord, PollMessageNoticeRecord, PollPinActionOutcomeRecord,
+    PollPinStateOutcomeRecord, PollVoteDraftRecord, PollVotersOutcomeRecord, PollsMirrorRecord,
+    parse_raw_topics_json,
 };
 use crate::runtime::{run, runtime};
 use crate::session::CoreSession;
@@ -469,6 +476,24 @@ pub struct SendTextOutcomeRecord {
     pub version: u64,
 }
 
+/// Active forward picker request mirrored from `olaz-core` (U8).
+#[derive(Clone, PartialEq, uniffi::Record)]
+pub struct ForwardRequestRecord {
+    pub id: u64,
+    pub conversation_id: String,
+    pub message: ChatMessageRecord,
+    pub more: Vec<ChatMessageRecord>,
+}
+
+impl fmt::Debug for ForwardRequestRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ForwardRequestRecord")
+            .field("id", &self.id)
+            .field("more_count", &self.more.len())
+            .finish()
+    }
+}
+
 /// Active 5-second delete-for-me undo bar snapshot delivered via [`CoreChangesRecord`].
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct DeleteUndoSnapshotRecord {
@@ -590,6 +615,17 @@ impl fmt::Debug for MessageConfirmRecord {
     }
 }
 
+impl From<ForwardRequest> for ForwardRequestRecord {
+    fn from(r: ForwardRequest) -> Self {
+        Self {
+            id: r.id,
+            conversation_id: r.conversation_id,
+            message: ChatMessageRecord::from(r.message),
+            more: r.more.into_iter().map(ChatMessageRecord::from).collect(),
+        }
+    }
+}
+
 impl From<MessageConfirmState> for MessageConfirmRecord {
     fn from(c: MessageConfirmState) -> Self {
         Self {
@@ -604,6 +640,33 @@ impl From<MessageConfirmState> for MessageConfirmRecord {
     }
 }
 
+/// Optional wrapper so UniFFI can distinguish "unchanged" from "cleared to None" (U8).
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct ForwardRequestUpdateRecord {
+    pub request: Option<ForwardRequestRecord>,
+}
+
+/// Outcome of `forward` / `forward_all` (U8).
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum ForwardOutcomeRecord {
+    Done { text: Option<String> },
+    Pending { text: String },
+    Failed { text: String },
+}
+
+impl fmt::Debug for ForwardOutcomeRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Done { text } => f
+                .debug_struct("Done")
+                .field("has_text", &text.is_some())
+                .finish(),
+            Self::Pending { .. } => f.write_str("Pending"),
+            Self::Failed { .. } => f.write_str("Failed"),
+        }
+    }
+}
+
 impl From<MessageConfirmRecord> for MessageConfirmState {
     fn from(c: MessageConfirmRecord) -> Self {
         Self {
@@ -614,6 +677,113 @@ impl From<MessageConfirmRecord> for MessageConfirmState {
             message: c.message,
             ok: c.ok,
             destructive: c.destructive,
+        }
+    }
+}
+
+impl From<ForwardOutcome> for ForwardOutcomeRecord {
+    fn from(o: ForwardOutcome) -> Self {
+        match o {
+            ForwardOutcome::Done(text) => Self::Done { text },
+            ForwardOutcome::Pending(text) => Self::Pending { text },
+            ForwardOutcome::Failed(text) => Self::Failed { text },
+        }
+    }
+}
+
+/// Return value of [`CoreEngine::forward`] and [`CoreEngine::forward_all`] (U8).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ForwardOpResultRecord {
+    pub outcome: ForwardOutcomeRecord,
+    pub version: u64,
+}
+
+/// Host return value for `resolve_media` (U8).
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum MediaResolutionRecord {
+    File { path: String },
+    Expired,
+    Unsupported,
+    Unavailable,
+}
+
+impl fmt::Debug for MediaResolutionRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File { .. } => f.write_str("File"),
+            Self::Expired => f.write_str("Expired"),
+            Self::Unsupported => f.write_str("Unsupported"),
+            Self::Unavailable => f.write_str("Unavailable"),
+        }
+    }
+}
+
+impl From<MediaResolutionRecord> for MediaResolutionOutcome {
+    fn from(r: MediaResolutionRecord) -> Self {
+        match r {
+            MediaResolutionRecord::File { path } => Self::File(path),
+            MediaResolutionRecord::Expired => Self::Expired,
+            MediaResolutionRecord::Unsupported => Self::Unsupported,
+            MediaResolutionRecord::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+/// Host return value for `resolve_file` (U8).
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FileResolutionRecord {
+    Ready { path: String },
+    Expired,
+    Failed { message: String },
+}
+
+impl fmt::Debug for FileResolutionRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ready { .. } => f.write_str("Ready"),
+            Self::Expired => f.write_str("Expired"),
+            Self::Failed { .. } => f.write_str("Failed"),
+        }
+    }
+}
+
+impl From<FileResolutionRecord> for FileResolutionOutcome {
+    fn from(r: FileResolutionRecord) -> Self {
+        match r {
+            FileResolutionRecord::Ready { path } => Self::Ready(path),
+            FileResolutionRecord::Expired => Self::Expired,
+            FileResolutionRecord::Failed { message } => Self::Failed(message),
+        }
+    }
+}
+
+/// Host return value for `send_media` / `send_files` (U8).
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum ComposerSendOutcomeRecord {
+    Done,
+    Cancelled,
+    Pending { text: String },
+    Failed { text: String },
+}
+
+impl fmt::Debug for ComposerSendOutcomeRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Done => f.write_str("Done"),
+            Self::Cancelled => f.write_str("Cancelled"),
+            Self::Pending { .. } => f.write_str("Pending"),
+            Self::Failed { .. } => f.write_str("Failed"),
+        }
+    }
+}
+
+impl From<ComposerSendOutcomeRecord> for ComposerSendOutcome {
+    fn from(r: ComposerSendOutcomeRecord) -> Self {
+        match r {
+            ComposerSendOutcomeRecord::Done => Self::Done,
+            ComposerSendOutcomeRecord::Cancelled => Self::Cancelled,
+            ComposerSendOutcomeRecord::Pending { text } => Self::Pending(text),
+            ComposerSendOutcomeRecord::Failed { text } => Self::Failed(text),
         }
     }
 }
@@ -1077,11 +1247,17 @@ pub struct CoreChangesRecord {
     pub message_meta: Option<MessageMetaRecord>,
     pub contacts: Option<ContactsStateRecord>,
     pub typing: Option<Vec<TypingEntryRecord>>,
+    pub forward_request: Option<ForwardRequestUpdateRecord>,
+    pub clear_selection: bool,
     pub delete_undo: Option<DeleteUndoUpdateRecord>,
     pub message_confirm: Option<MessageConfirmUpdateRecord>,
     pub auto_delete: Option<AutoDeleteUpdateRecord>,
     pub starred_ids: Option<Vec<String>>,
     pub cached_profiles: Option<Vec<CachedProfileEntry>>,
+    // U12
+    #[uniffi(default = None)]
+    pub polls: Option<PollsMirrorRecord>,
+    // U13
     pub sticker_suggest: Option<StickerSuggestUpdateRecord>,
     pub composer_confirm: Option<ComposerConfirmUpdateRecord>,
     pub queued_composer_confirms: Option<Vec<ComposerConfirmRecord>>,
@@ -1101,6 +1277,9 @@ impl fmt::Debug for CoreChangesRecord {
             .field("conversation_ui", &self.conversation_ui)
             .field("conversation_prompt", &self.conversation_prompt)
             .field("typing_count", &self.typing.as_ref().map(Vec::len))
+            .field("has_forward_request", &self.forward_request.is_some())
+            .field("clear_selection", &self.clear_selection)
+            .field("polls", &self.polls)
             .finish()
     }
 }
@@ -1132,6 +1311,10 @@ impl From<CoreChanges> for CoreChangesRecord {
                     })
                     .collect()
             }),
+            forward_request: c.forward_request.map(|req| ForwardRequestUpdateRecord {
+                request: req.map(Into::into),
+            }),
+            clear_selection: c.clear_selection,
             delete_undo: c.delete_undo.map(|u| DeleteUndoUpdateRecord {
                 undo: u.map(Into::into),
             }),
@@ -1155,6 +1338,7 @@ impl From<CoreChanges> for CoreChangesRecord {
                     })
                     .collect()
             }),
+            polls: c.polls.map(Into::into),
             sticker_suggest: c.sticker_suggest.map(|s| StickerSuggestUpdateRecord {
                 setting: s.map(Into::into),
             }),
@@ -1517,11 +1701,14 @@ impl CoreOfflineConversations {
             message_meta: None,
             contacts: None,
             typing: None,
+            forward_request: None,
+            clear_selection: false,
             delete_undo: None,
             message_confirm: None,
             auto_delete: None,
             starred_ids: None,
             cached_profiles: None,
+            polls: None,
             sticker_suggest: None,
             composer_confirm: None,
             queued_composer_confirms: None,
@@ -1578,6 +1765,14 @@ impl CoreOfflineConversations {
                             .collect(),
                     );
                 }
+                DirtyKey::ForwardRequest => {
+                    rec.forward_request = Some(ForwardRequestUpdateRecord {
+                        request: state.forward.request.clone().map(Into::into),
+                    });
+                }
+                DirtyKey::ForwardClearSelection => {
+                    rec.clear_selection = true;
+                }
                 // U6 (wired to FFI once U4+U6 cut over Swift)
                 DirtyKey::DeleteUndo
                 | DirtyKey::MessageConfirm
@@ -1586,6 +1781,9 @@ impl CoreOfflineConversations {
                 | DirtyKey::CachedProfiles
                 | DirtyKey::StickerSuggest
                 | DirtyKey::ComposerConfirm => {}
+                DirtyKey::Polls => {
+                    rec.polls = Some(state.polls.clone().into());
+                }
             }
         }
         rec
@@ -1817,7 +2015,35 @@ pub trait CoreHost: Send + Sync {
         client_id: String,
         quote: Option<E2eeQuoteArgRecord>,
     ) -> E2eeSendOutcomeRecord;
-    async fn show_card(&self, conv_id: String, text: String);
+    // --- Forward domain callbacks (U8) ---
+    async fn show_card(&self, conv_id: Option<String>, text: String);
+    async fn resolve_media(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        kind: String,
+    ) -> MediaResolutionRecord;
+    async fn resolve_file(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        name: String,
+        url: Option<String>,
+    ) -> FileResolutionRecord;
+    async fn fetch_media_data(&self, url: String) -> Option<String>;
+    async fn send_media(
+        &self,
+        conv_id: String,
+        paths: Vec<String>,
+        cleanup_after: bool,
+    ) -> ComposerSendOutcomeRecord;
+    async fn send_files(&self, conv_id: String, paths: Vec<String>) -> ComposerSendOutcomeRecord;
+
+    // --- Group polls domain callbacks (U12) ---
+    async fn arm_poll_debounce(&self, poll_id: String, seq: u64, delay_ms: u64) -> bool;
+    async fn cancel_all_poll_debounces(&self);
+
+    // --- Stickers & composer domain callbacks (U13) ---
     async fn send_e2ee_sticker(
         &self,
         conv_id: String,
@@ -2205,8 +2431,55 @@ impl Host for FfiHostBridge {
         }
     }
 
-    async fn show_card(&self, conv_id: String, text: String) {
+    async fn arm_poll_debounce(&self, poll_id: String, seq: u64, delay_ms: u64) -> bool {
+        self.0.arm_poll_debounce(poll_id, seq, delay_ms).await
+    }
+
+    async fn cancel_all_poll_debounces(&self) {
+        self.0.cancel_all_poll_debounces().await;
+    }
+
+    async fn show_card(&self, conv_id: Option<String>, text: String) {
         self.0.show_card(conv_id, text).await;
+    }
+
+    async fn resolve_media(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        kind: String,
+    ) -> MediaResolutionOutcome {
+        self.0.resolve_media(conv_id, msg_id, kind).await.into()
+    }
+
+    async fn resolve_file(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        name: String,
+        url: Option<String>,
+    ) -> FileResolutionOutcome {
+        self.0.resolve_file(conv_id, msg_id, name, url).await.into()
+    }
+
+    async fn fetch_media_data(&self, url: String) -> Option<String> {
+        self.0.fetch_media_data(url).await
+    }
+
+    async fn send_media(
+        &self,
+        conv_id: String,
+        paths: Vec<String>,
+        cleanup_after: bool,
+    ) -> ComposerSendOutcome {
+        self.0
+            .send_media(conv_id, paths, cleanup_after)
+            .await
+            .into()
+    }
+
+    async fn send_files(&self, conv_id: String, paths: Vec<String>) -> ComposerSendOutcome {
+        self.0.send_files(conv_id, paths).await.into()
     }
 
     async fn send_e2ee_sticker(
@@ -3118,6 +3391,83 @@ impl CoreEngine {
         .await
     }
 
+    /// Opens the forward picker for a single message (or emits a blocked `show_card`).
+    pub fn request_forward(&self, message: ChatMessageRecord) {
+        let chat: ChatMessage = (&message).into();
+        self.handle.send(Command::RequestForward {
+            message: Box::new(chat),
+        });
+    }
+
+    /// Opens the forward picker for Swift's current multi-message selection (oldest first).
+    pub fn forward_selection(&self, messages: Vec<ChatMessageRecord>) {
+        self.handle.send(Command::ForwardSelection {
+            messages: records_to_chat_messages(messages),
+        });
+    }
+
+    /// Dismisses the active forward picker request (e.g. sheet closed by user).
+    pub fn clear_forward_request(&self) {
+        self.handle.send(Command::ClearForwardRequest);
+    }
+
+    /// Forwards one message to `targets`, returning the outcome and settled mirror revision.
+    pub async fn forward(
+        &self,
+        message: ChatMessageRecord,
+        targets: Vec<String>,
+        now_ms: i64,
+    ) -> Result<ForwardOpResultRecord, CoreError> {
+        let chat: ChatMessage = (&message).into();
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let outcome = handle
+                .request_forward_outcome(Command::Forward {
+                    message: Box::new(chat),
+                    targets,
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            ForwardOpResultRecord {
+                outcome: outcome.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    /// Forwards all messages in the active `forward_request` to `targets`, returning the outcome
+    /// and settled mirror revision (after `show_card`, request clear, and `clear_selection`).
+    pub async fn forward_all(
+        &self,
+        targets: Vec<String>,
+        now_ms: i64,
+    ) -> Result<ForwardOpResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let outcome = handle
+                .request_forward_outcome(Command::ForwardAll { targets, now_ms })
+                .await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            ForwardOpResultRecord {
+                outcome: outcome.into(),
+                version,
+            }
+        })
+        .await
+    }
+
     /// Marks a conversation read using core's own message window for the `send_seen` target.
     pub fn mark_read(&self, id: String) {
         self.handle.send(Command::MarkRead { id });
@@ -3781,6 +4131,319 @@ impl CoreEngine {
         .await
     }
 
+    // --- Group polls domain (U12) ---
+
+    pub fn watch_poll(&self, id: String, conv_id: String, now_ms: i64) {
+        self.handle.send(Command::WatchPoll {
+            id,
+            conv_id,
+            now_ms,
+        });
+    }
+
+    pub fn retry_poll(&self, id: String, conv_id: String, now_ms: i64) {
+        self.handle.send(Command::RetryPoll {
+            id,
+            conv_id,
+            now_ms,
+        });
+    }
+
+    pub fn rewatch_polls(&self, now_ms: i64) {
+        self.handle.send(Command::RewatchPolls { now_ms });
+    }
+
+    pub fn refresh_poll(&self, id: String, now_ms: i64) {
+        self.handle.send(Command::RefreshPoll { id, now_ms });
+    }
+
+    pub async fn poll_voters(&self, id: String) -> Result<PollVotersOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            let voters = handle.request_poll_voters(id).await;
+            let version = handle.current_version();
+            PollVotersOutcomeRecord {
+                voters: voters.map(Into::into),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn refresh_poll_pin(
+        &self,
+        id: String,
+        conv_id: String,
+    ) -> Result<PollPinStateOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let state = handle.request_poll_pin_state(id, conv_id).await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            PollPinStateOutcomeRecord {
+                state: state.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn pin_poll(
+        &self,
+        id: String,
+        conv_id: String,
+        confirming: Option<String>,
+    ) -> Result<PollPinActionOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let outcome = handle
+                .request_poll_pin_outcome(id, conv_id, confirming)
+                .await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            PollPinActionOutcomeRecord {
+                outcome: outcome.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn unpin_poll(
+        &self,
+        id: String,
+        conv_id: String,
+    ) -> Result<PollActionOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let result = handle
+                .request_poll_action(Command::UnpinPoll { id, conv_id })
+                .await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            PollActionOutcomeRecord {
+                result: result.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn poll_capabilities(
+        &self,
+        conv_id: String,
+    ) -> Result<PollCapabilitiesOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            let caps = handle.request_poll_capabilities(conv_id).await;
+            let version = handle.current_version();
+            PollCapabilitiesOutcomeRecord {
+                capabilities: caps.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn vote_poll(
+        &self,
+        id: String,
+        conv_id: String,
+        draft: PollVoteDraftRecord,
+        detail: Option<PollDetailRecord>,
+        now_ms: i64,
+    ) -> Result<PollActionOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let result = handle
+                .request_poll_action(Command::VotePoll {
+                    id,
+                    conv_id,
+                    draft: draft.into(),
+                    detail: detail.map(Into::into),
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            PollActionOutcomeRecord {
+                result: result.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn lock_poll(
+        &self,
+        id: String,
+        conv_id: String,
+        now_ms: i64,
+    ) -> Result<PollActionOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let result = handle
+                .request_poll_action(Command::LockPoll {
+                    id,
+                    conv_id,
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            PollActionOutcomeRecord {
+                result: result.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn share_poll(
+        &self,
+        id: String,
+        conv_id: String,
+    ) -> Result<PollActionOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let result = handle
+                .request_poll_action(Command::SharePoll { id, conv_id })
+                .await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            PollActionOutcomeRecord {
+                result: result.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn create_poll(
+        &self,
+        conv_id: String,
+        draft: PollCreateDraftRecord,
+        config: PollConfigRecord,
+        can_pin: bool,
+    ) -> Result<PollActionOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let result = handle
+                .request_poll_action(Command::CreatePoll {
+                    conv_id,
+                    draft: draft.into(),
+                    config: config.into(),
+                    can_pin,
+                })
+                .await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            PollActionOutcomeRecord {
+                result: result.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub fn note_poll_messages(
+        &self,
+        notices: Vec<PollMessageNoticeRecord>,
+        now_ms: i64,
+        host_already_armed: bool,
+    ) {
+        self.handle.send(Command::NotePollMessages {
+            notices: notices.into_iter().map(Into::into).collect(),
+            now_ms,
+            host_already_armed,
+        });
+    }
+
+    pub fn fire_poll_debounce(&self, poll_id: String, seq: u64, now_ms: i64) {
+        self.handle.send(Command::FirePollDebounce {
+            poll_id,
+            seq,
+            now_ms,
+        });
+    }
+
+    pub fn handle_poll_state(&self, state_json: String) {
+        let state = olaz_json::parse_object_str(&state_json).unwrap_or_default();
+        self.handle.send(Command::HandlePollState { state });
+    }
+
+    pub fn reset_polls(&self, sync_epoch: u64) {
+        self.handle.send(Command::ResetPolls { sync_epoch });
+    }
+
+    pub fn seed_polls(&self, polls: PollsMirrorRecord) {
+        self.handle.send(Command::SeedPolls {
+            polls: Box::new(polls.into()),
+        });
+    }
+
+    // U7: temporary write-throughs from Swift board pins until U7 lands.
+    pub fn sync_board_pins(&self, conv_id: String, list: Option<BoardPinListRecord>) {
+        self.handle.send(Command::SyncBoardPins {
+            conv_id,
+            list: list.map(Into::into),
+        });
+    }
+
+    // U7: temporary write-through from Swift raw board topics until U7 lands.
+    pub fn sync_board_raw_topics(
+        &self,
+        conv_id: String,
+        version: i64,
+        topics_json: Option<String>,
+    ) {
+        let raw = topics_json.map(|json| olaz_core::polls::BoardRawTopics {
+            version,
+            topics: parse_raw_topics_json(&json),
+        });
+        self.handle
+            .send(Command::SyncBoardRawTopics { conv_id, raw });
+    }
+
+    // U7: temporary write-through for `pins_state` WebContent/test events until U7 lands.
+    pub fn handle_pins_state(&self, state_json: String) {
+        let state = olaz_json::parse_object_str(&state_json).unwrap_or_default();
+        self.handle.send(Command::HandlePinsState { state });
+    }
+
+    // U7: temporary clear on `resetMessageActions()` until U7 lands.
+    pub fn clear_board_caches(&self) {
+        self.handle.send(Command::ClearBoardCaches);
+    }
+
     /// Stops the actor, aborts in-flight session & transport tasks, and closes `next_changes()`.
     pub fn stop(&self) {
         self.handle.stop();
@@ -3924,7 +4587,46 @@ mod tests {
         ) -> E2eeSendOutcomeRecord {
             E2eeSendOutcomeRecord::Aborted
         }
-        async fn show_card(&self, _conv_id: String, _text: String) {}
+        async fn show_card(&self, _conv_id: Option<String>, _text: String) {}
+        async fn resolve_media(
+            &self,
+            _conv_id: String,
+            _msg_id: String,
+            _kind: String,
+        ) -> MediaResolutionRecord {
+            MediaResolutionRecord::Unavailable
+        }
+        async fn resolve_file(
+            &self,
+            _conv_id: String,
+            _msg_id: String,
+            _name: String,
+            _url: Option<String>,
+        ) -> FileResolutionRecord {
+            FileResolutionRecord::Expired
+        }
+        async fn fetch_media_data(&self, _url: String) -> Option<String> {
+            None
+        }
+        async fn send_media(
+            &self,
+            _conv_id: String,
+            _paths: Vec<String>,
+            _cleanup_after: bool,
+        ) -> ComposerSendOutcomeRecord {
+            ComposerSendOutcomeRecord::Cancelled
+        }
+        async fn send_files(
+            &self,
+            _conv_id: String,
+            _paths: Vec<String>,
+        ) -> ComposerSendOutcomeRecord {
+            ComposerSendOutcomeRecord::Cancelled
+        }
+        async fn arm_poll_debounce(&self, _poll_id: String, _seq: u64, _delay_ms: u64) -> bool {
+            false
+        }
+        async fn cancel_all_poll_debounces(&self) {}
         async fn send_e2ee_sticker(
             &self,
             _conv_id: String,

@@ -18,6 +18,14 @@ use crate::reduce::{ReduceOutput, conversations};
 use crate::state::CoreState;
 use crate::stickers::{CardActionOutcome, StickerEntry};
 
+/// How a send transaction reports completion when its done input arrives.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendCompletion {
+    None,
+    Op(u64),
+    Forward(u64),
+}
+
 /// Distinguishes text vs sticker sends sharing the U5 send pipeline.
 #[derive(Clone, PartialEq)]
 enum SendKind {
@@ -31,7 +39,7 @@ enum SendKind {
 /// In-flight text or sticker send transaction tracked until its completion arrives.
 #[derive(Clone, PartialEq)]
 struct PendingSend {
-    op_id: Option<u64>,
+    completion: SendCompletion,
     conv_id: String,
     cli_id: String,
     optimistic: ChatMessage,
@@ -64,13 +72,17 @@ impl SendState {
         self.auto_delete_ttl_ms.clear();
         let pending = std::mem::take(&mut self.in_flight);
         for (_, send) in pending {
-            let result = match send.kind {
-                SendKind::Text => OpResult::Bool(false),
-                SendKind::Sticker { .. } => OpResult::CardActionOutcome(CardActionOutcome::Failed(
-                    "Không gửi được sticker. Hãy thử lại.".to_owned(),
-                )),
-            };
-            complete_op(send.op_id, result, false, out);
+            if let SendCompletion::Op(op_id) = send.completion {
+                let result = match send.kind {
+                    SendKind::Text => OpResult::Bool(false),
+                    SendKind::Sticker { .. } => {
+                        OpResult::CardActionOutcome(CardActionOutcome::Failed(
+                            "Không gửi được sticker. Hãy thử lại.".to_owned(),
+                        ))
+                    }
+                };
+                complete_op(Some(op_id), result, false, out);
+            }
         }
     }
 }
@@ -113,7 +125,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
             now_ms,
             is_e2ee,
             ttl_ms,
-        } => reduce_send_text(
+        } => start_send_text(
             state,
             SendTextRequest {
                 conv_id,
@@ -126,7 +138,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                 now_ms,
                 is_e2ee_override: is_e2ee,
                 ttl_ms_override: ttl_ms,
-                op_id,
+                completion: op_id.map_or(SendCompletion::None, SendCompletion::Op),
             },
             out,
         ),
@@ -180,23 +192,23 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
     }
 }
 
-struct SendTextRequest {
-    conv_id: String,
-    text: String,
-    quote_id: Option<String>,
-    mentions: Vec<Mention>,
-    styles: Vec<TextStyle>,
-    urgency: i64,
-    client_id: i64,
-    now_ms: i64,
-    is_e2ee_override: Option<bool>,
-    ttl_ms_override: Option<i64>,
-    op_id: Option<u64>,
+pub(crate) struct SendTextRequest {
+    pub conv_id: String,
+    pub text: String,
+    pub quote_id: Option<String>,
+    pub mentions: Vec<Mention>,
+    pub styles: Vec<TextStyle>,
+    pub urgency: i64,
+    pub client_id: i64,
+    pub now_ms: i64,
+    pub is_e2ee_override: Option<bool>,
+    pub ttl_ms_override: Option<i64>,
+    pub completion: SendCompletion,
 }
 
-fn reduce_send_text(state: &mut CoreState, req: SendTextRequest, out: &mut ReduceOutput) {
+pub(crate) fn start_send_text(state: &mut CoreState, req: SendTextRequest, out: &mut ReduceOutput) {
     if req.text.trim().is_empty() || req.conv_id.is_empty() {
-        complete_op(req.op_id, OpResult::Bool(false), false, out);
+        finish_send_completion(state, req.completion, false, false, out);
         return;
     }
 
@@ -307,7 +319,7 @@ fn reduce_send_text(state: &mut CoreState, req: SendTextRequest, out: &mut Reduc
         cli_id.clone(),
         optimistic,
         SendKind::Text,
-        req.op_id,
+        req.completion,
         out,
     );
 
@@ -435,7 +447,7 @@ fn reduce_send_sticker(state: &mut CoreState, req: SendStickerRequest, out: &mut
             sticker: req.sticker,
             had_window_before,
         },
-        req.op_id,
+        req.op_id.map_or(SendCompletion::None, SendCompletion::Op),
         out,
     );
 
@@ -468,7 +480,7 @@ fn enqueue_optimistic_send(
     cli_id: String,
     optimistic: ChatMessage,
     kind: SendKind,
-    op_id: Option<u64>,
+    completion: SendCompletion,
     out: &mut ReduceOutput,
 ) -> u64 {
     let snap = state.identity_snapshot();
@@ -485,7 +497,7 @@ fn enqueue_optimistic_send(
     state.send.in_flight.insert(
         send_id,
         PendingSend {
-            op_id,
+            completion,
             conv_id,
             cli_id,
             optimistic,
@@ -538,7 +550,7 @@ fn finish_send(
                     out.dirty.insert(DirtyKey::Messages);
                 }
                 update_conversation_after_send(state, &echoed, out);
-                complete_send_success(pending.op_id, pending.kind, out);
+                complete_send_success(state, pending.completion, pending.kind, out);
                 return;
             }
 
@@ -567,7 +579,7 @@ fn finish_send(
                 }));
             }
             update_conversation_after_send(state, &pending.optimistic, out);
-            complete_send_success(pending.op_id, pending.kind, out);
+            complete_send_success(state, pending.completion, pending.kind, out);
         }
         Err(err) => {
             if matches!(
@@ -588,7 +600,7 @@ fn finish_send(
                         out.effects
                             .push(Effect::EngineLog(format!("sendText failed: {err_msg}")));
                     }
-                    complete_op(pending.op_id, OpResult::Bool(false), false, out);
+                    finish_send_completion(state, pending.completion, false, false, out);
                 }
                 SendKind::Sticker {
                     had_window_before, ..
@@ -618,32 +630,59 @@ fn finish_send(
                             )
                         }
                     };
-                    complete_op(
-                        pending.op_id,
-                        OpResult::CardActionOutcome(outcome),
-                        false,
-                        out,
-                    );
+                    if let SendCompletion::Op(op_id) = pending.completion {
+                        complete_op(
+                            Some(op_id),
+                            OpResult::CardActionOutcome(outcome),
+                            false,
+                            out,
+                        );
+                    }
                 }
             }
         }
     }
 }
 
-fn complete_send_success(op_id: Option<u64>, kind: SendKind, out: &mut ReduceOutput) {
+fn complete_send_success(
+    state: &mut CoreState,
+    completion: SendCompletion,
+    kind: SendKind,
+    out: &mut ReduceOutput,
+) {
     match kind {
         SendKind::Text => {
-            complete_op(op_id, OpResult::Bool(true), true, out);
+            finish_send_completion(state, completion, true, true, out);
         }
         SendKind::Sticker { sticker, .. } => {
             out.effects
                 .push(Effect::Store(StoreOp::SaveRecentSticker { sticker }));
-            complete_op(
-                op_id,
-                OpResult::CardActionOutcome(CardActionOutcome::Done),
-                true,
-                out,
-            );
+            if let SendCompletion::Op(op_id) = completion {
+                complete_op(
+                    Some(op_id),
+                    OpResult::CardActionOutcome(CardActionOutcome::Done),
+                    true,
+                    out,
+                );
+            }
+        }
+    }
+}
+
+fn finish_send_completion(
+    state: &mut CoreState,
+    completion: SendCompletion,
+    ok: bool,
+    after_store: bool,
+    out: &mut ReduceOutput,
+) {
+    match completion {
+        SendCompletion::None => {}
+        SendCompletion::Op(op_id) => {
+            complete_op(Some(op_id), OpResult::Bool(ok), after_store, out);
+        }
+        SendCompletion::Forward(forward_id) => {
+            crate::reduce::forward::on_send_text_done(state, forward_id, ok, out);
         }
     }
 }

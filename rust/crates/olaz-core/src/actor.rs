@@ -14,6 +14,7 @@ use crate::changes::{ChangeHub, CoreChanges};
 use crate::composer::{ComposerOutcome, MyCardInfo, ReminderComposeInfo};
 use crate::conversations::{ConversationActionResult, PinBoard};
 use crate::effect::{Effect, OpResult};
+use crate::forward::ForwardOutcome;
 use crate::input::{Command, Input};
 use crate::messages::IdentitySnapshot;
 use crate::reduce::reduce;
@@ -273,15 +274,85 @@ impl CoreHandle {
         }
     }
 
+    /// Awaits a U8 forward command returning [`ForwardOutcome`].
+    pub async fn request_forward_outcome(&self, command: Command) -> ForwardOutcome {
+        match self.request(command).await {
+            Some(OpResult::Forward(outcome)) => outcome,
+            _ => ForwardOutcome::Failed("Có lỗi khi chia sẻ tin nhắn".to_owned()),
+        }
+    }
+
     /// Awaits a request-reply command returning `bool` (e.g., `UnlockFromPinSearch`).
     pub async fn request_bool(&self, command: Command) -> bool {
         matches!(self.request(command).await, Some(OpResult::Bool(true)))
+    }
+
+    // U12
+    /// Awaits [`Command::PollVoters`].
+    pub async fn request_poll_voters(&self, id: String) -> Option<crate::polls::PollVoters> {
+        match self.request(Command::PollVoters { id }).await {
+            Some(OpResult::PollVoters(v)) => v,
+            _ => None,
+        }
     }
 
     pub async fn request_opt_i64(&self, command: Command) -> Option<i64> {
         match self.request(command).await {
             Some(OpResult::OptI64(v)) => v,
             _ => None,
+        }
+    }
+
+    /// Awaits [`Command::RefreshPollPin`].
+    pub async fn request_poll_pin_state(
+        &self,
+        id: String,
+        conv_id: String,
+    ) -> crate::polls::PollPinState {
+        match self.request(Command::RefreshPollPin { id, conv_id }).await {
+            Some(OpResult::PollPinState(s)) => s,
+            _ => crate::polls::PollPinState::default(),
+        }
+    }
+
+    /// Awaits [`Command::PinPoll`].
+    pub async fn request_poll_pin_outcome(
+        &self,
+        id: String,
+        conv_id: String,
+        confirming: Option<String>,
+    ) -> crate::polls::PollPinOutcome {
+        match self
+            .request(Command::PinPoll {
+                id,
+                conv_id,
+                confirming,
+            })
+            .await
+        {
+            Some(OpResult::PollPinOutcome(o)) => o,
+            _ => crate::polls::PollPinOutcome::Failed(crate::polls::PollActionResult::err(Some(
+                "network",
+            ))),
+        }
+    }
+
+    /// Awaits a poll mutation command returning [`crate::polls::PollActionResult`].
+    pub async fn request_poll_action(&self, command: Command) -> crate::polls::PollActionResult {
+        match self.request(command).await {
+            Some(OpResult::PollActionResult(r)) => r,
+            _ => crate::polls::PollActionResult::err(Some("network")),
+        }
+    }
+
+    /// Awaits [`Command::PollCapabilities`].
+    pub async fn request_poll_capabilities(
+        &self,
+        conv_id: String,
+    ) -> crate::polls::PollCapabilities {
+        match self.request(Command::PollCapabilities { conv_id }).await {
+            Some(OpResult::PollCapabilities(c)) => c,
+            _ => crate::polls::PollCapabilities::default(),
         }
     }
 
