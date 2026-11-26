@@ -129,7 +129,7 @@ private struct ShellMinimumSize: ViewModifier {
     let shell: ShellModel
 
     func body(content: Content) -> some View {
-        content.frame(minWidth: shell.holdsInspectorRoom ? InspectorRoom.windowMinWidthWithInspector : InspectorRoom.windowMinWidth,
+        content.frame(minWidth: shell.holdsInspectorRoom ? shell.inspectorMinWidth : InspectorRoom.windowMinWidth,
                       minHeight: 620)
     }
 }
