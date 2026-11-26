@@ -120,8 +120,8 @@ extension ZaloWireParser {
             let kind: String
             switch JSONLossless.int64(row["type"]) ?? 2 {
             case 3: kind = "poll"
-            // Official topic types: 0 note ("tạo ghi chú"), 1 reminder.
-            case 0: kind = "note"
+            // Official topic types: 0 TEXT_TOPIC (note when startTime <= 0, reminder when startTime > 0), 1 reminder/link.
+            case 0: kind = (JSONLossless.int64(row["startTime"]) ?? 0) > 0 ? "reminder" : "note"
             case 1: kind = "reminder"
             default: kind = "message"
             }

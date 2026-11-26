@@ -144,6 +144,20 @@ struct PinTests {
         #expect(PinnedList(json: ["ready": true, "limit": 5]).limit == 5)
         #expect(PinnedList(json: ["ready": true]).limit == ZaloWireParser.defaultPinLimit)
     }
+
+    @Test func textTopicWithStartTimeParsesAsReminder() {
+        let box: [String: Any] = [
+            "items": [
+                ["id": "r1", "type": 0, "startTime": 1_700_003_000_000 as Int64, "params": #"{"title":"hello"}"#],
+                ["id": "n1", "type": 0, "startTime": -1, "params": #"{"title":"note"}"#],
+            ],
+            "boardVersion": 2,
+            "pinLimit": 3,
+        ]
+        let parsed = ZaloWireParser.parseBoardTopics(box, convId: "g501")
+        #expect(parsed.list.items.map(\.ref) == ["r1", "n1"])
+        #expect(parsed.list.items.map(\.kind) == [.reminder, .note])
+    }
 }
 
 private extension ChatMessage {

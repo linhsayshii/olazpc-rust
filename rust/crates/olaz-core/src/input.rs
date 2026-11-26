@@ -1771,7 +1771,10 @@ pub enum Input {
     },
     CreateReminderDone {
         op_id: Option<u64>,
+        conv_id: String,
+        pin: bool,
         ok: bool,
+        create_keys: Vec<String>,
     },
     ConfirmPromoteExpired {
         confirm_gen: u64,
@@ -2525,9 +2528,10 @@ impl fmt::Debug for Input {
                 .field("card_send_id", card_send_id)
                 .field("ok", &result.is_ok())
                 .finish(),
-            Self::CreateReminderDone { op_id, ok } => f
+            Self::CreateReminderDone { op_id, pin, ok, .. } => f
                 .debug_struct("CreateReminderDone")
                 .field("op_id", op_id)
+                .field("pin", pin)
                 .field("ok", ok)
                 .finish(),
             Self::ConfirmPromoteExpired { confirm_gen } => f

@@ -138,13 +138,38 @@ pub(crate) fn reduce_composer(state: &mut CoreState, input: Input, out: &mut Red
             card_send_id,
             result,
         } => reduce_contact_card_done(state, card_send_id, result, out),
-        Input::CreateReminderDone { op_id, ok } => {
-            let outcome = if ok {
-                ComposerOutcome::Done
-            } else {
-                ComposerOutcome::Failed(REMINDER_API_FAILURE.to_owned())
-            };
-            complete_op(op_id, OpResult::ComposerOutcome(outcome), false, out);
+        Input::CreateReminderDone {
+            op_id,
+            conv_id,
+            pin,
+            ok,
+            create_keys,
+        } => {
+            if !ok {
+                complete_op(
+                    op_id,
+                    OpResult::ComposerOutcome(ComposerOutcome::Failed(
+                        REMINDER_API_FAILURE.to_owned(),
+                    )),
+                    false,
+                    out,
+                );
+                return;
+            }
+            if is_group_id(&conv_id) && pin {
+                out.effects.push(Effect::EngineLog(format!(
+                    "reminder create shape: group=true pin=true keys=[{}]",
+                    create_keys.join(",")
+                )));
+                out.effects
+                    .push(Effect::Host(HostCall::RefreshBoardPins { conv_id }));
+            }
+            complete_op(
+                op_id,
+                OpResult::ComposerOutcome(ComposerOutcome::Done),
+                false,
+                out,
+            );
         }
         Input::ConfirmPromoteExpired { confirm_gen } => {
             if state.composer.confirm_timer_gen == confirm_gen
@@ -534,5 +559,71 @@ mod tests {
                 after_store: false,
             } if msg == REMINDER_TOO_LONG_FAILURE
         )));
+    }
+
+    #[test]
+    fn group_pinned_reminder_refreshes_board_pins() {
+        let mut state = ready_state();
+        let out = reduce(
+            &mut state,
+            Input::CreateReminderDone {
+                op_id: Some(71),
+                conv_id: "g501308".to_owned(),
+                pin: true,
+                ok: true,
+                create_keys: vec!["id".to_owned(), "type".to_owned()],
+            },
+        );
+        assert!(out.effects.iter().any(|e| matches!(
+            e,
+            Effect::EngineLog(line) if line == "reminder create shape: group=true pin=true keys=[id,type]"
+        )));
+        assert!(out.effects.iter().any(|e| matches!(
+            e,
+            Effect::Host(HostCall::RefreshBoardPins { conv_id }) if conv_id == "g501308"
+        )));
+        assert!(out.effects.iter().any(|e| matches!(
+            e,
+            Effect::CompleteOp {
+                op_id: 71,
+                result: OpResult::ComposerOutcome(ComposerOutcome::Done),
+                after_store: false,
+            }
+        )));
+    }
+
+    #[test]
+    fn group_unpinned_or_oneone_reminder_skips_board_refresh() {
+        let mut state = ready_state();
+        for (op_id, conv_id, pin) in [(72, "g501308", false), (73, "3001308", true)] {
+            let out = reduce(
+                &mut state,
+                Input::CreateReminderDone {
+                    op_id: Some(op_id),
+                    conv_id: conv_id.to_owned(),
+                    pin,
+                    ok: true,
+                    create_keys: vec!["id".to_owned()],
+                },
+            );
+            assert!(
+                !out.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::Host(HostCall::RefreshBoardPins { .. })))
+            );
+            assert!(
+                !out.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::EngineLog(_)))
+            );
+            assert!(out.effects.iter().any(|e| matches!(
+                e,
+                Effect::CompleteOp {
+                    op_id: id,
+                    result: OpResult::ComposerOutcome(ComposerOutcome::Done),
+                    after_store: false,
+                } if *id == op_id
+            )));
+        }
     }
 }
