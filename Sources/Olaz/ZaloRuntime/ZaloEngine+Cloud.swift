@@ -176,7 +176,7 @@ extension ZaloEngine {
             applyCloudSnapshot(sqlSummaries: [], existingIdsByConv: [:])
             return
         }
-        Task { [weak self] in
+        cloudRefreshTask = Task { [weak self] in
             await self?.performRefreshCloud()
         }
     }

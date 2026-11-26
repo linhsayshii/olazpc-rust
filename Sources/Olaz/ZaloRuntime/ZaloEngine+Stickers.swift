@@ -259,6 +259,21 @@ extension ZaloEngine {
             }
             let res: SendMessageResult
             if isE2EE {
+                if let sendE2EEStickerHostHandler {
+                    let cliInt = await sessionClient.nextClientId()
+                    let cliId = "\(cliInt)"
+                    let args: [String: Any] = [
+                        "conv_id": conversationId,
+                        "cate_id": sticker.cateId,
+                        "sticker_id": sticker.stickerId,
+                        "client_id": cliId,
+                    ]
+                    _ = traceHost("send_e2ee_sticker", args: args)
+                    guard let hostRes = try await sendE2EEStickerHostHandler(args) else {
+                        return .failed("Không gửi được sticker mã hóa đầu cuối.")
+                    }
+                    res = hostRes
+                } else {
                 let myUid = profile?.userId ?? ""
                 guard !myUid.isEmpty,
                       await e2eeManager.ensureSessions(forPeer: conversationId, myUid: myUid, webSocket: webSocket, store: sqliteStore) else {
@@ -309,6 +324,7 @@ extension ZaloEngine {
                     clientId: cliInt,
                     listParams: ZaloJSONArrayBox(listParams)
                 )
+                }
             } else {
                 res = try await sessionClient.sendStickerAPI(convId: conversationId, cateId: sticker.cateId, stickerId: sticker.stickerId)
             }
@@ -321,7 +337,7 @@ extension ZaloEngine {
                 isMine: true,
                 kind: .sticker(url: sticker.url),
                 text: "[Sticker]",
-                date: Date(),
+                date: Date(timeIntervalSince1970: Double(nowMs()) / 1000.0),
                 status: .sent,
                 quote: nil,
                 reactions: [],

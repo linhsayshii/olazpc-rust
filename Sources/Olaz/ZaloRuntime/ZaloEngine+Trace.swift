@@ -64,6 +64,7 @@ extension ZaloEngine {
     internal func cancelTasksForRecording() {
         hostTrace = nil
         sendE2EETextHostHandler = nil
+        sendE2EEStickerHostHandler = nil
         resolveMediaHostHandler = nil
         resolveFileHostHandler = nil
         fetchMediaDataHostHandler = nil
@@ -106,8 +107,13 @@ extension ZaloEngine {
         contactsTasks.values.forEach { $0.cancel() }
         contactsTasks.removeAll()
         pollDebounceSleep = nil
+        composerConfirmSleep = nil
+        composerConfirmTask?.cancel()
+        composerConfirmTask = nil
         resetPolls()
         pollRefreshTasks.values.forEach { $0.cancel() }
+        cloudRefreshTask?.cancel()
+        cloudRefreshTask = nil
         typingResetTasks.values.forEach { $0.cancel() }
         typingResetTasks = [:]
     }
@@ -187,6 +193,14 @@ extension ZaloEngine {
         _ = await persistConversationsTask?.value
     }
 
+    internal func awaitCloudTasksForRecording() async {
+        while let task = cloudRefreshTask {
+            cloudRefreshTask = nil
+            _ = await task.value
+        }
+        _ = await persistConversationsTask?.value
+    }
+
     internal func finishTearDownForRecording() async {
         await sessionClient.setSessionTrace(nil)
         _ = await bootTask?.value
@@ -219,6 +233,7 @@ extension ZaloEngine {
             pollRefreshTasks.removeAll()
             for task in tasks { _ = await task.value }
         }
+        _ = await cloudRefreshTask?.value
         _ = await persistConversationsTask?.value
         _ = await pendingCleanupTask?.value
         await webSocket.stop()

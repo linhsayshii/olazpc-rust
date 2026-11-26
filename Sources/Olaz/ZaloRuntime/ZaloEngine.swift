@@ -178,6 +178,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var cachedQRPNG: Data?
     @ObservationIgnored internal var hostTrace: ((String, [String: Any]) -> Bool)?
     @ObservationIgnored internal var sendE2EETextHostHandler: (([String: Any]) async throws -> SendMessageResult)?
+    @ObservationIgnored internal var sendE2EEStickerHostHandler: (([String: Any]) async throws -> SendMessageResult?)?
     @ObservationIgnored internal var resolveMediaHostHandler: (([String: Any]) async -> MediaResolution)?
     @ObservationIgnored internal var resolveFileHostHandler: (([String: Any]) async -> FileResolution)?
     @ObservationIgnored internal var fetchMediaDataHostHandler: (([String: Any]) async -> Data?)?
@@ -225,7 +226,10 @@ final class ZaloEngine {
     @ObservationIgnored internal var messageActionTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var contactsTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var pollRefreshTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored internal var cloudRefreshTask: Task<Void, Never>?
     @ObservationIgnored internal var pollDebounceSleep: (@MainActor (Int) async -> Bool)?
+    @ObservationIgnored internal var composerConfirmTask: Task<Void, Never>?
+    @ObservationIgnored internal var composerConfirmSleep: (@MainActor (Int) async -> Bool)?
     @ObservationIgnored internal var activeSendTask: Task<Bool, Never>?
     @ObservationIgnored internal var batchImportTask: Task<Void, Never>?
     @ObservationIgnored internal var activeSyncBatchTasks: [UUID: Task<Void, Never>] = [:]
