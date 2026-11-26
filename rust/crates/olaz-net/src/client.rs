@@ -397,11 +397,9 @@ pub async fn download_sync_batch_with<T: Transport>(
         && is_valid_zpw_sek(Some(sek))
         && !uid.is_empty()
     {
-        let host = url::Url::parse(url).map_err(|_| NetError::InvalidUrl(url.to_owned()))?;
-        let session_cookie =
-            olaz_client::headers::session_cookie(host.host_str().unwrap_or(""), sek)
-                .unwrap_or_default();
-        let cookie = format!("{session_cookie}; zpw_uin={uid}");
+        // Phone sync downloads the authenticated upload_batch event's server-supplied URL.
+        // Preserve its pre-existing one-cookie retry, independently of API cookie host policy.
+        let cookie = format!("zpw_sek={sek}; zpw_uin={uid}");
         let retry = bare_request(url, timeout, Some(&cookie), transport.preferred_languages())?;
         let retried = transport.send(retry).await?;
         if (200..300).contains(&retried.status) {
@@ -421,17 +419,17 @@ fn bare_request(
     cookie: Option<&str>,
     preferred_languages: &[String],
 ) -> Result<crate::http::RequestSpec, NetError> {
-    let mut options = RequestOptions::get(url).timeout(timeout);
-    if let Some(cookie) = cookie {
-        options
-            .extra_headers
-            .push(("Cookie".to_owned(), cookie.to_owned()));
-    }
-    // A bare request never carries the session cookie: pass no sek.
-    build_request_with_kind(
+    let options = RequestOptions::get(url).timeout(timeout);
+    let mut request = build_request_with_kind(
         &options,
         None,
         preferred_languages,
         olaz_client::headers::RequestKind::MediaOther,
-    )
+    )?;
+    // Only downloadSyncBatch's explicit 401/403 retry supplies this cookie. Its destination
+    // comes from the active phone-sync event, and historically was not restricted to API hosts.
+    if let Some(cookie) = cookie {
+        crate::http::set_header(&mut request.headers, "Cookie", cookie);
+    }
+    Ok(request)
 }

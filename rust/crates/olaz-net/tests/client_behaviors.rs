@@ -567,3 +567,42 @@ fn api_chat_subdomains_receive_both_domain_cookies() {
         assert_eq!(request.header("cookie"), Some("zpw_sek=sek; zpw_sek=sek"));
     }
 }
+
+#[tokio::test]
+async fn sync_batch_keeps_legacy_cookie_retry_for_server_supplied_destinations() {
+    // dlfl.vn also occurs in Swift's upload_batch fixtures; these are routing-policy tests,
+    // not assertions about a live server's current download hostname.
+    for target in [
+        "http://127.0.0.1/batch",
+        "https://dlfl.vn/batch",
+        "https://chat.zalo.me/batch",
+    ] {
+        for status in [401, 403] {
+            let transport = MockTransport::scripted(vec![
+                Ok(RawResponse::new(status, Vec::new())),
+                Ok(RawResponse::new(200, b"batch".to_vec())),
+            ]);
+            let body = olaz_net::download_sync_batch_with(
+                &transport,
+                target,
+                Duration::from_secs(5),
+                Some("sek.1.2"),
+                Some("100"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(body, b"batch");
+            let requests = transport.requests();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].header("Cookie"), None);
+            assert_eq!(
+                requests[1].header("Cookie"),
+                Some("zpw_sek=sek.1.2; zpw_uin=100")
+            );
+            assert_eq!(requests[1].url, target);
+            assert_eq!(requests[1].header("accept"), Some("*/*"));
+            assert_eq!(requests[1].header("content-type"), None);
+            assert_eq!(requests[1].header("zpw_sek"), None);
+        }
+    }
+}
