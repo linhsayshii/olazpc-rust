@@ -196,6 +196,8 @@ final class ZaloEngine {
     @ObservationIgnored internal var sendMediaHostHandler: (([String: Any]) async -> ComposerOutcome)?
     @ObservationIgnored internal var sendFilesHostHandler: (([String: Any]) async -> ComposerOutcome)?
     @ObservationIgnored internal var forwardTempPhotoURL: (() -> URL)?
+    @ObservationIgnored internal var sendE2EEStickerHostHandler: (([String: Any]) async throws -> SendMessageResult?)?
+    @ObservationIgnored internal var sendE2EEContactCardHostHandler: (([String: Any]) async throws -> SendMessageResult)?
     @ObservationIgnored internal var traceU4HostEnabled: Bool = false {
         didSet {
             let active = (hostTrace != nil) && traceU4HostEnabled
@@ -235,6 +237,8 @@ final class ZaloEngine {
     @ObservationIgnored internal var pollRefreshTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var pollDebounceSleep: (@MainActor (Int) async -> Bool)?
     @ObservationIgnored internal var localPollSyncEpoch: UInt64 = 0
+    @ObservationIgnored internal var composerConfirmTask: Task<Void, Never>?
+    @ObservationIgnored internal var composerConfirmSleep: (@MainActor (Int) async -> Bool)?
     @ObservationIgnored internal var activeSendTask: Task<Bool, Never>?
     @ObservationIgnored internal var batchImportTask: Task<Void, Never>?
     @ObservationIgnored internal var activeSyncBatchTasks: [UUID: Task<Void, Never>] = [:]

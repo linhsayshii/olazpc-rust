@@ -10,6 +10,7 @@
 pub mod actions;
 pub mod actor;
 pub mod changes;
+pub mod composer;
 pub mod conversations;
 pub mod effect;
 pub mod forward;
@@ -21,6 +22,7 @@ pub mod reduce;
 pub mod runner;
 pub mod search;
 pub mod state;
+pub mod stickers;
 pub mod typed_chat;
 pub mod typing;
 
@@ -41,6 +43,12 @@ pub use actor::{ActorSink, CoreHandle};
 pub use changes::{
     ChangeHub, CoreChanges, DirtyKey, DirtySet, MessageMetaSnapshot, snapshot_message_meta,
 };
+pub use composer::{
+    COMPOSER_GENERIC_FAILURE, CONFIRM_PROMOTE_DELAY_MS, ComposerConfirm, ComposerOutcome,
+    ComposerState, ContactCardSendSpec, MyCardInfo, NOT_LOGGED_IN_FAILURE, REMINDER_API_FAILURE,
+    REMINDER_TITLE_MAX_BYTES, REMINDER_TITLE_MAX_CHARS, REMINDER_TOO_LONG_FAILURE,
+    ReminderComposeInfo,
+};
 pub use conversations::{
     BatchApplyDelta, CachedGroup, CachedProfile, ConvMessageDelta, ConvPreviewOverride,
     ConversationActionResult, ConversationActionUI, ConversationActionsState, ConversationExtras,
@@ -57,6 +65,7 @@ pub use forward::{
     ComposerSendOutcome, FileResolutionOutcome, ForwardOutcome, ForwardRequest, ForwardState,
     MediaResolutionOutcome,
 };
+pub use input::StickerSendError;
 pub use input::{
     BootstrapAliasesError, Command, CompletedLogin, E2eeQuoteArg, HiddenPinSyncKind, Input,
     LegacyCookie, PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
@@ -97,6 +106,12 @@ pub use state::{
     CoreFailKind, CoreSnapshot, CoreState, FailReason, LoginState, LoginStep,
     PersistedTransportState, Phase, Profile, SessionSnapshot, SessionState, TransportState,
     WsPhase,
+};
+pub use stickers::{
+    CardActionOutcome, MAX_RECENT_STICKERS, STICKER_CATEGORIES_CACHE_MIN, STICKER_SEARCH_LIMIT,
+    STICKER_SUGGEST_DEBOUNCE_MS, STICKER_SUGGEST_LIMIT, STICKER_TAB_ENTRY_LIMIT, STICKER_TAB_LIMIT,
+    STICKER_TAB_RECENT_ID, StickerAnimation, StickerEntry, StickerSource, StickerState,
+    StickerSuggestSetting, StickerTab,
 };
 pub use typed_chat::{
     ParseState, PlainChatParse, SharedParse, TypedChatEnvelope, WirePayloadHandle,

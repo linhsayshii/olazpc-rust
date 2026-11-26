@@ -9,13 +9,18 @@ use std::time::Duration;
 
 use olaz_api::{PollState, SendMessageResult};
 use olaz_core::changes::{DirtyKey, snapshot_message_meta};
+use olaz_core::composer::{ComposerConfirm, ComposerOutcome, MyCardInfo, ReminderComposeInfo};
 use olaz_core::conversations::{BatchApplyDelta, ConversationSummary, sort_conversations};
-use olaz_core::input::E2eeQuoteArg;
+use olaz_core::input::{E2eeQuoteArg, StickerSendError};
 use olaz_core::messages::{HistoryFreshness, MuteEntry};
 use olaz_core::reduce::classify::{MobileSyncEvent, Route, classify};
 use olaz_core::reduce::reduce;
 use olaz_core::runner::{BatchHookOutcome, ParsedEventsHookOutcome, SharedStoreSlot, WsDriver};
 use olaz_core::state::PersistedTransportState;
+use olaz_core::stickers::{
+    CardActionOutcome, StickerAnimation, StickerEntry, StickerSource, StickerSuggestSetting,
+    StickerTab,
+};
 use olaz_core::typed_chat::{TypedChatEnvelope, WirePayloadHandle};
 use olaz_core::{
     Command, ComposerSendOutcome, CoreChanges, CoreFailKind, CoreHandle, CoreState,
@@ -839,6 +844,423 @@ pub struct AutoDeleteUpdateRecord {
     pub entries: Option<Vec<AutoDeleteEntryRecord>>,
 }
 
+// --- U13 stickers & composer side-actions records ---
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum StickerAnimationRecord {
+    Sprite {
+        url: String,
+        frames: i64,
+        frame_ms: i64,
+    },
+    Animated {
+        url: String,
+    },
+}
+
+impl fmt::Debug for StickerAnimationRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sprite {
+                frames, frame_ms, ..
+            } => f
+                .debug_struct("Sprite")
+                .field("frames", frames)
+                .field("frame_ms", frame_ms)
+                .finish(),
+            Self::Animated { .. } => f.write_str("Animated"),
+        }
+    }
+}
+
+impl From<StickerAnimation> for StickerAnimationRecord {
+    fn from(a: StickerAnimation) -> Self {
+        match a {
+            StickerAnimation::Sprite {
+                url,
+                frames,
+                frame_ms,
+            } => Self::Sprite {
+                url,
+                frames,
+                frame_ms,
+            },
+            StickerAnimation::Animated { url } => Self::Animated { url },
+        }
+    }
+}
+
+impl From<StickerAnimationRecord> for StickerAnimation {
+    fn from(a: StickerAnimationRecord) -> Self {
+        match a {
+            StickerAnimationRecord::Sprite {
+                url,
+                frames,
+                frame_ms,
+            } => Self::Sprite {
+                url,
+                frames,
+                frame_ms,
+            },
+            StickerAnimationRecord::Animated { url } => Self::Animated { url },
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct StickerEntryRecord {
+    pub cate_id: i64,
+    pub sticker_id: i64,
+    pub url: String,
+    pub animation: Option<StickerAnimationRecord>,
+}
+
+impl fmt::Debug for StickerEntryRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StickerEntryRecord")
+            .field("cate_id", &self.cate_id)
+            .field("sticker_id", &self.sticker_id)
+            .field("has_url", &!self.url.is_empty())
+            .field("animation", &self.animation)
+            .finish()
+    }
+}
+
+impl From<StickerEntry> for StickerEntryRecord {
+    fn from(s: StickerEntry) -> Self {
+        Self {
+            cate_id: s.cate_id,
+            sticker_id: s.sticker_id,
+            url: s.url,
+            animation: s.animation.map(Into::into),
+        }
+    }
+}
+
+impl From<StickerEntryRecord> for StickerEntry {
+    fn from(s: StickerEntryRecord) -> Self {
+        Self {
+            cate_id: s.cate_id,
+            sticker_id: s.sticker_id,
+            url: s.url,
+            animation: s.animation.map(Into::into),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct StickerTabRecord {
+    pub id: i64,
+    pub name: String,
+    pub icon: Option<String>,
+    pub count: i64,
+}
+
+impl fmt::Debug for StickerTabRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StickerTabRecord")
+            .field("id", &self.id)
+            .field("name_len", &self.name.len())
+            .field("has_icon", &self.icon.is_some())
+            .field("count", &self.count)
+            .finish()
+    }
+}
+
+impl From<StickerTab> for StickerTabRecord {
+    fn from(t: StickerTab) -> Self {
+        Self {
+            id: t.id,
+            name: t.name,
+            icon: t.icon,
+            count: t.count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct StickerSuggestSettingRecord {
+    pub enabled: bool,
+    pub debounce: i64,
+}
+
+impl From<StickerSuggestSetting> for StickerSuggestSettingRecord {
+    fn from(s: StickerSuggestSetting) -> Self {
+        Self {
+            enabled: s.enabled,
+            debounce: s.debounce,
+        }
+    }
+}
+
+impl From<StickerSuggestSettingRecord> for StickerSuggestSetting {
+    fn from(s: StickerSuggestSettingRecord) -> Self {
+        Self {
+            enabled: s.enabled,
+            debounce: s.debounce,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct StickerSuggestUpdateRecord {
+    pub setting: Option<StickerSuggestSettingRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum StickerSourceRecord {
+    Category,
+    Recent,
+    Search,
+    Suggestion,
+}
+
+impl From<StickerSourceRecord> for StickerSource {
+    fn from(s: StickerSourceRecord) -> Self {
+        match s {
+            StickerSourceRecord::Category => Self::Category,
+            StickerSourceRecord::Recent => Self::Recent,
+            StickerSourceRecord::Search => Self::Search,
+            StickerSourceRecord::Suggestion => Self::Suggestion,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum CardActionOutcomeRecord {
+    Done,
+    OpenChat { id: String },
+    OpenProfile { uid: String },
+    OpenUrl { url: String },
+    Copy { text: String },
+    Present,
+    Unsupported { text: String },
+    Locked { text: String },
+    Failed { text: String },
+    Pending { text: String },
+}
+
+impl fmt::Debug for CardActionOutcomeRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Done => f.write_str("Done"),
+            Self::OpenChat { .. } => f.write_str("OpenChat"),
+            Self::OpenProfile { .. } => f.write_str("OpenProfile"),
+            Self::OpenUrl { .. } => f.write_str("OpenUrl"),
+            Self::Copy { .. } => f.write_str("Copy"),
+            Self::Present => f.write_str("Present"),
+            Self::Unsupported { .. } => f.write_str("Unsupported"),
+            Self::Locked { .. } => f.write_str("Locked"),
+            Self::Failed { .. } => f.write_str("Failed"),
+            Self::Pending { .. } => f.write_str("Pending"),
+        }
+    }
+}
+
+impl From<CardActionOutcome> for CardActionOutcomeRecord {
+    fn from(o: CardActionOutcome) -> Self {
+        match o {
+            CardActionOutcome::Done => Self::Done,
+            CardActionOutcome::OpenChat(id) => Self::OpenChat { id },
+            CardActionOutcome::OpenProfile(uid) => Self::OpenProfile { uid },
+            CardActionOutcome::OpenUrl(url) => Self::OpenUrl { url },
+            CardActionOutcome::Copy(text) => Self::Copy { text },
+            CardActionOutcome::Present => Self::Present,
+            CardActionOutcome::Unsupported(text) => Self::Unsupported { text },
+            CardActionOutcome::Locked(text) => Self::Locked { text },
+            CardActionOutcome::Failed(text) => Self::Failed { text },
+            CardActionOutcome::Pending(text) => Self::Pending { text },
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum ComposerOutcomeRecord {
+    Done,
+    Cancelled,
+    Failed { text: String },
+    Pending { text: String },
+}
+
+impl fmt::Debug for ComposerOutcomeRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Done => f.write_str("Done"),
+            Self::Cancelled => f.write_str("Cancelled"),
+            Self::Failed { .. } => f.write_str("Failed"),
+            Self::Pending { .. } => f.write_str("Pending"),
+        }
+    }
+}
+
+impl From<ComposerOutcome> for ComposerOutcomeRecord {
+    fn from(o: ComposerOutcome) -> Self {
+        match o {
+            ComposerOutcome::Done => Self::Done,
+            ComposerOutcome::Cancelled => Self::Cancelled,
+            ComposerOutcome::Failed(text) => Self::Failed { text },
+            ComposerOutcome::Pending(text) => Self::Pending { text },
+        }
+    }
+}
+
+impl From<ComposerOutcomeRecord> for ComposerOutcome {
+    fn from(o: ComposerOutcomeRecord) -> Self {
+        match o {
+            ComposerOutcomeRecord::Done => Self::Done,
+            ComposerOutcomeRecord::Cancelled => Self::Cancelled,
+            ComposerOutcomeRecord::Failed { text } => Self::Failed(text),
+            ComposerOutcomeRecord::Pending { text } => Self::Pending(text),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MyCardInfoRecord {
+    pub uid: String,
+    pub name: String,
+    pub avatar: Option<String>,
+    pub phone: String,
+    pub with_phone: bool,
+}
+
+impl fmt::Debug for MyCardInfoRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MyCardInfoRecord")
+            .field("has_uid", &!self.uid.is_empty())
+            .field("name_len", &self.name.len())
+            .field("has_avatar", &self.avatar.is_some())
+            .field("with_phone", &self.with_phone)
+            .finish()
+    }
+}
+
+impl From<MyCardInfo> for MyCardInfoRecord {
+    fn from(c: MyCardInfo) -> Self {
+        Self {
+            uid: c.uid,
+            name: c.name,
+            avatar: c.avatar,
+            phone: c.phone,
+            with_phone: c.with_phone,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ReminderComposeInfoRecord {
+    pub allowed: bool,
+    pub hidden: bool,
+    pub text: String,
+    pub is_group: bool,
+    pub can_pin: bool,
+    pub pin_toggle: bool,
+    pub title_max_chars: i64,
+    pub title_max_bytes: i64,
+}
+
+impl fmt::Debug for ReminderComposeInfoRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReminderComposeInfoRecord")
+            .field("allowed", &self.allowed)
+            .field("hidden", &self.hidden)
+            .field("is_group", &self.is_group)
+            .field("can_pin", &self.can_pin)
+            .field("pin_toggle", &self.pin_toggle)
+            .finish()
+    }
+}
+
+impl From<ReminderComposeInfo> for ReminderComposeInfoRecord {
+    fn from(r: ReminderComposeInfo) -> Self {
+        Self {
+            allowed: r.allowed,
+            hidden: r.hidden,
+            text: r.text,
+            is_group: r.is_group,
+            can_pin: r.can_pin,
+            pin_toggle: r.pin_toggle,
+            title_max_chars: r.title_max_chars,
+            title_max_bytes: r.title_max_bytes,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ComposerConfirmRecord {
+    pub id: String,
+    pub conv_id: String,
+    pub title: String,
+    pub message: String,
+    pub ok: String,
+    pub cancel: String,
+}
+
+impl fmt::Debug for ComposerConfirmRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ComposerConfirmRecord")
+            .field("has_id", &!self.id.is_empty())
+            .field("has_conv_id", &!self.conv_id.is_empty())
+            .field("title_len", &self.title.len())
+            .field("message_len", &self.message.len())
+            .finish()
+    }
+}
+
+impl From<ComposerConfirm> for ComposerConfirmRecord {
+    fn from(c: ComposerConfirm) -> Self {
+        Self {
+            id: c.id,
+            conv_id: c.conv_id,
+            title: c.title,
+            message: c.message,
+            ok: c.ok,
+            cancel: c.cancel,
+        }
+    }
+}
+
+impl From<ComposerConfirmRecord> for ComposerConfirm {
+    fn from(c: ComposerConfirmRecord) -> Self {
+        Self {
+            id: c.id,
+            conv_id: c.conv_id,
+            title: c.title,
+            message: c.message,
+            ok: c.ok,
+            cancel: c.cancel,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ComposerConfirmUpdateRecord {
+    pub confirm: Option<ComposerConfirmRecord>,
+}
+
+/// Outcome returned by Swift's `send_e2ee_sticker` host callback (U13).
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum E2eeStickerSendOutcomeRecord {
+    Sent {
+        msg_id: String,
+        cli_msg_id: String,
+        ts_ms: i64,
+    },
+    E2eeFailed,
+    ApiFailed {
+        message: String,
+    },
+}
+
+impl fmt::Debug for E2eeStickerSendOutcomeRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sent { ts_ms, .. } => f.debug_struct("Sent").field("ts_ms", ts_ms).finish(),
+            Self::E2eeFailed => f.write_str("E2eeFailed"),
+            Self::ApiFailed { .. } => f.write_str("ApiFailed"),
+        }
+    }
+}
+
 /// Coalesced dirty-key change batch returned by [`CoreEngine::next_changes`].
 #[derive(Clone, PartialEq, uniffi::Record)]
 pub struct CoreChangesRecord {
@@ -866,6 +1288,10 @@ pub struct CoreChangesRecord {
     // U12
     #[uniffi(default = None)]
     pub polls: Option<PollsMirrorRecord>,
+    // U13
+    pub sticker_suggest: Option<StickerSuggestUpdateRecord>,
+    pub composer_confirm: Option<ComposerConfirmUpdateRecord>,
+    pub queued_composer_confirms: Option<Vec<ComposerConfirmRecord>>,
 }
 
 impl fmt::Debug for CoreChangesRecord {
@@ -954,6 +1380,15 @@ impl From<CoreChanges> for CoreChangesRecord {
                     .collect()
             }),
             polls: c.polls.map(Into::into),
+            sticker_suggest: c.sticker_suggest.map(|s| StickerSuggestUpdateRecord {
+                setting: s.map(Into::into),
+            }),
+            composer_confirm: c.composer_confirm.map(|m| ComposerConfirmUpdateRecord {
+                confirm: m.map(Into::into),
+            }),
+            queued_composer_confirms: c
+                .queued_composer_confirms
+                .map(|list| list.into_iter().map(Into::into).collect()),
         }
     }
 }
@@ -1316,6 +1751,9 @@ impl CoreOfflineConversations {
             cached_profiles: None,
             cached_groups: None,
             polls: None,
+            sticker_suggest: None,
+            composer_confirm: None,
+            queued_composer_confirms: None,
         };
         for key in out.dirty {
             match key {
@@ -1383,7 +1821,9 @@ impl CoreOfflineConversations {
                 | DirtyKey::AutoDelete
                 | DirtyKey::StarredIds
                 | DirtyKey::CachedProfiles
-                | DirtyKey::CachedGroups => {}
+                | DirtyKey::CachedGroups
+                | DirtyKey::StickerSuggest
+                | DirtyKey::ComposerConfirm => {}
                 DirtyKey::Polls => {
                     rec.polls = Some(state.polls.clone().into());
                 }
@@ -1618,7 +2058,6 @@ pub trait CoreHost: Send + Sync {
         client_id: String,
         quote: Option<E2eeQuoteArgRecord>,
     ) -> E2eeSendOutcomeRecord;
-
     // --- Forward domain callbacks (U8) ---
     async fn show_card(&self, conv_id: Option<String>, text: String);
     async fn resolve_media(
@@ -1646,6 +2085,30 @@ pub trait CoreHost: Send + Sync {
     // --- Group polls domain callbacks (U12) ---
     async fn arm_poll_debounce(&self, poll_id: String, seq: u64, delay_ms: u64) -> bool;
     async fn cancel_all_poll_debounces(&self);
+
+    // --- Stickers & composer domain callbacks (U13) ---
+    async fn send_e2ee_sticker(
+        &self,
+        conv_id: String,
+        cate_id: i64,
+        sticker_id: i64,
+        client_id: String,
+    ) -> E2eeStickerSendOutcomeRecord;
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Matches send_e2ee_contact_card host boundary args 1-for-1"
+    )]
+    async fn send_e2ee_contact_card(
+        &self,
+        conv_id: String,
+        client_id: String,
+        contact_uid: String,
+        title: String,
+        phone: String,
+        avatar: String,
+        qr_code_url: String,
+    ) -> E2eeSendOutcomeRecord;
+    async fn sleep_confirm_promote(&self, delay_ms: u64);
 }
 
 struct FfiHostBridge(Arc<dyn CoreHost>);
@@ -2060,6 +2523,76 @@ impl Host for FfiHostBridge {
 
     async fn send_files(&self, conv_id: String, paths: Vec<String>) -> ComposerSendOutcome {
         self.0.send_files(conv_id, paths).await.into()
+    }
+
+    async fn send_e2ee_sticker(
+        &self,
+        conv_id: String,
+        cate_id: i64,
+        sticker_id: i64,
+        client_id: String,
+    ) -> Result<SendMessageResult, StickerSendError> {
+        match self
+            .0
+            .send_e2ee_sticker(conv_id, cate_id, sticker_id, client_id)
+            .await
+        {
+            E2eeStickerSendOutcomeRecord::Sent {
+                msg_id,
+                cli_msg_id,
+                ts_ms,
+            } => Ok(SendMessageResult {
+                msg_id,
+                cli_msg_id,
+                ts_ms,
+            }),
+            E2eeStickerSendOutcomeRecord::E2eeFailed => Err(StickerSendError::E2eeFailed),
+            E2eeStickerSendOutcomeRecord::ApiFailed { message } => {
+                Err(StickerSendError::Api(message))
+            }
+        }
+    }
+
+    async fn send_e2ee_contact_card(
+        &self,
+        conv_id: String,
+        client_id: String,
+        contact_uid: String,
+        title: String,
+        phone: String,
+        avatar: String,
+        qr_code_url: String,
+    ) -> Result<SendMessageResult, String> {
+        match self
+            .0
+            .send_e2ee_contact_card(
+                conv_id,
+                client_id,
+                contact_uid,
+                title,
+                phone,
+                avatar,
+                qr_code_url,
+            )
+            .await
+        {
+            E2eeSendOutcomeRecord::Sent {
+                msg_id,
+                cli_msg_id,
+                ts_ms,
+            } => Ok(SendMessageResult {
+                msg_id,
+                cli_msg_id,
+                ts_ms,
+            }),
+            E2eeSendOutcomeRecord::Failed { message } => Err(message),
+            E2eeSendOutcomeRecord::Aborted => Err(String::new()),
+        }
+    }
+
+    async fn sleep_confirm_promote(&self, delay: Duration) {
+        let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        self.0.sleep_confirm_promote(delay_ms).await;
     }
 }
 
@@ -3323,6 +3856,247 @@ impl CoreEngine {
         .await
     }
 
+    // --- U13 stickers & composer side-actions domain ---
+
+    /// Fetches sticker tabs (recent + Củ hành + server categories with >= 5 pack caching).
+    pub async fn sticker_tabs(&self) -> Result<Option<Vec<StickerTabRecord>>, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            Ok(handle
+                .request_sticker_tabs()
+                .await
+                .map(|list| list.into_iter().map(Into::into).collect()))
+        })
+        .await?
+    }
+
+    /// Fetches stickers in tab `id` (`-2` recent, `0` built-in, `> 0` server category).
+    pub async fn stickers_in_tab(
+        &self,
+        id: i64,
+    ) -> Result<Option<Vec<StickerEntryRecord>>, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            Ok(handle
+                .request_sticker_entries(Command::StickersInTab { id })
+                .await
+                .map(|list| list.into_iter().map(Into::into).collect()))
+        })
+        .await?
+    }
+
+    /// Searches stickers by keyword (max 40).
+    pub async fn search_stickers(
+        &self,
+        text: String,
+    ) -> Result<Option<Vec<StickerEntryRecord>>, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            Ok(handle
+                .request_sticker_entries(Command::SearchStickers { text })
+                .await
+                .map(|list| list.into_iter().map(Into::into).collect()))
+        })
+        .await?
+    }
+
+    /// Fetches typing sticker suggestions for `conv_id` and `text` (empty on E2EE or disabled).
+    pub async fn typing_sticker_suggestions(
+        &self,
+        conv_id: String,
+        text: String,
+        is_e2ee: Option<bool>,
+    ) -> Result<Option<Vec<StickerEntryRecord>>, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            Ok(handle
+                .request_sticker_entries(Command::TypingStickerSuggestions {
+                    conv_id,
+                    text,
+                    is_e2ee,
+                })
+                .await
+                .map(|list| list.into_iter().map(Into::into).collect()))
+        })
+        .await?
+    }
+
+    /// Sends a sticker through the U5 send pipeline (optimistic message, dedupe, recent persistence).
+    pub async fn send_sticker(
+        &self,
+        conv_id: String,
+        sticker: StickerEntryRecord,
+        source: StickerSourceRecord,
+        client_id: i64,
+        now_ms: i64,
+        is_e2ee: Option<bool>,
+    ) -> Result<CardActionOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let outcome = handle
+                .request_card_action(Command::SendSticker {
+                    conv_id,
+                    sticker: sticker.into(),
+                    source: source.into(),
+                    client_id,
+                    now_ms,
+                    is_e2ee,
+                })
+                .await;
+            runner.flush_store().await;
+            let _ = handle.settle().await;
+            outcome.into()
+        })
+        .await
+    }
+
+    /// Reads persisted `stickerSuggest` preference without mutating in-memory suggest state.
+    pub async fn sticker_setting(&self) -> Result<Option<StickerSuggestSettingRecord>, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle
+                .request_sticker_suggest_setting(Command::StickerSetting)
+                .await
+                .map(Into::into)
+        })
+        .await
+    }
+
+    /// Persists `stickerSuggest` preference and updates in-memory suggest state.
+    pub async fn set_sticker_suggest(
+        &self,
+        enabled: bool,
+    ) -> Result<Option<StickerSuggestSettingRecord>, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let res = handle
+                .request_sticker_suggest_setting(Command::SetStickerSuggest { enabled })
+                .await
+                .map(Into::into);
+            runner.flush_store().await;
+            let _ = handle.settle().await;
+            res
+        })
+        .await
+    }
+
+    /// Seeds in-memory sticker suggest setting (for tests / state sync).
+    pub fn seed_sticker_suggest_setting(&self, setting: Option<StickerSuggestSettingRecord>) {
+        self.handle
+            .send(Command::SeedStickerSuggestSetting(setting.map(Into::into)));
+    }
+
+    /// Resets sticker pack cache and in-memory suggest setting.
+    pub fn reset_stickers(&self) {
+        self.handle.send(Command::ResetStickers);
+    }
+
+    /// Returns own contact card info from the active profile.
+    pub async fn my_card(&self) -> Result<Option<MyCardInfoRecord>, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move { handle.request_my_card().await.map(Into::into) }).await
+    }
+
+    /// Sends own contact card (plain or 1-1 E2EE via `send_e2ee_contact_card`).
+    pub async fn send_my_card(
+        &self,
+        conv_id: String,
+        with_phone: bool,
+        client_id: Option<i64>,
+        now_ms: i64,
+        is_e2ee: Option<bool>,
+    ) -> Result<ComposerOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let outcome = handle
+                .request_composer_outcome(Command::SendMyCard {
+                    conv_id,
+                    with_phone,
+                    client_id,
+                    now_ms,
+                    is_e2ee,
+                })
+                .await;
+            runner.flush_store().await;
+            let _ = handle.settle().await;
+            outcome.into()
+        })
+        .await
+    }
+
+    /// Queries reminder compose capabilities and title limits for `conv_id`.
+    pub async fn reminder_compose_info(
+        &self,
+        conv_id: String,
+    ) -> Result<Option<ReminderComposeInfoRecord>, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move { handle.request_reminder_info(conv_id).await.map(Into::into) }).await
+    }
+
+    /// Creates a reminder (enforces official title limits before HTTP).
+    pub async fn create_reminder(
+        &self,
+        conv_id: String,
+        title: String,
+        start_ms: i64,
+        repeat_mode: i64,
+        pin: bool,
+    ) -> Result<ComposerOutcomeRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle
+                .request_composer_outcome(Command::CreateReminder {
+                    conv_id,
+                    title,
+                    start_ms,
+                    repeat_mode,
+                    pin,
+                })
+                .await
+                .into()
+        })
+        .await
+    }
+
+    /// Answers the active composer confirm dialog (schedules 300 ms promotion if queued).
+    pub fn answer_composer_confirm(&self, confirm_id: String, ok: bool) {
+        self.handle
+            .send(Command::AnswerComposerConfirm { confirm_id, ok });
+    }
+
+    /// Cancels any pending confirm promotion timer and drops all composer confirms.
+    pub fn drop_composer_confirms(&self) {
+        self.handle.send(Command::DropComposerConfirms);
+    }
+
+    /// Seeds active + queued composer confirms in core state.
+    pub fn seed_composer_confirms(
+        &self,
+        active: Option<ComposerConfirmRecord>,
+        queued: Vec<ComposerConfirmRecord>,
+    ) {
+        self.handle.send(Command::SeedComposerConfirms {
+            active: active.map(Into::into),
+            queued: queued.into_iter().map(Into::into).collect(),
+        });
+    }
+
+    /// Reports a composer outcome (`Failed` / `Pending` emit `show_card`).
+    pub fn composer_report(&self, conv_id: String, outcome: ComposerOutcomeRecord) {
+        self.handle.send(Command::ComposerReport {
+            conv_id,
+            outcome: outcome.into(),
+        });
+    }
+
+    /// Resets composer state (cancels timers, drops confirms, fails in-flight contact cards).
+    pub fn reset_composer(&self) {
+        self.handle.send(Command::ResetComposer);
+    }
+
     // --- Core-owned WebSocket pass-throughs for Swift feature domains ---
 
     /// Sends a raw WebSocket frame. `false` unless authenticated and the write succeeded.
@@ -3952,6 +4726,30 @@ mod tests {
             false
         }
         async fn cancel_all_poll_debounces(&self) {}
+        async fn send_e2ee_sticker(
+            &self,
+            _conv_id: String,
+            _cate_id: i64,
+            _sticker_id: i64,
+            _client_id: String,
+        ) -> E2eeStickerSendOutcomeRecord {
+            E2eeStickerSendOutcomeRecord::E2eeFailed
+        }
+        async fn send_e2ee_contact_card(
+            &self,
+            _conv_id: String,
+            _client_id: String,
+            _contact_uid: String,
+            _title: String,
+            _phone: String,
+            _avatar: String,
+            _qr_code_url: String,
+        ) -> E2eeSendOutcomeRecord {
+            E2eeSendOutcomeRecord::Aborted
+        }
+        async fn sleep_confirm_promote(&self, delay_ms: u64) {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
     }
 
     #[test]

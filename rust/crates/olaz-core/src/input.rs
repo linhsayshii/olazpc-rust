@@ -11,6 +11,7 @@ use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
 use crate::actions::{MessageConfirmState, ReactFailure, RecallFailure};
+use crate::composer::{ComposerConfirm, ComposerOutcome};
 use crate::conversations::{
     BatchApplyDelta, ConversationActionResult, ConversationPreview, ConversationSummary,
     IdentityTable, LocalAccountHydration, MessagePreviewInput,
@@ -19,7 +20,18 @@ use crate::effect::OpResult;
 use crate::forward::{ComposerSendOutcome, FileResolutionOutcome, MediaResolutionOutcome};
 use crate::messages::{ContactsState, HistoryFreshness};
 use crate::state::{CoreFailKind, FailReason, PersistedTransportState};
+use crate::stickers::{StickerEntry, StickerSource, StickerSuggestSetting};
 use crate::typed_chat::TypedChatEnvelope;
+
+// U13
+/// Failure kind for `Input::SendStickerDone`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StickerSendError {
+    /// Pre-send Signal/E2EE failure (no session, empty payload, or scripted `"e2ee_failed"`).
+    E2eeFailed,
+    /// API / transport failure message (logged under `sendSticker failed: ...`).
+    Api(String),
+}
 
 // U5-send
 /// Quote metadata passed across the `send_e2ee_text` host boundary.
@@ -510,6 +522,84 @@ pub enum Command {
     },
     // U7: temporary clear on `resetMessageActions()` until U7 lands.
     ClearBoardCaches,
+
+    // --- Stickers & composer side actions (U13) ---
+    /// Fetch picker tabs (prepends recent tab `-2` when `recentStickers` is non-empty).
+    StickerTabs,
+    /// Fetch stickers in a tab (`-2` = recent, `0` = built-in Củ hành, `> 0` = server category).
+    StickersInTab {
+        id: i64,
+    },
+    /// Search stickers by keyword (max 40).
+    SearchStickers {
+        text: String,
+    },
+    /// Fetch typing sticker suggestions for `conv_id` and `text` (max 30; empty on E2EE/disabled).
+    TypingStickerSuggestions {
+        conv_id: String,
+        text: String,
+        is_e2ee: Option<bool>,
+    },
+    /// Send a sticker through the U5 send pipeline.
+    SendSticker {
+        conv_id: String,
+        sticker: StickerEntry,
+        source: StickerSource,
+        client_id: i64,
+        now_ms: i64,
+        is_e2ee: Option<bool>,
+    },
+    /// Read persisted `stickerSuggest` preference without mutating in-memory `suggest_setting`.
+    StickerSetting,
+    /// Persist `stickerSuggest` preference and update in-memory `suggest_setting`.
+    SetStickerSuggest {
+        enabled: bool,
+    },
+    /// Test/seed helper: seed in-memory `suggest_setting` directly.
+    SeedStickerSuggestSetting(Option<StickerSuggestSetting>),
+    /// Clear sticker cache and in-memory suggest setting.
+    ResetStickers,
+    /// Read own contact card from current profile.
+    MyCard,
+    /// Send own contact card (plain or E2EE 1-1 via shared contact-card helper).
+    SendMyCard {
+        conv_id: String,
+        with_phone: bool,
+        client_id: Option<i64>,
+        now_ms: i64,
+        is_e2ee: Option<bool>,
+    },
+    /// Query reminder compose capabilities & limits for `conv_id`.
+    ReminderComposeInfo {
+        conv_id: String,
+    },
+    /// Create a reminder (enforces official title length limits before HTTP).
+    CreateReminder {
+        conv_id: String,
+        title: String,
+        start_ms: i64,
+        repeat_mode: i64,
+        pin: bool,
+    },
+    /// Answer the active composer confirm (`ok` is ignored on dismiss; queues 300 ms promotion).
+    AnswerComposerConfirm {
+        confirm_id: String,
+        ok: bool,
+    },
+    /// Cancel any pending confirm promotion timer and clear active + queued confirms.
+    DropComposerConfirms,
+    /// Seed active + queued composer confirms.
+    SeedComposerConfirms {
+        active: Option<ComposerConfirm>,
+        queued: Vec<ComposerConfirm>,
+    },
+    /// Report a composer outcome (`Failed` / `Pending` emit `HostCall::ShowCard`).
+    ComposerReport {
+        conv_id: String,
+        outcome: ComposerOutcome,
+    },
+    /// Reset composer state (drops confirms and fails in-flight contact-card sends).
+    ResetComposer,
 }
 
 impl fmt::Debug for Command {
@@ -909,6 +999,71 @@ impl fmt::Debug for Command {
                 .field("keys", &state.len())
                 .finish(),
             Self::ClearBoardCaches => f.write_str("ClearBoardCaches"),
+            // U13
+            Self::StickerTabs => f.write_str("StickerTabs"),
+            Self::StickersInTab { id } => f.debug_struct("StickersInTab").field("id", id).finish(),
+            Self::SearchStickers { text } => f
+                .debug_struct("SearchStickers")
+                .field("len", &text.len())
+                .finish(),
+            Self::TypingStickerSuggestions { text, is_e2ee, .. } => f
+                .debug_struct("TypingStickerSuggestions")
+                .field("len", &text.len())
+                .field("is_e2ee", is_e2ee)
+                .finish(),
+            Self::SendSticker {
+                sticker,
+                source,
+                is_e2ee,
+                ..
+            } => f
+                .debug_struct("SendSticker")
+                .field("sticker", sticker)
+                .field("source", source)
+                .field("is_e2ee", is_e2ee)
+                .finish(),
+            Self::StickerSetting => f.write_str("StickerSetting"),
+            Self::SetStickerSuggest { enabled } => f
+                .debug_struct("SetStickerSuggest")
+                .field("enabled", enabled)
+                .finish(),
+            Self::SeedStickerSuggestSetting(s) => {
+                f.debug_tuple("SeedStickerSuggestSetting").field(s).finish()
+            }
+            Self::ResetStickers => f.write_str("ResetStickers"),
+            Self::MyCard => f.write_str("MyCard"),
+            Self::SendMyCard {
+                with_phone,
+                is_e2ee,
+                ..
+            } => f
+                .debug_struct("SendMyCard")
+                .field("with_phone", with_phone)
+                .field("is_e2ee", is_e2ee)
+                .finish(),
+            Self::ReminderComposeInfo { .. } => f.write_str("ReminderComposeInfo"),
+            Self::CreateReminder {
+                repeat_mode, pin, ..
+            } => f
+                .debug_struct("CreateReminder")
+                .field("repeat_mode", repeat_mode)
+                .field("pin", pin)
+                .finish(),
+            Self::AnswerComposerConfirm { ok, .. } => f
+                .debug_struct("AnswerComposerConfirm")
+                .field("ok", ok)
+                .finish(),
+            Self::DropComposerConfirms => f.write_str("DropComposerConfirms"),
+            Self::SeedComposerConfirms { active, queued } => f
+                .debug_struct("SeedComposerConfirms")
+                .field("has_active", &active.is_some())
+                .field("queued_count", &queued.len())
+                .finish(),
+            Self::ComposerReport { outcome, .. } => f
+                .debug_struct("ComposerReport")
+                .field("outcome", outcome)
+                .finish(),
+            Self::ResetComposer => f.write_str("ResetComposer"),
         }
     }
 }
@@ -1325,10 +1480,6 @@ pub enum Input {
         forward_id: u64,
         client_id: i64,
     },
-    ForwardContactCardDone {
-        forward_id: u64,
-        result: Result<SendMessageResult, String>,
-    },
     ForwardMediaResolved {
         forward_id: u64,
         resolution: MediaResolutionOutcome,
@@ -1488,6 +1639,51 @@ pub enum Input {
         now_ms: i64,
         error_type: Option<String>,
         op_id: Option<u64>,
+    },
+    // U13
+    StickerCategoriesFetched {
+        op_id: Option<u64>,
+        result: Result<(olaz_api::FetchedStickerCategories, usize), String>,
+    },
+    StickerTabsRecentsLoaded {
+        op_id: Option<u64>,
+        recent_count: usize,
+    },
+    RecentStickersLoaded {
+        op_id: Option<u64>,
+        rows: Vec<serde_json::Value>,
+    },
+    StickerCategoryDetailFetched {
+        op_id: Option<u64>,
+        cate_id: i64,
+        result: Result<Vec<Map<String, Value>>, String>,
+    },
+    StickerSearchFetched {
+        op_id: Option<u64>,
+        result: Result<Vec<Map<String, Value>>, String>,
+    },
+    StickerSuggestFetched {
+        op_id: Option<u64>,
+        result: Result<Vec<Map<String, Value>>, String>,
+    },
+    StickerSuggestPrefLoaded {
+        op_id: Option<u64>,
+        enabled: bool,
+    },
+    SendStickerDone {
+        send_id: u64,
+        result: Result<olaz_api::SendMessageResult, StickerSendError>,
+    },
+    ContactCardSendDone {
+        card_send_id: u64,
+        result: Result<olaz_api::SendMessageResult, String>,
+    },
+    CreateReminderDone {
+        op_id: Option<u64>,
+        ok: bool,
+    },
+    ConfirmPromoteExpired {
+        confirm_gen: u64,
     },
 }
 
@@ -1888,11 +2084,6 @@ impl fmt::Debug for Input {
                 .debug_struct("ForwardClientIdAllocated")
                 .field("forward_id", forward_id)
                 .finish(),
-            Self::ForwardContactCardDone { forward_id, result } => f
-                .debug_struct("ForwardContactCardDone")
-                .field("forward_id", forward_id)
-                .field("ok", &result.is_ok())
-                .finish(),
             Self::ForwardMediaResolved {
                 forward_id,
                 resolution,
@@ -2124,6 +2315,72 @@ impl fmt::Debug for Input {
                 .field("now_ms", now_ms)
                 .field("error_type", error_type)
                 .field("op_id", op_id)
+                .finish(),
+            // U13
+            Self::StickerCategoriesFetched { op_id, result } => f
+                .debug_struct("StickerCategoriesFetched")
+                .field("op_id", op_id)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::StickerTabsRecentsLoaded {
+                op_id,
+                recent_count,
+            } => f
+                .debug_struct("StickerTabsRecentsLoaded")
+                .field("op_id", op_id)
+                .field("recent_count", recent_count)
+                .finish(),
+            Self::RecentStickersLoaded { op_id, rows } => f
+                .debug_struct("RecentStickersLoaded")
+                .field("op_id", op_id)
+                .field("count", &rows.len())
+                .finish(),
+            Self::StickerCategoryDetailFetched {
+                op_id,
+                cate_id,
+                result,
+            } => f
+                .debug_struct("StickerCategoryDetailFetched")
+                .field("op_id", op_id)
+                .field("cate_id", cate_id)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::StickerSearchFetched { op_id, result } => f
+                .debug_struct("StickerSearchFetched")
+                .field("op_id", op_id)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::StickerSuggestFetched { op_id, result } => f
+                .debug_struct("StickerSuggestFetched")
+                .field("op_id", op_id)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::StickerSuggestPrefLoaded { op_id, enabled } => f
+                .debug_struct("StickerSuggestPrefLoaded")
+                .field("op_id", op_id)
+                .field("enabled", enabled)
+                .finish(),
+            Self::SendStickerDone { send_id, result } => f
+                .debug_struct("SendStickerDone")
+                .field("send_id", send_id)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::ContactCardSendDone {
+                card_send_id,
+                result,
+            } => f
+                .debug_struct("ContactCardSendDone")
+                .field("card_send_id", card_send_id)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::CreateReminderDone { op_id, ok } => f
+                .debug_struct("CreateReminderDone")
+                .field("op_id", op_id)
+                .field("ok", ok)
+                .finish(),
+            Self::ConfirmPromoteExpired { confirm_gen } => f
+                .debug_struct("ConfirmPromoteExpired")
+                .field("confirm_gen", confirm_gen)
                 .finish(),
         }
     }

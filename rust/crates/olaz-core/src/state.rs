@@ -12,9 +12,11 @@ use olaz_ws::CursorMap;
 use serde_json::{Map, Value, json};
 
 use crate::actions::{ActionsState, DeleteUndoSnapshot, MessageConfirmState};
+use crate::composer::{ComposerConfirm, ComposerState};
 use crate::conversations::{CachedProfile, ConversationsState};
 use crate::forward::{ForwardRequest, ForwardState};
 use crate::messages::{ContactsState, IdentitySnapshot, MessagesState};
+use crate::stickers::{StickerState, StickerSuggestSetting};
 use crate::typing::{TypingState, TypingStatus};
 
 /// Top-level state owned by the single `olaz-core` actor.
@@ -43,6 +45,9 @@ pub struct CoreState {
     pub board_pins: BTreeMap<String, crate::polls::BoardPinList>,
     // U7: temporary read-only raw board topics mirror written through from Swift until U7 lands.
     pub board_raw_topics: BTreeMap<String, crate::polls::BoardRawTopics>,
+    // U13
+    pub stickers: StickerState,
+    pub composer: ComposerState,
 }
 
 impl CoreState {
@@ -69,6 +74,10 @@ impl CoreState {
             // U12
             polls: self.polls.clone(),
             board_pins: self.board_pins.clone(),
+            // U13
+            sticker_suggest_setting: self.stickers.suggest_setting,
+            composer_confirm: self.composer.active_confirm.clone(),
+            queued_composer_confirms: self.composer.queued_confirms.iter().cloned().collect(),
         }
     }
 
@@ -110,6 +119,9 @@ impl fmt::Debug for CoreState {
             .field("polls", &self.polls)
             .field("board_pins_count", &self.board_pins.len())
             .field("board_raw_topics_count", &self.board_raw_topics.len())
+            // U13
+            .field("stickers", &self.stickers)
+            .field("composer", &self.composer)
             .finish()
     }
 }
@@ -136,6 +148,10 @@ pub struct CoreSnapshot {
     // U12
     pub polls: crate::polls::PollsState,
     pub board_pins: BTreeMap<String, crate::polls::BoardPinList>,
+    // U13
+    pub sticker_suggest_setting: Option<StickerSuggestSetting>,
+    pub composer_confirm: Option<ComposerConfirm>,
+    pub queued_composer_confirms: Vec<ComposerConfirm>,
 }
 
 impl fmt::Debug for CoreSnapshot {
@@ -162,6 +178,13 @@ impl fmt::Debug for CoreSnapshot {
             // U12
             .field("polls", &self.polls)
             .field("board_pins_count", &self.board_pins.len())
+            // U13
+            .field("sticker_suggest_setting", &self.sticker_suggest_setting)
+            .field("has_composer_confirm", &self.composer_confirm.is_some())
+            .field(
+                "queued_composer_confirms_count",
+                &self.queued_composer_confirms.len(),
+            )
             .finish()
     }
 }
