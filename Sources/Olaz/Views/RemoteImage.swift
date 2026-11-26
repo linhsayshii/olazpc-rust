@@ -179,6 +179,7 @@ struct AnimatedImageView: NSViewRepresentable {
         override init(frame: NSRect) {
             super.init(frame: frame)
             wantsLayer = true
+            clipsToBounds = true
             layer?.masksToBounds = true
             imageView.animates = true
             imageView.imageScaling = .scaleAxesIndependently
@@ -189,7 +190,10 @@ struct AnimatedImageView: NSViewRepresentable {
         override func layout() {
             super.layout()
             let size = imageView.image?.size ?? .zero
-            guard size.width > 0, size.height > 0, bounds.width > 0, bounds.height > 0 else { return }
+            guard size.width > 0, size.height > 0, bounds.width > 0, bounds.height > 0 else {
+                imageView.frame = .zero
+                return
+            }
             let sx = bounds.width / size.width, sy = bounds.height / size.height
             let scale = fill ? max(sx, sy) : min(sx, sy)
             let w = size.width * scale, h = size.height * scale
@@ -206,8 +210,41 @@ struct AnimatedImageView: NSViewRepresentable {
         view.needsLayout = true
     }
 
+    /// Computes the layout size for an animated image under `proposal`, matching SwiftUI's
+    /// `Image.resizable().aspectRatio(contentMode:)` so `.fit` preserves aspect ratio and never
+    /// falls back to an unscaled natural pixel dimension when one axis is unspecified (for example
+    /// inside a chat row's `.fixedSize(horizontal: false, vertical: true)`).
+    nonisolated static func fittedSize(imageSize: CGSize, proposal: ProposedViewSize, contentMode: ContentMode) -> CGSize {
+        let pw = proposal.width.flatMap { $0.isFinite ? max(0, $0) : nil }
+        let ph = proposal.height.flatMap { $0.isFinite ? max(0, $0) : nil }
+        guard imageSize.width > 0, imageSize.height > 0 else {
+            return CGSize(width: pw ?? 0, height: ph ?? 0)
+        }
+        switch contentMode {
+        case .fit:
+            switch (pw, ph) {
+            case let (w?, h?):
+                guard w > 0, h > 0 else { return .zero }
+                let scale = min(w / imageSize.width, h / imageSize.height)
+                return CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+            case let (w?, nil):
+                guard w > 0 else { return .zero }
+                let scale = w / imageSize.width
+                return CGSize(width: w, height: imageSize.height * scale)
+            case let (nil, h?):
+                guard h > 0 else { return .zero }
+                let scale = h / imageSize.height
+                return CGSize(width: imageSize.width * scale, height: h)
+            case (nil, nil):
+                return imageSize
+            }
+        case .fill:
+            return CGSize(width: pw ?? imageSize.width, height: ph ?? imageSize.height)
+        }
+    }
+
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: Container, context: Context) -> CGSize? {
-        proposal.replacingUnspecifiedDimensions(by: image.size)
+        Self.fittedSize(imageSize: image.size, proposal: proposal, contentMode: contentMode)
     }
 }
 
