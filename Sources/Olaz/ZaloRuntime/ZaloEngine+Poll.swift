@@ -678,7 +678,6 @@ extension ZaloEngine {
                 await waitForMirrorVersion(v)
             }
         }
-        await syncCachedIdentityPreferencesFromStore()
     }
 
     internal func armLocalPollDebounceTask(pollId: String, seq: UInt64, delayMs: UInt64) {

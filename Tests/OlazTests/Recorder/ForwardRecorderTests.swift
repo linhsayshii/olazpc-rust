@@ -831,6 +831,86 @@ final class ForwardRecorderTests: XCTestCase {
                     ]),
                 ]
             ),
+
+            // 9. forward_contact_card_e2ee: forward contact card (with and without phone) to a 1-1 target
+            // in e2ee_threads (records today's Swift plain /api/message/contact behaviour as-is).
+            ForwardRecorderHarness.ScenarioDef(
+                name: "forward_contact_card_e2ee",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000809",
+                    displayName: "Forward User 9",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "next_client_id": .int(8000000000900),
+                        "e2ee_threads": .array([.string("3000809b")]),
+                        "history_freshness": .object(["3000809a": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000809a", name: "Source 9", previewText: "[Danh thiếp] Card NoPhone", previewTsMs: baseTs + 2_000),
+                            localConv(id: "3000809b", name: "E2EE Peer 9"),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(
+                                id: "9080901",
+                                convId: "3000809a",
+                                senderId: "3000809a",
+                                text: "[Danh thiếp] Card Phone",
+                                kind: .object([
+                                    "type": .string("contactCard"),
+                                    "name": .string("Card Phone"),
+                                    "uid": .string("4000809"),
+                                    "phone": .string("+84901234569"),
+                                ]),
+                                kindTag: "contactCard",
+                                tsMs: baseTs + 1_000,
+                                menu: okMenu
+                            ),
+                            storedMsg(
+                                id: "9080902",
+                                convId: "3000809a",
+                                senderId: "3000809a",
+                                text: "[Danh thiếp] Card NoPhone",
+                                kind: .object([
+                                    "type": .string("contactCard"),
+                                    "name": .string("Card NoPhone"),
+                                    "uid": .string("4000810"),
+                                ]),
+                                kindTag: "contactCard",
+                                tsMs: baseTs + 2_000,
+                                menu: okMenu
+                            ),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000809", displayName: "Forward User 9"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000809", displayName: "Forward User 9"),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/contact",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["msgId": .string("9009001")])])
+                    ),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/contact",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["msgId": .string("9009002")])])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000809a")])]),
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 10_000),
+                        "args": .object(["conv_id": .string("3000809a"), "msg_id": .string("9080901"), "targets": .array([.string("3000809b")])]),
+                    ]),
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 11_000),
+                        "args": .object(["conv_id": .string("3000809a"), "msg_id": .string("9080902"), "targets": .array([.string("3000809b")])]),
+                    ]),
+                ]
+            ),
         ]
     }
 }
@@ -1193,6 +1273,35 @@ enum ForwardRecorderHarness {
             }
         }
 
+        let e2eeContactCardQueue = scenario.seed["host_results"]?["send_e2ee_contact_card"]?.arrayValue ?? []
+        let hasScriptedContactCard = scenario.seed["host_results"]?["send_e2ee_contact_card"] != nil
+        var e2eeContactCardIndex = 0
+        engine.sendE2EEContactCardHostHandler = { args in
+            let cliId = args["client_id"] as? String ?? ""
+            if hasScriptedContactCard {
+                guard e2eeContactCardIndex < e2eeContactCardQueue.count else {
+                    throw ZaloSessionError(code: 500, message: "No scripted send_e2ee_contact_card result", url: "/api/e2ee/pc/message/forward")
+                }
+                let item = e2eeContactCardQueue[e2eeContactCardIndex]
+                e2eeContactCardIndex += 1
+                if let errObj = item["error"]?.objectValue {
+                    let code = Int(errObj["code"]?.int64Value ?? 500)
+                    let msg = errObj["message"]?.stringValue ?? "E2EE error"
+                    let url = errObj["url"]?.stringValue ?? "/api/e2ee/pc/message/forward"
+                    throw ZaloSessionError(code: code, message: msg, url: url)
+                }
+                if let errMsg = item["error"]?.stringValue {
+                    throw ZaloSessionError(code: 500, message: errMsg, url: "/api/e2ee/pc/message/forward")
+                }
+                let msgId = item["msg_id"]?.stringValue ?? cliId
+                let cliMsgId = item["cli_msg_id"]?.stringValue ?? cliId
+                let tsMs = item["ts_ms"]?.int64Value ?? 0
+                return SendMessageResult(msgId: msgId, cliMsgId: cliMsgId, tsMs: tsMs)
+            }
+            // Deterministic fallback for unscripted send_e2ee_contact_card (user-decisions item 14.1).
+            return SendMessageResult(msgId: cliId, cliMsgId: cliId, tsMs: 0)
+        }
+
         let resolveMediaQueue = scenario.seed["host_results"]?["resolve_media"]?.arrayValue ?? []
         var resolveMediaIndex = 0
         if scenario.seed["host_results"]?["resolve_media"] != nil {
@@ -1353,7 +1462,8 @@ enum ForwardRecorderHarness {
                 return true
             case "apply_batch", "apply_parsed_events", "show_typing",
                  "resolve_media", "resolve_file", "fetch_media_data",
-                 "send_media", "send_files", "send_e2ee_text":
+                 "send_media", "send_files", "send_e2ee_text",
+                 "send_e2ee_contact_card":
                 return true
             case "start_ws":
                 return !suppressedTransports.contains("ws")

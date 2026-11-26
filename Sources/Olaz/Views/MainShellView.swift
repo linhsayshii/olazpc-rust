@@ -30,6 +30,10 @@ struct MainShellView: View {
             InspectorColumn()
                 .inspectorColumnWidth(min: 260, ideal: InspectorRoom.inspectorWidth, max: 440)
         }
+        // If SwiftUI or the system dismisses the inspector directly, release the window room and minimum width too.
+        .onChange(of: shell.showInspector) { _, shown in
+            if !shown { shell.hideInspector() }
+        }
         // Selection and call state are watched by a child view: read here, every chat switch (and the call gate it updates)
         // would re-run this whole body, split view and toolbar included.
         .background {

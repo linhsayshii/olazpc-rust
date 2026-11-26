@@ -12,7 +12,8 @@ use crate::input::{Command, Input};
 use crate::polls::{
     POLL_DEBOUNCE_DELAY_MS, PollActionResult, PollCapabilities, PollPinOutcome,
     build_pin_limit_confirm, build_poll_voters, merge_fetched_group_metadata,
-    normalize_poll_detail, refresh_poll_pin_state, resolve_poll_group_id,
+    normalize_poll_detail, poll_detail_shape_log_line, refresh_poll_pin_state,
+    resolve_poll_group_id,
 };
 use crate::reduce::ReduceOutput;
 use crate::state::CoreState;
@@ -255,6 +256,8 @@ pub fn reduce_polls(state: &mut CoreState, input: Input, out: &mut ReduceOutput)
                     complete_op(out, op_id, OpResult::Unit, false);
                     return;
                 };
+                out.effects
+                    .push(Effect::EngineLog(poll_detail_shape_log_line(&data_node)));
                 let gid = resolve_poll_group_id(
                     &poll_id,
                     &data_node,
@@ -304,6 +307,7 @@ pub fn reduce_polls(state: &mut CoreState, input: Input, out: &mut ReduceOutput)
                 out.dirty.insert(DirtyKey::Conversations);
                 out.dirty.insert(DirtyKey::ConversationFlags);
                 out.dirty.insert(DirtyKey::ConversationExtras);
+                out.dirty.insert(DirtyKey::CachedGroups);
                 if let Some(bytes) = persisted.cached_groups_json {
                     out.effects.push(Effect::Store(StoreOp::SetPreferenceData {
                         key: "cachedGroups".to_owned(),
@@ -803,5 +807,117 @@ fn reduce_poll_command(
         }
 
         _ => {}
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests assert invariants on synthetic fixtures"
+)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::reduce::reduce;
+
+    #[test]
+    fn poll_detail_fetched_emits_shape_engine_log_and_parses_numeric_flags() {
+        let mut state = CoreState::default();
+        let payload = json!({
+            "data": {
+                "group_id": "500101",
+                "question": "SECRET_POLL_QUESTION",
+                "creator": "2001001",
+                "status": 1,
+                "expired_time": 0,
+                "is_add_new_option": 1,
+                "is_multi_choice": 1,
+                "is_anonymous": 0,
+                "is_hide_vote_preview": 0,
+                "options": [
+                    {"option_id": 1, "content": "SECRET_OPT", "voters": []},
+                ],
+            }
+        });
+        let out = reduce(
+            &mut state,
+            Input::PollDetailFetched {
+                op_id: None,
+                poll_id: "9301".to_owned(),
+                purpose: PollDetailPurpose::Refresh {
+                    now_ms: 1_700_010_000_000,
+                },
+                payload: payload.as_object().cloned(),
+                is_authenticated: false,
+            },
+        );
+        let detail = state.polls.details.get("9301").expect("poll detail stored");
+        assert!(detail.allow_add);
+        assert!(detail.multi);
+        assert!(!detail.anonymous);
+        assert!(!detail.hide_preview);
+        let shape_logs: Vec<&str> = out
+            .effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::EngineLog(line) => Some(line.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shape_logs.len(), 1);
+        assert!(shape_logs[0].starts_with("poll detail shape: "));
+        assert!(shape_logs[0].contains("is_add_new_option:number"));
+        assert!(!shape_logs[0].contains("SECRET_POLL_QUESTION"));
+        assert!(!shape_logs[0].contains("SECRET_OPT"));
+    }
+
+    #[test]
+    fn poll_group_detail_fetched_dirties_cached_groups() {
+        let mut state = CoreState::default();
+        let data_node = json!({
+            "group_id": "500202",
+            "question": "Q",
+            "creator": "2001001",
+            "status": 1,
+            "expired_time": 0,
+            "is_add_new_option": 1,
+            "options": [],
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+        let group_info = json!({
+            "groupId": "500202",
+            "name": "Nhóm Poll",
+            "avt": "https://cdn.example.invalid/g.jpg",
+            "creatorId": "2001001",
+            "memVerList": ["2001001_0", "3001001_1"],
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+
+        let out = reduce(
+            &mut state,
+            Input::PollGroupDetailFetched {
+                op_id: None,
+                poll_id: "9302".to_owned(),
+                group_id: "g500202".to_owned(),
+                data_node,
+                group_info: Some(group_info),
+                now_ms: 1_700_010_000_000,
+            },
+        );
+        assert!(out.dirty.contains(&DirtyKey::CachedGroups));
+        assert!(out.dirty.contains(&DirtyKey::Polls));
+        let cached = state
+            .conversations
+            .identities
+            .cached_groups
+            .get("g500202")
+            .expect("cached group updated");
+        assert_eq!(cached.name, "Nhóm Poll");
+        assert_eq!(cached.members, 2);
     }
 }
