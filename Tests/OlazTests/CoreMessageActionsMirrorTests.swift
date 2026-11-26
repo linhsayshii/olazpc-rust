@@ -25,6 +25,8 @@ import Testing
             messageMeta: nil,
             contacts: nil,
             typing: nil,
+            forwardRequest: nil,
+            clearSelection: false,
             deleteUndo: deleteUndo,
             messageConfirm: nil,
             autoDelete: nil,
@@ -390,6 +392,292 @@ import Testing
         // After core settles, targetMsg remains present, deleteUndo stays nil, and overlays are drained.
         await engine.settleForRecording()
         #expect(engine.messages[convId]?.contains(where: { $0.id == targetMsg.id }) == true)
+        #expect(engine.deleteUndo == nil)
+        #expect(engine.optimisticMessageOverlays.isEmpty)
+
+        await engine.finishTearDownForRecording()
+    }
+
+    @MainActor
+    @Test func staleBatchAfterV1DoesNotPoisonSuppressedReaction() async throws {
+        let convId = "3000777"
+        let (engine, _, cleanup) = try await Self.makeBootedEngine(convId: convId)
+        defer { cleanup() }
+        defer { engine.cancelTasksForRecording() }
+
+        let originalMsg = try #require(engine.messages[convId]?.last)
+        #expect(originalMsg.reactions.isEmpty)
+        let v0 = engine.appliedMirrorVersion
+        let v1 = v0 + 1
+
+        var heartMsg = originalMsg
+        ZaloEngine.mutateReactions(
+            &heartMsg.reactions,
+            actorUid: "2000777",
+            myUid: "2000777",
+            isMe: true,
+            rType: "5",
+            rIcon: "/-heart",
+            allowDuplicateSameUser: true,
+            nameLookup: { _ in "Bạn" }
+        )
+        #expect(heartMsg.reactions.contains(where: { $0.includesMe && $0.icon.type == "5" }))
+
+        // Apply optimistic ❤️ on MainActor and open an unresolved overlay (resolvedVersion == .max).
+        let token = engine.beginOptimisticReactionOverlay(
+            convId: convId,
+            msgId: heartMsg.id,
+            clientId: heartMsg.clientId,
+            reactions: heartMsg.reactions
+        )
+        if var list = engine.messages[convId], let idx = list.firstIndex(where: { $0.id == heartMsg.id }) {
+            list[idx] = heartMsg
+            engine.messages[convId] = list
+        }
+
+        // Authoritative V1 carrying ❤️ arrives while the overlay is still unresolved.
+        engine.applyCoreChanges(Self.emptyChanges(
+            version: v1,
+            windowDeltas: [
+                .patch(convId: convId, upserts: [ChatMessageRecord(message: heartMsg)], removedIds: []),
+            ]
+        ))
+        #expect(engine.appliedMirrorVersion == v1)
+
+        // A stale non-zero batch (v0 < v1) and a version-0 stale batch both arrive AFTER V1
+        // carrying the pre-react empty reactions. Neither may poison the V1 suppressed value.
+        engine.applyCoreChanges(Self.emptyChanges(
+            version: v0,
+            windowDeltas: [
+                .patch(convId: convId, upserts: [ChatMessageRecord(message: originalMsg)], removedIds: []),
+            ]
+        ))
+        engine.applyCoreChanges(Self.emptyChanges(
+            version: 0,
+            windowDeltas: [
+                .patch(convId: convId, upserts: [ChatMessageRecord(message: originalMsg)], removedIds: []),
+            ]
+        ))
+
+        let midMsg = try #require(engine.messages[convId]?.first(where: { $0.id == originalMsg.id }))
+        #expect(midMsg.reactions.contains(where: { $0.includesMe && $0.icon.type == "5" }))
+
+        // Resolving the overlay at V1 must keep ❤️ (not overwrite with stale []) and drain overlays.
+        engine.resolveOptimisticOverlay(token: token, targetVersion: v1)
+        let finalMsg = try #require(engine.messages[convId]?.first(where: { $0.id == originalMsg.id }))
+        #expect(finalMsg.reactions.contains(where: { $0.includesMe && $0.icon.type == "5" }))
+        #expect(engine.optimisticMessageOverlays.isEmpty)
+
+        await engine.finishTearDownForRecording()
+    }
+
+    @MainActor
+    @Test func outOfOrderNonZeroBatchIsIgnored() async throws {
+        let convId = "3000777"
+        let (engine, _, cleanup) = try await Self.makeBootedEngine(convId: convId)
+        defer { cleanup() }
+        defer { engine.cancelTasksForRecording() }
+
+        let originalMsg = try #require(engine.messages[convId]?.last)
+        let v0 = max(UInt64(1), engine.appliedMirrorVersion)
+        let v1 = v0 + 1
+        let v2 = v0 + 2
+
+        var v1Msg = originalMsg
+        v1Msg.text = "Authoritative V1"
+        ZaloEngine.mutateReactions(
+            &v1Msg.reactions,
+            actorUid: "2000777",
+            myUid: "2000777",
+            isMe: true,
+            rType: "5",
+            rIcon: "/-heart",
+            allowDuplicateSameUser: true,
+            nameLookup: { _ in "Bạn" }
+        )
+
+        // Advance mirror to V1.
+        engine.applyCoreChanges(Self.emptyChanges(
+            version: v1,
+            windowDeltas: [
+                .patch(convId: convId, upserts: [ChatMessageRecord(message: v1Msg)], removedIds: []),
+            ]
+        ))
+        #expect(engine.appliedMirrorVersion == v1)
+
+        // Deliver a strictly older non-zero batch (v0 < v1) with stale text, empty reactions, and undo.
+        var staleMsg = originalMsg
+        staleMsg.text = "Stale V0"
+        staleMsg.reactions = []
+        let staleUndo = DeleteUndoSnapshotRecord(convId: convId, count: 1, deadlineMs: engine.nowMs() + 5_000)
+        engine.applyCoreChanges(Self.emptyChanges(
+            version: v0,
+            windowDeltas: [
+                .patch(convId: convId, upserts: [ChatMessageRecord(message: staleMsg)], removedIds: []),
+            ],
+            deleteUndo: DeleteUndoUpdateRecord(undo: staleUndo)
+        ))
+
+        let afterStale = try #require(engine.messages[convId]?.first(where: { $0.id == originalMsg.id }))
+        #expect(engine.appliedMirrorVersion == v1)
+        #expect(afterStale.text == "Authoritative V1")
+        #expect(afterStale.reactions.contains(where: { $0.includesMe && $0.icon.type == "5" }))
+        #expect(engine.deleteUndo == nil)
+
+        // A strictly newer batch (v2 > v1) still applies normally.
+        var v2Msg = v1Msg
+        v2Msg.text = "Authoritative V2"
+        engine.applyCoreChanges(Self.emptyChanges(
+            version: v2,
+            windowDeltas: [
+                .patch(convId: convId, upserts: [ChatMessageRecord(message: v2Msg)], removedIds: []),
+            ]
+        ))
+        let afterV2 = try #require(engine.messages[convId]?.first(where: { $0.id == originalMsg.id }))
+        #expect(engine.appliedMirrorVersion == v2)
+        #expect(afterV2.text == "Authoritative V2")
+
+        await engine.finishTearDownForRecording()
+    }
+
+    @MainActor
+    @Test func unrelatedDeltaInSameConversationDoesNotOverwriteSuppressedRollback() async throws {
+        let convId = "3000777"
+        let (engine, _, cleanup) = try await Self.makeBootedEngine(convId: convId)
+        defer { cleanup() }
+        defer { engine.cancelTasksForRecording() }
+
+        let firstMsg = try #require(engine.messages[convId]?.first)
+        let targetMsg = try #require(engine.messages[convId]?.last)
+        #expect(firstMsg.id != targetMsg.id)
+        let v0 = engine.appliedMirrorVersion
+
+        // Part A: Failed reaction rollback followed by unrelated append + patch in the same conversation.
+        var heartMsg = targetMsg
+        ZaloEngine.mutateReactions(
+            &heartMsg.reactions,
+            actorUid: "2000777",
+            myUid: "2000777",
+            isMe: true,
+            rType: "5",
+            rIcon: "/-heart",
+            allowDuplicateSameUser: true,
+            nameLookup: { _ in "Bạn" }
+        )
+        let reactToken = engine.beginOptimisticReactionOverlay(
+            convId: convId,
+            msgId: heartMsg.id,
+            clientId: heartMsg.clientId,
+            reactions: heartMsg.reactions
+        )
+        if var list = engine.messages[convId], let idx = list.firstIndex(where: { $0.id == heartMsg.id }) {
+            list[idx] = heartMsg
+            engine.messages[convId] = list
+        }
+
+        // Core rollback arrives at V1 (empty reactions) while overlay is still unresolved.
+        let v1 = v0 + 1
+        engine.applyCoreChanges(Self.emptyChanges(
+            version: v1,
+            windowDeltas: [
+                .patch(convId: convId, upserts: [ChatMessageRecord(message: targetMsg)], removedIds: []),
+            ]
+        ))
+        // Optimistic ❤️ stays visible until resolved.
+        let beforeUnrelated = try #require(engine.messages[convId]?.first(where: { $0.id == targetMsg.id }))
+        #expect(beforeUnrelated.reactions.contains(where: { $0.includesMe && $0.icon.type == "5" }))
+
+        // Unrelated delta at V2 in the SAME conversation: edits firstMsg and appends m3, never touching targetMsg.
+        var editedFirst = firstMsg
+        editedFirst.text = "First (edited)"
+        let m3 = ChatMessage(
+            id: "8200003",
+            conversationId: convId,
+            senderId: convId,
+            senderName: "Peer",
+            senderAvatar: nil,
+            isMine: false,
+            kind: .text,
+            text: "Third",
+            date: targetMsg.date.addingTimeInterval(1),
+            status: .sent,
+            quote: nil,
+            reactions: [],
+            isE2EE: false,
+            clientId: "c3"
+        )
+        let v2 = v0 + 2
+        engine.applyCoreChanges(Self.emptyChanges(
+            version: v2,
+            windowDeltas: [
+                .patch(convId: convId, upserts: [ChatMessageRecord(message: editedFirst)], removedIds: []),
+                .append(convId: convId, messages: [ChatMessageRecord(message: m3)]),
+            ]
+        ))
+
+        // Resolving the reaction overlay at V1 must still roll back to [] (not be overwritten by V2).
+        engine.resolveOptimisticOverlay(token: reactToken, targetVersion: v1)
+        let rolledBack = try #require(engine.messages[convId]?.first(where: { $0.id == targetMsg.id }))
+        #expect(rolledBack.reactions.isEmpty)
+        #expect(engine.messages[convId]?.first(where: { $0.id == firstMsg.id })?.text == "First (edited)")
+        #expect(engine.messages[convId]?.contains(where: { $0.id == "8200003" }) == true)
+        #expect(engine.optimisticMessageOverlays.isEmpty)
+
+        // Part B: Failed delete rollback followed by unrelated append in the same conversation.
+        let fakeUndo = DeleteUndo(
+            id: UUID().uuidString,
+            conversationId: convId,
+            count: 1,
+            deadline: Date().addingTimeInterval(6)
+        )
+        let deleteToken = engine.beginOptimisticDeleteOverlay(
+            convId: convId,
+            messages: [targetMsg],
+            undo: fakeUndo
+        )
+        engine.messages[convId]?.removeAll { $0.id == targetMsg.id }
+        engine.deleteUndo = fakeUndo
+
+        // Authoritative V3 restores targetMsg (rollback) and clears deleteUndo while overlay is unresolved.
+        let v3 = v0 + 3
+        engine.applyCoreChanges(Self.emptyChanges(
+            version: v3,
+            windowDeltas: [
+                .patch(convId: convId, upserts: [ChatMessageRecord(message: targetMsg)], removedIds: []),
+            ],
+            deleteUndo: DeleteUndoUpdateRecord(undo: nil)
+        ))
+        #expect(engine.messages[convId]?.contains(where: { $0.id == targetMsg.id }) == false)
+
+        // Unrelated V4 appends m4 in the same conversation without touching targetMsg.
+        let m4 = ChatMessage(
+            id: "8200004",
+            conversationId: convId,
+            senderId: convId,
+            senderName: "Peer",
+            senderAvatar: nil,
+            isMine: false,
+            kind: .text,
+            text: "Fourth",
+            date: m3.date.addingTimeInterval(1),
+            status: .sent,
+            quote: nil,
+            reactions: [],
+            isE2EE: false,
+            clientId: "c4"
+        )
+        let v4 = v0 + 4
+        engine.applyCoreChanges(Self.emptyChanges(
+            version: v4,
+            windowDeltas: [
+                .append(convId: convId, messages: [ChatMessageRecord(message: m4)]),
+            ]
+        ))
+
+        // Resolving the delete overlay at V3 must still restore targetMsg and clear deleteUndo.
+        engine.resolveOptimisticOverlay(token: deleteToken, targetVersion: v3)
+        #expect(engine.messages[convId]?.contains(where: { $0.id == targetMsg.id }) == true)
+        #expect(engine.messages[convId]?.contains(where: { $0.id == "8200004" }) == true)
         #expect(engine.deleteUndo == nil)
         #expect(engine.optimisticMessageOverlays.isEmpty)
 

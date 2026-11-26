@@ -188,6 +188,12 @@ final class ZaloEngine {
         }
     }
     @ObservationIgnored internal var sendE2EETextHostHandler: (([String: Any]) async throws -> SendMessageResult)?
+    @ObservationIgnored internal var resolveMediaHostHandler: (([String: Any]) async -> MediaResolution)?
+    @ObservationIgnored internal var resolveFileHostHandler: (([String: Any]) async -> FileResolution)?
+    @ObservationIgnored internal var fetchMediaDataHostHandler: (([String: Any]) async -> Data?)?
+    @ObservationIgnored internal var sendMediaHostHandler: (([String: Any]) async -> ComposerOutcome)?
+    @ObservationIgnored internal var sendFilesHostHandler: (([String: Any]) async -> ComposerOutcome)?
+    @ObservationIgnored internal var forwardTempPhotoURL: (() -> URL)?
     @ObservationIgnored internal var traceU4HostEnabled: Bool = false {
         didSet {
             let active = (hostTrace != nil) && traceU4HostEnabled
@@ -226,6 +232,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var contactsTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var pollRefreshTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored internal var pollDebounceSleep: (@MainActor (Int) async -> Bool)?
+    @ObservationIgnored internal var localPollSyncEpoch: UInt64 = 0
     @ObservationIgnored internal var activeSendTask: Task<Bool, Never>?
     @ObservationIgnored internal var batchImportTask: Task<Void, Never>?
     @ObservationIgnored internal var activeSyncBatchTasks: [UUID: Task<Void, Never>] = [:]
@@ -483,6 +490,8 @@ final class ZaloEngine {
         cachedUnreadMarks = []
         cachedAliases = [:]
         cachedBoardRawTopics = [:]
+        // U7: clear core's temporary board caches until U7 owns board pins.
+        coreLifecycle.core?.clearBoardCaches()
         failedDrafts = FailedDraftStore()
     }
 

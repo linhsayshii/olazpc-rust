@@ -186,7 +186,7 @@ extension ZaloEngine {
                 ok: "Xác nhận"
             )
         case .chooseMany(let need):
-            CardActionCenter.shared.show(
+            showActionCard(
                 "Đã đạt giới hạn \(limit) ghim. Vui lòng chọn ít nhất \(need) ghim cần bỏ để cập nhật ghim mới.",
                 in: conversation
             )
@@ -205,12 +205,16 @@ extension ZaloEngine {
         )
         list.items.insert(item, at: 0)
         pins[conversation] = list
+        // U7: write-through optimistic pin board mutation until U7 owns board pins.
+        pushCoreBoardPinsIfRunning(for: conversation)
     }
 
     internal func removePinOptimistically(_ ref: String, in conversationId: String) {
         guard var list = pins[conversationId] else { return }
         list.items.removeAll { $0.ref == ref }
         pins[conversationId] = list
+        // U7: write-through optimistic pin board removal until U7 owns board pins.
+        pushCoreBoardPinsIfRunning(for: conversationId)
     }
 
     /// Loads the pinned message into the open chat (from the local store when it is older than what is shown); its row id, or nil.
@@ -229,9 +233,13 @@ extension ZaloEngine {
     func handlePinTopicEvent(conversationId: String) {
         EngineLog.shared.write("pins: event group=\(ZaloWireParser.isGroupId(conversationId)) open=\(openConversationId == conversationId)")
         if openConversationId == conversationId {
-            Task { await refreshBoardPins(for: conversationId) }
+            trackMessageActionTask { [weak self] in
+                await self?.refreshBoardPins(for: conversationId)
+            }
         } else {
             pins[conversationId] = nil
+            // U7: write-through board cache invalidation until U7 owns board pins.
+            pushCoreBoardPinsIfRunning(for: conversationId)
         }
     }
 }

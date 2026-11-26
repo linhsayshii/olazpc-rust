@@ -8,10 +8,13 @@ extension ZaloEngine {
     }
 
     /// Offline-only helper used when `coreLifecycle.core` is not started (unit tests).
+    /// When `coreLifecycle.core` is active, `olaz-core` reads `state.actions.delete_undo.pending_deleted_keys(&conv_id)` directly.
     private func pendingDeletedSearchKeys(in convId: String) -> [String] {
         var keys: [String] = []
         var seen = Set<String>()
-        for msg in pendingDeletedMessages.values.joined() where msg.conversationId == convId {
+        let sources = Array(pendingDeletedMessages.values.joined().filter { $0.conversationId == convId })
+            + (lastOptimisticDeletedMessages[convId] ?? [])
+        for msg in sources {
             if !msg.id.isEmpty, seen.insert(msg.id).inserted {
                 keys.append(msg.id)
             }
@@ -20,6 +23,16 @@ extension ZaloEngine {
             }
         }
         return keys
+    }
+
+    /// Ids of messages deleted "for me" in `convId` whose undo bar has not committed yet: they stay in SQLite until the
+    /// commit, so search and the load-around window must skip them. With the core, the batch is in
+    /// `lastOptimisticDeletedMessages` (U6); without it, in `pendingDeletedMessages`.
+    // U14: read the pending delete from core state once search moves into olaz-core.
+    private func pendingDeletedIds(in convId: String) -> Set<String> {
+        var ids = Set(pendingDeletedMessages.values.joined().filter { $0.conversationId == convId }.map(\.id))
+        ids.formUnion((lastOptimisticDeletedMessages[convId] ?? []).map(\.id))
+        return ids
     }
 
     /// Searches in-memory messages and SQLite history for `convId`, deduplicated by message/client ID and ordered newest-first.

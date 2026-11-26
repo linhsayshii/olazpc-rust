@@ -1,9 +1,17 @@
 import Foundation
+import OlazCore
 
-// Group polls (MSG_POLL 26), bridged to `HostScripts/poll-adapter.js` (`window.__zaloPoll`; posts
-// {page:'main', poll:{id, detail}} / {page:'main', poll:{id, error}}). Everything runs through the official
-// GroupPollManager (see the adapter header). Writes (vote / lock / share / create) are only called from explicit
-// button presses in `PollViews.swift`.
+// Group polls (MSG_POLL 26) backed by `olaz-core` (`PollsState` + `PollClock` + pure draft/config models).
+// Writes (vote / lock / share / create / pin / unpin) are triggered from explicit actions in `PollViews.swift`.
+
+private func pollJsonObjectString(_ dict: [String: Any]) -> String? {
+    guard JSONSerialization.isValidJSONObject(dict),
+          let data = try? JSONSerialization.data(withJSONObject: dict),
+          let text = String(data: data, encoding: .utf8) else {
+        return nil
+    }
+    return text
+}
 
 // MARK: - Poll model
 
@@ -13,6 +21,31 @@ struct PollDetail: Equatable, Sendable, Identifiable {
         var content: String
         var votes: Int
         var voted: Bool
+        fileprivate var cachedWeight: Double
+
+        init(id: String, content: String, votes: Int, voted: Bool, weight: Double = 0) {
+            self.id = id
+            self.content = content
+            self.votes = votes
+            self.voted = voted
+            self.cachedWeight = weight
+        }
+
+        init(coreRecord r: PollOptionRecord) {
+            self.id = r.id
+            self.content = r.content
+            self.votes = Int(r.votes)
+            self.voted = r.voted
+            self.cachedWeight = r.weight
+        }
+
+        var coreRecord: PollOptionRecord {
+            PollOptionRecord(id: id, content: content, votes: Int64(votes), voted: voted, weight: cachedWeight)
+        }
+
+        static func == (lhs: Option, rhs: Option) -> Bool {
+            lhs.id == rhs.id && lhs.content == rhs.content && lhs.votes == rhs.votes && lhs.voted == rhs.voted
+        }
     }
 
     var id: String
@@ -23,6 +56,7 @@ struct PollDetail: Equatable, Sendable, Identifiable {
     var creatorName: String
     var created: Date?
     var expires: Date?
+    private let expiresMs: Int64?
     var closed: Bool
     /// I have voted (official `joined`).
     var joined: Bool
@@ -34,53 +68,108 @@ struct PollDetail: Equatable, Sendable, Identifiable {
     var voterCount: Int
     /// Owner / deputy / creator (official `isEnableClose`).
     var canClose: Bool
+    /// Precomputed in core once per detail update.
+    let totalVotes: Int
+    /// "Ẩn kết quả khi chưa bình chọn": the numbers are only meaningful after I voted.
+    let resultsHidden: Bool
+    /// Official `isEnableViewDetail`: voter list is offered when the poll is not anonymous and results are visible.
+    let votersVisible: Bool
+    private let lockedWithoutExpiry: Bool
+    fileprivate let hasDuplicateOptions: Bool
     var options: [Option]
 
-    init?(json: [String: Any]) {
-        guard let id = json["id"] as? String, !id.isEmpty else { return nil }
-        func text(_ key: String) -> String { json[key] as? String ?? "" }
-        func flag(_ key: String) -> Bool { (json[key] as? NSNumber)?.boolValue ?? false }
-        func date(_ key: String) -> Date? {
-            let ms = (json[key] as? NSNumber)?.doubleValue ?? 0
-            return ms > 0 && ms < 4_102_444_800_000 ? Date(timeIntervalSince1970: ms / 1000) : nil
-        }
-        self.id = id
-        groupId = text("groupId")
-        question = text("question")
-        creator = text("creator")
-        creatorName = text("creatorName")
-        created = date("created")
-        expires = date("expired")
-        closed = flag("closed")
-        joined = flag("joined")
-        multi = flag("multi")
-        allowAdd = flag("allowAdd")
-        anonymous = flag("anonymous")
-        hidePreview = flag("hidePreview")
-        voterCount = clampedInt((json["voters"] as? NSNumber)?.doubleValue ?? 0)
-        canClose = flag("canClose")
-        options = (json["options"] as? [[String: Any]] ?? []).compactMap { row in
-            guard let id = row["id"] as? String, !id.isEmpty else { return nil }
-            return Option(id: id, content: row["content"] as? String ?? "",
-                          votes: max(0, clampedInt((row["votes"] as? NSNumber)?.doubleValue ?? 0)),
-                          voted: (row["voted"] as? NSNumber)?.boolValue ?? false)
-        }
+    init(coreRecord r: PollDetailRecord) {
+        self.id = r.id
+        self.groupId = r.groupId
+        self.question = r.question
+        self.creator = r.creator
+        self.creatorName = r.creatorName
+        self.created = r.createdMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) }
+        self.expires = r.expiresMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) }
+        self.expiresMs = r.expiresMs
+        self.closed = r.closed
+        self.joined = r.joined
+        self.multi = r.multi
+        self.allowAdd = r.allowAdd
+        self.anonymous = r.anonymous
+        self.hidePreview = r.hidePreview
+        self.voterCount = Int(r.voterCount)
+        self.canClose = r.canClose
+        self.totalVotes = Int(r.totalVotes)
+        self.resultsHidden = r.resultsHidden
+        self.votersVisible = r.votersVisible
+        self.lockedWithoutExpiry = r.lockedWithoutExpiry
+        self.hasDuplicateOptions = r.hasDuplicateOptions
+        self.options = r.options.map(Option.init(coreRecord:))
     }
 
-    var totalVotes: Int { options.reduce(0) { $0 + $1.votes } }
+    init?(json: [String: Any]) {
+        guard let jsonStr = pollJsonObjectString(json),
+              let rec = pollDetailFromJson(json: jsonStr) else {
+            return nil
+        }
+        self.init(coreRecord: rec)
+    }
 
-    func isExpired(at now: Date = .now) -> Bool { expires.map { $0 < now } ?? false }
+    var coreRecord: PollDetailRecord {
+        PollDetailRecord(
+            id: id,
+            groupId: groupId,
+            question: question,
+            creator: creator,
+            creatorName: creatorName,
+            createdMs: created.map { Int64(($0.timeIntervalSince1970 * 1000.0).rounded()) },
+            expiresMs: expires.map { Int64(($0.timeIntervalSince1970 * 1000.0).rounded()) },
+            closed: closed,
+            joined: joined,
+            multi: multi,
+            allowAdd: allowAdd,
+            anonymous: anonymous,
+            hidePreview: hidePreview,
+            voterCount: Int64(voterCount),
+            canClose: canClose,
+            totalVotes: Int64(totalVotes),
+            resultsHidden: resultsHidden,
+            votersVisible: votersVisible,
+            lockedWithoutExpiry: lockedWithoutExpiry,
+            hasDuplicateOptions: hasDuplicateOptions,
+            options: options.map(\.coreRecord)
+        )
+    }
+
+    static func == (lhs: PollDetail, rhs: PollDetail) -> Bool {
+        lhs.id == rhs.id
+            && lhs.groupId == rhs.groupId
+            && lhs.question == rhs.question
+            && lhs.creator == rhs.creator
+            && lhs.creatorName == rhs.creatorName
+            && lhs.created == rhs.created
+            && lhs.expires == rhs.expires
+            && lhs.closed == rhs.closed
+            && lhs.joined == rhs.joined
+            && lhs.multi == rhs.multi
+            && lhs.allowAdd == rhs.allowAdd
+            && lhs.anonymous == rhs.anonymous
+            && lhs.hidePreview == rhs.hidePreview
+            && lhs.voterCount == rhs.voterCount
+            && lhs.canClose == rhs.canClose
+            && lhs.options == rhs.options
+    }
+
+    func isExpired(at now: Date = .now) -> Bool {
+        guard let expiresMs else { return false }
+        let nowMs = Int64((now.timeIntervalSince1970 * 1000.0).rounded())
+        return expiresMs < nowMs
+    }
 
     /// Votes cannot change any more: closed, expired, or (results hidden until voting) already voted.
-    func isVotingLocked(at now: Date = .now) -> Bool { closed || isExpired(at: now) || (hidePreview && joined) }
+    func isVotingLocked(at now: Date = .now) -> Bool {
+        lockedWithoutExpiry || isExpired(at: now)
+    }
 
-    /// "Ẩn kết quả khi chưa bình chọn": the numbers are only meaningful after I voted.
-    var resultsHidden: Bool { hidePreview && !joined }
-
-    /// Official `isEnableViewDetail`: voter list is offered when the poll is not anonymous and results are visible.
-    var votersVisible: Bool { !anonymous && !resultsHidden && totalVotes > 0 }
-
-    func weight(of option: Option) -> Double { totalVotes > 0 ? Double(option.votes) / Double(totalVotes) : 0 }
+    func weight(of option: Option) -> Double {
+        option.cachedWeight
+    }
 }
 
 /// What the vote popup edits: which existing options are ticked and the options being added. Mirrors the
@@ -90,71 +179,156 @@ struct PollVoteDraft: Equatable {
         var id = UUID()
         var text = ""
         var voted = false
+        fileprivate var cachedDuplicate = false
+
+        init(id: UUID = UUID(), text: String = "", voted: Bool = false, isDuplicate: Bool = false) {
+            self.id = id
+            self.text = text
+            self.voted = voted
+            self.cachedDuplicate = isDuplicate
+        }
+
+        static func == (lhs: Added, rhs: Added) -> Bool {
+            lhs.id == rhs.id && lhs.text == rhs.text && lhs.voted == rhs.voted
+        }
     }
 
     private(set) var selected: Set<String>
     private let original: Set<String>
     private let multi: Bool
-    var added: [Added] = []
+    private var baseDetail: PollDetail
+    private var selectionChanged: Bool
+    private var selectionEmpty: Bool
+    private var cachedHasChanges: Bool
+    private var cachedVotesNothing: Bool
+    private var cachedHasDuplicates: Bool
+    private var cachedApplied: PollDetail
+    private var cachedAdded: [Added] = []
+    private var isMutatingFromCore = false
+
+    var added: [Added] {
+        get { cachedAdded }
+        set {
+            cachedAdded = newValue
+            if !isMutatingFromCore {
+                recomputeInCore()
+            }
+        }
+    }
 
     init(_ detail: PollDetail) {
-        let voted = Set(detail.options.filter(\.voted).map(\.id))
-        selected = voted
-        original = voted
-        multi = detail.multi
+        let rec = pollVoteDraftNew(detail: detail.coreRecord)
+        baseDetail = detail
+        selected = Set(rec.selected)
+        original = Set(rec.original)
+        multi = rec.multi
+        selectionChanged = rec.selectionChanged
+        selectionEmpty = rec.selectionEmpty
+        cachedHasChanges = rec.hasChanges
+        cachedVotesNothing = rec.votesNothing
+        cachedHasDuplicates = rec.hasDuplicates
+        cachedApplied = rec.applied.map(PollDetail.init(coreRecord:)) ?? detail
+        cachedAdded = rec.added.map { row in
+            Added(id: UUID(uuidString: row.id) ?? UUID(), text: row.text, voted: row.voted, isDuplicate: row.isDuplicate)
+        }
+    }
+
+    static func == (lhs: PollVoteDraft, rhs: PollVoteDraft) -> Bool {
+        lhs.selected == rhs.selected
+            && lhs.original == rhs.original
+            && lhs.multi == rhs.multi
+            && lhs.cachedAdded == rhs.cachedAdded
+    }
+
+    var coreRecord: PollVoteDraftRecord {
+        PollVoteDraftRecord(
+            selected: selected.sorted(),
+            original: original.sorted(),
+            multi: multi,
+            added: cachedAdded.map {
+                AddedPollOptionRecord(
+                    id: $0.id.uuidString,
+                    text: $0.text,
+                    voted: $0.voted,
+                    isDuplicate: $0.cachedDuplicate
+                )
+            },
+            selectionChanged: selectionChanged,
+            selectionEmpty: selectionEmpty,
+            hasChanges: cachedHasChanges,
+            votesNothing: cachedVotesNothing,
+            hasDuplicates: cachedHasDuplicates,
+            applied: cachedApplied.coreRecord
+        )
+    }
+
+    private mutating func applyCoreRecord(_ rec: PollVoteDraftRecord) {
+        isMutatingFromCore = true
+        defer { isMutatingFromCore = false }
+        selected = Set(rec.selected)
+        selectionChanged = rec.selectionChanged
+        selectionEmpty = rec.selectionEmpty
+        cachedHasChanges = rec.hasChanges
+        cachedVotesNothing = rec.votesNothing
+        cachedHasDuplicates = rec.hasDuplicates
+        if let app = rec.applied {
+            cachedApplied = PollDetail(coreRecord: app)
+        }
+        cachedAdded = rec.added.map { row in
+            Added(id: UUID(uuidString: row.id) ?? UUID(), text: row.text, voted: row.voted, isDuplicate: row.isDuplicate)
+        }
+    }
+
+    private mutating func recomputeInCore() {
+        applyCoreRecord(pollVoteDraftRecompute(draft: coreRecord, detail: baseDetail.coreRecord))
     }
 
     mutating func toggle(_ optionId: String) {
-        if selected.contains(optionId) { selected.remove(optionId); return }
-        if !multi { selected = []; for i in added.indices { added[i].voted = false } }
-        selected.insert(optionId)
+        applyCoreRecord(pollVoteDraftToggle(draft: coreRecord, optionId: optionId, detail: baseDetail.coreRecord))
     }
 
     mutating func setAddedVoted(_ id: UUID, _ voted: Bool) {
-        guard let at = added.firstIndex(where: { $0.id == id }) else { return }
-        if voted && !multi { selected = []; for i in added.indices { added[i].voted = false } }
-        added[at].voted = voted
+        applyCoreRecord(pollVoteDraftSetAddedVoted(draft: coreRecord, id: id.uuidString, voted: voted, detail: baseDetail.coreRecord))
     }
 
-    mutating func addRow() { added.append(Added()) }
-    mutating func removeAdded(_ id: UUID) { added.removeAll { $0.id == id } }
+    mutating func addRow() {
+        cachedAdded.append(Added())
+        recomputeInCore()
+    }
 
-    private var filled: [Added] {
-        added.map { Added(id: $0.id, text: $0.text.trimmingCharacters(in: .whitespacesAndNewlines), voted: $0.voted) }.filter { !$0.text.isEmpty }
+    mutating func removeAdded(_ id: UUID) {
+        cachedAdded.removeAll { $0.id == id }
+        recomputeInCore()
     }
 
     /// Anything to send: a changed tick or a new option (official confirm button state).
-    var hasChanges: Bool { selected != original || !filled.isEmpty }
+    var hasChanges: Bool { cachedHasChanges }
 
     /// Nothing is ticked (existing or added): the official "hide results" confirmation is skipped for this.
-    var votesNothing: Bool { selected.isEmpty && !filled.contains(where: \.voted) }
+    var votesNothing: Bool { cachedVotesNothing }
 
     /// Same trimmed text used twice among the existing and the added options.
     func hasDuplicates(in detail: PollDetail) -> Bool {
-        let all = detail.options.map { $0.content.trimmingCharacters(in: .whitespacesAndNewlines) } + filled.map(\.text)
-        return Set(all).count != all.count
+        detail == baseDetail ? cachedHasDuplicates : pollVoteDraftHasDuplicates(draft: coreRecord, detail: detail.coreRecord)
     }
 
     func isDuplicate(_ id: UUID, in detail: PollDetail) -> Bool {
-        guard let row = filled.first(where: { $0.id == id }) else { return false }
-        let others = detail.options.map { $0.content.trimmingCharacters(in: .whitespacesAndNewlines) } + filled.filter { $0.id != id }.map(\.text)
-        return others.contains(row.text)
+        if detail == baseDetail {
+            return cachedAdded.first { $0.id == id }?.cachedDuplicate ?? false
+        }
+        return pollVoteDraftIsDuplicate(draft: coreRecord, id: id.uuidString, detail: detail.coreRecord)
     }
 
-    /// Arguments of `window.__zaloPoll.vote` (option ids in the poll's own order).
+    /// Arguments of the vote / add-option request (option ids in the poll's own order).
     func request(for detail: PollDetail) -> (newOptions: [[String: Any]], votedIds: [String]) {
-        (filled.map { ["voted": $0.voted, "content": $0.text] }, detail.options.map(\.id).filter(selected.contains))
+        let req = pollVoteDraftRequest(draft: coreRecord, detail: detail.coreRecord)
+        let opts: [[String: Any]] = req.newOptions.map { ["voted": $0.voted, "content": $0.content] }
+        return (opts, req.votedIds)
     }
 
     /// The poll as it would look after this vote (live preview of the bars, like the official popup).
     func applied(to detail: PollDetail) -> PollDetail {
-        var next = detail
-        for i in next.options.indices {
-            let was = detail.options[i].voted, now = selected.contains(detail.options[i].id)
-            next.options[i].voted = now
-            if was != now { next.options[i].votes = max(0, next.options[i].votes + (now ? 1 : -1)) }
-        }
-        return next
+        detail == baseDetail ? cachedApplied : PollDetail(coreRecord: pollVoteDraftApplied(draft: coreRecord, detail: detail.coreRecord))
     }
 
     var canSubmit: Bool { hasChanges }
@@ -179,47 +353,75 @@ struct PollVoters: Equatable, Sendable {
     var restricted: Bool
     var groups: [Group]
 
-    init?(json: Any?) {
-        guard let object = json as? [String: Any] else { return nil }
-        restricted = (object["restricted"] as? NSNumber)?.boolValue ?? false
-        groups = (object["groups"] as? [[String: Any]] ?? []).compactMap { row in
-            guard let id = row["optionId"] as? String else { return nil }
-            let users = (row["users"] as? [[String: Any]] ?? []).compactMap { u -> User? in
-                guard let uid = u["uid"] as? String, !uid.isEmpty else { return nil }
-                return User(uid: uid, name: u["name"] as? String ?? "", avatar: (u["avatar"] as? String).flatMap { $0.isEmpty ? nil : URL(string: $0) },
-                            isMe: (u["isMe"] as? NSNumber)?.boolValue ?? false)
-            }
-            return Group(id: id, content: row["content"] as? String ?? "", votes: clampedInt((row["votes"] as? NSNumber)?.doubleValue ?? 0), users: users)
+    init(coreRecord r: PollVotersRecord) {
+        restricted = r.restricted
+        groups = r.groups.map { g in
+            Group(
+                id: g.id,
+                content: g.content,
+                votes: Int(g.votes),
+                users: g.users.map { u in
+                    User(
+                        uid: u.uid,
+                        name: u.name,
+                        avatar: u.avatar.flatMap { $0.isEmpty ? nil : URL(string: $0) },
+                        isMe: u.isMe
+                    )
+                }
+            )
         }
+    }
+
+    init?(json: Any?) {
+        guard let object = json as? [String: Any],
+              let jsonStr = pollJsonObjectString(object),
+              let rec = pollVotersFromJson(json: jsonStr) else {
+            return nil
+        }
+        self.init(coreRecord: rec)
     }
 }
 
 /// Official `groupPoll` limits (config) used by the create popup.
 struct PollConfig: Equatable, Sendable {
-    var minOptions = 2
-    var maxOptions = 30
-    var maxQuestion = 200
-    var maxOption = 120
-    var enableAnonymous = true
-    var enableHidePreview = true
+    var minOptions: Int
+    var maxOptions: Int
+    var maxQuestion: Int
+    var maxOption: Int
+    var enableAnonymous: Bool
+    var enableHidePreview: Bool
     /// Options shown on the chat card before "* Còn N lựa chọn khác".
-    var displayOptions = 3
+    var displayOptions: Int
 
-    init() {}
+    init(coreRecord r: PollConfigRecord) {
+        minOptions = Int(r.minOptions)
+        maxOptions = Int(r.maxOptions)
+        maxQuestion = Int(r.maxQuestion)
+        maxOption = Int(r.maxOption)
+        enableAnonymous = r.enableAnonymous
+        enableHidePreview = r.enableHidePreview
+        displayOptions = Int(r.displayOptions)
+    }
+
+    init() {
+        self.init(coreRecord: pollConfigDefault())
+    }
 
     init(json: [String: Any]?) {
-        guard let json else { return }
-        func count(_ key: String, _ fallback: Int) -> Int {
-            let value = clampedInt((json[key] as? NSNumber)?.doubleValue ?? 0)
-            return value > 0 ? value : fallback
-        }
-        minOptions = count("minOptions", minOptions)
-        maxOptions = max(minOptions, count("maxOptions", maxOptions))
-        maxQuestion = count("maxQuestion", maxQuestion)
-        maxOption = count("maxOption", maxOption)
-        displayOptions = count("displayOptions", displayOptions)
-        enableAnonymous = (json["enableAnonymous"] as? NSNumber)?.boolValue ?? true
-        enableHidePreview = (json["enableHidePreview"] as? NSNumber)?.boolValue ?? true
+        let jsonStr = json.flatMap(pollJsonObjectString)
+        self.init(coreRecord: pollConfigFromJson(json: jsonStr))
+    }
+
+    var coreRecord: PollConfigRecord {
+        PollConfigRecord(
+            minOptions: Int64(minOptions),
+            maxOptions: Int64(maxOptions),
+            maxQuestion: Int64(maxQuestion),
+            maxOption: Int64(maxOption),
+            enableAnonymous: enableAnonymous,
+            enableHidePreview: enableHidePreview,
+            displayOptions: Int64(displayOptions)
+        )
     }
 }
 
@@ -229,14 +431,18 @@ struct PollCapabilities: Equatable, Sendable {
     var canPin = false
     var config = PollConfig()
 
+    init(coreRecord r: PollCapabilitiesRecord) {
+        ready = r.ready
+        canCreate = r.canCreate
+        canPin = r.canPin
+        config = PollConfig(coreRecord: r.config)
+    }
+
     init() {}
 
     init(json: Any?) {
-        guard let o = json as? [String: Any] else { return }
-        ready = (o["ready"] as? NSNumber)?.boolValue ?? false
-        canCreate = (o["canCreate"] as? NSNumber)?.boolValue ?? false
-        canPin = (o["canPin"] as? NSNumber)?.boolValue ?? false
-        config = PollConfig(json: o["config"] as? [String: Any])
+        let jsonStr = (json as? [String: Any]).flatMap(pollJsonObjectString)
+        self.init(coreRecord: pollCapabilitiesFromJson(json: jsonStr))
     }
 }
 
@@ -244,6 +450,15 @@ struct PollCapabilities: Equatable, Sendable {
 struct PollCreateDraft: Equatable {
     enum Issue: Equatable {
         case emptyQuestion, tooFewOptions(Int), duplicate, pastDeadline
+
+        init(coreRecord r: PollCreateIssueRecord) {
+            switch r {
+            case .emptyQuestion: self = .emptyQuestion
+            case .tooFewOptions(let min): self = .tooFewOptions(Int(min))
+            case .duplicate: self = .duplicate
+            case .pastDeadline: self = .pastDeadline
+            }
+        }
     }
 
     var question = ""
@@ -258,42 +473,59 @@ struct PollCreateDraft: Equatable {
 
     init(config: PollConfig = PollConfig()) { options = Array(repeating: "", count: config.minOptions) }
 
+    var coreRecord: PollCreateDraftRecord {
+        PollCreateDraftRecord(
+            question: question,
+            options: options,
+            hasDeadline: hasDeadline,
+            deadlineMs: Int64(deadline.timeIntervalSince1970 * 1000.0),
+            pin: pin,
+            multi: multi,
+            allowAdd: allowAdd,
+            hidePreview: hidePreview,
+            anonymous: anonymous
+        )
+    }
+
     var trimmedQuestion: String { question.trimmingCharacters(in: .whitespacesAndNewlines) }
     var filledOptions: [String] { options.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty } }
 
     func isDuplicate(at index: Int) -> Bool {
-        guard options.indices.contains(index) else { return false }
-        let text = options[index].trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return false }
-        return options.enumerated().contains { $0.offset != index && $0.element.trimmingCharacters(in: .whitespacesAndNewlines) == text }
+        guard index >= 0 else { return false }
+        return pollCreateDraftIsDuplicate(draft: coreRecord, index: UInt64(index))
     }
 
     /// First reason the poll cannot be created yet; nil = ready.
     func issue(config: PollConfig, now: Date = .now) -> Issue? {
-        if trimmedQuestion.isEmpty { return .emptyQuestion }
-        let filled = filledOptions
-        if Set(filled).count != filled.count { return .duplicate }
-        if filled.count < config.minOptions { return .tooFewOptions(config.minOptions) }
-        if hasDeadline && deadline <= now { return .pastDeadline }
-        return nil
+        let nowMs = Int64(now.timeIntervalSince1970 * 1000.0)
+        return pollCreateDraftIssue(draft: coreRecord, config: config.coreRecord, nowMs: nowMs)
+            .map(Issue.init(coreRecord:))
     }
 
     /// "Add option" is meaningless while results are hidden (official create popup disables and sends false).
     var effectiveAllowAdd: Bool { allowAdd && !hidePreview }
 
-    /// Argument of `window.__zaloPoll.create`.
+    /// Normalized create-poll spec dictionary.
     func spec(config: PollConfig, canPin: Bool) -> [String: Any] {
-        [
-            "question": String(trimmedQuestion.prefix(config.maxQuestion)),
-            "options": filledOptions.map { String($0.prefix(config.maxOption)) },
-            "expired": hasDeadline ? Int(deadline.timeIntervalSince1970 * 1000) : 0,
-            "pin": pin && canPin, "multi": multi, "allowAdd": effectiveAllowAdd,
-            "hidePreview": hidePreview && config.enableHidePreview, "anonymous": anonymous && config.enableAnonymous,
-        ]
+        let raw = pollCreateDraftSpecJson(draft: coreRecord, config: config.coreRecord, canPin: canPin)
+        return JSONLossless.parseObject(string: raw) ?? [:]
     }
 }
 
-enum PollAction { case vote, lock, share, create, pin, unpin }
+enum PollAction {
+    case vote, lock, share, create, pin, unpin
+
+    var coreRecord: PollActionRecord {
+        switch self {
+        case .vote: return .vote
+        case .lock: return .lock
+        case .share: return .share
+        case .create: return .create
+        case .pin: return .pin
+        case .unpin: return .unpin
+        }
+    }
+}
 
 struct PollActionResult: Equatable, Sendable {
     var ok: Bool
@@ -301,36 +533,29 @@ struct PollActionResult: Equatable, Sendable {
     /// The poll was created, but "ghim" was left out (the board is full or could not be checked): pin it from its menu.
     var pinSkipped = false
 
+    init(ok: Bool, error: String? = nil, pinSkipped: Bool = false) {
+        self.ok = ok
+        self.error = error
+        self.pinSkipped = pinSkipped
+    }
+
+    init(coreRecord r: PollActionResultRecord) {
+        self.ok = r.ok
+        self.error = r.error
+        self.pinSkipped = r.pinSkipped
+    }
+
+    var coreRecord: PollActionResultRecord {
+        PollActionResultRecord(ok: ok, error: error, pinSkipped: pinSkipped)
+    }
+
     /// Official toast / modal texts (lang_vi.json).
     func message(for action: PollAction) -> String {
-        switch error {
-        case "closed": "Có lỗi xảy ra do bình chọn đã bị khoá"
-        case "expired": "Bình chọn đã hết hạn"
-        case "network": "Không có mạng, vui lòng kiểm tra lại kết nối và thử lại"
-        case "duplicate": "Phương án được thêm đã tồn tại"
-        case "forbidden":
-            switch action {
-            case .create: "Bạn không đủ quyền tạo bình chọn"
-            case .pin, .unpin: "Bạn không có quyền thực hiện thao tác này."   // STR_ONLY_ADMIN_INTERACT_PIN_BOARD
-            default: "Bạn không có quyền khóa bình chọn này"
-            }
-        case "limit": "Bảng ghim đã đầy. Hãy bỏ bớt ghim trong Zalo rồi thử lại."
-        case "partial": "Đã bỏ ghim cũ nhưng chưa ghim được bình chọn. Vui lòng thử ghim lại."
-        case "unknown": "Chưa xác nhận được kết quả. Vui lòng kiểm tra lại bình chọn sau."
-        default:
-            switch action {
-            case .vote: "Có lỗi xảy ra trong quá trình bình chọn."
-            case .lock: "Có lỗi xảy ra trong quá trình khóa bình chọn. Vui lòng thử lại."
-            case .share: "Có lỗi xảy ra trong quá trình chia sẻ bình chọn. Vui lòng thử lại."
-            case .create: "Có lỗi xảy ra trong quá trình tạo bình chọn. Vui lòng kiểm tra lại."
-            case .pin: "Ghim bình chọn không thành công. Vui lòng thử lại."
-            case .unpin: "Bỏ ghim không thành công. Vui lòng thử lại."
-            }
-        }
+        pollActionResultMessage(result: coreRecord, action: action.coreRecord)
     }
 }
 
-/// Whether the group's board lets me pin, and whether this poll is pinned (poll-adapter.js `pinState`; official board topics).
+/// Whether the group's board lets me pin, and whether this poll is pinned.
 /// Not `ready` = unknown / not offered (not a group, topic board unavailable): the pin item is hidden and nothing is guessed.
 struct PollPinState: Equatable, Sendable {
     var ready = false
@@ -340,14 +565,22 @@ struct PollPinState: Equatable, Sendable {
     /// Pinned topics the board holds at most (`pinLimit`).
     var limit = 0
 
+    init(coreRecord r: PollPinStateRecord) {
+        ready = r.ready
+        canPin = r.canPin
+        pinned = r.pinned
+        limit = Int(r.limit)
+    }
+
     init() {}
 
     init(json: Any?) {
-        guard let o = json as? [String: Any] else { return }
-        ready = (o["ready"] as? NSNumber)?.boolValue ?? false
-        canPin = (o["canPin"] as? NSNumber)?.boolValue ?? false
-        pinned = (o["pinned"] as? NSNumber)?.boolValue ?? false
-        limit = max(0, clampedInt((o["limit"] as? NSNumber)?.doubleValue ?? 0))
+        let jsonStr = (json as? [String: Any]).flatMap(pollJsonObjectString)
+        self.init(coreRecord: pollPinStateFromJson(json: jsonStr))
+    }
+
+    var coreRecord: PollPinStateRecord {
+        PollPinStateRecord(ready: ready, canPin: canPin, pinned: pinned, limit: Int64(limit))
     }
 
     /// The menu offers "Ghim" / "Bỏ ghim" (official: only with `isEnablePin`).
@@ -369,26 +602,26 @@ struct PollPinConfirm: Equatable, Sendable {
         self.title = title
     }
 
+    init(coreRecord r: PollPinConfirmRecord) {
+        self.ref = r.refId
+        self.limit = Int(r.limit)
+        self.kind = r.kind
+        self.title = r.title
+    }
+
     init?(json: Any?) {
-        guard let o = json as? [String: Any], let ref = o["ref"] as? String, !ref.isEmpty else { return nil }
-        self.ref = ref
-        limit = max(0, clampedInt((o["limit"] as? NSNumber)?.doubleValue ?? 0))
-        let replace = o["replace"] as? [String: Any]
-        kind = replace?["kind"] as? String ?? ""
-        title = replace?["title"] as? String ?? ""
+        let jsonStr = (json as? [String: Any]).flatMap(pollJsonObjectString)
+        guard let rec = pollPinConfirmFromJson(json: jsonStr) else { return nil }
+        self.init(coreRecord: rec)
+    }
+
+    var coreRecord: PollPinConfirmRecord {
+        PollPinConfirmRecord(refId: ref, limit: Int64(limit), kind: kind, title: title)
     }
 
     /// STR_ONLY_PIN_MAX_CONTENT + STR_DIRECTION_PIN_LIMIT, then the pin that goes.
     var message: String {
-        let label: String
-        switch kind {
-        case "poll": label = "Bình chọn"
-        case "reminder": label = "Nhắc hẹn"
-        case "message": label = "Tin nhắn"
-        default: label = "Ghi chú"
-        }
-        let head = limit > 0 ? "Đã đạt giới hạn \(limit) ghim. " : ""
-        return head + "Ghim cũ dưới đây sẽ được bỏ để cập nhật nội dung mới.\n" + (title.isEmpty ? label : "\(label): \(title)")
+        pollPinConfirmMessage(confirm: coreRecord)
     }
 }
 
@@ -396,6 +629,17 @@ enum PollPinOutcome: Equatable, Sendable {
     case done
     case needsConfirmation(PollPinConfirm)
     case failed(PollActionResult)
+
+    init(coreRecord r: PollPinOutcomeRecord) {
+        switch r {
+        case .done:
+            self = .done
+        case .needsConfirmation(let confirm):
+            self = .needsConfirmation(PollPinConfirm(coreRecord: confirm))
+        case .failed(let result):
+            self = .failed(PollActionResult(coreRecord: result))
+        }
+    }
 }
 
 struct PollStore: Equatable {
@@ -411,414 +655,353 @@ struct PollStore: Equatable {
 @MainActor
 internal enum PollClock {
     static var refreshTasks: [String: Task<Void, Never>] = [:]
-    /// Poll event messages already answered with a refresh (each message once).
+    /// Poll event messages already answered with a refresh (each message once, FIFO-capped at 2,000 in `olaz-core`).
     static var seenMessages: Set<String> = []
-    /// Polls on screen (id → conversation): re-registered with the page after a WebContent reload.
+    static var seenMessagesOrder: [String] = []
+    /// Polls on screen (id → conversation).
     static var watched: [String: String] = [:]
     static var lastAttempt: [String: Date] = [:]
     static var didEvictWatched = false
+    static var pendingRefresh: [String: UInt64] = [:]
+    static var nextDebounceSeq: UInt64 = 0
 }
 
 extension ZaloEngine {
+    internal func drainCorePollWork(_ core: CoreEngine) async {
+        switch phase {
+        case .login, .signingIn:
+            if let v = try? await core.settle() {
+                await waitForMirrorVersion(v)
+            }
+        default:
+            if let v = try? await core.waitIdle() {
+                await waitForMirrorVersion(v)
+            }
+        }
+        await syncCachedIdentityPreferencesFromStore()
+    }
+
+    internal func armLocalPollDebounceTask(pollId: String, seq: UInt64, delayMs: UInt64) {
+        PollClock.refreshTasks[pollId]?.cancel()
+        let clampedMs = Int(min(delayMs, UInt64(Int.max)))
+        PollClock.refreshTasks[pollId] = Task { @MainActor [weak self] in
+            let completed: Bool
+            if let sleepSeam = self?.pollDebounceSleep {
+                completed = await sleepSeam(clampedMs)
+            } else {
+                try? await Task.sleep(for: .milliseconds(clampedMs))
+                completed = !Task.isCancelled
+            }
+            guard completed, !Task.isCancelled, PollClock.pendingRefresh[pollId] == seq else {
+                return
+            }
+            PollClock.pendingRefresh.removeValue(forKey: pollId)
+            PollClock.refreshTasks.removeValue(forKey: pollId)
+            guard let self else { return }
+            let ts = self.nowMs()
+            if let core = self.coreLifecycle.core {
+                core.firePollDebounce(pollId: pollId, seq: seq, nowMs: ts)
+                self.trackPollTask { [weak self] in
+                    await self?.drainCorePollWork(core)
+                }
+            } else {
+                self.trackPollTask { [weak self] in
+                    guard let self, let core = await self.ensureCoreEngine() else { return }
+                    core.firePollDebounce(pollId: pollId, seq: seq, nowMs: ts)
+                    await self.drainCorePollWork(core)
+                }
+            }
+        }
+    }
+
     func watchPoll(_ id: String, in conversationId: String) {
         guard !id.isEmpty else { return }
-        PollClock.watched[id] = conversationId
-        if PollClock.watched.count > 500, let drop = PollClock.watched.keys.first(where: { $0 != id }) {
-            PollClock.watched[drop] = nil
-            PollClock.lastAttempt[drop] = nil
-            PollClock.didEvictWatched = true
+        let ts = nowMs()
+        if let core = coreLifecycle.core {
+            core.watchPoll(id: id, convId: conversationId, nowMs: ts)
+            trackPollTask { [weak self] in
+                await self?.drainCorePollWork(core)
+            }
+        } else {
+            trackPollTask { [weak self] in
+                guard let self, let core = await self.ensureCoreEngine() else { return }
+                core.watchPoll(id: id, convId: conversationId, nowMs: ts)
+                await self.drainCorePollWork(core)
+            }
         }
-        guard polls.details[id] == nil else { return }
-        let now = Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
-        if let last = PollClock.lastAttempt[id], now.timeIntervalSince(last) < 5 { return }
-        PollClock.lastAttempt[id] = now
-        polls.failed.remove(id)
-        refreshPoll(id)
     }
 
     func retryPoll(_ id: String, in conversationId: String) {
-        PollClock.lastAttempt[id] = Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
-        polls.failed.remove(id)
-        refreshPoll(id)
+        let ts = nowMs()
+        if let core = coreLifecycle.core {
+            core.retryPoll(id: id, convId: conversationId, nowMs: ts)
+            trackPollTask { [weak self] in
+                await self?.drainCorePollWork(core)
+            }
+        } else {
+            trackPollTask { [weak self] in
+                guard let self, let core = await self.ensureCoreEngine() else { return }
+                core.retryPoll(id: id, convId: conversationId, nowMs: ts)
+                await self.drainCorePollWork(core)
+            }
+        }
     }
 
     func rewatchPolls() {
-        for (id, _) in PollClock.watched { refreshPoll(id) }
+        let ts = nowMs()
+        if let core = coreLifecycle.core {
+            core.rewatchPolls(nowMs: ts)
+            trackPollTask { [weak self] in
+                await self?.drainCorePollWork(core)
+            }
+        } else {
+            trackPollTask { [weak self] in
+                guard let self, let core = await self.ensureCoreEngine() else { return }
+                core.rewatchPolls(nowMs: ts)
+                await self.drainCorePollWork(core)
+            }
+        }
     }
 
     func refreshPoll(_ id: String) {
         guard !id.isEmpty else { return }
-        trackPollTask { [weak self] in
-            guard let self else { return }
-            guard let box = try? await sessionClient.fetchPollDetail(pollId: id),
-                  let dataNode = box.dict["data"] as? [String: Any] else {
-                if polls.details[id] == nil { polls.failed.insert(id) }
-                return
+        let ts = nowMs()
+        if let core = coreLifecycle.core {
+            core.refreshPoll(id: id, nowMs: ts)
+            trackPollTask { [weak self] in
+                await self?.drainCorePollWork(core)
             }
-            let gid = resolvePollGroupId(id: id, payload: dataNode, explicit: nil)
-            let cleanGrid = ZaloWireParser.cleanGroupId(gid)
-            if !gid.isEmpty, !cleanGrid.isEmpty,
-               cachedGroupDetails[cleanGrid] == nil,
-               await sessionClient.isAuthenticated {
-                await refreshGroupMetadata(gid)
-            }
-            let normalized = normalizePollDetail(dataNode, id: id, groupId: gid)
-            if let detail = PollDetail(json: normalized) {
-                polls.failed.remove(id)
-                if polls.details[id] != detail { polls.details[id] = detail }
-            } else if polls.details[id] == nil {
-                polls.failed.insert(id)
+        } else {
+            trackPollTask { [weak self] in
+                guard let self, let core = await self.ensureCoreEngine() else { return }
+                core.refreshPoll(id: id, nowMs: ts)
+                await self.drainCorePollWork(core)
             }
         }
     }
 
     internal func resolvePollGroupId(id: String, payload: [String: Any], explicit: String?) -> String {
-        let candidates: [String] = [
-            explicit ?? "",
-            JSONLossless.string(payload["group_id"] ?? payload["groupId"] ?? payload["grid"]),
-            PollClock.watched[id] ?? "",
-            polls.details[id]?.groupId ?? ""
-        ]
-        for raw in candidates {
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty, trimmed != "0", trimmed != "g0" else { continue }
-            let gid = ZaloWireParser.groupConvId(trimmed)
-            if !gid.isEmpty { return gid }
-        }
-        for (convId, list) in messages where ZaloWireParser.isGroupId(convId) {
-            if list.contains(where: {
+        var hits: [PollWatchedEntryRecord] = []
+        for convId in messages.keys.sorted() where ZaloWireParser.isGroupId(convId) {
+            if let list = messages[convId], list.contains(where: {
                 if case .poll(let info) = $0.kind { return info.pollId == id }
                 return false
             }) {
-                return ZaloWireParser.groupConvId(convId)
+                hits.append(PollWatchedEntryRecord(pollId: id, convId: convId))
             }
         }
-        return ""
+        return resolvePollGroupIdFfi(
+            pollId: id,
+            payloadJson: Self.jsonString(for: payload),
+            explicitGroupId: explicit,
+            watchedGroupId: PollClock.watched[id],
+            previousDetailGroupId: polls.details[id]?.groupId,
+            groupWindowPollHits: hits
+        )
     }
 
     internal func isGroupAdminOrCreator(_ uid: String, inGroup groupId: String) -> Bool {
-        let cleanUid = ZaloWireParser.sanitizeProfileUid(uid) ?? ZaloWireParser.stripUserPrefix(uid)
-        guard !cleanUid.isEmpty, cleanUid != "0" else { return false }
-        let cleanGrid = ZaloWireParser.cleanGroupId(groupId)
-        let convId = ZaloWireParser.groupConvId(groupId)
-        let info = (!cleanGrid.isEmpty ? cachedGroupDetails[cleanGrid] : nil)
-            ?? (!convId.isEmpty ? cachedGroupDetails[convId] : nil)
-        guard let info else { return false }
-
-        var privileged = Set<String>()
-        func addCandidate(_ raw: Any?) {
-            let str = JSONLossless.string(raw)
-            let norm = ZaloWireParser.sanitizeProfileUid(str) ?? ZaloWireParser.stripUserPrefix(str)
-            if !norm.isEmpty, norm != "0" { privileged.insert(norm) }
-        }
-
-        for key in ["creatorId", "creator_id", "ownerId", "owner_id", "creator"] {
-            addCandidate(info[key])
-        }
-        for key in ["adminIds", "admin_ids", "admins", "deputies", "deputyIds"] {
-            if let arr = info[key] as? [Any] {
-                arr.forEach(addCandidate)
-            }
-        }
-        if let cur = info["currentMems"] as? [[String: Any]] {
-            for mem in cur {
-                let isAdmin = (JSONLossless.bool(mem["isAdmin"]) == true)
-                    || (JSONLossless.bool(mem["isCreator"]) == true)
-                if isAdmin {
-                    addCandidate(mem["id"] ?? mem["uid"])
-                }
-            }
-        }
-        return privileged.contains(cleanUid)
+        isGroupAdminOrCreatorFfi(uid: uid, groupId: groupId, contacts: currentContactsStateRecord())
     }
 
     internal func normalizePollDetail(_ d: [String: Any], id: String, groupId explicitGroupId: String? = nil) -> [String: Any] {
-        let myUid = ZaloWireParser.stripUserPrefix(profile?.userId ?? "")
-        let creatorId = ZaloWireParser.stripUserPrefix(JSONLossless.string(d["creator"]))
         let resolvedGroupId = resolvePollGroupId(id: id, payload: d, explicit: explicitGroupId)
-        let isPollCreator = !myUid.isEmpty && creatorId == myUid
-        let isGroupPrivileged = !myUid.isEmpty && !resolvedGroupId.isEmpty && isGroupAdminOrCreator(myUid, inGroup: resolvedGroupId)
-        let optionsRaw = (d["options"] as? [[String: Any]]) ?? []
-        var totalVoters = Set<String>()
-        var options: [[String: Any]] = []
-        for opt in optionsRaw {
-            let optId = JSONLossless.string(opt["option_id"] ?? opt["id"])
-            let voters = (opt["voters"] as? [Any] ?? []).map { ZaloWireParser.stripUserPrefix(JSONLossless.string($0)) }.filter { !$0.isEmpty }
-            voters.forEach { totalVoters.insert($0) }
-            options.append([
-                "id": optId,
-                "content": JSONLossless.string(opt["content"]),
-                "votes": voters.count,
-                "voted": !myUid.isEmpty && voters.contains(myUid),
-                "voters": voters
-            ])
+        guard let rec = normalizePollDetailFfi(
+            payloadJson: Self.jsonString(for: d),
+            pollId: id,
+            resolvedGroupId: resolvedGroupId,
+            myUid: profile?.userId ?? "",
+            myAvatar: profile?.avatar?.absoluteString,
+            contacts: currentContactsStateRecord(),
+            identities: currentIdentityTableRecord()
+        ) else {
+            return [:]
         }
-        return [
-            "id": id,
-            "groupId": resolvedGroupId,
-            "question": JSONLossless.string(d["question"]),
-            "creator": creatorId,
-            "creatorName": lookupPersonInfo(creatorId)?.name ?? "Thành viên",
-            "multi": d["is_multi_choice"] as? Bool ?? false,
-            "allowAdd": d["is_add_new_option"] as? Bool ?? false,
-            "anonymous": d["is_anonymous"] as? Bool ?? false,
-            "hidePreview": d["is_hide_vote_preview"] as? Bool ?? false,
-            "closed": (JSONLossless.int64(d["status"]) == 0),
-            "expired": (JSONLossless.int64(d["expired_time"]) ?? 0) * 1000,
-            "voters": totalVoters.count,
-            "canClose": isPollCreator || isGroupPrivileged,
-            "joined": !myUid.isEmpty && totalVoters.contains(myUid),
-            "options": options
-        ]
+        let raw = pollDetailToJson(detail: rec)
+        return JSONLossless.parseObject(string: raw) ?? [:]
     }
 
     func pollVoters(_ id: String) async -> PollVoters? {
-        guard let box = try? await sessionClient.fetchPollDetail(pollId: id),
-              let d = box.dict["data"] as? [String: Any] else { return nil }
-        let anonymous = d["is_anonymous"] as? Bool ?? false
-        let myUid = profile?.userId ?? ""
-        let optionsRaw = (d["options"] as? [[String: Any]]) ?? []
-        let groups: [[String: Any]] = optionsRaw.map { opt in
-            let voters = (opt["voters"] as? [Any] ?? []).map { ZaloWireParser.stripUserPrefix(JSONLossless.string($0)) }
-            let users: [[String: Any]] = anonymous ? [] : voters.map { uid in
-                let info = lookupPersonInfo(uid)
-                return ["uid": uid, "name": info?.name ?? ReactionDetail.unknownName, "avatar": info?.avatar ?? "", "isMe": uid == myUid]
-            }
-            return [
-                "optionId": JSONLossless.string(opt["option_id"] ?? opt["id"]),
-                "content": JSONLossless.string(opt["content"]),
-                "votes": voters.count,
-                "users": users
-            ]
-        }
-        return PollVoters(json: ["restricted": anonymous, "groups": groups])
+        guard let core = await ensureCoreEngine() else { return nil }
+        pushCoreIdentitiesIfRunning()
+        pushCoreContactsIfRunning()
+        guard let out = try? await core.pollVoters(id: id) else { return nil }
+        await waitForMirrorVersion(out.version)
+        return out.voters.map(PollVoters.init(coreRecord:))
     }
 
     @discardableResult
     func refreshPollPin(_ id: String, in conversationId: String) async -> PollPinState {
-        let isGroup = ZaloWireParser.isGroupId(conversationId)
-        if isGroup, pins[conversationId] == nil, await sessionClient.isAuthenticated {
-            await refreshBoardPins(for: conversationId)
+        guard let core = await ensureCoreEngine() else { return PollPinState() }
+        // U7: keep core's read-only board mirror up to date before computing poll pin state.
+        pushCoreBoardStateIfRunning(for: conversationId)
+        guard let out = try? await core.refreshPollPin(id: id, convId: conversationId) else {
+            return polls.pins[id] ?? PollPinState()
         }
-        let board = pins[conversationId]?.items ?? []
-        let isPinned = board.contains { $0.kind == .poll && $0.ref == id }
-        let state = PollPinState(json: ["ready": isGroup, "canPin": isGroup, "pinned": isPinned, "limit": 5])
-        if (state.ready || polls.pins[id] == nil), polls.pins[id] != state { polls.pins[id] = state }
-        return polls.pins[id] ?? state
+        await waitForMirrorVersion(out.version)
+        return PollPinState(coreRecord: out.state)
     }
 
     internal static func mapPollPinError(_ error: Error, partial: Bool = false) -> PollActionResult {
-        if partial {
-            return PollActionResult(ok: false, error: "partial")
-        }
         if let err = error as? ZaloSessionError {
-            let msg = err.message.lowercased()
-            if err.code == 1005 || err.code == 1010 || err.code == 201
-                || msg.contains("limit") || msg.contains("max") || msg.contains("full")
-                || msg.contains("giới hạn") || msg.contains("tối đa") {
-                return PollActionResult(ok: false, error: "limit")
-            }
-            if err.code == 112 || err.code == 114 || err.code == 200 || err.code == 403
-                || msg.contains("permission") || msg.contains("forbidden") || msg.contains("admin")
-                || msg.contains("quyền") || msg.contains("not allowed") {
-                return PollActionResult(ok: false, error: "forbidden")
-            }
-            return PollActionResult(ok: false, error: nil)
+            return PollActionResult(
+                coreRecord: mapPollPinSessionErrorFfi(
+                    code: Int64(err.code),
+                    message: err.message,
+                    partial: partial
+                )
+            )
         }
-        if error is ZaloTransportError || error is URLError {
-            return PollActionResult(ok: false, error: "network")
-        }
-        return PollActionResult(ok: false, error: nil)
+        let isNet = (error is ZaloTransportError) || (error is URLError)
+        return PollActionResult(
+            coreRecord: mapPollPinTransportErrorFfi(isNetworkOrTransport: isNet, partial: partial)
+        )
     }
 
     func pinPoll(_ id: String, in conversationId: String, confirming ref: String? = nil) async -> PollPinOutcome {
-        guard ZaloWireParser.isGroupId(conversationId), !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return .failed(PollActionResult(ok: false, error: "forbidden"))
+        guard let core = await ensureCoreEngine() else {
+            return .failed(PollActionResult(ok: false, error: "network"))
         }
-        let didUnpinOld: Bool
-        if let ref, !ref.isEmpty {
-            let boardCache = cachedBoardRawTopics[conversationId]
-            do {
-                try await sessionClient.unpinBoardTopic(
-                    convId: conversationId,
-                    topicId: ref,
-                    rawTopic: boardCache?.topics[ref].map { ZaloJSONBox($0) },
-                    boardVersion: boardCache?.version ?? 0
-                )
-            } catch {
-                return .failed(Self.mapPollPinError(error))
-            }
-            didUnpinOld = true
-        } else {
-            didUnpinOld = false
+        // U7: sync board pins & raw topics into core before `pinPoll`.
+        pushCoreBoardStateIfRunning(for: conversationId)
+        guard let out = try? await core.pinPoll(id: id, convId: conversationId, confirming: ref) else {
+            return .failed(PollActionResult(ok: false, error: nil))
         }
-
-        do {
-            _ = try await sessionClient.pinBoardItemAPI(groupId: conversationId, topicId: id, topicType: 3)
-            await refreshBoardPins(for: conversationId)
-            await refreshPollPin(id, in: conversationId)
-            return .done
-        } catch {
-            if didUnpinOld {
-                return .failed(Self.mapPollPinError(error, partial: true))
-            }
-            let mapped = Self.mapPollPinError(error)
-            if mapped.error == "limit" {
-                await refreshBoardPins(for: conversationId)
-                let items = pins[conversationId]?.items ?? []
-                if let oldest = items.last, oldest.ref != id {
-                    return .needsConfirmation(PollPinConfirm(
-                        ref: oldest.ref,
-                        limit: max(items.count, 5),
-                        kind: oldest.kind.rawValue,
-                        title: oldest.title
-                    ))
-                }
-            }
-            return .failed(mapped)
-        }
+        await waitForMirrorVersion(out.version)
+        return PollPinOutcome(coreRecord: out.outcome)
     }
 
     func unpinPoll(_ id: String, in conversationId: String) async -> PollActionResult {
-        do {
-            let boardCache = cachedBoardRawTopics[conversationId]
-            try await sessionClient.unpinBoardTopic(
-                convId: conversationId,
-                topicId: id,
-                rawTopic: boardCache?.topics[id].map { ZaloJSONBox($0) },
-                boardVersion: boardCache?.version ?? 0
-            )
-            await refreshBoardPins(for: conversationId)
-            await refreshPollPin(id, in: conversationId)
-            return PollActionResult(ok: true)
-        } catch {
+        guard let core = await ensureCoreEngine() else {
             return PollActionResult(ok: false, error: "network")
         }
+        // U7: sync board pins & raw topics into core before `unpinPoll`.
+        pushCoreBoardStateIfRunning(for: conversationId)
+        guard let out = try? await core.unpinPoll(id: id, convId: conversationId) else {
+            return PollActionResult(ok: false, error: "network")
+        }
+        await waitForMirrorVersion(out.version)
+        return PollActionResult(coreRecord: out.result)
     }
 
     func pollCapabilities(in conversationId: String) async -> PollCapabilities {
-        let isGroup = ZaloWireParser.isGroupId(conversationId)
-        return PollCapabilities(json: ["ready": isGroup, "canCreate": isGroup, "canPin": isGroup])
+        if let core = coreLifecycle.core,
+           let out = try? await core.pollCapabilities(convId: conversationId) {
+            await waitForMirrorVersion(out.version)
+            return PollCapabilities(coreRecord: out.capabilities)
+        }
+        return PollCapabilities(coreRecord: pollCapabilitiesForConversation(convId: conversationId))
     }
 
     func votePoll(_ id: String, in conversationId: String, draft: PollVoteDraft, detail: PollDetail) async -> PollActionResult {
-        let request = draft.request(for: detail)
-        do {
-            if !request.newOptions.isEmpty {
-                _ = try await sessionClient.addPollOptionAPI(
-                    pollId: id,
-                    newOptions: ZaloJSONArrayBox(request.newOptions),
-                    votedIds: request.votedIds
-                )
-            } else {
-                _ = try await sessionClient.votePollAPI(pollId: id, optionIds: request.votedIds)
-            }
-            refreshPoll(id)
-            return PollActionResult(ok: true)
-        } catch {
+        guard let core = await ensureCoreEngine() else {
             return PollActionResult(ok: false, error: "network")
         }
+        let ts = nowMs()
+        guard let out = try? await core.votePoll(
+            id: id,
+            convId: conversationId,
+            draft: draft.coreRecord,
+            detail: detail.coreRecord,
+            nowMs: ts
+        ) else {
+            return PollActionResult(ok: false, error: "network")
+        }
+        await waitForMirrorVersion(out.version)
+        trackPollTask { [weak self] in
+            await self?.drainCorePollWork(core)
+        }
+        return PollActionResult(coreRecord: out.result)
     }
 
     func lockPoll(_ id: String, in conversationId: String) async -> PollActionResult {
-        do {
-            _ = try await sessionClient.lockPollAPI(pollId: id)
-            refreshPoll(id)
-            return PollActionResult(ok: true)
-        } catch {
+        guard let core = await ensureCoreEngine() else {
             return PollActionResult(ok: false, error: "network")
         }
+        let ts = nowMs()
+        guard let out = try? await core.lockPoll(id: id, convId: conversationId, nowMs: ts) else {
+            return PollActionResult(ok: false, error: "network")
+        }
+        await waitForMirrorVersion(out.version)
+        trackPollTask { [weak self] in
+            await self?.drainCorePollWork(core)
+        }
+        return PollActionResult(coreRecord: out.result)
     }
 
     func sharePoll(_ id: String, in conversationId: String) async -> PollActionResult {
-        do {
-            _ = try await sessionClient.sharePollAPI(pollId: id)
-            return PollActionResult(ok: true)
-        } catch {
+        guard let core = await ensureCoreEngine() else {
             return PollActionResult(ok: false, error: "network")
         }
+        guard let out = try? await core.sharePoll(id: id, convId: conversationId) else {
+            return PollActionResult(ok: false, error: "network")
+        }
+        await waitForMirrorVersion(out.version)
+        return PollActionResult(coreRecord: out.result)
     }
 
     func createPoll(in conversationId: String, draft: PollCreateDraft, config: PollConfig, canPin: Bool) async -> PollActionResult {
-        do {
-            let expiredMs = draft.hasDeadline ? Int64(draft.deadline.timeIntervalSince1970 * 1000) : 0
-            let box = try await sessionClient.createPollAPI(
-                convId: conversationId,
-                question: String(draft.trimmedQuestion.prefix(config.maxQuestion)),
-                options: draft.filledOptions.map { String($0.prefix(config.maxOption)) },
-                expiredTimeMs: expiredMs,
-                allowMulti: draft.multi,
-                allowAdd: draft.effectiveAllowAdd,
-                hideVotePreview: draft.hidePreview && config.enableHidePreview,
-                isAnonymous: draft.anonymous && config.enableAnonymous
-            )
-            if draft.pin && canPin {
-                let dataNode = (box.dict["data"] as? [String: Any]) ?? box.dict
-                let createdPollId = JSONLossless.string(
-                    dataNode["poll_id"] ?? dataNode["pollId"] ?? dataNode["id"]
-                ).trimmingCharacters(in: .whitespacesAndNewlines)
-                if createdPollId.isEmpty {
-                    return PollActionResult(ok: true, pinSkipped: true)
-                }
-                let pinOutcome = await pinPoll(createdPollId, in: conversationId)
-                if case .done = pinOutcome {
-                    return PollActionResult(ok: true)
-                }
-                return PollActionResult(ok: true, pinSkipped: true)
-            }
-            return PollActionResult(ok: true)
-        } catch let err as ZaloSessionError {
-            let msg = err.message.lowercased()
-            if err.code == 112 || err.code == 114 || err.code == 403
-                || msg.contains("permission") || msg.contains("forbidden") || msg.contains("quyền") {
-                return PollActionResult(ok: false, error: "forbidden")
-            }
-            return PollActionResult(ok: false, error: "network")
-        } catch {
+        guard let core = await ensureCoreEngine() else {
             return PollActionResult(ok: false, error: "network")
         }
+        // U7: sync board pins & raw topics into core in case `createPoll` pins the newly created poll.
+        pushCoreBoardStateIfRunning(for: conversationId)
+        guard let out = try? await core.createPoll(
+            convId: conversationId,
+            draft: draft.coreRecord,
+            config: config.coreRecord,
+            canPin: canPin
+        ) else {
+            return PollActionResult(ok: false, error: "network")
+        }
+        await waitForMirrorVersion(out.version)
+        return PollActionResult(coreRecord: out.result)
     }
 
     func notePollMessages(_ incoming: [ChatMessage]) {
-        let now = Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
-        for message in incoming {
-            guard case .poll(let info) = message.kind, !info.pollId.isEmpty, polls.details[info.pollId] != nil,
-                  message.date > now.addingTimeInterval(-120), PollClock.seenMessages.insert(message.id).inserted else { continue }
-            if PollClock.seenMessages.count > 2000 { PollClock.seenMessages = [message.id] }
-            let id = info.pollId
-            PollClock.refreshTasks[id]?.cancel()
-            PollClock.refreshTasks[id] = Task { [weak self] in
-                let completed: Bool
-                if let sleepSeam = self?.pollDebounceSleep {
-                    completed = await sleepSeam(1500)
-                } else {
-                    try? await Task.sleep(for: .milliseconds(1500))
-                    completed = !Task.isCancelled
-                }
-                guard completed, !Task.isCancelled else { return }
-                PollClock.refreshTasks[id] = nil
-                self?.refreshPoll(id)
-            }
+        let notices: [PollMessageNoticeRecord] = incoming.compactMap { msg in
+            guard case .poll(let info) = msg.kind, !info.pollId.isEmpty else { return nil }
+            return PollMessageNoticeRecord(
+                msgId: msg.id,
+                pollId: info.pollId,
+                convId: msg.conversationId,
+                dateMs: Int64((msg.date.timeIntervalSince1970 * 1000.0).rounded())
+            )
         }
+        guard !notices.isEmpty else { return }
+        let ts = nowMs()
+        let plan = applyNotePollMessagesFfi(
+            mirror: currentPollsMirrorRecord(),
+            notices: notices,
+            nowMs: ts
+        )
+        applyPollsMirror(plan.mirror)
+        for arm in plan.armed {
+            armLocalPollDebounceTask(pollId: arm.pollId, seq: arm.seq, delayMs: arm.delayMs)
+        }
+        coreLifecycle.core?.notePollMessages(notices: notices, nowMs: ts, hostAlreadyArmed: true)
     }
 
     func handlePoll(state: [String: Any]) {
-        guard let json = state["poll"] as? [String: Any], let id = json["id"] as? String else { return }
-        if let detail = (json["detail"] as? [String: Any]).flatMap(PollDetail.init(json:)) {
-            polls.failed.remove(id)
-            if polls.details[id] != detail { polls.details[id] = detail }
-        } else if json["error"] != nil, polls.details[id] == nil {
-            polls.failed.insert(id)
+        let stateJson = Self.jsonString(for: state)
+        if let updated = applyPollStateEventFfi(mirror: currentPollsMirrorRecord(), stateJson: stateJson) {
+            applyPollsMirror(updated)
         }
+        coreLifecycle.core?.handlePollState(stateJson: stateJson)
     }
 
     func resetPolls() {
+        localPollSyncEpoch &+= 1
         polls = PollStore()
         PollClock.refreshTasks.values.forEach { $0.cancel() }
         PollClock.refreshTasks = [:]
         PollClock.seenMessages = []
+        PollClock.seenMessagesOrder = []
         PollClock.watched = [:]
         PollClock.lastAttempt = [:]
         PollClock.didEvictWatched = false
+        PollClock.pendingRefresh = [:]
+        PollClock.nextDebounceSeq = 0
+        coreLifecycle.core?.resetPolls(syncEpoch: localPollSyncEpoch)
     }
 }

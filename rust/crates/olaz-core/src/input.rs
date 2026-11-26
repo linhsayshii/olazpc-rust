@@ -16,6 +16,7 @@ use crate::conversations::{
     IdentityTable, LocalAccountHydration, MessagePreviewInput,
 };
 use crate::effect::OpResult;
+use crate::forward::{ComposerSendOutcome, FileResolutionOutcome, MediaResolutionOutcome};
 use crate::messages::{ContactsState, HistoryFreshness};
 use crate::state::{CoreFailKind, FailReason, PersistedTransportState};
 use crate::typed_chat::TypedChatEnvelope;
@@ -315,6 +316,28 @@ pub enum Command {
         conv_id: String,
         ttl_ms: i64,
     },
+    // U8
+    /// Opens the forward picker for a single message (or shows a blocked card).
+    RequestForward {
+        message: Box<ChatMessage>,
+    },
+    /// Opens the forward picker for Swift's current multi-message selection (oldest first).
+    ForwardSelection {
+        messages: Vec<ChatMessage>,
+    },
+    /// Dismisses the active forward picker request (e.g. sheet closed by user).
+    ClearForwardRequest,
+    /// Forwards one message to `targets`.
+    Forward {
+        message: Box<ChatMessage>,
+        targets: Vec<String>,
+        now_ms: i64,
+    },
+    /// Forwards all messages in the active `forward.request` to `targets`.
+    ForwardAll {
+        targets: Vec<String>,
+        now_ms: i64,
+    },
     // U14
     /// Searches in-memory messages and SQLite history for `conv_id`, newest-first.
     SearchMessages {
@@ -393,6 +416,100 @@ pub enum Command {
         keys: Vec<String>,
         persist: bool,
     },
+    // U12
+    WatchPoll {
+        id: String,
+        conv_id: String,
+        now_ms: i64,
+    },
+    RetryPoll {
+        id: String,
+        conv_id: String,
+        now_ms: i64,
+    },
+    RewatchPolls {
+        now_ms: i64,
+    },
+    RefreshPoll {
+        id: String,
+        now_ms: i64,
+    },
+    PollVoters {
+        id: String,
+    },
+    RefreshPollPin {
+        id: String,
+        conv_id: String,
+    },
+    PinPoll {
+        id: String,
+        conv_id: String,
+        confirming: Option<String>,
+    },
+    UnpinPoll {
+        id: String,
+        conv_id: String,
+    },
+    PollCapabilities {
+        conv_id: String,
+    },
+    VotePoll {
+        id: String,
+        conv_id: String,
+        draft: crate::polls::PollVoteDraft,
+        detail: Option<crate::polls::PollDetail>,
+        now_ms: i64,
+    },
+    LockPoll {
+        id: String,
+        conv_id: String,
+        now_ms: i64,
+    },
+    SharePoll {
+        id: String,
+        conv_id: String,
+    },
+    CreatePoll {
+        conv_id: String,
+        draft: crate::polls::PollCreateDraft,
+        config: crate::polls::PollConfig,
+        can_pin: bool,
+    },
+    NotePollMessages {
+        notices: Vec<crate::polls::PollMessageNotice>,
+        now_ms: i64,
+        host_already_armed: bool,
+    },
+    FirePollDebounce {
+        poll_id: String,
+        seq: u64,
+        now_ms: i64,
+    },
+    HandlePollState {
+        state: Map<String, Value>,
+    },
+    ResetPolls {
+        sync_epoch: u64,
+    },
+    SeedPolls {
+        polls: Box<crate::polls::PollsState>,
+    },
+    // U7: temporary write-throughs from Swift board pins until U7 lands.
+    SyncBoardPins {
+        conv_id: String,
+        list: Option<crate::polls::BoardPinList>,
+    },
+    // U7: temporary write-through from Swift raw board topics until U7 lands.
+    SyncBoardRawTopics {
+        conv_id: String,
+        raw: Option<crate::polls::BoardRawTopics>,
+    },
+    // U7: temporary write-through for `pins_state` WebContent/test events until U7 lands.
+    HandlePinsState {
+        state: Map<String, Value>,
+    },
+    // U7: temporary clear on `resetMessageActions()` until U7 lands.
+    ClearBoardCaches,
 }
 
 impl fmt::Debug for Command {
@@ -625,6 +742,21 @@ impl fmt::Debug for Command {
                 .finish(),
             Self::EnsureMessageLoaded { .. } => f.write_str("EnsureMessageLoaded"),
             Self::LoadQuotedMessage { .. } => f.write_str("LoadQuotedMessage"),
+            // U8
+            Self::RequestForward { .. } => f.write_str("RequestForward"),
+            Self::ForwardSelection { messages } => f
+                .debug_struct("ForwardSelection")
+                .field("count", &messages.len())
+                .finish(),
+            Self::ClearForwardRequest => f.write_str("ClearForwardRequest"),
+            Self::Forward { targets, .. } => f
+                .debug_struct("Forward")
+                .field("targets_count", &targets.len())
+                .finish(),
+            Self::ForwardAll { targets, .. } => f
+                .debug_struct("ForwardAll")
+                .field("targets_count", &targets.len())
+                .finish(),
             // U6
             Self::React {
                 remove_all, now_ms, ..
@@ -697,6 +829,86 @@ impl fmt::Debug for Command {
                 .field("count", &keys.len())
                 .field("persist", persist)
                 .finish(),
+            // U12
+            Self::WatchPoll { now_ms, .. } => {
+                f.debug_struct("WatchPoll").field("now_ms", now_ms).finish()
+            }
+            Self::RetryPoll { now_ms, .. } => {
+                f.debug_struct("RetryPoll").field("now_ms", now_ms).finish()
+            }
+            Self::RewatchPolls { now_ms } => f
+                .debug_struct("RewatchPolls")
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::RefreshPoll { now_ms, .. } => f
+                .debug_struct("RefreshPoll")
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::PollVoters { .. } => f.write_str("PollVoters"),
+            Self::RefreshPollPin { .. } => f.write_str("RefreshPollPin"),
+            Self::PinPoll { confirming, .. } => f
+                .debug_struct("PinPoll")
+                .field("has_confirming", &confirming.is_some())
+                .finish(),
+            Self::UnpinPoll { .. } => f.write_str("UnpinPoll"),
+            Self::PollCapabilities { .. } => f.write_str("PollCapabilities"),
+            Self::VotePoll { draft, now_ms, .. } => f
+                .debug_struct("VotePoll")
+                .field("draft", draft)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::LockPoll { now_ms, .. } => {
+                f.debug_struct("LockPoll").field("now_ms", now_ms).finish()
+            }
+            Self::SharePoll { .. } => f.write_str("SharePoll"),
+            Self::CreatePoll {
+                draft,
+                config,
+                can_pin,
+                ..
+            } => f
+                .debug_struct("CreatePoll")
+                .field("draft", draft)
+                .field("config", config)
+                .field("can_pin", can_pin)
+                .finish(),
+            Self::NotePollMessages {
+                notices,
+                now_ms,
+                host_already_armed,
+            } => f
+                .debug_struct("NotePollMessages")
+                .field("count", &notices.len())
+                .field("now_ms", now_ms)
+                .field("host_already_armed", host_already_armed)
+                .finish(),
+            Self::FirePollDebounce { seq, now_ms, .. } => f
+                .debug_struct("FirePollDebounce")
+                .field("seq", seq)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::HandlePollState { state } => f
+                .debug_struct("HandlePollState")
+                .field("keys", &state.len())
+                .finish(),
+            Self::ResetPolls { sync_epoch } => f
+                .debug_struct("ResetPolls")
+                .field("sync_epoch", sync_epoch)
+                .finish(),
+            Self::SeedPolls { polls } => f.debug_tuple("SeedPolls").field(polls).finish(),
+            Self::SyncBoardPins { list, .. } => f
+                .debug_struct("SyncBoardPins")
+                .field("present", &list.is_some())
+                .finish(),
+            Self::SyncBoardRawTopics { raw, .. } => f
+                .debug_struct("SyncBoardRawTopics")
+                .field("present", &raw.is_some())
+                .finish(),
+            Self::HandlePinsState { state } => f
+                .debug_struct("HandlePinsState")
+                .field("keys", &state.len())
+                .finish(),
+            Self::ClearBoardCaches => f.write_str("ClearBoardCaches"),
         }
     }
 }
@@ -1107,6 +1319,95 @@ pub enum Input {
     LegacyQuotedLookupDone {
         op_id: u64,
         rows: Vec<StoredMessage>,
+    },
+    // U8
+    ForwardClientIdAllocated {
+        forward_id: u64,
+        client_id: i64,
+    },
+    ForwardContactCardDone {
+        forward_id: u64,
+        result: Result<SendMessageResult, String>,
+    },
+    ForwardMediaResolved {
+        forward_id: u64,
+        resolution: MediaResolutionOutcome,
+    },
+    ForwardFileResolved {
+        forward_id: u64,
+        resolution: FileResolutionOutcome,
+    },
+    ForwardFetchMediaDone {
+        forward_id: u64,
+        temp_path: Option<String>,
+    },
+    ForwardSendMediaDone {
+        forward_id: u64,
+        outcome: ComposerSendOutcome,
+    },
+    ForwardSendFilesDone {
+        forward_id: u64,
+        outcome: ComposerSendOutcome,
+    },
+    // U12
+    PollDetailFetched {
+        op_id: Option<u64>,
+        poll_id: String,
+        purpose: crate::effect::PollDetailPurpose,
+        payload: Option<Map<String, Value>>,
+        is_authenticated: bool,
+    },
+    PollGroupDetailFetched {
+        op_id: Option<u64>,
+        poll_id: String,
+        group_id: String,
+        data_node: Map<String, Value>,
+        group_info: Option<Map<String, Value>>,
+        now_ms: i64,
+    },
+    PollBoardRefreshed {
+        conv_id: String,
+        continuation: crate::effect::PollBoardContinuation,
+    },
+    PollPinApiDone {
+        op_id: Option<u64>,
+        poll_id: String,
+        conv_id: String,
+        for_create: bool,
+        step_result: Result<(), crate::polls::PollActionResult>,
+    },
+    PollUnpinApiDone {
+        op_id: Option<u64>,
+        poll_id: String,
+        conv_id: String,
+        ok: bool,
+    },
+    PollVoteApiDone {
+        op_id: Option<u64>,
+        poll_id: String,
+        ok: bool,
+        now_ms: i64,
+    },
+    PollLockApiDone {
+        op_id: Option<u64>,
+        poll_id: String,
+        ok: bool,
+        now_ms: i64,
+    },
+    PollShareApiDone {
+        op_id: Option<u64>,
+        ok: bool,
+    },
+    PollCreateApiDone {
+        op_id: Option<u64>,
+        conv_id: String,
+        should_pin: bool,
+        result: Result<String, crate::polls::PollActionResult>,
+    },
+    PollDebounceFired {
+        poll_id: String,
+        seq: u64,
+        now_ms: i64,
     },
 
     // U6
@@ -1581,6 +1882,138 @@ impl fmt::Debug for Input {
                 .debug_struct("LegacyQuotedLookupDone")
                 .field("op_id", op_id)
                 .field("rows", &rows.len())
+                .finish(),
+            // U8
+            Self::ForwardClientIdAllocated { forward_id, .. } => f
+                .debug_struct("ForwardClientIdAllocated")
+                .field("forward_id", forward_id)
+                .finish(),
+            Self::ForwardContactCardDone { forward_id, result } => f
+                .debug_struct("ForwardContactCardDone")
+                .field("forward_id", forward_id)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::ForwardMediaResolved {
+                forward_id,
+                resolution,
+            } => f
+                .debug_struct("ForwardMediaResolved")
+                .field("forward_id", forward_id)
+                .field("resolution", resolution)
+                .finish(),
+            Self::ForwardFileResolved {
+                forward_id,
+                resolution,
+            } => f
+                .debug_struct("ForwardFileResolved")
+                .field("forward_id", forward_id)
+                .field("resolution", resolution)
+                .finish(),
+            Self::ForwardFetchMediaDone {
+                forward_id,
+                temp_path,
+            } => f
+                .debug_struct("ForwardFetchMediaDone")
+                .field("forward_id", forward_id)
+                .field("has_path", &temp_path.is_some())
+                .finish(),
+            Self::ForwardSendMediaDone {
+                forward_id,
+                outcome,
+            } => f
+                .debug_struct("ForwardSendMediaDone")
+                .field("forward_id", forward_id)
+                .field("outcome", outcome)
+                .finish(),
+            Self::ForwardSendFilesDone {
+                forward_id,
+                outcome,
+            } => f
+                .debug_struct("ForwardSendFilesDone")
+                .field("forward_id", forward_id)
+                .field("outcome", outcome)
+                .finish(),
+            // U12
+            Self::PollDetailFetched {
+                op_id,
+                purpose,
+                payload,
+                is_authenticated,
+                ..
+            } => f
+                .debug_struct("PollDetailFetched")
+                .field("op_id", op_id)
+                .field("purpose", purpose)
+                .field("has_payload", &payload.is_some())
+                .field("is_authenticated", is_authenticated)
+                .finish(),
+            Self::PollGroupDetailFetched {
+                op_id,
+                group_info,
+                now_ms,
+                ..
+            } => f
+                .debug_struct("PollGroupDetailFetched")
+                .field("op_id", op_id)
+                .field("has_group_info", &group_info.is_some())
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::PollBoardRefreshed { continuation, .. } => f
+                .debug_struct("PollBoardRefreshed")
+                .field("continuation", continuation)
+                .finish(),
+            Self::PollPinApiDone {
+                op_id,
+                for_create,
+                step_result,
+                ..
+            } => f
+                .debug_struct("PollPinApiDone")
+                .field("op_id", op_id)
+                .field("for_create", for_create)
+                .field("ok", &step_result.is_ok())
+                .finish(),
+            Self::PollUnpinApiDone { op_id, ok, .. } => f
+                .debug_struct("PollUnpinApiDone")
+                .field("op_id", op_id)
+                .field("ok", ok)
+                .finish(),
+            Self::PollVoteApiDone {
+                op_id, ok, now_ms, ..
+            } => f
+                .debug_struct("PollVoteApiDone")
+                .field("op_id", op_id)
+                .field("ok", ok)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::PollLockApiDone {
+                op_id, ok, now_ms, ..
+            } => f
+                .debug_struct("PollLockApiDone")
+                .field("op_id", op_id)
+                .field("ok", ok)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::PollShareApiDone { op_id, ok } => f
+                .debug_struct("PollShareApiDone")
+                .field("op_id", op_id)
+                .field("ok", ok)
+                .finish(),
+            Self::PollCreateApiDone {
+                op_id,
+                should_pin,
+                result,
+                ..
+            } => f
+                .debug_struct("PollCreateApiDone")
+                .field("op_id", op_id)
+                .field("should_pin", should_pin)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::PollDebounceFired { seq, now_ms, .. } => f
+                .debug_struct("PollDebounceFired")
+                .field("seq", seq)
+                .field("now_ms", now_ms)
                 .finish(),
             // U6
             Self::MessageIdsResolved {
