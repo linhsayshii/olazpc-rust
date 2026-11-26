@@ -50,6 +50,11 @@ struct ZaloDomains: Codable, Sendable {
         "quick_message": ["https://quickmsg-wpa.api.zaloapp.com"],
     ]
 
+    /// Additional `zpw_service_map_v3` defaults resolved in `candidates(for:)` without altering `defaultServiceMapV3.keys`.
+    private static let additionalDefaultServices: [String: [String]] = [
+        "friend_board": ["https://friendboard-wpa.chat.zalo.me"],
+    ]
+
     /// Secondary `.chat.zalo.me` fallbacks used only if all `.zaloapp.com` hosts fail.
     static let fallbackHosts: [String: [String]] = [
         "profile": ["https://tt-profile-wpa.chat.zalo.me"],
@@ -124,7 +129,7 @@ struct ZaloDomains: Codable, Sendable {
     /// Clears stale `.chat.zalo.me` HTTP preferred hosts left over from legacy `zpw_type=30` sessions.
     mutating func healFromVerified() {
         for (key, current) in preferredHosts {
-            if current.contains(".chat.zalo.me") && key != "zcloud" {
+            if current.contains(".chat.zalo.me") && key != "zcloud" && key != "friend_board" {
                 preferredHosts.removeValue(forKey: key)
             }
         }
@@ -201,6 +206,9 @@ struct ZaloDomains: Codable, Sendable {
         if !isolated {
             if let defaults = Self.defaultServiceMapV3[key] {
                 for host in defaults { appendUnique(host) }
+            }
+            if let extraDefaults = Self.additionalDefaultServices[key] {
+                for host in extraDefaults { appendUnique(host) }
             }
             if let fallbacks = Self.fallbackHosts[key] {
                 for host in fallbacks { appendUnique(host) }

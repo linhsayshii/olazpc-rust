@@ -92,10 +92,13 @@ actor ZaloE2EEManager {
 
     var debugHasRustStore: Bool { rust != nil }
 
-    func reset() {
+    func reset() async {
         if configuredMode == .shadow, !shadowStats.isIdle || shadowStats.snapshot != E2EEShadowStats.Snapshot() {
             logSink(shadowStats.summaryLine)
         }
+        let oldRuntime = runtime
+        runtime = nil
+        await oldRuntime?.close()
         rust = nil
         effectiveMode = configuredMode
         jsSnapshotCache = nil
@@ -398,10 +401,12 @@ actor ZaloE2EEManager {
     }
 
     func prepare(uid: String, store: ZaloSQLiteStore?) async {
-        guard !uid.isEmpty else { return }
+        guard !uid.isEmpty, !Task.isCancelled else { return }
         await loadPersistedThreads(store: store)
+        guard !Task.isCancelled else { return }
         if loadedUid == uid, registrationId > 0, runtime != nil || rust != nil { return }
         if effectiveMode == .authoritative, await prepareRust(uid: uid, store: store) { return }
+        guard !Task.isCancelled else { return }
         do {
             let rt = try await ensureRuntime()
             let savedJSON = (try? await store?.getPreferenceString(key: Self.storePrefKey)) ?? ""
@@ -417,7 +422,10 @@ actor ZaloE2EEManager {
             if let exported = res["storeJSON"]?.stringValue, !exported.isEmpty {
                 try? await store?.setPreferenceString(key: Self.storePrefKey, value: exported)
             }
+        } catch is CancellationError {
+            return
         } catch {
+            guard !Task.isCancelled else { return }
             let msg = error.localizedDescription
             Task { @MainActor in
                 EngineLog.shared.write("e2ee: init error \(msg)")
