@@ -19,6 +19,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod api;
+mod cloud;
 mod conversations;
 mod e2ee;
 mod error;
@@ -32,6 +33,7 @@ mod util;
 mod tests;
 
 pub use api::{JsonObject, SendMessageResult, ZaloApi};
+pub use cloud::{CloudPlanKind, CloudServerSnapshot, parse_cloud_usage_snapshot};
 pub use conversations::{
     HiddenConversationsSnapshot, PollOutcome, parse_hidden_conversations_response,
     received_friend_request_rows,
