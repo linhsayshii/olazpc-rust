@@ -831,6 +831,86 @@ final class ForwardRecorderTests: XCTestCase {
                     ]),
                 ]
             ),
+
+            // 9. forward_contact_card_e2ee: forward contact card (with and without phone) to a 1-1 target
+            // in e2ee_threads (records today's Swift plain /api/message/contact behaviour as-is).
+            ForwardRecorderHarness.ScenarioDef(
+                name: "forward_contact_card_e2ee",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2000809",
+                    displayName: "Forward User 9",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "next_client_id": .int(8000000000900),
+                        "e2ee_threads": .array([.string("3000809b")]),
+                        "history_freshness": .object(["3000809a": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3000809a", name: "Source 9", previewText: "[Danh thiếp] Card NoPhone", previewTsMs: baseTs + 2_000),
+                            localConv(id: "3000809b", name: "E2EE Peer 9"),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(
+                                id: "9080901",
+                                convId: "3000809a",
+                                senderId: "3000809a",
+                                text: "[Danh thiếp] Card Phone",
+                                kind: .object([
+                                    "type": .string("contactCard"),
+                                    "name": .string("Card Phone"),
+                                    "uid": .string("4000809"),
+                                    "phone": .string("+84901234569"),
+                                ]),
+                                kindTag: "contactCard",
+                                tsMs: baseTs + 1_000,
+                                menu: okMenu
+                            ),
+                            storedMsg(
+                                id: "9080902",
+                                convId: "3000809a",
+                                senderId: "3000809a",
+                                text: "[Danh thiếp] Card NoPhone",
+                                kind: .object([
+                                    "type": .string("contactCard"),
+                                    "name": .string("Card NoPhone"),
+                                    "uid": .string("4000810"),
+                                ]),
+                                kindTag: "contactCard",
+                                tsMs: baseTs + 2_000,
+                                menu: okMenu
+                            ),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2000809", displayName: "Forward User 9"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000809", displayName: "Forward User 9"),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/contact",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["msgId": .string("9009001")])])
+                    ),
+                    ForwardRecorderHarness.httpScript(
+                        path: "/api/message/contact",
+                        method: "POST",
+                        json: .object(["error_code": .int(0), "data": .object(["msgId": .string("9009002")])])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3000809a")])]),
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 10_000),
+                        "args": .object(["conv_id": .string("3000809a"), "msg_id": .string("9080901"), "targets": .array([.string("3000809b")])]),
+                    ]),
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 11_000),
+                        "args": .object(["conv_id": .string("3000809a"), "msg_id": .string("9080902"), "targets": .array([.string("3000809b")])]),
+                    ]),
+                ]
+            ),
         ]
     }
 }
