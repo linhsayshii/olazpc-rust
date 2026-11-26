@@ -11,7 +11,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::changes::{ChangeHub, CoreChanges};
-use crate::conversations::{ConversationActionResult, PinBoard};
+use crate::conversations::{ConversationActionResult, IdentityTable, PinBoard};
 use crate::effect::{Effect, OpResult};
 use crate::forward::ForwardOutcome;
 use crate::input::{Command, Input};
@@ -25,6 +25,7 @@ enum ActorMsg {
         input: Box<Input>,
         ack: Option<oneshot::Sender<u64>>,
     },
+    CoalescedIdentities,
     OpRequest {
         cmd: Box<Command>,
         reply: oneshot::Sender<OpResult>,
@@ -134,6 +135,7 @@ pub struct CoreHandle {
     tracker: Arc<ActivityTracker>,
     state_notify: Arc<Notify>,
     identity_snapshot: Arc<Mutex<Arc<IdentitySnapshot>>>,
+    latest_identities: Arc<Mutex<Option<IdentityTable>>>,
 }
 
 impl CoreHandle {
@@ -155,6 +157,7 @@ impl CoreHandle {
         let tracker = Arc::new(ActivityTracker::new());
         let state_notify = Arc::new(Notify::new());
         let identity_snapshot = Arc::new(Mutex::new(Arc::new(initial.identity_snapshot())));
+        let latest_identities = Arc::new(Mutex::new(None));
         let sink = ActorSink {
             tx: tx.clone(),
             tracker: Arc::clone(&tracker),
@@ -168,6 +171,7 @@ impl CoreHandle {
             Arc::clone(&tracker),
             Arc::clone(&state_notify),
             Arc::clone(&identity_snapshot),
+            Arc::clone(&latest_identities),
         ));
         Self {
             tx,
@@ -175,6 +179,7 @@ impl CoreHandle {
             tracker,
             state_notify,
             identity_snapshot,
+            latest_identities,
         }
     }
 
@@ -190,7 +195,26 @@ impl CoreHandle {
     }
 
     /// Enqueues a command without blocking.
+    ///
+    /// Burst `Command::UpdateIdentities` calls coalesce in place via `latest_identities` so the
+    /// actor mailbox holds at most one pending identity update per burst.
     pub fn send(&self, command: Command) {
+        if let Command::UpdateIdentities(table) = command {
+            let mut slot = self
+                .latest_identities
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let was_none = slot.is_none();
+            *slot = Some(table);
+            if was_none {
+                self.tracker.increment();
+                if self.tx.send(ActorMsg::CoalescedIdentities).is_err() {
+                    *slot = None;
+                    self.tracker.decrement();
+                }
+            }
+            return;
+        }
         self.tracker.increment();
         if self
             .tx
@@ -586,10 +610,33 @@ async fn run_actor(
     tracker: Arc<ActivityTracker>,
     state_notify: Arc<Notify>,
     identity_snapshot: Arc<Mutex<Arc<IdentitySnapshot>>>,
+    latest_identities: Arc<Mutex<Option<IdentityTable>>>,
 ) {
     let mut waiters = ActorWaiters::new();
     while let Some(msg) = rx.recv().await {
         match msg {
+            ActorMsg::CoalescedIdentities => {
+                let maybe_table = {
+                    let mut slot = latest_identities
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    slot.take()
+                };
+                if let Some(table) = maybe_table {
+                    let out = reduce(&mut state, Input::Command(Command::UpdateIdentities(table)));
+                    let _ = dispatch_reduce_output(
+                        &mut state,
+                        out,
+                        &runner,
+                        &sink,
+                        &changes,
+                        &state_notify,
+                        &identity_snapshot,
+                        &mut waiters,
+                    );
+                }
+                tracker.decrement();
+            }
             ActorMsg::Input { input, ack } => {
                 let out = reduce(&mut state, *input);
                 let version = dispatch_reduce_output(
@@ -740,5 +787,25 @@ mod tests {
         assert_eq!(core.drain_chat_polling(4, false).await, 0);
         core.stop();
         assert_eq!(core.drain_chat_polling(4, false).await, 0);
+    }
+
+    #[tokio::test]
+    async fn burst_update_identities_coalesces_to_latest_table() {
+        let core = CoreHandle::start(Arc::new(NoopRunner), Handle::current());
+        for i in 0..2_000usize {
+            let mut tbl = IdentityTable::default();
+            tbl.aliases
+                .insert("u1".to_owned(), format!("alias-{i}"));
+            core.send(Command::UpdateIdentities(tbl));
+        }
+        let rev = core.settle().await;
+        assert!(rev.is_some());
+        core.wait_idle().await;
+        let full = core.full_snapshot().await.expect("full snapshot");
+        assert_eq!(
+            full.conversations.identities.aliases.get("u1").map(String::as_str),
+            Some("alias-1999")
+        );
+        core.stop();
     }
 }
