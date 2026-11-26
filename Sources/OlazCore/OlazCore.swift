@@ -1370,7 +1370,7 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     /**
      * Ensures `message` is loaded into `messages.windows[conv_id]` so the list can scroll to it.
      */
-    func ensureMessageLoaded(convId: String, message: ChatMessageRecord, pendingDeletedKeys: [String]) async throws  -> EnsureMessageLoadedResultRecord
+    func ensureMessageLoaded(convId: String, message: ChatMessageRecord) async throws  -> EnsureMessageLoadedResultRecord
     
     func flushAll() async throws  -> UInt64
     
@@ -1421,7 +1421,7 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     /**
      * Finds and loads the message quoted by `message` in `conv_id`, returning its id if found.
      */
-    func loadQuotedMessage(convId: String, message: ChatMessageRecord, pendingDeletedKeys: [String]) async throws  -> LoadQuotedMessageResultRecord
+    func loadQuotedMessage(convId: String, message: ChatMessageRecord) async throws  -> LoadQuotedMessageResultRecord
     
     /**
      * Clears session credentials, resets Swift domains, and starts fresh QR login.
@@ -1590,7 +1590,7 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     /**
      * Searches in-memory messages and SQLite history for `conv_id`, newest-first.
      */
-    func searchMessages(convId: String, query: String, limit: Int64, pendingDeletedKeys: [String]) async throws  -> SearchMessagesResultRecord
+    func searchMessages(convId: String, query: String, limit: Int64) async throws  -> SearchMessagesResultRecord
     
     func seedContacts(contacts: ContactsStateRecord) 
     
@@ -2215,12 +2215,12 @@ open func ensureKnownContacts()  {try! rustCall() {
     /**
      * Ensures `message` is loaded into `messages.windows[conv_id]` so the list can scroll to it.
      */
-open func ensureMessageLoaded(convId: String, message: ChatMessageRecord, pendingDeletedKeys: [String])async throws  -> EnsureMessageLoadedResultRecord  {
+open func ensureMessageLoaded(convId: String, message: ChatMessageRecord)async throws  -> EnsureMessageLoadedResultRecord  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_olaz_ffi_fn_method_coreengine_ensure_message_loaded(
-                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterTypeChatMessageRecord_lower(message),FfiConverterSequenceString.lower(pendingDeletedKeys)
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterTypeChatMessageRecord_lower(message)
                 )
             },
             pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
@@ -2399,12 +2399,12 @@ open func loadOlderMessagesAndWait(id: String)async throws  -> UInt64  {
     /**
      * Finds and loads the message quoted by `message` in `conv_id`, returning its id if found.
      */
-open func loadQuotedMessage(convId: String, message: ChatMessageRecord, pendingDeletedKeys: [String])async throws  -> LoadQuotedMessageResultRecord  {
+open func loadQuotedMessage(convId: String, message: ChatMessageRecord)async throws  -> LoadQuotedMessageResultRecord  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_olaz_ffi_fn_method_coreengine_load_quoted_message(
-                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterTypeChatMessageRecord_lower(message),FfiConverterSequenceString.lower(pendingDeletedKeys)
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterTypeChatMessageRecord_lower(message)
                 )
             },
             pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
@@ -2913,12 +2913,12 @@ open func resolveMissingNames()async throws  -> UInt64  {
     /**
      * Searches in-memory messages and SQLite history for `conv_id`, newest-first.
      */
-open func searchMessages(convId: String, query: String, limit: Int64, pendingDeletedKeys: [String])async throws  -> SearchMessagesResultRecord  {
+open func searchMessages(convId: String, query: String, limit: Int64)async throws  -> SearchMessagesResultRecord  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_olaz_ffi_fn_method_coreengine_search_messages(
-                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(query),FfiConverterInt64.lower(limit),FfiConverterSequenceString.lower(pendingDeletedKeys)
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(query),FfiConverterInt64.lower(limit)
                 )
             },
             pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
@@ -23980,7 +23980,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_ensure_known_contacts() != 6914) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_coreengine_ensure_message_loaded() != 46656) {
+    if (uniffi_olaz_ffi_checksum_method_coreengine_ensure_message_loaded() != 11408) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_flush_all() != 42808) {
@@ -24016,7 +24016,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_load_older_messages_and_wait() != 36746) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_coreengine_load_quoted_message() != 30435) {
+    if (uniffi_olaz_ffi_checksum_method_coreengine_load_quoted_message() != 49356) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_log_out() != 29389) {
@@ -24121,7 +24121,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_resolve_missing_names() != 34703) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_coreengine_search_messages() != 64863) {
+    if (uniffi_olaz_ffi_checksum_method_coreengine_search_messages() != 44896) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_seed_contacts() != 13201) {
