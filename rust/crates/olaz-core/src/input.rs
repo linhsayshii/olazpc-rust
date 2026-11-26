@@ -1231,6 +1231,7 @@ pub enum Input {
     },
     CloudDeleteMessageApiDone {
         op_id: u64,
+        error: Option<String>,
     },
     CloudRemoteDeleteDone {
         op_id: u64,
@@ -1764,9 +1765,10 @@ impl fmt::Debug for Input {
                 .field("outcome", outcome)
                 .field("file_size", file_size)
                 .finish(),
-            Self::CloudDeleteMessageApiDone { op_id } => f
+            Self::CloudDeleteMessageApiDone { op_id, error } => f
                 .debug_struct("CloudDeleteMessageApiDone")
                 .field("op_id", op_id)
+                .field("ok", &error.is_none())
                 .finish(),
             Self::CloudRemoteDeleteDone { op_id } => f
                 .debug_struct("CloudRemoteDeleteDone")

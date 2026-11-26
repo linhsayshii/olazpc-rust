@@ -370,7 +370,9 @@ pub(crate) struct PendingCloudDelete {
     pub index: usize,
     pub current_conv_id: String,
     pub current_msg_id: String,
+    pub current_cli_msg_id: String,
     pub deleted: Vec<String>,
+    pub first_error: Option<String>,
 }
 
 /// Domain state owned by `CoreState::cloud`.
@@ -786,7 +788,13 @@ pub fn apply_cloud_snapshot(
         }
     }
 
-    conv_entries.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.id.cmp(&b.id)));
+    // Approved fix (user-decisions item 12.1): equal totals tie-break by name, then id.
+    conv_entries.sort_by(|a, b| {
+        b.total
+            .cmp(&a.total)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.id.cmp(&b.id))
+    });
     next.media = media_breakdown;
     next.my_cloud_types = my_cloud_breakdown;
     next.conversations = conv_entries;
@@ -989,5 +997,40 @@ mod tests {
         assert!(snap.hidden_lookup);
         assert!(!snap.loaded);
         assert!(snap.plan.is_none());
+    }
+
+    #[test]
+    fn equal_totals_tie_break_by_name_item_12_1() {
+        let summary =
+            |conv_id: &str, name: &str, photo_bytes: i64| StoredCloudConversationSummary {
+                conv_id: conv_id.to_owned(),
+                conv_name: name.to_owned(),
+                conv_avatar: String::new(),
+                is_group: false,
+                photo_bytes,
+                video_bytes: 0,
+                file_bytes: 0,
+                voice_bytes: 0,
+                item_count: 1,
+                last_activity_ms: 1_700_000_000_000,
+            };
+        let mut state = CoreState::default();
+        // Reverse ID order relative to name order so id-only sorting would disagree.
+        let sql_summaries = vec![
+            summary("3001", "Charlie", 150_000),
+            summary("3002", "Alpha", 150_000),
+            summary("3003", "Beta", 150_000),
+            summary("3004", "Biggest", 300_000),
+        ];
+        let changed = apply_cloud_snapshot(&mut state, &sql_summaries, &BTreeMap::new(), None);
+        assert!(changed);
+        let names: Vec<&str> = state
+            .cloud
+            .snapshot
+            .conversations
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Biggest", "Alpha", "Beta", "Charlie"]);
     }
 }

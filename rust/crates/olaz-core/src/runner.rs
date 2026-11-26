@@ -2400,16 +2400,19 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     op_id,
                     conv_id,
                     msg_id,
+                    cli_msg_id,
                     sender_id,
                 } => {
                     let api = Arc::clone(&self.api);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
-                        let _ = api
-                            .delete_message_for_me(&conv_id, &msg_id, &msg_id, &sender_id)
-                            .await;
-                        sink.send(Input::CloudDeleteMessageApiDone { op_id });
+                        let error = api
+                            .delete_message_for_me(&conv_id, &msg_id, &cli_msg_id, &sender_id)
+                            .await
+                            .err()
+                            .map(|err| err.display_without_url());
+                        sink.send(Input::CloudDeleteMessageApiDone { op_id, error });
                         drop(guard);
                     });
                 }

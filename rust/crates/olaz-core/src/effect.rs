@@ -914,11 +914,12 @@ pub enum Effect {
         conv_id: String,
         msg_id: String,
     },
-    /// Calls `ZaloApi::delete_message_for_me` for a single zCloud item (best-effort, ignores error).
+    /// Calls `ZaloApi::delete_message_for_me` for a single zCloud item (user-decisions item 12.3).
     CloudDeleteMessageApi {
         op_id: u64,
         conv_id: String,
         msg_id: String,
+        cli_msg_id: String,
         sender_id: String,
     },
     /// Clears cached zCloud viewer key/enk credentials on `ResetCloud`.

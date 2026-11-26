@@ -346,7 +346,11 @@ extension ZaloEngine {
 
         next.media = mediaBreakdown
         next.myCloudTypes = myCloudBreakdown
-        next.conversations = convEntries.sorted { $0.total > $1.total }
+        next.conversations = convEntries.sorted {
+            if $0.total != $1.total { return $0.total > $1.total }
+            if $0.name != $1.name { return $0.name < $1.name }
+            return $0.id < $1.id
+        }
 
         if let serverSnapshot {
             let previousHasKey = next.plan?.hasKey ?? true

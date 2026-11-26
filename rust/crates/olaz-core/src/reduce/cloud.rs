@@ -9,11 +9,12 @@ use crate::changes::DirtyKey;
 use crate::cloud::{
     CLOUD_FETCH_FAILED_ERROR, CLOUD_LOCAL_READ_ERROR, CLOUD_NOT_FOUND_ERROR,
     CLOUD_OFFLOAD_UNSUPPORTED_ERROR, CloudActionResult, CloudFetch, CloudFile, CloudItem,
-    CloudItemKind, CloudPage, CloudServerSnapshot, FileResolutionOutcome, MediaResolutionOutcome,
-    PendingCloudDelete, PendingCloudFetchStage, PendingCloudList, apply_cloud_snapshot,
-    cloud_item_from_message, cloud_item_from_stored, collect_list_memory_media_ids,
-    collect_memory_media_ids, message_cloud_kind, path_extension, resolve_cloud_conversation_meta,
-    sort_cloud_items, split_cloud_key,
+    CloudItemKind, CloudPage, CloudServerSnapshot, ESTIMATED_PHOTO_BYTES, ESTIMATED_VIDEO_BYTES,
+    ESTIMATED_VOICE_BYTES, FileResolutionOutcome, MediaResolutionOutcome, PendingCloudDelete,
+    PendingCloudFetchStage, PendingCloudList, apply_cloud_snapshot, cloud_item_from_message,
+    cloud_item_from_stored, collect_list_memory_media_ids, collect_memory_media_ids,
+    message_cloud_kind, path_extension, resolve_cloud_conversation_meta, sort_cloud_items,
+    split_cloud_key,
 };
 use crate::effect::{Effect, HostCall, OpResult};
 use crate::input::{Command, Input};
@@ -78,8 +79,8 @@ pub fn reduce_cloud(state: &mut CoreState, input: Input, out: &mut ReduceOutput)
         } => {
             handle_cloud_resolve_file_done(state, op_id, outcome, file_size, out);
         }
-        Input::CloudDeleteMessageApiDone { op_id } => {
-            handle_cloud_delete_api_done(state, op_id, out);
+        Input::CloudDeleteMessageApiDone { op_id, error } => {
+            handle_cloud_delete_api_done(state, op_id, error, out);
         }
         Input::CloudRemoteDeleteDone { op_id } => {
             on_cloud_remote_delete_done(state, op_id, out);
@@ -238,7 +239,9 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                     index: 0,
                     current_conv_id: String::new(),
                     current_msg_id: String::new(),
+                    current_cli_msg_id: String::new(),
                     deleted: Vec::new(),
+                    first_error: None,
                 },
             );
             advance_cloud_delete(state, op_id, out);
@@ -326,7 +329,7 @@ fn handle_cloud_refresh_loaded(
                     ok: !del.deleted.is_empty(),
                     deleted: del.deleted,
                     failed,
-                    error: None,
+                    error: del.first_error,
                 }),
                 after_store: false,
             });
@@ -488,7 +491,7 @@ fn start_fetch_with_message(
                     kind: CloudItemKind::Photo,
                     title: msg.text.clone(),
                     date_ms: Some(msg.date_ms),
-                    fallback_size: 0,
+                    fallback_size: ESTIMATED_PHOTO_BYTES,
                 },
             );
             out.effects.push(Effect::Host(HostCall::ResolveMedia {
@@ -505,7 +508,7 @@ fn start_fetch_with_message(
                     kind: CloudItemKind::Video,
                     title: msg.text.clone(),
                     date_ms: Some(msg.date_ms),
-                    fallback_size: 0,
+                    fallback_size: ESTIMATED_VIDEO_BYTES,
                 },
             );
             out.effects.push(Effect::Host(HostCall::ResolveMedia {
@@ -522,7 +525,7 @@ fn start_fetch_with_message(
                     kind: CloudItemKind::Voice,
                     title: msg.text.clone(),
                     date_ms: Some(msg.date_ms),
-                    fallback_size: 0,
+                    fallback_size: ESTIMATED_VOICE_BYTES,
                 },
             );
             out.effects.push(Effect::Host(HostCall::ResolveFile {
@@ -540,7 +543,7 @@ fn start_fetch_with_message(
                     kind: CloudItemKind::File,
                     title: name.clone(),
                     date_ms: Some(msg.date_ms),
-                    fallback_size: *size,
+                    fallback_size: (*size).max(0),
                 },
             );
             out.effects.push(Effect::Host(HostCall::ResolveFile {
@@ -589,10 +592,19 @@ fn handle_cloud_lookup_message_done(
         let resolved =
             message.or_else(|| find_message_across_windows(state, &del.current_msg_id).cloned());
         if let Some(msg) = resolved {
+            let cli_msg_id = if msg.client_id.is_empty() {
+                del.current_msg_id.clone()
+            } else {
+                msg.client_id.clone()
+            };
+            if let Some(entry) = state.cloud.pending_deletes.get_mut(&op_id) {
+                entry.current_cli_msg_id = cli_msg_id.clone();
+            }
             out.effects.push(Effect::CloudDeleteMessageApi {
                 op_id,
                 conv_id: del.current_conv_id,
                 msg_id: del.current_msg_id,
+                cli_msg_id,
                 sender_id: msg.sender_id,
             });
         } else {
@@ -623,7 +635,7 @@ fn handle_cloud_resolve_media_done(
         kind,
         title,
         date_ms,
-        fallback_size: _,
+        fallback_size,
     }) = state.cloud.pending_fetches.remove(&op_id)
     else {
         return;
@@ -634,7 +646,7 @@ fn handle_cloud_resolve_media_done(
             path,
             kind,
             title,
-            size: file_size.unwrap_or(0),
+            size: file_size.unwrap_or(fallback_size),
             date_ms,
         }),
         MediaResolutionOutcome::Expired => CloudFetch::Expired,
@@ -716,12 +728,21 @@ fn advance_cloud_delete(state: &mut CoreState, op_id: u64, out: &mut ReduceOutpu
             del.current_msg_id = mid.clone();
         }
 
-        if let Some(msg) = find_message_in_conv(state, &cid, &mid) {
+        if let Some(msg) = find_message_in_conv(state, &cid, &mid).cloned() {
+            let cli_msg_id = if msg.client_id.is_empty() {
+                mid.clone()
+            } else {
+                msg.client_id.clone()
+            };
+            if let Some(del) = state.cloud.pending_deletes.get_mut(&op_id) {
+                del.current_cli_msg_id = cli_msg_id.clone();
+            }
             out.effects.push(Effect::CloudDeleteMessageApi {
                 op_id,
                 conv_id: cid,
                 msg_id: mid,
-                sender_id: msg.sender_id.clone(),
+                cli_msg_id,
+                sender_id: msg.sender_id,
             });
             return;
         }
@@ -733,12 +754,21 @@ fn advance_cloud_delete(state: &mut CoreState, op_id: u64, out: &mut ReduceOutpu
             });
             return;
         }
-        if let Some(msg) = find_message_across_windows(state, &mid) {
+        if let Some(msg) = find_message_across_windows(state, &mid).cloned() {
+            let cli_msg_id = if msg.client_id.is_empty() {
+                mid.clone()
+            } else {
+                msg.client_id.clone()
+            };
+            if let Some(del) = state.cloud.pending_deletes.get_mut(&op_id) {
+                del.current_cli_msg_id = cli_msg_id.clone();
+            }
             out.effects.push(Effect::CloudDeleteMessageApi {
                 op_id,
                 conv_id: cid,
                 msg_id: mid,
-                sender_id: msg.sender_id.clone(),
+                cli_msg_id,
+                sender_id: msg.sender_id,
             });
             return;
         }
@@ -748,14 +778,31 @@ fn advance_cloud_delete(state: &mut CoreState, op_id: u64, out: &mut ReduceOutpu
     }
 }
 
-fn handle_cloud_delete_api_done(state: &mut CoreState, op_id: u64, out: &mut ReduceOutput) {
+fn handle_cloud_delete_api_done(
+    state: &mut CoreState,
+    op_id: u64,
+    error: Option<String>,
+    out: &mut ReduceOutput,
+) {
+    if let Some(err) = error {
+        // Approved fix (user-decisions item 12.3): on an API error, keep the item locally
+        // and record the failure rather than deleting it from SQLite/memory.
+        if let Some(del) = state.cloud.pending_deletes.get_mut(&op_id) {
+            if del.first_error.is_none() {
+                del.first_error = Some(err);
+            }
+            del.index += 1;
+        }
+        advance_cloud_delete(state, op_id, out);
+        return;
+    }
     let Some(del) = state.cloud.pending_deletes.get(&op_id) else {
         return;
     };
     out.effects.push(Effect::Host(HostCall::ApplyRemoteDelete {
         conv_id: del.current_conv_id.clone(),
         msg_id: del.current_msg_id.clone(),
-        cli_msg_id: del.current_msg_id.clone(),
+        cli_msg_id: del.current_cli_msg_id.clone(),
         update_conversation_preview: true,
         persist_conversations: true,
         cloud_delete_op_id: Some(op_id),
