@@ -553,7 +553,7 @@ pub trait Host: Send + Sync {
         NotifAuthorization::Unavailable
     }
     async fn start_call(&self, _uid: String, _video: bool) {}
-    // U13: Send category sticker via Swift host until U13 merges.
+    // Swift supplies client-id/time and E2EE mode before re-entering U13's core send path.
     async fn send_category_sticker(
         &self,
         _conv_id: String,
@@ -5516,10 +5516,16 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 sink,
                 _guard,
             } => {
-                let outcome = host
-                    .send_category_sticker(conv_id, cate_id, sticker_id)
-                    .await;
-                sink.send(Input::CategoryStickerSent { op_id, outcome });
+                // The Swift adapter re-enters U13 and may enqueue an E2EE host send.
+                // Keep its in-flight guard until completion without holding this worker.
+                let host = Arc::clone(&host);
+                tokio::spawn(async move {
+                    let outcome = host
+                        .send_category_sticker(conv_id, cate_id, sticker_id)
+                        .await;
+                    sink.send(Input::CategoryStickerSent { op_id, outcome });
+                    drop(_guard);
+                });
             }
             HostJob::RefreshContacts {
                 op_id,
@@ -5649,6 +5655,7 @@ mod tests {
         log: Mutex<Vec<&'static str>>,
         active: AtomicUsize,
         max_concurrent: AtomicUsize,
+        category_runner: Mutex<Option<std::sync::Weak<SessionEffectRunner<MockTransport>>>>,
     }
 
     impl SlowOrderedHost {
@@ -5657,6 +5664,7 @@ mod tests {
                 log: Mutex::new(Vec::new()),
                 active: AtomicUsize::new(0),
                 max_concurrent: AtomicUsize::new(0),
+                category_runner: Mutex::new(None),
             }
         }
 
@@ -5686,6 +5694,25 @@ mod tests {
         async fn offer_first_login_transfer(&self, _force: bool) {}
         async fn reset_domains(&self) {
             self.record("reset_domains", 5).await;
+        }
+        async fn send_category_sticker(
+            &self,
+            _conv_id: String,
+            _cate_id: i32,
+            _sticker_id: i32,
+        ) -> CardActionOutcomeData {
+            let runner = self
+                .category_runner
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade);
+            if let Some(runner) = runner {
+                // A category sticker can re-enter core and require another host callback
+                // (for example the U13 E2EE sender) before it completes.
+                runner.flush_host().await;
+            }
+            CardActionOutcomeData::Done
         }
         async fn persist_session(&self, _snapshot_json: String) {}
         async fn clear_session(&self) {
@@ -5756,6 +5783,44 @@ mod tests {
             vec!["clear_session", "reset_domains"]
         );
         core.stop();
+    }
+
+    #[tokio::test]
+    async fn category_sticker_callback_can_reenter_host_worker() {
+        let host = Arc::new(SlowOrderedHost::new());
+        let client = Arc::new(SessionClient::new(
+            MockTransport::scripted(vec![]),
+            "imei-category".to_owned(),
+            "Mac".to_owned(),
+        ));
+        let runner = Arc::new(SessionEffectRunner::new(
+            client,
+            Arc::clone(&host) as Arc<dyn Host>,
+            Handle::current(),
+        ));
+        *host
+            .category_runner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::downgrade(&runner));
+        let core = CoreHandle::start(
+            Arc::clone(&runner) as Arc<dyn EffectRunner>,
+            Handle::current(),
+        );
+        runner.dispatch(
+            vec![Effect::Host(HostCall::SendCategorySticker {
+                op_id: 1,
+                conv_id: "3001".to_owned(),
+                cate_id: 12,
+                sticker_id: 34,
+            })],
+            core.test_sink(),
+        );
+        let result = tokio::time::timeout(Duration::from_secs(1), core.wait_idle()).await;
+        core.stop();
+        assert!(
+            result.is_ok(),
+            "category sticker blocked its own host worker"
+        );
     }
 
     #[tokio::test]
