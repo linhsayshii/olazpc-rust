@@ -230,6 +230,9 @@ for DOMAIN in "${DOMAINS[@]}"; do
         messages)
             RECORDER_FILTER="MessageRecorderTests"
             ;;
+        message_actions)
+            RECORDER_FILTER="MessageActionRecorderTests"
+            ;;
         *)
             RECORDER_FILTER="${DOMAIN_CAP}RecorderTests"
             ;;

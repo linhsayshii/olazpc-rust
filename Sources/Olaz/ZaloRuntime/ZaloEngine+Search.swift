@@ -7,7 +7,7 @@ extension ZaloEngine {
         coreMessageMatchesSearchQuery(message: ChatMessageRecord(message: message), query: query)
     }
 
-    // U6: bridge until U6 moves pending-deleted message state into olaz-core.
+    /// Offline-only helper used when `coreLifecycle.core` is not started (unit tests).
     private func pendingDeletedSearchKeys(in convId: String) -> [String] {
         var keys: [String] = []
         var seen = Set<String>()
@@ -24,14 +24,11 @@ extension ZaloEngine {
 
     /// Searches in-memory messages and SQLite history for `convId`, deduplicated by message/client ID and ordered newest-first.
     func searchMessages(in convId: String, query: String, limit: Int = 50) async -> [ChatMessage] {
-        // U6: bridge pendingDeletedMessages into core until U6 owns pending deletes.
-        let pendingDeletedKeys = pendingDeletedSearchKeys(in: convId)
         if let core = coreLifecycle.core {
             guard let res = try? await core.searchMessages(
                 convId: convId,
                 query: query,
-                limit: Int64(limit),
-                pendingDeletedKeys: pendingDeletedKeys
+                limit: Int64(limit)
             ) else {
                 return []
             }
@@ -44,7 +41,7 @@ extension ZaloEngine {
         guard !convId.isEmpty, !trimmed.isEmpty, limit > 0 else { return [] }
         let clampedLimit = max(1, min(limit, 500))
 
-        let pendingDeletedIds = Set(pendingDeletedKeys)
+        let pendingDeletedIds = Set(pendingDeletedSearchKeys(in: convId))
         let inMemory = messages[convId] ?? []
         var memoryKeys = Set<String>()
         memoryKeys.reserveCapacity(inMemory.count * 2)
@@ -104,13 +101,10 @@ extension ZaloEngine {
     /// Ensures an older search match is loaded into `messages[convId]` so `MessageList` can scroll to it.
     @discardableResult
     func ensureMessageLoaded(_ message: ChatMessage, in convId: String) async -> Bool {
-        // U6: bridge pendingDeletedMessages into core until U6 owns pending deletes.
-        let pendingDeletedKeys = pendingDeletedSearchKeys(in: convId)
         if let core = coreLifecycle.core {
             guard let res = try? await core.ensureMessageLoaded(
                 convId: convId,
-                message: ChatMessageRecord(message: message),
-                pendingDeletedKeys: pendingDeletedKeys
+                message: ChatMessageRecord(message: message)
             ) else {
                 return false
             }
@@ -126,7 +120,7 @@ extension ZaloEngine {
 
         let targetTsMs = Int64((message.date.timeIntervalSince1970 * 1000).rounded())
         let oldestTsMs = messages[convId]?.first.map { Int64(($0.date.timeIntervalSince1970 * 1000).rounded()) }
-        let pendingDeletedIds = Set(pendingDeletedKeys)
+        let pendingDeletedIds = Set(pendingDeletedSearchKeys(in: convId))
 
         if let store = sqliteStore,
            let window = try? await store.decodedMessagesAround(
@@ -161,13 +155,10 @@ extension ZaloEngine {
     /// Quotes carry the original's ids; quotes stored by older builds have none and match the newest earlier message
     /// with the same text (and sender, when it is "Bạn").
     func loadQuotedMessage(of message: ChatMessage, in convId: String) async -> String? {
-        // U6: bridge pendingDeletedMessages into core until U6 owns pending deletes.
-        let pendingDeletedKeys = pendingDeletedSearchKeys(in: convId)
         if let core = coreLifecycle.core {
             guard let res = try? await core.loadQuotedMessage(
                 convId: convId,
-                message: ChatMessageRecord(message: message),
-                pendingDeletedKeys: pendingDeletedKeys
+                message: ChatMessageRecord(message: message)
             ) else {
                 return nil
             }
@@ -177,7 +168,7 @@ extension ZaloEngine {
 
         // Offline fallback for unit tests that construct ZaloEngine without calling start().
         guard let quote = message.quote else { return nil }
-        let pendingDeletedIds = Set(pendingDeletedKeys)
+        let pendingDeletedIds = Set(pendingDeletedSearchKeys(in: convId))
         let keys = [quote.msgId, quote.cliMsgId].filter { !$0.isEmpty && $0 != "0" }
         let list = messages[convId] ?? []
         for key in keys {

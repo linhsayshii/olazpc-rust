@@ -649,7 +649,7 @@ mod tests {
             .await;
 
         let (hits, _ver) = handle
-            .search_messages(conv.to_owned(), "needle".to_owned(), 3, Vec::new())
+            .search_messages(conv.to_owned(), "needle".to_owned(), 3)
             .await;
         let ids: Vec<_> = hits.into_iter().map(|m| m.id).collect();
         assert_eq!(ids, vec!["hit_005", "hit_004", "hit_003"]);
@@ -727,7 +727,7 @@ mod tests {
 
         // Fix 2: call detail + ecard reminderTitle found in store.
         let (call_hits, _) = handle
-            .search_messages(conv.to_owned(), "2 phút".to_owned(), 10, Vec::new())
+            .search_messages(conv.to_owned(), "2 phút".to_owned(), 10)
             .await;
         assert_eq!(
             call_hits.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
@@ -735,30 +735,50 @@ mod tests {
         );
 
         let (ecard_hits, _) = handle
-            .search_messages(conv.to_owned(), "giao ban".to_owned(), 10, Vec::new())
+            .search_messages(conv.to_owned(), "giao ban".to_owned(), 10)
             .await;
         assert_eq!(
             ecard_hits.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             vec!["m_ecard"]
         );
 
-        // Fix 3: pending_deleted by client_id filters search AND ensure_message_loaded fallback merge.
+        // Fix 3: U6 core delete_undo pending_deleted by client_id filters search AND
+        // ensure_message_loaded fallback merge (no Swift bridge needed).
+        let mut pd_mem = base_msg("srv_pd_mem", conv, 1002, "comet hidden", Kind::Text);
+        pd_mem.client_id = "cli_pd_shared".to_owned();
+        let _ = handle
+            .send_and_ack(crate::Command::WriteThroughUpsertMessage {
+                msg: Box::new(pd_mem),
+                replacing_client_id: None,
+            })
+            .await;
+        handle
+            .request_unit(crate::Command::DeleteForMe {
+                conv_id: conv.to_owned(),
+                msg_id: "srv_pd_mem".to_owned(),
+                confirmed: true,
+                now_ms: 1_700_000_000_000,
+            })
+            .await;
+
         let (pd_hits, _) = handle
-            .search_messages(
-                conv.to_owned(),
-                "comet".to_owned(),
-                10,
-                vec!["cli_pd_shared".to_owned()],
-            )
+            .search_messages(conv.to_owned(), "comet".to_owned(), 10)
             .await;
         assert!(pd_hits.is_empty());
 
         let mut pd_direct = base_msg("srv_pd", conv, 1002, "comet hidden", Kind::Text);
         pd_direct.client_id = "cli_pd_shared".to_owned();
         let (loaded_pd, _) = handle
-            .ensure_message_loaded(conv.to_owned(), pd_direct, vec!["cli_pd_shared".to_owned()])
+            .ensure_message_loaded(conv.to_owned(), pd_direct)
             .await;
         assert!(!loaded_pd);
+
+        // Undoing the delete restores visibility immediately in search.
+        handle.request_unit(crate::Command::UndoDelete).await;
+        let (restored_hits, _) = handle
+            .search_messages(conv.to_owned(), "comet".to_owned(), 10)
+            .await;
+        assert!(!restored_hits.is_empty());
 
         // Fix 4a: load_quoted_message skips recalled target by id.
         let mut quoting_recalled = base_msg("q_src1", conv, 2000, "reply", Kind::Text);
@@ -769,7 +789,7 @@ mod tests {
             text: "was recalled".to_owned(),
         });
         let (q1, _) = handle
-            .load_quoted_message(conv.to_owned(), quoting_recalled, Vec::new())
+            .load_quoted_message(conv.to_owned(), quoting_recalled)
             .await;
         assert_eq!(q1, None);
 
@@ -782,7 +802,7 @@ mod tests {
             text: "Old legacy quote".to_owned(),
         });
         let (q2, ver) = handle
-            .load_quoted_message(conv.to_owned(), quoting_legacy, Vec::new())
+            .load_quoted_message(conv.to_owned(), quoting_legacy)
             .await;
         assert_eq!(q2.as_deref(), Some("q_leg_store"));
         assert!(ver > 0);

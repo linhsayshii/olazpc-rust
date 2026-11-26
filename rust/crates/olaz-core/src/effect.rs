@@ -11,9 +11,12 @@ use olaz_wire::ChatMessage;
 use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
-use crate::conversations::{ConversationActionResult, IdentityTable, PinBoard};
+use crate::actions::DeleteUndoItem;
+use crate::conversations::{
+    ConversationActionResult, ConversationPreview, IdentityTable, PinBoard,
+};
 use crate::input::{E2eeQuoteArg, HiddenPinSyncKind, SeenTarget, StoreToken};
-use crate::messages::MuteEntry;
+use crate::messages::{IdentitySnapshot, MuteEntry};
 use crate::reduce::classify::MobileSyncEvent;
 use crate::typed_chat::TypedChatEnvelope;
 
@@ -121,6 +124,43 @@ pub enum StoreOp {
         trimmed_text: String,
         mine_only: bool,
         limit: i64,
+    },
+    // U6
+    DeleteMessage {
+        conv_id: String,
+        id: String,
+    },
+    ApplyRemoteReactionInStore {
+        conv_candidates: Vec<String>,
+        msg_id: String,
+        cli_msg_id: String,
+        actor_uid: String,
+        my_uid: String,
+        is_me: bool,
+        r_type: String,
+        r_icon: String,
+        allow_duplicate_same_user: bool,
+        snap: Box<IdentitySnapshot>,
+    },
+    MarkRecalledAndCheckLatest {
+        conv_id: String,
+        target_id: String,
+        cli_msg_id: String,
+        found_in_memory: bool,
+        recalled_last: Option<(i64, bool)>,
+        update_conversation_preview: bool,
+        persist_conversations: bool,
+        op_id: Option<u64>,
+        recall_many_id: Option<u64>,
+    },
+    DeleteMessageAndCheckLatest {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        deleted_ts_ms: Option<i64>,
+        mem_latest: Option<ConversationPreview>,
+        update_conversation_preview: bool,
+        persist_conversations: bool,
     },
 }
 
@@ -261,6 +301,32 @@ impl fmt::Debug for StoreOp {
                 .field("mine_only", mine_only)
                 .field("limit", limit)
                 .finish(),
+            // U6
+            Self::DeleteMessage { .. } => f.write_str("DeleteMessage"),
+            Self::ApplyRemoteReactionInStore { r_type, .. } => f
+                .debug_struct("ApplyRemoteReactionInStore")
+                .field("r_type", r_type)
+                .finish(),
+            Self::MarkRecalledAndCheckLatest {
+                found_in_memory,
+                update_conversation_preview,
+                persist_conversations,
+                ..
+            } => f
+                .debug_struct("MarkRecalledAndCheckLatest")
+                .field("found_in_memory", found_in_memory)
+                .field("update_conversation_preview", update_conversation_preview)
+                .field("persist_conversations", persist_conversations)
+                .finish(),
+            Self::DeleteMessageAndCheckLatest {
+                update_conversation_preview,
+                persist_conversations,
+                ..
+            } => f
+                .debug_struct("DeleteMessageAndCheckLatest")
+                .field("update_conversation_preview", update_conversation_preview)
+                .field("persist_conversations", persist_conversations)
+                .finish(),
         }
     }
 }
@@ -277,6 +343,7 @@ pub enum OpResult {
     // U14
     SearchMessages(Vec<olaz_wire::ChatMessage>),
     OptionalString(Option<String>),
+    OptI64(Option<i64>),
 }
 
 impl fmt::Debug for OpResult {
@@ -299,6 +366,7 @@ impl fmt::Debug for OpResult {
                 .debug_struct("OptionalString")
                 .field("present", &opt.is_some())
                 .finish(),
+            Self::OptI64(n) => f.debug_tuple("OptI64").field(n).finish(),
         }
     }
 }
@@ -416,6 +484,7 @@ pub enum HostCall {
         event_id: String,
         react_client_id: String,
         sender_name: String,
+        now_ms: i64,
     },
     ApplyRemoteRecall {
         conv_id: String,
@@ -423,6 +492,8 @@ pub enum HostCall {
         cli_msg_id: String,
         update_conversation_preview: bool,
         persist_conversations: bool,
+        op_id: Option<u64>,
+        recall_many_id: Option<u64>,
     },
     ApplyRemoteDelete {
         conv_id: String,
@@ -465,6 +536,11 @@ pub enum HostCall {
         text: String,
         client_id: String,
         quote: Option<E2eeQuoteArg>,
+    },
+    // U6
+    ShowCard {
+        conv_id: String,
+        text: String,
     },
 }
 
@@ -599,6 +675,11 @@ impl fmt::Debug for HostCall {
                 .debug_struct("SendE2eeText")
                 .field("send_id", send_id)
                 .field("has_quote", &quote.is_some())
+                .finish(),
+            // U6
+            Self::ShowCard { text, .. } => f
+                .debug_struct("ShowCard")
+                .field("text_len", &text.len())
                 .finish(),
         }
     }
@@ -810,6 +891,49 @@ pub enum Effect {
     SendTextApi {
         send_id: u64,
         params: SendTextParams,
+    },
+
+    // U6
+    /// Resolves server `msg_id` and `cli_msg_id` via SQLite + `fetch_history(count=30)`.
+    ResolveMessageIds {
+        resolve_id: u64,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+    },
+    /// Calls `ZaloApi::send_reaction` (with non-auth `msg_type != 1` retry) and reports `Input::ReactDone`.
+    SendReactionApi {
+        react_id: u64,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        r_icon: String,
+        r_type: i64,
+        msg_type: i64,
+    },
+    /// Calls `ZaloApi::recall_message` (with `code == 112` alt-route retry) and reports `Input::RecallDone`.
+    RecallMessageApi {
+        recall_id: u64,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        primary_is_e2ee: bool,
+        can_try_alt: bool,
+    },
+    /// Arms the 5 s delete-for-me undo expiry timer.
+    StartDeleteUndoExpiry { undo_gen: u64, delay: Duration },
+    /// Cancels any active delete-for-me undo expiry timer.
+    CancelDeleteUndoExpiry,
+    /// Commits a delete-for-me batch (`delete_message_for_me` API + SQLite delete per item).
+    CommitDeleteBatch { items: Vec<DeleteUndoItem> },
+    /// Calls `ZaloApi::fetch_auto_delete` and reports `Input::AutoDeleteLoaded`.
+    FetchAutoDeleteApi { op_id: Option<u64> },
+    /// Calls `ZaloApi::update_auto_delete` and reports `Input::AutoDeleteUpdated`.
+    UpdateAutoDeleteApi {
+        conv_id: String,
+        ttl: i64,
+        now_ms: i64,
+        op_id: Option<u64>,
     },
 
     /// Domain activity delegated to Swift via `CoreHost`.
@@ -1046,6 +1170,55 @@ impl fmt::Debug for Effect {
                 .debug_struct("SendTextApi")
                 .field("send_id", send_id)
                 .field("params", params)
+                .finish(),
+            // U6
+            Self::ResolveMessageIds { resolve_id, .. } => f
+                .debug_struct("ResolveMessageIds")
+                .field("resolve_id", resolve_id)
+                .finish(),
+            Self::SendReactionApi {
+                react_id,
+                r_type,
+                msg_type,
+                ..
+            } => f
+                .debug_struct("SendReactionApi")
+                .field("react_id", react_id)
+                .field("r_type", r_type)
+                .field("msg_type", msg_type)
+                .finish(),
+            Self::RecallMessageApi {
+                recall_id,
+                primary_is_e2ee,
+                can_try_alt,
+                ..
+            } => f
+                .debug_struct("RecallMessageApi")
+                .field("recall_id", recall_id)
+                .field("primary_is_e2ee", primary_is_e2ee)
+                .field("can_try_alt", can_try_alt)
+                .finish(),
+            Self::StartDeleteUndoExpiry { undo_gen, delay } => f
+                .debug_struct("StartDeleteUndoExpiry")
+                .field("undo_gen", undo_gen)
+                .field("delay_ms", &delay.as_millis())
+                .finish(),
+            Self::CancelDeleteUndoExpiry => f.write_str("CancelDeleteUndoExpiry"),
+            Self::CommitDeleteBatch { items } => f
+                .debug_struct("CommitDeleteBatch")
+                .field("count", &items.len())
+                .finish(),
+            Self::FetchAutoDeleteApi { op_id } => f
+                .debug_struct("FetchAutoDeleteApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::UpdateAutoDeleteApi {
+                ttl, now_ms, op_id, ..
+            } => f
+                .debug_struct("UpdateAutoDeleteApi")
+                .field("ttl", ttl)
+                .field("now_ms", now_ms)
+                .field("op_id", op_id)
                 .finish(),
             Self::Host(call) => f.debug_tuple("Host").field(call).finish(),
         }

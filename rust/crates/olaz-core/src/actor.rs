@@ -251,15 +251,12 @@ impl CoreHandle {
         conv_id: String,
         query: String,
         limit: i64,
-        // U6: bridge until U6 moves pending-deleted message state into olaz-core.
-        pending_deleted_keys: Vec<String>,
     ) -> (Vec<olaz_wire::ChatMessage>, u64) {
         match self
             .request_with_version(Command::SearchMessages {
                 conv_id,
                 query,
                 limit,
-                pending_deleted_keys,
             })
             .await
         {
@@ -273,14 +270,11 @@ impl CoreHandle {
         &self,
         conv_id: String,
         message: olaz_wire::ChatMessage,
-        // U6: bridge until U6 moves pending-deleted message state into olaz-core.
-        pending_deleted_keys: Vec<String>,
     ) -> (bool, u64) {
         match self
             .request_with_version(Command::EnsureMessageLoaded {
                 conv_id,
                 message: Box::new(message),
-                pending_deleted_keys,
             })
             .await
         {
@@ -294,14 +288,11 @@ impl CoreHandle {
         &self,
         conv_id: String,
         message: olaz_wire::ChatMessage,
-        // U6: bridge until U6 moves pending-deleted message state into olaz-core.
-        pending_deleted_keys: Vec<String>,
     ) -> (Option<String>, u64) {
         match self
             .request_with_version(Command::LoadQuotedMessage {
                 conv_id,
                 message: Box::new(message),
-                pending_deleted_keys,
             })
             .await
         {
@@ -344,6 +335,13 @@ impl CoreHandle {
     /// Awaits a request-reply command returning `bool` (e.g., `UnlockFromPinSearch`).
     pub async fn request_bool(&self, command: Command) -> bool {
         matches!(self.request(command).await, Some(OpResult::Bool(true)))
+    }
+
+    pub async fn request_opt_i64(&self, command: Command) -> Option<i64> {
+        match self.request(command).await {
+            Some(OpResult::OptI64(v)) => v,
+            _ => None,
+        }
     }
 
     /// Drains up to `max_batches` long-poll batches serialized behind any in-flight drain
@@ -466,6 +464,14 @@ impl CoreHandle {
     /// Stops the actor, aborts in-flight effects, and closes `next_changes()`.
     pub fn stop(&self) {
         let _ = self.tx.send(ActorMsg::Stop);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_sink(&self) -> ActorSink {
+        ActorSink {
+            tx: self.tx.clone(),
+            tracker: Arc::clone(&self.tracker),
+        }
     }
 }
 

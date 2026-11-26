@@ -20,6 +20,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
+use crate::actions::swift_error_type_name;
 use crate::actor::{ActorSink, InFlightGuard};
 use crate::conversations::{
     BatchApplyDelta, IdentityTable, MessagePreviewInput, hidden_pin_md5, hidden_pin_sha256,
@@ -386,7 +387,8 @@ pub trait Host: Send + Sync {
         _event_id: String,
         _react_client_id: String,
         _sender_name: String,
-    ) {
+    ) -> bool {
+        true
     }
     async fn apply_remote_recall(
         &self,
@@ -395,7 +397,8 @@ pub trait Host: Send + Sync {
         _cli_msg_id: String,
         _update_conversation_preview: bool,
         _persist_conversations: bool,
-    ) {
+    ) -> bool {
+        true
     }
     async fn apply_remote_delete(
         &self,
@@ -404,7 +407,8 @@ pub trait Host: Send + Sync {
         _cli_msg_id: String,
         _update_conversation_preview: bool,
         _persist_conversations: bool,
-    ) {
+    ) -> bool {
+        true
     }
     async fn decrypt_envelope(&self, payload: Map<String, Value>) -> Map<String, Value> {
         payload
@@ -486,6 +490,9 @@ pub trait Host: Send + Sync {
     ) -> Result<olaz_api::SendMessageResult, String> {
         Err("send_e2ee_text not implemented by host".to_owned())
     }
+    // U6: transient in-chat card toast (`CardActionCenter.shared.show`).
+    // Default no-op until U4+U6 cut over Swift `CoreHost`.
+    async fn show_card(&self, _conv_id: String, _text: String) {}
 }
 
 enum HostJob {
@@ -562,6 +569,8 @@ enum HostJob {
         event_id: String,
         react_client_id: String,
         sender_name: String,
+        now_ms: i64,
+        sink: ActorSink,
         _guard: InFlightGuard,
     },
     ApplyRemoteRecall {
@@ -570,6 +579,9 @@ enum HostJob {
         cli_msg_id: String,
         update_conversation_preview: bool,
         persist_conversations: bool,
+        op_id: Option<u64>,
+        recall_many_id: Option<u64>,
+        sink: ActorSink,
         _guard: InFlightGuard,
     },
     ApplyRemoteDelete {
@@ -578,6 +590,7 @@ enum HostJob {
         cli_msg_id: String,
         update_conversation_preview: bool,
         persist_conversations: bool,
+        sink: ActorSink,
         _guard: InFlightGuard,
     },
     DecryptEnvelope {
@@ -715,6 +728,12 @@ enum HostJob {
         duration: i64,
         _guard: InFlightGuard,
     },
+    // U6
+    ShowCard {
+        conv_id: String,
+        text: String,
+        _guard: InFlightGuard,
+    },
     Drain(oneshot::Sender<()>),
 }
 
@@ -725,6 +744,19 @@ enum StoreJob {
     Op {
         op: StoreOp,
         sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    ResolveMessageIdsLookup {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        reply: oneshot::Sender<(String, String, bool)>,
+    },
+    UpgradeMessageId {
+        conv_id: String,
+        old_id: String,
+        new_id: String,
+        client_id: String,
         _guard: InFlightGuard,
     },
     FlushOp {
@@ -760,6 +792,8 @@ pub struct SessionEffectRunner<T: Transport + 'static> {
     lp_fetch_abort: Mutex<Option<AbortHandle>>,
     // U5: per-conversation incoming typing expiry timers (`conv_id -> (expiry_gen, AbortHandle)`).
     typing_expiry_aborts: Arc<Mutex<BTreeMap<String, (u64, AbortHandle)>>>,
+    // U6: active delete-for-me undo bar expiry timer (`(undo_gen, AbortHandle)`).
+    delete_undo_abort: Arc<Mutex<Option<(u64, AbortHandle)>>>,
     host_worker_abort: AbortHandle,
     store_worker_abort: AbortHandle,
     runtime: Handle,
@@ -856,6 +890,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
             lp_timer_abort,
             lp_fetch_abort: Mutex::new(None),
             typing_expiry_aborts: Arc::new(Mutex::new(BTreeMap::new())),
+            delete_undo_abort: Arc::new(Mutex::new(None)),
             host_worker_abort: worker_handle.abort_handle(),
             store_worker_abort: store_handle.abort_handle(),
             runtime,
@@ -946,6 +981,8 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         for handle in handles {
             handle.abort();
         }
+        self.cancel_typing_expiry(None);
+        self.cancel_delete_undo_timer();
     }
 
     fn cancel_typing_expiry(&self, conv_id: Option<&str>) {
@@ -964,6 +1001,17 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
                     abort.abort();
                 }
             }
+        }
+    }
+
+    fn cancel_delete_undo_timer(&self) {
+        if let Some((_, handle)) = self
+            .delete_undo_abort
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            handle.abort();
         }
     }
 
@@ -1936,6 +1984,270 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         drop(guard);
                     });
                 }
+                // U6
+                Effect::StartDeleteUndoExpiry { undo_gen, delay } => {
+                    // Untracked background timer (like StartTypingExpiry / StartLpTimer) so
+                    // `wait_idle()` does not block on the 5 s undo window.
+                    let timer_sink = sink.clone();
+                    let aborts = Arc::clone(&self.delete_undo_abort);
+                    let aborts_inner = Arc::clone(&aborts);
+                    let handle = self
+                        .runtime
+                        .spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            {
+                                let mut slot =
+                                    aborts_inner.lock().unwrap_or_else(PoisonError::into_inner);
+                                if slot.as_ref().is_some_and(|(g, _)| *g == undo_gen) {
+                                    *slot = None;
+                                }
+                            }
+                            timer_sink.send(Input::DeleteUndoExpired { undo_gen });
+                        })
+                        .abort_handle();
+                    let prev = {
+                        let mut slot = aborts.lock().unwrap_or_else(PoisonError::into_inner);
+                        slot.replace((undo_gen, handle))
+                    };
+                    if let Some((_, prev_handle)) = prev {
+                        prev_handle.abort();
+                    }
+                }
+                Effect::ResolveMessageIds {
+                    resolve_id,
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let store_tx = self.store_tx.clone();
+                    let sink_inner = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let (tx, rx) = oneshot::channel();
+                        let _ = store_tx.send(StoreJob::ResolveMessageIdsLookup {
+                            conv_id: conv_id.clone(),
+                            msg_id: msg_id.clone(),
+                            cli_msg_id: cli_msg_id.clone(),
+                            reply: tx,
+                        });
+                        let (mut effective_msg_id, resolved_cli_id, need_history) =
+                            rx.await.unwrap_or_else(|_| {
+                                let cli = cli_msg_id.trim();
+                                let resolved_cli = if cli.is_empty() {
+                                    msg_id.trim().to_owned()
+                                } else {
+                                    cli.to_owned()
+                                };
+                                let eff = msg_id.trim().to_owned();
+                                let need = eff.is_empty() || eff == resolved_cli;
+                                (eff, resolved_cli, need)
+                            });
+                        let mut upgraded_from_history = false;
+                        if need_history
+                            && let Ok(root_map) = api.fetch_history(&conv_id, None, 30, None).await
+                            && let Some(resolved) = crate::actions::find_server_msg_id(
+                                &Value::Object(root_map),
+                                &resolved_cli_id,
+                            )
+                        {
+                            effective_msg_id = resolved.clone();
+                            upgraded_from_history = true;
+                            let upgrade_guard = sink_inner.track();
+                            let _ = store_tx.send(StoreJob::UpgradeMessageId {
+                                conv_id: conv_id.clone(),
+                                old_id: msg_id.clone(),
+                                new_id: resolved,
+                                client_id: resolved_cli_id.clone(),
+                                _guard: upgrade_guard,
+                            });
+                        }
+                        if effective_msg_id.is_empty() {
+                            effective_msg_id = resolved_cli_id.clone();
+                        }
+                        sink_inner.send(Input::MessageIdsResolved {
+                            resolve_id,
+                            effective_msg_id,
+                            resolved_cli_id,
+                            upgraded_from_history,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::SendReactionApi {
+                    react_id,
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                    r_icon,
+                    r_type,
+                    msg_type,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let client = Arc::clone(&self.client);
+                    let sink_inner = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let first_cli = client.next_client_id();
+                        let mut final_cli = first_cli.to_string();
+                        let res = match api
+                            .send_reaction(
+                                &conv_id,
+                                &msg_id,
+                                &cli_msg_id,
+                                &r_icon,
+                                r_type,
+                                msg_type,
+                                Some(first_cli),
+                            )
+                            .await
+                        {
+                            Ok(_) => Ok(()),
+                            Err(err)
+                                if matches!(
+                                    err,
+                                    olaz_api::ApiError::Net(olaz_net::NetError::Session(_))
+                                ) && !err.is_auth_error()
+                                    && msg_type != 1 =>
+                            {
+                                let retry_cli = client.next_client_id();
+                                final_cli = retry_cli.to_string();
+                                api.send_reaction(
+                                    &conv_id,
+                                    &msg_id,
+                                    &cli_msg_id,
+                                    &r_icon,
+                                    r_type,
+                                    1,
+                                    Some(retry_cli),
+                                )
+                                .await
+                                .map(|_| ())
+                            }
+                            Err(err) => Err(err),
+                        };
+                        let error = res
+                            .err()
+                            .map(|e| crate::actions::ReactFailure::from_api_error(&e));
+                        sink_inner.send(Input::ReactDone {
+                            react_id,
+                            final_react_client_id: final_cli,
+                            error,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::RecallMessageApi {
+                    recall_id,
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                    primary_is_e2ee,
+                    can_try_alt,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink_inner = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let mut retried_alt = false;
+                        let res = match api
+                            .recall_message(&conv_id, &msg_id, &cli_msg_id, primary_is_e2ee)
+                            .await
+                        {
+                            Ok(()) => Ok(()),
+                            Err(olaz_api::ApiError::Net(olaz_net::NetError::Session(ref se)))
+                                if se.code == 112 && can_try_alt =>
+                            {
+                                retried_alt = true;
+                                api.recall_message(&conv_id, &msg_id, &cli_msg_id, !primary_is_e2ee)
+                                    .await
+                            }
+                            Err(err) => Err(err),
+                        };
+                        let error = res
+                            .err()
+                            .map(|e| crate::actions::RecallFailure::from_api_error(&e));
+                        sink_inner.send(Input::RecallDone {
+                            recall_id,
+                            retried_alt,
+                            error,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::CancelDeleteUndoExpiry => {
+                    self.cancel_delete_undo_timer();
+                }
+                Effect::CommitDeleteBatch { items } => {
+                    let client = Arc::clone(&self.client);
+                    let store_tx = self.store_tx.clone();
+                    let sink_inner = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        for item in items {
+                            let resolved_cli = if item.cli_msg_id.is_empty() {
+                                item.msg_id.as_str()
+                            } else {
+                                item.cli_msg_id.as_str()
+                            };
+                            let _ = api
+                                .delete_message_for_me(
+                                    &item.conv_id,
+                                    &item.msg_id,
+                                    resolved_cli,
+                                    &item.sender_id,
+                                )
+                                .await;
+                            let store_guard = sink_inner.track();
+                            let _ = store_tx.send(StoreJob::Op {
+                                op: StoreOp::DeleteMessage {
+                                    conv_id: item.conv_id,
+                                    id: item.msg_id,
+                                },
+                                sink: sink_inner.clone(),
+                                _guard: store_guard,
+                            });
+                        }
+                        drop(guard);
+                    });
+                }
+                Effect::FetchAutoDeleteApi { op_id } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let outcome = api.fetch_auto_delete().await.ok();
+                        sink.send(Input::AutoDeleteLoaded { outcome, op_id });
+                        drop(guard);
+                    });
+                }
+                Effect::UpdateAutoDeleteApi {
+                    conv_id,
+                    ttl,
+                    now_ms,
+                    op_id,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let error_type = match api.update_auto_delete(&conv_id, ttl).await {
+                            Ok(()) => None,
+                            Err(err) => Some(swift_error_type_name(&err).to_owned()),
+                        };
+                        sink.send(Input::AutoDeleteUpdated {
+                            conv_id,
+                            ttl,
+                            now_ms,
+                            error_type,
+                            op_id,
+                        });
+                        drop(guard);
+                    });
+                }
                 Effect::Host(call) => {
                     let guard = sink.track();
                     let job = match call {
@@ -2110,6 +2422,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             event_id,
                             react_client_id,
                             sender_name,
+                            now_ms,
                         } => HostJob::ApplyRemoteReaction {
                             conv_id,
                             msg_id,
@@ -2120,6 +2433,8 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             event_id,
                             react_client_id,
                             sender_name,
+                            now_ms,
+                            sink: sink.clone(),
                             _guard: guard,
                         },
                         HostCall::ApplyRemoteRecall {
@@ -2128,12 +2443,17 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             cli_msg_id,
                             update_conversation_preview,
                             persist_conversations,
+                            op_id,
+                            recall_many_id,
                         } => HostJob::ApplyRemoteRecall {
                             conv_id,
                             msg_id,
                             cli_msg_id,
                             update_conversation_preview,
                             persist_conversations,
+                            op_id,
+                            recall_many_id,
+                            sink: sink.clone(),
                             _guard: guard,
                         },
                         HostCall::ApplyRemoteDelete {
@@ -2148,6 +2468,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             cli_msg_id,
                             update_conversation_preview,
                             persist_conversations,
+                            sink: sink.clone(),
                             _guard: guard,
                         },
                         HostCall::DecryptEnvelope {
@@ -2204,6 +2525,12 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         HostCall::SendE2eeText { .. } => {
                             continue;
                         }
+                        // U6
+                        HostCall::ShowCard { conv_id, text } => HostJob::ShowCard {
+                            conv_id,
+                            text,
+                            _guard: guard,
+                        },
                     };
                     self.send_host(job);
                 }
@@ -2532,6 +2859,140 @@ async fn run_store_worker(
                             });
                         }
                     }
+                    StoreOp::MarkRecalledAndCheckLatest {
+                        conv_id,
+                        target_id,
+                        cli_msg_id,
+                        found_in_memory,
+                        recalled_last,
+                        update_conversation_preview,
+                        persist_conversations,
+                        op_id,
+                        recall_many_id,
+                    } => {
+                        let conv_c = conv_id.clone();
+                        let target_c = target_id.clone();
+                        let cli_c = cli_msg_id.clone();
+                        let recalled_last_final = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let mut store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let _ = store.mark_recalled(&conv_c, &target_c, &cli_c);
+                                    let mut rl = recalled_last;
+                                    if !found_in_memory
+                                        && let Ok(rows) = store.messages(&conv_c, None, 1)
+                                        && let Some(latest) = rows.last()
+                                        && latest.kind_tag == "recalled"
+                                        && ((!target_c.is_empty()
+                                            && (latest.id == target_c
+                                                || latest.client_id == target_c))
+                                            || (!cli_c.is_empty()
+                                                && (latest.id == cli_c
+                                                    || latest.client_id == cli_c)))
+                                    {
+                                        rl = Some((latest.ts_ms, latest.is_mine));
+                                    }
+                                    rl
+                                })
+                                .await
+                                .unwrap_or(recalled_last)
+                        } else {
+                            recalled_last
+                        };
+                        sink.send(Input::RemoteRecallStoreDone {
+                            conv_id,
+                            recalled_last: recalled_last_final,
+                            update_conversation_preview,
+                            persist_conversations,
+                            op_id,
+                            recall_many_id,
+                        });
+                    }
+                    StoreOp::DeleteMessageAndCheckLatest {
+                        conv_id,
+                        msg_id,
+                        cli_msg_id,
+                        deleted_ts_ms,
+                        mem_latest,
+                        update_conversation_preview,
+                        persist_conversations,
+                    } => {
+                        let conv_c = conv_id.clone();
+                        let msg_c = msg_id.clone();
+                        let cli_c = cli_msg_id.clone();
+                        let (resolved_deleted_ts_ms, store_latest) = if let Some(store_arc) =
+                            store_opt
+                        {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let mut store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let target_id = if !msg_c.is_empty() {
+                                        msg_c.as_str()
+                                    } else {
+                                        cli_c.as_str()
+                                    };
+                                    let mut del_ts = deleted_ts_ms;
+                                    if del_ts.is_none() {
+                                        let mut existing = if !target_id.is_empty() {
+                                            store.message(&conv_c, target_id).ok().flatten()
+                                        } else {
+                                            None
+                                        };
+                                        if existing.is_none() && !cli_c.is_empty() {
+                                            existing =
+                                                store.message(&conv_c, &cli_c).ok().flatten();
+                                        }
+                                        if let Some(row) = existing {
+                                            del_ts = Some(row.ts_ms);
+                                        }
+                                    }
+                                    for id in crate::actions::remote_delete_store_ids(
+                                        crate::actions::REMOTE_DELETE_MATCH_POLICY,
+                                        &msg_c,
+                                        &cli_c,
+                                    ) {
+                                        let _ = store.delete_message(&conv_c, &id);
+                                    }
+                                    let latest_preview = store
+                                        .messages(&conv_c, None, 1)
+                                        .ok()
+                                        .and_then(|rows| rows.into_iter().last())
+                                        .map(|latest| {
+                                            let text = if let Some(decoded) =
+                                                crate::messages::decode_db_stored(&latest)
+                                            {
+                                                crate::conversations::message_preview_label(
+                                                    &decoded,
+                                                )
+                                            } else if latest.kind_tag == "recalled" {
+                                                "Tin nhắn đã được thu hồi".to_owned()
+                                            } else {
+                                                latest.text.clone()
+                                            };
+                                            crate::conversations::ConversationPreview {
+                                                text,
+                                                date_ms: Some(latest.ts_ms),
+                                                from_me: latest.is_mine,
+                                            }
+                                        });
+                                    (del_ts, latest_preview)
+                                })
+                                .await
+                                .unwrap_or((deleted_ts_ms, None))
+                        } else {
+                            (deleted_ts_ms, None)
+                        };
+                        sink.send(Input::RemoteDeleteStoreDone {
+                            conv_id,
+                            deleted_ts_ms: resolved_deleted_ts_ms,
+                            mem_latest,
+                            store_latest,
+                            update_conversation_preview,
+                            persist_conversations,
+                        });
+                    }
                     other => {
                         if let Some(store_arc) = store_opt {
                             let _ = runtime
@@ -2593,6 +3054,78 @@ async fn run_store_worker(
                                                 },
                                             );
                                         }
+                                        // U6
+                                        StoreOp::DeleteMessage { conv_id, id } => {
+                                            let _ = store.delete_message(&conv_id, &id);
+                                        }
+                                        StoreOp::ApplyRemoteReactionInStore {
+                                            conv_candidates,
+                                            msg_id,
+                                            cli_msg_id,
+                                            actor_uid,
+                                            my_uid,
+                                            is_me,
+                                            r_type,
+                                            r_icon,
+                                            allow_duplicate_same_user,
+                                            snap,
+                                        } => {
+                                            let mut found = None;
+                                            for candidate in &conv_candidates {
+                                                if found.is_some() {
+                                                    break;
+                                                }
+                                                if !msg_id.is_empty() {
+                                                    found = store
+                                                        .message(candidate, &msg_id)
+                                                        .ok()
+                                                        .flatten();
+                                                }
+                                                if found.is_none() && !cli_msg_id.is_empty() {
+                                                    found = store
+                                                        .message(candidate, &cli_msg_id)
+                                                        .ok()
+                                                        .flatten();
+                                                }
+                                            }
+                                            if let Some(row) = found
+                                                && let Some(mut msg) =
+                                                    crate::messages::decode_db_stored(&row)
+                                            {
+                                                crate::actions::mutate_reactions(
+                                                    &mut msg.reactions,
+                                                    &crate::actions::ReactionMutation {
+                                                        actor_uid: &actor_uid,
+                                                        my_uid: &my_uid,
+                                                        is_me,
+                                                        r_type: &r_type,
+                                                        r_icon: &r_icon,
+                                                        allow_duplicate_same_user,
+                                                    },
+                                                    |uid| {
+                                                        snap.lookup_person(uid)
+                                                            .map(|p| p.name)
+                                                            .unwrap_or_default()
+                                                    },
+                                                );
+                                                if let Some(wire_stored) =
+                                                    olaz_wire::encode_chat_message(
+                                                        &msg,
+                                                        &msg.client_id,
+                                                    )
+                                                {
+                                                    let _ = store.save_messages_with(
+                                                        &[crate::messages::to_db_stored(
+                                                            &wire_stored,
+                                                        )],
+                                                        SaveOptions {
+                                                            skip_twin_checks: false,
+                                                            preserve_existing_reactions: false,
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                        }
                                         StoreOp::LoadMentionPreviewMessages { .. }
                                         | StoreOp::LoadPreferenceString { .. }
                                         | StoreOp::ProbeAndSaveMessages { .. }
@@ -2601,12 +3134,118 @@ async fn run_store_worker(
                                         | StoreOp::SearchMessagesPage { .. }
                                         | StoreOp::LoadMessagesAround { .. }
                                         | StoreOp::LookupMessage { .. }
-                                        | StoreOp::FindLegacyQuoted { .. } => {}
+                                        | StoreOp::FindLegacyQuoted { .. }
+                                        | StoreOp::MarkRecalledAndCheckLatest { .. }
+                                        | StoreOp::DeleteMessageAndCheckLatest { .. } => {}
                                     }
                                 })
                                 .await;
                         }
                     }
+                }
+            }
+            StoreJob::ResolveMessageIdsLookup {
+                conv_id,
+                msg_id,
+                cli_msg_id,
+                reply,
+            } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let msg_id_fb = msg_id.clone();
+                let cli_msg_id_fb = cli_msg_id.clone();
+                let res = if let Some(store_arc) = store_opt {
+                    runtime
+                        .spawn_blocking(move || {
+                            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                            let mut resolved_cli = cli_msg_id.trim().to_owned();
+                            if resolved_cli.is_empty()
+                                && let Ok(Some(stored)) = store.message(&conv_id, &msg_id)
+                            {
+                                let col_cli = stored.client_id.trim();
+                                if !col_cli.is_empty() {
+                                    resolved_cli = col_cli.to_owned();
+                                } else if let Ok(Value::Object(map)) =
+                                    serde_json::from_slice::<Value>(&stored.raw_json_data)
+                                {
+                                    let raw_cli = map
+                                        .get("clientId")
+                                        .or_else(|| map.get("cliMsgId"))
+                                        .and_then(|v| match v {
+                                            Value::String(s) => Some(s.trim().to_owned()),
+                                            Value::Number(n) => Some(n.to_string()),
+                                            _ => None,
+                                        })
+                                        .unwrap_or_default();
+                                    if !raw_cli.is_empty() {
+                                        resolved_cli = raw_cli;
+                                    }
+                                }
+                            }
+                            if resolved_cli.is_empty() {
+                                resolved_cli = msg_id.clone();
+                            }
+                            let mut effective_msg_id = msg_id.trim().to_owned();
+                            let mut need_history = false;
+                            if effective_msg_id.is_empty() || effective_msg_id == resolved_cli {
+                                if let Ok(Some(stored)) = store.message(&conv_id, &resolved_cli)
+                                    && !stored.id.is_empty()
+                                    && stored.id != resolved_cli
+                                {
+                                    effective_msg_id = stored.id;
+                                } else {
+                                    need_history = true;
+                                }
+                            }
+                            (effective_msg_id, resolved_cli, need_history)
+                        })
+                        .await
+                        .unwrap_or_else(|_| {
+                            let cli = cli_msg_id_fb.trim();
+                            let r = if cli.is_empty() {
+                                msg_id_fb.clone()
+                            } else {
+                                cli.to_owned()
+                            };
+                            let eff = msg_id_fb.trim().to_owned();
+                            let need = eff.is_empty() || eff == r;
+                            (eff, r, need)
+                        })
+                } else {
+                    let cli = cli_msg_id_fb.trim();
+                    let r = if cli.is_empty() {
+                        msg_id_fb.clone()
+                    } else {
+                        cli.to_owned()
+                    };
+                    let eff = msg_id_fb.trim().to_owned();
+                    let need = eff.is_empty() || eff == r;
+                    (eff, r, need)
+                };
+                let _ = reply.send(res);
+            }
+            StoreJob::UpgradeMessageId {
+                conv_id,
+                old_id,
+                new_id,
+                client_id,
+                _guard,
+            } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                if let Some(store_arc) = store_opt {
+                    let _ = runtime
+                        .spawn_blocking(move || {
+                            let mut store =
+                                store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                            let _ =
+                                store.upgrade_message_id(&conv_id, &old_id, &new_id, &client_id);
+                        })
+                        .await;
                 }
             }
             StoreJob::FlushOp {
@@ -2875,20 +3514,38 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 event_id,
                 react_client_id,
                 sender_name,
+                now_ms,
+                sink,
                 _guard,
             } => {
-                host.apply_remote_reaction(
-                    conv_id,
-                    msg_id,
-                    cli_msg_id,
-                    sender_id,
-                    r_type,
-                    r_icon,
-                    event_id,
-                    react_client_id,
-                    sender_name,
-                )
-                .await;
+                let approved = host
+                    .apply_remote_reaction(
+                        conv_id.clone(),
+                        msg_id.clone(),
+                        cli_msg_id.clone(),
+                        sender_id.clone(),
+                        r_type.clone(),
+                        r_icon.clone(),
+                        event_id.clone(),
+                        react_client_id.clone(),
+                        sender_name.clone(),
+                    )
+                    .await;
+                if approved {
+                    let effective_now = if now_ms > 0 { now_ms } else { unix_now_ms() };
+                    sink.send(Input::RemoteReactionApproved {
+                        conv_id,
+                        msg_id,
+                        cli_msg_id,
+                        sender_id,
+                        r_type,
+                        r_icon,
+                        event_id,
+                        react_client_id,
+                        sender_name,
+                        now_ms: effective_now,
+                    });
+                }
             }
             HostJob::ApplyRemoteRecall {
                 conv_id,
@@ -2896,16 +3553,36 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 cli_msg_id,
                 update_conversation_preview,
                 persist_conversations,
+                op_id,
+                recall_many_id,
+                sink,
                 _guard,
             } => {
-                host.apply_remote_recall(
-                    conv_id,
-                    msg_id,
-                    cli_msg_id,
-                    update_conversation_preview,
-                    persist_conversations,
-                )
-                .await;
+                let approved = host
+                    .apply_remote_recall(
+                        conv_id.clone(),
+                        msg_id.clone(),
+                        cli_msg_id.clone(),
+                        update_conversation_preview,
+                        persist_conversations,
+                    )
+                    .await;
+                if approved {
+                    sink.send(Input::RemoteRecallApproved {
+                        conv_id,
+                        msg_id,
+                        cli_msg_id,
+                        update_conversation_preview,
+                        persist_conversations,
+                        op_id,
+                        recall_many_id,
+                    });
+                } else if op_id.is_some() || recall_many_id.is_some() {
+                    sink.send(Input::RemoteRecallSkipped {
+                        op_id,
+                        recall_many_id,
+                    });
+                }
             }
             HostJob::ApplyRemoteDelete {
                 conv_id,
@@ -2913,16 +3590,27 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 cli_msg_id,
                 update_conversation_preview,
                 persist_conversations,
+                sink,
                 _guard,
             } => {
-                host.apply_remote_delete(
-                    conv_id,
-                    msg_id,
-                    cli_msg_id,
-                    update_conversation_preview,
-                    persist_conversations,
-                )
-                .await;
+                let approved = host
+                    .apply_remote_delete(
+                        conv_id.clone(),
+                        msg_id.clone(),
+                        cli_msg_id.clone(),
+                        update_conversation_preview,
+                        persist_conversations,
+                    )
+                    .await;
+                if approved {
+                    sink.send(Input::RemoteDeleteApproved {
+                        conv_id,
+                        msg_id,
+                        cli_msg_id,
+                        update_conversation_preview,
+                        persist_conversations,
+                    });
+                }
             }
             HostJob::DecryptEnvelope {
                 payload,
@@ -3167,6 +3855,14 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
             } => {
                 host.mute(conv_id, set, start, start_explicit, duration)
                     .await;
+            }
+            // U6
+            HostJob::ShowCard {
+                conv_id,
+                text,
+                _guard,
+            } => {
+                host.show_card(conv_id, text).await;
             }
             HostJob::Drain(tx) => {
                 let _ = tx.send(());
@@ -3895,6 +4591,389 @@ mod tests {
         });
         core.wait_idle().await;
         assert_eq!(client.transport().requests().len(), 2);
+
+        core.stop();
+    }
+
+    #[derive(Default)]
+    struct RecordingCardHost {
+        cards: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl Host for RecordingCardHost {
+        async fn load_saved_session(&self) -> Option<String> {
+            None
+        }
+        async fn load_legacy_cookie(&self) -> Option<LegacyCookie> {
+            None
+        }
+        async fn set_pref(&self, _key: String, _value: String) {}
+        async fn prepare_store(&self, _user_id: String, _account: LoginAccount) {}
+        async fn start_bootstrap(&self) {}
+        async fn offer_first_login_transfer(&self, _force: bool) {}
+        async fn reset_domains(&self) {}
+        async fn persist_session(&self, _snapshot_json: String) {}
+        async fn clear_session(&self) {}
+        async fn mark_expired(&self, _snapshot_json: String) {}
+        async fn persist_poll_state(&self, _state: PollState) {}
+        async fn persist_ws_cursors(&self, _cursors: CursorMap) {}
+        async fn apply_batch(
+            &self,
+            _cmd: Option<u16>,
+            _increment_unread: bool,
+            _notify_incoming: bool,
+            _payload: Map<String, Value>,
+        ) -> BatchApplyDelta {
+            BatchApplyDelta::default()
+        }
+        async fn apply_parsed_events(
+            &self,
+            _cmd: u16,
+            _increment_unread: bool,
+            _notify_incoming: bool,
+            _envelope: TypedChatEnvelope,
+        ) -> BatchApplyDelta {
+            BatchApplyDelta::default()
+        }
+        async fn mobile_sync(&self, _events: Vec<MobileSyncEvent>) {}
+        async fn e2ee_signal(&self, _cmd: u16, _payload: Map<String, Value>) {}
+        async fn e2ee_deliver_reports(&self, _cmd: u16, _payload: Map<String, Value>) {}
+        async fn e2ee_connected(&self, _uid: String) {}
+        async fn e2ee_disconnected(&self) {}
+        async fn voip_control(&self, _act: String, _raw_data: Value, _data: Map<String, Value>) {}
+        async fn show_typing(&self, _conv_id: String, _uid: String, _on_pc: bool) {}
+        async fn pin_topic(&self, _conv_id: String) {}
+        async fn group_notice(&self, _act: String, _data: Map<String, Value>, _ts: i64) {}
+        async fn mute(
+            &self,
+            _conv_id: String,
+            _set: bool,
+            _start: i64,
+            _start_explicit: bool,
+            _duration: i64,
+        ) {
+        }
+        async fn show_card(&self, conv_id: String, text: String) {
+            self.cards
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((conv_id, text));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_undo_timer_commits_after_5s_and_undo_cancels_with_show_card() {
+        use crate::actions::{DELETE_UNDO_DURATION, DeleteUndoItem, RESTORE_SUCCESS_CARD_TEXT};
+        use crate::reduce::ReduceOutput;
+        use crate::state::CoreState;
+        use olaz_net::http::RawResponse;
+        use olaz_store::{Store, StoredMessage};
+
+        let transport = MockTransport::from_fn(|_req| {
+            Ok(RawResponse::new(
+                200,
+                serde_json::json!({"error_code": 0, "data": {}})
+                    .to_string()
+                    .into_bytes(),
+            ))
+        });
+        let client = Arc::new(SessionClient::new(
+            transport,
+            "imei-u6".to_owned(),
+            "Mac".to_owned(),
+        ));
+        client.update_credentials(
+            LoginAccount {
+                user_id: "2000620".to_owned(),
+                ..LoginAccount::default()
+            },
+            b"0123456789abcdef".to_vec(),
+            "sek.1".to_owned(),
+            Some(ZaloDomains::default()),
+        );
+        let host = Arc::new(RecordingCardHost::default());
+        let runner = Arc::new(SessionEffectRunner::new(
+            Arc::clone(&client),
+            Arc::clone(&host) as Arc<dyn Host>,
+            Handle::current(),
+        ));
+
+        // Seed an in-memory SQLite store with one message to confirm CommitDeleteBatch deletes it.
+        let Ok(mut store) = Store::open_in_memory() else {
+            panic!("failed to open in-memory store");
+        };
+        let seeded = StoredMessage {
+            id: "9020001".to_owned(),
+            conv_id: "3000620".to_owned(),
+            client_id: "c9020001".to_owned(),
+            sender_id: "2000620".to_owned(),
+            sender_name: "Me".to_owned(),
+            sender_avatar: String::new(),
+            is_mine: true,
+            text: "to delete".to_owned(),
+            kind_tag: "text".to_owned(),
+            ts_ms: 1_700_000_000_000,
+            status: "sent".to_owned(),
+            raw_json_data: Vec::new(),
+        };
+        let Ok(_) = store.save_messages(&[seeded]) else {
+            panic!("failed to save seeded message");
+        };
+        let store_arc = Arc::new(Mutex::new(store));
+        runner.attach_store(Arc::clone(&store_arc));
+
+        // 1) Undo before 5 s cancels timer, emits show_card, and never calls delete API.
+        let mut initial = CoreState::default();
+        let mut out = ReduceOutput::default();
+        initial.actions.delete_undo.start_batch(
+            "3000620".to_owned(),
+            vec![DeleteUndoItem {
+                conv_id: "3000620".to_owned(),
+                msg_id: "9020001".to_owned(),
+                cli_msg_id: "c9020001".to_owned(),
+                sender_id: "2000620".to_owned(),
+                message: None,
+            }],
+            1_700_000_011_000,
+            &mut out,
+        );
+        let core = CoreHandle::start_with_state(
+            initial,
+            Arc::clone(&runner) as Arc<dyn EffectRunner>,
+            Handle::current(),
+        );
+        core.request_unit(Command::UndoDelete).await;
+        core.wait_idle().await;
+        assert_eq!(
+            *host.cards.lock().unwrap_or_else(PoisonError::into_inner),
+            vec![("3000620".to_owned(), RESTORE_SUCCESS_CARD_TEXT.to_owned())]
+        );
+        assert!(client.transport().requests().is_empty());
+        core.stop();
+
+        // 2) DismissDeleteUndo commits batch via delete_message_for_me API + SQLite delete.
+        let mut initial2 = CoreState::default();
+        let mut out2 = ReduceOutput::default();
+        initial2.actions.delete_undo.start_batch(
+            "3000620".to_owned(),
+            vec![DeleteUndoItem {
+                conv_id: "3000620".to_owned(),
+                msg_id: "9020001".to_owned(),
+                cli_msg_id: "c9020001".to_owned(),
+                sender_id: "2000620".to_owned(),
+                message: None,
+            }],
+            1_700_000_011_000,
+            &mut out2,
+        );
+        let runner2 = Arc::new(SessionEffectRunner::new(
+            Arc::clone(&client),
+            Arc::clone(&host) as Arc<dyn Host>,
+            Handle::current(),
+        ));
+        runner2.attach_store(Arc::clone(&store_arc));
+        let core2 = CoreHandle::start_with_state(
+            initial2,
+            Arc::clone(&runner2) as Arc<dyn EffectRunner>,
+            Handle::current(),
+        );
+        core2.request_unit(Command::DismissDeleteUndo).await;
+        core2.wait_idle().await;
+        runner2.flush_store().await;
+
+        assert_eq!(client.transport().requests().len(), 1);
+        assert_eq!(
+            client.transport().requests()[0].path(),
+            "/api/message/delete"
+        );
+        let remaining = store_arc
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .read_messages_now("3000620", None, 10)
+            .unwrap_or_default();
+        assert!(remaining.is_empty());
+        core2.stop();
+
+        // 3) StartDeleteUndoExpiry fires after 5 s on paused time, clears the bar, and commits.
+        let mut initial3 = CoreState::default();
+        let mut out3 = ReduceOutput::default();
+        initial3.actions.delete_undo.start_batch(
+            "3000620".to_owned(),
+            vec![DeleteUndoItem {
+                conv_id: "3000620".to_owned(),
+                msg_id: "9020002".to_owned(),
+                cli_msg_id: "c9020002".to_owned(),
+                sender_id: "2000620".to_owned(),
+                message: None,
+            }],
+            1_700_000_020_000,
+            &mut out3,
+        );
+        let runner3 = Arc::new(SessionEffectRunner::new(
+            Arc::clone(&client),
+            Arc::clone(&host) as Arc<dyn Host>,
+            Handle::current(),
+        ));
+        let core3 = CoreHandle::start_with_state(
+            initial3,
+            Arc::clone(&runner3) as Arc<dyn EffectRunner>,
+            Handle::current(),
+        );
+        runner3.dispatch(out3.effects, core3.test_sink());
+        // wait_idle returns immediately while the 5 s timer is armed.
+        core3.wait_idle().await;
+
+        // Before 5 s: undo bar is still active, no new delete API request yet.
+        tokio::time::advance(Duration::from_millis(4_900)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            core3
+                .full_snapshot()
+                .await
+                .and_then(|s| s.delete_undo)
+                .is_some()
+        );
+        assert_eq!(client.transport().requests().len(), 1);
+
+        // At 5 s: timer fires DeleteUndoExpired -> clears bar + commits delete via API.
+        tokio::time::advance(DELETE_UNDO_DURATION).await;
+        let Some(change) = core3.next_changes().await else {
+            panic!("expected delete_undo clear change");
+        };
+        assert_eq!(change.delete_undo, Some(None));
+        core3.wait_idle().await;
+        assert_eq!(client.transport().requests().len(), 2);
+        assert_eq!(
+            client.transport().requests()[1].path(),
+            "/api/message/delete"
+        );
+        core3.stop();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_delete_load_and_set_runner_flow_updates_state_and_emits_show_card_on_error() {
+        use crate::actions::AUTO_DELETE_FAILED_CARD_TEXT;
+        use olaz_net::http::RawResponse;
+        use std::sync::atomic::AtomicUsize;
+
+        let load_calls = Arc::new(AtomicUsize::new(0));
+        let update_calls = Arc::new(AtomicUsize::new(0));
+        let lc = Arc::clone(&load_calls);
+        let uc = Arc::clone(&update_calls);
+        let transport = MockTransport::from_fn(move |req| match req.path().as_str() {
+            "/api/conv/autodelete/getConvers" => {
+                let n = lc.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // First call fails -> initializes empty map when None.
+                    Ok(RawResponse::new(
+                        200,
+                        serde_json::json!({"error_code": 500, "error_message": "fail"})
+                            .to_string()
+                            .into_bytes(),
+                    ))
+                } else {
+                    Ok(RawResponse::new(
+                        200,
+                        serde_json::json!({
+                            "error_code": 0,
+                            "data": {
+                                "convers": [
+                                    {"destId": "627", "isGroup": 1, "ttl": 86_400_000}
+                                ]
+                            }
+                        })
+                        .to_string()
+                        .into_bytes(),
+                    ))
+                }
+            }
+            "/api/conv/autodelete/updateConvers" => {
+                let n = uc.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Ok(RawResponse::new(
+                        200,
+                        serde_json::json!({"error_code": 112, "error_message": "bad"})
+                            .to_string()
+                            .into_bytes(),
+                    ))
+                } else {
+                    Ok(RawResponse::new(
+                        200,
+                        serde_json::json!({"error_code": 0, "data": {}})
+                            .to_string()
+                            .into_bytes(),
+                    ))
+                }
+            }
+            _ => Ok(RawResponse::new(404, b"{}".to_vec())),
+        });
+        let client = Arc::new(SessionClient::new(
+            transport,
+            "imei-ad".to_owned(),
+            "Mac".to_owned(),
+        ));
+        client.update_credentials(
+            LoginAccount {
+                user_id: "2000627".to_owned(),
+                ..LoginAccount::default()
+            },
+            b"0123456789abcdef".to_vec(),
+            "sek.1".to_owned(),
+            Some(ZaloDomains::default()),
+        );
+        let host = Arc::new(RecordingCardHost::default());
+        let runner = Arc::new(SessionEffectRunner::new(
+            Arc::clone(&client),
+            Arc::clone(&host) as Arc<dyn Host>,
+            Handle::current(),
+        ));
+        let core = CoreHandle::start(runner, Handle::current());
+
+        // 1) Load failure when None sets Some({}).
+        core.request_unit(Command::LoadAutoDelete).await;
+        let snap1 = core.full_snapshot().await;
+        assert_eq!(snap1.and_then(|s| s.auto_delete), Some(BTreeMap::new()));
+
+        // 2) Load success populates map.
+        core.request_unit(Command::LoadAutoDelete).await;
+        let snap2 = core.full_snapshot().await;
+        assert_eq!(
+            snap2.and_then(|s| s.auto_delete),
+            Some(BTreeMap::from([("g627".to_owned(), 86_400_000)]))
+        );
+
+        // 3) SetAutoDelete failure leaves map intact and emits show_card.
+        core.request_unit(Command::SetAutoDelete {
+            conv_id: "3000628".to_owned(),
+            ttl: 3_600_000,
+            now_ms: 1_700_000_000_000,
+        })
+        .await;
+        core.wait_idle().await;
+        assert_eq!(
+            *host.cards.lock().unwrap_or_else(PoisonError::into_inner),
+            vec![(
+                "3000628".to_owned(),
+                AUTO_DELETE_FAILED_CARD_TEXT.to_owned()
+            )]
+        );
+
+        // 4) SetAutoDelete success updates map and publishes CoreChanges.auto_delete.
+        core.request_unit(Command::SetAutoDelete {
+            conv_id: "3000628".to_owned(),
+            ttl: 3_600_000,
+            now_ms: 1_700_000_005_000,
+        })
+        .await;
+        let snap4 = core.full_snapshot().await;
+        assert_eq!(
+            snap4.and_then(|s| s.auto_delete),
+            Some(BTreeMap::from([
+                ("3000628".to_owned(), 3_600_000),
+                ("g627".to_owned(), 86_400_000),
+            ]))
+        );
 
         core.stop();
     }

@@ -68,27 +68,11 @@ pub(crate) fn reduce_search(state: &mut CoreState, input: Input, out: &mut Reduc
                 conv_id,
                 query,
                 limit,
-                pending_deleted_keys,
             } => {
-                start_search(
-                    state,
-                    op_id,
-                    conv_id,
-                    query,
-                    limit,
-                    pending_deleted_keys,
-                    out,
-                );
+                start_search(state, op_id, conv_id, query, limit, out);
             }
-            Command::EnsureMessageLoaded {
-                conv_id,
-                message,
-                pending_deleted_keys,
-            } => {
-                let pending_set: HashSet<String> = pending_deleted_keys
-                    .into_iter()
-                    .filter(|k| !k.is_empty())
-                    .collect();
+            Command::EnsureMessageLoaded { conv_id, message } => {
+                let pending_set = state.actions.delete_undo.pending_deleted_keys(&conv_id);
                 start_ensure_message_loaded(
                     state,
                     op_id,
@@ -99,15 +83,8 @@ pub(crate) fn reduce_search(state: &mut CoreState, input: Input, out: &mut Reduc
                     out,
                 );
             }
-            Command::LoadQuotedMessage {
-                conv_id,
-                message,
-                pending_deleted_keys,
-            } => {
-                let pending_set: HashSet<String> = pending_deleted_keys
-                    .into_iter()
-                    .filter(|k| !k.is_empty())
-                    .collect();
+            Command::LoadQuotedMessage { conv_id, message } => {
+                let pending_set = state.actions.delete_undo.pending_deleted_keys(&conv_id);
                 start_load_quoted(state, op_id, conv_id, *message, pending_set, out);
             }
             _ => {}
@@ -145,7 +122,6 @@ fn start_search(
     conv_id: String,
     query: String,
     limit: i64,
-    pending_deleted_keys: Vec<String>,
     out: &mut ReduceOutput,
 ) {
     let trimmed = trim_search_query(&query);
@@ -172,10 +148,7 @@ fn start_search(
         return;
     }
 
-    let pending_set: HashSet<String> = pending_deleted_keys
-        .into_iter()
-        .filter(|k| !k.is_empty())
-        .collect();
+    let pending_set = state.actions.delete_undo.pending_deleted_keys(&conv_id);
 
     let in_memory = state
         .messages

@@ -62,9 +62,11 @@ pub use api::{
 pub use chat::*;
 pub use conversations::*;
 pub use core::{
-    ControlRouteRecord, CoreChangesRecord, CoreEngine, CoreFailKindRecord, CoreHost,
-    CoreWirePayload, FailReasonRecord, LegacyCookieRecord, LoginAccountRecord, LoginStateRecord,
-    LoginStepRecord, MobileSyncEventRecord, PersistedTransportStateRecord, PhaseRecord,
+    AutoDeleteEntryRecord, AutoDeleteUpdateRecord, ControlRouteRecord, CoreChangesRecord,
+    CoreEngine, CoreFailKindRecord, CoreHost, CoreWirePayload, DeleteUndoSnapshotRecord,
+    DeleteUndoUpdateRecord, FailReasonRecord, LegacyCookieRecord, LoginAccountRecord,
+    LoginStateRecord, LoginStepRecord, MessageConfirmActionRecord, MessageConfirmRecord,
+    MessageConfirmUpdateRecord, MobileSyncEventRecord, PersistedTransportStateRecord, PhaseRecord,
     ProfileRecord, SessionStateRecord, classify_control_envelope,
 };
 pub use crypto::{decrypt_ws_frame, inflate};
