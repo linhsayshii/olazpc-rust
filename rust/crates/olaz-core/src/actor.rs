@@ -11,6 +11,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::changes::{ChangeHub, CoreChanges};
+use crate::cloud::{CloudActionResult, CloudFetch, CloudPage, MediaResolutionOutcome};
 use crate::conversations::{ConversationActionResult, PinBoard};
 use crate::effect::{Effect, OpResult};
 use crate::input::{Command, Input};
@@ -280,6 +281,35 @@ impl CoreHandle {
         match self.request(command).await {
             Some(OpResult::OptI64(v)) => v,
             _ => None,
+        }
+    }
+
+    // U11: zCloud request-reply helpers
+    pub async fn request_cloud_page(&self, command: Command) -> CloudPage {
+        match self.request(command).await {
+            Some(OpResult::CloudPage(page)) => page,
+            _ => CloudPage::default(),
+        }
+    }
+
+    pub async fn request_cloud_fetch(&self, command: Command) -> CloudFetch {
+        match self.request(command).await {
+            Some(OpResult::CloudFetch(res)) => res,
+            _ => CloudFetch::Failed(crate::cloud::CLOUD_FETCH_FAILED_ERROR.to_owned()),
+        }
+    }
+
+    pub async fn request_cloud_action(&self, command: Command) -> CloudActionResult {
+        match self.request(command).await {
+            Some(OpResult::CloudAction(res)) => res,
+            _ => CloudActionResult::default(),
+        }
+    }
+
+    pub async fn request_media_resolution(&self, command: Command) -> MediaResolutionOutcome {
+        match self.request(command).await {
+            Some(OpResult::MediaResolution(res)) => res,
+            _ => MediaResolutionOutcome::Unavailable,
         }
     }
 

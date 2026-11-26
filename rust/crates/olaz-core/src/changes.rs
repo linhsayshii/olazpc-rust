@@ -13,6 +13,7 @@ use std::sync::{Mutex, PoisonError};
 use tokio::sync::Notify;
 
 use crate::actions::{DeleteUndoSnapshot, MessageConfirmState};
+use crate::cloud::CloudSnapshotState;
 use crate::conversations::{
     CachedProfile, ConversationActionUI, ConversationActionsState, ConversationExtras,
     ConversationPrompt, ConversationSummary,
@@ -47,6 +48,8 @@ pub enum DirtyKey {
     AutoDelete,
     StarredIds,
     CachedProfiles,
+    // U11
+    Cloud,
 }
 
 /// Set of keys dirtied by one `reduce` step.
@@ -103,6 +106,9 @@ pub struct CoreChanges {
     pub starred_ids: Option<BTreeSet<String>>,
     /// Updated cached profile map (`cachedProfiles`).
     pub cached_profiles: Option<BTreeMap<String, CachedProfile>>,
+    // U11
+    /// Updated zCloud snapshot (`cloud`).
+    pub cloud: Option<CloudSnapshotState>,
 }
 
 impl fmt::Debug for CoreChanges {
@@ -147,6 +153,8 @@ struct DirtyBuffer {
     auto_delete: Option<Option<BTreeMap<String, i64>>>,
     starred_ids: Option<BTreeSet<String>>,
     cached_profiles: Option<BTreeMap<String, CachedProfile>>,
+    // U11
+    cloud: Option<CloudSnapshotState>,
     closed: bool,
 }
 
@@ -167,6 +175,7 @@ impl DirtyBuffer {
             || self.auto_delete.is_some()
             || self.starred_ids.is_some()
             || self.cached_profiles.is_some()
+            || self.cloud.is_some()
     }
 }
 
@@ -302,6 +311,9 @@ impl ChangeHub {
                     buf.cached_profiles =
                         Some(state.conversations.identities.cached_profiles.clone());
                 }
+                DirtyKey::Cloud => {
+                    buf.cloud = Some(state.cloud.snapshot.clone());
+                }
             }
             buf.dirty.insert(key);
         }
@@ -387,6 +399,8 @@ impl ChangeHub {
                             auto_delete: None,
                             starred_ids: None,
                             cached_profiles: None,
+                            // U11
+                            cloud: None,
                         });
                     }
                 }
@@ -451,6 +465,8 @@ impl ChangeHub {
                         auto_delete: buf.auto_delete.take(),
                         starred_ids: buf.starred_ids.take(),
                         cached_profiles: buf.cached_profiles.take(),
+                        // U11
+                        cloud: buf.cloud.take(),
                     });
                 }
                 if buf.closed {

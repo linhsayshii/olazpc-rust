@@ -4,6 +4,7 @@
 
 pub mod bootstrap;
 pub mod classify;
+pub mod cloud;
 pub mod conversations;
 pub mod messages;
 pub mod send;
@@ -38,6 +39,19 @@ fn is_message_command(cmd: &Command) -> bool {
             | Command::RefreshReactionNames { .. }
             | Command::SeedHistoryFreshness(_)
             | Command::SeedContacts(_)
+    )
+}
+
+fn is_cloud_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::RefreshCloud
+            | Command::CloudList { .. }
+            | Command::CloudThumbnail { .. }
+            | Command::CloudFetch { .. }
+            | Command::CloudDelete { .. }
+            | Command::CloudSetOffload { .. }
+            | Command::ResetCloud
     )
 }
 
@@ -162,6 +176,21 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
             ..
         }
         | Input::SendTextDone { .. } => send::reduce_send(state, input, &mut out),
+
+        // U11
+        Input::Command(ref cmd) if is_cloud_command(cmd) => {
+            cloud::reduce_cloud(state, input, &mut out);
+        }
+        Input::OpRequest { ref cmd, .. } if is_cloud_command(cmd) => {
+            cloud::reduce_cloud(state, input, &mut out);
+        }
+        Input::CloudRefreshLoaded { .. }
+        | Input::CloudListStoreDone { .. }
+        | Input::CloudLookupMessageDone { .. }
+        | Input::CloudResolveMediaDone { .. }
+        | Input::CloudResolveFileDone { .. }
+        | Input::CloudDeleteMessageApiDone { .. }
+        | Input::CloudRemoteDeleteDone { .. } => cloud::reduce_cloud(state, input, &mut out),
 
         // U6
         Input::Command(ref cmd) if is_action_command(cmd) => {

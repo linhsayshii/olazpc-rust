@@ -12,6 +12,7 @@ use olaz_ws::CursorMap;
 use serde_json::{Map, Value, json};
 
 use crate::actions::{ActionsState, DeleteUndoSnapshot, MessageConfirmState};
+use crate::cloud::{CloudSnapshotState, CloudState};
 use crate::conversations::{CachedProfile, ConversationsState};
 use crate::messages::{ContactsState, IdentitySnapshot, MessagesState};
 use crate::typing::{TypingState, TypingStatus};
@@ -32,6 +33,8 @@ pub struct CoreState {
     pub send: crate::reduce::send::SendState,
     // U6
     pub actions: ActionsState,
+    // U11
+    pub cloud: CloudState,
 }
 
 impl CoreState {
@@ -52,6 +55,8 @@ impl CoreState {
             starred_ids: self.actions.starred_ids.clone(),
             cached_profiles: self.conversations.identities.cached_profiles.clone(),
             last_prune_next_expiry_ms: self.actions.last_prune_next_expiry_ms,
+            // U11
+            cloud: self.cloud.snapshot.clone(),
         }
     }
 
@@ -87,6 +92,8 @@ impl fmt::Debug for CoreState {
             .field("send", &self.send)
             // U6
             .field("actions", &self.actions)
+            // U11
+            .field("cloud", &self.cloud)
             .finish()
     }
 }
@@ -107,6 +114,8 @@ pub struct CoreSnapshot {
     pub starred_ids: BTreeSet<String>,
     pub cached_profiles: BTreeMap<String, CachedProfile>,
     pub last_prune_next_expiry_ms: Option<i64>,
+    // U11
+    pub cloud: CloudSnapshotState,
 }
 
 impl fmt::Debug for CoreSnapshot {

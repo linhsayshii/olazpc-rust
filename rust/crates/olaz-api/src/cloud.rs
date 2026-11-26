@@ -98,12 +98,15 @@ pub fn parse_cloud_usage_snapshot(
     let service_usage = usage_payload
         .get("service_usage")
         .and_then(Value::as_object);
-    let su_cloud_media =
-        int64(service_usage.and_then(|m| m.get("cloud_media"))).unwrap_or(0).max(0);
-    let su_backup =
-        int64(service_usage.and_then(|m| m.get("message_backup"))).unwrap_or(0).max(0);
-    let su_my_cloud =
-        int64(service_usage.and_then(|m| m.get("my_cloud"))).unwrap_or(0).max(0);
+    let su_cloud_media = int64(service_usage.and_then(|m| m.get("cloud_media")))
+        .unwrap_or(0)
+        .max(0);
+    let su_backup = int64(service_usage.and_then(|m| m.get("message_backup")))
+        .unwrap_or(0)
+        .max(0);
+    let su_my_cloud = int64(service_usage.and_then(|m| m.get("my_cloud")))
+        .unwrap_or(0)
+        .max(0);
     let raw_quota = int64(usage_payload.get("quota")).unwrap_or(0).max(0);
     let raw_usage = int64(usage_payload.get("usage")).unwrap_or(0).max(0);
 
@@ -176,7 +179,13 @@ pub fn parse_cloud_usage_snapshot(
         .and_then(Value::as_object);
     let expire_at_ms = int64(sub.and_then(|s| s.get("expire_time")))
         .filter(|&raw| raw > 0)
-        .map(|raw| if raw > 10_000_000_000 { raw } else { raw.saturating_mul(1000) });
+        .map(|raw| {
+            if raw > 10_000_000_000 {
+                raw
+            } else {
+                raw.saturating_mul(1000)
+            }
+        });
 
     let auto_renew = sub.and_then(|s| {
         let prod = string(s.get("auto_renew_product_id")).trim().to_owned();
@@ -242,7 +251,10 @@ fn sum_other_family_usage(payload: Option<&Value>, my_uid: &str) -> i64 {
     total
 }
 
-fn resolve_plan_name(info_payload: Option<&Map<String, Value>>, plan_kind: CloudPlanKind) -> String {
+fn resolve_plan_name(
+    info_payload: Option<&Map<String, Value>>,
+    plan_kind: CloudPlanKind,
+) -> String {
     if plan_kind == CloudPlanKind::Grace {
         return "zCloud".to_owned();
     }
@@ -279,9 +291,7 @@ fn resolve_plan_name(info_payload: Option<&Map<String, Value>>, plan_kind: Cloud
 }
 
 fn url_path_only(url: &str) -> String {
-    let without_scheme = url
-        .split_once("://")
-        .map_or(url, |(_, rest)| rest);
+    let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     let path_and_query = without_scheme
         .find('/')
         .map_or("/", |idx| &without_scheme[idx..]);
@@ -303,14 +313,14 @@ impl<T: Transport> ZaloApi<T> {
         force_refresh: bool,
     ) -> Result<(String, String), ApiError> {
         if !force_refresh {
-            let cached = self.client().with_session(|s| {
-                match (&s.cloud_viewer_key, &s.cloud_enk) {
-                    (Some(vk), Some(ek)) if !vk.is_empty() && !ek.is_empty() => {
-                        Some((vk.clone(), ek.clone()))
-                    }
-                    _ => None,
-                }
-            });
+            let cached =
+                self.client()
+                    .with_session(|s| match (&s.cloud_viewer_key, &s.cloud_enk) {
+                        (Some(vk), Some(ek)) if !vk.is_empty() && !ek.is_empty() => {
+                            Some((vk.clone(), ek.clone()))
+                        }
+                        _ => None,
+                    });
             if let Some(pair) = cached {
                 return Ok(pair);
             }
@@ -319,10 +329,7 @@ impl<T: Transport> ZaloApi<T> {
         let resp = self
             .get(ApiRequest::new("auth", "/api/getCloudViewerKey"))
             .await?;
-        let d = resp
-            .get("data")
-            .and_then(Value::as_object)
-            .unwrap_or(&resp);
+        let d = resp.get("data").and_then(Value::as_object).unwrap_or(&resp);
         let vk = string(d.get("viewer_key")).trim().to_owned();
         let ek = string(d.get("enk")).trim().to_owned();
         if vk.is_empty() || ek.is_empty() {
@@ -531,10 +538,11 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use olaz_crypto::encode_cloud_aes_with_iv;
     use olaz_net::{
+        SessionClient,
+        domains::ZaloDomains,
         http::RawResponse,
         mock::MockTransport,
         session::{LoginAccount, SessionState},
-        domains::ZaloDomains, SessionClient,
     };
     use serde_json::json;
 
@@ -607,7 +615,11 @@ mod tests {
         );
 
         let val = api
-            .zcloud_get("/cloudmedia/info/pc/v1/usage-mycloud", &BTreeMap::new(), true)
+            .zcloud_get(
+                "/cloudmedia/info/pc/v1/usage-mycloud",
+                &BTreeMap::new(),
+                true,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -698,7 +710,8 @@ mod tests {
             "usage": 0,
             "service_usage": {"cloud_media": 1000, "message_backup": 2000, "my_cloud": 3000}
         });
-        let settings = json!({"opt_in": 5, "enable_offload": 1, "cloud_media_file_size_limit": 5000});
+        let settings =
+            json!({"opt_in": 5, "enable_offload": 1, "cloud_media_file_size_limit": 5000});
         let info = json!({
             "package_name": {"vi": "Gói Pro", "en": "Pro"},
             "subscription_info": {

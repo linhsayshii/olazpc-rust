@@ -322,3 +322,16 @@ Consequences:
     - `remote-react-burst-direct` (`n=200`): `main` **99.38 ms** (`0.497 ms/ev`) -> U6 **75.28 ms** (`0.376 ms/ev`, −24.3%, 1.32x).
     - `remote-react-burst-batch` (`n=200`): `main` **250.22 ms** (`1.251 ms/ev`) -> U6 **64.28 ms** (`0.321 ms/ev`, −74.3%, 3.89x).
     - U6 beats baseline on every metric on all 5 pairs.
+
+## ADR-026: U11 zCloud domain in `olaz-core` (2026-11-26)
+
+- **Context**: `ZaloEngine+Cloud.swift` and `ZaloAPIService+Cloud.swift` previously owned zCloud quota/settings API fetching, `cloud-viewer-key` caching, SQLite + unsynced in-memory storage aggregation, sorted/paginated item listing, thumbnail/file download dispatch, item deletion, and offload/reset state in Swift.
+- **Decision**:
+  - Port zCloud API endpoints (`fetch_cloud_server_snapshot` over `zcloud` `/v2/storage/quota`, `/v2/cloud-settings/all`, `/v2/backup/key/get-meta`, `/v2/storage/my-cloud/meta`, plus viewer-key acquisition/caching on `SessionClient` cleared on logout and `reset_cloud`) into `olaz-api/src/cloud.rs` and `olaz-net`.
+  - Port zCloud state (`CloudState`, `CloudSnapshotState`), pure snapshot aggregation/merge/sorting (`olaz-core/src/cloud.rs`), and reducer (`olaz-core/src/reduce/cloud.rs`) into `olaz-core`, publishing `DirtyKey::Cloud` (`CoreChanges.cloud`) to Swift.
+  - Reuse U6's remote-delete pipeline (`HostCall::ApplyRemoteDelete` + `StoreOp::DeleteMessageAndCheckLatest` with optional `cloud_delete_op_id` completion hook) for `Command::CloudDelete` so deleting zCloud items removes them from memory, SQLite, and conversation previews before refreshing the cloud snapshot.
+  - Reuse the U8-aligned host callbacks `Host::resolve_media` (`MediaResolutionRecord`) and `Host::resolve_file` (`FileResolutionRecord`) for `Command::CloudThumbnail` and `Command::CloudFetch`, keeping disk cache / media resolution on the Swift host until media resolution moves to Rust.
+  - Preserve legacy Swift fallback in `ZaloEngine+Cloud.swift` only when `coreLifecycle.core == nil` (for standalone non-booted unit tests such as `Stage4FeaturesTests`), while all live and recorder flows delegate to `CoreEngine`.
+- **Verification**:
+  - `cargo test -p olaz-core --test cases -- cloud`: 8/8 cases match (`aggregation`, `delete`, `fetch_and_thumbnail`, `list_memory_merge`, `list_store_only`, `offload_and_reset`, `refresh_server_snapshot`, `refresh_signed_out_and_no_store`) with 0 diffs and 0 new `known-diffs.jsonl` entries.
+  - `olaz-core` unit tests + `olaz-api` cloud parser tests + `olaz-ffi` tests + `scripts/gate-core.sh all` (including `CloudRecorderTests` with `OLAZ_SLOW_CASES=1`).

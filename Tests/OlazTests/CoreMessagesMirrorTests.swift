@@ -54,7 +54,8 @@ import Testing
             messageConfirm: nil,
             autoDelete: nil,
             starredIds: nil,
-            cachedProfiles: nil
+            cachedProfiles: nil,
+            cloud: nil
         )
     }
 

@@ -1390,6 +1390,7 @@ fn emit_pass2_events(
                     cli_msg_id: cli_msg_id.clone(),
                     update_conversation_preview: update_preview,
                     persist_conversations: opts.persist_conversations,
+                    cloud_delete_op_id: None,
                 }));
             }
             ParsedWireEvent::Typing {

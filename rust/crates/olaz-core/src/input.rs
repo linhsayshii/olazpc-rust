@@ -5,12 +5,15 @@ use std::fmt;
 
 use olaz_api::{AutoDeleteFetchOutcome, HiddenConversationsSnapshot, PollState, SendMessageResult};
 use olaz_net::{LoginAccount, NetError, QrScanResult, QrTicket, SessionStatus};
-use olaz_store::StoredMessage;
+use olaz_store::{StoredCloudConversationSummary, StoredCloudMediaItem, StoredMessage};
 use olaz_wire::{ChatMessage, Mention, ParsedWireEvent, TextStyle};
 use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
 use crate::actions::{MessageConfirmState, ReactFailure, RecallFailure};
+use crate::cloud::{
+    CloudItemKind, CloudServerSnapshot, FileResolutionOutcome, MediaResolutionOutcome,
+};
 use crate::conversations::{
     BatchApplyDelta, ConversationActionResult, ConversationPreview, ConversationSummary,
     IdentityTable, LocalAccountHydration, MessagePreviewInput,
@@ -376,6 +379,29 @@ pub enum Command {
         keys: Vec<String>,
         persist: bool,
     },
+    // U11: zCloud
+    RefreshCloud,
+    CloudList {
+        conv_id: Option<String>,
+        kind: Option<CloudItemKind>,
+        sort_by_size: bool,
+        ascending: bool,
+        offset: i64,
+        limit: i64,
+    },
+    CloudThumbnail {
+        key: String,
+    },
+    CloudFetch {
+        key: String,
+    },
+    CloudDelete {
+        keys: Vec<String>,
+    },
+    CloudSetOffload {
+        enabled: bool,
+    },
+    ResetCloud,
 }
 
 impl fmt::Debug for Command {
@@ -672,6 +698,33 @@ impl fmt::Debug for Command {
                 .field("count", &keys.len())
                 .field("persist", persist)
                 .finish(),
+            Self::RefreshCloud => f.write_str("RefreshCloud"),
+            Self::CloudList {
+                kind,
+                sort_by_size,
+                ascending,
+                offset,
+                limit,
+                ..
+            } => f
+                .debug_struct("CloudList")
+                .field("kind", kind)
+                .field("sort_by_size", sort_by_size)
+                .field("ascending", ascending)
+                .field("offset", offset)
+                .field("limit", limit)
+                .finish(),
+            Self::CloudThumbnail { .. } => f.write_str("CloudThumbnail"),
+            Self::CloudFetch { .. } => f.write_str("CloudFetch"),
+            Self::CloudDelete { keys } => f
+                .debug_struct("CloudDelete")
+                .field("count", &keys.len())
+                .finish(),
+            Self::CloudSetOffload { enabled } => f
+                .debug_struct("CloudSetOffload")
+                .field("enabled", enabled)
+                .finish(),
+            Self::ResetCloud => f.write_str("ResetCloud"),
         }
     }
 }
@@ -1122,6 +1175,7 @@ pub enum Input {
         cli_msg_id: String,
         update_conversation_preview: bool,
         persist_conversations: bool,
+        cloud_delete_op_id: Option<u64>,
     },
     RemoteDeleteStoreDone {
         conv_id: String,
@@ -1130,6 +1184,7 @@ pub enum Input {
         store_latest: Option<ConversationPreview>,
         update_conversation_preview: bool,
         persist_conversations: bool,
+        cloud_delete_op_id: Option<u64>,
     },
     DeleteUndoExpired {
         undo_gen: u64,
@@ -1144,6 +1199,41 @@ pub enum Input {
         now_ms: i64,
         error_type: Option<String>,
         op_id: Option<u64>,
+    },
+    // U11
+    CloudRefreshLoaded {
+        op_id: Option<u64>,
+        server_snapshot: Option<CloudServerSnapshot>,
+        sql_summaries: Vec<StoredCloudConversationSummary>,
+        existing_ids_by_conv: BTreeMap<String, BTreeSet<String>>,
+    },
+    CloudListStoreDone {
+        op_id: u64,
+        store_present: bool,
+        existing_ids_by_conv: BTreeMap<String, BTreeSet<String>>,
+        sql_items: Vec<StoredCloudMediaItem>,
+        sql_has_more: bool,
+        sql_error: bool,
+    },
+    CloudLookupMessageDone {
+        op_id: u64,
+        message: Option<Box<ChatMessage>>,
+    },
+    CloudResolveMediaDone {
+        op_id: u64,
+        outcome: MediaResolutionOutcome,
+        file_size: Option<i64>,
+    },
+    CloudResolveFileDone {
+        op_id: u64,
+        outcome: FileResolutionOutcome,
+        file_size: Option<i64>,
+    },
+    CloudDeleteMessageApiDone {
+        op_id: u64,
+    },
+    CloudRemoteDeleteDone {
+        op_id: u64,
     },
 }
 
@@ -1620,6 +1710,66 @@ impl fmt::Debug for Input {
                 .field("ttl", ttl)
                 .field("now_ms", now_ms)
                 .field("error_type", error_type)
+                .field("op_id", op_id)
+                .finish(),
+            // U11
+            Self::CloudRefreshLoaded {
+                op_id,
+                server_snapshot,
+                sql_summaries,
+                ..
+            } => f
+                .debug_struct("CloudRefreshLoaded")
+                .field("op_id", op_id)
+                .field("has_server_snapshot", &server_snapshot.is_some())
+                .field("sql_summaries", &sql_summaries.len())
+                .finish(),
+            Self::CloudListStoreDone {
+                op_id,
+                store_present,
+                sql_items,
+                sql_has_more,
+                sql_error,
+                ..
+            } => f
+                .debug_struct("CloudListStoreDone")
+                .field("op_id", op_id)
+                .field("store_present", store_present)
+                .field("sql_items", &sql_items.len())
+                .field("sql_has_more", sql_has_more)
+                .field("sql_error", sql_error)
+                .finish(),
+            Self::CloudLookupMessageDone { op_id, message } => f
+                .debug_struct("CloudLookupMessageDone")
+                .field("op_id", op_id)
+                .field("found", &message.is_some())
+                .finish(),
+            Self::CloudResolveMediaDone {
+                op_id,
+                outcome,
+                file_size,
+            } => f
+                .debug_struct("CloudResolveMediaDone")
+                .field("op_id", op_id)
+                .field("outcome", outcome)
+                .field("file_size", file_size)
+                .finish(),
+            Self::CloudResolveFileDone {
+                op_id,
+                outcome,
+                file_size,
+            } => f
+                .debug_struct("CloudResolveFileDone")
+                .field("op_id", op_id)
+                .field("outcome", outcome)
+                .field("file_size", file_size)
+                .finish(),
+            Self::CloudDeleteMessageApiDone { op_id } => f
+                .debug_struct("CloudDeleteMessageApiDone")
+                .field("op_id", op_id)
+                .finish(),
+            Self::CloudRemoteDeleteDone { op_id } => f
+                .debug_struct("CloudRemoteDeleteDone")
                 .field("op_id", op_id)
                 .finish(),
         }

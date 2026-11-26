@@ -694,7 +694,7 @@ LIMIT ?;"
     m.conv_id,
     COALESCE(c.name, ''),
     COALESCE(c.avatar, ''),
-    c.is_group,
+    COALESCE(c.is_group, 0),
     SUM(CASE WHEN m.kind_tag = 'photo' THEN ({size}) ELSE 0 END) AS photo_bytes,
     SUM(CASE WHEN m.kind_tag = 'video' THEN ({size}) ELSE 0 END) AS video_bytes,
     SUM(CASE WHEN m.kind_tag = 'file' THEN ({size}) ELSE 0 END) AS file_bytes,

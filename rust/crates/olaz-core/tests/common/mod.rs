@@ -19,6 +19,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use olaz_api::{PollState, SendMessageResult, ZaloApi};
 use olaz_core::actor::{ActorSink, CoreHandle};
+use olaz_core::cloud::{
+    CloudActionResult, CloudBreakdown, CloudConversation, CloudFetch, CloudItem, CloudItemKind,
+    CloudPage, CloudPlan, CloudSettings, CloudSnapshotState, FileResolutionOutcome,
+    MediaResolutionOutcome,
+};
 use olaz_core::conversations::{
     BatchApplyDelta, CachedGroup, CachedProfile, ConvMessageDelta, ConvPreviewOverride,
     ConversationPreview, FriendIdentity, GroupIdentity, IdentityTable, MessagePreviewInput,
@@ -1305,6 +1310,8 @@ pub struct RecordingHost {
     shared_store_slot: Mutex<Option<SharedStoreSlot>>,
     store: Mutex<Option<Arc<Mutex<Store>>>>,
     e2ee_send_results: Mutex<VecDeque<Result<SendMessageResult, String>>>,
+    resolve_media_results: Mutex<VecDeque<MediaResolutionOutcome>>,
+    resolve_file_results: Mutex<VecDeque<FileResolutionOutcome>>,
     messages: Mutex<HashMap<String, Vec<ChatMessage>>>,
     open_conversation_id: Mutex<Option<String>>,
     identities: Mutex<IdentityTable>,
@@ -1428,6 +1435,64 @@ impl RecordingHost {
                 }
             }
         }
+        let mut resolve_media_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("resolve_media"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                let state = item
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unavailable");
+                let outcome = match state {
+                    "file" | "ok" => item
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .filter(|p| p.starts_with('/'))
+                        .map(|p| MediaResolutionOutcome::File(p.to_owned()))
+                        .unwrap_or(MediaResolutionOutcome::Unavailable),
+                    "expired" => MediaResolutionOutcome::Expired,
+                    "unsupported" => MediaResolutionOutcome::Unsupported,
+                    _ => MediaResolutionOutcome::Unavailable,
+                };
+                resolve_media_results.push_back(outcome);
+            }
+        }
+        let mut resolve_file_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("resolve_file"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                let state = item
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("failed");
+                let outcome = match state {
+                    "ready" => item
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .filter(|p| !p.is_empty())
+                        .map(|p| FileResolutionOutcome::Ready(p.to_owned()))
+                        .unwrap_or_else(|| {
+                            FileResolutionOutcome::Failed("Missing staged path".to_owned())
+                        }),
+                    "expired" => FileResolutionOutcome::Expired,
+                    _ => FileResolutionOutcome::Failed(
+                        item.get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Không tải được tệp.")
+                            .to_owned(),
+                    ),
+                };
+                resolve_file_results.push_back(outcome);
+            }
+        }
         Self {
             saved_session,
             legacy_cookie,
@@ -1445,6 +1510,8 @@ impl RecordingHost {
             shared_store_slot: Mutex::new(None),
             store: Mutex::new(None),
             e2ee_send_results: Mutex::new(e2ee_send_results),
+            resolve_media_results: Mutex::new(resolve_media_results),
+            resolve_file_results: Mutex::new(resolve_file_results),
             messages: Mutex::new(HashMap::new()),
             open_conversation_id: Mutex::new(open_conv),
             identities: Mutex::new(identities),
@@ -2326,6 +2393,52 @@ impl Host for RecordingHost {
         }
     }
 
+    async fn resolve_media(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        kind: String,
+    ) -> MediaResolutionOutcome {
+        self.record(
+            "resolve_media",
+            json!({
+                "conv_id": conv_id,
+                "msg_id": msg_id,
+                "kind": kind,
+            }),
+        );
+        self.resolve_media_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or(MediaResolutionOutcome::Unavailable)
+    }
+
+    async fn resolve_file(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        name: String,
+        url: Option<String>,
+    ) -> FileResolutionOutcome {
+        self.record(
+            "resolve_file",
+            json!({
+                "conv_id": conv_id,
+                "msg_id": msg_id,
+                "name": name,
+                "url": url.unwrap_or_default(),
+            }),
+        );
+        self.resolve_file_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or_else(|| {
+                FileResolutionOutcome::Failed("No scripted resolve_file result".to_owned())
+            })
+    }
+
     async fn apply_batch(
         &self,
         cmd: Option<u16>,
@@ -3140,15 +3253,175 @@ fn enrich_send_message_json(m: &ChatMessage, base: &mut Map<String, Value>) {
     );
 }
 
+fn encode_cloud_breakdown(b: &CloudBreakdown) -> Value {
+    json!({
+        "photo": b.photo,
+        "video": b.video,
+        "file": b.file,
+        "voice": b.voice,
+        "total": b.total(),
+    })
+}
+
+fn encode_cloud_plan(p: &CloudPlan) -> Value {
+    json!({
+        "kind": p.kind.as_str(),
+        "name": p.name,
+        "quota": p.quota,
+        "usage": p.usage,
+        "family": p.family,
+        "cloud_media": p.cloud_media,
+        "message_backup": p.message_backup,
+        "my_cloud": p.my_cloud,
+        "expire_at_ms": p.expire_at_ms,
+        "auto_renew": p.auto_renew,
+        "months": p.months,
+        "has_key": p.has_key,
+        "backup_media": p.backup_media,
+        "backup_my_cloud": p.backup_my_cloud,
+        "backup_messages": p.backup_messages,
+        "file_limit": p.file_limit,
+    })
+}
+
+fn encode_cloud_conversation(c: &CloudConversation) -> Value {
+    json!({
+        "id": c.id,
+        "name": c.name,
+        "avatar": c.avatar,
+        "is_group": c.is_group,
+        "total": c.total,
+        "last_activity_ms": c.last_activity_ms,
+    })
+}
+
+fn encode_cloud_settings(s: &CloudSettings) -> Value {
+    json!({
+        "offload_enabled": s.offload_enabled,
+        "offload_available": s.offload_available,
+        "last_offload_at_ms": s.last_offload_at_ms,
+        "last_offload_size": s.last_offload_size,
+        "ttl_days": s.ttl_days,
+    })
+}
+
+fn encode_cloud_state(s: &CloudSnapshotState) -> Value {
+    json!({
+        "plan": s.plan.as_ref().map(encode_cloud_plan),
+        "media": encode_cloud_breakdown(&s.media),
+        "my_cloud_types": encode_cloud_breakdown(&s.my_cloud_types),
+        "conversations": s.conversations.iter().map(encode_cloud_conversation).collect::<Vec<_>>(),
+        "settings": encode_cloud_settings(&s.settings),
+        "changed": s.changed,
+        "loaded": s.loaded,
+        "hidden_lookup": s.hidden_lookup,
+        "self_id": s.self_id,
+    })
+}
+
+fn encode_cloud_item(item: &CloudItem) -> Value {
+    json!({
+        "id": item.id,
+        "kind": item.kind.as_str(),
+        "conv_id": item.conversation_id,
+        "conv_name": item.conversation_name,
+        "size": item.size,
+        "date_ms": item.date_ms,
+        "title": item.title,
+        "ext": item.ext,
+        "duration": item.duration.round() as i64,
+        "width": item.width,
+        "height": item.height,
+    })
+}
+
+fn encode_cloud_page(page: &CloudPage) -> Value {
+    json!({
+        "items": page.items.iter().map(encode_cloud_item).collect::<Vec<_>>(),
+        "has_more": page.has_more,
+        "error": page.error,
+    })
+}
+
+fn encode_cloud_fetch(fetch: &CloudFetch) -> Value {
+    match fetch {
+        CloudFetch::Ready(file) => {
+            let url = if file.path.starts_with('/') {
+                format!("file://{}", file.path)
+            } else {
+                format!("file:///{}", file.path)
+            };
+            json!({
+                "status": "ready",
+                "file": {
+                    "url": url,
+                    "kind": file.kind.as_str(),
+                    "title": file.title,
+                    "ext": file.ext,
+                    "size": file.size,
+                    "date_ms": file.date_ms,
+                },
+            })
+        }
+        CloudFetch::Expired => json!({ "status": "expired" }),
+        CloudFetch::Failed(err) => json!({ "status": "failed", "error": err }),
+    }
+}
+
+fn encode_media_resolution(res: &MediaResolutionOutcome) -> Value {
+    match res {
+        MediaResolutionOutcome::File(path) => json!({ "state": "file", "path": path }),
+        MediaResolutionOutcome::Expired => json!({ "state": "expired" }),
+        MediaResolutionOutcome::Unavailable => json!({ "state": "unavailable" }),
+        MediaResolutionOutcome::Unsupported => json!({ "state": "unsupported" }),
+    }
+}
+
+fn encode_cloud_action_result(res: &CloudActionResult) -> Value {
+    json!({
+        "ok": res.ok,
+        "deleted": res.deleted,
+        "failed": res.failed,
+        "error": res.error,
+    })
+}
+
+fn decode_step_message(msg_json: &Value, fallback_conv_id: &str) -> Option<ChatMessage> {
+    let mut obj = msg_json.as_object()?.clone();
+    let pairs = [
+        ("conversationId", "conv_id"),
+        ("clientId", "client_id"),
+        ("senderId", "sender_id"),
+        ("senderName", "sender_name"),
+        ("senderAvatar", "sender_avatar"),
+        ("isMine", "is_mine"),
+        ("isE2EE", "is_e2ee"),
+        ("date", "date_ms"),
+    ];
+    for (camel, snake) in pairs {
+        if !obj.contains_key(camel)
+            && let Some(v) = obj.get(snake).cloned()
+        {
+            obj.insert(camel.to_owned(), v);
+        }
+    }
+    if let Some(kind_str) = obj.get("kind").and_then(Value::as_str).map(str::to_owned) {
+        obj.insert("kind".to_owned(), json!({ "type": kind_str }));
+    }
+    ChatMessage::from_json(&obj, fallback_conv_id)
+}
+
 struct SnapshotOpts<'a> {
     is_u3: bool,
     is_u4: bool,
     is_u5: bool,
     is_u6: bool,
+    is_u11: bool,
     last_send_result: Option<bool>,
     send_logs: &'a Mutex<Vec<String>>,
     prune_next_expiry_ms: Option<i64>,
     action_logs: &'a Mutex<Vec<String>>,
+    results: &'a BTreeMap<String, Value>,
 }
 
 async fn capture_case_snapshot(
@@ -3161,10 +3434,12 @@ async fn capture_case_snapshot(
         is_u4,
         is_u5,
         is_u6,
+        is_u11,
         last_send_result,
         send_logs,
         prune_next_expiry_ms,
         action_logs,
+        results,
     } = *opts;
     if !is_u3 {
         return core
@@ -3422,6 +3697,14 @@ async fn capture_case_snapshot(
             }
         }
     }
+    if is_u11 {
+        obj.insert("cloud".to_owned(), encode_cloud_state(&full.cloud));
+        let mut res_map = Map::new();
+        for (k, v) in results {
+            res_map.insert(k.clone(), v.clone());
+        }
+        obj.insert("results".to_owned(), Value::Object(res_map));
+    }
     Some(Value::Object(obj))
 }
 
@@ -3447,7 +3730,8 @@ fn str_vec_arg(args: &Value, key: &str) -> Vec<String> {
 /// Runs a single Case format v1 [`Case`] under paused tokio time and returns the observed
 /// snapshots, final state, sorted canonical requests, and ordered host calls.
 pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
-    let is_u6 = case.domain == "message_actions";
+    let is_u11 = case.domain == "cloud";
+    let is_u6 = case.domain == "message_actions" || is_u11;
     let is_u5 = case.domain == "send" || is_u6;
     let is_u4 = case.domain == "bootstrap" || case.domain == "messages" || is_u5;
     let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions" || is_u4;
@@ -3580,8 +3864,9 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let mut prune_next_expiry_ms: Option<i64> = None;
     let mut pending_send_task: Option<tokio::task::JoinHandle<bool>> = None;
     let mut pending_action_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut results: BTreeMap<String, Value> = BTreeMap::new();
 
-    for step in &case.steps {
+    for (step_idx, step) in case.steps.iter().enumerate() {
         match step {
             Step::Cmd {
                 cmd,
@@ -4356,6 +4641,217 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                             tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
                     }
                 }
+                // U11 cloud domain commands
+                "ensure_loaded" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let conv_id = str_arg(args, "conv_id");
+                    let target = if let Some(msg_obj) = args.get("message") {
+                        decode_step_message(msg_obj, &conv_id)
+                    } else if let Some(msg_id) = args.get("msg_id").and_then(Value::as_str) {
+                        let from_mem = core.full_snapshot().await.and_then(|snap| {
+                            snap.messages.windows.get(&conv_id).and_then(|list| {
+                                list.iter()
+                                    .find(|m| m.id == msg_id || m.client_id == msg_id)
+                                    .cloned()
+                            })
+                        });
+                        if from_mem.is_some() {
+                            from_mem
+                        } else {
+                            let store_opt = host
+                                .store
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .clone();
+                            store_opt.and_then(|s| {
+                                let guard = s.lock().unwrap_or_else(PoisonError::into_inner);
+                                guard
+                                    .message(&conv_id, msg_id)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|row| decode_stored_message(&to_wire_stored(&row)))
+                            })
+                        }
+                    } else {
+                        None
+                    };
+                    let Some(target) = target else {
+                        return Err(format!(
+                            "ensure_loaded could not resolve target message for `{conv_id}`"
+                        ));
+                    };
+                    let loaded = if conv_id.is_empty() {
+                        false
+                    } else {
+                        let already_loaded = core.full_snapshot().await.is_some_and(|snap| {
+                            snap.messages
+                                .windows
+                                .get(&conv_id)
+                                .is_some_and(|list| list.iter().any(|m| m.id == target.id))
+                        });
+                        if already_loaded {
+                            true
+                        } else {
+                            let oldest_ts_ms = core.full_snapshot().await.and_then(|snap| {
+                                snap.messages
+                                    .windows
+                                    .get(&conv_id)
+                                    .and_then(|list| list.first())
+                                    .map(|m| m.date_ms)
+                            });
+                            let store_opt = host
+                                .store
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .clone();
+                            if let Some(store_arc) = store_opt {
+                                let window = {
+                                    let guard =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    guard
+                                        .messages_around(
+                                            &conv_id,
+                                            target.date_ms,
+                                            oldest_ts_ms,
+                                            25,
+                                            3000,
+                                        )
+                                        .ok()
+                                };
+                                if let Some(win) = window {
+                                    for row in &win.messages {
+                                        if let Some(decoded) =
+                                            decode_stored_message(&to_wire_stored(row))
+                                        {
+                                            let replacing = if row.client_id.is_empty() {
+                                                None
+                                            } else {
+                                                Some(row.client_id.clone())
+                                            };
+                                            core.request_unit(Command::WriteThroughUpsertMessage {
+                                                msg: Box::new(decoded),
+                                                replacing_client_id: replacing,
+                                            })
+                                            .await;
+                                        }
+                                    }
+                                    if win.has_more_older {
+                                        core.request_unit(Command::WriteThroughSetHasMore {
+                                            conv_id: conv_id.clone(),
+                                            has_more: true,
+                                        })
+                                        .await;
+                                    }
+                                }
+                            }
+                            let now_loaded = core.full_snapshot().await.is_some_and(|snap| {
+                                snap.messages
+                                    .windows
+                                    .get(&conv_id)
+                                    .is_some_and(|list| list.iter().any(|m| m.id == target.id))
+                            });
+                            if !now_loaded
+                                && (target.conversation_id == conv_id
+                                    || target.conversation_id.is_empty())
+                            {
+                                let mut to_insert = target.clone();
+                                if to_insert.conversation_id.is_empty() {
+                                    to_insert.conversation_id.clone_from(&conv_id);
+                                }
+                                core.request_unit(Command::WriteThroughUpsertMessage {
+                                    msg: Box::new(to_insert),
+                                    replacing_client_id: None,
+                                })
+                                .await;
+                            }
+                            core.full_snapshot().await.is_some_and(|snap| {
+                                snap.messages
+                                    .windows
+                                    .get(&conv_id)
+                                    .is_some_and(|list| list.iter().any(|m| m.id == target.id))
+                            })
+                        }
+                    };
+                    let _ = core.settle().await;
+                    results.insert(step_idx.to_string(), Value::Bool(loaded));
+                }
+                "refresh_cloud" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    host.record("refresh_cloud", json!({}));
+                    core.request_unit(Command::RefreshCloud).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "cloud_list" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let conv_id = args
+                        .get("conv_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let kind = args
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .and_then(CloudItemKind::from_raw);
+                    let sort_by_size = args
+                        .get("sort_by_size")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let ascending = args
+                        .get("ascending")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let offset = args.get("offset").and_then(Value::as_i64).unwrap_or(0);
+                    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(60);
+                    let page = core
+                        .request_cloud_page(Command::CloudList {
+                            conv_id,
+                            kind,
+                            sort_by_size,
+                            ascending,
+                            offset,
+                            limit,
+                        })
+                        .await;
+                    results.insert(step_idx.to_string(), encode_cloud_page(&page));
+                }
+                "cloud_fetch" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let key = str_arg(args, "key");
+                    let fetch = core.request_cloud_fetch(Command::CloudFetch { key }).await;
+                    results.insert(step_idx.to_string(), encode_cloud_fetch(&fetch));
+                }
+                "cloud_thumbnail" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let key = str_arg(args, "key");
+                    let thumb = core
+                        .request_media_resolution(Command::CloudThumbnail { key })
+                        .await;
+                    results.insert(step_idx.to_string(), encode_media_resolution(&thumb));
+                }
+                "cloud_delete" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let keys = str_vec_arg(args, "keys");
+                    let res = core
+                        .request_cloud_action(Command::CloudDelete { keys })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    results.insert(step_idx.to_string(), encode_cloud_action_result(&res));
+                }
+                "cloud_set_offload" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let enabled = args
+                        .get("enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let res = core
+                        .request_cloud_action(Command::CloudSetOffload { enabled })
+                        .await;
+                    results.insert(step_idx.to_string(), encode_cloud_action_result(&res));
+                }
+                "reset_cloud" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    core.request_unit(Command::ResetCloud).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
                 other => return Err(format!("unknown step cmd: {other}")),
             },
             Step::Await {
@@ -4417,10 +4913,12 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         is_u4,
                         is_u5,
                         is_u6,
+                        is_u11,
                         last_send_result,
                         send_logs: &send_logs,
                         prune_next_expiry_ms,
                         action_logs: &action_logs,
+                        results: &results,
                     },
                 )
                 .await
@@ -4469,10 +4967,12 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             is_u4,
             is_u5,
             is_u6,
+            is_u11,
             last_send_result,
             send_logs: &send_logs,
             prune_next_expiry_ms,
             action_logs: &action_logs,
+            results: &results,
         },
     )
     .await

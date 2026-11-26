@@ -337,6 +337,10 @@ fn reduce_command(state: &mut CoreState, cmd: Command, out: &mut ReduceOutput) {
                 out.dirty.insert(DirtyKey::Typing);
             }
             state.send.reset(out);
+            // U11
+            if state.cloud.reset_session() {
+                out.dirty.insert(DirtyKey::Cloud);
+            }
             // U6
             let (undo_changed, confirm_changed, auto_del_changed, starred_changed) =
                 state.actions.reset_session();
