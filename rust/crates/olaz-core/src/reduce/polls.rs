@@ -959,7 +959,6 @@ fn reduce_poll_command(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;

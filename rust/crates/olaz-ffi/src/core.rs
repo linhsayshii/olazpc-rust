@@ -32,10 +32,11 @@ use serde_json::{Map, Value};
 use crate::api::PollStateRecord;
 use crate::chat::{ChatMessageRecord, MessageMention, TextStyleRecord};
 use crate::conversations::{
-    CachedGroupEntry, CachedProfileEntry, ConvPreviewOverrideRecord, ConversationActionResultRecord,
-    ConversationActionUiRecord, ConversationActionsRecord, ConversationExtrasRecord,
-    ConversationPromptRecord, ConversationSummaryRecord, IdentityTableRecord,
-    MessagePreviewInputRecord, PinBoardRecord, PromptUpdateRecord, RankEntry, SeenTargetRecord,
+    CachedGroupEntry, CachedProfileEntry, ConvPreviewOverrideRecord,
+    ConversationActionResultRecord, ConversationActionUiRecord, ConversationActionsRecord,
+    ConversationExtrasRecord, ConversationPromptRecord, ConversationSummaryRecord,
+    IdentityTableRecord, MessagePreviewInputRecord, PinBoardRecord, PromptUpdateRecord, RankEntry,
+    SeenTargetRecord,
 };
 use crate::error::{CoreError, NetworkKind};
 use crate::messages::{

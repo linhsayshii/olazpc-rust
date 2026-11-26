@@ -794,8 +794,7 @@ mod tests {
         let core = CoreHandle::start(Arc::new(NoopRunner), Handle::current());
         for i in 0..2_000usize {
             let mut tbl = IdentityTable::default();
-            tbl.aliases
-                .insert("u1".to_owned(), format!("alias-{i}"));
+            tbl.aliases.insert("u1".to_owned(), format!("alias-{i}"));
             core.send(Command::UpdateIdentities(tbl));
         }
         let rev = core.settle().await;
@@ -803,7 +802,11 @@ mod tests {
         core.wait_idle().await;
         let full = core.full_snapshot().await.expect("full snapshot");
         assert_eq!(
-            full.conversations.identities.aliases.get("u1").map(String::as_str),
+            full.conversations
+                .identities
+                .aliases
+                .get("u1")
+                .map(String::as_str),
             Some("alias-1999")
         );
         core.stop();

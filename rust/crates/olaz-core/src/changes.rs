@@ -344,8 +344,7 @@ impl ChangeHub {
                         Some(state.conversations.identities.cached_profiles.clone());
                 }
                 DirtyKey::CachedGroups => {
-                    buf.cached_groups =
-                        Some(state.conversations.identities.cached_groups.clone());
+                    buf.cached_groups = Some(state.conversations.identities.cached_groups.clone());
                 }
             }
             buf.dirty.insert(key);

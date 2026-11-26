@@ -2282,7 +2282,8 @@ mod tests {
         assert!(detail_on.anonymous);
         assert!(detail_on.hide_preview);
 
-        let voters_anon = build_poll_voters(numeric_on.as_object().unwrap(), "2001001", None, &convs);
+        let voters_anon =
+            build_poll_voters(numeric_on.as_object().unwrap(), "2001001", None, &convs);
         assert!(voters_anon.restricted);
         assert!(voters_anon.groups[0].users.is_empty());
 
