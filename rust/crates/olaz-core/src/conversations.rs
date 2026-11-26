@@ -794,6 +794,9 @@ pub struct LocalAccountHydration {
     pub friend_global_ids: BTreeMap<String, String>,
     /// Latest decoded message for group conversations whose preview contains `@`.
     pub group_latest_messages: BTreeMap<String, MessagePreviewInput>,
+    // U6
+    pub starred_ids: Vec<String>,
+    pub seen_reaction_event_ids: Vec<String>,
 }
 
 impl fmt::Debug for LocalAccountHydration {
@@ -2607,6 +2610,12 @@ pub fn load_local_account_from_store(
             .ok()
             .flatten()
             .filter(|s| !s.is_empty()),
+        starred_ids: store
+            .get_preference_strings("starredIds")
+            .unwrap_or_default(),
+        seen_reaction_event_ids: store
+            .get_preference_strings("seenReactionEventIds")
+            .unwrap_or_default(),
         ..LocalAccountHydration::default()
     };
 

@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::changes::DirtyKey;
 use crate::conversations::{
     BatchApplyDelta, ConversationActionResult, ConversationLabel, ConversationPreview,
-    ConversationPrompt, PIN_LIMIT, parse_server_labels_response, serialize_labels_local_json,
-    serialize_labels_server_json,
+    ConversationPrompt, MessagePreviewInput, PIN_LIMIT, parse_server_labels_response,
+    serialize_labels_local_json, serialize_labels_server_json,
 };
 use crate::effect::{Effect, OpResult, StoreOp};
 use crate::input::{Command, HiddenPinSyncKind, Input};
@@ -16,6 +16,40 @@ use crate::reduce::ReduceOutput;
 use crate::state::CoreState;
 
 const RESOLVE_NAMES_CHUNK_SIZE: usize = 50;
+
+/// Updates a conversation's preview from a newly created or incoming message and persists if changed.
+pub(crate) fn apply_message_preview_update(
+    state: &mut CoreState,
+    msg: &MessagePreviewInput,
+    increment_unread: bool,
+    out: &mut ReduceOutput,
+) -> bool {
+    let my_uid = state
+        .session
+        .profile
+        .as_ref()
+        .map(|p| p.user_id.clone())
+        .unwrap_or_default();
+    let my_avatar = state
+        .session
+        .profile
+        .as_ref()
+        .and_then(|p| p.avatar.clone());
+    let self_conv_id = state.session.self_conversation_id.clone();
+    let changed = state.conversations.update_conversation_on_message(
+        &state.contacts,
+        msg,
+        increment_unread,
+        &my_uid,
+        my_avatar.as_deref(),
+        self_conv_id.as_deref(),
+    );
+    if changed {
+        mark_list_flags_extras_dirty(out);
+        emit_save_conversations(state, out);
+    }
+    changed
+}
 
 /// Applies a [`BatchApplyDelta`] computed by Swift's message-batch path to conversation state.
 pub(crate) fn apply_batch_delta(
@@ -517,30 +551,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
             msg,
             increment_unread,
         } => {
-            let my_uid = state
-                .session
-                .profile
-                .as_ref()
-                .map(|p| p.user_id.clone())
-                .unwrap_or_default();
-            let my_avatar = state
-                .session
-                .profile
-                .as_ref()
-                .and_then(|p| p.avatar.clone());
-            let self_conv_id = state.session.self_conversation_id.clone();
-            let changed = state.conversations.update_conversation_on_message(
-                &state.contacts,
-                &msg,
-                increment_unread,
-                &my_uid,
-                my_avatar.as_deref(),
-                self_conv_id.as_deref(),
-            );
-            if changed {
-                mark_list_flags_extras_dirty(out);
-                emit_save_conversations(state, out);
-            }
+            let changed = apply_message_preview_update(state, &msg, increment_unread, out);
             complete_op(op_id, OpResult::Unit, changed, out);
         }
 

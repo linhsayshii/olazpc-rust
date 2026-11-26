@@ -109,6 +109,8 @@ pub fn reduce_session(state: &mut CoreState, input: Input, out: &mut ReduceOutpu
                     .as_ref()
                     .and_then(|p| p.avatar.clone());
                 let self_conv_id = state.session.self_conversation_id.clone();
+                let starred_ids = hydration.starred_ids.clone();
+                let seen_reaction_event_ids = hydration.seen_reaction_event_ids.clone();
                 state.conversations.hydrate_from_local(
                     &mut state.contacts,
                     *hydration,
@@ -116,9 +118,17 @@ pub fn reduce_session(state: &mut CoreState, input: Input, out: &mut ReduceOutpu
                     my_avatar.as_deref(),
                     self_conv_id.as_deref(),
                 );
+                state
+                    .actions
+                    .seen_reactions
+                    .hydrate_from_saved(&seen_reaction_event_ids);
+                state.actions.starred_ids = starred_ids.into_iter().collect();
                 out.dirty.insert(DirtyKey::Conversations);
                 out.dirty.insert(DirtyKey::ConversationFlags);
                 out.dirty.insert(DirtyKey::ConversationExtras);
+                if !state.actions.starred_ids.is_empty() {
+                    out.dirty.insert(DirtyKey::StarredIds);
+                }
             }
             match pending {
                 PendingStore::Boot {
@@ -328,6 +338,21 @@ fn reduce_command(state: &mut CoreState, cmd: Command, out: &mut ReduceOutput) {
                 out.dirty.insert(DirtyKey::Typing);
             }
             state.send.reset(out);
+            // U6
+            let (undo_changed, confirm_changed, auto_del_changed, starred_changed) =
+                state.actions.reset_session();
+            if undo_changed {
+                out.dirty.insert(DirtyKey::DeleteUndo);
+            }
+            if confirm_changed {
+                out.dirty.insert(DirtyKey::MessageConfirm);
+            }
+            if auto_del_changed {
+                out.dirty.insert(DirtyKey::AutoDelete);
+            }
+            if starred_changed {
+                out.dirty.insert(DirtyKey::StarredIds);
+            }
             state.session.sign_out_notice = None;
             state.session.qr_gen = state.session.qr_gen.saturating_add(1);
             state.session.phase = Phase::Login(LoginState::generating());
@@ -409,6 +434,21 @@ pub(crate) fn enter_session_expired(state: &mut CoreState, reason: String, out: 
         out.dirty.insert(DirtyKey::Typing);
     }
     state.send.reset(out);
+    // U6
+    let (undo_changed, confirm_changed, auto_del_changed, starred_changed) =
+        state.actions.reset_session();
+    if undo_changed {
+        out.dirty.insert(DirtyKey::DeleteUndo);
+    }
+    if confirm_changed {
+        out.dirty.insert(DirtyKey::MessageConfirm);
+    }
+    if auto_del_changed {
+        out.dirty.insert(DirtyKey::AutoDelete);
+    }
+    if starred_changed {
+        out.dirty.insert(DirtyKey::StarredIds);
+    }
     state.session.sign_out_notice = Some(reason);
     state.session.qr_gen = state.session.qr_gen.saturating_add(1);
     state.session.phase = Phase::Login(LoginState::generating());

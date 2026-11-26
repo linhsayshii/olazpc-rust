@@ -574,6 +574,7 @@ async fn s02_echo_first_reconciliation_drops_optimistic_and_keeps_echo() {
         notify_incoming: false,
         persist_conversations: true,
         probe_freshness: false,
+        now_ms: None,
     });
     let _ = core.settle().await;
     inner_runner.flush_store().await;

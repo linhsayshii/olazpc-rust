@@ -588,6 +588,7 @@ fn reduce_message_command(
             notify_incoming,
             persist_conversations,
             probe_freshness,
+            now_ms,
         } => {
             let my_uid = state
                 .session
@@ -611,7 +612,7 @@ fn reduce_message_command(
                 }));
                 return;
             }
-            let applied = ingest_wire_batch_in_core(
+            let applied = ingest_wire_batch_with_now(
                 state,
                 &root_val,
                 default_cmd,
@@ -621,6 +622,7 @@ fn reduce_message_command(
                 notify_incoming,
                 persist_conversations,
                 probe_freshness,
+                now_ms,
                 out,
             );
             if let Some(id) = op_id {
@@ -844,7 +846,17 @@ fn apply_fetched_history_page(
     }
 
     // Pass 2 on history page: chronological reactions, then recalls & deletes (which update preview).
-    emit_pass2_events(state, &events, true, true, false, out);
+    emit_pass2_events(
+        state,
+        &events,
+        Pass2Options {
+            update_preview_immediately: true,
+            emit_typing: false,
+            persist_conversations: true,
+            now_ms: None,
+        },
+        out,
+    );
 
     pass1.new_visible_count
 }
@@ -1023,6 +1035,38 @@ pub(crate) fn ingest_wire_batch_in_core(
     probe_freshness: bool,
     out: &mut ReduceOutput,
 ) -> u32 {
+    ingest_wire_batch_with_now(
+        state,
+        root,
+        default_cmd,
+        fallback_conv_id,
+        is_group_hint,
+        increment_unread,
+        notify_incoming,
+        persist_conversations,
+        probe_freshness,
+        None,
+        out,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Matches ZaloEngine.applyBatchResponse parameter list 1-for-1"
+)]
+fn ingest_wire_batch_with_now(
+    state: &mut CoreState,
+    root: &Value,
+    default_cmd: u16,
+    fallback_conv_id: Option<&str>,
+    is_group_hint: Option<bool>,
+    increment_unread: bool,
+    notify_incoming: bool,
+    persist_conversations: bool,
+    probe_freshness: bool,
+    now_ms: Option<i64>,
+    out: &mut ReduceOutput,
+) -> u32 {
     let my_uid = state
         .session
         .profile
@@ -1040,13 +1084,14 @@ pub(crate) fn ingest_wire_batch_in_core(
         is_group_hint,
         &snap,
     );
-    ingest_parsed_events_in_core(
+    ingest_parsed_events_with_now(
         state,
         &events,
         increment_unread,
         notify_incoming,
         persist_conversations,
         probe_freshness,
+        now_ms,
         out,
     )
 }
@@ -1059,6 +1104,32 @@ pub(crate) fn ingest_parsed_events_in_core(
     notify_incoming: bool,
     persist_conversations: bool,
     probe_freshness: bool,
+    out: &mut ReduceOutput,
+) -> u32 {
+    ingest_parsed_events_with_now(
+        state,
+        events,
+        increment_unread,
+        notify_incoming,
+        persist_conversations,
+        probe_freshness,
+        None,
+        out,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Internal wrapper threading optional deterministic now_ms for batch replay"
+)]
+fn ingest_parsed_events_with_now(
+    state: &mut CoreState,
+    events: &[ParsedWireEvent],
+    increment_unread: bool,
+    notify_incoming: bool,
+    persist_conversations: bool,
+    probe_freshness: bool,
+    now_ms: Option<i64>,
     out: &mut ReduceOutput,
 ) -> u32 {
     if events.is_empty() {
@@ -1175,8 +1246,17 @@ pub(crate) fn ingest_parsed_events_in_core(
     }
 
     // Pass 2: chronological reactions, recalls, deletes, typing.
-    let preview_overrides =
-        emit_pass2_events(state, events, false, persist_conversations, true, out);
+    let preview_overrides = emit_pass2_events(
+        state,
+        events,
+        Pass2Options {
+            update_preview_immediately: false,
+            emit_typing: true,
+            persist_conversations,
+            now_ms,
+        },
+        out,
+    );
 
     let mut updates = Vec::with_capacity(latest_by_conv.len());
     let mut poll_msgs = Vec::with_capacity(latest_by_conv.len());
@@ -1221,14 +1301,23 @@ pub(crate) fn ingest_parsed_events_in_core(
     applied_count
 }
 
+struct Pass2Options {
+    update_preview_immediately: bool,
+    emit_typing: bool,
+    persist_conversations: bool,
+    now_ms: Option<i64>,
+}
+
 fn emit_pass2_events(
     state: &mut CoreState,
     events: &[ParsedWireEvent],
-    update_conversation_preview_immediately: bool,
-    persist_conversations: bool,
-    emit_typing: bool,
+    opts: Pass2Options,
     out: &mut ReduceOutput,
 ) -> Vec<ConvPreviewOverride> {
+    let has_messages = events
+        .iter()
+        .any(|e| matches!(e, ParsedWireEvent::Message(..)));
+    let update_preview = opts.update_preview_immediately || !has_messages;
     for ev in sort_reaction_events_chronologically(events) {
         if let ParsedWireEvent::Reaction {
             conv_id,
@@ -1254,6 +1343,7 @@ fn emit_pass2_events(
                     event_id,
                     react_client_id,
                     sender_name,
+                    now_ms: opts.now_ms.unwrap_or(0),
                 }));
         }
     }
@@ -1276,11 +1366,10 @@ fn emit_pass2_events(
                     conv_id: conv_id.clone(),
                     msg_id: msg_id.clone(),
                     cli_msg_id: cli_msg_id.clone(),
-                    update_conversation_preview: update_conversation_preview_immediately
-                        || !events
-                            .iter()
-                            .any(|e| matches!(e, ParsedWireEvent::Message(..))),
-                    persist_conversations,
+                    update_conversation_preview: update_preview,
+                    persist_conversations: opts.persist_conversations,
+                    op_id: None,
+                    recall_many_id: None,
                 }));
             }
             ParsedWireEvent::Delete {
@@ -1292,16 +1381,13 @@ fn emit_pass2_events(
                     conv_id: conv_id.clone(),
                     msg_id: msg_id.clone(),
                     cli_msg_id: cli_msg_id.clone(),
-                    update_conversation_preview: update_conversation_preview_immediately
-                        || !events
-                            .iter()
-                            .any(|e| matches!(e, ParsedWireEvent::Message(..))),
-                    persist_conversations,
+                    update_conversation_preview: update_preview,
+                    persist_conversations: opts.persist_conversations,
                 }));
             }
             ParsedWireEvent::Typing {
                 conv_id, sender_id, ..
-            } if emit_typing && sender_id != &my_uid => {
+            } if opts.emit_typing && sender_id != &my_uid => {
                 out.effects.push(Effect::Host(HostCall::ShowBatchTyping {
                     conv_id: conv_id.clone(),
                     sender_id: sender_id.clone(),

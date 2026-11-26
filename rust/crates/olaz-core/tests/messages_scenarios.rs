@@ -344,6 +344,7 @@ fn m05_apply_batch_direct_detects_signal_cipher_and_delegates_to_decrypt_envelop
                 notify_incoming: false,
                 persist_conversations: true,
                 probe_freshness: false,
+                now_ms: None,
             },
         },
     );
