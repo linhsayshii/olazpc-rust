@@ -92,10 +92,13 @@ actor ZaloE2EEManager {
 
     var debugHasRustStore: Bool { rust != nil }
 
-    func reset() {
+    func reset() async {
         if configuredMode == .shadow, !shadowStats.isIdle || shadowStats.snapshot != E2EEShadowStats.Snapshot() {
             logSink(shadowStats.summaryLine)
         }
+        let oldRuntime = runtime
+        runtime = nil
+        await oldRuntime?.close()
         rust = nil
         effectiveMode = configuredMode
         jsSnapshotCache = nil

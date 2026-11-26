@@ -3,16 +3,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use olaz_api::{HiddenConversationsSnapshot, PollState, SendMessageResult};
+use olaz_api::{AutoDeleteFetchOutcome, HiddenConversationsSnapshot, PollState, SendMessageResult};
 use olaz_net::{LoginAccount, NetError, QrScanResult, QrTicket, SessionStatus};
 use olaz_store::StoredMessage;
 use olaz_wire::{ChatMessage, Mention, ParsedWireEvent, TextStyle};
 use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
+use crate::actions::{MessageConfirmState, ReactFailure, RecallFailure};
 use crate::conversations::{
-    BatchApplyDelta, ConversationActionResult, ConversationSummary, IdentityTable,
-    LocalAccountHydration, MessagePreviewInput,
+    BatchApplyDelta, ConversationActionResult, ConversationPreview, ConversationSummary,
+    IdentityTable, LocalAccountHydration, MessagePreviewInput,
 };
 use crate::effect::OpResult;
 use crate::messages::{ContactsState, HistoryFreshness};
@@ -243,6 +244,7 @@ pub enum Command {
         notify_incoming: bool,
         persist_conversations: bool,
         probe_freshness: bool,
+        now_ms: Option<i64>,
     },
     ApplyParsedEventsDirect {
         events: Vec<ParsedWireEvent>,
@@ -312,6 +314,67 @@ pub enum Command {
     SetAutoDeleteTtl {
         conv_id: String,
         ttl_ms: i64,
+    },
+
+    // U6
+    React {
+        conv_id: String,
+        msg_id: String,
+        emoji: String,
+        remove_all: bool,
+        now_ms: i64,
+    },
+    Recall {
+        conv_id: String,
+        msg_id: String,
+        is_e2ee_thread: Option<bool>,
+        now_ms: i64,
+    },
+    RecallMany {
+        conv_id: String,
+        msg_ids: Vec<String>,
+        confirm: bool,
+        now_ms: i64,
+    },
+    DeleteForMe {
+        conv_id: String,
+        msg_id: String,
+        confirmed: bool,
+        now_ms: i64,
+    },
+    DeleteMany {
+        conv_id: String,
+        msg_ids: Vec<String>,
+        confirm: bool,
+        now_ms: i64,
+    },
+    AnswerMessageConfirm {
+        ok: bool,
+        now_ms: i64,
+    },
+    AskMessageConfirm {
+        confirm: Box<MessageConfirmState>,
+    },
+    SetStarred {
+        conv_id: String,
+        msg_id: String,
+        on: bool,
+    },
+    UndoDelete,
+    DismissDeleteUndo,
+    LoadAutoDelete,
+    SetAutoDelete {
+        conv_id: String,
+        ttl: i64,
+        now_ms: i64,
+    },
+    PruneExpiredMessages {
+        conv_id: String,
+        now_ms: i64,
+    },
+    RecordSeenReactionKeys {
+        keys: Vec<String>,
+        persist: bool,
     },
     // U12
     WatchPoll {
@@ -630,6 +693,78 @@ impl fmt::Debug for Command {
             Self::SetAutoDeleteTtl { ttl_ms, .. } => f
                 .debug_struct("SetAutoDeleteTtl")
                 .field("ttl_ms", ttl_ms)
+                .finish(),
+            // U6
+            Self::React {
+                remove_all, now_ms, ..
+            } => f
+                .debug_struct("React")
+                .field("remove_all", remove_all)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::Recall {
+                is_e2ee_thread,
+                now_ms,
+                ..
+            } => f
+                .debug_struct("Recall")
+                .field("is_e2ee_thread", is_e2ee_thread)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::RecallMany {
+                msg_ids,
+                confirm,
+                now_ms,
+                ..
+            } => f
+                .debug_struct("RecallMany")
+                .field("count", &msg_ids.len())
+                .field("confirm", confirm)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::DeleteForMe {
+                confirmed, now_ms, ..
+            } => f
+                .debug_struct("DeleteForMe")
+                .field("confirmed", confirmed)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::DeleteMany {
+                msg_ids,
+                confirm,
+                now_ms,
+                ..
+            } => f
+                .debug_struct("DeleteMany")
+                .field("count", &msg_ids.len())
+                .field("confirm", confirm)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::AnswerMessageConfirm { ok, now_ms } => f
+                .debug_struct("AnswerMessageConfirm")
+                .field("ok", ok)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::AskMessageConfirm { confirm } => {
+                f.debug_tuple("AskMessageConfirm").field(confirm).finish()
+            }
+            Self::SetStarred { on, .. } => f.debug_struct("SetStarred").field("on", on).finish(),
+            Self::UndoDelete => f.write_str("UndoDelete"),
+            Self::DismissDeleteUndo => f.write_str("DismissDeleteUndo"),
+            Self::LoadAutoDelete => f.write_str("LoadAutoDelete"),
+            Self::SetAutoDelete { ttl, now_ms, .. } => f
+                .debug_struct("SetAutoDelete")
+                .field("ttl", ttl)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::PruneExpiredMessages { now_ms, .. } => f
+                .debug_struct("PruneExpiredMessages")
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::RecordSeenReactionKeys { keys, persist } => f
+                .debug_struct("RecordSeenReactionKeys")
+                .field("count", &keys.len())
+                .field("persist", persist)
                 .finish(),
             // U12
             Self::WatchPoll { now_ms, .. } => {
@@ -1164,6 +1299,86 @@ pub enum Input {
         seq: u64,
         now_ms: i64,
     },
+
+    // U6
+    MessageIdsResolved {
+        resolve_id: u64,
+        effective_msg_id: String,
+        resolved_cli_id: String,
+        upgraded_from_history: bool,
+    },
+    ReactDone {
+        react_id: u64,
+        final_react_client_id: String,
+        error: Option<ReactFailure>,
+    },
+    RecallDone {
+        recall_id: u64,
+        retried_alt: bool,
+        error: Option<RecallFailure>,
+    },
+    RemoteReactionApproved {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        sender_id: String,
+        r_type: String,
+        r_icon: String,
+        event_id: String,
+        react_client_id: String,
+        sender_name: String,
+        now_ms: i64,
+    },
+    RemoteRecallApproved {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        update_conversation_preview: bool,
+        persist_conversations: bool,
+        op_id: Option<u64>,
+        recall_many_id: Option<u64>,
+    },
+    RemoteRecallSkipped {
+        op_id: Option<u64>,
+        recall_many_id: Option<u64>,
+    },
+    RemoteRecallStoreDone {
+        conv_id: String,
+        recalled_last: Option<(i64, bool)>,
+        update_conversation_preview: bool,
+        persist_conversations: bool,
+        op_id: Option<u64>,
+        recall_many_id: Option<u64>,
+    },
+    RemoteDeleteApproved {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        update_conversation_preview: bool,
+        persist_conversations: bool,
+    },
+    RemoteDeleteStoreDone {
+        conv_id: String,
+        deleted_ts_ms: Option<i64>,
+        mem_latest: Option<ConversationPreview>,
+        store_latest: Option<ConversationPreview>,
+        update_conversation_preview: bool,
+        persist_conversations: bool,
+    },
+    DeleteUndoExpired {
+        undo_gen: u64,
+    },
+    AutoDeleteLoaded {
+        outcome: Option<AutoDeleteFetchOutcome>,
+        op_id: Option<u64>,
+    },
+    AutoDeleteUpdated {
+        conv_id: String,
+        ttl: i64,
+        now_ms: i64,
+        error_type: Option<String>,
+        op_id: Option<u64>,
+    },
 }
 
 impl fmt::Debug for Input {
@@ -1612,6 +1827,116 @@ impl fmt::Debug for Input {
                 .debug_struct("PollDebounceFired")
                 .field("seq", seq)
                 .field("now_ms", now_ms)
+                .finish(),
+            // U6
+            Self::MessageIdsResolved {
+                resolve_id,
+                upgraded_from_history,
+                ..
+            } => f
+                .debug_struct("MessageIdsResolved")
+                .field("resolve_id", resolve_id)
+                .field("upgraded_from_history", upgraded_from_history)
+                .finish(),
+            Self::ReactDone {
+                react_id, error, ..
+            } => f
+                .debug_struct("ReactDone")
+                .field("react_id", react_id)
+                .field("ok", &error.is_none())
+                .finish(),
+            Self::RecallDone {
+                recall_id,
+                retried_alt,
+                error,
+            } => f
+                .debug_struct("RecallDone")
+                .field("recall_id", recall_id)
+                .field("retried_alt", retried_alt)
+                .field("ok", &error.is_none())
+                .finish(),
+            Self::RemoteReactionApproved { r_type, now_ms, .. } => f
+                .debug_struct("RemoteReactionApproved")
+                .field("r_type", r_type)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::RemoteRecallApproved {
+                update_conversation_preview,
+                persist_conversations,
+                op_id,
+                recall_many_id,
+                ..
+            } => f
+                .debug_struct("RemoteRecallApproved")
+                .field("update_conversation_preview", update_conversation_preview)
+                .field("persist_conversations", persist_conversations)
+                .field("op_id", op_id)
+                .field("recall_many_id", recall_many_id)
+                .finish(),
+            Self::RemoteRecallSkipped {
+                op_id,
+                recall_many_id,
+            } => f
+                .debug_struct("RemoteRecallSkipped")
+                .field("op_id", op_id)
+                .field("recall_many_id", recall_many_id)
+                .finish(),
+            Self::RemoteRecallStoreDone {
+                recalled_last,
+                update_conversation_preview,
+                persist_conversations,
+                op_id,
+                recall_many_id,
+                ..
+            } => f
+                .debug_struct("RemoteRecallStoreDone")
+                .field("has_recalled_last", &recalled_last.is_some())
+                .field("update_conversation_preview", update_conversation_preview)
+                .field("persist_conversations", persist_conversations)
+                .field("op_id", op_id)
+                .field("recall_many_id", recall_many_id)
+                .finish(),
+            Self::RemoteDeleteApproved {
+                update_conversation_preview,
+                persist_conversations,
+                ..
+            } => f
+                .debug_struct("RemoteDeleteApproved")
+                .field("update_conversation_preview", update_conversation_preview)
+                .field("persist_conversations", persist_conversations)
+                .finish(),
+            Self::RemoteDeleteStoreDone {
+                deleted_ts_ms,
+                update_conversation_preview,
+                persist_conversations,
+                ..
+            } => f
+                .debug_struct("RemoteDeleteStoreDone")
+                .field("has_deleted_ts", &deleted_ts_ms.is_some())
+                .field("update_conversation_preview", update_conversation_preview)
+                .field("persist_conversations", persist_conversations)
+                .finish(),
+            Self::DeleteUndoExpired { undo_gen } => f
+                .debug_struct("DeleteUndoExpired")
+                .field("undo_gen", undo_gen)
+                .finish(),
+            Self::AutoDeleteLoaded { outcome, op_id } => f
+                .debug_struct("AutoDeleteLoaded")
+                .field("outcome", outcome)
+                .field("op_id", op_id)
+                .finish(),
+            Self::AutoDeleteUpdated {
+                ttl,
+                now_ms,
+                error_type,
+                op_id,
+                ..
+            } => f
+                .debug_struct("AutoDeleteUpdated")
+                .field("ttl", ttl)
+                .field("now_ms", now_ms)
+                .field("error_type", error_type)
+                .field("op_id", op_id)
                 .finish(),
         }
     }

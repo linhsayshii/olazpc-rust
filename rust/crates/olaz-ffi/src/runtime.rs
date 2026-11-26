@@ -7,11 +7,18 @@ use tokio::runtime::{Builder, Runtime};
 
 use crate::error::CoreError;
 
-const WORKER_THREADS: usize = 2;
+const MIN_WORKER_THREADS: usize = 4;
+const MAX_WORKER_THREADS: usize = 8;
+
+fn worker_thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().clamp(MIN_WORKER_THREADS, MAX_WORKER_THREADS))
+        .unwrap_or(MIN_WORKER_THREADS)
+}
 
 static RUNTIME: LazyLock<Result<Runtime, String>> = LazyLock::new(|| {
     Builder::new_multi_thread()
-        .worker_threads(WORKER_THREADS)
+        .worker_threads(worker_thread_count())
         .thread_name("olaz-core")
         .enable_all()
         .build()

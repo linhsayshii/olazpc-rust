@@ -177,9 +177,14 @@ pub struct Seed {
     #[serde(default)]
     pub e2ee_threads: Vec<String>,
     #[serde(default)]
-    pub auto_delete: BTreeMap<String, i64>,
+    pub auto_delete: Option<BTreeMap<String, i64>>,
     #[serde(default)]
     pub host_results: Option<Value>,
+    // U6
+    #[serde(default)]
+    pub starred_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub seen_reaction_event_ids: Option<Vec<String>>,
     // U12
     #[serde(default)]
     pub cached_group_details: Option<Value>,
@@ -1310,6 +1315,7 @@ pub struct RecordingHost {
     notify: Notify,
     is_u3: bool,
     is_u4: bool,
+    is_u6: bool,
     is_u12: bool,
     data_dir: Option<PathBuf>,
     virtual_now_ms: Mutex<i64>,
@@ -1335,6 +1341,16 @@ impl RecordingHost {
         seed: &Seed,
         is_u3: bool,
         is_u4: bool,
+        data_dir: Option<PathBuf>,
+    ) -> Self {
+        Self::from_seed_with_all_modes(seed, is_u3, is_u4, false, data_dir)
+    }
+
+    pub fn from_seed_with_all_modes(
+        seed: &Seed,
+        is_u3: bool,
+        is_u4: bool,
+        is_u6: bool,
         data_dir: Option<PathBuf>,
     ) -> Self {
         let saved_session = seed
@@ -1442,6 +1458,7 @@ impl RecordingHost {
             notify: Notify::new(),
             is_u3,
             is_u4,
+            is_u6,
             is_u12: false,
             data_dir,
             virtual_now_ms: Mutex::new(1_700_000_000_000),
@@ -1469,47 +1486,9 @@ impl RecordingHost {
             .clone()
     }
 
-    pub fn enable_u12_virtual_clock(&self) -> Self {
-        Self {
-            saved_session: self.saved_session.clone(),
-            legacy_cookie: self.legacy_cookie.clone(),
-            transport_state: self.transport_state.clone(),
-            self_profile: Mutex::new(
-                self.self_profile
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone(),
-            ),
-            calls: Mutex::new(Vec::new()),
-            notify: Notify::new(),
-            is_u3: self.is_u3,
-            is_u4: self.is_u4,
-            is_u12: true,
-            data_dir: self.data_dir.clone(),
-            shared_store_slot: Mutex::new(None),
-            store: Mutex::new(None),
-            e2ee_send_results: Mutex::new(
-                self.e2ee_send_results
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone(),
-            ),
-            messages: Mutex::new(HashMap::new()),
-            open_conversation_id: Mutex::new(
-                self.open_conversation_id
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone(),
-            ),
-            identities: Mutex::new(
-                self.identities
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone(),
-            ),
-            virtual_now_ms: Mutex::new(1_700_000_000_000),
-            virtual_poll_timers: Mutex::new(Vec::new()),
-        }
+    pub fn enable_u12_virtual_clock(mut self) -> Self {
+        self.is_u12 = true;
+        self
     }
 
     pub fn virtual_now_ms(&self) -> i64 {
@@ -2346,7 +2325,7 @@ impl Host for RecordingHost {
         event_id: String,
         react_client_id: String,
         sender_name: String,
-    ) {
+    ) -> bool {
         if self.is_u4 {
             self.record(
                 "apply_remote_reaction",
@@ -2363,6 +2342,7 @@ impl Host for RecordingHost {
                 }),
             );
         }
+        self.is_u6
     }
 
     async fn apply_remote_recall(
@@ -2372,7 +2352,7 @@ impl Host for RecordingHost {
         cli_msg_id: String,
         _update_conversation_preview: bool,
         _persist_conversations: bool,
-    ) {
+    ) -> bool {
         if self.is_u4 {
             self.record(
                 "apply_remote_recall",
@@ -2383,6 +2363,7 @@ impl Host for RecordingHost {
                 }),
             );
         }
+        self.is_u6
     }
 
     async fn apply_remote_delete(
@@ -2392,7 +2373,7 @@ impl Host for RecordingHost {
         cli_msg_id: String,
         _update_conversation_preview: bool,
         _persist_conversations: bool,
-    ) {
+    ) -> bool {
         if self.is_u4 {
             self.record(
                 "apply_remote_delete",
@@ -2400,6 +2381,19 @@ impl Host for RecordingHost {
                     "conv_id": conv_id,
                     "msg_id": msg_id,
                     "cli_msg_id": cli_msg_id,
+                }),
+            );
+        }
+        self.is_u6
+    }
+
+    async fn show_card(&self, conv_id: String, text: String) {
+        if self.is_u6 {
+            self.record(
+                "show_card",
+                json!({
+                    "conv_id": conv_id,
+                    "text": text,
                 }),
             );
         }
@@ -2906,6 +2900,21 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
             .set_preference_strings("hiddenIds", ids)
             .map_err(|e| format!("seed hiddenIds: {e}"))?;
     }
+    if let Some(ids) = &seed.starred_ids {
+        store
+            .set_preference_strings("starredIds", ids)
+            .map_err(|e| format!("seed starredIds: {e}"))?;
+    }
+    if let Some(ids) = &seed.seen_reaction_event_ids {
+        store
+            .set_preference_strings("seenReactionEventIds", ids)
+            .map_err(|e| format!("seed seenReactionEventIds: {e}"))?;
+    }
+    if !seed.e2ee_threads.is_empty() {
+        store
+            .set_preference_strings("e2eeThreadsV1", &seed.e2ee_threads)
+            .map_err(|e| format!("seed e2eeThreadsV1: {e}"))?;
+    }
     if let Some(md5) = &seed.hidden_pin_md5
         && !md5.is_empty()
     {
@@ -3116,20 +3125,31 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
 struct LogCapturingRunner<R> {
     inner: Arc<R>,
     send_logs: Arc<Mutex<Vec<String>>>,
+    action_logs: Arc<Mutex<Vec<String>>>,
 }
 
 impl<R: EffectRunner> EffectRunner for LogCapturingRunner<R> {
     fn dispatch(&self, effects: Vec<Effect>, sink: ActorSink) {
         {
-            let mut logs = self
+            let mut s_logs = self
                 .send_logs
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            let mut a_logs = self
+                .action_logs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             for eff in &effects {
-                if let Effect::EngineLog(line) = eff
-                    && line.starts_with("sendText ")
-                {
-                    logs.push(line.clone());
+                if let Effect::EngineLog(line) = eff {
+                    if line.starts_with("sendText ") {
+                        s_logs.push(line.clone());
+                    }
+                    if line.starts_with("react failed")
+                        || line.starts_with("recall failed")
+                        || line.starts_with("autodelete: ")
+                    {
+                        a_logs.push(line.clone());
+                    }
                 }
             }
         }
@@ -3979,23 +3999,40 @@ async fn run_u12_poll_model_checks(checks: &[Value], core: &CoreHandle) -> Value
     Value::Array(check_results)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "test harness snapshot layers grow incrementally across domains"
-)]
-async fn capture_case_snapshot(
-    core: &CoreHandle,
-    host: &RecordingHost,
+struct SnapshotOpts<'a> {
     is_u3: bool,
     is_u4: bool,
     is_u5: bool,
+    is_u6: bool,
     is_u12: bool,
     last_send_result: Option<bool>,
-    send_logs: &Mutex<Vec<String>>,
-    u12_results: &BTreeMap<String, Value>,
-    watched_check_ids: Option<&[String]>,
-    seeded_member_cache: Option<&Value>,
+    send_logs: &'a Mutex<Vec<String>>,
+    prune_next_expiry_ms: Option<i64>,
+    action_logs: &'a Mutex<Vec<String>>,
+    u12_results: &'a BTreeMap<String, Value>,
+    watched_check_ids: Option<&'a [String]>,
+    seeded_member_cache: Option<&'a Value>,
+}
+
+async fn capture_case_snapshot(
+    core: &CoreHandle,
+    host: &RecordingHost,
+    opts: &SnapshotOpts<'_>,
 ) -> Option<Value> {
+    let SnapshotOpts {
+        is_u3,
+        is_u4,
+        is_u5,
+        is_u6,
+        is_u12,
+        last_send_result,
+        send_logs,
+        prune_next_expiry_ms,
+        action_logs,
+        u12_results,
+        watched_check_ids,
+        seeded_member_cache,
+    } = *opts;
     if !is_u3 {
         return core
             .snapshot()
@@ -4102,6 +4139,166 @@ async fn capture_case_snapshot(
             seeded_member_cache,
         );
     }
+    if is_u6 {
+        if let Some(Value::Object(msgs_obj)) = obj.get_mut("messages") {
+            for (conv_id, list) in &full.messages.windows {
+                if let Some(Value::Array(arr)) = msgs_obj.get_mut(conv_id)
+                    && arr.len() == list.len()
+                {
+                    for (m, item) in list.iter().zip(arr.iter_mut()) {
+                        if let Value::Object(map) = item {
+                            let buttons: Vec<Value> = m
+                                .card_buttons
+                                .iter()
+                                .map(|b| {
+                                    json!({
+                                        "ref": b.r#ref,
+                                        "label": b.label,
+                                        "enabled": b.enabled,
+                                        "help": b.help,
+                                    })
+                                })
+                                .collect();
+                            map.insert("buttons".to_owned(), Value::Array(buttons));
+                        }
+                    }
+                }
+            }
+        }
+        let undo_val = match &full.delete_undo {
+            Some(u) => json!({
+                "conv_id": u.conv_id,
+                "count": u.count,
+                "deadline_ms": u.deadline_ms,
+            }),
+            None => Value::Null,
+        };
+        obj.insert("delete_undo".to_owned(), undo_val);
+
+        let confirm_val = match &full.message_confirm {
+            Some(c) => json!({
+                "conv_id": c.conv_id,
+                "action": c.action.kind_name(),
+                "title": c.title,
+                "message": c.message,
+                "ok": c.ok,
+                "destructive": c.destructive,
+            }),
+            None => Value::Null,
+        };
+        obj.insert("message_confirm".to_owned(), confirm_val);
+
+        let auto_del_val = match &full.auto_delete {
+            Some(map) => {
+                let m: Map<String, Value> = map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Value::from(*v)))
+                    .collect();
+                Value::Object(m)
+            }
+            None => Value::Null,
+        };
+        obj.insert("auto_delete".to_owned(), auto_del_val);
+
+        let mut starred_sorted: Vec<String> = full.starred_ids.iter().cloned().collect();
+        starred_sorted.sort();
+        obj.insert(
+            "starred_ids".to_owned(),
+            Value::Array(starred_sorted.into_iter().map(Value::String).collect()),
+        );
+        obj.insert(
+            "prune_next_expiry_ms".to_owned(),
+            prune_next_expiry_ms.map_or(Value::Null, Value::from),
+        );
+        let mut profiles_obj = Map::new();
+        for (uid, prof) in &full.cached_profiles {
+            profiles_obj.insert(
+                uid.clone(),
+                json!({
+                    "name": prof.name,
+                    "avatar": prof.avatar,
+                }),
+            );
+        }
+        obj.insert("cached_profiles".to_owned(), Value::Object(profiles_obj));
+
+        let a_logs: Vec<Value> = action_logs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .map(Value::String)
+            .collect();
+        obj.insert("action_logs".to_owned(), Value::Array(a_logs));
+
+        if let Some(store_arc) = host.attached_store()
+            && let Some(Value::Object(store_obj)) = obj.get_mut("store")
+        {
+            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Ok(mut stored_msgs) = store.load_all_messages() {
+                stored_msgs.sort_by(|a, b| {
+                    a.conv_id
+                        .as_bytes()
+                        .cmp(b.conv_id.as_bytes())
+                        .then_with(|| a.ts_ms.cmp(&b.ts_ms))
+                        .then_with(|| a.id.as_bytes().cmp(b.id.as_bytes()))
+                });
+                if let Some(Value::Array(existing_arr)) = store_obj.get_mut("messages")
+                    && existing_arr.len() == stored_msgs.len()
+                {
+                    for (row, base) in stored_msgs.iter().zip(existing_arr.iter_mut()) {
+                        if let Value::Object(dict) = base {
+                            let decoded = decode_stored_message(&to_wire_stored(row));
+                            let reactions_json: Vec<Value> = decoded
+                                .as_ref()
+                                .map(|m| {
+                                    m.reactions
+                                        .iter()
+                                        .map(|r| {
+                                            let icon = if !r.icon.emoji.is_empty() {
+                                                r.icon.emoji.clone()
+                                            } else if !r.icon.key.is_empty() {
+                                                r.icon.key.clone()
+                                            } else {
+                                                r.icon.r#type.clone()
+                                            };
+                                            json!({
+                                                "icon": icon,
+                                                "count": r.count,
+                                                "includes_me": r.includes_me,
+                                            })
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            dict.insert("reactions".to_owned(), Value::Array(reactions_json));
+                            dict.insert(
+                                "starred".to_owned(),
+                                Value::Bool(decoded.as_ref().is_some_and(|m| m.menu.starred)),
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some(Value::Object(prefs_obj)) = store_obj.get_mut("prefs") {
+                let mut starred_pref = store
+                    .get_preference_strings("starredIds")
+                    .unwrap_or_default();
+                starred_pref.sort();
+                prefs_obj.insert(
+                    "starred_ids".to_owned(),
+                    Value::Array(starred_pref.into_iter().map(Value::String).collect()),
+                );
+                let seen_pref = store
+                    .get_preference_strings("seenReactionEventIds")
+                    .unwrap_or_default();
+                prefs_obj.insert(
+                    "seen_reaction_event_ids".to_owned(),
+                    Value::Array(seen_pref.into_iter().map(Value::String).collect()),
+                );
+            }
+        }
+    }
     Some(Value::Object(obj))
 }
 
@@ -4128,7 +4325,8 @@ fn str_vec_arg(args: &Value, key: &str) -> Vec<String> {
 /// snapshots, final state, sorted canonical requests, and ordered host calls.
 pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let is_u12 = case.domain == "polls";
-    let is_u5 = case.domain == "send" || is_u12;
+    let is_u6 = case.domain == "message_actions";
+    let is_u5 = case.domain == "send" || is_u6 || is_u12;
     let is_u4 = case.domain == "bootstrap" || case.domain == "messages" || is_u5;
     let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions" || is_u4;
     let temp_dir = if is_u3 {
@@ -4186,10 +4384,11 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         client.seed_next_client_id(next_cid);
     }
 
-    let base_host = RecordingHost::from_seed_with_modes(
+    let base_host = RecordingHost::from_seed_with_all_modes(
         &case.seed,
         is_u3,
         is_u4,
+        is_u6,
         temp_dir.as_ref().map(|d| d.path().to_path_buf()),
     );
     let host = Arc::new(if is_u12 {
@@ -4207,9 +4406,11 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     ));
     host.bind_store_slot(inner_runner.shared_store_slot());
     let send_logs = Arc::new(Mutex::new(Vec::<String>::new()));
+    let action_logs = Arc::new(Mutex::new(Vec::<String>::new()));
     let runner: Arc<dyn EffectRunner> = Arc::new(LogCapturingRunner {
         inner: Arc::clone(&inner_runner),
         send_logs: Arc::clone(&send_logs),
+        action_logs: Arc::clone(&action_logs),
     });
 
     let mut initial_state = CoreState::default();
@@ -4237,13 +4438,18 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     for tid in &case.seed.e2ee_threads {
         initial_state.send.e2ee_threads.insert(tid.clone());
     }
-    for (conv_id, ttl) in &case.seed.auto_delete {
-        if *ttl > 0 {
-            initial_state
-                .send
-                .auto_delete_ttl_ms
-                .insert(conv_id.clone(), *ttl);
+    if let Some(auto_del) = &case.seed.auto_delete {
+        let mut map = BTreeMap::new();
+        for (conv_id, ttl) in auto_del {
+            if *ttl > 0 {
+                initial_state
+                    .send
+                    .auto_delete_ttl_ms
+                    .insert(conv_id.clone(), *ttl);
+                map.insert(conv_id.clone(), *ttl);
+            }
         }
+        initial_state.actions.auto_delete = Some(map);
     }
     if is_u12 {
         if let Some(contacts) = &case.seed.contacts {
@@ -4455,10 +4661,20 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let mut snapshots = BTreeMap::new();
     let mut host_cursor = 0usize;
     let mut last_send_result: Option<bool> = None;
+    let mut prune_next_expiry_ms: Option<i64> = None;
     let mut pending_send_task: Option<tokio::task::JoinHandle<bool>> = None;
+    let mut pending_action_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut u12_results: BTreeMap<String, Value> = BTreeMap::new();
 
     for (step_index, step) in case.steps.iter().enumerate() {
+        if is_u12
+            && let Step::Cmd {
+                now_ms: Some(step_now),
+                ..
+            } = step
+        {
+            host.set_virtual_now_ms(*step_now);
+        }
         match step {
             Step::Cmd {
                 cmd,
@@ -4466,98 +4682,115 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 now_ms,
                 rand4,
                 timeout_ms,
-            } => {
-                if is_u12 && let Some(step_now) = *now_ms {
-                    host.set_virtual_now_ms(step_now);
-                }
-                match cmd.as_str() {
-                    "start"
-                    | "refresh_qr"
-                    | "log_out"
-                    | "session_expired"
-                    | "apply_account_profile"
-                    | "drain_chat_polling" => {
-                        let parsed = parse_command(cmd, args)?;
-                        match parsed {
-                            Command::LogOut | Command::SessionExpired { .. } => {
-                                let _ =
-                                    tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
-                                        .await;
-                                core.send(parsed);
-                            }
-                            Command::RefreshQr => {
-                                let _ = tokio::time::timeout(
-                                    Duration::from_millis(500),
-                                    core.wait_idle(),
-                                )
+            } => match cmd.as_str() {
+                "start"
+                | "refresh_qr"
+                | "log_out"
+                | "session_expired"
+                | "apply_account_profile"
+                | "drain_chat_polling" => {
+                    let parsed = parse_command(cmd, args)?;
+                    match parsed {
+                        Command::LogOut | Command::SessionExpired { .. } => {
+                            let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
                                 .await;
-                                core.send(parsed);
-                            }
-                            Command::ApplyAccountProfile(_) => {
-                                let _ = core.send_and_ack(parsed).await;
-                            }
-                            Command::DrainChatPolling {
-                                max_batches,
-                                notify_incoming,
-                            } => {
-                                let _ = core.drain_chat_polling(max_batches, notify_incoming).await;
-                            }
-                            Command::Start => {
-                                core.send(parsed);
-                            }
-                            _ => {}
+                            core.send(parsed);
                         }
+                        Command::RefreshQr => {
+                            let _ =
+                                tokio::time::timeout(Duration::from_millis(500), core.wait_idle())
+                                    .await;
+                            core.send(parsed);
+                        }
+                        Command::ApplyAccountProfile(_) => {
+                            let _ = core.send_and_ack(parsed).await;
+                        }
+                        Command::DrainChatPolling {
+                            max_batches,
+                            notify_incoming,
+                        } => {
+                            let _ = core.drain_chat_polling(max_batches, notify_incoming).await;
+                        }
+                        Command::Start => {
+                            core.send(parsed);
+                        }
+                        _ => {}
                     }
-                    // U4-messages
-                    "open" => {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let id = str_arg(args, "id");
-                        host.set_open_conversation(Some(id.clone()));
-                        core.request_unit(Command::OpenConversation {
-                            id,
-                            preloaded: Vec::new(),
-                            skip_local_read: false,
-                        })
+                }
+                // U4-messages
+                "open" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    host.set_open_conversation(Some(id.clone()));
+                    core.request_unit(Command::OpenConversation {
+                        id,
+                        preloaded: Vec::new(),
+                        skip_local_read: false,
+                    })
+                    .await;
+                }
+                "close" => {
+                    host.set_open_conversation(None);
+                    core.request_unit(Command::CloseConversation).await;
+                }
+                "load_older" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    core.request_unit(Command::LoadOlderMessages { id }).await;
+                }
+                // U4-bootstrap
+                "bootstrap" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::Bootstrap { now_ms: ts_ms })
                         .await;
-                    }
-                    "close" => {
-                        host.set_open_conversation(None);
-                        core.request_unit(Command::CloseConversation).await;
-                    }
-                    "load_older" => {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let id = str_arg(args, "id");
-                        core.request_unit(Command::LoadOlderMessages { id }).await;
-                    }
-                    // U4-bootstrap
-                    "bootstrap" => {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
-                        core.request_unit(Command::Bootstrap { now_ms: ts_ms })
-                            .await;
-                    }
-                    "apply_batch" => {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let payload = args.get("payload").cloned().unwrap_or_else(|| json!({}));
-                        let default_cmd = args
-                            .get("default_cmd")
-                            .and_then(Value::as_u64)
-                            .and_then(|v| u16::try_from(v).ok())
-                            .unwrap_or(0);
-                        let fallback_conv_id = args.get("fallback_conv_id").and_then(Value::as_str);
-                        let is_group_hint = args.get("is_group_hint").and_then(Value::as_bool);
-                        let increment_unread = args
-                            .get("increment_unread")
+                }
+                "apply_batch" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let payload = args.get("payload").cloned().unwrap_or_else(|| json!({}));
+                    let default_cmd = args
+                        .get("default_cmd")
+                        .and_then(Value::as_u64)
+                        .and_then(|v| u16::try_from(v).ok())
+                        .unwrap_or(0);
+                    let fallback_conv_id = args.get("fallback_conv_id").and_then(Value::as_str);
+                    let is_group_hint = args.get("is_group_hint").and_then(Value::as_bool);
+                    let increment_unread = args
+                        .get("increment_unread")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let persist_conversations = args
+                        .get("persist_conversations")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    if is_u6 {
+                        let notify_incoming = args
+                            .get("notify_incoming")
                             .and_then(Value::as_bool)
                             .unwrap_or(false);
-                        let persist_conversations = args
-                            .get("persist_conversations")
+                        let probe_freshness = args
+                            .get("probe_freshness")
                             .and_then(Value::as_bool)
-                            .unwrap_or(true);
+                            .unwrap_or(false);
+                        let payload_map = payload.as_object().cloned().unwrap_or_default();
+                        let _ = core
+                            .request(Command::ApplyBatchDirect {
+                                payload: payload_map,
+                                default_cmd,
+                                fallback_conv_id: fallback_conv_id.map(str::to_owned),
+                                is_group_hint,
+                                increment_unread,
+                                notify_incoming,
+                                persist_conversations,
+                                probe_freshness,
+                                now_ms: *now_ms,
+                            })
+                            .await;
+                        if pending_send_task.is_none() && pending_action_task.is_none() {
+                            let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
+                                .await;
+                        }
+                    } else {
                         let delta = host.process_direct_batch(
                             &payload,
                             default_cmd,
@@ -4568,876 +4801,1062 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         );
                         core.request_unit(Command::ApplyBatchDelta(delta)).await;
                     }
-                    "ensure_known_contacts" => {
-                        core.request_unit(Command::EnsureKnownContacts).await;
-                    }
-                    "resolve_missing_names" => {
-                        core.request_unit(Command::ResolveMissingNames).await;
-                    }
-                    "refresh_mention_previews" => {
-                        core.request_unit(Command::RefreshMentionPreviews).await;
-                    }
-                    "update_contacts" => {
-                        let table = host.update_contacts(args);
-                        core.request_unit(Command::UpdateIdentities(table)).await;
-                    }
-                    "open_conversation" => {
-                        let id_opt = args
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_owned);
-                        let load = args.get("load").and_then(Value::as_bool).unwrap_or(false);
-                        host.set_open_conversation(id_opt.clone());
-                        core.request_unit(Command::SetOpenConversation { id: id_opt.clone() })
-                            .await;
-                        if load && let Some(conv_id) = id_opt {
-                            let local_latest = host.load_local_messages_for_open(&conv_id);
-                            let api = ZaloApi::from_shared(Arc::clone(&client));
-                            let mut fetched = 0usize;
-                            if let Ok(page) =
-                                api.fetch_history(&conv_id, None, 50, Some(false)).await
-                            {
-                                let delta = host.process_direct_batch(
-                                    &Value::Object(page),
-                                    0,
-                                    Some(&conv_id),
-                                    None,
-                                    false,
-                                    false,
-                                );
-                                fetched = delta.applied_count as usize;
-                            }
-                            let latest =
-                                host.load_local_messages_for_open(&conv_id).or(local_latest);
-                            let missing_preview = core.full_snapshot().await.is_some_and(|s| {
-                                s.conversations
-                                    .conversations
-                                    .iter()
-                                    .find(|c| c.id == conv_id)
-                                    .is_none_or(|c| c.preview.is_none())
-                            });
-                            if (fetched > 0 || missing_preview)
-                                && let Some(msg) = latest
-                            {
-                                core.request_unit(Command::UpdateConversationOnMessage {
-                                    msg: MessagePreviewInput::from_chat_message(&msg),
-                                    increment_unread: false,
-                                })
-                                .await;
-                            }
-                            let seen_target = host.seen_target_for(&conv_id);
-                            core.request_unit(Command::MarkConversationRead {
-                                id: conv_id,
-                                seen_target,
+                }
+                "ensure_known_contacts" => {
+                    core.request_unit(Command::EnsureKnownContacts).await;
+                }
+                "resolve_missing_names" => {
+                    core.request_unit(Command::ResolveMissingNames).await;
+                }
+                "refresh_mention_previews" => {
+                    core.request_unit(Command::RefreshMentionPreviews).await;
+                }
+                "update_contacts" => {
+                    let table = host.update_contacts(args);
+                    core.request_unit(Command::UpdateIdentities(table)).await;
+                }
+                "open_conversation" => {
+                    let id_opt = args
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    let load = args.get("load").and_then(Value::as_bool).unwrap_or(false);
+                    host.set_open_conversation(id_opt.clone());
+                    core.request_unit(Command::SetOpenConversation { id: id_opt.clone() })
+                        .await;
+                    if load && let Some(conv_id) = id_opt {
+                        let local_latest = host.load_local_messages_for_open(&conv_id);
+                        let api = ZaloApi::from_shared(Arc::clone(&client));
+                        let mut fetched = 0usize;
+                        if let Ok(page) = api.fetch_history(&conv_id, None, 50, Some(false)).await {
+                            let delta = host.process_direct_batch(
+                                &Value::Object(page),
+                                0,
+                                Some(&conv_id),
+                                None,
+                                false,
+                                false,
+                            );
+                            fetched = delta.applied_count as usize;
+                        }
+                        let latest = host.load_local_messages_for_open(&conv_id).or(local_latest);
+                        let missing_preview = core.full_snapshot().await.is_some_and(|s| {
+                            s.conversations
+                                .conversations
+                                .iter()
+                                .find(|c| c.id == conv_id)
+                                .is_none_or(|c| c.preview.is_none())
+                        });
+                        if (fetched > 0 || missing_preview)
+                            && let Some(msg) = latest
+                        {
+                            core.request_unit(Command::UpdateConversationOnMessage {
+                                msg: MessagePreviewInput::from_chat_message(&msg),
+                                increment_unread: false,
                             })
                             .await;
                         }
-                    }
-                    "pin" => {
-                        let id = str_arg(args, "id");
-                        core.request_unit(Command::PinConversation { id }).await;
-                    }
-                    "unpin" => {
-                        let id = str_arg(args, "id");
-                        core.request_unit(Command::UnpinConversation { id }).await;
-                    }
-                    "pin_board" => {
-                        let id = str_arg(args, "id");
-                        let _ = core.request_pin_board(id).await;
-                    }
-                    "pin_replacing" => {
-                        let unpin_ids = str_vec_arg(args, "unpin");
-                        let pin_id = str_arg(args, "id");
-                        let _ = core
-                            .request_action(Command::PinReplacing { unpin_ids, pin_id })
-                            .await;
-                    }
-                    "move" => {
-                        let id = str_arg(args, "id");
-                        let to_other = args
-                            .get("to_other")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(true);
-                        core.request_unit(Command::MoveConversation { id, to_other })
-                            .await;
-                    }
-                    "request_delete" => {
-                        let id = str_arg(args, "id");
-                        core.request_unit(Command::RequestDeleteConversation { id })
-                            .await;
-                    }
-                    "confirm_delete" => {
-                        let id = str_arg(args, "id");
-                        let last_cli_msg_id = host.last_message_id(&id);
-                        core.request_unit(Command::ConfirmDeleteConversation {
-                            id: id.clone(),
-                            last_cli_msg_id,
+                        let seen_target = host.seen_target_for(&conv_id);
+                        core.request_unit(Command::MarkConversationRead {
+                            id: conv_id,
+                            seen_target,
                         })
                         .await;
-                        host.remove_messages(&id);
                     }
-                    "mark_read" => {
-                        let id = str_arg(args, "id");
-                        if is_u5 {
-                            core.request_unit(Command::MarkRead { id }).await;
-                            if pending_send_task.is_none() {
-                                let _ =
-                                    tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
-                                        .await;
-                            }
-                        } else {
-                            let seen_target = host.seen_target_for(&id);
-                            core.request_unit(Command::MarkConversationRead { id, seen_target })
+                }
+                "pin" => {
+                    let id = str_arg(args, "id");
+                    core.request_unit(Command::PinConversation { id }).await;
+                }
+                "unpin" => {
+                    let id = str_arg(args, "id");
+                    core.request_unit(Command::UnpinConversation { id }).await;
+                }
+                "pin_board" => {
+                    let id = str_arg(args, "id");
+                    let _ = core.request_pin_board(id).await;
+                }
+                "pin_replacing" => {
+                    let unpin_ids = str_vec_arg(args, "unpin");
+                    let pin_id = str_arg(args, "id");
+                    let _ = core
+                        .request_action(Command::PinReplacing { unpin_ids, pin_id })
+                        .await;
+                }
+                "move" => {
+                    let id = str_arg(args, "id");
+                    let to_other = args
+                        .get("to_other")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    core.request_unit(Command::MoveConversation { id, to_other })
+                        .await;
+                }
+                "request_delete" => {
+                    let id = str_arg(args, "id");
+                    core.request_unit(Command::RequestDeleteConversation { id })
+                        .await;
+                }
+                "confirm_delete" => {
+                    let id = str_arg(args, "id");
+                    let last_cli_msg_id = host.last_message_id(&id);
+                    core.request_unit(Command::ConfirmDeleteConversation {
+                        id: id.clone(),
+                        last_cli_msg_id,
+                    })
+                    .await;
+                    host.remove_messages(&id);
+                }
+                "mark_read" => {
+                    let id = str_arg(args, "id");
+                    if is_u5 {
+                        core.request_unit(Command::MarkRead { id }).await;
+                        if pending_send_task.is_none() {
+                            let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
                                 .await;
                         }
-                    }
-                    "mark_unread" => {
-                        let id = str_arg(args, "id");
-                        core.request_unit(Command::MarkConversationUnread { id })
+                    } else {
+                        let seen_target = host.seen_target_for(&id);
+                        core.request_unit(Command::MarkConversationRead { id, seen_target })
                             .await;
                     }
-                    "hide" => {
-                        let id = str_arg(args, "id");
-                        let pin = str_arg(args, "pin");
-                        let _ = core
-                            .request_action(Command::HideConversation { id, pin })
-                            .await;
-                    }
-                    "hide_new_pin" => {
-                        let id = str_arg(args, "id");
-                        let pin = str_arg(args, "pin");
-                        let _ = core
-                            .request_action(Command::HideConversationNewPin { id, pin })
-                            .await;
-                    }
-                    "unhide" => {
-                        let id = str_arg(args, "id");
-                        let pin = args.get("pin").and_then(Value::as_str).map(str::to_owned);
-                        let _ = core
-                            .request_action(Command::UnhideConversation { id, pin })
-                            .await;
-                    }
-                    "set_pin" => {
-                        let pin = str_arg(args, "pin");
-                        let changed = args
-                            .get("changed")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                        let _ = core
-                            .request_action(Command::SetHiddenPin { pin, changed })
-                            .await;
-                    }
-                    "reset_pin" => {
-                        let _ = core.request_action(Command::ResetHiddenPin).await;
-                    }
-                    "sync_hidden" => {
-                        core.request_unit(Command::SyncHiddenConversations).await;
-                    }
-                    "apply_server_hidden" => {
-                        let pin = str_arg(args, "pin");
-                        let thread_ids = str_vec_arg(args, "thread_ids");
-                        core.request_unit(Command::ApplyServerHiddenConversations {
-                            pin,
-                            thread_ids,
-                        })
+                }
+                "mark_unread" => {
+                    let id = str_arg(args, "id");
+                    core.request_unit(Command::MarkConversationUnread { id })
                         .await;
+                }
+                "hide" => {
+                    let id = str_arg(args, "id");
+                    let pin = str_arg(args, "pin");
+                    let _ = core
+                        .request_action(Command::HideConversation { id, pin })
+                        .await;
+                }
+                "hide_new_pin" => {
+                    let id = str_arg(args, "id");
+                    let pin = str_arg(args, "pin");
+                    let _ = core
+                        .request_action(Command::HideConversationNewPin { id, pin })
+                        .await;
+                }
+                "unhide" => {
+                    let id = str_arg(args, "id");
+                    let pin = args.get("pin").and_then(Value::as_str).map(str::to_owned);
+                    let _ = core
+                        .request_action(Command::UnhideConversation { id, pin })
+                        .await;
+                }
+                "set_pin" => {
+                    let pin = str_arg(args, "pin");
+                    let changed = args
+                        .get("changed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let _ = core
+                        .request_action(Command::SetHiddenPin { pin, changed })
+                        .await;
+                }
+                "reset_pin" => {
+                    let _ = core.request_action(Command::ResetHiddenPin).await;
+                }
+                "sync_hidden" => {
+                    core.request_unit(Command::SyncHiddenConversations).await;
+                }
+                "apply_server_hidden" => {
+                    let pin = str_arg(args, "pin");
+                    let thread_ids = str_vec_arg(args, "thread_ids");
+                    core.request_unit(Command::ApplyServerHiddenConversations { pin, thread_ids })
+                        .await;
+                }
+                "hidden_search" => {
+                    let query = str_arg(args, "query");
+                    let _ = core.request_hidden_search(query).await;
+                }
+                "unlock_from_pin_search" => {
+                    let id = str_arg(args, "id");
+                    let _ = core.request_bool(Command::UnlockFromPinSearch { id }).await;
+                }
+                "relock_hidden" => {
+                    core.request_unit(Command::RelockHidden).await;
+                }
+                "handle_conversation_actions" => {
+                    let state = args
+                        .get("state")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    core.request_unit(Command::HandleConversationActions { state })
+                        .await;
+                }
+                "handle_conversation_extras" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let state = args
+                        .get("state")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    core.request_unit(Command::HandleConversationExtras { state })
+                        .await;
+                }
+                "label_create" => {
+                    let name = str_arg(args, "name");
+                    let color_hex = args
+                        .get("color_hex")
+                        .and_then(Value::as_str)
+                        .unwrap_or("#0068FF")
+                        .to_owned();
+                    let conversation_ids = str_vec_arg(args, "conversation_ids");
+                    let ms = now_ms.unwrap_or(1_700_000_000_000);
+                    let r4 = rand4.clone().unwrap_or_else(|| "0000".to_owned());
+                    core.request_unit(Command::CreateConversationLabel {
+                        name,
+                        color_hex,
+                        conversation_ids,
+                        now_ms: ms,
+                        rand4: r4,
+                    })
+                    .await;
+                }
+                "label_update" => {
+                    let id = str_arg(args, "id");
+                    let name = str_arg(args, "name");
+                    let color_hex = args
+                        .get("color_hex")
+                        .and_then(Value::as_str)
+                        .unwrap_or("#0068FF")
+                        .to_owned();
+                    core.request_unit(Command::UpdateConversationLabel {
+                        id,
+                        name,
+                        color_hex,
+                    })
+                    .await;
+                }
+                "label_delete" => {
+                    let id = str_arg(args, "id");
+                    core.request_unit(Command::DeleteConversationLabel { id })
+                        .await;
+                }
+                "label_assign" => {
+                    let conversation_id = str_arg(args, "conversation_id");
+                    let label_id = args
+                        .get("label_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    core.request_unit(Command::SetConversationLabel {
+                        conversation_id,
+                        label_id,
+                    })
+                    .await;
+                }
+                "label_reorder" => {
+                    let ids = str_vec_arg(args, "ids");
+                    core.request_unit(Command::ReorderConversationLabels { ids })
+                        .await;
+                }
+                "set_filter" => {
+                    let filter_type = args
+                        .get("type")
+                        .and_then(Value::as_i64)
+                        .and_then(|v| i32::try_from(v).ok())
+                        .unwrap_or(0);
+                    let label_ids = str_vec_arg(args, "label_ids");
+                    core.request_unit(Command::SetConversationFilter {
+                        filter_type,
+                        label_ids,
+                    })
+                    .await;
+                }
+                "sync_labels" => {
+                    core.request_unit(Command::SyncConversationLabels).await;
+                }
+                // U5 send domain commands
+                "send_text" => {
+                    let id = str_arg(args, "id");
+                    let text_arg = str_arg(args, "text");
+                    let quote_id = args
+                        .get("quote_id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    let mentions: Vec<Mention> = args
+                        .get("mentions")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|m| Mention {
+                                    uid: m
+                                        .get("uid")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                    pos: m.get("pos").and_then(Value::as_i64).unwrap_or(0),
+                                    len: m.get("len").and_then(Value::as_i64).unwrap_or(0),
+                                    is_all: m
+                                        .get("is_all")
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let styles: Vec<TextStyle> = args
+                        .get("styles")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|st| TextStyle {
+                                    start: st.get("start").and_then(Value::as_i64).unwrap_or(0),
+                                    len: st.get("len").and_then(Value::as_i64).unwrap_or(0),
+                                    st: st
+                                        .get("st")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let urgency = args.get("urgency").and_then(Value::as_i64).unwrap_or(0);
+                    let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    let client_id = if !text_arg.trim().is_empty() && !id.is_empty() {
+                        client.next_client_id()
+                    } else {
+                        0
+                    };
+                    let send_cmd = Command::SendText {
+                        conv_id: id,
+                        text: text_arg,
+                        quote_id,
+                        mentions,
+                        styles,
+                        urgency,
+                        client_id,
+                        now_ms: ts_ms,
+                        is_e2ee: None,
+                        ttl_ms: None,
+                    };
+                    if is_async {
+                        let target_held = transport.held_arrived_count() + 1;
+                        let core_bg = Arc::clone(&core);
+                        pending_send_task =
+                            Some(tokio::spawn(
+                                async move { core_bg.request_bool(send_cmd).await },
+                            ));
+                        let _ = core.settle().await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(200),
+                            transport.wait_for_held_arrival(target_held),
+                        )
+                        .await;
+                    } else {
+                        let ok = core.request_bool(send_cmd).await;
+                        last_send_result = Some(ok);
                     }
-                    "hidden_search" => {
-                        let query = str_arg(args, "query");
-                        let _ = core.request_hidden_search(query).await;
+                }
+                "await_send" => {
+                    if let Some(handle) = pending_send_task.take() {
+                        let ok = handle
+                            .await
+                            .map_err(|e| format!("await_send join error: {e}"))?;
+                        last_send_result = Some(ok);
                     }
-                    "unlock_from_pin_search" => {
-                        let id = str_arg(args, "id");
-                        let _ = core.request_bool(Command::UnlockFromPinSearch { id }).await;
-                    }
-                    "relock_hidden" => {
-                        core.request_unit(Command::RelockHidden).await;
-                    }
-                    "handle_conversation_actions" => {
-                        let state = args
-                            .get("state")
-                            .and_then(Value::as_object)
-                            .cloned()
-                            .unwrap_or_default();
-                        core.request_unit(Command::HandleConversationActions { state })
-                            .await;
-                    }
-                    "handle_conversation_extras" => {
+                }
+                "notify_typing" => {
+                    let id = str_arg(args, "id");
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::NotifyTyping {
+                        conv_id: id,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() {
                         let _ =
                             tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let state = args
-                            .get("state")
-                            .and_then(Value::as_object)
-                            .cloned()
-                            .unwrap_or_default();
-                        core.request_unit(Command::HandleConversationExtras { state })
+                    }
+                }
+                "handle_typing" => {
+                    let state_map = args
+                        .get("state")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    core.request_unit(Command::HandleTyping { state: state_map })
+                        .await;
+                }
+                "set_pref" => {
+                    let key = str_arg(args, "key");
+                    if key == "olaz.sendTyping" {
+                        let enabled = args.get("value").and_then(Value::as_bool).unwrap_or(true);
+                        core.request_unit(Command::SetSendTypingEnabled { enabled })
                             .await;
                     }
-                    "label_create" => {
-                        let name = str_arg(args, "name");
-                        let color_hex = args
-                            .get("color_hex")
-                            .and_then(Value::as_str)
-                            .unwrap_or("#0068FF")
-                            .to_owned();
-                        let conversation_ids = str_vec_arg(args, "conversation_ids");
-                        let ms = now_ms.unwrap_or(1_700_000_000_000);
-                        let r4 = rand4.clone().unwrap_or_else(|| "0000".to_owned());
-                        core.request_unit(Command::CreateConversationLabel {
-                            name,
-                            color_hex,
-                            conversation_ids,
-                            now_ms: ms,
-                            rand4: r4,
-                        })
-                        .await;
-                    }
-                    "label_update" => {
-                        let id = str_arg(args, "id");
-                        let name = str_arg(args, "name");
-                        let color_hex = args
-                            .get("color_hex")
-                            .and_then(Value::as_str)
-                            .unwrap_or("#0068FF")
-                            .to_owned();
-                        core.request_unit(Command::UpdateConversationLabel {
-                            id,
-                            name,
-                            color_hex,
-                        })
-                        .await;
-                    }
-                    "label_delete" => {
-                        let id = str_arg(args, "id");
-                        core.request_unit(Command::DeleteConversationLabel { id })
-                            .await;
-                    }
-                    "label_assign" => {
-                        let conversation_id = str_arg(args, "conversation_id");
-                        let label_id = args
-                            .get("label_id")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        core.request_unit(Command::SetConversationLabel {
-                            conversation_id,
-                            label_id,
-                        })
-                        .await;
-                    }
-                    "label_reorder" => {
-                        let ids = str_vec_arg(args, "ids");
-                        core.request_unit(Command::ReorderConversationLabels { ids })
-                            .await;
-                    }
-                    "set_filter" => {
-                        let filter_type = args
-                            .get("type")
-                            .and_then(Value::as_i64)
-                            .and_then(|v| i32::try_from(v).ok())
-                            .unwrap_or(0);
-                        let label_ids = str_vec_arg(args, "label_ids");
-                        core.request_unit(Command::SetConversationFilter {
-                            filter_type,
-                            label_ids,
-                        })
-                        .await;
-                    }
-                    "sync_labels" => {
-                        core.request_unit(Command::SyncConversationLabels).await;
-                    }
-                    // U5 send domain commands
-                    "send_text" => {
-                        let id = str_arg(args, "id");
-                        let text_arg = str_arg(args, "text");
-                        let quote_id = args
-                            .get("quote_id")
-                            .and_then(Value::as_str)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_owned);
-                        let mentions: Vec<Mention> = args
-                            .get("mentions")
-                            .and_then(Value::as_array)
-                            .map(|arr| {
-                                arr.iter()
-                                    .map(|m| Mention {
-                                        uid: m
-                                            .get("uid")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or_default()
-                                            .to_owned(),
-                                        pos: m.get("pos").and_then(Value::as_i64).unwrap_or(0),
-                                        len: m.get("len").and_then(Value::as_i64).unwrap_or(0),
-                                        is_all: m
-                                            .get("is_all")
-                                            .and_then(Value::as_bool)
-                                            .unwrap_or(false),
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let styles: Vec<TextStyle> = args
-                            .get("styles")
-                            .and_then(Value::as_array)
-                            .map(|arr| {
-                                arr.iter()
-                                    .map(|st| TextStyle {
-                                        start: st.get("start").and_then(Value::as_i64).unwrap_or(0),
-                                        len: st.get("len").and_then(Value::as_i64).unwrap_or(0),
-                                        st: st
-                                            .get("st")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or_default()
-                                            .to_owned(),
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let urgency = args.get("urgency").and_then(Value::as_i64).unwrap_or(0);
-                        let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
-                        let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
-                        let client_id = if !text_arg.trim().is_empty() && !id.is_empty() {
-                            client.next_client_id()
-                        } else {
-                            0
-                        };
-                        let send_cmd = Command::SendText {
-                            conv_id: id,
-                            text: text_arg,
-                            quote_id,
-                            mentions,
-                            styles,
-                            urgency,
-                            client_id,
-                            now_ms: ts_ms,
-                            is_e2ee: None,
-                            ttl_ms: None,
-                        };
-                        if is_async {
-                            let target_held = transport.held_arrived_count() + 1;
-                            let core_bg = Arc::clone(&core);
-                            pending_send_task =
-                                Some(tokio::spawn(
-                                    async move { core_bg.request_bool(send_cmd).await },
-                                ));
-                            let _ = core.settle().await;
-                            let _ = tokio::time::timeout(
-                                Duration::from_millis(200),
-                                transport.wait_for_held_arrival(target_held),
-                            )
-                            .await;
-                        } else {
-                            let ok = core.request_bool(send_cmd).await;
-                            last_send_result = Some(ok);
-                        }
-                    }
-                    "await_send" => {
-                        if let Some(handle) = pending_send_task.take() {
-                            let ok = handle
+                }
+                "clear_client_auth" => {
+                    client.with_session(|s| {
+                        s.zpw_sek = None;
+                        s.secret_key = None;
+                        s.account = None;
+                    });
+                }
+                "await_typing_expiry" => {
+                    let id = str_arg(args, "id");
+                    let dur = Duration::from_millis(timeout_ms.unwrap_or(15_000));
+                    let wait_fut = async {
+                        loop {
+                            if core
+                                .full_snapshot()
                                 .await
-                                .map_err(|e| format!("await_send join error: {e}"))?;
-                            last_send_result = Some(ok);
+                                .is_none_or(|snap| !snap.typing.contains_key(&id))
+                            {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
                         }
-                    }
-                    "notify_typing" => {
-                        let id = str_arg(args, "id");
-                        let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
-                        core.request_unit(Command::NotifyTyping {
-                            conv_id: id,
-                            now_ms: ts_ms,
-                        })
+                    };
+                    tokio::time::timeout(dur, wait_fut)
+                        .await
+                        .map_err(|_| format!("timed out awaiting typing expiry for `{id}`"))?;
+                }
+                // U6 message_actions domain commands
+                "react" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let emoji = str_arg(args, "emoji");
+                    let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    let react_cmd = Command::React {
+                        conv_id,
+                        msg_id,
+                        emoji,
+                        remove_all: false,
+                        now_ms: ts_ms,
+                    };
+                    if is_async {
+                        let target_held = transport.held_arrived_count() + 1;
+                        let core_bg = Arc::clone(&core);
+                        pending_action_task = Some(tokio::spawn(async move {
+                            core_bg.request_unit(react_cmd).await;
+                        }));
+                        let _ = core.settle().await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(200),
+                            transport.wait_for_held_arrival(target_held),
+                        )
                         .await;
+                    } else {
+                        core.request_unit(react_cmd).await;
                         if pending_send_task.is_none() {
                             let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
                                 .await;
                         }
                     }
-                    "handle_typing" => {
-                        let state_map = args
-                            .get("state")
-                            .and_then(Value::as_object)
-                            .cloned()
-                            .unwrap_or_default();
-                        core.request_unit(Command::HandleTyping { state: state_map })
-                            .await;
-                    }
-                    "set_pref" => {
-                        let key = str_arg(args, "key");
-                        if key == "olaz.sendTyping" {
-                            let enabled =
-                                args.get("value").and_then(Value::as_bool).unwrap_or(true);
-                            core.request_unit(Command::SetSendTypingEnabled { enabled })
-                                .await;
-                        }
-                    }
-                    "clear_client_auth" => {
-                        client.with_session(|s| {
-                            s.zpw_sek = None;
-                            s.secret_key = None;
-                            s.account = None;
-                        });
-                    }
-                    "await_typing_expiry" => {
-                        let id = str_arg(args, "id");
-                        let dur = Duration::from_millis(timeout_ms.unwrap_or(15_000));
-                        let wait_fut = async {
-                            loop {
-                                if core
-                                    .full_snapshot()
-                                    .await
-                                    .is_none_or(|snap| !snap.typing.contains_key(&id))
-                                {
-                                    break;
-                                }
-                                tokio::time::sleep(Duration::from_millis(50)).await;
-                            }
-                        };
-                        tokio::time::timeout(dur, wait_fut)
+                }
+                "await_action" => {
+                    if let Some(handle) = pending_action_task.take() {
+                        handle
                             .await
-                            .map_err(|_| format!("timed out awaiting typing expiry for `{id}`"))?;
+                            .map_err(|e| format!("await_action join error: {e}"))?;
                     }
-                    // U12 polls domain commands
-                    "watch_poll" => {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let id = str_arg(args, "id");
-                        let conv_id = str_arg(args, "conv_id");
-                        let ts_ms = host.virtual_now_ms();
-                        core.request_unit(Command::WatchPoll {
-                            id,
-                            conv_id,
-                            now_ms: ts_ms,
-                        })
-                        .await;
+                    if pending_send_task.is_none() {
                         let _ =
                             tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
                     }
-                    "retry_poll" => {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let id = str_arg(args, "id");
-                        let conv_id = str_arg(args, "conv_id");
-                        let ts_ms = host.virtual_now_ms();
-                        core.request_unit(Command::RetryPoll {
-                            id,
-                            conv_id,
-                            now_ms: ts_ms,
-                        })
-                        .await;
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                    }
-                    "rewatch_polls" => {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let ts_ms = host.virtual_now_ms();
-                        core.request_unit(Command::RewatchPolls { now_ms: ts_ms })
-                            .await;
+                }
+                "remove_my_reactions" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::React {
+                        conv_id,
+                        msg_id,
+                        emoji: String::new(),
+                        remove_all: true,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
                         let _ =
                             tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
                     }
-                    "refresh_poll" => {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let id = str_arg(args, "id");
-                        let ts_ms = host.virtual_now_ms();
-                        core.request_unit(Command::RefreshPoll { id, now_ms: ts_ms })
-                            .await;
+                }
+                "recall" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::Recall {
+                        conv_id,
+                        msg_id,
+                        is_e2ee_thread: None,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
                         let _ =
                             tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
                     }
-                    "poll_voters" => {
+                }
+                "recall_many" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_ids = str_vec_arg(args, "msg_ids");
+                    let use_confirm = args.get("confirm").and_then(Value::as_bool).unwrap_or(true);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::RecallMany {
+                        conv_id,
+                        msg_ids,
+                        confirm: use_confirm,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
                         let _ =
                             tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let id = str_arg(args, "id");
-                        let voters = core.request_poll_voters(id).await;
-                        let val = match voters {
-                            None => Value::Null,
-                            Some(v) => {
-                                let groups: Vec<Value> = v
-                                    .groups
-                                    .iter()
-                                    .map(|g| {
-                                        let users: Vec<Value> = g
-                                            .users
-                                            .iter()
-                                            .map(|u| {
-                                                json!({
-                                                    "uid": u.uid,
-                                                    "name": u.name,
-                                                    "avatar": u.avatar,
-                                                    "is_me": u.is_me,
-                                                })
-                                            })
-                                            .collect();
-                                        json!({
-                                            "id": g.id,
-                                            "content": g.content,
-                                            "votes": g.votes,
-                                            "users": users,
-                                        })
-                                    })
-                                    .collect();
-                                json!({
-                                    "restricted": v.restricted,
-                                    "groups": groups,
-                                })
-                            }
-                        };
-                        u12_results.insert(step_index.to_string(), val);
                     }
-                    "refresh_poll_pin" => {
+                }
+                "delete_for_me" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let confirmed = args
+                        .get("confirmed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::DeleteForMe {
+                        conv_id,
+                        msg_id,
+                        confirmed,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
                         let _ =
                             tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let id = str_arg(args, "id");
-                        let conv_id = str_arg(args, "conv_id");
-                        let pin_state = core.request_poll_pin_state(id, conv_id).await;
-                        u12_results.insert(
-                            step_index.to_string(),
-                            encode_u12_poll_pin_state(&pin_state),
-                        );
                     }
-                    "pin_poll" => {
+                }
+                "delete_many" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_ids = str_vec_arg(args, "msg_ids");
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::DeleteMany {
+                        conv_id,
+                        msg_ids,
+                        confirm: true,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
                         let _ =
                             tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let id = str_arg(args, "id");
-                        let conv_id = str_arg(args, "conv_id");
-                        let confirming = args
-                            .get("confirming")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        let outcome = core.request_poll_pin_outcome(id, conv_id, confirming).await;
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let outcome_json = match outcome {
-                            olaz_core::PollPinOutcome::Done => json!({ "status": "done" }),
-                            olaz_core::PollPinOutcome::NeedsConfirmation(confirm) => json!({
-                                "status": "needs_confirmation",
-                                "ref": confirm.ref_id,
-                                "limit": confirm.limit,
-                                "kind": confirm.kind,
-                                "title": confirm.title,
-                                "message": confirm.message(),
-                            }),
-                            olaz_core::PollPinOutcome::Failed(res) => json!({
-                                "status": "failed",
-                                "ok": res.ok,
-                                "error": res.error,
-                                "pin_skipped": res.pin_skipped,
-                                "message": res.message(olaz_core::PollAction::Pin),
-                            }),
-                        };
-                        u12_results.insert(step_index.to_string(), outcome_json);
                     }
-                    "unpin_poll" => {
+                }
+                "undo_delete" => {
+                    core.request_unit(Command::UndoDelete).await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
                         let _ =
                             tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let id = str_arg(args, "id");
-                        let conv_id = str_arg(args, "conv_id");
-                        let res = core
-                            .request_poll_action(Command::UnpinPoll { id, conv_id })
-                            .await;
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        u12_results.insert(
-                            step_index.to_string(),
-                            json!({
-                                "ok": res.ok,
-                                "error": res.error,
-                                "pin_skipped": res.pin_skipped,
-                                "message": res.message(olaz_core::PollAction::Unpin),
-                            }),
-                        );
                     }
-                    "vote_poll" => {
+                }
+                "dismiss_delete_undo" => {
+                    core.request_unit(Command::DismissDeleteUndo).await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
                         let _ =
                             tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let id = str_arg(args, "id");
-                        let conv_id = str_arg(args, "conv_id");
-                        let snap = core.full_snapshot().await.unwrap_or_default();
-                        let detail =
-                            if args.get("detail_from").and_then(Value::as_str) == Some("state") {
-                                snap.polls.details.get(&id).cloned()
-                            } else if let Some(df_obj) =
-                                args.get("detail_from").and_then(Value::as_object)
+                    }
+                }
+                "await_delete_undo_expiry" => {
+                    let dur = Duration::from_millis(timeout_ms.unwrap_or(8_000));
+                    let wait_fut = async {
+                        loop {
+                            if core
+                                .full_snapshot()
+                                .await
+                                .is_none_or(|snap| snap.delete_undo.is_none())
                             {
-                                olaz_core::PollDetail::from_json(df_obj)
-                            } else {
-                                snap.polls.details.get(&id).cloned()
-                            };
-                        let detail =
-                            detail.ok_or_else(|| format!("vote_poll missing detail for {id}"))?;
-                        let mut draft = olaz_core::PollVoteDraft::new(&detail);
-                        if let Some(toggles) = args
-                            .get("draft")
-                            .and_then(|d| d.get("toggle"))
-                            .and_then(Value::as_array)
-                        {
-                            for item in toggles {
-                                if let Some(opt_id) = item.as_str() {
-                                    draft.toggle(opt_id);
-                                }
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    };
+                    tokio::time::timeout(dur, wait_fut)
+                        .await
+                        .map_err(|_| "timed out awaiting deleteUndo expiry".to_owned())?;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "answer_confirm" => {
+                    let ok = args.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::AnswerMessageConfirm { ok, now_ms: ts_ms })
+                        .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "star" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let on = args.get("on").and_then(Value::as_bool).unwrap_or(true);
+                    core.request_unit(Command::SetStarred {
+                        conv_id,
+                        msg_id,
+                        on,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "load_auto_delete" => {
+                    core.request_unit(Command::LoadAutoDelete).await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "set_auto_delete" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let ttl = args.get("ttl").and_then(Value::as_i64).unwrap_or(0);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::SetAutoDelete {
+                        conv_id,
+                        ttl,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "prune_expired" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    prune_next_expiry_ms = core
+                        .request_opt_i64(Command::PruneExpiredMessages {
+                            conv_id,
+                            now_ms: ts_ms,
+                        })
+                        .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                // U12 polls domain commands
+                "watch_poll" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let conv_id = str_arg(args, "conv_id");
+                    let ts_ms = host.virtual_now_ms();
+                    core.request_unit(Command::WatchPoll {
+                        id,
+                        conv_id,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "retry_poll" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let conv_id = str_arg(args, "conv_id");
+                    let ts_ms = host.virtual_now_ms();
+                    core.request_unit(Command::RetryPoll {
+                        id,
+                        conv_id,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "rewatch_polls" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let ts_ms = host.virtual_now_ms();
+                    core.request_unit(Command::RewatchPolls { now_ms: ts_ms })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "refresh_poll" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let ts_ms = host.virtual_now_ms();
+                    core.request_unit(Command::RefreshPoll { id, now_ms: ts_ms })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "poll_voters" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let voters = core.request_poll_voters(id).await;
+                    let val = match voters {
+                        None => Value::Null,
+                        Some(v) => {
+                            let groups: Vec<Value> = v
+                                .groups
+                                .iter()
+                                .map(|g| {
+                                    let users: Vec<Value> = g
+                                        .users
+                                        .iter()
+                                        .map(|u| {
+                                            json!({
+                                                "uid": u.uid,
+                                                "name": u.name,
+                                                "avatar": u.avatar,
+                                                "is_me": u.is_me,
+                                            })
+                                        })
+                                        .collect();
+                                    json!({
+                                        "id": g.id,
+                                        "content": g.content,
+                                        "votes": g.votes,
+                                        "users": users,
+                                    })
+                                })
+                                .collect();
+                            json!({
+                                "restricted": v.restricted,
+                                "groups": groups,
+                            })
+                        }
+                    };
+                    u12_results.insert(step_index.to_string(), val);
+                }
+                "refresh_poll_pin" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let conv_id = str_arg(args, "conv_id");
+                    let pin_state = core.request_poll_pin_state(id, conv_id).await;
+                    u12_results.insert(
+                        step_index.to_string(),
+                        encode_u12_poll_pin_state(&pin_state),
+                    );
+                }
+                "pin_poll" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let conv_id = str_arg(args, "conv_id");
+                    let confirming = args
+                        .get("confirming")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let outcome = core.request_poll_pin_outcome(id, conv_id, confirming).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let outcome_json = match outcome {
+                        olaz_core::PollPinOutcome::Done => json!({ "status": "done" }),
+                        olaz_core::PollPinOutcome::NeedsConfirmation(confirm) => json!({
+                            "status": "needs_confirmation",
+                            "ref": confirm.ref_id,
+                            "limit": confirm.limit,
+                            "kind": confirm.kind,
+                            "title": confirm.title,
+                            "message": confirm.message(),
+                        }),
+                        olaz_core::PollPinOutcome::Failed(res) => json!({
+                            "status": "failed",
+                            "ok": res.ok,
+                            "error": res.error,
+                            "pin_skipped": res.pin_skipped,
+                            "message": res.message(olaz_core::PollAction::Pin),
+                        }),
+                    };
+                    u12_results.insert(step_index.to_string(), outcome_json);
+                }
+                "unpin_poll" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let conv_id = str_arg(args, "conv_id");
+                    let res = core
+                        .request_poll_action(Command::UnpinPoll { id, conv_id })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    u12_results.insert(
+                        step_index.to_string(),
+                        json!({
+                            "ok": res.ok,
+                            "error": res.error,
+                            "pin_skipped": res.pin_skipped,
+                            "message": res.message(olaz_core::PollAction::Unpin),
+                        }),
+                    );
+                }
+                "vote_poll" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let conv_id = str_arg(args, "conv_id");
+                    let snap = core.full_snapshot().await.unwrap_or_default();
+                    let detail = if args.get("detail_from").and_then(Value::as_str) == Some("state")
+                    {
+                        snap.polls.details.get(&id).cloned()
+                    } else if let Some(df_obj) = args.get("detail_from").and_then(Value::as_object)
+                    {
+                        olaz_core::PollDetail::from_json(df_obj)
+                    } else {
+                        snap.polls.details.get(&id).cloned()
+                    };
+                    let detail =
+                        detail.ok_or_else(|| format!("vote_poll missing detail for {id}"))?;
+                    let mut draft = olaz_core::PollVoteDraft::new(&detail);
+                    if let Some(toggles) = args
+                        .get("draft")
+                        .and_then(|d| d.get("toggle"))
+                        .and_then(Value::as_array)
+                    {
+                        for item in toggles {
+                            if let Some(opt_id) = item.as_str() {
+                                draft.toggle(opt_id);
                             }
                         }
-                        if let Some(added_arr) = args
-                            .get("draft")
-                            .and_then(|d| d.get("added"))
-                            .and_then(Value::as_array)
-                        {
-                            for item in added_arr {
-                                let row_id = draft.add_row();
-                                let idx = draft.added.len() - 1;
-                                draft.added[idx].text = item
-                                    .get("text")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_owned();
-                                let voted =
-                                    item.get("voted").and_then(Value::as_bool).unwrap_or(false);
-                                draft.set_added_voted(&row_id, voted);
-                            }
-                        }
-                        let (new_opts, voted_ids) = draft.request(&detail);
-                        let new_opts_json: Vec<Value> = new_opts
-                            .iter()
-                            .map(|o| json!({ "content": o.content, "voted": o.voted }))
-                            .collect();
-                        let applied = draft.applied(&detail);
-                        let has_changes = draft.has_changes();
-                        let votes_nothing = draft.votes_nothing();
-                        let has_duplicates = draft.has_duplicates(&detail);
-                        let can_submit = draft.can_submit();
-                        let ts_ms = host.virtual_now_ms();
-                        let res = core
-                            .request_poll_action(Command::VotePoll {
-                                id,
-                                conv_id,
-                                draft,
-                                detail: Some(detail),
-                                now_ms: ts_ms,
-                            })
-                            .await;
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        u12_results.insert(
-                            step_index.to_string(),
-                            json!({
-                                "ok": res.ok,
-                                "error": res.error,
-                                "pin_skipped": res.pin_skipped,
-                                "message": res.message(olaz_core::PollAction::Vote),
-                                "request": {
-                                    "new_options": new_opts_json,
-                                    "voted_ids": voted_ids,
-                                },
-                                "applied": encode_u12_poll_detail(&applied),
-                                "has_changes": has_changes,
-                                "votes_nothing": votes_nothing,
-                                "has_duplicates": has_duplicates,
-                                "can_submit": can_submit,
-                            }),
-                        );
                     }
-                    "lock_poll" => {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let id = str_arg(args, "id");
-                        let conv_id = str_arg(args, "conv_id");
-                        let ts_ms = host.virtual_now_ms();
-                        let res = core
-                            .request_poll_action(Command::LockPoll {
-                                id,
-                                conv_id,
-                                now_ms: ts_ms,
-                            })
-                            .await;
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        u12_results.insert(
-                            step_index.to_string(),
-                            json!({
-                                "ok": res.ok,
-                                "error": res.error,
-                                "pin_skipped": res.pin_skipped,
-                                "message": res.message(olaz_core::PollAction::Lock),
-                            }),
-                        );
-                    }
-                    "share_poll" => {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let id = str_arg(args, "id");
-                        let conv_id = str_arg(args, "conv_id");
-                        let res = core
-                            .request_poll_action(Command::SharePoll { id, conv_id })
-                            .await;
-                        u12_results.insert(
-                            step_index.to_string(),
-                            json!({
-                                "ok": res.ok,
-                                "error": res.error,
-                                "pin_skipped": res.pin_skipped,
-                                "message": res.message(olaz_core::PollAction::Share),
-                            }),
-                        );
-                    }
-                    "create_poll" => {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let conv_id = str_arg(args, "conv_id");
-                        let can_pin = args
-                            .get("can_pin")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                        let cfg = olaz_core::PollConfig::from_json(
-                            args.get("config").and_then(Value::as_object),
-                        );
-                        let ts_ms = host.virtual_now_ms();
-                        let mut draft = olaz_core::PollCreateDraft::new(&cfg, ts_ms);
-                        if let Some(d_obj) = args.get("draft").and_then(Value::as_object) {
-                            draft.question = d_obj
-                                .get("question")
+                    if let Some(added_arr) = args
+                        .get("draft")
+                        .and_then(|d| d.get("added"))
+                        .and_then(Value::as_array)
+                    {
+                        for item in added_arr {
+                            let row_id = draft.add_row();
+                            let idx = draft.added.len() - 1;
+                            draft.added[idx].text = item
+                                .get("text")
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
                                 .to_owned();
-                            if let Some(opts) = d_obj.get("options").and_then(Value::as_array) {
-                                draft.options = opts
-                                    .iter()
-                                    .filter_map(Value::as_str)
-                                    .map(str::to_owned)
-                                    .collect();
-                            }
-                            draft.has_deadline = d_obj
-                                .get("has_deadline")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false);
-                            if let Some(dl_ms) = d_obj.get("deadline_ms").and_then(Value::as_i64) {
-                                draft.deadline_ms = dl_ms;
-                            }
-                            draft.pin = d_obj.get("pin").and_then(Value::as_bool).unwrap_or(false);
-                            draft.multi =
-                                d_obj.get("multi").and_then(Value::as_bool).unwrap_or(true);
-                            draft.allow_add = d_obj
-                                .get("allow_add")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(true);
-                            draft.hide_preview = d_obj
-                                .get("hide_preview")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false);
-                            draft.anonymous = d_obj
-                                .get("anonymous")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false);
+                            let voted = item.get("voted").and_then(Value::as_bool).unwrap_or(false);
+                            draft.set_added_voted(&row_id, voted);
                         }
-                        let spec = draft.spec(&cfg, can_pin);
-                        let res = core
-                            .request_poll_action(Command::CreatePoll {
-                                conv_id,
-                                draft,
-                                config: cfg,
-                                can_pin,
-                            })
-                            .await;
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        u12_results.insert(
-                            step_index.to_string(),
-                            json!({
-                                "ok": res.ok,
-                                "error": res.error,
-                                "pin_skipped": res.pin_skipped,
-                                "message": res.message(olaz_core::PollAction::Create),
-                                "spec": spec,
-                            }),
-                        );
                     }
-                    "note_poll_messages" => {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let conv_id = str_arg(args, "conv_id");
-                        let items: Vec<olaz_core::PollMessageNotice> = args
-                            .get("ids")
-                            .and_then(Value::as_array)
-                            .map(|arr| {
-                                arr.iter()
-                                    .map(|row| olaz_core::PollMessageNotice {
-                                        msg_id: str_arg(row, "id"),
-                                        poll_id: str_arg(row, "poll_id"),
-                                        conv_id: conv_id.clone(),
-                                        date_ms: row
-                                            .get("date_ms")
-                                            .and_then(Value::as_i64)
-                                            .unwrap_or(0),
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let ts_ms = host.virtual_now_ms();
-                        core.request_unit(Command::NotePollMessages {
-                            notices: items,
+                    let (new_opts, voted_ids) = draft.request(&detail);
+                    let new_opts_json: Vec<Value> = new_opts
+                        .iter()
+                        .map(|o| json!({ "content": o.content, "voted": o.voted }))
+                        .collect();
+                    let applied = draft.applied(&detail);
+                    let has_changes = draft.has_changes();
+                    let votes_nothing = draft.votes_nothing();
+                    let has_duplicates = draft.has_duplicates(&detail);
+                    let can_submit = draft.can_submit();
+                    let ts_ms = host.virtual_now_ms();
+                    let res = core
+                        .request_poll_action(Command::VotePoll {
+                            id,
+                            conv_id,
+                            draft,
+                            detail: Some(detail),
                             now_ms: ts_ms,
-                            host_already_armed: false,
                         })
                         .await;
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                    }
-                    "advance_ms" => {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let ms = args.get("ms").and_then(Value::as_i64).unwrap_or(0);
-                        let (now_after, ready) = host.advance_virtual_clock(ms);
-                        for (poll_id, seq) in ready {
-                            core.request_unit(Command::FirePollDebounce {
-                                poll_id,
-                                seq,
-                                now_ms: now_after,
-                            })
-                            .await;
-                        }
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                    }
-                    "poll_state" => {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        if let Some(j_map) = args.get("json").and_then(Value::as_object).cloned() {
-                            core.request_unit(Command::HandlePollState { state: j_map })
-                                .await;
-                        }
-                    }
-                    "pins_state" => {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        if let Some(j_map) = args.get("json").and_then(Value::as_object).cloned() {
-                            core.request_unit(Command::HandlePinsState { state: j_map })
-                                .await;
-                        }
-                    }
-                    "reset_polls" => {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        host.clear_virtual_poll_timers();
-                        core.request_unit(Command::ResetPolls { sync_epoch: 0 })
-                            .await;
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                    }
-                    "poll_model_checks" => {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                        let checks = args
-                            .get("checks")
-                            .and_then(Value::as_array)
-                            .map(Vec::as_slice)
-                            .unwrap_or(&[]);
-                        let check_results = run_u12_poll_model_checks(checks, &core).await;
-                        u12_results.insert(step_index.to_string(), check_results);
-                    }
-                    other => return Err(format!("unknown step cmd: {other}")),
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    u12_results.insert(
+                        step_index.to_string(),
+                        json!({
+                            "ok": res.ok,
+                            "error": res.error,
+                            "pin_skipped": res.pin_skipped,
+                            "message": res.message(olaz_core::PollAction::Vote),
+                            "request": {
+                                "new_options": new_opts_json,
+                                "voted_ids": voted_ids,
+                            },
+                            "applied": encode_u12_poll_detail(&applied),
+                            "has_changes": has_changes,
+                            "votes_nothing": votes_nothing,
+                            "has_duplicates": has_duplicates,
+                            "can_submit": can_submit,
+                        }),
+                    );
                 }
-            }
+                "lock_poll" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let conv_id = str_arg(args, "conv_id");
+                    let ts_ms = host.virtual_now_ms();
+                    let res = core
+                        .request_poll_action(Command::LockPoll {
+                            id,
+                            conv_id,
+                            now_ms: ts_ms,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    u12_results.insert(
+                        step_index.to_string(),
+                        json!({
+                            "ok": res.ok,
+                            "error": res.error,
+                            "pin_skipped": res.pin_skipped,
+                            "message": res.message(olaz_core::PollAction::Lock),
+                        }),
+                    );
+                }
+                "share_poll" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let conv_id = str_arg(args, "conv_id");
+                    let res = core
+                        .request_poll_action(Command::SharePoll { id, conv_id })
+                        .await;
+                    u12_results.insert(
+                        step_index.to_string(),
+                        json!({
+                            "ok": res.ok,
+                            "error": res.error,
+                            "pin_skipped": res.pin_skipped,
+                            "message": res.message(olaz_core::PollAction::Share),
+                        }),
+                    );
+                }
+                "create_poll" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let conv_id = str_arg(args, "conv_id");
+                    let can_pin = args
+                        .get("can_pin")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let cfg = olaz_core::PollConfig::from_json(
+                        args.get("config").and_then(Value::as_object),
+                    );
+                    let ts_ms = host.virtual_now_ms();
+                    let mut draft = olaz_core::PollCreateDraft::new(&cfg, ts_ms);
+                    if let Some(d_obj) = args.get("draft").and_then(Value::as_object) {
+                        draft.question = d_obj
+                            .get("question")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        if let Some(opts) = d_obj.get("options").and_then(Value::as_array) {
+                            draft.options = opts
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect();
+                        }
+                        draft.has_deadline = d_obj
+                            .get("has_deadline")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        if let Some(dl_ms) = d_obj.get("deadline_ms").and_then(Value::as_i64) {
+                            draft.deadline_ms = dl_ms;
+                        }
+                        draft.pin = d_obj.get("pin").and_then(Value::as_bool).unwrap_or(false);
+                        draft.multi = d_obj.get("multi").and_then(Value::as_bool).unwrap_or(true);
+                        draft.allow_add = d_obj
+                            .get("allow_add")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true);
+                        draft.hide_preview = d_obj
+                            .get("hide_preview")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        draft.anonymous = d_obj
+                            .get("anonymous")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                    }
+                    let spec = draft.spec(&cfg, can_pin);
+                    let res = core
+                        .request_poll_action(Command::CreatePoll {
+                            conv_id,
+                            draft,
+                            config: cfg,
+                            can_pin,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    u12_results.insert(
+                        step_index.to_string(),
+                        json!({
+                            "ok": res.ok,
+                            "error": res.error,
+                            "pin_skipped": res.pin_skipped,
+                            "message": res.message(olaz_core::PollAction::Create),
+                            "spec": spec,
+                        }),
+                    );
+                }
+                "note_poll_messages" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let conv_id = str_arg(args, "conv_id");
+                    let items: Vec<olaz_core::PollMessageNotice> = args
+                        .get("ids")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|row| olaz_core::PollMessageNotice {
+                                    msg_id: str_arg(row, "id"),
+                                    poll_id: str_arg(row, "poll_id"),
+                                    conv_id: conv_id.clone(),
+                                    date_ms: row
+                                        .get("date_ms")
+                                        .and_then(Value::as_i64)
+                                        .unwrap_or(0),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let ts_ms = host.virtual_now_ms();
+                    core.request_unit(Command::NotePollMessages {
+                        notices: items,
+                        now_ms: ts_ms,
+                        host_already_armed: false,
+                    })
+                    .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "advance_ms" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let ms = args.get("ms").and_then(Value::as_i64).unwrap_or(0);
+                    let (now_after, ready) = host.advance_virtual_clock(ms);
+                    for (poll_id, seq) in ready {
+                        core.request_unit(Command::FirePollDebounce {
+                            poll_id,
+                            seq,
+                            now_ms: now_after,
+                        })
+                        .await;
+                    }
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "poll_state" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    if let Some(j_map) = args.get("json").and_then(Value::as_object).cloned() {
+                        core.request_unit(Command::HandlePollState { state: j_map })
+                            .await;
+                    }
+                }
+                "pins_state" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    if let Some(j_map) = args.get("json").and_then(Value::as_object).cloned() {
+                        core.request_unit(Command::HandlePinsState { state: j_map })
+                            .await;
+                    }
+                }
+                "reset_polls" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    host.clear_virtual_poll_timers();
+                    core.request_unit(Command::ResetPolls { sync_epoch: 0 })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "poll_model_checks" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let checks = args
+                        .get("checks")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let check_results = run_u12_poll_model_checks(checks, &core).await;
+                    u12_results.insert(step_index.to_string(), check_results);
+                }
+                other => return Err(format!("unknown step cmd: {other}")),
+            },
             Step::Await {
                 predicate,
                 timeout_ms,
@@ -5479,7 +5898,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             }
             Step::Snapshot { snapshot } => {
                 if is_u3 {
-                    if pending_send_task.is_some() {
+                    if pending_send_task.is_some() || pending_action_task.is_some() {
                         inner_runner.flush_host().await;
                         let _ = core.settle().await;
                         inner_runner.flush_store().await;
@@ -5492,15 +5911,20 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 if let Some(snap) = capture_case_snapshot(
                     &core,
                     &host,
-                    is_u3,
-                    is_u4,
-                    is_u5,
-                    is_u12,
-                    last_send_result,
-                    &send_logs,
-                    &u12_results,
-                    case.seed.watched_check_ids.as_deref(),
-                    case.seed.group_member_cache.as_ref(),
+                    &SnapshotOpts {
+                        is_u3,
+                        is_u4,
+                        is_u5,
+                        is_u6,
+                        is_u12,
+                        last_send_result,
+                        send_logs: &send_logs,
+                        prune_next_expiry_ms,
+                        action_logs: &action_logs,
+                        u12_results: &u12_results,
+                        watched_check_ids: case.seed.watched_check_ids.as_deref(),
+                        seeded_member_cache: case.seed.group_member_cache.as_ref(),
+                    },
                 )
                 .await
                 {
@@ -5535,18 +5959,28 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             .map_err(|e| format!("trailing send task join error: {e}"))?;
         last_send_result = Some(ok);
     }
+    if let Some(handle) = pending_action_task.take() {
+        handle
+            .await
+            .map_err(|e| format!("trailing action task join error: {e}"))?;
+    }
     let final_state = capture_case_snapshot(
         &core,
         &host,
-        is_u3,
-        is_u4,
-        is_u5,
-        is_u12,
-        last_send_result,
-        &send_logs,
-        &u12_results,
-        case.seed.watched_check_ids.as_deref(),
-        case.seed.group_member_cache.as_ref(),
+        &SnapshotOpts {
+            is_u3,
+            is_u4,
+            is_u5,
+            is_u6,
+            is_u12,
+            last_send_result,
+            send_logs: &send_logs,
+            prune_next_expiry_ms,
+            action_logs: &action_logs,
+            u12_results: &u12_results,
+            watched_check_ids: case.seed.watched_check_ids.as_deref(),
+            seeded_member_cache: case.seed.group_member_cache.as_ref(),
+        },
     )
     .await
     .ok_or_else(|| "actor stopped before final snapshot".to_owned())?;

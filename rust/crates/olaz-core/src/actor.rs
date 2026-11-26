@@ -285,6 +285,13 @@ impl CoreHandle {
         }
     }
 
+    pub async fn request_opt_i64(&self, command: Command) -> Option<i64> {
+        match self.request(command).await {
+            Some(OpResult::OptI64(v)) => v,
+            _ => None,
+        }
+    }
+
     /// Awaits [`Command::RefreshPollPin`].
     pub async fn request_poll_pin_state(
         &self,
@@ -458,6 +465,14 @@ impl CoreHandle {
     /// Stops the actor, aborts in-flight effects, and closes `next_changes()`.
     pub fn stop(&self) {
         let _ = self.tx.send(ActorMsg::Stop);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_sink(&self) -> ActorSink {
+        ActorSink {
+            tx: self.tx.clone(),
+            tracker: Arc::clone(&self.tracker),
+        }
     }
 }
 

@@ -31,7 +31,7 @@ enum SessionSnapshot {
                     obj["step"] = .string("expired")
                 case .failed(let message):
                     obj["step"] = .string("failed")
-                    obj["message"] = .string(message)
+                    obj["message"] = .string(Self.canonicalizeNSURLErrorMessage(message))
                 }
                 return .object(obj)
             case .signingIn:
@@ -78,5 +78,18 @@ enum SessionSnapshot {
     @MainActor
     static func matchesPredicate(_ engine: ZaloEngine, predicate: CaseJSON) -> Bool {
         matchesPredicate(capture(from: engine), predicate: predicate)
+    }
+
+    /// Normalizes host-locale-localized `NSURLErrorDomain` fallback strings (e.g. Vietnamese macOS
+    /// `"Không thể hoàn tất tác vụ. (Lỗi NSURLErrorDomain -1004.)"`) to Foundation's canonical English
+    /// `"The operation couldn’t be completed. (NSURLErrorDomain error -1004.)"` so recordings replay
+    /// deterministically across any macOS UI language while keeping non-`NSURLErrorDomain` messages verbatim.
+    private static func canonicalizeNSURLErrorMessage(_ message: String) -> String {
+        guard message.contains("NSURLErrorDomain"),
+              let match = message.firstMatch(of: /NSURLErrorDomain(?: error)? (-?\d+)/)
+        else {
+            return message
+        }
+        return "The operation couldn\u{2019}t be completed. (NSURLErrorDomain error \(match.1).)"
     }
 }

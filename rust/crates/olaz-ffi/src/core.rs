@@ -18,8 +18,9 @@ use olaz_core::runner::{BatchHookOutcome, ParsedEventsHookOutcome, SharedStoreSl
 use olaz_core::state::PersistedTransportState;
 use olaz_core::typed_chat::{TypedChatEnvelope, WirePayloadHandle};
 use olaz_core::{
-    Command, CoreChanges, CoreFailKind, CoreHandle, CoreState, FailReason, Host, Input,
-    LegacyCookie, LoginState, LoginStep, Phase, Profile, SessionEffectRunner, SessionSnapshot,
+    Command, CoreChanges, CoreFailKind, CoreHandle, CoreState, DeleteUndoSnapshot, FailReason,
+    Host, Input, LegacyCookie, LoginState, LoginStep, MessageConfirmAction, MessageConfirmState,
+    Phase, Profile, SessionEffectRunner, SessionSnapshot,
 };
 use olaz_json::to_swift_json_string;
 use olaz_net::{LoginAccount, NetworkErrorKind, ReqwestTransport, SessionClient};
@@ -30,10 +31,10 @@ use serde_json::{Map, Value};
 use crate::api::PollStateRecord;
 use crate::chat::{ChatMessageRecord, MessageMention, TextStyleRecord};
 use crate::conversations::{
-    ConvPreviewOverrideRecord, ConversationActionResultRecord, ConversationActionUiRecord,
-    ConversationActionsRecord, ConversationExtrasRecord, ConversationPromptRecord,
-    ConversationSummaryRecord, IdentityTableRecord, MessagePreviewInputRecord, PinBoardRecord,
-    PromptUpdateRecord, RankEntry, SeenTargetRecord,
+    CachedProfileEntry, ConvPreviewOverrideRecord, ConversationActionResultRecord,
+    ConversationActionUiRecord, ConversationActionsRecord, ConversationExtrasRecord,
+    ConversationPromptRecord, ConversationSummaryRecord, IdentityTableRecord,
+    MessagePreviewInputRecord, PinBoardRecord, PromptUpdateRecord, RankEntry, SeenTargetRecord,
 };
 use crate::error::{CoreError, NetworkKind};
 use crate::messages::{
@@ -469,6 +470,182 @@ pub struct SendTextOutcomeRecord {
     pub version: u64,
 }
 
+/// Active 5-second delete-for-me undo bar snapshot delivered via [`CoreChangesRecord`].
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DeleteUndoSnapshotRecord {
+    pub conv_id: String,
+    pub count: u64,
+    pub deadline_ms: i64,
+}
+
+impl From<DeleteUndoSnapshot> for DeleteUndoSnapshotRecord {
+    fn from(s: DeleteUndoSnapshot) -> Self {
+        Self {
+            conv_id: s.conv_id,
+            count: s.count as u64,
+            deadline_ms: s.deadline_ms,
+        }
+    }
+}
+
+/// Wrapper for `Option<Option<DeleteUndoSnapshot>>` (UniFFI forbids nested `Option`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DeleteUndoUpdateRecord {
+    pub undo: Option<DeleteUndoSnapshotRecord>,
+}
+
+/// Action kind carried by [`MessageConfirmRecord`].
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum MessageConfirmActionRecord {
+    DeleteForMe {
+        msg_id: String,
+    },
+    DeleteMany {
+        msg_ids: Vec<String>,
+    },
+    RecallMany {
+        msg_ids: Vec<String>,
+    },
+    Pin {
+        msg_id: String,
+        replacing_ref: Option<String>,
+    },
+    Unpin {
+        topic_ref: String,
+    },
+}
+
+impl fmt::Debug for MessageConfirmActionRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeleteForMe { .. } => f.write_str("DeleteForMe"),
+            Self::DeleteMany { msg_ids } => f
+                .debug_struct("DeleteMany")
+                .field("count", &msg_ids.len())
+                .finish(),
+            Self::RecallMany { msg_ids } => f
+                .debug_struct("RecallMany")
+                .field("count", &msg_ids.len())
+                .finish(),
+            Self::Pin { .. } => f.write_str("Pin"),
+            Self::Unpin { .. } => f.write_str("Unpin"),
+        }
+    }
+}
+
+impl From<MessageConfirmAction> for MessageConfirmActionRecord {
+    fn from(a: MessageConfirmAction) -> Self {
+        match a {
+            MessageConfirmAction::DeleteForMe { msg_id } => Self::DeleteForMe { msg_id },
+            MessageConfirmAction::DeleteMany { msg_ids } => Self::DeleteMany { msg_ids },
+            MessageConfirmAction::RecallMany { msg_ids } => Self::RecallMany { msg_ids },
+            MessageConfirmAction::Pin {
+                msg_id,
+                replacing_ref,
+            } => Self::Pin {
+                msg_id,
+                replacing_ref,
+            },
+            MessageConfirmAction::Unpin { topic_ref } => Self::Unpin { topic_ref },
+        }
+    }
+}
+
+impl From<MessageConfirmActionRecord> for MessageConfirmAction {
+    fn from(a: MessageConfirmActionRecord) -> Self {
+        match a {
+            MessageConfirmActionRecord::DeleteForMe { msg_id } => Self::DeleteForMe { msg_id },
+            MessageConfirmActionRecord::DeleteMany { msg_ids } => Self::DeleteMany { msg_ids },
+            MessageConfirmActionRecord::RecallMany { msg_ids } => Self::RecallMany { msg_ids },
+            MessageConfirmActionRecord::Pin {
+                msg_id,
+                replacing_ref,
+            } => Self::Pin {
+                msg_id,
+                replacing_ref,
+            },
+            MessageConfirmActionRecord::Unpin { topic_ref } => Self::Unpin { topic_ref },
+        }
+    }
+}
+
+/// Active message-action confirmation dialog state delivered via [`CoreChangesRecord`].
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MessageConfirmRecord {
+    pub id: u64,
+    pub conv_id: String,
+    pub action: MessageConfirmActionRecord,
+    pub title: String,
+    pub message: String,
+    pub ok: String,
+    pub destructive: bool,
+}
+
+impl fmt::Debug for MessageConfirmRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MessageConfirmRecord")
+            .field("id", &self.id)
+            .field("action", &self.action)
+            .field("destructive", &self.destructive)
+            .finish()
+    }
+}
+
+impl From<MessageConfirmState> for MessageConfirmRecord {
+    fn from(c: MessageConfirmState) -> Self {
+        Self {
+            id: c.id,
+            conv_id: c.conv_id,
+            action: c.action.into(),
+            title: c.title,
+            message: c.message,
+            ok: c.ok,
+            destructive: c.destructive,
+        }
+    }
+}
+
+impl From<MessageConfirmRecord> for MessageConfirmState {
+    fn from(c: MessageConfirmRecord) -> Self {
+        Self {
+            id: c.id,
+            conv_id: c.conv_id,
+            action: c.action.into(),
+            title: c.title,
+            message: c.message,
+            ok: c.ok,
+            destructive: c.destructive,
+        }
+    }
+}
+
+/// Wrapper for `Option<Option<MessageConfirmState>>` (UniFFI forbids nested `Option`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MessageConfirmUpdateRecord {
+    pub confirm: Option<MessageConfirmRecord>,
+}
+
+/// Single conversation auto-delete TTL entry (ms).
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AutoDeleteEntryRecord {
+    pub conv_id: String,
+    pub ttl_ms: i64,
+}
+
+impl fmt::Debug for AutoDeleteEntryRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AutoDeleteEntryRecord")
+            .field("ttl_ms", &self.ttl_ms)
+            .finish()
+    }
+}
+
+/// Wrapper for `Option<Option<BTreeMap<String, i64>>>` (`entries: None` = unloaded / cleared).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AutoDeleteUpdateRecord {
+    pub entries: Option<Vec<AutoDeleteEntryRecord>>,
+}
+
 /// Coalesced dirty-key change batch returned by [`CoreEngine::next_changes`].
 #[derive(Clone, PartialEq, uniffi::Record)]
 pub struct CoreChangesRecord {
@@ -484,6 +661,11 @@ pub struct CoreChangesRecord {
     pub message_meta: Option<MessageMetaRecord>,
     pub contacts: Option<ContactsStateRecord>,
     pub typing: Option<Vec<TypingEntryRecord>>,
+    pub delete_undo: Option<DeleteUndoUpdateRecord>,
+    pub message_confirm: Option<MessageConfirmUpdateRecord>,
+    pub auto_delete: Option<AutoDeleteUpdateRecord>,
+    pub starred_ids: Option<Vec<String>>,
+    pub cached_profiles: Option<Vec<CachedProfileEntry>>,
     // U12
     #[uniffi(default = None)]
     pub polls: Option<PollsMirrorRecord>,
@@ -532,6 +714,29 @@ impl From<CoreChanges> for CoreChangesRecord {
                         conv_id,
                         name: status.name,
                         on_pc: status.on_pc,
+                    })
+                    .collect()
+            }),
+            delete_undo: c.delete_undo.map(|u| DeleteUndoUpdateRecord {
+                undo: u.map(Into::into),
+            }),
+            message_confirm: c.message_confirm.map(|m| MessageConfirmUpdateRecord {
+                confirm: m.map(Into::into),
+            }),
+            auto_delete: c.auto_delete.map(|opt_map| AutoDeleteUpdateRecord {
+                entries: opt_map.map(|map| {
+                    map.into_iter()
+                        .map(|(conv_id, ttl_ms)| AutoDeleteEntryRecord { conv_id, ttl_ms })
+                        .collect()
+                }),
+            }),
+            starred_ids: c.starred_ids.map(|set| set.into_iter().collect()),
+            cached_profiles: c.cached_profiles.map(|map| {
+                map.into_iter()
+                    .map(|(uid, p)| CachedProfileEntry {
+                        uid,
+                        name: p.name,
+                        avatar: p.avatar,
                     })
                     .collect()
             }),
@@ -889,6 +1094,11 @@ impl CoreOfflineConversations {
             message_meta: None,
             contacts: None,
             typing: None,
+            delete_undo: None,
+            message_confirm: None,
+            auto_delete: None,
+            starred_ids: None,
+            cached_profiles: None,
             polls: None,
         };
         for key in out.dirty {
@@ -943,6 +1153,12 @@ impl CoreOfflineConversations {
                             .collect(),
                     );
                 }
+                // U6 (wired to FFI once U4+U6 cut over Swift)
+                DirtyKey::DeleteUndo
+                | DirtyKey::MessageConfirm
+                | DirtyKey::AutoDelete
+                | DirtyKey::StarredIds
+                | DirtyKey::CachedProfiles => {}
                 DirtyKey::Polls => {
                     rec.polls = Some(state.polls.clone().into());
                 }
@@ -1120,7 +1336,7 @@ pub trait CoreHost: Send + Sync {
         event_id: String,
         react_client_id: String,
         sender_name: String,
-    );
+    ) -> bool;
     async fn apply_remote_recall(
         &self,
         conv_id: String,
@@ -1128,7 +1344,7 @@ pub trait CoreHost: Send + Sync {
         cli_msg_id: String,
         update_conversation_preview: bool,
         persist_conversations: bool,
-    );
+    ) -> bool;
     async fn apply_remote_delete(
         &self,
         conv_id: String,
@@ -1136,7 +1352,7 @@ pub trait CoreHost: Send + Sync {
         cli_msg_id: String,
         update_conversation_preview: bool,
         persist_conversations: bool,
-    );
+    ) -> bool;
     async fn decrypt_envelope(&self, payload_json: String) -> String;
     async fn mark_e2ee_conversations(&self, conv_ids: Vec<String>);
     async fn note_poll_messages(&self, messages: Vec<ChatMessageRecord>);
@@ -1177,6 +1393,7 @@ pub trait CoreHost: Send + Sync {
         client_id: String,
         quote: Option<E2eeQuoteArgRecord>,
     ) -> E2eeSendOutcomeRecord;
+    async fn show_card(&self, conv_id: String, text: String);
 
     // --- Group polls domain callbacks (U12) ---
     async fn arm_poll_debounce(&self, poll_id: String, seq: u64, delay_ms: u64) -> bool;
@@ -1324,7 +1541,7 @@ impl Host for FfiHostBridge {
         event_id: String,
         react_client_id: String,
         sender_name: String,
-    ) {
+    ) -> bool {
         self.0
             .apply_remote_reaction(
                 conv_id,
@@ -1337,7 +1554,7 @@ impl Host for FfiHostBridge {
                 react_client_id,
                 sender_name,
             )
-            .await;
+            .await
     }
 
     async fn apply_remote_recall(
@@ -1347,7 +1564,7 @@ impl Host for FfiHostBridge {
         cli_msg_id: String,
         update_conversation_preview: bool,
         persist_conversations: bool,
-    ) {
+    ) -> bool {
         self.0
             .apply_remote_recall(
                 conv_id,
@@ -1356,7 +1573,7 @@ impl Host for FfiHostBridge {
                 update_conversation_preview,
                 persist_conversations,
             )
-            .await;
+            .await
     }
 
     async fn apply_remote_delete(
@@ -1366,7 +1583,7 @@ impl Host for FfiHostBridge {
         cli_msg_id: String,
         update_conversation_preview: bool,
         persist_conversations: bool,
-    ) {
+    ) -> bool {
         self.0
             .apply_remote_delete(
                 conv_id,
@@ -1375,7 +1592,7 @@ impl Host for FfiHostBridge {
                 update_conversation_preview,
                 persist_conversations,
             )
-            .await;
+            .await
     }
 
     async fn decrypt_envelope(&self, payload: Map<String, Value>) -> Map<String, Value> {
@@ -1552,6 +1769,10 @@ impl Host for FfiHostBridge {
 
     async fn cancel_all_poll_debounces(&self) {
         self.0.cancel_all_poll_debounces().await;
+    }
+
+    async fn show_card(&self, conv_id: String, text: String) {
+        self.0.show_card(conv_id, text).await;
     }
 }
 
@@ -2178,6 +2399,7 @@ impl CoreEngine {
         notify_incoming: bool,
         persist_conversations: bool,
         probe_freshness: bool,
+        now_ms: Option<i64>,
     ) -> Result<i64, CoreError> {
         let payload = olaz_json::parse_object_str(&payload_json).unwrap_or_default();
         let handle = Arc::clone(&self.handle);
@@ -2193,6 +2415,7 @@ impl CoreEngine {
                     notify_incoming,
                     persist_conversations,
                     probe_freshness,
+                    now_ms,
                 })
                 .await
             {
@@ -2200,6 +2423,9 @@ impl CoreEngine {
                 _ => 0,
             };
             runner.flush_host().await;
+            let _ = handle.settle().await;
+            runner.flush_store().await;
+            let _ = handle.settle().await;
             runner.flush_store().await;
             let _ = handle.settle().await;
             n
@@ -2232,6 +2458,9 @@ impl CoreEngine {
                 _ => 0,
             };
             runner.flush_host().await;
+            let _ = handle.settle().await;
+            runner.flush_store().await;
+            let _ = handle.settle().await;
             runner.flush_store().await;
             let _ = handle.settle().await;
             n
@@ -2296,6 +2525,9 @@ impl CoreEngine {
         let runner = Arc::clone(&self.runner);
         run(async move {
             runner.flush_host().await;
+            let _ = handle.settle().await;
+            runner.flush_store().await;
+            let _ = handle.settle().await;
             runner.flush_store().await;
             handle
                 .settle()
@@ -2430,6 +2662,245 @@ impl CoreEngine {
     pub fn set_auto_delete_ttl(&self, conv_id: String, ttl_ms: i64) {
         self.handle
             .send(Command::SetAutoDeleteTtl { conv_id, ttl_ms });
+    }
+
+    // --- U6 message actions ---
+
+    /// Adds, toggles, or clears (`remove_all = true`) the current user's reaction on a message.
+    /// Returns the settled core mirror version after the API + store + host callbacks finish.
+    pub async fn react(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        emoji: String,
+        remove_all: bool,
+        now_ms: i64,
+    ) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            handle
+                .request_unit(Command::React {
+                    conv_id,
+                    msg_id,
+                    emoji,
+                    remove_all,
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    /// Recalls a single message for everyone and awaits completion of the API, local/store update,
+    /// and host callbacks. Returns the settled core mirror version.
+    pub async fn recall(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        is_e2ee_thread: Option<bool>,
+        now_ms: i64,
+    ) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            handle
+                .request_unit(Command::Recall {
+                    conv_id,
+                    msg_id,
+                    is_e2ee_thread,
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            let _ = handle.settle().await;
+            runner.flush_store().await;
+            let _ = handle.settle().await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    /// Recalls a selection of messages (shows confirm when `confirm = true`, else executes).
+    pub fn recall_many(&self, conv_id: String, msg_ids: Vec<String>, confirm: bool, now_ms: i64) {
+        self.handle.send(Command::RecallMany {
+            conv_id,
+            msg_ids,
+            confirm,
+            now_ms,
+        });
+    }
+
+    /// Recalls a selection of messages directly (`confirm = false`) and awaits completion.
+    pub async fn recall_many_async(
+        &self,
+        conv_id: String,
+        msg_ids: Vec<String>,
+        now_ms: i64,
+    ) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            handle
+                .request_unit(Command::RecallMany {
+                    conv_id,
+                    msg_ids,
+                    confirm: false,
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            let _ = handle.settle().await;
+            runner.flush_store().await;
+            let _ = handle.settle().await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    /// Deletes a single message only for the current user (shows confirm when `!confirmed` and
+    /// `menu.delete == forMe`, else removes optimistically and starts the 5 s undo bar).
+    pub fn delete_for_me(&self, conv_id: String, msg_id: String, confirmed: bool, now_ms: i64) {
+        self.handle.send(Command::DeleteForMe {
+            conv_id,
+            msg_id,
+            confirmed,
+            now_ms,
+        });
+    }
+
+    /// Deletes multiple selected messages only for the current user.
+    pub fn delete_many(&self, conv_id: String, msg_ids: Vec<String>, confirm: bool, now_ms: i64) {
+        self.handle.send(Command::DeleteMany {
+            conv_id,
+            msg_ids,
+            confirm,
+            now_ms,
+        });
+    }
+
+    /// Cancels the active 5 s delete-undo bar, restores messages, and shows the restore card.
+    pub fn undo_delete(&self) {
+        self.handle.send(Command::UndoDelete);
+    }
+
+    /// Dismisses the active 5 s delete-undo bar and commits the pending delete immediately.
+    pub fn dismiss_delete_undo(&self) {
+        self.handle.send(Command::DismissDeleteUndo);
+    }
+
+    /// Answers the active message-action confirmation dialog (`ok = true` executes, `false` cancels).
+    pub fn answer_message_confirm(&self, ok: bool, now_ms: i64) {
+        self.handle
+            .send(Command::AnswerMessageConfirm { ok, now_ms });
+    }
+
+    /// Presents a host-originated confirmation dialog (e.g. pin / unpin) in core's confirm slot.
+    pub fn ask_message_confirm(&self, confirm: MessageConfirmRecord) {
+        self.handle.send(Command::AskMessageConfirm {
+            confirm: Box::new(confirm.into()),
+        });
+    }
+
+    /// Toggles starred state on a message (updates window, `starredIds` pref, and SQLite row).
+    pub fn set_starred(&self, conv_id: String, msg_id: String, on: bool) {
+        self.handle.send(Command::SetStarred {
+            conv_id,
+            msg_id,
+            on,
+        });
+    }
+
+    /// Fetches per-conversation auto-delete TTLs from Zalo and awaits the mirror update.
+    pub async fn load_auto_delete(&self) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            handle.request_unit(Command::LoadAutoDelete).await;
+            runner.flush_host().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    /// Updates a conversation's auto-delete TTL on Zalo, inserts the system notice, and persists.
+    pub async fn set_auto_delete(
+        &self,
+        conv_id: String,
+        ttl: i64,
+        now_ms: i64,
+    ) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            handle
+                .request_unit(Command::SetAutoDelete {
+                    conv_id,
+                    ttl,
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    /// Prunes expired messages from `conv_id` in core memory and SQLite (fire-and-forget).
+    pub fn prune_expired_messages(&self, conv_id: String, now_ms: i64) {
+        self.handle
+            .send(Command::PruneExpiredMessages { conv_id, now_ms });
+    }
+
+    /// Seeds previously loaded seen-reaction dedup keys into core without writing back to SQLite.
+    pub fn seed_seen_reaction_keys(&self, keys: Vec<String>) {
+        if keys.is_empty() {
+            return;
+        }
+        self.handle.send(Command::RecordSeenReactionKeys {
+            keys,
+            persist: false,
+        });
+    }
+
+    /// Records seen-reaction dedup keys in core and flushes `"seenReactionEventIds"` to SQLite.
+    pub async fn record_seen_reaction_keys(&self, keys: Vec<String>) -> Result<(), CoreError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            handle
+                .request_unit(Command::RecordSeenReactionKeys {
+                    keys,
+                    persist: true,
+                })
+                .await;
+            runner.flush_store().await;
+        })
+        .await
     }
 
     // --- Core-owned WebSocket pass-throughs for Swift feature domains ---
@@ -2955,7 +3426,8 @@ mod tests {
             _event_id: String,
             _react_client_id: String,
             _sender_name: String,
-        ) {
+        ) -> bool {
+            true
         }
         async fn apply_remote_recall(
             &self,
@@ -2964,7 +3436,8 @@ mod tests {
             _cli_msg_id: String,
             _update_conversation_preview: bool,
             _persist_conversations: bool,
-        ) {
+        ) -> bool {
+            true
         }
         async fn apply_remote_delete(
             &self,
@@ -2973,7 +3446,8 @@ mod tests {
             _cli_msg_id: String,
             _update_conversation_preview: bool,
             _persist_conversations: bool,
-        ) {
+        ) -> bool {
+            true
         }
         async fn decrypt_envelope(&self, payload_json: String) -> String {
             payload_json
@@ -3018,6 +3492,7 @@ mod tests {
         ) -> E2eeSendOutcomeRecord {
             E2eeSendOutcomeRecord::Aborted
         }
+        async fn show_card(&self, _conv_id: String, _text: String) {}
         async fn arm_poll_debounce(&self, _poll_id: String, _seq: u64, _delay_ms: u64) -> bool {
             false
         }
