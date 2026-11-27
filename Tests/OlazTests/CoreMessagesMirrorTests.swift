@@ -57,6 +57,8 @@ import Testing
             autoDelete: nil,
             starredIds: nil,
             cachedProfiles: nil,
+            notificationSettings: nil,
+            aliases: nil,
             pins: nil,
             cachedGroups: nil,
             polls: nil,

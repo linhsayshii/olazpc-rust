@@ -565,19 +565,19 @@ private final class CallHarness {
     @Test func incomingGroupCallBannerShowsGroupName() {
         let engine = ZaloEngine()
         engine.call.helperInstalled = true
-        engine.handleCall(state: ["call": ["kind": "incoming", "name": "Gia đình", "caller": "Mẹ", "avatar": "", "group": true, "busy": false]])
-        #expect(engine.call.incoming?.name == "Gia đình")
-        #expect(engine.call.incoming?.caller == "Mẹ")
+        engine.handleCall(state: ["call": ["kind": "incoming", "name": "Nhóm A", "caller": "Người A", "avatar": "", "group": true, "busy": false]])
+        #expect(engine.call.incoming?.name == "Nhóm A")
+        #expect(engine.call.incoming?.caller == "Người A")
         #expect(engine.call.incoming?.group == true)
         // Group name unknown: the caller stands in (no separate caller line), else a generic title.
-        engine.handleCall(state: ["call": ["kind": "incoming", "name": "", "caller": "Mẹ", "avatar": "", "group": true, "busy": false]])
-        #expect(engine.call.incoming?.name == "Mẹ")
+        engine.handleCall(state: ["call": ["kind": "incoming", "name": "", "caller": "Người A", "avatar": "", "group": true, "busy": false]])
+        #expect(engine.call.incoming?.name == "Người A")
         #expect(engine.call.incoming?.caller == nil)
         engine.handleCall(state: ["call": ["kind": "incoming", "name": "", "caller": "", "avatar": "", "group": true, "busy": false]])
         #expect(engine.call.incoming?.name == "Cuộc gọi nhóm")
         // Busy: nothing rings.
         engine.call.incoming = nil
-        engine.handleCall(state: ["call": ["kind": "incoming", "name": "Gia đình", "avatar": "", "group": true, "busy": true]])
+        engine.handleCall(state: ["call": ["kind": "incoming", "name": "Nhóm A", "avatar": "", "group": true, "busy": true]])
         #expect(engine.call.incoming == nil)
     }
 
@@ -585,14 +585,14 @@ private final class CallHarness {
         let engine = ZaloEngine()
         let request: [String: Any] = [
             "kind": "picker", "token": "t1", "add": false, "video": true,
-            "group": ["id": "g1", "name": "Gia đình", "avatar": ""],
+            "group": ["id": "g1", "name": "Nhóm A", "avatar": ""],
             "max": 4, "existing": [], "note": "",
-            "members": [["id": "u2", "name": "Mẹ", "avatar": ""], ["id": "u3", "name": "", "avatar": "https://x.test/a.jpg"], ["id": "", "name": "bỏ"]],
+            "members": [["id": "u2", "name": "Người A", "avatar": ""], ["id": "u3", "name": "", "avatar": "https://x.test/a.jpg"], ["id": "", "name": "bỏ"]],
         ]
         engine.handleCall(state: ["call": request])
         let picker = engine.call.picker
         #expect(picker?.id == "t1" && picker?.adding == false && picker?.video == true)
-        #expect(picker?.groupName == "Gia đình" && picker?.maxSelectable == 4)
+        #expect(picker?.groupName == "Nhóm A" && picker?.maxSelectable == 4)
         #expect(picker?.members.map(\.id) == ["u2", "u3"])            // rows without an id are dropped
         #expect(picker?.members[1].name == "Người dùng Zalo")           // never an empty row
         #expect(picker?.members[1].avatar != nil)
@@ -653,10 +653,10 @@ private final class CallHarness {
     @Test func incomingCallBannerAndBusyCall() {
         let engine = ZaloEngine()
         engine.call.helperInstalled = true          // independent of whether this Mac has the Zalo runtime
-        engine.handleCall(state: ["call": ["kind": "incoming", "name": "Mẹ", "avatar": "", "group": false, "busy": true]])
+        engine.handleCall(state: ["call": ["kind": "incoming", "name": "Người A", "avatar": "", "group": false, "busy": true]])
         #expect(engine.call.incoming == nil)       // already in a call: the client auto-declines, nothing rings
-        engine.handleCall(state: ["call": ["kind": "incoming", "name": "Mẹ", "avatar": "", "group": false, "busy": false]])
-        #expect(engine.call.incoming?.name == "Mẹ")
+        engine.handleCall(state: ["call": ["kind": "incoming", "name": "Người A", "avatar": "", "group": false, "busy": false]])
+        #expect(engine.call.incoming?.name == "Người A")
         engine.handleCall(event: .callState("free"))
         #expect(engine.call.incoming == nil)
     }

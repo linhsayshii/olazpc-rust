@@ -352,15 +352,15 @@ fn client_id_index_exists_bulk_save_is_fast_and_e2ee_twin_protection_intact() {
 #[test]
 fn locked_echo_with_server_id_upgrades_local_plain_row() {
     let mut store = Store::open_in_memory().unwrap();
-    let cli = "1795343225001";
-    let srv = "8502116332999";
+    let cli = "1700000100001";
+    let srv = "9000000001001";
     store
         .save_messages(&[msg(
             cli,
-            "3161",
+            "3000101",
             cli,
             "Tin nhắn E2EE vừa gửi",
-            1_795_343_225_000,
+            1_700_000_100_000,
             "text",
             "sent",
         )])
@@ -368,15 +368,15 @@ fn locked_echo_with_server_id_upgrades_local_plain_row() {
     store
         .save_messages(&[msg(
             srv,
-            "3161",
+            "3000101",
             cli,
             "Tin nhắn mã hóa đầu cuối",
-            1_795_343_225_000,
+            1_700_000_100_000,
             "placeholder",
             "e2ee_locked",
         )])
         .unwrap();
-    let rows = store.messages("3161", None, 10).unwrap();
+    let rows = store.messages("3000101", None, 10).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, srv);
     assert_eq!(rows[0].client_id, cli);
@@ -388,15 +388,16 @@ fn locked_echo_with_server_id_upgrades_local_plain_row() {
 }
 
 // NativeProtocolTests.e2eeSignalDecryptionPlaceholderProtectionAndSQLiteSelfHealing (store part)
-const PREKEY_CIPHER: &str = "AzMovwMIpFUwoVUSIQVNUKcMqQKEDdK1jcEt8He7V15D1iWl9ngJgOPtsXiUIRohBZSX4D1qiBhXbdSPciObevx/DTnpfki5s5eI0wzTTQp/InIzCiEFCFnb614YZfaOg7R9/7/DIagW4nsLw5V5jK1ELLEbY1IQCBgAIkDL6XqJXgMKkj5gMtM5+CCkjt5p+Xm4q0wQjhLXMOgyl8M137oQAjyDi9fCjALZOCaCQpyjgm5/eW2crnxEu3JybU+y/enV2FQ=";
+const PREKEY_CIPHER: &str =
+    "AzMIAQgPFh0kKzI5QEdOVVxjanF4f4aNlJuiqbC3vsXM09rh6O/2/QQLEhkgJy41PENKUVhfZm10e4KJ";
 const WHISPER_CIPHER: &str =
-    "AjMKIQXfGtZEt75pr2/KWoTA8W8Bu0oNpGDv9ITalIBSb69UaxAOGAAiENtYix7GNUB1eR/LgY4IuK2Blmqxld2njA==";
+    "AjMKAw4ZJC86RVBbZnF8h5KdqLO+ydTf6vUACxYhLDdCTVhjbnmEj5qlsLvG0dzn8v0IEx4pND9KVWBr";
 
 #[test]
 fn signal_ciphertext_detection() {
     assert!(is_signal_ciphertext(PREKEY_CIPHER));
     assert!(is_signal_ciphertext(WHISPER_CIPHER));
-    assert!(!is_signal_ciphertext("miế ngan trộn"));
+    assert!(!is_signal_ciphertext("xin chào bạn"));
     assert!(!is_signal_ciphertext(
         "https://api.zaloapp.com/api/emoticon/sticker/webpc?eid=34840&size=130"
     ));
@@ -412,24 +413,24 @@ fn signal_ciphertext_detection() {
 fn e2ee_locked_never_overwrites_plain_and_legacy_poison_is_repaired() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path().join("history.sqlite3")).unwrap();
-    let conv_id = "31612076530602762";
+    let conv_id = "3000101";
     let locked = msg(
-        "8502116332010",
+        "9000000002001",
         conv_id,
-        "1794982452921",
+        "1700000002001",
         "Tin nhắn mã hóa đầu cuối",
-        1_794_982_453_589,
+        1_700_000_002_000,
         "placeholder",
         "e2ee_locked",
     );
     store.save_messages(std::slice::from_ref(&locked)).unwrap();
 
     let plain = msg(
-        "8502116332010",
+        "9000000002001",
         conv_id,
-        "1794982452921",
-        "Con về ăn cơm nhé",
-        1_794_982_453_589,
+        "1700000002001",
+        "Hẹn gặp lúc 10 giờ nhé",
+        1_700_000_002_000,
         "text",
         "sent",
     );
@@ -437,7 +438,7 @@ fn e2ee_locked_never_overwrites_plain_and_legacy_poison_is_repaired() {
     store.save_messages(&[locked]).unwrap();
     let loaded = store.messages(conv_id, None, 10).unwrap();
     assert_eq!(loaded.len(), 1);
-    assert_eq!(loaded[0].text, "Con về ăn cơm nhé");
+    assert_eq!(loaded[0].text, "Hẹn gặp lúc 10 giờ nhé");
     assert_eq!(loaded[0].status, "sent");
 
     let broken_url =
@@ -448,18 +449,18 @@ fn e2ee_locked_never_overwrites_plain_and_legacy_poison_is_repaired() {
             conv_id,
             "999111",
             "[Sticker]",
-            1_794_982_472_463,
+            1_700_000_003_000,
             "sticker",
             "sent",
         ),
         json!({"id": "legacy_poison_1", "clientId": "999111", "conversationId": conv_id,
-            "senderId": conv_id, "senderName": "Mẹ", "senderAvatar": "", "isMine": false,
+            "senderId": conv_id, "senderName": "Người A", "senderAvatar": "", "isMine": false,
             "kind": {"type": "sticker", "url": broken_url}, "text": "[Sticker]",
-            "date": 1_794_982_472_463_i64, "status": "sent", "isE2EE": false}),
+            "date": 1_700_000_003_000_i64, "status": "sent", "isE2EE": false}),
     );
     store.save_messages(&[poisoned]).unwrap();
     // Poisoned conversation preview is sanitized too.
-    let mut c = conv(conv_id, false, "Mẹ", false, 5);
+    let mut c = conv(conv_id, false, "Người A", false, 5);
     c.preview_text = PREKEY_CIPHER.into();
     store.save_conversations(&[c]).unwrap();
 
@@ -946,10 +947,10 @@ fn large_64bit_ids_round_trip_as_text() {
     let raw = format!("{{\"id\":\"{id}\",\"big\":{id}}}");
     let m = StoredMessage {
         raw_json_data: raw.clone().into_bytes(),
-        ..msg(id, "31612076530602762", "", "x", 1, "text", "sent")
+        ..msg(id, "3000101", "", "x", 1, "text", "sent")
     };
     store.save_messages(&[m]).unwrap();
-    let got = store.message("31612076530602762", id).unwrap().unwrap();
+    let got = store.message("3000101", id).unwrap().unwrap();
     assert_eq!(got.id, id);
     assert_eq!(String::from_utf8(got.raw_json_data).unwrap(), raw);
 }
