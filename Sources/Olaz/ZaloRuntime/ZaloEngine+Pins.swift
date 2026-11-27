@@ -167,6 +167,24 @@ extension ZaloEngine {
 
     /// "Ghim tin nhắn" from the message menu: the official limit check first (`checkPinTopic`), then the pin.
     func pinMessage(_ message: ChatMessage) {
+        if let core = coreLifecycle.core {
+            let conversation = message.conversationId
+            guard !isPinned(message) else { return }
+            let list = pins[conversation]
+            let items = list?.items ?? []
+            let limit = list?.limit ?? ZaloWireParser.defaultPinLimit
+            if case .allowed = PinLimitDecision.decide(count: items.count, limit: limit) {
+                pin(message)
+                return
+            }
+            trackMessageActionTask { [weak self] in
+                guard let self else { return }
+                if let v = try? await core.pinMessageAsync(convId: conversation, msgId: message.id) {
+                    await self.waitForMirrorVersion(v)
+                }
+            }
+            return
+        }
         let conversation = message.conversationId
         guard !isPinned(message) else { return }
         let list = pins[conversation]
@@ -194,9 +212,10 @@ extension ZaloEngine {
     }
 
     /// Shows the pin at once (newest first, the replaced one gone); the board re-fetch that follows the request settles it.
-    internal func insertPinOptimistically(_ message: ChatMessage, replacing ref: String?) {
+    @discardableResult
+    internal func insertPinOptimistically(_ message: ChatMessage, replacing ref: String?) -> PinnedItem? {
         let conversation = message.conversationId
-        guard var list = pins[conversation] else { return }
+        guard var list = pins[conversation] else { return nil }
         if let ref { list.items.removeAll { $0.ref == ref } }
         let item = PinnedItem(
             ref: "local:\(message.id)", kind: .message, title: Self.messagePreviewLabel(message),
@@ -205,20 +224,22 @@ extension ZaloEngine {
         )
         list.items.insert(item, at: 0)
         pins[conversation] = list
-        // U7: write-through optimistic pin board mutation until U7 owns board pins.
-        pushCoreBoardPinsIfRunning(for: conversation)
+        return item
     }
 
     internal func removePinOptimistically(_ ref: String, in conversationId: String) {
         guard var list = pins[conversationId] else { return }
         list.items.removeAll { $0.ref == ref }
         pins[conversationId] = list
-        // U7: write-through optimistic pin board removal until U7 owns board pins.
-        pushCoreBoardPinsIfRunning(for: conversationId)
     }
 
     /// Loads the pinned message into the open chat (from the local store when it is older than what is shown); its row id, or nil.
     func loadPinnedMessage(_ item: PinnedItem, in conversationId: String) async -> String? {
+        if let core = coreLifecycle.core {
+            let loaded = try? await core.loadPinnedMessage(convId: conversationId, topicRef: item.ref)
+            await waitForCoreMirrorDrain()
+            return loaded ?? nil
+        }
         if let loaded = item.message(in: messages[conversationId] ?? []) { return loaded.id }
         guard item.kind == .message, let store = sqliteStore else { return nil }
         for key in [item.msgId, item.cliMsgId] where !key.isEmpty {
@@ -231,6 +252,15 @@ extension ZaloEngine {
 
     /// A pin control event: re-read the board of the open chat; others are dropped so their next open reads it fresh.
     func handlePinTopicEvent(conversationId: String) {
+        if let core = coreLifecycle.core {
+            trackMessageActionTask { [weak self] in
+                guard let self else { return }
+                if let v = try? await core.handlePinTopicEvent(convId: conversationId) {
+                    await self.waitForMirrorVersion(v)
+                }
+            }
+            return
+        }
         EngineLog.shared.write("pins: event group=\(ZaloWireParser.isGroupId(conversationId)) open=\(openConversationId == conversationId)")
         if openConversationId == conversationId {
             trackMessageActionTask { [weak self] in
@@ -238,8 +268,6 @@ extension ZaloEngine {
             }
         } else {
             pins[conversationId] = nil
-            // U7: write-through board cache invalidation until U7 owns board pins.
-            pushCoreBoardPinsIfRunning(for: conversationId)
         }
     }
 }

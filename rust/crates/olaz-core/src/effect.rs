@@ -1,5 +1,6 @@
 //! Side effects returned by `reduce` and executed by [`crate::runner::EffectRunner`].
 
+use crate::pins::{RefreshBoardFollowup, UnpinBoardPurpose};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
@@ -47,7 +48,7 @@ pub type ReplaceBoardPinSpec = (String, Option<Map<String, Value>>, i64);
 
 // U12
 /// Continuation executed after [`Effect::RefreshBoardPinsForPoll`] completes on the host FIFO.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum PollBoardContinuation {
     FinishRefreshPin {
         op_id: Option<u64>,
@@ -136,6 +137,12 @@ pub enum StoreOp {
     SetPreferenceStrings {
         key: String,
         values: Vec<String>,
+    },
+    // U7
+    LookupPinnedMessage {
+        conv_id: String,
+        keys: Vec<String>,
+        op_id: Option<u64>,
     },
     SetPreferenceData {
         key: String,
@@ -288,6 +295,11 @@ impl fmt::Debug for StoreOp {
                 .debug_struct("SetPreferenceStrings")
                 .field("key", key)
                 .field("count", &values.len())
+                .finish(),
+            Self::LookupPinnedMessage { keys, op_id, .. } => f
+                .debug_struct("LookupPinnedMessage")
+                .field("keys", &keys.len())
+                .field("op_id", op_id)
                 .finish(),
             Self::SetPreferenceData { key, data } => f
                 .debug_struct("SetPreferenceData")
@@ -444,6 +456,7 @@ pub enum OpResult {
     SearchMessages(Vec<olaz_wire::ChatMessage>),
     OptionalString(Option<String>),
     OptI64(Option<i64>),
+    OptString(Option<String>),
     // U12
     PollVoters(Option<crate::polls::PollVoters>),
     PollPinState(crate::polls::PollPinState),
@@ -487,6 +500,10 @@ impl fmt::Debug for OpResult {
                 .field("present", &opt.is_some())
                 .finish(),
             Self::OptI64(n) => f.debug_tuple("OptI64").field(n).finish(),
+            Self::OptString(s) => f
+                .debug_struct("OptString")
+                .field("some", &s.is_some())
+                .finish(),
             // U12
             Self::PollVoters(v) => f
                 .debug_struct("PollVoters")
@@ -721,6 +738,12 @@ pub enum HostCall {
         conv_id: String,
         paths: Vec<String>,
     },
+    // U14: temporary host boundary for U7 `load_pinned_message` SQLite jumps.
+    EnsureMessageLoaded {
+        conv_id: String,
+        message: Box<ChatMessage>,
+        op_id: Option<u64>,
+    },
     // U11 (reuses `Host::resolve_media` / `Host::resolve_file` serially on the host worker)
     CloudResolveMedia {
         op_id: u64,
@@ -927,6 +950,11 @@ impl fmt::Debug for HostCall {
                 .debug_struct("SendFiles")
                 .field("forward_id", forward_id)
                 .field("paths_count", &paths.len())
+                .finish(),
+            // U14
+            Self::EnsureMessageLoaded { op_id, .. } => f
+                .debug_struct("EnsureMessageLoaded")
+                .field("op_id", op_id)
                 .finish(),
             // U11
             Self::CloudResolveMedia { op_id, kind, .. } => f
@@ -1243,6 +1271,7 @@ pub enum Effect {
     /// `client.is_authenticated()`) and then sends [`Input::PollBoardRefreshed`].
     RefreshBoardPinsForPoll {
         conv_id: String,
+        req_gen: u64,
         require_auth: bool,
         continuation: PollBoardContinuation,
     },
@@ -1352,6 +1381,35 @@ pub enum Effect {
         now_ms: i64,
         op_id: Option<u64>,
     },
+    // --- Board pins domain (U7) ---
+    /// Calls `host.refresh_board_pins` gate and (when approved) `ZaloApi::fetch_board_pins`.
+    RefreshBoardPins {
+        conv_id: String,
+        req_gen: u64,
+        followup: RefreshBoardFollowup,
+    },
+    /// Calls `ZaloApi::fetch_board_pins` directly after `HostCall::RefreshBoardPins` was approved.
+    FetchBoardPinsApi {
+        conv_id: String,
+        req_gen: u64,
+        followup: RefreshBoardFollowup,
+    },
+    /// Calls `ZaloApi::pin_board_message` and reports `Input::PinBoardMessageDone`.
+    PinBoardMessageApi {
+        pin_op_id: u64,
+        conv_id: String,
+        params: Map<String, Value>,
+        board_version: i64,
+    },
+    /// Calls `ZaloApi::unpin_board_topic` and reports `Input::UnpinBoardTopicDone`.
+    UnpinBoardTopicApi {
+        conv_id: String,
+        topic_id: String,
+        raw_topic: Option<Map<String, Value>>,
+        board_version: i64,
+        purpose: UnpinBoardPurpose,
+    },
+
     // U11
     /// Fetches zCloud server snapshot (when account/store allow) + SQLite aggregation/dedup.
     RefreshCloudData {
@@ -1720,6 +1778,39 @@ impl fmt::Debug for Effect {
                 .field("ttl", ttl)
                 .field("now_ms", now_ms)
                 .field("op_id", op_id)
+                .finish(),
+            // U7
+            Self::RefreshBoardPins {
+                req_gen, followup, ..
+            } => f
+                .debug_struct("RefreshBoardPins")
+                .field("req_gen", req_gen)
+                .field("followup", followup)
+                .finish(),
+            Self::FetchBoardPinsApi {
+                req_gen, followup, ..
+            } => f
+                .debug_struct("FetchBoardPinsApi")
+                .field("req_gen", req_gen)
+                .field("followup", followup)
+                .finish(),
+            Self::PinBoardMessageApi {
+                pin_op_id,
+                board_version,
+                ..
+            } => f
+                .debug_struct("PinBoardMessageApi")
+                .field("pin_op_id", pin_op_id)
+                .field("board_version", board_version)
+                .finish(),
+            Self::UnpinBoardTopicApi {
+                board_version,
+                purpose,
+                ..
+            } => f
+                .debug_struct("UnpinBoardTopicApi")
+                .field("board_version", board_version)
+                .field("purpose", purpose)
                 .finish(),
             // U12
             Self::FetchPollDetailApi { op_id, purpose, .. } => f

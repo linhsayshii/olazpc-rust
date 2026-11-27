@@ -641,6 +641,25 @@ impl CoreHandle {
         }
     }
 
+    // --- Board pins domain (U7) ---
+
+    pub async fn refresh_board_pins(&self, conv_id: String) -> Option<()> {
+        match self.request(Command::RefreshBoardPins { conv_id }).await {
+            Some(OpResult::Unit) => Some(()),
+            _ => None,
+        }
+    }
+
+    pub async fn load_pinned_message(&self, conv_id: String, topic_ref: String) -> Option<String> {
+        match self
+            .request(Command::LoadPinnedMessage { conv_id, topic_ref })
+            .await
+        {
+            Some(OpResult::OptString(val)) => val,
+            _ => None,
+        }
+    }
+
     /// Stops the actor, aborts in-flight effects, and closes `next_changes()`.
     pub fn stop(&self) {
         let _ = self.tx.send(ActorMsg::Stop);
