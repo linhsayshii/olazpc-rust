@@ -138,7 +138,7 @@ where
         .join("&")
 }
 
-/// `zpw_ver=694&zpw_type=23`, the query prefix of every authenticated call.
+/// `zpw_ver=695&zpw_type=23`, the query prefix of every authenticated call.
 pub fn common_params() -> String {
     format!("zpw_ver={ZPW_VER}&zpw_type={ZPW_TYPE}")
 }

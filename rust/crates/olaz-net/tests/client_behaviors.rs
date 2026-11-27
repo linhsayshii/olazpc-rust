@@ -24,7 +24,7 @@ fn chromium_api_headers_keep_caller_values_and_session_cookie() {
         ("ACCEPT".into(), "custom".into()),
     ];
     let spec = build_request(&options, Some("sek.1.2")).unwrap();
-    assert_eq!(spec.header("user-agent"), Some("ZaloPC-darwin-23v694"));
+    assert_eq!(spec.header("user-agent"), Some("ZaloPC-darwin-23v695"));
     assert_eq!(spec.header("Cookie"), Some("zpw_sek=sek.1.2"));
     assert_eq!(spec.header("zpw_sek"), None);
     assert_eq!(spec.header("accept"), Some("custom"));

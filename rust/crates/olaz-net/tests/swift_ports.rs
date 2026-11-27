@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 #[test]
 fn service_candidate_failover_and_winner_promotion() {
     assert_eq!(ZPW_TYPE, "23");
-    assert_eq!(USER_AGENT, "ZaloPC-darwin-23v694");
+    assert_eq!(USER_AGENT, "ZaloPC-darwin-23v695");
     assert_eq!(WS_ORIGIN, "file://");
 
     let mut domains = ZaloDomains::default();
@@ -202,7 +202,7 @@ async fn mocked_service_captures_path_and_decrypts_request_payload() {
 
     let recorded = c.transport().requests().pop().unwrap();
     assert_eq!(recorded.path(), "/api/e2ee/pc/message/sms");
-    assert_eq!(recorded.query_value("zpw_ver"), Some("694"));
+    assert_eq!(recorded.query_value("zpw_ver"), Some("695"));
     assert_eq!(recorded.query_value("zpw_type"), Some("23"));
     let payload = decrypted_params(&recorded);
     assert_eq!(olaz_crypto::int64(payload.get("destType")), Some(3));

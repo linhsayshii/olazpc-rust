@@ -29,7 +29,7 @@ import Testing
         #expect(engine.profile?.avatar == nil)
         #expect(engine.profile?.phone == nil)
         #expect(engine.selfConversationId == "u42")
-        #expect(engine.clientVersion == "694 (Native)")
+        #expect(engine.clientVersion == "695 (Native)")
 
         await engine.applyAccountProfile(ZaloLoginAccount(
             userId: "u42",

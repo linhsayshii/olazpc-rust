@@ -168,7 +168,7 @@ mod tests {
                     .into_iter()
                     .collect();
             let mut expected: BTreeMap<String, String> = [
-                ("user-agent", "ZaloPC-darwin-23v694"),
+                ("user-agent", "ZaloPC-darwin-23v695"),
                 (
                     "sec-ch-ua",
                     "\"Not?A_Brand\";v=\"8\", \"Chromium\";v=\"108\"",
@@ -264,7 +264,7 @@ mod tests {
             h,
             BTreeMap::from([
                 ("Origin", "file://".into()),
-                ("User-Agent", "ZaloPC-darwin-23v694".into()),
+                ("User-Agent", "ZaloPC-darwin-23v695".into()),
                 ("Accept-Encoding", "gzip, deflate, br".into()),
                 ("Accept-Language", "vi".into()),
                 ("Pragma", "no-cache".into()),

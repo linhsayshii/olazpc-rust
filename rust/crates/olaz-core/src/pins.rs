@@ -750,7 +750,7 @@ mod tests {
         let se = ApiError::Net(NetError::Session(ZaloSessionError {
             code: 500,
             message: "fail".to_owned(),
-            url: "https://groupboard-wpa.api.zaloapp.com/api/board/pin/list?zpw_ver=694".to_owned(),
+            url: "https://groupboard-wpa.api.zaloapp.com/api/board/pin/list?zpw_ver=695".to_owned(),
         }));
         assert_eq!(pin_error_shape(&se), "code=500 path=/api/board/pin/list");
 

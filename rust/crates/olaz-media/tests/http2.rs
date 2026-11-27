@@ -114,7 +114,7 @@ fn assert_headers(headers: &Headers, accept: &str, dest: &str, mode: &str, api: 
     assert_eq!(get("accept"), Some(accept));
     assert_eq!(get("accept-encoding"), Some("gzip, deflate, br"));
     assert_eq!(get("accept-language"), Some("vi-VN,en-US;q=0.9"));
-    assert_eq!(get("user-agent"), Some("ZaloPC-darwin-23v694"));
+    assert_eq!(get("user-agent"), Some("ZaloPC-darwin-23v695"));
     assert_eq!(
         get("sec-ch-ua"),
         Some("\"Not?A_Brand\";v=\"8\", \"Chromium\";v=\"108\"")

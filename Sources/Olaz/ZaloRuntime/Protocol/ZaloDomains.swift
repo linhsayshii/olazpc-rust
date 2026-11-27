@@ -1,6 +1,6 @@
 import Foundation
 
-/// Authoritative Zalo macOS PC service endpoints (`zpw_ver=694`, `zpw_type=23`)
+/// Authoritative Zalo macOS PC service endpoints (`zpw_ver=695`, `zpw_type=23`)
 /// plus live `getServerInfo` / `getLoginInfo` service map discovery and failover.
 struct ZaloDomains: Codable, Sendable {
     static let zpwVer = RustCore.clientIdentity.clientVersion

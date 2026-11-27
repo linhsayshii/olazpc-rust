@@ -52,7 +52,7 @@ fn ws_url_has_slash_before_query() {
     assert!(url.starts_with("wss://ws1-msg.chat.zalo.me/?"));
     assert_eq!(
         url,
-        "wss://ws1-msg.chat.zalo.me/?zpw_ver=694&zpw_type=23&t=123456"
+        "wss://ws1-msg.chat.zalo.me/?zpw_ver=695&zpw_type=23&t=123456"
     );
 }
 
@@ -61,22 +61,22 @@ fn ws_url_variants() {
     // path already present: no extra slash
     assert_eq!(
         build_socket_url("wss://h.example/ws", 1),
-        "wss://h.example/ws?zpw_ver=694&zpw_type=23&t=1"
+        "wss://h.example/ws?zpw_ver=695&zpw_type=23&t=1"
     );
     // existing query preserved
     assert_eq!(
         build_socket_url("wss://h.example?a=b", 1),
-        "wss://h.example/?a=b&zpw_ver=694&zpw_type=23&t=1"
+        "wss://h.example/?a=b&zpw_ver=695&zpw_type=23&t=1"
     );
     // empty query dropped
     assert_eq!(
         build_socket_url("wss://h.example?", 1),
-        "wss://h.example/?zpw_ver=694&zpw_type=23&t=1"
+        "wss://h.example/?zpw_ver=695&zpw_type=23&t=1"
     );
     // no scheme: hostPart itself is inspected
     assert_eq!(
         build_socket_url("h.example", 1),
-        "h.example/?zpw_ver=694&zpw_type=23&t=1"
+        "h.example/?zpw_ver=695&zpw_type=23&t=1"
     );
 }
 

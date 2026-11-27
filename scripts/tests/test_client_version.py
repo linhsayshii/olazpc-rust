@@ -13,14 +13,14 @@ class ClientVersionDriftTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             identity = root / "identity.rs"
-            identity.write_text('client_identity!("694", "23");')
+            identity.write_text('client_identity!("695", "23");')
             asar = root / "app.asar"
             for data, code, label in [
                 (None, 0, "SKIP"),
-                (b'header\x00getClientVersion:function(){return 694}\x00tail', 0, "PASS"),
-                (b'getClientVersion: function () { return 694; }', 0, "PASS"),
-                (b'getClientVersion:function(){return 695}', 1, "FAIL"),
-                (b'getClientVersion:function(){return 694}getClientVersion:function(){return 695}', 1, "FAIL"),
+                (b'header\x00getClientVersion:function(){return 695}\x00tail', 0, "PASS"),
+                (b'getClientVersion: function () { return 695; }', 0, "PASS"),
+                (b'getClientVersion:function(){return 696}', 1, "FAIL"),
+                (b'getClientVersion:function(){return 695}getClientVersion:function(){return 696}', 1, "FAIL"),
                 (b'no function here', 1, "FAIL"),
                 (b'', 1, "FAIL"),
             ]:
