@@ -357,11 +357,16 @@ extension ZaloEngine {
     }
 
     func leaveGroup(_ groupId: String, silent: Bool = false) async -> Bool {
+        let gid = ZaloWireParser.groupConvId(groupId)
         guard let core = await ensureCoreEngine(),
               let res = try? await core.leaveGroup(groupId: groupId, silent: silent) else {
             return false
         }
         await waitForMirrorVersion(res.version)
+        if res.ok, openConversationId == gid {
+            openConversationId = nil
+            dropMessagePrompts()
+        }
         return res.ok
     }
 
