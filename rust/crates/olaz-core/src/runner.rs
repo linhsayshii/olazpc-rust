@@ -612,10 +612,6 @@ pub trait Host: Send + Sync {
     ) -> VideoMetadata {
         VideoMetadata::default()
     }
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Matches upload_photo host boundary"
-    )]
     async fn media_upload_photo(
         &self,
         _op_id: u64,
@@ -644,10 +640,6 @@ pub trait Host: Send + Sync {
     ) -> Result<UploadedVideoResult, String> {
         Err("media_upload_video not implemented by host".to_owned())
     }
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Matches upload_file host boundary"
-    )]
     async fn media_upload_file(
         &self,
         _op_id: u64,

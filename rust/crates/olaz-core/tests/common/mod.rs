@@ -17,7 +17,7 @@ use olaz_core::media::{
     UploadedVideoResult, VideoMetadata, file_download_key,
 };
 use olaz_core::runner::{BatchHookOutcome, ParsedEventsHookOutcome};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -1411,7 +1411,10 @@ pub struct RecordingHost {
     is_u6: bool,
     is_u12: bool,
     is_u13: bool,
+    is_u15: bool,
     data_dir: Option<PathBuf>,
+    core_handle: Mutex<Option<Arc<CoreHandle>>>,
+    session_client: Mutex<Option<Arc<SessionClient<ArcTransport>>>>,
     virtual_now_ms: Mutex<i64>,
     virtual_poll_timers: Mutex<Vec<(String, u64, i64)>>,
     shared_store_slot: Mutex<Option<SharedStoreSlot>>,
@@ -1791,7 +1794,10 @@ impl RecordingHost {
             is_u6,
             is_u12: false,
             is_u13,
+            is_u15: false,
             data_dir,
+            core_handle: Mutex::new(None),
+            session_client: Mutex::new(None),
             virtual_now_ms: Mutex::new(1_700_000_000_000),
             virtual_poll_timers: Mutex::new(Vec::new()),
             shared_store_slot: Mutex::new(None),
@@ -1853,6 +1859,25 @@ impl RecordingHost {
     pub fn enable_u12_virtual_clock(mut self) -> Self {
         self.is_u12 = true;
         self
+    }
+
+    pub fn enable_u15(mut self) -> Self {
+        self.is_u15 = true;
+        self
+    }
+
+    pub fn bind_core(&self, core: Arc<CoreHandle>) {
+        *self
+            .core_handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(core);
+    }
+
+    fn bind_client(&self, client: Arc<SessionClient<ArcTransport>>) {
+        *self
+            .session_client
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(client);
     }
 
     pub fn virtual_now_ms(&self) -> i64 {
@@ -2474,6 +2499,15 @@ impl Host for RecordingHost {
             let _ = std::fs::create_dir_all(&acc_dir);
             let db_path = acc_dir.join("history.sqlite3");
             if let Ok(store) = Store::open(&db_path) {
+                let persisted_e2ee: BTreeSet<String> = if self.is_u15 {
+                    store
+                        .get_preference_strings("e2eeThreadsV1")
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect()
+                } else {
+                    BTreeSet::new()
+                };
                 let shared = Arc::new(Mutex::new(store));
                 *self.store.lock().unwrap_or_else(PoisonError::into_inner) =
                     Some(Arc::clone(&shared));
@@ -2484,6 +2518,18 @@ impl Host for RecordingHost {
                     .as_ref()
                 {
                     *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(shared);
+                }
+                if self.is_u15 && !persisted_e2ee.is_empty() {
+                    let core = self
+                        .core_handle
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone();
+                    if let Some(core) = core {
+                        let _ = core
+                            .send_and_ack(Command::SetE2eeThreads(persisted_e2ee))
+                            .await;
+                    }
                 }
             }
         }
@@ -2696,6 +2742,36 @@ impl Host for RecordingHost {
         msg_id: String,
         kind: String,
     ) -> MediaResolutionOutcome {
+        let u15_core = if self.is_u15 {
+            self.core_handle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        } else {
+            None
+        };
+        if let Some(core) = u15_core {
+            let media_kind = MediaKind::from_str_tag(&kind).unwrap_or(MediaKind::Photo);
+            let now_ms = *self
+                .virtual_now_ms
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let res = core
+                .request_media_resolution(Command::ResolveMedia {
+                    conv_id,
+                    msg_id,
+                    kind: media_kind,
+                    force: false,
+                    now_ms,
+                })
+                .await;
+            return match res {
+                olaz_core::MediaResolution::File(path) => MediaResolutionOutcome::File(path),
+                olaz_core::MediaResolution::Expired => MediaResolutionOutcome::Expired,
+                olaz_core::MediaResolution::Unsupported => MediaResolutionOutcome::Unsupported,
+                olaz_core::MediaResolution::Unavailable => MediaResolutionOutcome::Unavailable,
+            };
+        }
         self.record(
             "resolve_media",
             json!({
@@ -2761,6 +2837,33 @@ impl Host for RecordingHost {
         paths: Vec<String>,
         _cleanup_after: bool,
     ) -> ComposerSendOutcome {
+        let u15_core = if self.is_u15 {
+            self.core_handle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        } else {
+            None
+        };
+        if let Some(core) = u15_core {
+            let now_ms = *self
+                .virtual_now_ms
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let outcome = core
+                .request_composer_outcome(Command::SendMedia {
+                    conv_id,
+                    paths,
+                    now_ms,
+                })
+                .await;
+            return match outcome {
+                ComposerOutcome::Done => ComposerSendOutcome::Done,
+                ComposerOutcome::Cancelled => ComposerSendOutcome::Cancelled,
+                ComposerOutcome::Pending(t) => ComposerSendOutcome::Pending(t),
+                ComposerOutcome::Failed(t) => ComposerSendOutcome::Failed(t),
+            };
+        }
         self.record(
             "send_media",
             json!({
@@ -2883,7 +2986,7 @@ impl Host for RecordingHost {
         self.media
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .probe_outgoing(&path)
+            .probe_outgoing(&path, mode.as_str())
     }
 
     async fn media_image_dimensions(
@@ -2937,20 +3040,158 @@ impl Host for RecordingHost {
         width: i64,
         height: i64,
     ) -> Result<UploadedPhotoResult, String> {
-        self.record(
-            "upload_photo",
-            json!({
-                "conv_id": conv_id,
-                "file_name": file_name,
-                "size": size,
-                "width": width,
-                "height": height,
-            }),
-        );
-        self.media
+        let has_hook = self
+            .media
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .pop_upload_photo()
+            .has_upload_photo_hook;
+        if has_hook {
+            self.record(
+                "upload_photo",
+                json!({
+                    "conv_id": conv_id,
+                    "file_name": file_name,
+                    "size": size,
+                    "width": width,
+                    "height": height,
+                }),
+            );
+            return self
+                .media
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_upload_photo();
+        }
+        let Some(client) = self
+            .session_client
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
+            return Err("Missing SessionClient for HTTP photo upload".to_owned());
+        };
+        let is_group = conv_id.starts_with('g');
+        let target_id = conv_id.strip_prefix('g').unwrap_or(&conv_id).to_owned();
+        let cli_int = client.next_client_id();
+        let imei = client.imei();
+        let upload_path = if is_group {
+            "/api/group/photo_original/upload"
+        } else {
+            "/api/message/photo_original/upload"
+        };
+        let mut upload_payload = json!({
+            "totalChunk": 1,
+            "fileName": file_name,
+            "clientId": cli_int,
+            "totalSize": size,
+            "imei": imei,
+            "isE2EE": 0,
+            "jxl": 0,
+            "chunkId": 1,
+        });
+        if let Value::Object(m) = &mut upload_payload {
+            if is_group {
+                m.insert("grid".to_owned(), Value::String(target_id.clone()));
+            } else {
+                m.insert("toid".to_owned(), Value::String(target_id.clone()));
+            }
+        }
+        let upload_req = olaz_net::ApiRequest::new("file", upload_path)
+            .query("type", if is_group { "11" } else { "2" })
+            .payload(upload_payload);
+        let part = olaz_net::MultipartPart {
+            field_name: "chunkContent".to_owned(),
+            file_name: file_name.clone(),
+            mime_type: "image/jpeg".to_owned(),
+            data: vec![0u8; usize::try_from(size.max(0)).unwrap_or(0)],
+        };
+        let upload_resp = client
+            .post_multipart(&upload_req, &part)
+            .await
+            .map_err(|e| e.to_string())?;
+        let d = upload_resp
+            .get("data")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "Photo upload returned no data".to_owned())?;
+        let str_field = |k: &str| {
+            d.get(k)
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        let normal_url = str_field("normalUrl");
+        let hd_url = {
+            let s = str_field("hdUrl");
+            if s.is_empty() { normal_url.clone() } else { s }
+        };
+        let thumb_url = {
+            let s = str_field("thumbUrl");
+            if s.is_empty() { normal_url.clone() } else { s }
+        };
+        let raw_url = {
+            let s = str_field("rawUrl");
+            if s.is_empty() { normal_url.clone() } else { s }
+        };
+        let ori_url = {
+            let s = str_field("oriUrl");
+            if s.is_empty() { normal_url.clone() } else { s }
+        };
+        let photo_id: i64 = str_field("photoId").parse().unwrap_or(0);
+
+        let send_path = if is_group {
+            "/api/group/photo_original/send"
+        } else {
+            "/api/message/photo_original/send"
+        };
+        let mut send_payload = json!({
+            "photoId": photo_id,
+            "clientId": cli_int,
+            "desc": "",
+            "width": width,
+            "height": height,
+            "rawUrl": raw_url,
+            "normalUrl": normal_url,
+            "hdUrl": hd_url,
+            "thumbUrl": thumb_url,
+            "oriUrl": ori_url,
+            "hdSize": size,
+            "zsource": -1,
+            "jcp": "{\"convertible\":true}",
+            "ttl": 0,
+            "imei": imei,
+        });
+        if let Value::Object(m) = &mut send_payload {
+            if is_group {
+                m.insert("grid".to_owned(), Value::String(target_id));
+            } else {
+                m.insert("toid".to_owned(), Value::String(target_id));
+            }
+        }
+        let send_req = olaz_net::ApiRequest::new("file", send_path).payload(send_payload);
+        let send_resp = client.post(&send_req).await.map_err(|e| e.to_string())?;
+        let msg_id = send_resp
+            .get("data")
+            .and_then(|v| v.get("msgId"))
+            .and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        Ok(UploadedPhotoResult {
+            url: if hd_url.is_empty() {
+                normal_url
+            } else {
+                hd_url
+            },
+            msg_id,
+            cli_msg_id: cli_int.to_string(),
+            width,
+            height,
+        })
     }
 
     async fn media_upload_video(
@@ -2964,22 +3205,184 @@ impl Host for RecordingHost {
         height: i64,
         has_thumb: bool,
     ) -> Result<UploadedVideoResult, String> {
-        self.record(
-            "upload_video",
-            json!({
-                "conv_id": conv_id,
-                "file_name": file_name,
-                "size": size,
-                "duration_ms": duration_ms,
-                "width": width,
-                "height": height,
-                "has_thumb": has_thumb,
-            }),
-        );
-        self.media
+        let has_hook = self
+            .media
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .pop_upload_video()
+            .has_upload_video_hook;
+        if has_hook {
+            self.record(
+                "upload_video",
+                json!({
+                    "conv_id": conv_id,
+                    "file_name": file_name,
+                    "size": size,
+                    "duration_ms": duration_ms,
+                    "width": width,
+                    "height": height,
+                    "has_thumb": has_thumb,
+                }),
+            );
+            return self
+                .media
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_upload_video();
+        }
+        let Some(client) = self
+            .session_client
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
+            return Err("Missing SessionClient for HTTP video upload".to_owned());
+        };
+        let is_group = conv_id.starts_with('g');
+        let target_id = conv_id.strip_prefix('g').unwrap_or(&conv_id).to_owned();
+        let cli_int = client.next_client_id();
+        let imei = client.imei();
+        let file_upload_path = if is_group {
+            "/api/group/video/file/upload"
+        } else {
+            "/api/message/video/file/upload"
+        };
+        let mut video_payload = json!({
+            "totalChunk": 1,
+            "fileName": file_name,
+            "clientId": cli_int,
+            "totalSize": size,
+            "imei": imei,
+            "isE2EE": 0,
+            "chunkId": 1,
+        });
+        if let Value::Object(m) = &mut video_payload {
+            if is_group {
+                m.insert("grid".to_owned(), Value::String(target_id.clone()));
+            } else {
+                m.insert("toid".to_owned(), Value::String(target_id.clone()));
+            }
+        }
+        let video_req = olaz_net::ApiRequest::new("file", file_upload_path)
+            .query("type", if is_group { "11" } else { "2" })
+            .payload(video_payload);
+        let video_part = olaz_net::MultipartPart {
+            field_name: "chunkContent".to_owned(),
+            file_name: file_name.clone(),
+            mime_type: "video/mp4".to_owned(),
+            data: vec![0u8; usize::try_from(size.max(0)).unwrap_or(0)],
+        };
+        let video_resp = client
+            .post_multipart(&video_req, &video_part)
+            .await
+            .map_err(|e| e.to_string())?;
+        let vd = video_resp
+            .get("data")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "Video upload returned no data".to_owned())?;
+        let file_url = vd
+            .get("fileUrl")
+            .or_else(|| vd.get("videoUrl"))
+            .or_else(|| vd.get("url"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+
+        let mut thumb_url = String::new();
+        if has_thumb && !file_url.is_empty() {
+            let thumb_cli_int = client.next_client_id();
+            let thumb_path = if is_group {
+                "/api/group/video/thumb/upload"
+            } else {
+                "/api/message/video/thumb/upload"
+            };
+            let mut thumb_payload = json!({
+                "totalChunk": 1,
+                "fileName": "thumb.jpg",
+                "clientId": thumb_cli_int,
+                "totalSize": 5,
+                "imei": imei,
+                "isE2EE": 0,
+                "chunkId": 1,
+            });
+            if let Value::Object(m) = &mut thumb_payload {
+                if is_group {
+                    m.insert("grid".to_owned(), Value::String(target_id.clone()));
+                } else {
+                    m.insert("toid".to_owned(), Value::String(target_id.clone()));
+                }
+            }
+            let thumb_req = olaz_net::ApiRequest::new("file", thumb_path)
+                .query("type", if is_group { "11" } else { "2" })
+                .payload(thumb_payload);
+            let thumb_part = olaz_net::MultipartPart {
+                field_name: "chunkContent".to_owned(),
+                file_name: "thumb.jpg".to_owned(),
+                mime_type: "image/jpeg".to_owned(),
+                data: b"thumb".to_vec(),
+            };
+            let thumb_resp = client
+                .post_multipart(&thumb_req, &thumb_part)
+                .await
+                .map_err(|e| e.to_string())?;
+            if let Some(td) = thumb_resp.get("data").and_then(Value::as_object) {
+                thumb_url = td
+                    .get("thumbUrl")
+                    .or_else(|| td.get("url"))
+                    .or_else(|| td.get("normalUrl"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+            }
+        }
+
+        let msg_info = canonical_json_string(&json!({
+            "videoUrl": file_url,
+            "thumbUrl": thumb_url,
+            "duration": duration_ms,
+            "width": width,
+            "height": height,
+            "fileSize": size,
+            "title": "",
+        }));
+        let send_path = if is_group {
+            "/api/group/forward"
+        } else {
+            "/api/message/forward"
+        };
+        let mut send_payload = json!({
+            "msgType": 5,
+            "msgInfo": msg_info,
+            "clientId": cli_int,
+            "ttl": 0,
+            "imei": imei,
+        });
+        if let Value::Object(m) = &mut send_payload {
+            if is_group {
+                m.insert("grid".to_owned(), Value::String(target_id));
+            } else {
+                m.insert("toId".to_owned(), Value::String(target_id));
+            }
+        }
+        let send_req = olaz_net::ApiRequest::new("chat", send_path).payload(send_payload);
+        let send_resp = client.post(&send_req).await.map_err(|e| e.to_string())?;
+        let msg_id = send_resp
+            .get("data")
+            .and_then(|v| v.get("msgId"))
+            .and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        Ok(UploadedVideoResult {
+            url: file_url,
+            thumb_url,
+            msg_id,
+            cli_msg_id: cli_int.to_string(),
+            width,
+            height,
+            duration_ms,
+        })
     }
 
     async fn media_upload_file(
@@ -5675,11 +6078,9 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         && !uid.is_empty()
     {
         let mut seeded_copy = case.seed.clone();
-        if is_u15 {
-            if let Some(msgs) = seeded_copy.local_messages.as_mut() {
-                for m in msgs.iter_mut() {
-                    *m = media::substitute_media_paths(m);
-                }
+        if is_u15 && let Some(msgs) = seeded_copy.local_messages.as_mut() {
+            for m in msgs.iter_mut() {
+                *m = media::substitute_media_paths(m);
             }
         }
         seed_sqlite_store(uid, dir.path(), &seeded_copy)?;
@@ -5728,11 +6129,20 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         is_u13,
         temp_dir.as_ref().map(|d| d.path().to_path_buf()),
     );
-    let host = Arc::new(if is_u12 {
+    let base_host = if is_u12 {
         base_host.enable_u12_virtual_clock()
     } else {
         base_host
-    });
+    };
+    let base_host = if is_u15 {
+        base_host.enable_u15()
+    } else {
+        base_host
+    };
+    let host = Arc::new(base_host);
+    if is_u15 {
+        host.bind_client(Arc::clone(&client));
+    }
     let inner_runner = Arc::new(SessionEffectRunner::with_options(
         Arc::clone(&client),
         Arc::clone(&host) as Arc<dyn Host>,
@@ -5772,8 +6182,10 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 .insert(cid.clone(), f);
         }
     }
-    for tid in &case.seed.e2ee_threads {
-        initial_state.send.e2ee_threads.insert(tid.clone());
+    if !is_u15 {
+        for tid in &case.seed.e2ee_threads {
+            initial_state.send.e2ee_threads.insert(tid.clone());
+        }
     }
     if is_u15 {
         if let Some(plan) = case.seed.cloud_plan.as_ref().and_then(Value::as_object) {
@@ -6077,6 +6489,9 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         runner,
         Handle::current(),
     ));
+    if is_u15 {
+        host.bind_core(Arc::clone(&core));
+    }
 
     let mut snapshots = BTreeMap::new();
     let mut results = Map::<String, Value>::new();
@@ -6841,6 +7256,9 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                                 .cloned()
                         })
                         .ok_or_else(|| format!("forward missing msg {msg_id} in {conv_id}"))?;
+                    if is_u15 {
+                        host.set_virtual_now_ms(ts_ms);
+                    }
                     let outcome = core
                         .request_forward_outcome(Command::Forward {
                             message: Box::new(msg),
@@ -6849,8 +7267,11 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         })
                         .await;
                     let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                    forward_results
-                        .insert(step_idx.to_string(), encode_forward_outcome_json(&outcome));
+                    let encoded_fwd = encode_forward_outcome_json(&outcome);
+                    forward_results.insert(step_idx.to_string(), encoded_fwd.clone());
+                    if is_u15 {
+                        results.insert(step_idx.to_string(), encoded_fwd);
+                    }
                 }
                 "forward_all" => {
                     let targets = str_vec_arg(args, "targets");

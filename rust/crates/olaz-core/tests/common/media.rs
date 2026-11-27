@@ -73,7 +73,7 @@ pub fn decode_base64(input: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(clean.len() / 4 * 3);
-    for chunk in clean.chunks_exact(4) {
+    for chunk in clean.as_chunks::<4>().0 {
         let a = val(chunk[0])?;
         let b = val(chunk[1])?;
         out.push((a << 2) | (b >> 4));
@@ -192,8 +192,11 @@ pub struct MediaTestState {
     pub active_file_specs: HashMap<String, Value>,
     pub image_dims_queue: VecDeque<Value>,
     pub video_meta_queue: VecDeque<Value>,
+    pub has_upload_photo_hook: bool,
     pub upload_photo_queue: VecDeque<Value>,
+    pub has_upload_video_hook: bool,
     pub upload_video_queue: VecDeque<Value>,
+    pub has_upload_file_hook: bool,
     pub upload_file_queue: VecDeque<Value>,
     pub video_poster_queue: VecDeque<Value>,
     pub loader_map: HashMap<String, Value>,
@@ -217,14 +220,23 @@ impl MediaTestState {
             if let Some(arr) = hr.get("video_metadata").and_then(Value::as_array) {
                 st.video_meta_queue = arr.iter().cloned().collect();
             }
-            if let Some(arr) = hr.get("upload_photo").and_then(Value::as_array) {
-                st.upload_photo_queue = arr.iter().cloned().collect();
+            if let Some(val) = hr.get("upload_photo") {
+                st.has_upload_photo_hook = true;
+                if let Some(arr) = val.as_array() {
+                    st.upload_photo_queue = arr.iter().cloned().collect();
+                }
             }
-            if let Some(arr) = hr.get("upload_video").and_then(Value::as_array) {
-                st.upload_video_queue = arr.iter().cloned().collect();
+            if let Some(val) = hr.get("upload_video") {
+                st.has_upload_video_hook = true;
+                if let Some(arr) = val.as_array() {
+                    st.upload_video_queue = arr.iter().cloned().collect();
+                }
             }
-            if let Some(arr) = hr.get("upload_file").and_then(Value::as_array) {
-                st.upload_file_queue = arr.iter().cloned().collect();
+            if let Some(val) = hr.get("upload_file") {
+                st.has_upload_file_hook = true;
+                if let Some(arr) = val.as_array() {
+                    st.upload_file_queue = arr.iter().cloned().collect();
+                }
             }
             if let Some(arr) = hr.get("video_poster").and_then(Value::as_array) {
                 st.video_poster_queue = arr.iter().cloned().collect();
@@ -281,25 +293,49 @@ impl MediaTestState {
         paths
     }
 
-    pub fn probe_outgoing(&self, path: &str) -> OutgoingFileProbe {
-        let Some(spec) = self.active_file_specs.get(path) else {
-            return OutgoingFileProbe {
-                exists: false,
-                is_dir: false,
-                readable: false,
-                size: 0,
-                media_type: None,
-            };
-        };
-        OutgoingFileProbe {
-            exists: spec.get("exists").and_then(Value::as_bool).unwrap_or(true),
-            is_dir: spec.get("is_dir").and_then(Value::as_bool).unwrap_or(false),
-            readable: spec
+    pub fn probe_outgoing(&self, path: &str, mode: &str) -> OutgoingFileProbe {
+        if let Some(spec) = self.active_file_specs.get(path) {
+            let exists = spec.get("exists").and_then(Value::as_bool).unwrap_or(true);
+            let is_dir = spec.get("is_dir").and_then(Value::as_bool).unwrap_or(false);
+            let readable = spec
                 .get("readable")
                 .and_then(Value::as_bool)
-                .unwrap_or(true),
-            size: spec.get("size").and_then(Value::as_i64).unwrap_or(1024),
-            media_type: spec.get("type").and_then(Value::as_str).map(str::to_owned),
+                .unwrap_or(true);
+            let size = spec.get("size").and_then(Value::as_i64).unwrap_or(1024);
+            let media_type = spec
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    (mode == "media" && exists && !is_dir && readable)
+                        .then(|| infer_media_type_from_path(path).to_owned())
+                });
+            return OutgoingFileProbe {
+                exists,
+                is_dir,
+                readable,
+                size,
+                media_type,
+            };
+        }
+        let cache_prefix = format!("{MEDIA_DATA_ROOT}/MediaCache/");
+        if path.starts_with(&cache_prefix)
+            && let Some(bytes) = self.virtual_files.get(path)
+        {
+            return OutgoingFileProbe {
+                exists: true,
+                is_dir: false,
+                readable: true,
+                size: i64::try_from(bytes.len()).unwrap_or(0),
+                media_type: (mode == "media").then(|| infer_media_type_from_path(path).to_owned()),
+            };
+        }
+        OutgoingFileProbe {
+            exists: false,
+            is_dir: false,
+            readable: false,
+            size: 0,
+            media_type: None,
         }
     }
 
@@ -564,6 +600,20 @@ impl MediaTestState {
             .unwrap_or_default();
         self.virtual_files.insert(dest.clone(), bytes);
         Some(dest)
+    }
+}
+
+fn infer_media_type_from_path(path: &str) -> &'static str {
+    let ext = path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "heic" | "heif" | "jxl" | "bmp" | "tiff"
+        | "tif" => "image",
+        "mp4" | "mov" | "m4v" | "avi" | "mkv" | "webm" => "video",
+        _ => "file",
     }
 }
 

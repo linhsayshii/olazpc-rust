@@ -1300,12 +1300,12 @@ fn continue_media_flight_with_message(
     };
 
     let candidates = match extract_media_candidates(kind, &msg) {
-        Ok(c) if !c.is_empty() => c,
-        Ok(_) => {
+        Some(c) if !c.is_empty() => c,
+        Some(_) => {
             finish_media_flight(state, flight_id, MediaResolution::Unavailable, out);
             return;
         }
-        Err(()) => {
+        None => {
             finish_media_flight(state, flight_id, MediaResolution::Unsupported, out);
             return;
         }

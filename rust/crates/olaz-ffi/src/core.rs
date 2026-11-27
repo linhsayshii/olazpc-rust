@@ -2542,10 +2542,6 @@ pub trait CoreHost: Send + Sync {
         name: String,
         size: i64,
     ) -> VideoMetadataRecord;
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Matches upload_photo host boundary"
-    )]
     async fn media_upload_photo(
         &self,
         op_id: u64,
@@ -2570,10 +2566,6 @@ pub trait CoreHost: Send + Sync {
         height: i64,
         has_thumb: bool,
     ) -> UploadVideoOutcomeRecord;
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Matches upload_file host boundary"
-    )]
     async fn media_upload_file(
         &self,
         op_id: u64,

@@ -774,9 +774,9 @@ pub fn file_download_key(conv_id: &str, msg_id: &str, url: Option<&str>, name: &
 
 /// Extracts deduplicated candidate URLs for `(kind, msg)` (`ZaloEngine.resolveMedia`).
 ///
-/// Returns `Err(())` when `(kind, msg.kind)` is an unsupported pair (caller yields `.unsupported`).
-/// Returns `Ok(vec)` where an empty `vec` yields `.unavailable`.
-pub fn extract_media_candidates(kind: MediaKind, msg: &ChatMessage) -> Result<Vec<String>, ()> {
+/// Returns `None` when `(kind, msg.kind)` is an unsupported pair (caller yields `.unsupported`).
+/// Returns `Some(vec)` where an empty `vec` yields `.unavailable`.
+pub fn extract_media_candidates(kind: MediaKind, msg: &ChatMessage) -> Option<Vec<String>> {
     let mut raw: Vec<&str> = Vec::new();
     match (kind, &msg.kind) {
         (MediaKind::Photo, Kind::Photo { url, .. }) => {
@@ -832,7 +832,7 @@ pub fn extract_media_candidates(kind: MediaKind, msg: &ChatMessage) -> Result<Ve
                 }
             }
         }
-        _ => return Err(()),
+        _ => return None,
     }
 
     let mut seen = HashSet::with_capacity(raw.len());
@@ -842,7 +842,7 @@ pub fn extract_media_candidates(kind: MediaKind, msg: &ChatMessage) -> Result<Ve
             out.push(candidate.to_owned());
         }
     }
-    Ok(out)
+    Some(out)
 }
 
 /// Pure in-memory shared-media fallback when no SQLite store is attached
@@ -859,7 +859,7 @@ pub fn shared_media_memory(
         .cloned()
         .collect();
     // Swift `sorted { $0.date > $1.date }` is stable descending by date_ms.
-    matched.sort_by(|a, b| b.date_ms.cmp(&a.date_ms));
+    matched.sort_by_key(|a| std::cmp::Reverse(a.date_ms));
     matched.truncate(limit);
     SharedMediaPage {
         items: matched,
@@ -1083,15 +1083,15 @@ mod tests {
         );
         assert_eq!(
             extract_media_candidates(MediaKind::Photo, &photo),
-            Ok(vec![
+            Some(vec![
                 "https://cdn/1.png".to_owned(),
                 "https://cdn/2.png".to_owned(),
             ])
         );
-        assert_eq!(extract_media_candidates(MediaKind::Video, &photo), Err(()));
+        assert_eq!(extract_media_candidates(MediaKind::Video, &photo), None);
         assert_eq!(
             extract_media_candidates(MediaKind::VideoThumb, &photo),
-            Err(())
+            None
         );
 
         let video = msg_with_kind(
@@ -1104,7 +1104,7 @@ mod tests {
         );
         assert_eq!(
             extract_media_candidates(MediaKind::VideoThumb, &video),
-            Ok(vec![
+            Some(vec![
                 "https://cdn/t.png".to_owned(),
                 "https://cdn/v.mp4".to_owned(),
                 "https://cdn/fb.mp4".to_owned(),
@@ -1112,12 +1112,12 @@ mod tests {
         );
         assert_eq!(
             extract_media_candidates(MediaKind::Video, &video),
-            Ok(vec![
+            Some(vec![
                 "https://cdn/v.mp4".to_owned(),
                 "https://cdn/fb.mp4".to_owned(),
             ])
         );
-        assert_eq!(extract_media_candidates(MediaKind::Photo, &video), Err(()));
+        assert_eq!(extract_media_candidates(MediaKind::Photo, &video), None);
 
         let gif = msg_with_kind(
             Kind::Gif {
@@ -1127,9 +1127,9 @@ mod tests {
         );
         assert_eq!(
             extract_media_candidates(MediaKind::Photo, &gif),
-            Ok(vec!["https://cdn/g.gif".to_owned()])
+            Some(vec!["https://cdn/g.gif".to_owned()])
         );
-        assert_eq!(extract_media_candidates(MediaKind::Video, &gif), Err(()));
+        assert_eq!(extract_media_candidates(MediaKind::Video, &gif), None);
     }
 
     #[test]
