@@ -22,8 +22,17 @@ class E2EEGroupFlagTests(unittest.TestCase):
                 args.append(str(asar))
             return subprocess.run(args, capture_output=True, text=True, check=False)
 
-    def test_missing_asar_skips(self):
-        result = self._run(None)
+    def test_missing_explicit_asar_fails(self):
+        for use_flag in (False, True):
+            result = self._run(None, use_flag=use_flag)
+            combined = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 1, combined)
+            self.assertIn("does not exist", combined)
+
+    def test_missing_default_asar_skips(self):
+        with tempfile.TemporaryDirectory() as home:
+            env = {"HOME": home, "PATH": "/usr/bin:/bin"}
+            result = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True, text=True, check=False, env=env)
         combined = result.stdout + result.stderr
         self.assertEqual(result.returncode, 0, combined)
         self.assertIn("SKIP", combined)

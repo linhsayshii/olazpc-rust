@@ -10,8 +10,11 @@ DEFAULT_ASAR = Path.home() / "Library/Application Support/Olaz/ZaloRuntime/curre
 PATTERN = re.compile(rb"DEACTIVATE_E2EE_GROUP\s*:\s*([^,}\];\)\s]*)")
 
 
-def check(asar: Path) -> int:
+def check(asar: Path, explicit: bool) -> int:
     if not asar.exists():
+        if explicit:
+            print(f"e2ee-group-flag FAIL: {asar} does not exist", file=sys.stderr)
+            return 1
         print("e2ee-group-flag SKIP: app.asar is missing")
         return 0
     if asar.stat().st_size == 0:
@@ -43,9 +46,9 @@ def main() -> int:
     parser.add_argument("asar_pos", nargs="?", type=Path, help="Path to app.asar")
     parser.add_argument("--asar", type=Path, dest="asar_opt", help="Path to app.asar")
     args = parser.parse_args()
-    asar = args.asar_opt or args.asar_pos or DEFAULT_ASAR
+    given = args.asar_opt or args.asar_pos
     try:
-        return check(asar)
+        return check(given or DEFAULT_ASAR, explicit=given is not None)
     except (OSError, ValueError) as error:
         print("e2ee-group-flag FAIL: " + str(error), file=sys.stderr)
         return 1
