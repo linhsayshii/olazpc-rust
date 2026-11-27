@@ -2,9 +2,10 @@
 
 use std::fmt;
 
+use olaz_json::string as json_string;
 use olaz_net::{ApiRequest, Transport};
 use olaz_wire::{clean_group_id, is_group_id, strip_user_prefix};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::api::{JsonObject, ZaloApi};
 use crate::error::ApiError;
@@ -83,7 +84,7 @@ pub fn build_create_reminder_request(params: &CreateReminderParams, imei: &str) 
             "startTime": params.start_time_ms,
             "duration": -1,
             "params": params_str,
-            "pinAct": if params.pin { 1 } else { 2 },
+            "pinAct": 0,
             "repeat": params.repeat_mode,
             "src": 1,
             "imei": imei,
@@ -101,5 +102,86 @@ impl<T: Transport> ZaloApi<T> {
         let spec = build_create_reminder_request(params, &imei);
         self.post(ApiRequest::new(spec.service, spec.path).payload(spec.payload))
             .await
+    }
+}
+
+/// Extracts the created topic/reminder id from a `createv2` response.
+#[must_use]
+pub fn extract_created_reminder_id(resp: &JsonObject) -> String {
+    let data_node = resp.get("data").and_then(Value::as_object).unwrap_or(resp);
+    let raw = data_node
+        .get("id")
+        .or_else(|| data_node.get("topicId"))
+        .or_else(|| data_node.get("topic_id"));
+    json_string(raw).trim().to_owned()
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "unit test fixtures")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_create_reminder_sends_pin_act_zero_and_1_1_preserves_need_pin() {
+        for pin in [true, false] {
+            let spec = build_create_reminder_request(
+                &CreateReminderParams {
+                    conv_id: "g501308".to_owned(),
+                    title: "Standup".to_owned(),
+                    start_time_ms: 1_700_003_000_000,
+                    repeat_mode: 2,
+                    pin,
+                },
+                "imei-1",
+            );
+            assert_eq!(spec.service, "group_board");
+            assert_eq!(spec.path, "/api/board/topic/createv2");
+            assert_eq!(spec.payload.get("grid"), Some(&json!("501308")));
+            assert_eq!(spec.payload.get("type"), Some(&json!(0)));
+            assert_eq!(spec.payload.get("pinAct"), Some(&json!(0)));
+        }
+
+        let oneone = build_create_reminder_request(
+            &CreateReminderParams {
+                conv_id: "3001308".to_owned(),
+                title: "Call".to_owned(),
+                start_time_ms: 1_700_001_000_000,
+                repeat_mode: 0,
+                pin: true,
+            },
+            "imei-1",
+        );
+        assert_eq!(oneone.path, "/api/board/oneone/create");
+        let obj_str = oneone
+            .payload
+            .get("objectData")
+            .and_then(Value::as_str)
+            .unwrap();
+        let obj: Value = serde_json::from_str(obj_str).unwrap();
+        assert_eq!(obj.get("needPin"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn extract_created_reminder_id_reads_data_and_root_variants() {
+        assert_eq!(
+            extract_created_reminder_id(json!({"data": {"id": " rem_1 "}}).as_object().unwrap()),
+            "rem_1"
+        );
+        assert_eq!(
+            extract_created_reminder_id(json!({"data": {"id": 987654}}).as_object().unwrap()),
+            "987654"
+        );
+        assert_eq!(
+            extract_created_reminder_id(json!({"data": {"topicId": "t_2"}}).as_object().unwrap()),
+            "t_2"
+        );
+        assert_eq!(
+            extract_created_reminder_id(json!({"topic_id": "t_3"}).as_object().unwrap()),
+            "t_3"
+        );
+        assert_eq!(
+            extract_created_reminder_id(json!({"data": {}}).as_object().unwrap()),
+            ""
+        );
     }
 }

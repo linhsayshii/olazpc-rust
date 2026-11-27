@@ -1089,7 +1089,7 @@ enum StickerRecorderHarness {
             var recorded: [CaseJSON] = []
             recorded.reserveCapacity(sortedScenarios.count)
             for scenario in sortedScenarios {
-                let c = try await recordScenario(domain: domain, scenario)
+                let c = try await recordScenario(domain: domain, scenario, shouldRecord: true)
                 recorded.append(c)
             }
             try CaseFile.write(recorded, to: url)
@@ -1147,14 +1147,14 @@ enum StickerRecorderHarness {
     }
 
     @MainActor
-    static func recordScenario(domain: String, _ scenario: ScenarioDef) async throws -> CaseJSON {
+    static func recordScenario(domain: String, _ scenario: ScenarioDef, shouldRecord: Bool = false) async throws -> CaseJSON {
         try await RecorderSuiteLock.shared.withLock {
-            try await recordScenarioLocked(domain: domain, scenario)
+            try await recordScenarioLocked(domain: domain, scenario, shouldRecord: shouldRecord)
         }
     }
 
     @MainActor
-    private static func recordScenarioLocked(domain: String, _ scenario: ScenarioDef) async throws -> CaseJSON {
+    private static func recordScenarioLocked(domain: String, _ scenario: ScenarioDef, shouldRecord: Bool = false) async throws -> CaseJSON {
         let dataDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("olaz-stickers-recorder-\(scenario.name)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
@@ -1662,7 +1662,7 @@ enum StickerRecorderHarness {
             server.stop()
             await engine.finishTearDownForRecording()
 
-            if server.hadUnscriptedRequest {
+            if shouldRecord && server.hadUnscriptedRequest {
                 let unscripted = requests.filter { $0["unscripted"]?.boolValue == true }
                 throw RecorderError.unscriptedRequest(scenario: scenario.name, detail: CaseJSON.array(unscripted).canonicalString())
             }

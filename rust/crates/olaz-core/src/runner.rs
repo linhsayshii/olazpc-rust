@@ -2728,6 +2728,8 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         let pin = params.pin;
                         match api.create_reminder(&params).await {
                             Ok(resp) => {
+                                let raw_id = olaz_api::extract_created_reminder_id(&resp);
+                                let topic_id = (!raw_id.is_empty()).then_some(raw_id);
                                 let data_node = resp
                                     .get("data")
                                     .and_then(serde_json::Value::as_object)
@@ -2740,6 +2742,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                                     conv_id,
                                     pin,
                                     ok: true,
+                                    topic_id,
                                     create_keys,
                                 });
                             }
@@ -2749,10 +2752,39 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                                     conv_id,
                                     pin,
                                     ok: false,
+                                    topic_id: None,
                                     create_keys: Vec::new(),
                                 });
                             }
                         }
+                        drop(guard);
+                    });
+                }
+                Effect::PinReminderTopicApi {
+                    op_id,
+                    conv_id,
+                    topic_id,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let (ok, status) = match api.pin_board_item(&conv_id, &topic_id, 0).await {
+                            Ok(_) => (true, "ok".to_owned()),
+                            Err(err) => (
+                                false,
+                                err.session_error().map_or_else(
+                                    || "err(net)".to_owned(),
+                                    |s| format!("err(code={})", s.code),
+                                ),
+                            ),
+                        };
+                        sink.send(Input::ReminderPinDone {
+                            op_id,
+                            conv_id,
+                            ok,
+                            status,
+                        });
                         drop(guard);
                     });
                 }

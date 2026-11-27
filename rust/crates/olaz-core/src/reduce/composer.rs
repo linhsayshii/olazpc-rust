@@ -16,12 +16,14 @@ use crate::changes::DirtyKey;
 use crate::composer::{
     COMPOSER_GENERIC_FAILURE, CONFIRM_PROMOTE_DELAY_MS, ComposerOutcome, ContactCardContinuation,
     ContactCardSendSpec, MyCardInfo, NOT_LOGGED_IN_FAILURE, PendingContactCard,
-    REMINDER_API_FAILURE, REMINDER_TITLE_MAX_BYTES, REMINDER_TITLE_MAX_CHARS,
-    REMINDER_TOO_LONG_FAILURE, ReminderComposeInfo,
+    REMINDER_API_FAILURE, REMINDER_PIN_FAILED_CARD_TEXT, REMINDER_TITLE_MAX_BYTES,
+    REMINDER_TITLE_MAX_CHARS, REMINDER_TOO_LONG_FAILURE, ReminderComposeInfo,
+    reminder_pin_limit_card_text,
 };
 use crate::effect::{Effect, HostCall, OpResult, StoreOp};
 use crate::input::{Command, Input};
 use crate::messages::{WindowChange, is_valid_url_str, to_db_stored};
+use crate::pins::{DEFAULT_PIN_LIMIT, PinLimitDecision, RefreshBoardFollowup};
 use crate::reduce::ReduceOutput;
 use crate::reduce::send::update_conversation_after_send;
 use crate::state::CoreState;
@@ -143,6 +145,7 @@ pub(crate) fn reduce_composer(state: &mut CoreState, input: Input, out: &mut Red
             conv_id,
             pin,
             ok,
+            topic_id,
             create_keys,
         } => {
             if !ok {
@@ -161,8 +164,35 @@ pub(crate) fn reduce_composer(state: &mut CoreState, input: Input, out: &mut Red
                     "reminder create shape: group=true pin=true keys=[{}]",
                     create_keys.join(",")
                 )));
-                out.effects
-                    .push(Effect::Host(HostCall::RefreshBoardPins { conv_id }));
+                let (count, limit) = match state.pins.lists.get(&conv_id) {
+                    Some(list) => (list.items.len(), list.limit),
+                    None => (0, DEFAULT_PIN_LIMIT),
+                };
+                if PinLimitDecision::decide(count, limit) != PinLimitDecision::Allowed {
+                    out.effects.push(Effect::Host(HostCall::ShowCard {
+                        conv_id: Some(conv_id),
+                        text: reminder_pin_limit_card_text(limit),
+                    }));
+                    complete_op(
+                        op_id,
+                        OpResult::ComposerOutcome(ComposerOutcome::Done),
+                        false,
+                        out,
+                    );
+                    return;
+                }
+                if let Some(tid) = topic_id.filter(|t| !t.is_empty()) {
+                    out.effects.push(Effect::PinReminderTopicApi {
+                        op_id,
+                        conv_id,
+                        topic_id: tid,
+                    });
+                    return;
+                }
+                out.effects.push(Effect::Host(HostCall::ShowCard {
+                    conv_id: Some(conv_id),
+                    text: REMINDER_PIN_FAILED_CARD_TEXT.to_owned(),
+                }));
             }
             complete_op(
                 op_id,
@@ -170,6 +200,34 @@ pub(crate) fn reduce_composer(state: &mut CoreState, input: Input, out: &mut Red
                 false,
                 out,
             );
+        }
+        Input::ReminderPinDone {
+            op_id,
+            conv_id,
+            ok,
+            status,
+        } => {
+            out.effects
+                .push(Effect::EngineLog(format!("reminder pinv2: {status}")));
+            if ok {
+                let req_gen = state.pins.current_gen(&conv_id);
+                out.effects.push(Effect::RefreshBoardPins {
+                    conv_id,
+                    req_gen,
+                    followup: RefreshBoardFollowup::ReminderPinned { op_id },
+                });
+            } else {
+                out.effects.push(Effect::Host(HostCall::ShowCard {
+                    conv_id: Some(conv_id),
+                    text: REMINDER_PIN_FAILED_CARD_TEXT.to_owned(),
+                }));
+                complete_op(
+                    op_id,
+                    OpResult::ComposerOutcome(ComposerOutcome::Done),
+                    false,
+                    out,
+                );
+            }
         }
         Input::ConfirmPromoteExpired { confirm_gen } => {
             if state.composer.confirm_timer_gen == confirm_gen
@@ -562,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn group_pinned_reminder_refreshes_board_pins() {
+    fn group_pinned_reminder_calls_pinv2_then_refreshes_board_pins_via_u7() {
         let mut state = ready_state();
         let out = reduce(
             &mut state,
@@ -571,6 +629,7 @@ mod tests {
                 conv_id: "g501308".to_owned(),
                 pin: true,
                 ok: true,
+                topic_id: Some("rem_71".to_owned()),
                 create_keys: vec!["id".to_owned(), "type".to_owned()],
             },
         );
@@ -580,9 +639,53 @@ mod tests {
         )));
         assert!(out.effects.iter().any(|e| matches!(
             e,
-            Effect::Host(HostCall::RefreshBoardPins { conv_id }) if conv_id == "g501308"
+            Effect::PinReminderTopicApi {
+                op_id: Some(71),
+                conv_id,
+                topic_id,
+            } if conv_id == "g501308" && topic_id == "rem_71"
         )));
-        assert!(out.effects.iter().any(|e| matches!(
+        assert!(
+            !out.effects
+                .iter()
+                .any(|e| matches!(e, Effect::CompleteOp { op_id: 71, .. })),
+            "op completes after pinv2 and board refresh"
+        );
+
+        let out2 = reduce(
+            &mut state,
+            Input::ReminderPinDone {
+                op_id: Some(71),
+                conv_id: "g501308".to_owned(),
+                ok: true,
+                status: "ok".to_owned(),
+            },
+        );
+        assert!(out2.effects.iter().any(|e| matches!(
+            e,
+            Effect::RefreshBoardPins {
+                conv_id,
+                req_gen: 0,
+                followup: RefreshBoardFollowup::ReminderPinned { op_id: Some(71) },
+            } if conv_id == "g501308"
+        )));
+        assert!(
+            !out2
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::CompleteOp { op_id: 71, .. })),
+            "op completes after board refresh finishes"
+        );
+
+        let out3 = reduce(
+            &mut state,
+            Input::BoardPinsFetchSkipped {
+                conv_id: "g501308".to_owned(),
+                req_gen: 0,
+                followup: RefreshBoardFollowup::ReminderPinned { op_id: Some(71) },
+            },
+        );
+        assert!(out3.effects.iter().any(|e| matches!(
             e,
             Effect::CompleteOp {
                 op_id: 71,
@@ -593,7 +696,108 @@ mod tests {
     }
 
     #[test]
-    fn group_unpinned_or_oneone_reminder_skips_board_refresh() {
+    fn group_pinned_reminder_at_pin_limit_skips_pinv2_and_shows_limit_card() {
+        let mut state = ready_state();
+        state.pins.lists.insert(
+            "g501308".to_owned(),
+            crate::pins::PinnedList {
+                ready: true,
+                can_pin: true,
+                limit: 3,
+                items: vec![
+                    crate::pins::PinnedItem {
+                        ref_id: "p1".to_owned(),
+                        kind: "message".to_owned(),
+                        ..Default::default()
+                    },
+                    crate::pins::PinnedItem {
+                        ref_id: "p2".to_owned(),
+                        kind: "note".to_owned(),
+                        ..Default::default()
+                    },
+                    crate::pins::PinnedItem {
+                        ref_id: "p3".to_owned(),
+                        kind: "poll".to_owned(),
+                        ..Default::default()
+                    },
+                ],
+            },
+        );
+
+        let out = reduce(
+            &mut state,
+            Input::CreateReminderDone {
+                op_id: Some(74),
+                conv_id: "g501308".to_owned(),
+                pin: true,
+                ok: true,
+                topic_id: Some("rem_74".to_owned()),
+                create_keys: vec!["id".to_owned()],
+            },
+        );
+        assert!(
+            !out.effects
+                .iter()
+                .any(|e| matches!(e, Effect::PinReminderTopicApi { .. }))
+        );
+        assert!(
+            !out.effects
+                .iter()
+                .any(|e| matches!(e, Effect::RefreshBoardPins { .. }))
+        );
+        assert!(out.effects.iter().any(|e| matches!(
+            e,
+            Effect::Host(HostCall::ShowCard {
+                conv_id: Some(cid),
+                text,
+            }) if cid == "g501308" && text == "Đã đạt giới hạn 3 ghim."
+        )));
+        assert!(out.effects.iter().any(|e| matches!(
+            e,
+            Effect::CompleteOp {
+                op_id: 74,
+                result: OpResult::ComposerOutcome(ComposerOutcome::Done),
+                after_store: false,
+            }
+        )));
+    }
+
+    #[test]
+    fn group_pinned_reminder_pinv2_failure_keeps_reminder_and_shows_error_card() {
+        let mut state = ready_state();
+        let out = reduce(
+            &mut state,
+            Input::ReminderPinDone {
+                op_id: Some(75),
+                conv_id: "g501308".to_owned(),
+                ok: false,
+                status: "err(code=112)".to_owned(),
+            },
+        );
+        assert!(
+            !out.effects
+                .iter()
+                .any(|e| matches!(e, Effect::RefreshBoardPins { .. }))
+        );
+        assert!(out.effects.iter().any(|e| matches!(
+            e,
+            Effect::Host(HostCall::ShowCard {
+                conv_id: Some(cid),
+                text,
+            }) if cid == "g501308" && text == REMINDER_PIN_FAILED_CARD_TEXT
+        )));
+        assert!(out.effects.iter().any(|e| matches!(
+            e,
+            Effect::CompleteOp {
+                op_id: 75,
+                result: OpResult::ComposerOutcome(ComposerOutcome::Done),
+                after_store: false,
+            }
+        )));
+    }
+
+    #[test]
+    fn group_unpinned_or_oneone_reminder_skips_pinv2_and_board_refresh() {
         let mut state = ready_state();
         for (op_id, conv_id, pin) in [(72, "g501308", false), (73, "3001308", true)] {
             let out = reduce(
@@ -603,13 +807,24 @@ mod tests {
                     conv_id: conv_id.to_owned(),
                     pin,
                     ok: true,
+                    topic_id: Some("rem_x".to_owned()),
                     create_keys: vec!["id".to_owned()],
                 },
             );
             assert!(
                 !out.effects
                     .iter()
-                    .any(|e| matches!(e, Effect::Host(HostCall::RefreshBoardPins { .. })))
+                    .any(|e| matches!(e, Effect::PinReminderTopicApi { .. }))
+            );
+            assert!(
+                !out.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::RefreshBoardPins { .. }))
+            );
+            assert!(
+                !out.effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::Host(HostCall::ShowCard { .. })))
             );
             assert!(
                 !out.effects

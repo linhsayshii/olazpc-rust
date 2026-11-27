@@ -63,7 +63,9 @@ pub use pins::{
     board_topic_params, friend_board_list_box, friend_board_unpin_topics, pin_topic_params,
 };
 pub use poll::{PollQueueCursor, PollState};
-pub use reminders::{CreateReminderParams, build_create_reminder_request};
+pub use reminders::{
+    CreateReminderParams, build_create_reminder_request, extract_created_reminder_id,
+};
 pub use stickers::{
     FetchedStickerCategories, SendStickerParams, StickerCategoryRow, build_send_sticker_request,
     builtin_sticker_pack, parse_sticker_catalog_bytes,

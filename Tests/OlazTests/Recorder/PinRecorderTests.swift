@@ -1689,6 +1689,181 @@ final class PinRecorderTests: XCTestCase {
                     ]),
                 ]
             ),
+
+            // 13. reminder_pin: group createv2 sends pinAct 0; pin=true calls pinv2 + core board refresh;
+            // pin=false skips pinv2/refresh; pinv2 failure keeps reminder + ShowCard; board at pinLimit skips pinv2 + ShowCard.
+            PinRecorderHarness.ScenarioDef(
+                name: "reminder_pin",
+                seed: PinRecorderHarness.readySessionSeed(
+                    userId: "2000713",
+                    displayName: "Pin User 13",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "local_conversations": .array([
+                            localConv(id: "g500713", isGroup: true, name: "Nhóm Nhắc Hẹn", members: 4),
+                            localConv(id: "g500714", isGroup: true, name: "Nhóm Đầy Ghim", members: 4),
+                        ]),
+                        "pins": .object([
+                            "g500713": .object([
+                                "convId": .string("g500713"),
+                                "ready": .bool(true),
+                                "canPin": .bool(true),
+                                "limit": .int(3),
+                                "items": .array([
+                                    .object([
+                                        "ref": .string("t_713_1"),
+                                        "kind": .string("message"),
+                                        "title": .string("Tin cũ"),
+                                        "sender": .string("An"),
+                                        "msgId": .string("91301"),
+                                    ]),
+                                ]),
+                            ]),
+                            "g500714": .object([
+                                "convId": .string("g500714"),
+                                "ready": .bool(true),
+                                "canPin": .bool(true),
+                                "limit": .int(3),
+                                "items": .array([
+                                    .object(["ref": .string("t_714_1"), "kind": .string("message"), "title": .string("Ghim 1"), "sender": .string("An")]),
+                                    .object(["ref": .string("t_714_2"), "kind": .string("message"), "title": .string("Ghim 2"), "sender": .string("Bình")]),
+                                    .object(["ref": .string("t_714_3"), "kind": .string("message"), "title": .string("Ghim 3"), "sender": .string("Chi")]),
+                                ]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    PinRecorderHarness.loginInfoScript(uid: "2000713", displayName: "Pin User 13"),
+                    MessageRecorderHarness.profileMeScript(uid: "2000713", displayName: "Pin User 13"),
+                    // 1) Pinned group reminder: createv2 -> pinv2 -> pin/list
+                    PinRecorderHarness.httpScript(
+                        path: "/api/board/topic/createv2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "id": .string("rem_713_1"),
+                                "type": .int(0),
+                                "startTime": .int(1700010000000),
+                            ]),
+                        ])
+                    ),
+                    PinRecorderHarness.httpScript(
+                        path: "/api/board/pinv2",
+                        method: "GET",
+                        json: .object(["error_code": .int(0), "data": .object([:])])
+                    ),
+                    PinRecorderHarness.httpScript(
+                        path: "/api/board/pin/list",
+                        method: "GET",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "boardVersion": .int(2),
+                                "pinLimit": .int(3),
+                                "topics": .array([
+                                    .object([
+                                        "id": .string("rem_713_1"),
+                                        "type": .int(0),
+                                        "startTime": .int(1700010000000),
+                                        "creatorId": .string("2000713"),
+                                        "params": .string("{\"title\":\"Họp sprint\"}"),
+                                    ]),
+                                    .object([
+                                        "id": .string("t_713_1"),
+                                        "type": .int(2),
+                                        "params": .object(["title": .string("Tin cũ"), "senderName": .string("An")]),
+                                    ]),
+                                ]),
+                            ]),
+                        ])
+                    ),
+                    // 2) Unpinned group reminder: createv2 only
+                    PinRecorderHarness.httpScript(
+                        path: "/api/board/topic/createv2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object(["id": .string("rem_713_2")]),
+                        ])
+                    ),
+                    // 3) Pinned group reminder where pinv2 fails: keep reminder + ShowCard, no refresh
+                    PinRecorderHarness.httpScript(
+                        path: "/api/board/topic/createv2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object(["id": .string("rem_713_3")]),
+                        ])
+                    ),
+                    PinRecorderHarness.httpScript(
+                        path: "/api/board/pinv2",
+                        method: "GET",
+                        json: .object(["error_code": .int(114), "error_message": .string("pin failed")])
+                    ),
+                    // 4) Pinned group reminder when board is at pinLimit (3/3): createv2 only + ShowCard
+                    PinRecorderHarness.httpScript(
+                        path: "/api/board/topic/createv2",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object(["id": .string("rem_714_1")]),
+                        ])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    // 1) Pinned happy path
+                    .object([
+                        "cmd": .string("create_reminder"),
+                        "args": .object([
+                            "conv_id": .string("g500713"),
+                            "title": .string("Họp sprint"),
+                            "start_ms": .int(1700010000000),
+                            "repeat": .int(0),
+                            "pin": .bool(true),
+                        ]),
+                    ]),
+                    .object(["snapshot": .string("after_pinned_ok")]),
+                    // 2) Unpinned
+                    .object([
+                        "cmd": .string("create_reminder"),
+                        "args": .object([
+                            "conv_id": .string("g500713"),
+                            "title": .string("Không ghim"),
+                            "start_ms": .int(1700020000000),
+                            "repeat": .int(1),
+                            "pin": .bool(false),
+                        ]),
+                    ]),
+                    .object(["snapshot": .string("after_unpinned")]),
+                    // 3) pinv2 failure
+                    .object([
+                        "cmd": .string("create_reminder"),
+                        "args": .object([
+                            "conv_id": .string("g500713"),
+                            "title": .string("Ghim lỗi"),
+                            "start_ms": .int(1700030000000),
+                            "repeat": .int(0),
+                            "pin": .bool(true),
+                        ]),
+                    ]),
+                    .object(["snapshot": .string("after_pinv2_fail")]),
+                    // 4) Board at pinLimit
+                    .object([
+                        "cmd": .string("create_reminder"),
+                        "args": .object([
+                            "conv_id": .string("g500714"),
+                            "title": .string("Đầy ghim"),
+                            "start_ms": .int(1700040000000),
+                            "repeat": .int(0),
+                            "pin": .bool(true),
+                        ]),
+                    ]),
+                ]
+            ),
         ]
     }
 }
@@ -2299,6 +2474,19 @@ private enum PinRecorderHarness {
                         throw RecorderError.invalidStep(scenario: scenario.name, detail: "is_pinned missing msg \(msgId) in \(convId)")
                     }
                     results["\(stepIndex)"] = .bool(engine.isPinned(msg))
+                case "create_reminder":
+                    _ = await engine.bootTask?.value
+                    guard let convId = args?["conv_id"]?.stringValue,
+                          let title = args?["title"]?.stringValue,
+                          let startMs = args?["start_ms"]?.int64Value,
+                          let repeatRaw = args?["repeat"]?.int64Value,
+                          let repeatRule = ReminderRepeat(rawValue: Int(repeatRaw)),
+                          let pin = args?["pin"]?.boolValue else {
+                        throw RecorderError.invalidStep(scenario: scenario.name, detail: "create_reminder requires conv_id, title, start_ms, repeat, pin")
+                    }
+                    let start = Date(timeIntervalSince1970: Double(startMs) / 1000.0)
+                    let outcome = await engine.createReminder(in: convId, title: title, start: start, repeat: repeatRule, pin: pin)
+                    results["\(stepIndex)"] = StickerSnapshot.encodeComposerOutcome(outcome)
                 default:
                     throw RecorderError.invalidStep(scenario: scenario.name, detail: "Unknown cmd: \(cmd)")
                 }

@@ -17,6 +17,14 @@ pub const COMPOSER_GENERIC_FAILURE: &str = "Không gửi được. Hãy thử l�
 pub const REMINDER_TOO_LONG_FAILURE: &str = "Bạn đã nhập quá số kí tự cho phép";
 /// Failure message when the reminder API call fails.
 pub const REMINDER_API_FAILURE: &str = "Không tạo được nhắc hẹn. Hãy thử lại.";
+/// Card toast shown when pinning a newly created group reminder via `pinv2` fails.
+pub const REMINDER_PIN_FAILED_CARD_TEXT: &str = "Có lỗi xảy ra";
+
+/// Official pin-limit card toast (`STR_ONLY_PIN_MAX_CONTENT`) shown when the group board is full.
+#[must_use]
+pub fn reminder_pin_limit_card_text(limit: i64) -> String {
+    format!("Đã đạt giới hạn {limit} ghim.")
+}
 /// Failure message when `send_my_card` is called before a profile is loaded.
 pub const NOT_LOGGED_IN_FAILURE: &str = "Chưa đăng nhập.";
 

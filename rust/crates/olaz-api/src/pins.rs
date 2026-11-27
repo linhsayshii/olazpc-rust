@@ -275,6 +275,17 @@ impl<T: Transport> ZaloApi<T> {
             .await?;
         Ok(())
     }
+
+    /// Pins an existing group board topic (`GET group_board /api/board/pinv2`, encrypted
+    /// `{grid, topicId, type}` with `g` stripped from `conv_id`).
+    pub async fn pin_board_item(
+        &self,
+        conv_id: &str,
+        topic_id: &str,
+        topic_type: i64,
+    ) -> Result<JsonObject, ApiError> {
+        self.pin_board_item_api(conv_id, topic_id, topic_type).await
+    }
 }
 
 #[cfg(test)]
@@ -482,6 +493,27 @@ mod tests {
         assert_eq!(
             params_of(&reqs[5]).get("topics"),
             Some(&json!([{"topicId": "t_f", "topicType": 2}]))
+        );
+    }
+
+    #[tokio::test]
+    async fn pin_board_item_sends_encrypted_get_pinv2_without_g_prefix() {
+        let api = api_with(|_| {
+            Ok(RawResponse::new(
+                200,
+                json!({"error_code": 0, "data": {}})
+                    .to_string()
+                    .into_bytes(),
+            ))
+        });
+        let _ = api.pin_board_item("g500701", "rem_42", 0).await.unwrap();
+        let reqs = api.client().transport().requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, olaz_net::Method::Get);
+        assert_eq!(reqs[0].path(), "/api/board/pinv2");
+        assert_eq!(
+            params_of(&reqs[0]),
+            json!({"grid": "500701", "topicId": "rem_42", "type": 0})
         );
     }
 }

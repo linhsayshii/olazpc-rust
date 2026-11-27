@@ -299,6 +299,7 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         }
         Input::ContactCardSendDone { .. }
         | Input::CreateReminderDone { .. }
+        | Input::ReminderPinDone { .. }
         | Input::ConfirmPromoteExpired { .. } => {
             composer::reduce_composer(state, input, &mut out);
         }
