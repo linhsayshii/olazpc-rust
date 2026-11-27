@@ -17,6 +17,7 @@ use crate::composer::{ComposerConfirm, ComposerState};
 use crate::conversations::{CachedProfile, ConversationsState};
 use crate::forward::{ForwardRequest, ForwardState};
 use crate::messages::{ContactsState, IdentitySnapshot, MessagesState};
+use crate::notify::{NotificationSettingsSnapshot, NotifyState};
 use crate::pins::{PinsSnapshot, PinsState};
 use crate::stickers::{StickerState, StickerSuggestSetting};
 use crate::typing::{TypingState, TypingStatus};
@@ -41,6 +42,8 @@ pub struct CoreState {
     pub search: crate::search::SearchState,
     // U6
     pub actions: ActionsState,
+    // U16
+    pub notify: NotifyState,
     // U7
     pub pins: PinsState,
     // U12
@@ -73,6 +76,9 @@ impl CoreState {
             starred_ids: self.actions.starred_ids.clone(),
             cached_profiles: self.conversations.identities.cached_profiles.clone(),
             last_prune_next_expiry_ms: self.actions.last_prune_next_expiry_ms,
+            // U16
+            notification_settings: self.notify.settings.clone(),
+            aliases: self.conversations.identities.aliases.clone(),
             // U7
             pins: self.pins.snapshot(),
             // U12
@@ -120,6 +126,8 @@ impl fmt::Debug for CoreState {
             .field("forward", &self.forward)
             // U6
             .field("actions", &self.actions)
+            // U16
+            .field("notify", &self.notify)
             // U7
             .field("pins", &self.pins)
             // U12
@@ -152,6 +160,9 @@ pub struct CoreSnapshot {
     pub starred_ids: BTreeSet<String>,
     pub cached_profiles: BTreeMap<String, CachedProfile>,
     pub last_prune_next_expiry_ms: Option<i64>,
+    // U16
+    pub notification_settings: NotificationSettingsSnapshot,
+    pub aliases: BTreeMap<String, String>,
     // U7
     pub pins: PinsSnapshot,
     // U12

@@ -9,6 +9,7 @@ pub mod composer;
 pub mod conversations;
 pub mod forward;
 pub mod messages;
+pub mod notify;
 pub mod pins;
 // U12
 pub mod polls;
@@ -358,6 +359,29 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
             polls::reduce_polls(state, input, &mut out);
         }
 
+        // U16
+        Input::Command(ref cmd) if notify::is_notify_command(cmd) => {
+            notify::reduce_notify(state, input, &mut out);
+        }
+        Input::OpRequest { ref cmd, .. } if notify::is_notify_command(cmd) => {
+            notify::reduce_notify(state, input, &mut out);
+        }
+        Input::NotificationPrefsLoaded { .. }
+        | Input::NotifAuthResolved { .. }
+        | Input::SetMuteApiDone { .. }
+        | Input::NotifyProfilesFetched { .. }
+        | Input::SuggestedStickersFetched { .. }
+        | Input::ContactProfileFetched { .. }
+        | Input::SubmitFriendDone { .. }
+        | Input::SaveAliasDone { .. }
+        | Input::GroupInvitePreviewDone { .. }
+        | Input::JoinGroupDone { .. }
+        | Input::ReminderWatchTimeout { .. }
+        | Input::ReminderDetailFetched { .. }
+        | Input::RespondReminderDone { .. }
+        | Input::ReminderRespondersFetched { .. }
+        | Input::ReminderResponderProfilesFetched { .. }
+        | Input::CategoryStickerSent { .. } => notify::reduce_notify(state, input, &mut out),
         // U7
         Input::Command(ref cmd) if is_pin_command(cmd) => {
             pins::reduce_pins(state, input, &mut out);
