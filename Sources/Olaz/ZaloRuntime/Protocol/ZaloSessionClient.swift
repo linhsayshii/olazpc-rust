@@ -137,9 +137,8 @@ actor ZaloSessionClient {
         self.cookieStorage = cookieStorage
         self.computerName = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
 
-        let expectedSuffix = ZaloCrypto.md5Hex(ZaloDomains.userAgent)
         let storedIMEI = defaults.string(forKey: Self.imeiDefaultsKey)
-        if let storedIMEI, storedIMEI.count == 69, storedIMEI.hasSuffix(expectedSuffix) {
+        if let storedIMEI, Self.isValidPCIMEI(storedIMEI) {
             self.imei = storedIMEI
         } else {
             let fresh = Self.generateIMEI()
@@ -152,6 +151,23 @@ actor ZaloSessionClient {
         let uuid = UUID().uuidString.lowercased()
         let uaMD5 = ZaloCrypto.md5Hex(ZaloDomains.userAgent)
         return "\(uuid)-\(uaMD5)"
+    }
+
+    /// True for a well-formed PC IMEI: `<lowercase uuid>-<32 lowercase hex>`, 69 ASCII characters.
+    /// Matches the official Zalo PC client's `z_uuid` retention across `zpw_ver` bumps.
+    static func isValidPCIMEI(_ imei: String) -> Bool {
+        let bytes = Array(imei.utf8)
+        guard bytes.count == 69 else { return false }
+        for (idx, byte) in bytes.enumerated() {
+            switch idx {
+            case 8, 13, 18, 23, 36:
+                guard byte == 0x2D else { return false }
+            default:
+                let isLowerHex = (byte >= 0x30 && byte <= 0x39) || (byte >= 0x61 && byte <= 0x66)
+                guard isLowerHex else { return false }
+            }
+        }
+        return true
     }
 
     var isAuthenticated: Bool {
@@ -624,11 +640,8 @@ actor ZaloSessionClient {
             if stored.imei.count == 69 {
                 self.imei = stored.imei
             }
-        } else {
-            let expectedSuffix = ZaloCrypto.md5Hex(ZaloDomains.userAgent)
-            if stored.imei.count == 69, stored.imei.hasSuffix(expectedSuffix) {
-                self.imei = stored.imei
-            }
+        } else if Self.isValidPCIMEI(stored.imei) {
+            self.imei = stored.imei
         }
         if !stored.computerName.isEmpty {
             self.computerName = stored.computerName

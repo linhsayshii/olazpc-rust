@@ -74,9 +74,22 @@ pub fn generate_imei() -> String {
     format!("{uuid}-{}", md5_hex(USER_AGENT))
 }
 
-/// True for an IMEI Swift would keep: 69 characters ending in `md5(userAgent)`.
-pub fn is_current_imei(imei: &str) -> bool {
-    imei.chars().count() == 69 && imei.ends_with(&md5_hex(USER_AGENT))
+/// True for a well-formed PC IMEI: `<lowercase uuid>-<32 lowercase hex>`, 69 ASCII characters.
+///
+/// Matches the official Zalo PC client's `z_uuid` retention rule: a valid stored PC IMEI is kept
+/// across `zpw_ver` bumps without comparing its suffix against `md5(USER_AGENT)`.
+pub fn is_valid_pc_imei(imei: &str) -> bool {
+    let bytes = imei.as_bytes();
+    if bytes.len() != 69 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(i, &b)| {
+        if matches!(i, 8 | 13 | 18 | 23 | 36) {
+            b == b'-'
+        } else {
+            matches!(b, b'0'..=b'9' | b'a'..=b'f')
+        }
+    })
 }
 
 /// Mutable session fields (Swift actor properties that belong to the transport layer).
@@ -242,7 +255,7 @@ impl SessionState {
             if stored.imei.chars().count() == 69 {
                 self.imei = stored.imei.clone();
             }
-        } else if is_current_imei(&stored.imei) {
+        } else if is_valid_pc_imei(&stored.imei) {
             self.imei = stored.imei.clone();
         }
         if !stored.computer_name.is_empty() {

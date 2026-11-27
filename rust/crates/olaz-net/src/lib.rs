@@ -44,5 +44,5 @@ pub use login::{
 pub use request::{ApiRequest, MultipartPart, canonical_json};
 pub use session::{
     LoginAccount, ServerSettingsSource, SessionSnapshot, SessionState, SessionStatus,
-    generate_imei, is_current_imei,
+    generate_imei, is_valid_pc_imei,
 };

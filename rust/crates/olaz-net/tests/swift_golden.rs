@@ -36,7 +36,7 @@ fn golden(key: &str) -> String {
 fn golden_imei_matches_probe_construction() {
     // `uuid-md5(userAgent)`
     assert_eq!(IMEI, golden("imei"));
-    assert!(olaz_net::is_current_imei(IMEI));
+    assert!(olaz_net::is_valid_pc_imei(IMEI));
 }
 
 #[test]
