@@ -73,7 +73,7 @@ pub fn is_current_imei(imei: &str) -> bool {
 }
 
 /// Mutable session fields (Swift actor properties that belong to the transport layer).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionState {
     pub domains: ZaloDomains,
     pub imei: String,
@@ -90,6 +90,19 @@ pub struct SessionState {
     pub seeded_next_client_id: Option<i64>,
     pub cloud_viewer_key: Option<String>,
     pub cloud_enk: Option<String>,
+}
+
+impl std::fmt::Debug for SessionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionState")
+            .field("has_secret_key", &self.secret_key.is_some())
+            .field("has_zpw_sek", &self.zpw_sek.is_some())
+            .field("has_account", &self.account.is_some())
+            .field("expired_at", &self.expired_at)
+            .field("has_cloud_viewer_key", &self.cloud_viewer_key.is_some())
+            .field("has_cloud_enk", &self.cloud_enk.is_some())
+            .finish()
+    }
 }
 
 impl SessionState {
@@ -175,6 +188,12 @@ impl SessionState {
         self.domains = ZaloDomains::default();
     }
 
+    /// Clears cached zCloud viewer credentials (`cloud_viewer_key` and `cloud_enk`).
+    pub fn clear_cloud_viewer_key(&mut self) {
+        self.cloud_viewer_key = None;
+        self.cloud_enk = None;
+    }
+
     pub fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
             zpw_type: Some(ZPW_TYPE.to_owned()),
@@ -218,6 +237,8 @@ impl SessionState {
         self.zpw_sek = Some(account.zpw_sek.clone());
         self.secret_key = Some(key);
         self.account = Some(account);
+        self.cloud_viewer_key = None;
+        self.cloud_enk = None;
         true
     }
 
@@ -279,6 +300,10 @@ impl SessionState {
 
         let mut current = self.account.take().unwrap_or_default();
         if !uid.is_empty() {
+            if !current.user_id.is_empty() && current.user_id != uid {
+                self.cloud_viewer_key = None;
+                self.cloud_enk = None;
+            }
             current.user_id = uid;
         }
         if !dkey.is_empty() {

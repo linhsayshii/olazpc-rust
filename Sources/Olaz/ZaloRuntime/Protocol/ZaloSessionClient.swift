@@ -117,6 +117,7 @@ actor ZaloSessionClient {
     private var lastClientIdMs: Int64 = 0
     private var seededNextClientId: Int64?
     private var sessionTrace: (@MainActor @Sendable (String) -> Bool)?
+    private var rawDownloadURLTransform: (@Sendable (URL) -> URL)?
 
     private static let keychainIdentifier = "olaz.native.session"
     private static let imeiDefaultsKey = "olaz.native.pc.imei"
@@ -568,6 +569,10 @@ actor ZaloSessionClient {
 
     func setSessionTrace(_ trace: (@MainActor @Sendable (String) -> Bool)?) {
         self.sessionTrace = trace
+    }
+
+    func setRawDownloadURLTransform(_ transform: (@Sendable (URL) -> URL)?) {
+        self.rawDownloadURLTransform = transform
     }
 
     private func persistSessionIfAllowed() async {
@@ -1223,8 +1228,9 @@ actor ZaloSessionClient {
     }
 
     func rawDownloadData(url: URL, timeout: TimeInterval = 20) async throws -> Data {
+        let effectiveURL = rawDownloadURLTransform?(url) ?? url
         let raw = try coreRaw()
-        do { return try await raw.download(url: url.absoluteString, timeoutSecs: timeout) }
+        do { return try await raw.download(url: effectiveURL.absoluteString, timeoutSecs: timeout) }
         catch { throw RustCore.mapError(error, quietTimeout: true) }
     }
 

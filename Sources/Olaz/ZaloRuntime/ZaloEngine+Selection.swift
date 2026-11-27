@@ -1,4 +1,5 @@
 import Foundation
+import OlazCore
 
 /// "Chọn nhiều tin nhắn" (official `STR_SELECT`): the messages picked in one conversation, in the order they were picked.
 struct MessageSelection: Equatable {
@@ -49,7 +50,7 @@ extension ZaloEngine {
             selection.anchor = id
         } else {
             guard selection.ids.count < MessageSelection.limit else {
-                CardActionCenter.shared.show("Bạn chỉ có thể chọn tối đa \(MessageSelection.limit) tin nhắn", in: selection.conversationId)
+                showActionCard("Bạn chỉ có thể chọn tối đa \(MessageSelection.limit) tin nhắn", in: selection.conversationId)
                 return
             }
             selection.ids.append(id)
@@ -80,8 +81,12 @@ extension ZaloEngine {
     func forwardSelection() {
         let list = selectedMessages()
         guard let first = list.first else { return }
+        if let core = coreLifecycle.core {
+            core.forwardSelection(messages: list.map(ChatMessageRecord.init(message:)))
+            return
+        }
         guard selectionCanForward(list) else {
-            CardActionCenter.shared.show("Có tin nhắn không thể chia sẻ", in: first.conversationId)
+            showActionCard("Có tin nhắn không thể chia sẻ", in: first.conversationId)
             return
         }
         forwardRequest = ForwardRequest(conversationId: first.conversationId, message: first, more: Array(list.dropFirst()))

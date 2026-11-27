@@ -501,17 +501,21 @@ extension ZaloEngine {
         if !missingProfileUids.isEmpty,
            let profBox = try? await sessionClient.fetchProfiles(uids: Array(missingProfileUids.prefix(50))) {
             let profilesMap = ZaloWireParser.extractProfilesMap(profBox.dict)
+            var nextProfiles = cachedProfiles
             var cacheChanged = false
             for (uid, row) in profilesMap {
                 let clean = ZaloWireParser.sanitizeProfileUid(uid) ?? ZaloWireParser.stripUserPrefix(uid)
                 let fetchedName = ZaloWireParser.preferredName(row)
                 let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
                 if !clean.isEmpty && (!fetchedName.isEmpty || !avt.isEmpty) {
-                    cachedProfiles[clean] = ZaloWebKitMigrator.CachedProfile(name: fetchedName, avatar: avt)
+                    nextProfiles[clean] = ZaloWebKitMigrator.CachedProfile(name: fetchedName, avatar: avt)
                     cacheChanged = true
                 }
             }
             if cacheChanged {
+                if nextProfiles != cachedProfiles {
+                    cachedProfiles = nextProfiles
+                }
                 if let data = try? JSONEncoder().encode(cachedProfiles) {
                     try? await sqliteStore?.setPreferenceData(key: "cachedProfiles", data: data)
                 }

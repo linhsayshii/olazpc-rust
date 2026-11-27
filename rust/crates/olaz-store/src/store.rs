@@ -76,23 +76,65 @@ fn register_search_functions(conn: &Connection) -> rusqlite::Result<()> {
                 ValueRef::Null => String::new(),
                 ValueRef::Integer(n) => n.to_string(),
                 ValueRef::Real(f) => f.to_string(),
-                ValueRef::Text(b) | ValueRef::Blob(b) => String::from_utf8_lossy(b).to_lowercase(),
+                ValueRef::Text(b) | ValueRef::Blob(b) => {
+                    crate::search_text::fold_search_text(&String::from_utf8_lossy(b))
+                }
+            })
+        },
+    )?;
+    conn.create_scalar_function(
+        "olaz_contains",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let needle_owned;
+            let needle: &str = match ctx.get_raw(1) {
+                ValueRef::Text(b) | ValueRef::Blob(b) => match std::str::from_utf8(b) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        needle_owned = String::from_utf8_lossy(b).into_owned();
+                        &needle_owned
+                    }
+                },
+                _ => return Ok(0_i64),
+            };
+            if needle.is_empty() {
+                return Ok(0_i64);
+            }
+            let matched = match ctx.get_raw(0) {
+                ValueRef::Null => false,
+                ValueRef::Integer(n) => {
+                    crate::search_text::search_text_contains_folded(&n.to_string(), needle)
+                }
+                ValueRef::Real(f) => {
+                    crate::search_text::search_text_contains_folded(&f.to_string(), needle)
+                }
+                ValueRef::Text(b) | ValueRef::Blob(b) => match std::str::from_utf8(b) {
+                    Ok(hay) => crate::search_text::search_text_contains_folded(hay, needle),
+                    Err(_) => crate::search_text::search_text_contains_folded(
+                        &String::from_utf8_lossy(b),
+                        needle,
+                    ),
+                },
+            };
+            Ok(i64::from(matched))
+        },
+    )?;
+    conn.create_scalar_function(
+        "olaz_trim",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            Ok(match ctx.get_raw(0) {
+                ValueRef::Null => String::new(),
+                ValueRef::Integer(n) => n.to_string(),
+                ValueRef::Real(f) => f.to_string(),
+                ValueRef::Text(b) | ValueRef::Blob(b) => {
+                    crate::search_text::trim_search_query(&String::from_utf8_lossy(b)).to_owned()
+                }
             })
         },
     )
-}
-
-/// Escapes SQLite `LIKE` wildcards (`%`, `_`, `\`) using `\` as the escape character.
-#[must_use]
-pub fn escape_like_pattern(query: &str) -> String {
-    let mut out = String::with_capacity(query.len());
-    for ch in query.chars() {
-        if matches!(ch, '\\' | '%' | '_') {
-            out.push('\\');
-        }
-        out.push(ch);
-    }
-    out
 }
 
 /// Local SQLite store: conversations, message history, shared-media index, preferences.
@@ -373,49 +415,78 @@ ORDER BY conv_id ASC, ts_ms ASC, id ASC;"
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Case-insensitive (via `olaz_fold`) search in one conversation, newest first.
-    /// Skips recalled and E2EE-locked rows; searches `raw_json` caption/title/etc.
+    /// Case-insensitive (via shared `fold_search_text` / `olaz_contains`) search in one
+    /// conversation, newest first. Skips recalled and E2EE-locked rows; searches `raw_json`
+    /// caption/title/detail/reminderTitle/etc.
     pub fn search_messages(
         &self,
         conversation_id: &str,
         query: &str,
         limit: i64,
     ) -> Result<Vec<StoredMessage>> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
+        self.search_messages_page(conversation_id, query, None, limit.clamp(1, 500))
+    }
+
+    /// Cursor-paged variant of [`Self::search_messages`] for U14 Fix 1.
+    ///
+    /// When `before` is `Some((before_ts_ms, before_id))`, only rows strictly older in
+    /// `(ts_ms DESC, id DESC)` order are scanned. `limit` is clamped to `1..=1000` so callers can
+    /// fetch `max(limit * 2, 50)` pages up to the 500-result cap.
+    pub fn search_messages_page(
+        &self,
+        conversation_id: &str,
+        query: &str,
+        before: Option<(i64, &str)>,
+        limit: i64,
+    ) -> Result<Vec<StoredMessage>> {
         let trimmed = trim_ws(query);
         if conversation_id.is_empty() || trimmed.is_empty() || limit <= 0 {
             return Ok(Vec::new());
         }
-        let clamped = limit.clamp(1, 500);
-        let pattern = format!("%{}%", escape_like_pattern(&trimmed.to_lowercase()));
-        let mut stmt = self.db()?.prepare_cached(
-            r"SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
+        let clamped = limit.clamp(1, 1000);
+        let folded_needle = crate::search_text::fold_search_text(trimmed);
+        if folded_needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some((before_ts, before_id)) = before {
+            let mut stmt = self.db()?.prepare_cached(
+                r"SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
 FROM messages
 WHERE conv_id = ?1
   AND kind_tag != 'recalled'
   AND status != 'e2ee_locked'
+  AND (ts_ms < ?4 OR (ts_ms = ?4 AND id < ?5))
   AND (
-      olaz_fold(text) LIKE ?2 ESCAPE '\'
+      olaz_contains(text, ?2)
       OR (
           json_valid(raw_json)
           AND (
-              olaz_fold(COALESCE(json_extract(raw_json, '$.text'), '')) LIKE ?2 ESCAPE '\'
-              OR olaz_fold(COALESCE(json_extract(raw_json, '$.caption'), '')) LIKE ?2 ESCAPE '\'
-              OR olaz_fold(COALESCE(json_extract(raw_json, '$.body'), '')) LIKE ?2 ESCAPE '\'
-              OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.caption'), '')) LIKE ?2 ESCAPE '\'
-              OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.title'), '')) LIKE ?2 ESCAPE '\'
-              OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.description'), '')) LIKE ?2 ESCAPE '\'
-              OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.name'), '')) LIKE ?2 ESCAPE '\'
-              OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.address'), '')) LIKE ?2 ESCAPE '\'
-              OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.question'), '')) LIKE ?2 ESCAPE '\'
-              OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.header'), '')) LIKE ?2 ESCAPE '\'
-              OR olaz_fold(COALESCE(json_extract(raw_json, '$.kind.text'), '')) LIKE ?2 ESCAPE '\'
+              olaz_contains(COALESCE(json_extract(raw_json, '$.text'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.caption'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.body'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.kind.caption'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.kind.title'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.kind.description'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.kind.name'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.kind.address'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.kind.detail'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.kind.reminderTitle'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.kind.question'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.kind.header'), ''), ?2)
+              OR (
+                  kind_tag IN ('zinstant', 'notice')
+                  AND olaz_contains(COALESCE(json_extract(raw_json, '$.kind.text'), ''), ?2)
+              )
               OR (
                   kind_tag = 'oaMessage'
                   AND json_type(raw_json, '$.kind.parts') = 'array'
                   AND EXISTS (
                       SELECT 1 FROM json_each(raw_json, '$.kind.parts')
-                      WHERE olaz_fold(COALESCE(json_extract(value, '$.title'), '')) LIKE ?2 ESCAPE '\'
-                         OR olaz_fold(COALESCE(json_extract(value, '$.description'), '')) LIKE ?2 ESCAPE '\'
+                      WHERE olaz_contains(COALESCE(json_extract(value, '$.title'), ''), ?2)
+                         OR olaz_contains(COALESCE(json_extract(value, '$.description'), ''), ?2)
                   )
               )
           )
@@ -423,9 +494,112 @@ WHERE conv_id = ?1
   )
 ORDER BY ts_ms DESC, id DESC
 LIMIT ?3;",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    conversation_id,
+                    folded_needle,
+                    clamped,
+                    before_ts,
+                    before_id
+                ],
+                read_stored_message,
+            )?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        } else {
+            let mut stmt = self.db()?.prepare_cached(
+                r"SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
+FROM messages
+WHERE conv_id = ?1
+  AND kind_tag != 'recalled'
+  AND status != 'e2ee_locked'
+  AND (
+      olaz_contains(text, ?2)
+      OR (
+          json_valid(raw_json)
+          AND (
+              olaz_contains(COALESCE(json_extract(raw_json, '$.text'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.caption'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.body'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.kind.caption'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.kind.title'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.kind.description'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.kind.name'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.kind.address'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.kind.detail'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.kind.reminderTitle'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.kind.question'), ''), ?2)
+              OR olaz_contains(COALESCE(json_extract(raw_json, '$.kind.header'), ''), ?2)
+              OR (
+                  kind_tag IN ('zinstant', 'notice')
+                  AND olaz_contains(COALESCE(json_extract(raw_json, '$.kind.text'), ''), ?2)
+              )
+              OR (
+                  kind_tag = 'oaMessage'
+                  AND json_type(raw_json, '$.kind.parts') = 'array'
+                  AND EXISTS (
+                      SELECT 1 FROM json_each(raw_json, '$.kind.parts')
+                      WHERE olaz_contains(COALESCE(json_extract(value, '$.title'), ''), ?2)
+                         OR olaz_contains(COALESCE(json_extract(value, '$.description'), ''), ?2)
+                  )
+              )
+          )
+      )
+  )
+ORDER BY ts_ms DESC, id DESC
+LIMIT ?3;",
+            )?;
+            let rows = stmt.query_map(
+                params![conversation_id, folded_needle, clamped],
+                read_stored_message,
+            )?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        }
+    }
+
+    /// Finds newest earlier non-recalled messages matching `trimmed_text` (exact after Swift
+    /// whitespace trim) for legacy quote fallback (U14 Fix 4).
+    pub fn find_legacy_quoted_candidates(
+        &self,
+        conv_id: &str,
+        exclude_id: &str,
+        max_ts_ms: i64,
+        trimmed_text: &str,
+        mine_only: bool,
+        limit: i64,
+    ) -> Result<Vec<StoredMessage>> {
+        if conv_id.is_empty() || trimmed_text.is_empty() || limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let clamped = limit.clamp(1, 100);
+        let mine_flag = i64::from(mine_only);
+        let mut stmt = self.db()?.prepare_cached(
+            r"SELECT id, conv_id, client_id, sender_id, sender_name, sender_avatar, is_mine, text, kind_tag, ts_ms, status, raw_json
+FROM messages
+WHERE conv_id = ?1
+  AND id != ?2
+  AND ts_ms <= ?3
+  AND kind_tag != 'recalled'
+  AND (?4 = 0 OR is_mine = 1)
+  AND (
+      olaz_trim(text) = ?5
+      OR (
+          json_valid(raw_json)
+          AND olaz_trim(COALESCE(json_extract(raw_json, '$.text'), '')) = ?5
+      )
+  )
+ORDER BY ts_ms DESC, id DESC
+LIMIT ?6;",
         )?;
         let rows = stmt.query_map(
-            params![conversation_id, pattern, clamped],
+            params![
+                conv_id,
+                exclude_id,
+                max_ts_ms,
+                mine_flag,
+                trimmed_text,
+                clamped
+            ],
             read_stored_message,
         )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -694,7 +868,7 @@ LIMIT ?;"
     m.conv_id,
     COALESCE(c.name, ''),
     COALESCE(c.avatar, ''),
-    COALESCE(c.is_group, 0),
+    c.is_group,
     SUM(CASE WHEN m.kind_tag = 'photo' THEN ({size}) ELSE 0 END) AS photo_bytes,
     SUM(CASE WHEN m.kind_tag = 'video' THEN ({size}) ELSE 0 END) AS video_bytes,
     SUM(CASE WHEN m.kind_tag = 'file' THEN ({size}) ELSE 0 END) AS file_bytes,

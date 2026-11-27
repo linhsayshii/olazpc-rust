@@ -1664,6 +1664,8 @@ dependencies = [
 name = "olaz-store"
 version = "0.1.0"
 dependencies = [
+ "icu_normalizer",
+ "icu_properties",
  "olaz-json",
  "olaz-wire",
  "rusqlite",

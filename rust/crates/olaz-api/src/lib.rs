@@ -16,6 +16,7 @@
 
 mod api;
 mod autodelete;
+mod cloud;
 mod contacts;
 mod conversations;
 mod e2ee;
@@ -26,6 +27,8 @@ mod history;
 mod messaging;
 mod poll;
 mod profiles;
+mod reminders;
+mod stickers;
 mod util;
 
 #[cfg(test)]
@@ -36,6 +39,7 @@ pub use autodelete::{
     AUTO_DELETE_OPTIONS, AutoDeleteFetchOutcome, auto_delete_label, auto_delete_remaining,
     build_update_auto_delete_payload, parse_auto_delete_settings,
 };
+pub use cloud::{CloudPlanKind, CloudServerSnapshot, parse_cloud_usage_snapshot};
 pub use contacts::{
     BlockedUserEntry, build_accept_friend_request_payload, build_fid_imei_payload,
     build_search_friend_by_phone_payload, build_send_friend_request_payload,
@@ -51,10 +55,16 @@ pub use e2ee::{
 };
 pub use error::ApiError;
 pub use messaging::{
-    CallSpec, ReactionParams, ReactionRequestSpec, RecallParams, SendTextArgs, SendTextParams,
-    build_reaction_request, build_recall_message_request,
+    CallSpec, ReactionParams, ReactionRequestSpec, RecallParams, SendContactCardParams,
+    SendTextArgs, SendTextParams, build_reaction_request, build_recall_message_request,
+    build_send_contact_card_request,
 };
 pub use poll::{PollQueueCursor, PollState};
+pub use reminders::{CreateReminderParams, build_create_reminder_request};
+pub use stickers::{
+    FetchedStickerCategories, SendStickerParams, StickerCategoryRow, build_send_sticker_request,
+    builtin_sticker_pack, parse_sticker_catalog_bytes,
+};
 
 // U12 (polls + shared group metadata helper for U10)
 pub use group_polls::{

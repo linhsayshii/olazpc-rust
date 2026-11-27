@@ -64,6 +64,14 @@ extension ZaloEngine {
     internal func cancelTasksForRecording() {
         hostTrace = nil
         sendE2EETextHostHandler = nil
+        sendE2EEStickerHostHandler = nil
+        sendE2EEContactCardHostHandler = nil
+        resolveMediaHostHandler = nil
+        resolveFileHostHandler = nil
+        fetchMediaDataHostHandler = nil
+        sendMediaHostHandler = nil
+        sendFilesHostHandler = nil
+        forwardTempPhotoURL = nil
         traceU4HostEnabled = false
         stateTrace = nil
         transportSettleTrace = nil
@@ -89,12 +97,17 @@ extension ZaloEngine {
         messageActionTasks.removeAll()
         contactsTasks.values.forEach { $0.cancel() }
         contactsTasks.removeAll()
-        optimisticOverlayFenceTasks.values.forEach { $0.cancel() }
-        optimisticOverlayFenceTasks.removeAll()
         pollDebounceSleep = nil
         resetPolls()
         pollRefreshTasks.values.forEach { $0.cancel() }
         pollRefreshTasks.removeAll()
+        cloudRefreshTask?.cancel()
+        cloudRefreshTask = nil
+        optimisticOverlayFenceTasks.values.forEach { $0.cancel() }
+        optimisticOverlayFenceTasks.removeAll()
+        composerConfirmSleep = nil
+        composerConfirmTask?.cancel()
+        composerConfirmTask = nil
         typingResetTasks.values.forEach { $0.cancel() }
         typingResetTasks = [:]
         callBridge?.shutdown()
@@ -202,6 +215,15 @@ extension ZaloEngine {
         }
         _ = await persistConversationsTask?.value
     }
+
+    internal func awaitCloudTasksForRecording() async {
+        while let task = cloudRefreshTask {
+            cloudRefreshTask = nil
+            _ = await task.value
+        }
+        _ = await persistConversationsTask?.value
+    }
+
     internal func finishTearDownForRecording() async {
         await sessionClient.setSessionTrace(nil)
         if let initTask = coreInitTask {
@@ -262,6 +284,7 @@ extension ZaloEngine {
             pollRefreshTasks.removeAll()
             for task in tasks { _ = await task.value }
         }
+        _ = await cloudRefreshTask?.value
         _ = await persistConversationsTask?.value
         persistConversationsTask = nil
         _ = await pendingCleanupTask?.value

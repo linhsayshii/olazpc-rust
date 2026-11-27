@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
-use olaz_api::{PollState, SendTextParams};
+use olaz_api::{
+    CreateReminderParams, PollState, SendContactCardParams, SendStickerParams, SendTextParams,
+};
 use olaz_net::{LoginAccount, QrTicket};
 use olaz_store::{StoredConversation, StoredMessage};
 use olaz_wire::ChatMessage;
@@ -12,12 +14,16 @@ use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
 use crate::actions::DeleteUndoItem;
+use crate::cloud::{CloudActionResult, CloudFetch, CloudPage, MediaResolutionOutcome};
+use crate::composer::{ComposerOutcome, MyCardInfo, ReminderComposeInfo};
 use crate::conversations::{
     ConversationActionResult, ConversationPreview, IdentityTable, PinBoard,
 };
+use crate::forward::ForwardOutcome;
 use crate::input::{E2eeQuoteArg, HiddenPinSyncKind, SeenTarget, StoreToken};
 use crate::messages::{IdentitySnapshot, MuteEntry};
 use crate::reduce::classify::MobileSyncEvent;
+use crate::stickers::{CardActionOutcome, StickerEntry, StickerSuggestSetting, StickerTab};
 use crate::typed_chat::TypedChatEnvelope;
 
 /// Distinguishes which history-paging flow requested [`Effect::FetchHistoryPageApi`].
@@ -135,6 +141,13 @@ pub enum StoreOp {
         key: String,
         data: Vec<u8>,
     },
+    SetPreferenceBool {
+        key: String,
+        value: bool,
+    },
+    SaveRecentSticker {
+        sticker: StickerEntry,
+    },
     DeletePreference {
         key: String,
     },
@@ -172,6 +185,34 @@ pub enum StoreOp {
         limit: usize,
         op_id: Option<u64>,
     },
+    // U14
+    SearchMessagesPage {
+        op_id: u64,
+        conv_id: String,
+        query: String,
+        before: Option<(i64, String)>,
+        limit: i64,
+    },
+    LoadMessagesAround {
+        op_id: u64,
+        conv_id: String,
+        target_ts_ms: i64,
+        before_oldest_ts_ms: Option<i64>,
+    },
+    LookupMessage {
+        op_id: u64,
+        conv_id: String,
+        key: String,
+    },
+    FindLegacyQuoted {
+        op_id: u64,
+        conv_id: String,
+        exclude_id: String,
+        max_ts_ms: i64,
+        trimmed_text: String,
+        mine_only: bool,
+        limit: i64,
+    },
     // U6
     DeleteMessage {
         conv_id: String,
@@ -208,6 +249,7 @@ pub enum StoreOp {
         mem_latest: Option<ConversationPreview>,
         update_conversation_preview: bool,
         persist_conversations: bool,
+        cloud_delete_op_id: Option<u64>,
     },
 }
 
@@ -251,6 +293,15 @@ impl fmt::Debug for StoreOp {
                 .debug_struct("SetPreferenceData")
                 .field("key", key)
                 .field("bytes", &data.len())
+                .finish(),
+            Self::SetPreferenceBool { key, value } => f
+                .debug_struct("SetPreferenceBool")
+                .field("key", key)
+                .field("value", value)
+                .finish(),
+            Self::SaveRecentSticker { sticker } => f
+                .debug_struct("SaveRecentSticker")
+                .field("sticker", sticker)
                 .finish(),
             Self::DeletePreference { key } => f
                 .debug_struct("DeletePreference")
@@ -304,6 +355,50 @@ impl fmt::Debug for StoreOp {
                 .field("before_ts_ms", before_ts_ms)
                 .field("limit", limit)
                 .finish(),
+            // U14
+            Self::SearchMessagesPage {
+                op_id,
+                query,
+                before,
+                limit,
+                ..
+            } => f
+                .debug_struct("SearchMessagesPage")
+                .field("op_id", op_id)
+                .field("query_len", &query.len())
+                .field("has_before", &before.is_some())
+                .field("limit", limit)
+                .finish(),
+            Self::LoadMessagesAround {
+                op_id,
+                target_ts_ms,
+                before_oldest_ts_ms,
+                ..
+            } => f
+                .debug_struct("LoadMessagesAround")
+                .field("op_id", op_id)
+                .field("target_ts_ms", target_ts_ms)
+                .field("has_before_oldest", &before_oldest_ts_ms.is_some())
+                .finish(),
+            Self::LookupMessage { op_id, .. } => f
+                .debug_struct("LookupMessage")
+                .field("op_id", op_id)
+                .finish(),
+            Self::FindLegacyQuoted {
+                op_id,
+                max_ts_ms,
+                trimmed_text,
+                mine_only,
+                limit,
+                ..
+            } => f
+                .debug_struct("FindLegacyQuoted")
+                .field("op_id", op_id)
+                .field("max_ts_ms", max_ts_ms)
+                .field("text_len", &trimmed_text.len())
+                .field("mine_only", mine_only)
+                .field("limit", limit)
+                .finish(),
             // U6
             Self::DeleteMessage { .. } => f.write_str("DeleteMessage"),
             Self::ApplyRemoteReactionInStore { r_type, .. } => f
@@ -343,6 +438,11 @@ pub enum OpResult {
     HiddenSearch(Option<Vec<String>>),
     Bool(bool),
     Int(i64),
+    // U8
+    Forward(ForwardOutcome),
+    // U14
+    SearchMessages(Vec<olaz_wire::ChatMessage>),
+    OptionalString(Option<String>),
     OptI64(Option<i64>),
     // U12
     PollVoters(Option<crate::polls::PollVoters>),
@@ -352,6 +452,19 @@ pub enum OpResult {
     PollCapabilities(crate::polls::PollCapabilities),
     // U9
     SaveAlias(crate::messages::SaveAliasOutcome),
+    // U11
+    CloudPage(CloudPage),
+    CloudFetch(CloudFetch),
+    CloudAction(CloudActionResult),
+    MediaResolution(MediaResolutionOutcome),
+    // U13
+    StickerTabs(Option<Vec<StickerTab>>),
+    StickerEntries(Option<Vec<StickerEntry>>),
+    StickerSuggestSetting(Option<StickerSuggestSetting>),
+    CardActionOutcome(CardActionOutcome),
+    ComposerOutcome(ComposerOutcome),
+    MyCard(Option<MyCardInfo>),
+    ReminderComposeInfo(Option<ReminderComposeInfo>),
 }
 
 impl fmt::Debug for OpResult {
@@ -366,6 +479,15 @@ impl fmt::Debug for OpResult {
                 .finish(),
             Self::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
             Self::Int(n) => f.debug_tuple("Int").field(n).finish(),
+            Self::Forward(o) => f.debug_tuple("Forward").field(o).finish(),
+            Self::SearchMessages(msgs) => f
+                .debug_struct("SearchMessages")
+                .field("count", &msgs.len())
+                .finish(),
+            Self::OptionalString(opt) => f
+                .debug_struct("OptionalString")
+                .field("present", &opt.is_some())
+                .finish(),
             Self::OptI64(n) => f.debug_tuple("OptI64").field(n).finish(),
             // U12
             Self::PollVoters(v) => f
@@ -377,6 +499,27 @@ impl fmt::Debug for OpResult {
             Self::PollActionResult(r) => f.debug_tuple("PollActionResult").field(r).finish(),
             Self::PollCapabilities(c) => f.debug_tuple("PollCapabilities").field(c).finish(),
             Self::SaveAlias(s) => f.debug_tuple("SaveAlias").field(s).finish(),
+            // U11
+            Self::CloudPage(p) => f.debug_tuple("CloudPage").field(p).finish(),
+            Self::CloudFetch(r) => f.debug_tuple("CloudFetch").field(r).finish(),
+            Self::CloudAction(a) => f.debug_tuple("CloudAction").field(a).finish(),
+            Self::MediaResolution(m) => f.debug_tuple("MediaResolution").field(m).finish(),
+            // U13
+            Self::StickerTabs(v) => f
+                .debug_struct("StickerTabs")
+                .field("count", &v.as_ref().map(Vec::len))
+                .finish(),
+            Self::StickerEntries(v) => f
+                .debug_struct("StickerEntries")
+                .field("count", &v.as_ref().map(Vec::len))
+                .finish(),
+            Self::StickerSuggestSetting(s) => {
+                f.debug_tuple("StickerSuggestSetting").field(s).finish()
+            }
+            Self::CardActionOutcome(o) => f.debug_tuple("CardActionOutcome").field(o).finish(),
+            Self::ComposerOutcome(o) => f.debug_tuple("ComposerOutcome").field(o).finish(),
+            Self::MyCard(c) => f.debug_tuple("MyCard").field(c).finish(),
+            Self::ReminderComposeInfo(r) => f.debug_tuple("ReminderComposeInfo").field(r).finish(),
         }
     }
 }
@@ -511,6 +654,7 @@ pub enum HostCall {
         cli_msg_id: String,
         update_conversation_preview: bool,
         persist_conversations: bool,
+        cloud_delete_op_id: Option<u64>,
     },
     DecryptEnvelope {
         payload: Map<String, Value>,
@@ -547,10 +691,70 @@ pub enum HostCall {
         client_id: String,
         quote: Option<E2eeQuoteArg>,
     },
-    // U6
+    // U8
     ShowCard {
-        conv_id: String,
+        conv_id: Option<String>,
         text: String,
+    },
+    ResolveMedia {
+        forward_id: u64,
+        conv_id: String,
+        msg_id: String,
+        kind: String,
+    },
+    ResolveFile {
+        forward_id: u64,
+        conv_id: String,
+        msg_id: String,
+        name: String,
+        url: Option<String>,
+    },
+    FetchMediaData {
+        forward_id: u64,
+        url: String,
+    },
+    SendMedia {
+        forward_id: u64,
+        conv_id: String,
+        paths: Vec<String>,
+        cleanup_after: bool,
+    },
+    SendFiles {
+        forward_id: u64,
+        conv_id: String,
+        paths: Vec<String>,
+    },
+    // U11 (reuses `Host::resolve_media` / `Host::resolve_file` serially on the host worker)
+    CloudResolveMedia {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
+        kind: String,
+    },
+    CloudResolveFile {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
+        name: String,
+        url: Option<String>,
+    },
+    // U13
+    SendE2eeSticker {
+        send_id: u64,
+        conv_id: String,
+        cate_id: i64,
+        sticker_id: i64,
+        client_id: String,
+    },
+    SendE2eeContactCard {
+        card_send_id: u64,
+        conv_id: String,
+        client_id: String,
+        contact_uid: String,
+        title: String,
+        phone: String,
+        avatar: String,
+        qr_code_url: String,
     },
 }
 
@@ -686,10 +890,73 @@ impl fmt::Debug for HostCall {
                 .field("send_id", send_id)
                 .field("has_quote", &quote.is_some())
                 .finish(),
-            // U6
-            Self::ShowCard { text, .. } => f
+            // U8
+            Self::ShowCard { conv_id, .. } => f
                 .debug_struct("ShowCard")
-                .field("text_len", &text.len())
+                .field("has_conv_id", &conv_id.is_some())
+                .finish(),
+            Self::ResolveMedia {
+                forward_id, kind, ..
+            } => f
+                .debug_struct("ResolveMedia")
+                .field("forward_id", forward_id)
+                .field("kind", kind)
+                .finish(),
+            Self::ResolveFile {
+                forward_id, url, ..
+            } => f
+                .debug_struct("ResolveFile")
+                .field("forward_id", forward_id)
+                .field("has_url", &url.is_some())
+                .finish(),
+            Self::FetchMediaData { forward_id, .. } => f
+                .debug_struct("FetchMediaData")
+                .field("forward_id", forward_id)
+                .finish(),
+            Self::SendMedia {
+                forward_id,
+                paths,
+                cleanup_after,
+                ..
+            } => f
+                .debug_struct("SendMedia")
+                .field("forward_id", forward_id)
+                .field("paths_count", &paths.len())
+                .field("cleanup_after", cleanup_after)
+                .finish(),
+            Self::SendFiles {
+                forward_id, paths, ..
+            } => f
+                .debug_struct("SendFiles")
+                .field("forward_id", forward_id)
+                .field("paths_count", &paths.len())
+                .finish(),
+            // U11
+            Self::CloudResolveMedia { op_id, kind, .. } => f
+                .debug_struct("CloudResolveMedia")
+                .field("op_id", op_id)
+                .field("kind", kind)
+                .finish(),
+            Self::CloudResolveFile { op_id, url, .. } => f
+                .debug_struct("CloudResolveFile")
+                .field("op_id", op_id)
+                .field("has_url", &url.is_some())
+                .finish(),
+            // U13
+            Self::SendE2eeSticker {
+                send_id,
+                cate_id,
+                sticker_id,
+                ..
+            } => f
+                .debug_struct("SendE2eeSticker")
+                .field("send_id", send_id)
+                .field("cate_id", cate_id)
+                .field("sticker_id", sticker_id)
+                .finish(),
+            Self::SendE2eeContactCard { card_send_id, .. } => f
+                .debug_struct("SendE2eeContactCard")
+                .field("card_send_id", card_send_id)
                 .finish(),
         }
     }
@@ -955,6 +1222,11 @@ pub enum Effect {
         send_id: u64,
         params: SendTextParams,
     },
+    // U8
+    /// Allocates a client id from `SessionClient::next_client_id` and returns [`Input::ForwardClientIdAllocated`].
+    AllocClientId {
+        forward_id: u64,
+    },
     // U12
     /// Calls `ZaloApi::fetch_poll_detail` for `Refresh` or `Voters`.
     FetchPollDetailApi {
@@ -1083,6 +1355,85 @@ pub enum Effect {
         now_ms: i64,
         op_id: Option<u64>,
     },
+    // U11
+    /// Fetches zCloud server snapshot (when account/store allow) + SQLite aggregation/dedup.
+    RefreshCloudData {
+        op_id: Option<u64>,
+        media_ids_by_conv: Vec<(String, Vec<String>)>,
+        skip_api_if_no_store: bool,
+    },
+    /// Runs SQLite zCloud media listing + in-memory dedup probe on the serialized store worker.
+    CloudListStore {
+        op_id: u64,
+        conv_id: Option<String>,
+        excluding_self: Option<String>,
+        kind_tags: Vec<String>,
+        sort_by_size: bool,
+        ascending: bool,
+        offset: i64,
+        limit: i64,
+        memory_media: Vec<(String, Vec<String>, Vec<String>)>,
+    },
+    /// Looks up a decoded message in SQLite for `cloud_fetch` / `cloud_delete`.
+    CloudLookupMessage {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
+    },
+    /// Calls `ZaloApi::delete_message_for_me` for a single zCloud item (user-decisions item 12.3).
+    CloudDeleteMessageApi {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        sender_id: String,
+    },
+    /// Clears cached zCloud viewer key/enk credentials on `ResetCloud`.
+    ClearCloudViewerKey,
+
+    // U13
+    FetchStickerCategories {
+        op_id: Option<u64>,
+    },
+    LoadRecentStickersForTabs {
+        op_id: Option<u64>,
+    },
+    LoadRecentStickers {
+        op_id: Option<u64>,
+    },
+    FetchStickerCategoryDetail {
+        op_id: Option<u64>,
+        cate_id: i64,
+    },
+    SearchStickersApi {
+        op_id: Option<u64>,
+        keyword: String,
+        limit: i64,
+    },
+    SuggestStickersApi {
+        op_id: Option<u64>,
+        keyword: String,
+    },
+    SendStickerApi {
+        send_id: u64,
+        params: SendStickerParams,
+    },
+    LoadStickerSuggestPref {
+        op_id: Option<u64>,
+    },
+    SendContactCardApi {
+        card_send_id: u64,
+        params: SendContactCardParams,
+    },
+    CreateReminderApi {
+        op_id: Option<u64>,
+        params: CreateReminderParams,
+    },
+    StartConfirmPromoteDelay {
+        confirm_gen: u64,
+        delay: Duration,
+    },
+    CancelConfirmPromoteDelay,
 
     // U9
     FetchContactsSyncApi {
@@ -1361,6 +1712,11 @@ impl fmt::Debug for Effect {
                 .field("send_id", send_id)
                 .field("params", params)
                 .finish(),
+            // U8
+            Self::AllocClientId { forward_id } => f
+                .debug_struct("AllocClientId")
+                .field("forward_id", forward_id)
+                .finish(),
             // U6
             Self::ResolveMessageIds { resolve_id, .. } => f
                 .debug_struct("ResolveMessageIds")
@@ -1532,6 +1888,96 @@ impl fmt::Debug for Effect {
                 .field("has_alias", &!trimmed_alias.is_empty())
                 .field("op_id", op_id)
                 .finish(),
+            // U11
+            Self::RefreshCloudData {
+                op_id,
+                media_ids_by_conv,
+                skip_api_if_no_store,
+            } => f
+                .debug_struct("RefreshCloudData")
+                .field("op_id", op_id)
+                .field("convs", &media_ids_by_conv.len())
+                .field("skip_api_if_no_store", skip_api_if_no_store)
+                .finish(),
+            Self::CloudListStore {
+                op_id,
+                sort_by_size,
+                ascending,
+                offset,
+                limit,
+                ..
+            } => f
+                .debug_struct("CloudListStore")
+                .field("op_id", op_id)
+                .field("sort_by_size", sort_by_size)
+                .field("ascending", ascending)
+                .field("offset", offset)
+                .field("limit", limit)
+                .finish(),
+            Self::CloudLookupMessage { op_id, .. } => f
+                .debug_struct("CloudLookupMessage")
+                .field("op_id", op_id)
+                .finish(),
+            Self::CloudDeleteMessageApi { op_id, .. } => f
+                .debug_struct("CloudDeleteMessageApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::ClearCloudViewerKey => f.write_str("ClearCloudViewerKey"),
+            // U13
+            Self::FetchStickerCategories { op_id } => f
+                .debug_struct("FetchStickerCategories")
+                .field("op_id", op_id)
+                .finish(),
+            Self::LoadRecentStickersForTabs { op_id } => f
+                .debug_struct("LoadRecentStickersForTabs")
+                .field("op_id", op_id)
+                .finish(),
+            Self::LoadRecentStickers { op_id } => f
+                .debug_struct("LoadRecentStickers")
+                .field("op_id", op_id)
+                .finish(),
+            Self::FetchStickerCategoryDetail { op_id, cate_id } => f
+                .debug_struct("FetchStickerCategoryDetail")
+                .field("op_id", op_id)
+                .field("cate_id", cate_id)
+                .finish(),
+            Self::SearchStickersApi { op_id, limit, .. } => f
+                .debug_struct("SearchStickersApi")
+                .field("op_id", op_id)
+                .field("limit", limit)
+                .finish(),
+            Self::SuggestStickersApi { op_id, .. } => f
+                .debug_struct("SuggestStickersApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::SendStickerApi { send_id, params } => f
+                .debug_struct("SendStickerApi")
+                .field("send_id", send_id)
+                .field("params", params)
+                .finish(),
+            Self::LoadStickerSuggestPref { op_id } => f
+                .debug_struct("LoadStickerSuggestPref")
+                .field("op_id", op_id)
+                .finish(),
+            Self::SendContactCardApi {
+                card_send_id,
+                params,
+            } => f
+                .debug_struct("SendContactCardApi")
+                .field("card_send_id", card_send_id)
+                .field("params", params)
+                .finish(),
+            Self::CreateReminderApi { op_id, params } => f
+                .debug_struct("CreateReminderApi")
+                .field("op_id", op_id)
+                .field("params", params)
+                .finish(),
+            Self::StartConfirmPromoteDelay { confirm_gen, delay } => f
+                .debug_struct("StartConfirmPromoteDelay")
+                .field("confirm_gen", confirm_gen)
+                .field("delay_ms", &delay.as_millis())
+                .finish(),
+            Self::CancelConfirmPromoteDelay => f.write_str("CancelConfirmPromoteDelay"),
             Self::Host(call) => f.debug_tuple("Host").field(call).finish(),
         }
     }

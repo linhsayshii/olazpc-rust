@@ -730,7 +730,7 @@ pub(crate) fn reduce_contacts_input(state: &mut CoreState, input: Input, out: &m
                     "Bỏ chặn thành công"
                 };
                 out.effects.push(Effect::Host(HostCall::ShowCard {
-                    conv_id: open_conv_id.unwrap_or_default(),
+                    conv_id: open_conv_id.filter(|s| !s.is_empty()),
                     text: text.to_owned(),
                 }));
             } else {
@@ -740,7 +740,7 @@ pub(crate) fn reduce_contacts_input(state: &mut CoreState, input: Input, out: &m
                     "Bỏ chặn bạn không thành công. Vui lòng thử lại sau"
                 };
                 out.effects.push(Effect::Host(HostCall::ShowCard {
-                    conv_id: open_conv_id.unwrap_or_default(),
+                    conv_id: open_conv_id.filter(|s| !s.is_empty()),
                     text: text.to_owned(),
                 }));
             }

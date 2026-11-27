@@ -80,21 +80,10 @@ struct ForwardSheet: View {
     private func send() async {
         guard !selected.isEmpty, !busy else { return }
         busy = true; failure = nil
-        // Several selected messages: forwarded oldest first; any success counts as shared.
-        var outcome = MessageActionOutcome.failed("Có lỗi khi chia sẻ tin nhắn")
-        for message in request.all {
-            let one = await engine.forward(message, to: selected)
-            if case .done = outcome { continue }
-            outcome = one
-        }
+        let outcome = await engine.forwardAll(to: selected)
         busy = false
-        if case .done = outcome, !request.more.isEmpty { engine.endSelection() }
         switch outcome {
-        case .done(let text):
-            CardActionCenter.shared.show(text ?? "Đã chia sẻ tin nhắn", in: request.conversationId)
-            dismiss()
-        case .pending(let text):
-            CardActionCenter.shared.show(text, in: request.conversationId)
+        case .done, .pending:
             dismiss()
         case .failed(let text):
             failure = text
@@ -427,7 +416,7 @@ private struct MessageActionPresenter: ViewModifier {
     func body(content: Content) -> some View {
         content
             .sheet(item: Binding(get: { engine.forwardRequest?.conversationId == conversationId ? engine.forwardRequest : nil },
-                                 set: { engine.forwardRequest = $0 })) { request in
+                                 set: { if $0 == nil { engine.dismissForwardRequest() } else { engine.forwardRequest = $0 } })) { request in
                 ForwardSheet(request: request).cardNoticeOverlay()
             }
             // Answered only by its buttons (the dismissal binding must not answer first and turn an OK into a cancel).

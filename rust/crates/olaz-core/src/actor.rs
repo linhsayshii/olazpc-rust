@@ -11,22 +11,27 @@ use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::changes::{ChangeHub, CoreChanges};
-use crate::conversations::{ConversationActionResult, PinBoard};
+use crate::cloud::{CloudActionResult, CloudFetch, CloudPage, MediaResolutionOutcome};
+use crate::composer::{ComposerOutcome, MyCardInfo, ReminderComposeInfo};
+use crate::conversations::{ConversationActionResult, IdentityTable, PinBoard};
 use crate::effect::{Effect, OpResult};
+use crate::forward::ForwardOutcome;
 use crate::input::{Command, Input};
 use crate::messages::IdentitySnapshot;
 use crate::reduce::reduce;
 use crate::runner::EffectRunner;
 use crate::state::{CoreSnapshot, CoreState, SessionSnapshot};
+use crate::stickers::{CardActionOutcome, StickerEntry, StickerSuggestSetting, StickerTab};
 
 enum ActorMsg {
     Input {
         input: Box<Input>,
         ack: Option<oneshot::Sender<u64>>,
     },
+    CoalescedIdentities,
     OpRequest {
         cmd: Box<Command>,
-        reply: oneshot::Sender<OpResult>,
+        reply: oneshot::Sender<(OpResult, u64)>,
     },
     DrainChatPolling {
         max_batches: u32,
@@ -133,6 +138,7 @@ pub struct CoreHandle {
     tracker: Arc<ActivityTracker>,
     state_notify: Arc<Notify>,
     identity_snapshot: Arc<Mutex<Arc<IdentitySnapshot>>>,
+    latest_identities: Arc<Mutex<Option<IdentityTable>>>,
 }
 
 impl CoreHandle {
@@ -154,6 +160,7 @@ impl CoreHandle {
         let tracker = Arc::new(ActivityTracker::new());
         let state_notify = Arc::new(Notify::new());
         let identity_snapshot = Arc::new(Mutex::new(Arc::new(initial.identity_snapshot())));
+        let latest_identities = Arc::new(Mutex::new(None));
         let sink = ActorSink {
             tx: tx.clone(),
             tracker: Arc::clone(&tracker),
@@ -167,6 +174,7 @@ impl CoreHandle {
             Arc::clone(&tracker),
             Arc::clone(&state_notify),
             Arc::clone(&identity_snapshot),
+            Arc::clone(&latest_identities),
         ));
         Self {
             tx,
@@ -174,6 +182,7 @@ impl CoreHandle {
             tracker,
             state_notify,
             identity_snapshot,
+            latest_identities,
         }
     }
 
@@ -246,8 +255,27 @@ impl CoreHandle {
     }
 
     /// Enqueues a command without blocking.
+    ///
+    /// Burst `Command::UpdateIdentities` calls coalesce in place via `latest_identities` so the
+    /// actor mailbox holds at most one pending identity update per burst.
     pub fn send(&self, command: Command) {
         self.sync_identity_snapshot_before_send(&command);
+        if let Command::UpdateIdentities(table) = command {
+            let mut slot = self
+                .latest_identities
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let was_none = slot.is_none();
+            *slot = Some(table);
+            if was_none {
+                self.tracker.increment();
+                if self.tx.send(ActorMsg::CoalescedIdentities).is_err() {
+                    *slot = None;
+                    self.tracker.decrement();
+                }
+            }
+            return;
+        }
         self.tracker.increment();
         if self
             .tx
@@ -280,8 +308,8 @@ impl CoreHandle {
         ack_rx.await.ok()
     }
 
-    /// Sends a request-reply command and awaits its completion [`OpResult`].
-    pub async fn request(&self, command: Command) -> Option<OpResult> {
+    /// Sends a request-reply command and awaits its completion `(OpResult, settled_version)`.
+    pub async fn request_with_version(&self, command: Command) -> Option<(OpResult, u64)> {
         let (reply, rx) = oneshot::channel();
         self.tracker.increment();
         if self
@@ -296,6 +324,67 @@ impl CoreHandle {
             return None;
         }
         rx.await.ok()
+    }
+
+    /// Sends a request-reply command and awaits its completion [`OpResult`].
+    pub async fn request(&self, command: Command) -> Option<OpResult> {
+        self.request_with_version(command).await.map(|(res, _)| res)
+    }
+
+    /// U14: Searches in-memory and SQLite messages for `conv_id`, returning `(matches, settled_version)`.
+    pub async fn search_messages(
+        &self,
+        conv_id: String,
+        query: String,
+        limit: i64,
+    ) -> (Vec<olaz_wire::ChatMessage>, u64) {
+        match self
+            .request_with_version(Command::SearchMessages {
+                conv_id,
+                query,
+                limit,
+            })
+            .await
+        {
+            Some((OpResult::SearchMessages(msgs), ver)) => (msgs, ver),
+            _ => (Vec::new(), self.current_version()),
+        }
+    }
+
+    /// U14: Ensures `message` is loaded into `messages.windows[conv_id]`, returning `(loaded, settled_version)`.
+    pub async fn ensure_message_loaded(
+        &self,
+        conv_id: String,
+        message: olaz_wire::ChatMessage,
+    ) -> (bool, u64) {
+        match self
+            .request_with_version(Command::EnsureMessageLoaded {
+                conv_id,
+                message: Box::new(message),
+            })
+            .await
+        {
+            Some((OpResult::Bool(loaded), ver)) => (loaded, ver),
+            _ => (false, self.current_version()),
+        }
+    }
+
+    /// U14: Finds and loads the message quoted by `message` in `conv_id`, returning `(id, settled_version)`.
+    pub async fn load_quoted_message(
+        &self,
+        conv_id: String,
+        message: olaz_wire::ChatMessage,
+    ) -> (Option<String>, u64) {
+        match self
+            .request_with_version(Command::LoadQuotedMessage {
+                conv_id,
+                message: Box::new(message),
+            })
+            .await
+        {
+            Some((OpResult::OptionalString(id), ver)) => (id, ver),
+            _ => (None, self.current_version()),
+        }
     }
 
     /// Awaits a request-reply command that completes with `OpResult::Unit`.
@@ -326,6 +415,14 @@ impl CoreHandle {
         match self.request(Command::HiddenSearch { query }).await {
             Some(OpResult::HiddenSearch(ids)) => ids,
             _ => None,
+        }
+    }
+
+    /// Awaits a U8 forward command returning [`ForwardOutcome`].
+    pub async fn request_forward_outcome(&self, command: Command) -> ForwardOutcome {
+        match self.request(command).await {
+            Some(OpResult::Forward(outcome)) => outcome,
+            _ => ForwardOutcome::Failed("Có lỗi khi chia sẻ tin nhắn".to_owned()),
         }
     }
 
@@ -415,6 +512,88 @@ impl CoreHandle {
                 ok: false,
                 text: "Không lưu được tên gợi nhớ.".to_owned(),
             },
+        }
+    }
+
+    // U11: zCloud request-reply helpers
+    pub async fn request_cloud_page(&self, command: Command) -> CloudPage {
+        match self.request(command).await {
+            Some(OpResult::CloudPage(page)) => page,
+            _ => CloudPage::default(),
+        }
+    }
+
+    pub async fn request_cloud_fetch(&self, command: Command) -> CloudFetch {
+        match self.request(command).await {
+            Some(OpResult::CloudFetch(res)) => res,
+            _ => CloudFetch::Failed(crate::cloud::CLOUD_FETCH_FAILED_ERROR.to_owned()),
+        }
+    }
+
+    pub async fn request_cloud_action(&self, command: Command) -> CloudActionResult {
+        match self.request(command).await {
+            Some(OpResult::CloudAction(res)) => res,
+            _ => CloudActionResult::default(),
+        }
+    }
+
+    pub async fn request_media_resolution(&self, command: Command) -> MediaResolutionOutcome {
+        match self.request(command).await {
+            Some(OpResult::MediaResolution(res)) => res,
+            _ => MediaResolutionOutcome::Unavailable,
+        }
+    }
+
+    // U13 typed request helpers
+    pub async fn request_sticker_tabs(&self) -> Option<Vec<StickerTab>> {
+        match self.request(Command::StickerTabs).await {
+            Some(OpResult::StickerTabs(v)) => v,
+            _ => None,
+        }
+    }
+
+    pub async fn request_sticker_entries(&self, command: Command) -> Option<Vec<StickerEntry>> {
+        match self.request(command).await {
+            Some(OpResult::StickerEntries(v)) => v,
+            _ => None,
+        }
+    }
+
+    pub async fn request_sticker_suggest_setting(
+        &self,
+        command: Command,
+    ) -> Option<StickerSuggestSetting> {
+        match self.request(command).await {
+            Some(OpResult::StickerSuggestSetting(s)) => s,
+            _ => None,
+        }
+    }
+
+    pub async fn request_card_action(&self, command: Command) -> CardActionOutcome {
+        match self.request(command).await {
+            Some(OpResult::CardActionOutcome(o)) => o,
+            _ => CardActionOutcome::Failed("Không gửi được sticker. Hãy thử lại.".to_owned()),
+        }
+    }
+
+    pub async fn request_composer_outcome(&self, command: Command) -> ComposerOutcome {
+        match self.request(command).await {
+            Some(OpResult::ComposerOutcome(o)) => o,
+            _ => ComposerOutcome::Failed(crate::composer::COMPOSER_GENERIC_FAILURE.to_owned()),
+        }
+    }
+
+    pub async fn request_my_card(&self) -> Option<MyCardInfo> {
+        match self.request(Command::MyCard).await {
+            Some(OpResult::MyCard(c)) => c,
+            _ => None,
+        }
+    }
+
+    pub async fn request_reminder_info(&self, conv_id: String) -> Option<ReminderComposeInfo> {
+        match self.request(Command::ReminderComposeInfo { conv_id }).await {
+            Some(OpResult::ReminderComposeInfo(r)) => r,
+            _ => None,
         }
     }
 
@@ -557,7 +736,7 @@ impl Drop for CoreHandle {
 
 struct ActorWaiters {
     drains: HashMap<u64, oneshot::Sender<u32>>,
-    ops: HashMap<u64, oneshot::Sender<OpResult>>,
+    ops: HashMap<u64, oneshot::Sender<(OpResult, u64)>>,
     next_op_id: u64,
 }
 
@@ -625,7 +804,7 @@ fn dispatch_reduce_output(
                     after_store: false,
                 } => {
                     if let Some(waiter) = waiters.ops.remove(&op_id) {
-                        let _ = waiter.send(result);
+                        let _ = waiter.send((result, version));
                     }
                 }
                 other => runner_effects.push(other),
@@ -654,10 +833,33 @@ async fn run_actor(
     tracker: Arc<ActivityTracker>,
     state_notify: Arc<Notify>,
     identity_snapshot: Arc<Mutex<Arc<IdentitySnapshot>>>,
+    latest_identities: Arc<Mutex<Option<IdentityTable>>>,
 ) {
     let mut waiters = ActorWaiters::new();
     while let Some(msg) = rx.recv().await {
         match msg {
+            ActorMsg::CoalescedIdentities => {
+                let maybe_table = {
+                    let mut slot = latest_identities
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    slot.take()
+                };
+                if let Some(table) = maybe_table {
+                    let out = reduce(&mut state, Input::Command(Command::UpdateIdentities(table)));
+                    let _ = dispatch_reduce_output(
+                        &mut state,
+                        out,
+                        &runner,
+                        &sink,
+                        &changes,
+                        &state_notify,
+                        &identity_snapshot,
+                        &mut waiters,
+                    );
+                }
+                tracker.decrement();
+            }
             ActorMsg::Input { input, ack } => {
                 let out = reduce(&mut state, *input);
                 let version = dispatch_reduce_output(
@@ -743,6 +945,10 @@ async fn run_actor(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "unit tests assert invariants on synthetic fixtures"
+)]
 mod tests {
     use olaz_net::LoginAccount;
 
@@ -845,6 +1051,25 @@ mod tests {
         assert_eq!(post_settle.as_ref().map(|h| h.name.as_str()), Some("Hùng"));
         let me = core.identity_snapshot().lookup_person("100");
         assert_eq!(me.as_ref().map(|h| h.name.as_str()), Some("Bạn"));
+        core.stop();
+    }
+
+    #[tokio::test]
+    async fn burst_update_identities_coalesces_to_latest_table() {
+        let core = CoreHandle::start(Arc::new(NoopRunner), Handle::current());
+        for i in 0..2_000usize {
+            let mut tbl = IdentityTable::default();
+            tbl.aliases.insert("u1".to_owned(), format!("alias-{i}"));
+            core.send(Command::UpdateIdentities(tbl));
+        }
+        let rev = core.settle().await;
+        assert!(rev.is_some());
+        core.wait_idle().await;
+        let full = core.full_snapshot().await.expect("full snapshot");
+        assert_eq!(
+            full.contacts.aliases.get("u1").map(String::as_str),
+            Some("alias-1999")
+        );
         core.stop();
     }
 }

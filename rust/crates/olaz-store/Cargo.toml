@@ -13,6 +13,8 @@ rusqlite = { version = "0.37", features = ["functions"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 olaz-json = { path = "../olaz-json" }
 olaz-wire = { path = "../olaz-wire" }
+icu_normalizer = "2.4"
+icu_properties = "2.4"
 thiserror = "2"
 
 [dev-dependencies]
