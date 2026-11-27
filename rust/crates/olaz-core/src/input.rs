@@ -1,5 +1,6 @@
 //! Inputs to the pure reducer: external commands and effect completions.
 
+use crate::pins::{BoardRawTopics, PinnedList, RefreshBoardFollowup, UnpinBoardPurpose};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -28,6 +29,10 @@ use crate::media::{
     UploadedPhotoResult, UploadedVideoResult, VideoMetadata,
 };
 use crate::messages::{ContactsState, HistoryFreshness};
+use crate::notify::{
+    CardActionOutcomeData, FriendRequestOriginKind, MuteInfo, NotifAuthorization, PinReminderRef,
+    RawResponderBuckets,
+};
 use crate::state::{CoreFailKind, FailReason, PersistedTransportState};
 use crate::stickers::{StickerEntry, StickerSource, StickerSuggestSetting};
 use crate::typed_chat::TypedChatEnvelope;
@@ -445,6 +450,138 @@ pub enum Command {
         keys: Vec<String>,
         persist: bool,
     },
+    // U16
+    SetNotificationsEnabled {
+        enabled: bool,
+    },
+    SetNotificationSound {
+        enabled: bool,
+    },
+    SetMessagePreview {
+        shown: bool,
+    },
+    SetNotifAuthorization {
+        auth: NotifAuthorization,
+    },
+    MuteConversation {
+        conv_id: String,
+        duration_secs: i64,
+        now_ms: i64,
+    },
+    UnmuteConversation {
+        conv_id: String,
+        now_ms: i64,
+    },
+    IsConversationMuted {
+        conv_id: String,
+        now_ms: i64,
+    },
+    HandleNotificationSettingsPayload {
+        payload: Map<String, Value>,
+    },
+    LoadNotificationPreferences,
+    NotifyIncomingBatch {
+        messages: Vec<ChatMessage>,
+        now_ms: i64,
+    },
+    PerformCardAction {
+        conv_id: String,
+        msg_id: String,
+        action_ref: String,
+    },
+    SuggestedStickers {
+        conv_id: String,
+        msg_id: String,
+    },
+    ContactCardState {
+        uid: String,
+    },
+    ContactProfile {
+        uid: String,
+    },
+    PrepareFriendRequest {
+        uid: String,
+        conv_id: String,
+        via: FriendRequestOriginKind,
+    },
+    SubmitFriendRequest {
+        uid: String,
+        message: String,
+    },
+    SaveAlias {
+        uid: String,
+        name: String,
+    },
+    GroupInvitePreview {
+        url: String,
+    },
+    JoinGroup {
+        url: String,
+        preview_group_id: Option<String>,
+    },
+    ReminderWatch {
+        conv_id: String,
+        msg_id: String,
+        signature: String,
+    },
+    RespondReminder {
+        conv_id: String,
+        msg_id: String,
+        accept: bool,
+    },
+    ReminderResponders {
+        conv_id: String,
+        msg_id: String,
+    },
+    ResetCardState,
+    FireReminderWatchTimer {
+        waiter_id: u64,
+    },
+    SyncPinReminderRefs {
+        conv_id: String,
+        refs: Vec<PinReminderRef>,
+    },
+
+    // --- Board pins domain (U7) ---
+    RefreshBoardPins {
+        conv_id: String,
+    },
+    RewatchPins,
+    PinMessage {
+        conv_id: String,
+        msg_id: String,
+    },
+    Pin {
+        conv_id: String,
+        msg_id: String,
+        replacing: Option<String>,
+    },
+    RequestUnpin {
+        conv_id: String,
+        topic_ref: String,
+    },
+    RequestUnpinMessage {
+        conv_id: String,
+        msg_id: String,
+    },
+    Unpin {
+        conv_id: String,
+        topic_ref: String,
+    },
+    HandlePinsState {
+        state_json: Map<String, Value>,
+    },
+    HandlePinTopicEvent {
+        conv_id: String,
+    },
+    LoadPinnedMessage {
+        conv_id: String,
+        topic_ref: String,
+    },
+    SeedPins {
+        lists: BTreeMap<String, PinnedList>,
+        raw_topics: BTreeMap<String, BoardRawTopics>,
+    },
     // U12
     WatchPoll {
         id: String,
@@ -523,22 +660,6 @@ pub enum Command {
     SeedPolls {
         polls: Box<crate::polls::PollsState>,
     },
-    // U7: temporary write-throughs from Swift board pins until U7 lands.
-    SyncBoardPins {
-        conv_id: String,
-        list: Option<crate::polls::BoardPinList>,
-    },
-    // U7: temporary write-through from Swift raw board topics until U7 lands.
-    SyncBoardRawTopics {
-        conv_id: String,
-        raw: Option<crate::polls::BoardRawTopics>,
-    },
-    // U7: temporary write-through for `pins_state` WebContent/test events until U7 lands.
-    HandlePinsState {
-        state: Map<String, Value>,
-    },
-    // U7: temporary clear on `resetMessageActions()` until U7 lands.
-    ClearBoardCaches,
     // U11: zCloud
     RefreshCloud,
     CloudList {
@@ -1020,6 +1141,113 @@ impl fmt::Debug for Command {
                 .field("count", &keys.len())
                 .field("persist", persist)
                 .finish(),
+            // U16
+            Self::SetNotificationsEnabled { enabled } => f
+                .debug_struct("SetNotificationsEnabled")
+                .field("enabled", enabled)
+                .finish(),
+            Self::SetNotificationSound { enabled } => f
+                .debug_struct("SetNotificationSound")
+                .field("enabled", enabled)
+                .finish(),
+            Self::SetMessagePreview { shown } => f
+                .debug_struct("SetMessagePreview")
+                .field("shown", shown)
+                .finish(),
+            Self::SetNotifAuthorization { auth } => f
+                .debug_struct("SetNotifAuthorization")
+                .field("auth", auth)
+                .finish(),
+            Self::MuteConversation {
+                duration_secs,
+                now_ms,
+                ..
+            } => f
+                .debug_struct("MuteConversation")
+                .field("duration_secs", duration_secs)
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::UnmuteConversation { now_ms, .. } => f
+                .debug_struct("UnmuteConversation")
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::IsConversationMuted { now_ms, .. } => f
+                .debug_struct("IsConversationMuted")
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::HandleNotificationSettingsPayload { payload } => f
+                .debug_struct("HandleNotificationSettingsPayload")
+                .field("keys", &payload.len())
+                .finish(),
+            Self::LoadNotificationPreferences => f.write_str("LoadNotificationPreferences"),
+            Self::NotifyIncomingBatch { messages, now_ms } => f
+                .debug_struct("NotifyIncomingBatch")
+                .field("count", &messages.len())
+                .field("now_ms", now_ms)
+                .finish(),
+            Self::PerformCardAction { .. } => f.write_str("PerformCardAction"),
+            Self::SuggestedStickers { .. } => f.write_str("SuggestedStickers"),
+            Self::ContactCardState { .. } => f.write_str("ContactCardState"),
+            Self::ContactProfile { .. } => f.write_str("ContactProfile"),
+            Self::PrepareFriendRequest { via, .. } => f
+                .debug_struct("PrepareFriendRequest")
+                .field("via", via)
+                .finish(),
+            Self::SubmitFriendRequest { message, .. } => f
+                .debug_struct("SubmitFriendRequest")
+                .field("msg_len", &message.len())
+                .finish(),
+            Self::SaveAlias { name, .. } => f
+                .debug_struct("SaveAlias")
+                .field("name_len", &name.len())
+                .finish(),
+            Self::GroupInvitePreview { .. } => f.write_str("GroupInvitePreview"),
+            Self::JoinGroup {
+                preview_group_id, ..
+            } => f
+                .debug_struct("JoinGroup")
+                .field("has_preview_gid", &preview_group_id.is_some())
+                .finish(),
+            Self::ReminderWatch { signature, .. } => f
+                .debug_struct("ReminderWatch")
+                .field("has_sig", &!signature.is_empty())
+                .finish(),
+            Self::RespondReminder { accept, .. } => f
+                .debug_struct("RespondReminder")
+                .field("accept", accept)
+                .finish(),
+            Self::ReminderResponders { .. } => f.write_str("ReminderResponders"),
+            Self::ResetCardState => f.write_str("ResetCardState"),
+            Self::FireReminderWatchTimer { waiter_id } => f
+                .debug_struct("FireReminderWatchTimer")
+                .field("waiter_id", waiter_id)
+                .finish(),
+            Self::SyncPinReminderRefs { refs, .. } => f
+                .debug_struct("SyncPinReminderRefs")
+                .field("count", &refs.len())
+                .finish(),
+            // U7
+            Self::RefreshBoardPins { .. } => f.write_str("RefreshBoardPins"),
+            Self::RewatchPins => f.write_str("RewatchPins"),
+            Self::PinMessage { .. } => f.write_str("PinMessage"),
+            Self::Pin { replacing, .. } => f
+                .debug_struct("Pin")
+                .field("has_replacing", &replacing.is_some())
+                .finish(),
+            Self::RequestUnpin { .. } => f.write_str("RequestUnpin"),
+            Self::RequestUnpinMessage { .. } => f.write_str("RequestUnpinMessage"),
+            Self::Unpin { .. } => f.write_str("Unpin"),
+            Self::HandlePinsState { state_json } => f
+                .debug_struct("HandlePinsState")
+                .field("keys", &state_json.len())
+                .finish(),
+            Self::HandlePinTopicEvent { .. } => f.write_str("HandlePinTopicEvent"),
+            Self::LoadPinnedMessage { .. } => f.write_str("LoadPinnedMessage"),
+            Self::SeedPins { lists, raw_topics } => f
+                .debug_struct("SeedPins")
+                .field("lists", &lists.len())
+                .field("raw_topics", &raw_topics.len())
+                .finish(),
             // U12
             Self::WatchPoll { now_ms, .. } => {
                 f.debug_struct("WatchPoll").field("now_ms", now_ms).finish()
@@ -1087,19 +1315,6 @@ impl fmt::Debug for Command {
                 .field("sync_epoch", sync_epoch)
                 .finish(),
             Self::SeedPolls { polls } => f.debug_tuple("SeedPolls").field(polls).finish(),
-            Self::SyncBoardPins { list, .. } => f
-                .debug_struct("SyncBoardPins")
-                .field("present", &list.is_some())
-                .finish(),
-            Self::SyncBoardRawTopics { raw, .. } => f
-                .debug_struct("SyncBoardRawTopics")
-                .field("present", &raw.is_some())
-                .finish(),
-            Self::HandlePinsState { state } => f
-                .debug_struct("HandlePinsState")
-                .field("keys", &state.len())
-                .finish(),
-            Self::ClearBoardCaches => f.write_str("ClearBoardCaches"),
             Self::RefreshCloud => f.write_str("RefreshCloud"),
             Self::CloudList {
                 kind,
@@ -1807,6 +2022,123 @@ pub enum Input {
         ttl: i64,
         now_ms: i64,
         error_type: Option<String>,
+        op_id: Option<u64>,
+    },
+    // U16
+    NotificationPrefsLoaded {
+        enabled: bool,
+        sound: bool,
+        mutes: Option<BTreeMap<String, MuteInfo>>,
+        op_id: Option<u64>,
+    },
+    NotifAuthResolved {
+        auth: NotifAuthorization,
+        op_id: Option<u64>,
+    },
+    SetMuteApiDone {
+        req_id: u64,
+        ok: bool,
+    },
+    NotifyProfilesFetched {
+        batch_id: u64,
+        profiles: Map<String, Value>,
+    },
+    SuggestedStickersFetched {
+        op_id: u64,
+        rows: Option<Vec<Map<String, Value>>>,
+    },
+    ContactProfileFetched {
+        op_id: u64,
+        uid: String,
+        row: Option<Map<String, Value>>,
+    },
+    SubmitFriendDone {
+        op_id: u64,
+        ok: bool,
+    },
+    SaveAliasDone {
+        op_id: u64,
+        uid: String,
+        trimmed_name: String,
+        ok: bool,
+    },
+    GroupInvitePreviewDone {
+        op_id: u64,
+        url: String,
+        resp: Option<Map<String, Value>>,
+    },
+    JoinGroupDone {
+        op_id: u64,
+        fallback_group_id: Option<String>,
+        result: Result<Map<String, Value>, olaz_api::ApiError>,
+    },
+    ReminderWatchTimeout {
+        waiter_id: u64,
+    },
+    ReminderDetailFetched {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
+        event_id: String,
+        resp: Option<Map<String, Value>>,
+    },
+    RespondReminderDone {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
+        event_id: String,
+        accept: bool,
+        ok: bool,
+        detail_resp: Option<Map<String, Value>>,
+    },
+    ReminderRespondersFetched {
+        op_id: u64,
+        resp: Option<Map<String, Value>>,
+    },
+    ReminderResponderProfilesFetched {
+        op_id: u64,
+        buckets: RawResponderBuckets,
+        profiles: Map<String, Value>,
+    },
+    CategoryStickerSent {
+        op_id: u64,
+        outcome: CardActionOutcomeData,
+    },
+
+    // --- Board pins domain (U7) ---
+    BoardPinsFetched {
+        conv_id: String,
+        req_gen: u64,
+        result: Result<Map<String, Value>, String>,
+        followup: RefreshBoardFollowup,
+    },
+    BoardPinsFetchSkipped {
+        conv_id: String,
+        req_gen: u64,
+        followup: RefreshBoardFollowup,
+    },
+    UnpinBoardTopicDone {
+        purpose: UnpinBoardPurpose,
+        error: Option<String>,
+    },
+    PinBoardMessageDone {
+        pin_op_id: u64,
+        error: Option<String>,
+    },
+    PinTopicApproved {
+        conv_id: String,
+    },
+    RefreshBoardPinsApproved {
+        conv_id: String,
+    },
+    PinnedMessageLookupDone {
+        conv_id: String,
+        row: Option<olaz_store::StoredMessage>,
+        op_id: Option<u64>,
+    },
+    PinnedEnsureMessageLoadedDone {
+        msg_id: String,
+        loaded: bool,
         op_id: Option<u64>,
     },
     // U11
@@ -2602,6 +2934,139 @@ impl fmt::Debug for Input {
                 .field("ttl", ttl)
                 .field("now_ms", now_ms)
                 .field("error_type", error_type)
+                .field("op_id", op_id)
+                .finish(),
+            // U16
+            Self::NotificationPrefsLoaded {
+                enabled,
+                sound,
+                mutes,
+                op_id,
+            } => f
+                .debug_struct("NotificationPrefsLoaded")
+                .field("enabled", enabled)
+                .field("sound", sound)
+                .field("mutes_count", &mutes.as_ref().map(BTreeMap::len))
+                .field("op_id", op_id)
+                .finish(),
+            Self::NotifAuthResolved { auth, op_id } => f
+                .debug_struct("NotifAuthResolved")
+                .field("auth", auth)
+                .field("op_id", op_id)
+                .finish(),
+            Self::SetMuteApiDone { req_id, ok } => f
+                .debug_struct("SetMuteApiDone")
+                .field("req_id", req_id)
+                .field("ok", ok)
+                .finish(),
+            Self::NotifyProfilesFetched { batch_id, profiles } => f
+                .debug_struct("NotifyProfilesFetched")
+                .field("batch_id", batch_id)
+                .field("profiles", &profiles.len())
+                .finish(),
+            Self::SuggestedStickersFetched { op_id, rows } => f
+                .debug_struct("SuggestedStickersFetched")
+                .field("op_id", op_id)
+                .field("rows", &rows.as_ref().map(Vec::len))
+                .finish(),
+            Self::ContactProfileFetched { op_id, row, .. } => f
+                .debug_struct("ContactProfileFetched")
+                .field("op_id", op_id)
+                .field("has_row", &row.is_some())
+                .finish(),
+            Self::SubmitFriendDone { op_id, ok } => f
+                .debug_struct("SubmitFriendDone")
+                .field("op_id", op_id)
+                .field("ok", ok)
+                .finish(),
+            Self::SaveAliasDone { op_id, ok, .. } => f
+                .debug_struct("SaveAliasDone")
+                .field("op_id", op_id)
+                .field("ok", ok)
+                .finish(),
+            Self::GroupInvitePreviewDone { op_id, resp, .. } => f
+                .debug_struct("GroupInvitePreviewDone")
+                .field("op_id", op_id)
+                .field("has_resp", &resp.is_some())
+                .finish(),
+            Self::JoinGroupDone { op_id, result, .. } => f
+                .debug_struct("JoinGroupDone")
+                .field("op_id", op_id)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::ReminderWatchTimeout { waiter_id } => f
+                .debug_struct("ReminderWatchTimeout")
+                .field("waiter_id", waiter_id)
+                .finish(),
+            Self::ReminderDetailFetched { op_id, resp, .. } => f
+                .debug_struct("ReminderDetailFetched")
+                .field("op_id", op_id)
+                .field("has_resp", &resp.is_some())
+                .finish(),
+            Self::RespondReminderDone {
+                op_id, accept, ok, ..
+            } => f
+                .debug_struct("RespondReminderDone")
+                .field("op_id", op_id)
+                .field("accept", accept)
+                .field("ok", ok)
+                .finish(),
+            Self::ReminderRespondersFetched { op_id, resp } => f
+                .debug_struct("ReminderRespondersFetched")
+                .field("op_id", op_id)
+                .field("has_resp", &resp.is_some())
+                .finish(),
+            Self::ReminderResponderProfilesFetched {
+                op_id, profiles, ..
+            } => f
+                .debug_struct("ReminderResponderProfilesFetched")
+                .field("op_id", op_id)
+                .field("profiles", &profiles.len())
+                .finish(),
+            Self::CategoryStickerSent { op_id, outcome } => f
+                .debug_struct("CategoryStickerSent")
+                .field("op_id", op_id)
+                .field("outcome", outcome)
+                .finish(),
+            // U7
+            Self::BoardPinsFetched {
+                req_gen,
+                result,
+                followup,
+                ..
+            } => f
+                .debug_struct("BoardPinsFetched")
+                .field("req_gen", req_gen)
+                .field("ok", &result.is_ok())
+                .field("followup", followup)
+                .finish(),
+            Self::BoardPinsFetchSkipped {
+                req_gen, followup, ..
+            } => f
+                .debug_struct("BoardPinsFetchSkipped")
+                .field("req_gen", req_gen)
+                .field("followup", followup)
+                .finish(),
+            Self::UnpinBoardTopicDone { purpose, error } => f
+                .debug_struct("UnpinBoardTopicDone")
+                .field("purpose", purpose)
+                .field("ok", &error.is_none())
+                .finish(),
+            Self::PinBoardMessageDone { pin_op_id, error } => f
+                .debug_struct("PinBoardMessageDone")
+                .field("pin_op_id", pin_op_id)
+                .field("ok", &error.is_none())
+                .finish(),
+            Self::PinTopicApproved { .. } => f.write_str("PinTopicApproved"),
+            Self::RefreshBoardPinsApproved { .. } => f.write_str("RefreshBoardPinsApproved"),
+            Self::PinnedMessageLookupDone { row, op_id, .. } => f
+                .debug_struct("PinnedMessageLookupDone")
+                .field("found", &row.is_some())
+                .field("op_id", op_id)
+                .finish(),
+            Self::PinnedEnsureMessageLoadedDone { loaded, op_id, .. } => f
+                .debug_struct("PinnedEnsureMessageLoadedDone")
+                .field("loaded", loaded)
                 .field("op_id", op_id)
                 .finish(),
             // U11

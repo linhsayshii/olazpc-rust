@@ -441,7 +441,7 @@ extension ZaloSessionClient {
         } catch { throw RustCore.mapError(error) }
     }
 
-    func setMuteAPI(convId: String, isGroup: Bool, durationSeconds: Int, unmute: Bool) async throws {
+    func setMuteAPI(convId: String, isGroup: Bool, durationSeconds: Int, unmute: Bool, startTimeSec: Int64? = nil) async throws {
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
         _ = try await post(
             service: "profile",
@@ -450,7 +450,7 @@ extension ZaloSessionClient {
                 "toid": cleanId,
                 "duration": unmute ? 0 : durationSeconds,
                 "action": unmute ? 3 : 1,
-                "startTime": Int64(Date().timeIntervalSince1970),
+                "startTime": startTimeSec ?? Int64(Date().timeIntervalSince1970),
                 "muteType": isGroup ? 2 : 1,
                 "imei": imei
             ]

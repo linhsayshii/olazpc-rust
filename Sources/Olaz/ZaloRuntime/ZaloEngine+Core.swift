@@ -230,6 +230,8 @@ internal struct OptimisticMessageOverlay {
         case delete(msgIds: Set<String>, undo: DeleteUndo)
         case undoDelete(restored: [ChatMessage])
         case star(msgId: String, on: Bool)
+        case pin(item: PinnedItem, replacingRef: String?)
+        case unpin(ref: String)
     }
 
     let token: UUID
@@ -249,6 +251,9 @@ internal struct OptimisticMessageOverlay {
     var suppressedStarMsg: (starred: Bool, menuStar: MessageMenu.Star?)?
     var suppressedStarSetVersion: UInt64 = 0
     var suppressedStarInSet: Bool?
+    var suppressedPinsVersion: UInt64 = 0
+    var suppressedHasPinList: Bool = false
+    var suppressedPinList: PinnedList?
 }
 
 /// Commands queued on the MainActor while `CoreEngine` completes its one-time async creation.
@@ -406,9 +411,11 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         }
     }
 
-    func refreshBoardPins(convId: String) async {
-        guard let engine else { return }
-        await engine.refreshBoardPins(for: convId)
+    func refreshBoardPins(convId: String) async -> Bool {
+        guard let engine else { return false }
+        return await MainActor.run {
+            engine.traceU4Host("refresh_board_pins", args: ["conv_id": convId])
+        }
     }
 
     func markReadBoundary(convId: String, seenTarget: SeenTargetRecord?) async {
@@ -515,7 +522,11 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
     func notifyIncomingMessages(messages: [ChatMessageRecord]) async {
         guard let engine, !messages.isEmpty else { return }
         let mapped = messages.map(ChatMessage.init(record:))
-        await engine.notifyIncomingBatchMessages(mapped)
+        await MainActor.run {
+            engine.trackNotificationTask { [weak engine] in
+                await engine?.notifyIncomingBatchMessages(mapped)
+            }
+        }
     }
 
     func showBatchTyping(convId: String, senderId: String) async {
@@ -676,12 +687,10 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         }
     }
 
-    func pinTopic(convId: String) async {
-        guard let engine else { return }
-        await MainActor.run {
-            if engine.traceHost("pin_topic", args: ["conv_id": convId]) {
-                engine.handlePinTopicEvent(conversationId: convId)
-            }
+    func pinTopic(convId: String) async -> Bool {
+        guard let engine else { return false }
+        return await MainActor.run {
+            engine.traceHost("pin_topic", args: ["conv_id": convId])
         }
     }
 
@@ -895,6 +904,75 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
     func mediaStageFile(sourcePath: String, stem: String, ext: String?) async -> String? {
         guard let engine else { return nil }
         return await engine.hostMediaStageFile(sourcePath: sourcePath, stem: stem, ext: ext)
+    }
+
+    // MARK: - Notification & Card-Action Host Effects (U16)
+
+    func notifyBanners(banners: [NotifyBannerPayloadRecord]) async {
+        guard let engine, !banners.isEmpty else { return }
+        await MainActor.run {
+            for banner in banners {
+                engine.hostNotifyBanner(banner)
+            }
+        }
+    }
+
+    func requestNotifAuth() async -> NotifAuthorizationRecord {
+        guard let engine else { return .unavailable }
+        let auth = await engine.requestNotificationAuthorization()
+        return auth.coreRecord
+    }
+
+    func startCall(uid: String, video: Bool) async {
+        guard let engine else { return }
+        await MainActor.run {
+            engine.startCall(to: uid, video: video)
+        }
+    }
+
+    func sendCategorySticker(
+        convId: String,
+        cateId: Int32,
+        stickerId: Int32
+    ) async -> CardActionOutcomeRecord {
+        guard let engine else {
+            return .unsupported(text: CardActionOutcome.defaultUnsupported)
+        }
+        let outcome = await engine.sendCategorySticker(
+            in: convId,
+            category: Int(cateId),
+            sticker: Int(stickerId)
+        )
+        return ZaloEngine.mapCardActionOutcomeToRecord(outcome)
+    }
+
+    func refreshContacts() async {
+        guard let engine else { return }
+        await MainActor.run {
+            engine.refreshContacts()
+        }
+    }
+
+    func armReminderWatchTimer(waiterId: UInt64, delaySecs: Double) async -> Bool {
+        guard let engine else { return false }
+        return await MainActor.run {
+            engine.armLocalReminderWatchTimer(waiterId: waiterId, delaySecs: delaySecs)
+        }
+    }
+
+    func cancelReminderWatchTimer(waiterId: UInt64) async {
+        guard let engine else { return }
+        await MainActor.run {
+            engine.reminderWatchTimerTasks[waiterId]?.cancel()
+            engine.reminderWatchTimerTasks.removeValue(forKey: waiterId)
+        }
+    }
+
+    // U14: temporary host boundary until U14's core `ensure_message_loaded` lands on main.
+    func ensureMessageLoaded(convId: String, message: ChatMessageRecord) async -> Bool {
+        guard let engine else { return false }
+        await engine.waitForCoreMirrorDrain()
+        return await engine.ensureMessageLoaded(ChatMessage(record: message), in: convId)
     }
 }
 
@@ -1586,6 +1664,7 @@ extension ZaloEngine {
             }
             self.pushCoreContactsIfRunning()
             self.pushCoreHistoryFreshnessIfRunning()
+            self.pushCorePinsIfRunning()
             if let openId = self.openConversationId {
                 core.setOpenConversation(id: openId)
             }
@@ -1604,6 +1683,24 @@ extension ZaloEngine {
             }
             let sendTypingEnabled = self.userDefaults.object(forKey: OlazPrefs.sendTyping) as? Bool ?? true
             core.setSendTypingEnabled(enabled: sendTypingEnabled)
+            core.setMessagePreview(shown: self.notificationSettings.showsPreview)
+            if self.notificationSettings.authorization != .unknown {
+                core.setInitialNotificationAuth(auth: self.notificationSettings.authorization.coreRecord)
+            }
+            if self.notificationSettings.isLoaded {
+                let mutesPayload: [[String: Any]] = self.notificationSettings.mutes.map { id, info in
+                    ["id": id, "startTime": info.startTime, "duration": info.duration]
+                }
+                let settingsPayload: [String: Any] = [
+                    "kind": "settings",
+                    "enabled": self.notificationSettings.enabled,
+                    "sound": self.notificationSettings.sound,
+                    "hasSoundSetting": self.notificationSettings.hasSoundSetting,
+                    "mutes": mutesPayload,
+                ]
+                core.handleNotificationSettingsPayload(payloadJson: Self.jsonString(for: settingsPayload))
+            }
+            self.pushAllCorePinsIfRunning()
             if let autoDel = self.autoDelete {
                 for (convId, ttl) in autoDel where ttl > 0 {
                     core.setAutoDeleteTtl(convId: convId, ttlMs: ttl)
@@ -1627,17 +1724,6 @@ extension ZaloEngine {
                 || initialPolls.syncEpoch > 0
             {
                 core.seedPolls(polls: initialPolls)
-            }
-            // U7: seed temporary read-only board caches into core until U7 owns board pins.
-            for (convId, list) in self.pins {
-                core.syncBoardPins(convId: convId, list: list.boardPinListRecord)
-            }
-            for (convId, entry) in self.cachedBoardRawTopics {
-                core.syncBoardRawTopics(
-                    convId: convId,
-                    version: entry.version,
-                    topicsJson: Self.jsonString(for: entry.topics)
-                )
             }
             if let fileLimit = self.cloud.plan?.fileLimit {
                 core.seedMediaCloudFileLimit(limit: fileLimit)
@@ -2307,6 +2393,65 @@ extension ZaloEngine {
             }
         }
 
+        if let notifRec = batch.notificationSettings {
+            var next = notificationSettings
+            next.applyCoreRecord(notifRec)
+            if next != notificationSettings {
+                notificationSettings = next
+            }
+        }
+
+        if let aliasEntries = batch.aliases {
+            var next: [String: String] = [:]
+            next.reserveCapacity(aliasEntries.count)
+            for entry in aliasEntries {
+                next[entry.uid] = entry.alias
+            }
+            if cachedAliases != next {
+                cachedAliases = next
+            }
+        }
+
+        if let pinsSnap = batch.pins {
+            var nextLists: [String: PinnedList] = [:]
+            nextLists.reserveCapacity(pinsSnap.lists.count)
+            for entry in pinsSnap.lists {
+                let items = entry.items.map { it in
+                    PinnedItem(
+                        ref: it.refId,
+                        kind: PinnedItem.Kind(rawValue: it.kind) ?? .note,
+                        title: it.title,
+                        sender: it.sender,
+                        thumbnail: it.thumbnail.flatMap(URL.init(string:)),
+                        msgId: it.msgId,
+                        cliMsgId: it.cliMsgId
+                    )
+                }
+                nextLists[entry.convId] = PinnedList(
+                    ready: entry.ready,
+                    canPin: entry.canPin,
+                    items: items,
+                    limit: Int(entry.limit)
+                )
+            }
+            if pins != nextLists {
+                pins = nextLists
+            }
+            var nextRaw: [String: (version: Int64, topics: [String: [String: Any]])] = [:]
+            nextRaw.reserveCapacity(pinsSnap.rawTopics.count)
+            for entry in pinsSnap.rawTopics {
+                let rawObj = JSONLossless.parseObject(string: entry.topicsJson) ?? [:]
+                var topics: [String: [String: Any]] = [:]
+                for (tid, val) in rawObj {
+                    if let row = val as? [String: Any] {
+                        topics[tid] = row
+                    }
+                }
+                nextRaw[entry.convId] = (version: entry.version, topics: topics)
+            }
+            cachedBoardRawTopics = nextRaw
+        }
+
         if !optimisticMessageOverlays.isEmpty {
             reapplyActiveOptimisticOverlays(for: batch)
         }
@@ -2392,6 +2537,35 @@ extension ZaloEngine {
             token: token,
             convId: convId,
             kind: .star(msgId: msgId, on: on)
+        ))
+        return token
+    }
+
+    @discardableResult
+    internal func beginOptimisticPinOverlay(
+        convId: String,
+        item: PinnedItem,
+        replacingRef: String?
+    ) -> UUID {
+        let token = UUID()
+        optimisticMessageOverlays.append(OptimisticMessageOverlay(
+            token: token,
+            convId: convId,
+            kind: .pin(item: item, replacingRef: replacingRef)
+        ))
+        return token
+    }
+
+    @discardableResult
+    internal func beginOptimisticUnpinOverlay(
+        convId: String,
+        ref: String
+    ) -> UUID {
+        let token = UUID()
+        optimisticMessageOverlays.append(OptimisticMessageOverlay(
+            token: token,
+            convId: convId,
+            kind: .unpin(ref: ref)
         ))
         return token
     }
@@ -2483,6 +2657,12 @@ extension ZaloEngine {
                 } else {
                     cachedStarredIds.remove(msgId)
                 }
+            }
+        case .pin, .unpin:
+            if overlay.suppressedPinsVersion >= targetVersion,
+               overlay.suppressedHasPinList,
+               pins[overlay.convId] != overlay.suppressedPinList {
+                pins[overlay.convId] = overlay.suppressedPinList
             }
         }
     }
@@ -2663,6 +2843,53 @@ extension ZaloEngine {
                         cachedStarredIds.insert(msgId)
                     } else {
                         cachedStarredIds.remove(msgId)
+                    }
+                }
+            case .pin(let item, let replacingRef):
+                if batch.pins != nil {
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedPinsVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedPinsVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedHasPinList = true
+                        optimisticMessageOverlays[i].suppressedPinList = pins[overlay.convId]
+                    }
+                    if var list = pins[overlay.convId] {
+                        var changed = false
+                        if let replacingRef {
+                            let prev = list.items.count
+                            list.items.removeAll { $0.ref == replacingRef }
+                            if list.items.count != prev { changed = true }
+                        }
+                        let alreadyPresent = list.items.contains {
+                            $0.ref == item.ref || (!item.msgId.isEmpty && $0.msgId == item.msgId)
+                        }
+                        if !alreadyPresent {
+                            list.items.insert(item, at: 0)
+                            changed = true
+                        }
+                        if changed {
+                            pins[overlay.convId] = list
+                        }
+                    }
+                }
+            case .unpin(let ref):
+                if batch.pins != nil {
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedPinsVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedPinsVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedHasPinList = true
+                        optimisticMessageOverlays[i].suppressedPinList = pins[overlay.convId]
+                    }
+                    if var list = pins[overlay.convId] {
+                        let prev = list.items.count
+                        list.items.removeAll { $0.ref == ref }
+                        if list.items.count != prev {
+                            pins[overlay.convId] = list
+                        }
                     }
                 }
             }
@@ -3207,6 +3434,42 @@ extension ZaloEngine {
         core.seedHistoryFreshness(entries: entries)
     }
 
+    internal func pushCorePinsIfRunning() {
+        guard !isApplyingCoreMirror, let core = coreLifecycle.core else { return }
+        guard !pins.isEmpty || !cachedBoardRawTopics.isEmpty else { return }
+        var listsDict: [String: Any] = [:]
+        for (convId, list) in pins {
+            listsDict[convId] = [
+                "convId": convId,
+                "ready": list.ready,
+                "canPin": list.canPin,
+                "limit": list.limit,
+                "items": list.items.map { item -> [String: Any] in
+                    [
+                        "ref": item.ref,
+                        "kind": item.kind.rawValue,
+                        "title": item.title,
+                        "sender": item.sender,
+                        "thumb": item.thumbnail?.absoluteString ?? "",
+                        "msgId": item.msgId,
+                        "cliMsgId": item.cliMsgId,
+                    ]
+                },
+            ]
+        }
+        var rawDict: [String: Any] = [:]
+        for (convId, raw) in cachedBoardRawTopics {
+            rawDict[convId] = [
+                "version": raw.version,
+                "topics": raw.topics,
+            ]
+        }
+        core.seedPins(
+            listsJson: Self.jsonString(for: listsDict),
+            rawTopicsJson: Self.jsonString(for: rawDict)
+        )
+    }
+
     internal func applyContactsMirror(_ cRec: ContactsStateRecord) {
         var next = contacts
         next.friends = cRec.friends.map { f in
@@ -3288,6 +3551,76 @@ extension ZaloEngine {
                 let client = sessionClient
                 Task { await client.seedGlobalIdMappings(gidToUid) }
             }
+        }
+    }
+
+    internal func armLocalReminderWatchTimer(waiterId: UInt64, delaySecs: Double) -> Bool {
+        guard let sleepHook = reminderWatchSleep else {
+            return false
+        }
+        reminderWatchTimerTasks[waiterId]?.cancel()
+        reminderWatchTimerTasks[waiterId] = Task { @MainActor [weak self] in
+            let completed = await sleepHook(delaySecs)
+            guard let self, completed, !Task.isCancelled else { return }
+            self.reminderWatchTimerTasks.removeValue(forKey: waiterId)
+            self.coreLifecycle.core?.fireReminderWatchTimer(waiterId: waiterId)
+        }
+        return true
+    }
+
+    internal func hostNotifyBanner(_ banner: NotifyBannerPayloadRecord) {
+        let resolvedAvatarURL = banner.avatarUrl.flatMap { $0.isEmpty ? nil : URL(string: $0) }
+        let record = NotifyBannerRecord(
+            title: banner.title,
+            body: banner.body,
+            convId: banner.convId,
+            senderId: banner.senderId,
+            senderName: banner.senderName,
+            isGroup: banner.isGroup,
+            avatarURL: resolvedAvatarURL?.absoluteString,
+            silent: banner.silent
+        )
+        notifyBannerHook?(record)
+        if traceNotifyHost("notify_banner", args: [
+            "conv_id": banner.convId,
+            "sender_id": banner.senderId,
+            "is_group": banner.isGroup,
+            "has_avatar": resolvedAvatarURL != nil,
+            "silent": banner.silent,
+            "title_len": banner.title.count,
+            "sender_name_len": banner.senderName.count,
+            "body_len": banner.body.count,
+        ]) {
+            NativeNotifier.shared.notifyIncomingMessage(
+                title: banner.title,
+                body: banner.body,
+                conversationId: banner.convId,
+                senderId: banner.senderId,
+                senderName: banner.senderName,
+                isGroup: banner.isGroup,
+                avatarURL: resolvedAvatarURL,
+                silent: banner.silent
+            )
+        }
+    }
+
+    internal func pushCorePinsIfRunning(for convId: String) {
+        guard !isApplyingCoreMirror, let core = coreLifecycle.core else { return }
+        let items = (pins[convId]?.items ?? []).compactMap { item -> PinReminderRefRecord? in
+            guard item.kind == .reminder, !item.ref.isEmpty else { return nil }
+            return PinReminderRefRecord(
+                msgId: item.msgId,
+                cliMsgId: item.cliMsgId,
+                reminderRef: item.ref
+            )
+        }
+        core.syncPinReminderRefs(convId: convId, items: items)
+    }
+
+    internal func pushAllCorePinsIfRunning() {
+        guard !isApplyingCoreMirror, coreLifecycle.core != nil else { return }
+        for convId in pins.keys {
+            pushCorePinsIfRunning(for: convId)
         }
     }
 
@@ -3681,46 +4014,4 @@ extension ZaloEngine {
         }
     }
 
-    // U7: push Swift's board pins for one conversation into core's read-only board mirror.
-    internal func pushCoreBoardPinsIfRunning(for convId: String) {
-        guard let core = coreLifecycle.core else { return }
-        core.syncBoardPins(convId: convId, list: pins[convId]?.boardPinListRecord)
-    }
-
-    // U7: push Swift's board pins & raw topics for one conversation into core's read-only board mirror.
-    internal func pushCoreBoardStateIfRunning(for convId: String) {
-        guard let core = coreLifecycle.core else { return }
-        core.syncBoardPins(convId: convId, list: pins[convId]?.boardPinListRecord)
-        if let raw = cachedBoardRawTopics[convId] {
-            core.syncBoardRawTopics(
-                convId: convId,
-                version: raw.version,
-                topicsJson: Self.jsonString(for: raw.topics)
-            )
-        } else {
-            core.syncBoardRawTopics(convId: convId, version: 0, topicsJson: nil)
-        }
-    }
-}
-
-// U7: temporary conversion into `BoardPinListRecord` until U7 owns board pins.
-extension PinnedList {
-    var boardPinListRecord: BoardPinListRecord {
-        BoardPinListRecord(
-            ready: ready,
-            canPin: canPin,
-            limit: Int64(limit),
-            items: items.map { item in
-                BoardPinItemRecord(
-                    refId: item.ref,
-                    kind: item.kind.rawValue,
-                    title: item.title,
-                    sender: item.sender,
-                    thumbnail: item.thumbnail?.absoluteString,
-                    msgId: item.msgId,
-                    cliMsgId: item.cliMsgId
-                )
-            }
-        )
-    }
 }

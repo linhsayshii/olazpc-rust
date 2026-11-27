@@ -110,6 +110,7 @@ extension ZaloEngine {
     /// Starts a 1-1 voice / video call to `uid`, or opens the participant picker for a group video call (`g...`).
     func startCall(to uid: String, video: Bool) {
         guard !uid.isEmpty else { return }
+        guard traceHost("start_call", args: ["uid": uid, "video": video]) else { return }
         if uid.hasPrefix("g"), !video {
             showCallNotice("Chỉ gọi video cho nhóm", "Zalo chỉ hỗ trợ gọi video trong nhóm. Hãy chọn nút gọi video.")
             return

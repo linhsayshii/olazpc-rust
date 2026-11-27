@@ -128,6 +128,13 @@ struct PinnedList: Equatable, Sendable {
     /// Pins the board holds at most (official `pinLimit`).
     var limit = ZaloWireParser.defaultPinLimit
 
+    init(ready: Bool = false, canPin: Bool = false, items: [PinnedItem] = [], limit: Int = ZaloWireParser.defaultPinLimit) {
+        self.ready = ready
+        self.canPin = canPin
+        self.items = items
+        self.limit = limit
+    }
+
     init(json: [String: Any]) {
         ready = json["ready"] as? Bool ?? false
         canPin = json["canPin"] as? Bool ?? false
@@ -830,6 +837,27 @@ extension ZaloEngine {
     // MARK: Ghim tin nhắn
 
     func pin(_ message: ChatMessage, replacing ref: String? = nil) {
+        if let core = coreLifecycle.core {
+            let conversation = message.conversationId
+            let key = "\(conversation)|\(message.id)|pin"
+            guard messageActionsBusy.insert(key).inserted else { return }
+            let overlayToken: UUID? = insertPinOptimistically(message, replacing: ref).map { item in
+                beginOptimisticPinOverlay(convId: conversation, item: item, replacingRef: ref)
+            }
+            trackMessageActionTask { [weak self] in
+                guard let self else { return }
+                defer { self.messageActionsBusy.remove(key) }
+                if let v = try? await core.pin(convId: conversation, msgId: message.id, replacing: ref) {
+                    if let token = overlayToken {
+                        self.resolveOptimisticOverlay(token: token, targetVersion: v)
+                    }
+                    await self.waitForMirrorVersion(v)
+                } else if let token = overlayToken {
+                    self.cancelOptimisticOverlay(token: token)
+                }
+            }
+            return
+        }
         let conversation = message.conversationId
         let key = "\(conversation)|\(message.id)|pin"
         guard messageActionsBusy.insert(key).inserted else { return }
@@ -873,6 +901,21 @@ extension ZaloEngine {
     }
 
     func requestUnpin(_ item: PinnedItem, in conversationId: String) {
+        if let core = coreLifecycle.core {
+            if openConversationId == conversationId, messageConfirm == nil {
+                mirroredMessageConfirmCoreId = nil
+                messageConfirm = MessageActionConfirm(
+                    conversationId: conversationId,
+                    action: .unpin(ref: item.ref),
+                    title: item.kind == .message ? "Bỏ ghim tin nhắn" : "Bỏ ghim",
+                    message: item.kind == .message ? "Bạn muốn bỏ ghim tin nhắn?" : "Bạn muốn bỏ ghim nội dung này?",
+                    ok: "Bỏ ghim",
+                    destructive: true
+                )
+            }
+            core.requestUnpin(convId: conversationId, topicRef: item.ref)
+            return
+        }
         ask(MessageActionConfirm(
             conversationId: conversationId,
             action: .unpin(ref: item.ref),
@@ -940,12 +983,38 @@ extension ZaloEngine {
                 case .recallMany:
                     endSelection()
                 case .pin(let message, let replacing):
-                    core.answerMessageConfirm(ok: ok, nowMs: tsMs)
-                    pin(message, replacing: replacing)
+                    let pinOverlayToken: UUID? = insertPinOptimistically(message, replacing: replacing).map { item in
+                        beginOptimisticPinOverlay(convId: confirm.conversationId, item: item, replacingRef: replacing)
+                    }
+                    trackMessageActionTask { [weak self] in
+                        guard let self else { return }
+                        if let v = try? await core.answerMessageConfirmAsync(ok: ok, nowMs: tsMs) {
+                            if let token = pinOverlayToken {
+                                self.resolveOptimisticOverlay(token: token, targetVersion: v)
+                            }
+                            await self.waitForMirrorVersion(v)
+                        } else if let token = pinOverlayToken {
+                            self.cancelOptimisticOverlay(token: token)
+                        }
+                    }
                     return
                 case .unpin(let ref):
-                    core.answerMessageConfirm(ok: ok, nowMs: tsMs)
-                    unpin(ref, in: confirm.conversationId)
+                    var unpinOverlayToken: UUID?
+                    if pins[confirm.conversationId]?.items.contains(where: { $0.ref == ref }) == true {
+                        removePinOptimistically(ref, in: confirm.conversationId)
+                        unpinOverlayToken = beginOptimisticUnpinOverlay(convId: confirm.conversationId, ref: ref)
+                    }
+                    trackMessageActionTask { [weak self] in
+                        guard let self else { return }
+                        if let v = try? await core.answerMessageConfirmAsync(ok: ok, nowMs: tsMs) {
+                            if let token = unpinOverlayToken {
+                                self.resolveOptimisticOverlay(token: token, targetVersion: v)
+                            }
+                            await self.waitForMirrorVersion(v)
+                        } else if let token = unpinOverlayToken {
+                            self.cancelOptimisticOverlay(token: token)
+                        }
+                    }
                     return
                 }
             }
@@ -968,8 +1037,12 @@ extension ZaloEngine {
     // MARK: Pins of the open conversation
 
     internal func refreshBoardPins(for convId: String) async {
-        // U7: push current Swift board pins & raw topics into core before tracing/fetching.
-        pushCoreBoardStateIfRunning(for: convId)
+        if let core = coreLifecycle.core {
+            if let v = try? await core.refreshBoardPins(convId: convId) {
+                await waitForMirrorVersion(v)
+            }
+            return
+        }
         guard traceU4Host("refresh_board_pins", args: ["conv_id": convId]) else {
             return
         }
@@ -987,8 +1060,6 @@ extension ZaloEngine {
         EngineLog.shared.write("pins: list ok group=\(group) rows=\((box.dict["items"] as? [Any])?.count ?? -1) items=\(parsed.list.items.count)")
         cachedBoardRawTopics[convId] = (version: parsed.version, topics: parsed.raw)
         if pins[convId] != parsed.list { pins[convId] = parsed.list }
-        // U7: write-through fetched board pins & raw topics into core before returning to CoreHost.
-        pushCoreBoardStateIfRunning(for: convId)
     }
 
     /// Log shape of a board request error: the server code and the API path, never ids or text.
@@ -999,14 +1070,24 @@ extension ZaloEngine {
     }
 
     func handlePins(state: [String: Any]) {
+        if let core = coreLifecycle.core {
+            core.handlePinsState(stateJson: Self.jsonString(for: state))
+        }
         guard let json = state["pins"] as? [String: Any], let conversation = json["convId"] as? String, !conversation.isEmpty else { return }
         let list = PinnedList(json: json)
         if pins[conversation] != list { pins[conversation] = list }
-        // U7: write-through pins_state event into core until U7 owns board pins.
-        pushCoreBoardPinsIfRunning(for: conversation)
     }
 
     func rewatchPins() {
+        if let core = coreLifecycle.core {
+            trackMessageActionTask { [weak self] in
+                guard let self else { return }
+                if let v = try? await core.rewatchPins() {
+                    await self.waitForMirrorVersion(v)
+                }
+            }
+            return
+        }
         guard let id = openConversationId else { return }
         trackMessageActionTask { [weak self] in
             await self?.refreshBoardPins(for: id)
@@ -1027,8 +1108,6 @@ extension ZaloEngine {
         mirroredMessageConfirmCoreId = nil
         deleteUndo = nil
         pins = [:]
-        // U7: clear core's temporary board caches until U7 owns board pins.
-        coreLifecycle.core?.clearBoardCaches()
         messageActionsBusy = []
         pendingDeletedMessages = [:]
         optimisticOverlayFenceTasks.values.forEach { $0.cancel() }

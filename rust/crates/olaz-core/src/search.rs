@@ -244,7 +244,9 @@ mod tests {
         ) {
         }
         async fn show_typing(&self, _conv_id: String, _uid: String, _on_pc: bool) {}
-        async fn pin_topic(&self, _conv_id: String) {}
+        async fn pin_topic(&self, _conv_id: String) -> bool {
+            true
+        }
         async fn group_notice(
             &self,
             _act: String,
