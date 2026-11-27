@@ -335,6 +335,17 @@ enum EngineProbe {
         let outDir = URL(fileURLWithPath: outPath, isDirectory: true)
         try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
 
+        func argValue(_ flag: String) -> String? {
+            guard let idx = CommandLine.arguments.firstIndex(of: flag),
+                  idx + 1 < CommandLine.arguments.count else { return nil }
+            let val = CommandLine.arguments[idx + 1]
+            return val.isEmpty ? nil : val
+        }
+        let probePeer = argValue("--probe-peer")
+            ?? ProcessInfo.processInfo.environment["OLAZ_PROBE_PEER"].flatMap { $0.isEmpty ? nil : $0 }
+        let probeGroup = argValue("--probe-group")
+            ?? ProcessInfo.processInfo.environment["OLAZ_PROBE_GROUP"].flatMap { $0.isEmpty ? nil : $0 }
+
         @MainActor
         func collectOutlineRowCounts(_ root: NSView) -> [Int] {
             var counts: [Int] = []
@@ -409,8 +420,8 @@ enum EngineProbe {
         }
         let hasGhostG0 = engine.conversations.contains(where: { $0.id == "g0" || $0.id == "0" })
         let withPreviewCount = engine.conversations.filter { $0.preview != nil }.count
-        let meName = engine.conversations.first(where: { $0.id == "31612076530602762" })?.displayName ?? "-"
-        print("ui-smoke: metrics convs=\(engine.conversations.count) withPreview=\(withPreviewCount) ghostG0=\(hasGhostG0) meName=\(meName)")
+        let peerName = probePeer.flatMap { pid in engine.conversations.first(where: { $0.id == pid })?.displayName } ?? "-"
+        print("ui-smoke: metrics convs=\(engine.conversations.count) withPreview=\(withPreviewCount) ghostG0=\(hasGhostG0) peerName=\(peerName)")
         if let win = shell.window ?? NSApp.windows.first(where: { $0.canBecomeMain && $0.isVisible }) {
             win.setFrame(NSRect(x: 160, y: 140, width: 1260, height: 760), display: true, animate: false)
         }
@@ -475,8 +486,9 @@ enum EngineProbe {
 
         // 2b. 1-1 Friend Chat (verify synced 1-1 history + alias display name)
         let friendIds = Set(engine.contacts.friends.map(\.id))
-        let targetFriend = engine.conversations.first(where: { $0.id == "31612076530602762" && $0.preview != nil })
-            ?? engine.conversations.first(where: { !$0.isGroup && $0.id != engine.selfConversationId && friendIds.contains($0.id) && $0.preview != nil })
+        let targetFriend = probePeer.flatMap { pid in
+            engine.conversations.first(where: { $0.id == pid && $0.preview != nil })
+        } ?? engine.conversations.first(where: { !$0.isGroup && $0.id != engine.selfConversationId && friendIds.contains($0.id) && $0.preview != nil })
         if let fr = targetFriend {
             shell.destination = .inbox
             shell.selection = fr.id
@@ -488,9 +500,9 @@ enum EngineProbe {
         }
 
         // 3. Group chat + right-side Inspector (board pins, members, shared media)
-        let targetGroup = engine.conversations.first(where: { $0.id == "g5603230834364738744" })
-            ?? engine.conversations.first(where: { $0.id == "g5053215961091409242" })
-            ?? engine.conversations.first(where: { $0.isGroup && $0.preview != nil })
+        let targetGroup = probeGroup.flatMap { gid in
+            engine.conversations.first(where: { $0.id == gid || $0.id == ZaloWireParser.groupConvId(gid) })
+        } ?? engine.conversations.first(where: { $0.isGroup && $0.preview != nil })
         if let grp = targetGroup {
             shell.destination = .inbox
             shell.selection = grp.id
@@ -515,14 +527,14 @@ enum EngineProbe {
         }
         captureWindow("04_strangers.png")
 
-        // 5. Danh bạ: Bạn bè (313 friends) + FriendCard
+        // 5. Danh bạ: Bạn bè + FriendCard
         shell.destination = .friends
         try? await Task.sleep(for: .milliseconds(600))
         shell.contactSelection = engine.visibleFriends.first?.id
         try? await Task.sleep(for: .milliseconds(900))
         captureWindow("05_contacts_friends.png")
 
-        // 6. Danh bạ: Nhóm và cộng đồng (103 groups) + GroupCard
+        // 6. Danh bạ: Nhóm và cộng đồng + GroupCard
         shell.destination = .groups
         try? await Task.sleep(for: .milliseconds(600))
         shell.contactSelection = engine.visibleGroups.first?.id

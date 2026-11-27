@@ -199,19 +199,19 @@ import Testing
     @Test func webchatMsgInfoActionListIsSystem() {
         let evt = ZaloWireParser.parseWireMessage(
             [
-                "msgId": "8522", "cliMsgId": "1795", "uidFrom": "0", "idTo": "peer", "msgType": "webchat", "ts": 1_795_463_690_898,
-                "content": ["action": "msginfo.actionlist", "title": "Hoàng Việt Linh đã ghim tin nhắn a đi dạy về ah.",
+                "msgId": "5001", "cliMsgId": "4001", "uidFrom": "0", "idTo": "peer", "msgType": "webchat", "ts": 1_700_000_001_000,
+                "content": ["action": "msginfo.actionlist", "title": "Người A đã ghim tin nhắn Hẹn gặp lúc 10 giờ nhé.",
                             "description": "", "href": "", "params": "{}", "thumb": "", "type": "", "childnumber": 0]
             ],
             myUid: "me"
         )
         guard case .message(let msg, _) = evt else { Issue.record("expected message"); return }
         #expect(msg.kind == .system)
-        #expect(msg.text == "Hoàng Việt Linh đã ghim tin nhắn a đi dạy về ah.")
+        #expect(msg.text == "Người A đã ghim tin nhắn Hẹn gặp lúc 10 giờ nhé.")
         // A plain webchat (string or object content) stays text.
         for content: Any in ["hi", ["title": "hi"]] {
             let plain = ZaloWireParser.parseWireMessage(
-                ["msgId": "8523", "uidFrom": "peer", "idTo": "me", "msgType": "webchat", "ts": 1, "content": content], myUid: "me")
+                ["msgId": "5002", "uidFrom": "peer", "idTo": "me", "msgType": "webchat", "ts": 1, "content": content], myUid: "me")
             guard case .message(let m, _) = plain else { Issue.record("expected message"); return }
             #expect(m.kind == .text)
         }
@@ -222,19 +222,19 @@ import Testing
         func header(_ action: String, from: String) -> String {
             let evt = ZaloWireParser.parseWireMessage(
                 [
-                    "msgId": "9\(action)", "uidFrom": from, "idTo": "3993665107146848278", "msgType": "group.poll", "ts": 1,
+                    "msgId": "9\(action)", "uidFrom": from, "idTo": "5000101", "msgType": "group.poll", "ts": 1,
                     "content": ["action": action, "title": "", "description": "",
-                                "params": #"{"pollId":1192926841,"question":"Khỏe không","uid":"x","dName":"Việt Linh","pollVer":2}"#]
+                                "params": #"{"pollId":5001001,"question":"Họp lúc mấy giờ","uid":"x","dName":"Người A","pollVer":2}"#]
                 ],
                 myUid: "me", isGroupHint: true
             )
             guard case .message(let msg, _) = evt, case .poll(let info) = msg.kind else { return "" }
             return info.header
         }
-        #expect(header("create", from: "peer") == "Việt Linh tạo cuộc bình chọn mới: Khỏe không")
-        #expect(header("vote", from: "peer") == "Việt Linh tham gia cuộc bình chọn: Khỏe không")
-        #expect(header("update", from: "peer") == "Việt Linh đổi lựa chọn trong cuộc bình chọn: Khỏe không")
-        #expect(header("vote", from: "0") == "Bạn tham gia cuộc bình chọn: Khỏe không")
+        #expect(header("create", from: "peer") == "Người A tạo cuộc bình chọn mới: Họp lúc mấy giờ")
+        #expect(header("vote", from: "peer") == "Người A tham gia cuộc bình chọn: Họp lúc mấy giờ")
+        #expect(header("update", from: "peer") == "Người A đổi lựa chọn trong cuộc bình chọn: Họp lúc mấy giờ")
+        #expect(header("vote", from: "0") == "Bạn tham gia cuộc bình chọn: Họp lúc mấy giờ")
     }
 
     @Test @MainActor func recallEnforces24hGuardAndApplyRemoteRecallUpdatesBubbleSQLiteAndPreview() async throws {
@@ -324,24 +324,24 @@ import Testing
         let direct = ZaloSessionClient.extractE2EESendResponse([
             "error_code": 0,
             "data": [
-                "clientId": "1795343225629",
-                "minGlobalMsgId": "8517564749999",
-                "ts": 1_795_343_225_631
+                "clientId": "1700000100001",
+                "minGlobalMsgId": "9000000001001",
+                "ts": 1_700_000_100_005
             ]
         ])
-        #expect(direct.msgId == "8517564749999")
-        #expect(direct.tsMs == 1_795_343_225_631)
+        #expect(direct.msgId == "9000000001001")
+        #expect(direct.tsMs == 1_700_000_100_005)
 
         let nested = ZaloSessionClient.extractE2EESendResponse([
             "data": [
                 "data": [
-                    "minGlobalMsgId": "8517564750001",
-                    "ts": 1_795_343_300
+                    "minGlobalMsgId": "9000000001002",
+                    "ts": 1_700_000_200
                 ]
             ]
         ])
-        #expect(nested.msgId == "8517564750001")
-        #expect(nested.tsMs == 1_795_343_300_000)
+        #expect(nested.msgId == "9000000001002")
+        #expect(nested.tsMs == 1_700_000_200_000)
     }
 
     @Test @MainActor func temporaryClientIdRowUpgradesOnE2EELockedEchoInMemoryAndSQLite() async throws {
@@ -350,19 +350,19 @@ import Testing
         defer { try? FileManager.default.removeItem(at: root) }
 
         let store = try ZaloSQLiteStore(path: root.appendingPathComponent("history.sqlite3").path)
-        let cliId = "1795343225629"
-        let srvId = "8517564748888"
+        let cliId = "1700000100001"
+        let srvId = "9000000001003"
 
         let localPlain = ChatMessage(
             id: cliId,
-            conversationId: "3161",
+            conversationId: "3000101",
             senderId: "100",
             senderName: "Bạn",
             senderAvatar: nil,
             isMine: true,
             kind: .text,
             text: "Tin nhắn E2EE vừa gửi",
-            date: Date(timeIntervalSince1970: 1_795_343_225),
+            date: Date(timeIntervalSince1970: 1_700_000_100),
             status: .sent,
             quote: nil,
             reactions: [],
@@ -375,14 +375,14 @@ import Testing
         // Locked server echo arrives with real server msgId and matching clientId
         let lockedEcho = ChatMessage(
             id: srvId,
-            conversationId: "3161",
+            conversationId: "3000101",
             senderId: "100",
             senderName: "Bạn",
             senderAvatar: nil,
             isMine: true,
             kind: .placeholder(symbol: "lock.fill", text: "Tin nhắn mã hóa đầu cuối"),
             text: "Tin nhắn mã hóa đầu cuối",
-            date: Date(timeIntervalSince1970: 1_795_343_225),
+            date: Date(timeIntervalSince1970: 1_700_000_100),
             status: .sent,
             quote: nil,
             reactions: [],
@@ -393,7 +393,7 @@ import Testing
         lockedStored.status = "e2ee_locked"
         try await store.saveMessages([lockedStored])
 
-        let rows = try await store.messages(convId: "3161", limit: 10)
+        let rows = try await store.messages(convId: "3000101", limit: 10)
         #expect(rows.count == 1)
         #expect(rows.first?.id == srvId)
         #expect(rows.first?.clientId == cliId)
@@ -402,9 +402,9 @@ import Testing
 
         // Same upgrade behavior in engine in-memory message list
         let engine = ZaloEngine(dataDirectory: root, useKeychain: false)
-        engine.messages["3161"] = [localPlain]
+        engine.messages["3000101"] = [localPlain]
         engine.mergeMessageIntoMemory(lockedEcho, replacingClientId: cliId)
-        let memMsg = try #require(engine.messages["3161"]?.first)
+        let memMsg = try #require(engine.messages["3000101"]?.first)
         #expect(memMsg.id == srvId)
         #expect(memMsg.clientId == cliId)
         #expect(memMsg.text == "Tin nhắn E2EE vừa gửi")
@@ -426,25 +426,25 @@ import Testing
         account.displayName = "Minh"
         await engine.applyAccountProfile(account)
 
-        let cliId = "1795343225629"
-        let srvId = "8517564748888"
+        let cliId = "1700000100001"
+        let srvId = "9000000001003"
         let sent = ChatMessage(
             id: cliId,
-            conversationId: "3161",
+            conversationId: "3000101",
             senderId: "100",
             senderName: "Minh",
             senderAvatar: nil,
             isMine: true,
             kind: .text,
             text: "Tin nhắn E2EE vừa gửi",
-            date: Date(timeIntervalSince1970: 1_795_343_225),
+            date: Date(timeIntervalSince1970: 1_700_000_100),
             status: .sent,
             quote: nil,
             reactions: [],
             isE2EE: true,
             clientId: cliId
         )
-        engine.messages["3161"] = [sent]
+        engine.messages["3000101"] = [sent]
         try await store.saveMessages([try #require(ZaloWireParser.encodeChatMessage(sent, clientId: cliId))])
 
         // Signal whisper-shaped ciphertext (type 3, version 0x33, proto tag 0x0A) this device cannot decrypt.
@@ -459,22 +459,22 @@ import Testing
                     "msgId": srvId,
                     "cliMsgId": cliId,
                     "uidFrom": "0",
-                    "idTo": "3161",
+                    "idTo": "3000101",
                     "msgType": "webchat",
-                    "ts": 1_795_343_225_631,
+                    "ts": 1_700_000_100_005,
                     "content": cipher,
                 ]]
             ]
         ]
         _ = await engine.applyBatchResponse(echoBatch, persistConversations: false)
 
-        let mem = try #require(engine.messages["3161"])
+        let mem = try #require(engine.messages["3000101"])
         #expect(mem.count == 1)
         #expect(mem.first?.id == srvId)
         #expect(mem.first?.clientId == cliId)
         #expect(mem.first?.text == "Tin nhắn E2EE vừa gửi")
 
-        let rows = try await store.messages(convId: "3161", limit: 10)
+        let rows = try await store.messages(convId: "3000101", limit: 10)
         #expect(rows.count == 1)
         #expect(rows.first?.id == srvId)
         #expect(rows.first?.clientId == cliId)
@@ -490,22 +490,22 @@ import Testing
         let payload: [String: Any] = [
             "data": [
                 "msgs": [
-                    ["msgId": "8517564741111", "cliMsgId": "1795343000001"],
-                    ["msgId": "8517564742222", "cliMsgId": "1795343225629"]
+                    ["msgId": "9000000001011", "cliMsgId": "1700000100000"],
+                    ["msgId": "9000000001012", "cliMsgId": "1700000100001"]
                 ]
             ]
         ]
-        #expect(ZaloEngine.findServerMsgId(in: payload, matchingClientId: "1795343225629") == "8517564742222")
+        #expect(ZaloEngine.findServerMsgId(in: payload, matchingClientId: "1700000100001") == "9000000001012")
         #expect(ZaloEngine.findServerMsgId(in: payload, matchingClientId: "9999999999") == nil)
 
         let preloadNested: [String: Any] = [
             "data": [
                 "msgs": [
-                    "3161_0": #"[{"msgId":"8517564743333","cliMsgId":"1795343225999"}]"#
+                    "3000101_0": #"[{"msgId":"9000000001013","cliMsgId":"1700000100002"}]"#
                 ]
             ]
         ]
-        #expect(ZaloEngine.findServerMsgId(in: preloadNested, matchingClientId: "1795343225999") == "8517564743333")
+        #expect(ZaloEngine.findServerMsgId(in: preloadNested, matchingClientId: "1700000100002") == "9000000001013")
     }
 }
 
