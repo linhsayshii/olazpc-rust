@@ -1662,9 +1662,21 @@ enum StickerRecorderHarness {
             server.stop()
             await engine.finishTearDownForRecording()
 
-            if shouldRecord && server.hadUnscriptedRequest {
+            if server.hadUnscriptedRequest {
                 let unscripted = requests.filter { $0["unscripted"]?.boolValue == true }
-                throw RecorderError.unscriptedRequest(scenario: scenario.name, detail: CaseJSON.array(unscripted).canonicalString())
+                // user-decisions item 18: the old stickers/reminders recording predates /api/board/pinv2.
+                // Recording mode stays fully strict; in replay, tolerate only unscripted /api/board/pinv2
+                // for the reminders case and keep failing on every other unscripted request.
+                let unexpected = shouldRecord
+                    ? unscripted
+                    : unscripted.filter {
+                        !(scenario.name == "reminders"
+                            && $0["kind"]?.stringValue == "http"
+                            && $0["path"]?.stringValue == "/api/board/pinv2")
+                    }
+                if !unexpected.isEmpty {
+                    throw RecorderError.unscriptedRequest(scenario: scenario.name, detail: CaseJSON.array(unexpected).canonicalString())
+                }
             }
 
             var caseDict: [String: CaseJSON] = [
