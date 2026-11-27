@@ -190,7 +190,9 @@ impl Host for ActionsScenarioHost {
     async fn e2ee_disconnected(&self) {}
     async fn voip_control(&self, _act: String, _raw_data: Value, _data: Map<String, Value>) {}
     async fn show_typing(&self, _conv_id: String, _uid: String, _on_pc: bool) {}
-    async fn pin_topic(&self, _conv_id: String) {}
+    async fn pin_topic(&self, _conv_id: String) -> bool {
+        false
+    }
     async fn group_notice(&self, _act: String, _data: Map<String, Value>, _ts: i64) {}
     async fn mute(
         &self,

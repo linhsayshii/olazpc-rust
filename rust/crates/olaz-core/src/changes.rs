@@ -24,6 +24,7 @@ use crate::groups::GroupsState;
 use crate::messages::{
     ContactsState, HistoryFreshness, PendingWindowOp, WindowDelta, coalesce_window_op,
 };
+use crate::pins::PinsSnapshot;
 use crate::state::{CoreState, SessionSnapshot};
 use crate::stickers::StickerSuggestSetting;
 use crate::typing::TypingStatus;
@@ -57,6 +58,8 @@ pub enum DirtyKey {
     AutoDelete,
     StarredIds,
     CachedProfiles,
+    // U7
+    Pins,
     CachedGroups,
     // U12
     Polls,
@@ -128,6 +131,9 @@ pub struct CoreChanges {
     pub starred_ids: Option<BTreeSet<String>>,
     /// Updated cached profile map (`cachedProfiles`).
     pub cached_profiles: Option<BTreeMap<String, CachedProfile>>,
+    // U7
+    /// Updated board pins lists + raw topics snapshot.
+    pub pins: Option<PinsSnapshot>,
     /// Updated cached group map (`cachedGroups`).
     pub cached_groups: Option<BTreeMap<String, CachedGroup>>,
     // U12
@@ -156,6 +162,7 @@ impl fmt::Debug for CoreChanges {
             .field("has_contacts", &self.contacts.is_some())
             .field("has_groups", &self.groups.is_some())
             .field("has_typing", &self.typing.is_some())
+            .field("has_pins", &self.pins.is_some())
             .field("has_forward_request", &self.forward_request.is_some())
             .field("clear_selection", &self.clear_selection)
             .field("has_cached_groups", &self.cached_groups.is_some())
@@ -196,6 +203,8 @@ struct DirtyBuffer {
     auto_delete: Option<Option<BTreeMap<String, i64>>>,
     starred_ids: Option<BTreeSet<String>>,
     cached_profiles: Option<BTreeMap<String, CachedProfile>>,
+    // U7
+    pins: Option<PinsSnapshot>,
     cached_groups: Option<BTreeMap<String, CachedGroup>>,
     // U12
     polls: Option<crate::polls::PollsState>,
@@ -228,6 +237,7 @@ impl DirtyBuffer {
             || self.auto_delete.is_some()
             || self.starred_ids.is_some()
             || self.cached_profiles.is_some()
+            || self.pins.is_some()
             || self.cached_groups.is_some()
             || self.polls.is_some()
             || self.cloud.is_some()
@@ -383,6 +393,10 @@ impl ChangeHub {
                 DirtyKey::CachedProfiles => {
                     buf.cached_profiles = Some(state.contacts.cached_profiles.clone());
                 }
+                // U7
+                DirtyKey::Pins => {
+                    buf.pins = Some(state.pins.snapshot());
+                }
                 DirtyKey::CachedGroups => {
                     buf.cached_groups = Some(state.groups.cached_groups.clone());
                 }
@@ -487,6 +501,8 @@ impl ChangeHub {
                             auto_delete: None,
                             starred_ids: None,
                             cached_profiles: None,
+                            // U7
+                            pins: None,
                             cached_groups: None,
                             // U12
                             polls: None,
@@ -564,6 +580,8 @@ impl ChangeHub {
                         auto_delete: buf.auto_delete.take(),
                         starred_ids: buf.starred_ids.take(),
                         cached_profiles: buf.cached_profiles.take(),
+                        // U7
+                        pins: buf.pins.take(),
                         cached_groups: buf.cached_groups.take(),
                         // U12
                         polls: buf.polls.take(),

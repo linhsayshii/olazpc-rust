@@ -18,6 +18,7 @@ use crate::conversations::{CachedProfile, ConversationsState};
 use crate::forward::{ForwardRequest, ForwardState};
 use crate::groups::GroupsState;
 use crate::messages::{ContactsState, IdentitySnapshot, MessagesState};
+use crate::pins::{PinsSnapshot, PinsState};
 use crate::stickers::{StickerState, StickerSuggestSetting};
 use crate::typing::{TypingState, TypingStatus};
 
@@ -43,12 +44,10 @@ pub struct CoreState {
     pub search: crate::search::SearchState,
     // U6
     pub actions: ActionsState,
+    // U7
+    pub pins: PinsState,
     // U12
     pub polls: crate::polls::PollsState,
-    // U7: temporary read-only board pin mirror written through from Swift until U7 lands.
-    pub board_pins: BTreeMap<String, crate::polls::BoardPinList>,
-    // U7: temporary read-only raw board topics mirror written through from Swift until U7 lands.
-    pub board_raw_topics: BTreeMap<String, crate::polls::BoardRawTopics>,
     // U11
     pub cloud: CloudState,
     // U13
@@ -79,9 +78,10 @@ impl CoreState {
             starred_ids: self.actions.starred_ids.clone(),
             cached_profiles: self.contacts.cached_profiles.clone(),
             last_prune_next_expiry_ms: self.actions.last_prune_next_expiry_ms,
+            // U7
+            pins: self.pins.snapshot(),
             // U12
             polls: self.polls.clone(),
-            board_pins: self.board_pins.clone(),
             // U11
             cloud: self.cloud.snapshot.clone(),
             // U13
@@ -132,10 +132,10 @@ impl fmt::Debug for CoreState {
             .field("forward", &self.forward)
             // U6
             .field("actions", &self.actions)
+            // U7
+            .field("pins", &self.pins)
             // U12
             .field("polls", &self.polls)
-            .field("board_pins_count", &self.board_pins.len())
-            .field("board_raw_topics_count", &self.board_raw_topics.len())
             // U11
             .field("cloud", &self.cloud)
             // U13
@@ -166,9 +166,10 @@ pub struct CoreSnapshot {
     pub starred_ids: BTreeSet<String>,
     pub cached_profiles: BTreeMap<String, CachedProfile>,
     pub last_prune_next_expiry_ms: Option<i64>,
+    // U7
+    pub pins: PinsSnapshot,
     // U12
     pub polls: crate::polls::PollsState,
-    pub board_pins: BTreeMap<String, crate::polls::BoardPinList>,
     // U11
     pub cloud: CloudSnapshotState,
     // U13
@@ -199,9 +200,10 @@ impl fmt::Debug for CoreSnapshot {
             .field("starred_ids_count", &self.starred_ids.len())
             .field("cached_profiles_count", &self.cached_profiles.len())
             .field("last_prune_next_expiry_ms", &self.last_prune_next_expiry_ms)
+            // U7
+            .field("pins", &self.pins)
             // U12
             .field("polls", &self.polls)
-            .field("board_pins_count", &self.board_pins.len())
             // U11
             .field("cloud", &self.cloud)
             // U13

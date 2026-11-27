@@ -756,8 +756,11 @@ pub fn reduce_groups(state: &mut CoreState, input: Input, out: &mut ReduceOutput
                 if state.typing.active.remove(&gid).is_some() {
                     out.dirty.insert(DirtyKey::Typing);
                 }
-                state.board_pins.remove(&gid);
-                state.board_raw_topics.remove(&gid);
+                if state.pins.lists.remove(&gid).is_some()
+                    || state.pins.raw_topics.remove(&gid).is_some()
+                {
+                    out.dirty.insert(DirtyKey::Pins);
+                }
 
                 if state.conversations.open_conversation_id.as_deref() == Some(gid.as_str()) {
                     state.conversations.open_conversation_id = None;
