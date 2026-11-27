@@ -24,12 +24,18 @@ enum ZaloRuntime {
         var sha256: String?
     }
 
+    enum PlannedAction: Equatable, Sendable {
+        case upToDate
+        case installCurrent
+        case stageUpgrade(installed: String?)
+    }
+
     /// The Zalo PC release this Olaz build is tested with. Bumping it (version, DMG URL, DMG checksum) is how Olaz moves
     /// to a newer Zalo: an older runtime is upgraded in the background and swapped in at the next launch.
     static let pinned = Release(
-        version: "26.10.20",
-        url: URL(string: "https://res-download-pc.zadn.vn/mac/ZaloSetup-universal-26.10.20.dmg")!,
-        sha256: "a45d30b7f7b060f76b87722ef419b8f41d23a2913cdef084dcb0955dde8d85a0")
+        version: "26.11.10",
+        url: URL(string: "https://res-download-pc.zadn.vn/mac/ZaloSetup-universal-26.11.10.dmg")!,
+        sha256: "eff7e9c887a1164ae078e919f950b5552ffc3d846f8a63bd12ce88171ba79092")
 
     /// The download button of zalo.me/pc: redirects a Mac browser to the current DMG. Used when the pinned one is gone.
     static let latestLink = URL(string: "https://zalo.me/download/zalo-pc")!
@@ -74,6 +80,21 @@ enum ZaloRuntime {
         NSDictionary(contentsOf: bundle.appendingPathComponent("Contents/Info.plist"))?["CFBundleShortVersionString"] as? String
     }
 
+    /// Decides whether `root` needs a fresh install into `current`, a staged upgrade into `pending`, or nothing.
+    static func plannedAction(root: URL = root, pinned: Release = pinned) -> PlannedAction {
+        let current = root.appendingPathComponent("current", isDirectory: true)
+        let pending = root.appendingPathComponent("pending", isDirectory: true)
+        guard isComplete(current) else { return .installCurrent }
+        let installed = version(of: current)
+        if let installed, !isNewer(pinned.version, than: installed) {
+            return .upToDate
+        }
+        if isComplete(pending), let staged = version(of: pending), !isNewer(pinned.version, than: staged) {
+            return .upToDate
+        }
+        return .stageUpgrade(installed: installed)
+    }
+
     /// At launch, before anything reads the runtime: drops leftovers of interrupted installs and swaps in a prepared upgrade.
     static func prepareForLaunch(root: URL = root) {
         let fm = FileManager.default
@@ -111,7 +132,7 @@ enum ZaloRuntime {
         return false
     }
 
-    /// `ZaloSetup-universal-26.10.20.dmg` → `26.10.20`.
+    /// `ZaloSetup-universal-26.11.10.dmg` → `26.11.10`.
     static func version(fromInstallerName name: String) -> String? {
         name.firstMatch(of: /^ZaloSetup-[A-Za-z0-9]+-(\d+(?:\.\d+)+)\.dmg$/).map { String($0.1) }
     }
@@ -145,6 +166,21 @@ struct ZaloRuntimeInstaller: Sendable {
     var allowsLatest = true
     var work = ZaloRuntime.work
     var progress: @Sendable (Step) -> Void = { _ in }
+
+    /// Installs into `current` when missing, or stages an upgrade from an older runtime into `pending` for next launch.
+    @discardableResult
+    func ensureUpToDate(root: URL = ZaloRuntime.root) async throws -> String? {
+        switch ZaloRuntime.plannedAction(root: root, pinned: release) {
+        case .upToDate:
+            return nil
+        case .installCurrent:
+            return try await install(into: root.appendingPathComponent("current", isDirectory: true))
+        case .stageUpgrade(let installed):
+            let version = try await install(into: root.appendingPathComponent("pending", isDirectory: true))
+            runtimeLog.info("runtime: staged upgrade \(installed ?? "?", privacy: .public) → \(version, privacy: .public)")
+            return version
+        }
+    }
 
     /// Installs into `destination`, replacing what is there; returns the Zalo version installed.
     func install(into destination: URL) async throws -> String {
