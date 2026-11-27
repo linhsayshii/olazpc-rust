@@ -1,14 +1,26 @@
-//! Groups domain state and shared group metadata helpers (U10 + U12).
+//! Groups domain state, pure models, and shared group metadata helpers (U10 + U12).
 //!
-//! Owns `details_json` (`cachedGroupDetails`), `member_cache` (`groupMemberCache`), and
-//! `cached_groups` (`cachedGroups`) alongside U9's [`ContactsState`].
+//! Owns `details_json` (`cachedGroupDetails`), `member_cache` (`groupMemberCache`),
+//! `cached_groups` (`cachedGroups`), and `navigation_request` (`navigationRequest`) alongside U9's
+//! [`ContactsState`].
+//!
+//! Incorporates the three approved fixes from `user-decisions` item 7:
+//! 1. Created groups persist immediately (SQLite conversation + `cachedGroups` pref) even when
+//!    `/api/group/getmg-v2` returns an empty `gridInfoMap`.
+//! 2. Invite "Chưa thêm được …" notice preserves deterministic invite/response order (deduplicated)
+//!    instead of unordered `Set` iteration.
+//! 3. Mention candidates preserve member-list order (deduplicated) and exclude self by normalized
+//!    UID (`normalize_contact_uid`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use olaz_api::{JsonObject, clean_group_member_ids};
 use olaz_store::StoredConversation;
-use olaz_wire::{clean_group_id, group_conv_id, lossless};
+use olaz_wire::{
+    clean_group_id, group_conv_id, lossless, normalize_contact_uid, sanitize_profile_uid,
+    strip_user_prefix,
+};
 use serde_json::{Map, Value, json};
 
 use crate::conversations::{
@@ -19,6 +31,15 @@ use crate::messages::{
     serialize_cached_groups_json,
 };
 
+/// Default failure message when group creation fails (`STR_CREATE_GROUP_FAIL`).
+pub const GROUP_CREATE_DEFAULT_FAILURE: &str = "Tạo nhóm không thành công.";
+
+/// Official toast when an admin API fails with error code 166 (not owner/deputy).
+pub const GROUP_ADMIN_CODE_166_TEXT: &str = "Chỉ có trưởng/phó nhóm thực hiện được tính năng này.";
+
+/// Fallback display name for unknown group members (`ZaloEngine.contactName` / `loadGroupMembers`).
+pub const UNKNOWN_GROUP_MEMBER_NAME: &str = "Người dùng Zalo";
+
 /// Mentionable group member entry (`ChatModels.swift: MentionCandidate`).
 #[derive(Clone, PartialEq, Eq)]
 pub struct MentionCandidate {
@@ -28,12 +49,300 @@ pub struct MentionCandidate {
     pub is_all: bool,
 }
 
+impl MentionCandidate {
+    /// The synthetic `@All` mention candidate prepended to cached group member lists.
+    #[must_use]
+    pub fn all() -> Self {
+        Self {
+            id: "-1".to_owned(),
+            name: "All".to_owned(),
+            avatar: None,
+            is_all: true,
+        }
+    }
+}
+
 impl fmt::Debug for MentionCandidate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MentionCandidate")
             .field("is_all", &self.is_all)
             .field("has_avatar", &self.avatar.is_some())
             .finish()
+    }
+}
+
+/// Group roles derived from a cached group detail (`ZaloEngine+GroupAdmin.swift: GroupRoles`).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct GroupRoles {
+    pub owner: String,
+    pub admins: BTreeSet<String>,
+    /// Official `setting.joinAppr == 1`: new members wait for approval.
+    pub join_approval: bool,
+}
+
+impl fmt::Debug for GroupRoles {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupRoles")
+            .field("has_owner", &!self.owner.is_empty())
+            .field("admins", &self.admins.len())
+            .field("join_approval", &self.join_approval)
+            .finish()
+    }
+}
+
+impl GroupRoles {
+    #[must_use]
+    pub fn is_owner(&self, uid: &str) -> bool {
+        !uid.is_empty() && uid == self.owner
+    }
+
+    #[must_use]
+    pub fn is_admin(&self, uid: &str) -> bool {
+        self.admins.contains(uid)
+    }
+
+    #[must_use]
+    pub fn can_manage(&self, uid: &str) -> bool {
+        self.is_owner(uid) || self.is_admin(uid)
+    }
+
+    /// Port of `GroupRoles.from(_ info: [String: Any])`.
+    #[must_use]
+    pub fn from_info(info: &Map<String, Value>) -> Self {
+        let mut roles = Self {
+            owner: strip_user_prefix(&lossless::string(
+                info.get("creatorId")
+                    .or_else(|| info.get("creator_id"))
+                    .or_else(|| info.get("ownerId")),
+            )),
+            admins: BTreeSet::new(),
+            join_approval: false,
+        };
+        for key in ["adminIds", "admin_ids", "admins"] {
+            if let Some(Value::Array(arr)) = info.get(key) {
+                for raw in arr {
+                    let uid = strip_user_prefix(&lossless::string(Some(raw)));
+                    if !uid.is_empty() && uid != "0" && uid != roles.owner {
+                        roles.admins.insert(uid);
+                    }
+                }
+            }
+        }
+        if let Some(setting) = info.get("setting").and_then(Value::as_object) {
+            roles.join_approval = lossless::int64(setting.get("joinAppr")) == Some(1);
+        }
+        roles
+    }
+}
+
+/// Prepared JPEG group avatar bytes passed into `Command::CreateGroup`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GroupAvatarUpload {
+    pub jpeg: Vec<u8>,
+    pub side: u32,
+}
+
+impl fmt::Debug for GroupAvatarUpload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupAvatarUpload")
+            .field("bytes", &self.jpeg.len())
+            .field("side", &self.side)
+            .finish()
+    }
+}
+
+/// Outcome of `Command::CreateGroup` (`ZaloEngine+GroupCreate.swift: GroupCreateOutcome`).
+#[derive(Clone, PartialEq, Eq)]
+pub enum GroupCreateOutcome {
+    Created {
+        id: String,
+        failed: Vec<String>,
+    },
+    Exists {
+        id: String,
+        text: String,
+    },
+    Invalid {
+        text: String,
+        dropped: Vec<String>,
+    },
+    Failed {
+        title: Option<String>,
+        message: String,
+        closes: bool,
+    },
+    Pending {
+        text: String,
+    },
+}
+
+impl fmt::Debug for GroupCreateOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Created { failed, .. } => f
+                .debug_struct("Created")
+                .field("failed", &failed.len())
+                .finish(),
+            Self::Exists { .. } => f.write_str("Exists"),
+            Self::Invalid { dropped, .. } => f
+                .debug_struct("Invalid")
+                .field("dropped", &dropped.len())
+                .finish(),
+            Self::Failed { closes, .. } => {
+                f.debug_struct("Failed").field("closes", closes).finish()
+            }
+            Self::Pending { .. } => f.write_str("Pending"),
+        }
+    }
+}
+
+/// Admin mutation dispatched through `Effect::GroupAdminApi`.
+#[derive(Clone, PartialEq, Eq)]
+pub enum GroupAdminAction {
+    SetAdmin { uid: String, admin: bool },
+    ChangeOwner { uid: String },
+    BlockMember { uid: String },
+    ReviewPending { uids: Vec<String>, approve: bool },
+    SetJoinApproval { settings: JsonObject },
+}
+
+impl GroupAdminAction {
+    #[must_use]
+    pub const fn ok_text(&self) -> &'static str {
+        match self {
+            Self::SetAdmin { admin: true, .. } => "Đã thêm phó nhóm",
+            Self::SetAdmin { admin: false, .. } => "Đã xóa quyền phó nhóm",
+            Self::ChangeOwner { .. } => "Đã chuyển quyền trưởng nhóm",
+            Self::BlockMember { .. } => "Đã chặn khỏi nhóm",
+            Self::ReviewPending { .. } | Self::SetJoinApproval { .. } => "",
+        }
+    }
+
+    #[must_use]
+    pub const fn fail_text(&self) -> &'static str {
+        match self {
+            Self::SetAdmin { admin: true, .. } => "Thêm quyền phó nhóm không thành công",
+            Self::SetAdmin { admin: false, .. } => "Xóa quyền phó nhóm không thành công",
+            Self::ChangeOwner { .. } => "Có lỗi xảy ra không thể thay đổi trưởng nhóm!",
+            Self::BlockMember { .. } => "Chặn thành viên không thành công",
+            Self::ReviewPending { .. } => "Không thể thực hiện, vui lòng thử lại",
+            Self::SetJoinApproval { .. } => "Không thể thay đổi cài đặt nhóm",
+        }
+    }
+}
+
+impl fmt::Debug for GroupAdminAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SetAdmin { admin, .. } => {
+                f.debug_struct("SetAdmin").field("admin", admin).finish()
+            }
+            Self::ChangeOwner { .. } => f.write_str("ChangeOwner"),
+            Self::BlockMember { .. } => f.write_str("BlockMember"),
+            Self::ReviewPending { uids, approve } => f
+                .debug_struct("ReviewPending")
+                .field("uids", &uids.len())
+                .field("approve", approve)
+                .finish(),
+            Self::SetJoinApproval { settings } => f
+                .debug_struct("SetJoinApproval")
+                .field("keys", &settings.len())
+                .finish(),
+        }
+    }
+}
+
+/// Continuation carried across `Effect::FetchGroupDetailApi` -> `Input::GroupDetailFetched`.
+#[derive(Clone, PartialEq, Eq)]
+pub enum GroupDetailPurpose {
+    Refresh {
+        op_id: Option<u64>,
+        now_ms: i64,
+    },
+    CreateFollowup {
+        op_id: Option<u64>,
+        failed: Vec<String>,
+        avatar_upload_failed: bool,
+        now_ms: i64,
+    },
+    InviteFollowup {
+        op_id: Option<u64>,
+        rejected_ordered: Vec<String>,
+        now_ms: i64,
+    },
+    KickFollowup {
+        op_id: Option<u64>,
+        now_ms: i64,
+    },
+    AdminFollowup {
+        op_id: Option<u64>,
+        ok_text: String,
+        now_ms: i64,
+    },
+    LoadMembers {
+        op_id: Option<u64>,
+        now_ms: i64,
+    },
+}
+
+impl fmt::Debug for GroupDetailPurpose {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refresh { op_id, .. } => f.debug_struct("Refresh").field("op_id", op_id).finish(),
+            Self::CreateFollowup {
+                op_id,
+                failed,
+                avatar_upload_failed,
+                ..
+            } => f
+                .debug_struct("CreateFollowup")
+                .field("op_id", op_id)
+                .field("failed", &failed.len())
+                .field("avatar_upload_failed", avatar_upload_failed)
+                .finish(),
+            Self::InviteFollowup {
+                op_id,
+                rejected_ordered,
+                ..
+            } => f
+                .debug_struct("InviteFollowup")
+                .field("op_id", op_id)
+                .field("rejected", &rejected_ordered.len())
+                .finish(),
+            Self::KickFollowup { op_id, .. } => f
+                .debug_struct("KickFollowup")
+                .field("op_id", op_id)
+                .finish(),
+            Self::AdminFollowup { op_id, .. } => f
+                .debug_struct("AdminFollowup")
+                .field("op_id", op_id)
+                .finish(),
+            Self::LoadMembers { op_id, .. } => {
+                f.debug_struct("LoadMembers").field("op_id", op_id).finish()
+            }
+        }
+    }
+}
+
+/// Continuation carried across `Effect::FetchGroupMemberProfilesApi`.
+#[derive(Clone, PartialEq, Eq)]
+pub enum MemberProfilesPurpose {
+    Mention {
+        query: String,
+        excluding: Vec<String>,
+    },
+    LoadMembers,
+}
+
+impl fmt::Debug for MemberProfilesPurpose {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mention { excluding, .. } => f
+                .debug_struct("Mention")
+                .field("excluding", &excluding.len())
+                .finish(),
+            Self::LoadMembers => f.write_str("LoadMembers"),
+        }
     }
 }
 
@@ -46,6 +355,8 @@ pub struct GroupsState {
     pub member_cache: BTreeMap<String, Vec<MentionCandidate>>,
     /// Group conversation id (`g<grid>`) -> cached name/avatar/members (`cachedGroups`).
     pub cached_groups: BTreeMap<String, CachedGroup>,
+    /// Last created group conversation id requested for UI navigation (`navigationRequest`).
+    pub navigation_request: Option<String>,
 }
 
 impl fmt::Debug for GroupsState {
@@ -54,6 +365,7 @@ impl fmt::Debug for GroupsState {
             .field("details_json", &self.details_json.len())
             .field("member_cache", &self.member_cache.len())
             .field("cached_groups", &self.cached_groups.len())
+            .field("has_nav_request", &self.navigation_request.is_some())
             .finish()
     }
 }
@@ -86,6 +398,205 @@ impl GroupsState {
             })?;
         serde_json::from_str::<Map<String, Value>>(raw_json).ok()
     }
+
+    /// Computes [`GroupRoles`] for `group_id` from `details_json` (`ZaloEngine.groupRoles`).
+    #[must_use]
+    pub fn roles(&self, group_id: &str) -> GroupRoles {
+        self.detail_object(group_id)
+            .map(|info| GroupRoles::from_info(&info))
+            .unwrap_or_default()
+    }
+}
+
+/// Formats the "Chưa thêm được A, B và 3 người khác vào nhóm." notice (`ZaloEngine.notAddedText`).
+#[must_use]
+pub fn not_added_text(names: &[String]) -> String {
+    let shown = names
+        .iter()
+        .take(3)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = names.len().saturating_sub(3);
+    if rest > 0 {
+        format!("Chưa thêm được {shown} và {rest} người khác vào nhóm.")
+    } else {
+        format!("Chưa thêm được {shown} vào nhóm.")
+    }
+}
+
+/// Maps a group admin API error code to the official action-card text.
+#[must_use]
+pub fn admin_error_text(code: Option<i64>, default_fail: &str) -> String {
+    if code == Some(166) {
+        GROUP_ADMIN_CODE_166_TEXT.to_owned()
+    } else {
+        default_fail.to_owned()
+    }
+}
+
+/// Port of `ZaloWireParser.preferredName(_:)`.
+#[must_use]
+pub fn preferred_profile_name(row: &Map<String, Value>) -> String {
+    for key in [
+        "zaloName",
+        "zalo_name",
+        "displayName",
+        "display_name",
+        "dName",
+        "name",
+    ] {
+        let value = lossless::string(row.get(key));
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+    String::new()
+}
+
+/// Port of `ZaloEngine.contactName(_:)` (friends lookup with `Người dùng Zalo` fallback).
+#[must_use]
+pub fn contact_name_for_group_notice(uid: &str, contacts: &ContactsState) -> String {
+    contacts
+        .friends
+        .iter()
+        .find(|f| f.id == uid)
+        .map(|f| f.name.clone())
+        .unwrap_or_else(|| UNKNOWN_GROUP_MEMBER_NAME.to_owned())
+}
+
+/// Extracts raw member IDs from a group detail dict using the priority order
+/// `memVerList` -> `memIds` -> `currentMems` (used by `refreshGroupMetadata` and `mentionCandidates`).
+#[must_use]
+pub fn extract_raw_member_ids_from_detail(info: &Map<String, Value>) -> Vec<String> {
+    let mut raw: Vec<String> = Vec::new();
+    if let Some(Value::Array(ver_list)) = info.get("memVerList")
+        && ver_list.iter().all(Value::is_string)
+    {
+        for v in ver_list {
+            if let Some(s) = v.as_str()
+                && let Some(first) = s.split('_').next()
+            {
+                raw.push(first.to_owned());
+            }
+        }
+    }
+    if raw.is_empty()
+        && let Some(Value::Array(mems)) = info.get("memIds")
+    {
+        raw.extend(mems.iter().map(|v| lossless::string(Some(v))));
+    }
+    if raw.is_empty()
+        && let Some(Value::Array(cur)) = info.get("currentMems")
+        && cur.iter().all(Value::is_object)
+    {
+        for v in cur {
+            if let Some(obj) = v.as_object() {
+                raw.push(lossless::string(obj.get("id").or_else(|| obj.get("uid"))));
+            }
+        }
+    }
+    raw
+}
+
+/// Port of `ZaloEngine.groupMemberIds(in:)` — concatenates `memVerList`, `memIds`, `currentMems`
+/// from `details_json[cleanGrid]` plus cached non-All entries from `member_cache[gid]`, then cleans.
+#[must_use]
+pub fn group_member_ids(group_id: &str, groups: &GroupsState) -> Vec<String> {
+    let gid = group_conv_id(group_id);
+    let mut raw: Vec<String> = Vec::new();
+    if let Some(info) = groups.detail_object(group_id) {
+        if let Some(Value::Array(ver_list)) = info.get("memVerList")
+            && ver_list.iter().all(Value::is_string)
+        {
+            for v in ver_list {
+                if let Some(s) = v.as_str()
+                    && let Some(first) = s.split('_').next()
+                {
+                    raw.push(first.to_owned());
+                }
+            }
+        }
+        if let Some(Value::Array(mems)) = info.get("memIds") {
+            raw.extend(mems.iter().map(|v| lossless::string(Some(v))));
+        }
+        if let Some(Value::Array(cur)) = info.get("currentMems")
+            && cur.iter().all(Value::is_object)
+        {
+            for v in cur {
+                if let Some(obj) = v.as_object() {
+                    raw.push(lossless::string(obj.get("id").or_else(|| obj.get("uid"))));
+                }
+            }
+        }
+    }
+    if let Some(cached) = groups.member_cache.get(&gid) {
+        for c in cached {
+            if !c.is_all && c.id != "-1" {
+                raw.push(c.id.clone());
+            }
+        }
+    }
+    clean_group_member_ids(&raw)
+}
+
+/// Ordered, deduplicated member UIDs to fetch for `mentionCandidates` (excluding self).
+///
+/// Approved Fix (`user-decisions` item 7.3): preserves member-list order (deduplicated) instead of
+/// `Set` iteration order, and excludes self by normalized UID (`normalize_contact_uid`).
+#[must_use]
+pub fn mention_member_fetch_ids(
+    group_id: &str,
+    my_raw_uid: &str,
+    groups: &GroupsState,
+) -> Vec<String> {
+    let Some(info) = groups.detail_object(group_id) else {
+        return Vec::new();
+    };
+    let my_norm =
+        sanitize_profile_uid(my_raw_uid).unwrap_or_else(|| normalize_contact_uid(my_raw_uid));
+    let raw = extract_raw_member_ids_from_detail(&info);
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for item in raw {
+        let uid = sanitize_profile_uid(&item).unwrap_or_else(|| normalize_contact_uid(&item));
+        if uid.is_empty() {
+            continue;
+        }
+        if !my_norm.is_empty() && uid == my_norm {
+            continue;
+        }
+        if seen.insert(uid.clone()) {
+            out.push(uid);
+        }
+    }
+    out
+}
+
+/// Filters a cached list of [`MentionCandidate`] by query and excluded IDs.
+#[must_use]
+pub fn filter_mention_candidates(
+    cached: &[MentionCandidate],
+    query: &str,
+    excluding: &[String],
+) -> Vec<MentionCandidate> {
+    let excluded: BTreeSet<&str> = excluding.iter().map(String::as_str).collect();
+    let needle = fold_contact_str(query);
+    let needle = needle.trim();
+    cached
+        .iter()
+        .filter(|c| {
+            if excluded.contains(c.id.as_str()) {
+                return false;
+            }
+            if needle.is_empty() {
+                return true;
+            }
+            fold_contact_str(&c.name).contains(needle)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Persistence artifacts produced by [`apply_group_metadata_update`] /
@@ -165,19 +676,15 @@ pub fn apply_group_metadata_update(
     }
     if let Some(raw_ids) = patch.member_ids {
         let clean_ids = clean_group_member_ids(raw_ids);
-        if !clean_ids.is_empty() {
-            detail.insert("memIds".to_owned(), json!(clean_ids));
-            let ver_list: Vec<String> = clean_ids.iter().map(|id| format!("{id}_0")).collect();
-            detail.insert("memVerList".to_owned(), json!(ver_list));
-            if detail.contains_key("currentMems") {
-                let cur_mems: Vec<Value> = clean_ids.iter().map(|id| json!({ "id": id })).collect();
-                detail.insert("currentMems".to_owned(), Value::Array(cur_mems));
-            }
+        detail.insert("memIds".to_owned(), json!(clean_ids));
+        let ver_list: Vec<String> = clean_ids.iter().map(|id| format!("{id}_0")).collect();
+        detail.insert("memVerList".to_owned(), json!(ver_list));
+        if detail.contains_key("currentMems") {
+            let cur_mems: Vec<Value> = clean_ids.iter().map(|id| json!({ "id": id })).collect();
+            detail.insert("currentMems".to_owned(), Value::Array(cur_mems));
         }
     }
-    if !detail.is_empty()
-        && let Ok(serialized) = serde_json::to_string(&Value::Object(detail))
-    {
+    if let Ok(serialized) = serde_json::to_string(&Value::Object(detail)) {
         groups.details_json.insert(clean_grid, serialized);
     }
 
@@ -309,35 +816,7 @@ pub fn merge_fetched_group_metadata(
 
     let server_name = lossless::string(info.get("name"));
     let avt_str = lossless::string(info.get("avt").or_else(|| info.get("fullAvt")));
-
-    let mut raw_member_ids: Vec<String> = Vec::new();
-    if let Some(Value::Array(ver_list)) = info.get("memVerList")
-        && ver_list.iter().all(Value::is_string)
-    {
-        for v in ver_list {
-            if let Some(s) = v.as_str()
-                && let Some(first) = s.split('_').next()
-            {
-                raw_member_ids.push(first.to_owned());
-            }
-        }
-    }
-    if raw_member_ids.is_empty()
-        && let Some(Value::Array(mems)) = info.get("memIds")
-    {
-        raw_member_ids.extend(mems.iter().map(|v| lossless::string(Some(v))));
-    }
-    if raw_member_ids.is_empty()
-        && let Some(Value::Array(cur)) = info.get("currentMems")
-        && cur.iter().all(Value::is_object)
-    {
-        for v in cur {
-            if let Some(obj) = v.as_object() {
-                raw_member_ids.push(lossless::string(obj.get("id").or_else(|| obj.get("uid"))));
-            }
-        }
-    }
-    let clean_member_ids = clean_group_member_ids(&raw_member_ids);
+    let clean_member_ids = clean_group_member_ids(&extract_raw_member_ids_from_detail(info));
     let member_count = lossless::int64(info.get("totalMember").or_else(|| info.get("total")))
         .unwrap_or_else(|| i64::try_from(clean_member_ids.len()).unwrap_or(0));
 

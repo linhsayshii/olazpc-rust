@@ -29,6 +29,7 @@ use crate::conversations::{
 };
 use crate::effect::{Effect, HistoryFetchPurpose, HostCall, OpResult, StoreOp};
 use crate::forward::{ComposerSendOutcome, FileResolutionOutcome, MediaResolutionOutcome};
+use crate::groups::GroupAdminAction;
 use crate::input::{
     BootstrapAliasesError, Command, CompletedLogin, E2eeQuoteArg, Input, LegacyCookie,
     PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StickerSendError, StoreToken,
@@ -3329,6 +3330,265 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             trimmed_alias,
                             ok,
                             op_id,
+                        });
+                        drop(guard);
+                    });
+                }
+                // U10 groups
+                Effect::CreateGroupApi {
+                    op_id,
+                    name,
+                    members,
+                    avatar,
+                    now_ms,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let result = api
+                            .create_group(&name, &members)
+                            .await
+                            .map_err(|olaz_api::ApiError::Net(n)| SessionFailure::from(n));
+                        sink.send(Input::GroupCreatedApi {
+                            op_id,
+                            name,
+                            members,
+                            avatar,
+                            now_ms,
+                            result,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::UploadGroupAvatarApi {
+                    op_id,
+                    gid,
+                    avatar,
+                    failed,
+                    now_ms,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let result = api
+                            .upload_group_avatar(&gid, &avatar.jpeg, i64::from(avatar.side))
+                            .await
+                            .map_err(|olaz_api::ApiError::Net(n)| SessionFailure::from(n));
+                        sink.send(Input::GroupAvatarUploadedApi {
+                            op_id,
+                            gid,
+                            failed,
+                            now_ms,
+                            result,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::RenameGroupApi {
+                    op_id,
+                    gid,
+                    name,
+                    now_ms,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let result = api
+                            .rename_group(&gid, &name)
+                            .await
+                            .map(|_| ())
+                            .map_err(|olaz_api::ApiError::Net(n)| SessionFailure::from(n));
+                        sink.send(Input::GroupRenamedApi {
+                            op_id,
+                            gid,
+                            name,
+                            now_ms,
+                            result,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::InviteGroupMembersApi {
+                    op_id,
+                    gid,
+                    member_ids,
+                    now_ms,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let result = api
+                            .invite_group_members(&gid, &member_ids)
+                            .await
+                            .map_err(|olaz_api::ApiError::Net(n)| SessionFailure::from(n));
+                        sink.send(Input::GroupMembersInvitedApi {
+                            op_id,
+                            gid,
+                            clean_ids: member_ids,
+                            now_ms,
+                            result,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::KickGroupMemberApi {
+                    op_id,
+                    gid,
+                    member_id,
+                    now_ms,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let result = api
+                            .kick_group_members(&gid, std::slice::from_ref(&member_id))
+                            .await
+                            .map(|_| ())
+                            .map_err(|olaz_api::ApiError::Net(n)| SessionFailure::from(n));
+                        sink.send(Input::GroupMemberKickedApi {
+                            op_id,
+                            gid,
+                            member_id,
+                            now_ms,
+                            result,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::LeaveGroupApi { op_id, gid, silent } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let result = api
+                            .leave_group(&gid, silent)
+                            .await
+                            .map(|_| ())
+                            .map_err(|olaz_api::ApiError::Net(n)| SessionFailure::from(n));
+                        sink.send(Input::GroupLeftApi { op_id, gid, result });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchGroupDetailApi { gid, purpose } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let group_info = api.fetch_group_detail(&gid).await.ok();
+                        sink.send(Input::GroupDetailFetched {
+                            gid,
+                            purpose,
+                            group_info,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchGroupMemberProfilesApi {
+                    op_id,
+                    gid,
+                    uids,
+                    purpose,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let profiles_map = api
+                            .fetch_profiles(&uids)
+                            .await
+                            .ok()
+                            .map(|resp| extract_profiles_map(&resp));
+                        sink.send(Input::GroupMemberProfilesFetched {
+                            op_id,
+                            gid,
+                            uids,
+                            purpose,
+                            profiles_map,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::GroupAdminApi {
+                    op_id,
+                    gid,
+                    action,
+                    now_ms,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let res = match &action {
+                            GroupAdminAction::SetAdmin { uid, admin } => {
+                                api.set_group_admin(&gid, uid, *admin).await
+                            }
+                            GroupAdminAction::ChangeOwner { uid } => {
+                                api.change_group_owner(&gid, uid).await
+                            }
+                            GroupAdminAction::BlockMember { uid } => {
+                                api.set_group_member_blocked(&gid, uid, true).await
+                            }
+                            GroupAdminAction::ReviewPending { uids, approve } => {
+                                api.review_group_pending(&gid, uids, *approve).await
+                            }
+                            GroupAdminAction::SetJoinApproval { settings } => {
+                                api.update_group_settings(&gid, settings).await
+                            }
+                        };
+                        let result = res
+                            .map(|_| ())
+                            .map_err(|err| err.session_error().map(|s| s.code));
+                        sink.send(Input::GroupAdminApiDone {
+                            op_id,
+                            gid,
+                            action,
+                            now_ms,
+                            result,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchGroupPendingApi { op_id, group_id } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let members = api.fetch_group_pending(&group_id).await.ok();
+                        sink.send(Input::GroupPendingFetched { op_id, members });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchGroupLinkApi { op_id, gid } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let link = api.fetch_group_link(&gid).await.ok();
+                        sink.send(Input::GroupLinkFetched {
+                            op_id,
+                            gid,
+                            is_mutation: false,
+                            link,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::SetGroupLinkApi { op_id, gid, renew } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let link = api.set_group_link(&gid, renew).await.ok();
+                        sink.send(Input::GroupLinkFetched {
+                            op_id,
+                            gid,
+                            is_mutation: true,
+                            link,
                         });
                         drop(guard);
                     });

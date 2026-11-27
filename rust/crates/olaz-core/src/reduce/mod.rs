@@ -9,6 +9,7 @@ pub mod composer;
 pub mod contacts;
 pub mod conversations;
 pub mod forward;
+pub mod groups;
 pub mod messages;
 // U12
 pub mod polls;
@@ -47,6 +48,30 @@ fn is_message_command(cmd: &Command) -> bool {
             | Command::RefreshReactionNames { .. }
             | Command::SeedHistoryFreshness(_)
             | Command::SeedContacts(_)
+    )
+}
+
+fn is_group_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::CreateGroup { .. }
+            | Command::RenameGroup { .. }
+            | Command::InviteGroupMembers { .. }
+            | Command::KickGroupMember { .. }
+            | Command::LeaveGroup { .. }
+            | Command::RefreshGroupMetadata { .. }
+            | Command::MentionCandidates { .. }
+            | Command::LoadGroupMembers { .. }
+            | Command::SetGroupAdmin { .. }
+            | Command::ChangeGroupOwner { .. }
+            | Command::BlockGroupMember { .. }
+            | Command::FetchGroupPending { .. }
+            | Command::ReviewGroupPending { .. }
+            | Command::SetGroupJoinApproval { .. }
+            | Command::FetchGroupLink { .. }
+            | Command::SetGroupLink { .. }
+            | Command::HandleGroupEventNotice { .. }
+            | Command::ClearGroupNavigationRequest
             | Command::SeedGroups(_)
     )
 }
@@ -360,6 +385,27 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::PollDebounceFired { .. } => {
             polls::reduce_polls(state, input, &mut out);
         }
+        // U10 groups
+        Input::Command(ref cmd) if is_group_command(cmd) => {
+            groups::reduce_groups(state, input, &mut out);
+        }
+        Input::OpRequest { ref cmd, .. } if is_group_command(cmd) => {
+            groups::reduce_groups(state, input, &mut out);
+        }
+        Input::GroupCreatedApi { .. }
+        | Input::GroupAvatarUploadedApi { .. }
+        | Input::GroupRenamedApi { .. }
+        | Input::GroupMembersInvitedApi { .. }
+        | Input::GroupMemberKickedApi { .. }
+        | Input::GroupLeftApi { .. }
+        | Input::GroupDetailFetched { .. }
+        | Input::GroupMemberProfilesFetched { .. }
+        | Input::GroupAdminApiDone { .. }
+        | Input::GroupPendingFetched { .. }
+        | Input::GroupLinkFetched { .. } => {
+            groups::reduce_groups(state, input, &mut out);
+        }
+
         // U9
         Input::Command(cmd) if is_contacts_command(&cmd) => {
             contacts::reduce_contacts_command(state, cmd, None, &mut out);

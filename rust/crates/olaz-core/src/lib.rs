@@ -79,8 +79,12 @@ pub use forward::{
     MediaResolutionOutcome,
 };
 pub use groups::{
-    GroupMetadataPatch, GroupsState, MentionCandidate, MergedGroupMetadataPersistence,
-    apply_group_metadata_update, merge_fetched_group_metadata,
+    GroupAdminAction, GroupAvatarUpload, GroupCreateOutcome, GroupDetailPurpose,
+    GroupMetadataPatch, GroupRoles, GroupsState, MemberProfilesPurpose, MentionCandidate,
+    MergedGroupMetadataPersistence, admin_error_text, apply_group_metadata_update,
+    contact_name_for_group_notice, extract_raw_member_ids_from_detail, filter_mention_candidates,
+    group_member_ids, mention_member_fetch_ids, merge_fetched_group_metadata, not_added_text,
+    preferred_profile_name,
 };
 pub use input::StickerSendError;
 pub use input::{

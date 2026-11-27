@@ -5,7 +5,8 @@ use std::fmt;
 use std::time::Duration;
 
 use olaz_api::{
-    CreateReminderParams, PollState, SendContactCardParams, SendStickerParams, SendTextParams,
+    CreateReminderParams, GroupLink, GroupPendingMember, PollState, SendContactCardParams,
+    SendStickerParams, SendTextParams,
 };
 use olaz_net::{LoginAccount, QrTicket};
 use olaz_store::{StoredConversation, StoredMessage};
@@ -20,6 +21,10 @@ use crate::conversations::{
     ConversationActionResult, ConversationPreview, IdentityTable, PinBoard,
 };
 use crate::forward::ForwardOutcome;
+use crate::groups::{
+    GroupAdminAction, GroupAvatarUpload, GroupCreateOutcome, GroupDetailPurpose,
+    MemberProfilesPurpose, MentionCandidate,
+};
 use crate::input::{E2eeQuoteArg, HiddenPinSyncKind, SeenTarget, StoreToken};
 use crate::messages::{IdentitySnapshot, MuteEntry};
 use crate::reduce::classify::MobileSyncEvent;
@@ -465,6 +470,11 @@ pub enum OpResult {
     ComposerOutcome(ComposerOutcome),
     MyCard(Option<MyCardInfo>),
     ReminderComposeInfo(Option<ReminderComposeInfo>),
+    // U10 groups
+    GroupCreate(GroupCreateOutcome),
+    MentionCandidates(Vec<MentionCandidate>),
+    GroupPending(Option<Vec<GroupPendingMember>>),
+    GroupLink(Option<GroupLink>),
 }
 
 impl fmt::Debug for OpResult {
@@ -520,6 +530,20 @@ impl fmt::Debug for OpResult {
             Self::ComposerOutcome(o) => f.debug_tuple("ComposerOutcome").field(o).finish(),
             Self::MyCard(c) => f.debug_tuple("MyCard").field(c).finish(),
             Self::ReminderComposeInfo(r) => f.debug_tuple("ReminderComposeInfo").field(r).finish(),
+            // U10 groups
+            Self::GroupCreate(o) => f.debug_tuple("GroupCreate").field(o).finish(),
+            Self::MentionCandidates(v) => f
+                .debug_struct("MentionCandidates")
+                .field("count", &v.len())
+                .finish(),
+            Self::GroupPending(v) => f
+                .debug_struct("GroupPending")
+                .field("count", &v.as_ref().map(Vec::len))
+                .finish(),
+            Self::GroupLink(l) => f
+                .debug_struct("GroupLink")
+                .field("present", &l.is_some())
+                .finish(),
         }
     }
 }
@@ -1477,6 +1501,74 @@ pub enum Effect {
         op_id: Option<u64>,
     },
 
+    // U10 groups
+    CreateGroupApi {
+        op_id: Option<u64>,
+        name: String,
+        members: Vec<String>,
+        avatar: Option<GroupAvatarUpload>,
+        now_ms: i64,
+    },
+    UploadGroupAvatarApi {
+        op_id: Option<u64>,
+        gid: String,
+        avatar: GroupAvatarUpload,
+        failed: Vec<String>,
+        now_ms: i64,
+    },
+    RenameGroupApi {
+        op_id: Option<u64>,
+        gid: String,
+        name: String,
+        now_ms: i64,
+    },
+    InviteGroupMembersApi {
+        op_id: Option<u64>,
+        gid: String,
+        member_ids: Vec<String>,
+        now_ms: i64,
+    },
+    KickGroupMemberApi {
+        op_id: Option<u64>,
+        gid: String,
+        member_id: String,
+        now_ms: i64,
+    },
+    LeaveGroupApi {
+        op_id: Option<u64>,
+        gid: String,
+        silent: bool,
+    },
+    FetchGroupDetailApi {
+        gid: String,
+        purpose: GroupDetailPurpose,
+    },
+    FetchGroupMemberProfilesApi {
+        op_id: Option<u64>,
+        gid: String,
+        uids: Vec<String>,
+        purpose: MemberProfilesPurpose,
+    },
+    GroupAdminApi {
+        op_id: Option<u64>,
+        gid: String,
+        action: GroupAdminAction,
+        now_ms: i64,
+    },
+    FetchGroupPendingApi {
+        op_id: Option<u64>,
+        group_id: String,
+    },
+    FetchGroupLinkApi {
+        op_id: Option<u64>,
+        gid: String,
+    },
+    SetGroupLinkApi {
+        op_id: Option<u64>,
+        gid: String,
+        renew: bool,
+    },
+
     /// Domain activity delegated to Swift via `CoreHost`.
     Host(HostCall),
 }
@@ -1978,6 +2070,82 @@ impl fmt::Debug for Effect {
                 .field("delay_ms", &delay.as_millis())
                 .finish(),
             Self::CancelConfirmPromoteDelay => f.write_str("CancelConfirmPromoteDelay"),
+            // U10 groups
+            Self::CreateGroupApi {
+                op_id,
+                members,
+                avatar,
+                ..
+            } => f
+                .debug_struct("CreateGroupApi")
+                .field("op_id", op_id)
+                .field("members_count", &members.len())
+                .field("has_avatar", &avatar.is_some())
+                .finish(),
+            Self::UploadGroupAvatarApi {
+                op_id,
+                avatar,
+                failed,
+                ..
+            } => f
+                .debug_struct("UploadGroupAvatarApi")
+                .field("op_id", op_id)
+                .field("avatar", avatar)
+                .field("failed_count", &failed.len())
+                .finish(),
+            Self::RenameGroupApi { op_id, .. } => f
+                .debug_struct("RenameGroupApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::InviteGroupMembersApi {
+                op_id, member_ids, ..
+            } => f
+                .debug_struct("InviteGroupMembersApi")
+                .field("op_id", op_id)
+                .field("members_count", &member_ids.len())
+                .finish(),
+            Self::KickGroupMemberApi { op_id, .. } => f
+                .debug_struct("KickGroupMemberApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::LeaveGroupApi { op_id, silent, .. } => f
+                .debug_struct("LeaveGroupApi")
+                .field("op_id", op_id)
+                .field("silent", silent)
+                .finish(),
+            Self::FetchGroupDetailApi { purpose, .. } => f
+                .debug_struct("FetchGroupDetailApi")
+                .field("purpose", purpose)
+                .finish(),
+            Self::FetchGroupMemberProfilesApi {
+                op_id,
+                uids,
+                purpose,
+                ..
+            } => f
+                .debug_struct("FetchGroupMemberProfilesApi")
+                .field("op_id", op_id)
+                .field("uids_count", &uids.len())
+                .field("purpose", purpose)
+                .finish(),
+            Self::GroupAdminApi { op_id, action, .. } => f
+                .debug_struct("GroupAdminApi")
+                .field("op_id", op_id)
+                .field("action", action)
+                .finish(),
+            Self::FetchGroupPendingApi { op_id, .. } => f
+                .debug_struct("FetchGroupPendingApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::FetchGroupLinkApi { op_id, .. } => f
+                .debug_struct("FetchGroupLinkApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::SetGroupLinkApi { op_id, renew, .. } => f
+                .debug_struct("SetGroupLinkApi")
+                .field("op_id", op_id)
+                .field("renew", renew)
+                .finish(),
             Self::Host(call) => f.debug_tuple("Host").field(call).finish(),
         }
     }

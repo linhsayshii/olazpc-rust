@@ -55,7 +55,7 @@ fn candidate_uids_equal(a: &str, b: &str) -> bool {
     sa == sb
 }
 
-fn format_session_failure_localized(failure: &SessionFailure) -> String {
+pub(crate) fn format_session_failure_localized(failure: &SessionFailure) -> String {
     match failure {
         SessionFailure::Cancelled => "Đã hủy.".to_owned(),
         SessionFailure::QrTimeout => "Mã QR đã hết hạn.".to_owned(),
@@ -87,7 +87,11 @@ fn format_session_failure_localized(failure: &SessionFailure) -> String {
     }
 }
 
-fn start_contacts_sync(state: &mut CoreState, op_id: Option<u64>, out: &mut ReduceOutput) {
+pub(crate) fn start_contacts_sync(
+    state: &mut CoreState,
+    op_id: Option<u64>,
+    out: &mut ReduceOutput,
+) {
     state.contacts.sync_in_flight = state.contacts.sync_in_flight.saturating_add(1);
     if !state.contacts.loading_requests {
         state.contacts.loading_requests = true;

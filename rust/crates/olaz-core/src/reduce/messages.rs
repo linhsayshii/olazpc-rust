@@ -757,15 +757,6 @@ fn reduce_message_command(
             complete_op(op_id, out);
         }
 
-        Command::SeedGroups(groups) => {
-            state.groups.apply_seeded_groups(*groups);
-            out.dirty.insert(DirtyKey::Groups);
-            out.dirty.insert(DirtyKey::CachedGroups);
-            out.dirty.insert(DirtyKey::Contacts);
-            out.refresh_identity_snapshot = true;
-            complete_op(op_id, out);
-        }
-
         _ => {
             complete_op(op_id, out);
         }

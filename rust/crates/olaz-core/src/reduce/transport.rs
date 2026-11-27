@@ -494,6 +494,9 @@ fn emit_routes(
                     .push(Effect::Host(HostCall::PinTopic { conv_id }));
             }
             Route::GroupNotice { act, data, ts } => {
+                let _ = crate::reduce::groups::handle_group_event_notice(
+                    state, &act, &data, ts, ts, out,
+                );
                 out.effects
                     .push(Effect::Host(HostCall::GroupNotice { act, data, ts }));
             }

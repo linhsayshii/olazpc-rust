@@ -16,6 +16,7 @@ use crate::composer::{ComposerOutcome, MyCardInfo, ReminderComposeInfo};
 use crate::conversations::{ConversationActionResult, IdentityTable, PinBoard};
 use crate::effect::{Effect, OpResult};
 use crate::forward::ForwardOutcome;
+use crate::groups::{GroupCreateOutcome, MentionCandidate};
 use crate::input::{Command, Input};
 use crate::messages::IdentitySnapshot;
 use crate::reduce::reduce;
@@ -607,6 +608,42 @@ impl CoreHandle {
     pub async fn request_reminder_info(&self, conv_id: String) -> Option<ReminderComposeInfo> {
         match self.request(Command::ReminderComposeInfo { conv_id }).await {
             Some(OpResult::ReminderComposeInfo(r)) => r,
+            _ => None,
+        }
+    }
+
+    // U10 groups
+    pub async fn request_group_create(&self, command: Command) -> GroupCreateOutcome {
+        match self.request(command).await {
+            Some(OpResult::GroupCreate(o)) => o,
+            _ => GroupCreateOutcome::Failed {
+                title: None,
+                message: "Tạo nhóm không thành công.".to_owned(),
+                closes: false,
+            },
+        }
+    }
+
+    pub async fn request_mention_candidates(&self, command: Command) -> Vec<MentionCandidate> {
+        match self.request(command).await {
+            Some(OpResult::MentionCandidates(v)) => v,
+            _ => Vec::new(),
+        }
+    }
+
+    pub async fn request_group_pending(
+        &self,
+        group_id: String,
+    ) -> Option<Vec<olaz_api::GroupPendingMember>> {
+        match self.request(Command::FetchGroupPending { group_id }).await {
+            Some(OpResult::GroupPending(m)) => m,
+            _ => None,
+        }
+    }
+
+    pub async fn request_group_link(&self, command: Command) -> Option<olaz_api::GroupLink> {
+        match self.request(command).await {
+            Some(OpResult::GroupLink(l)) => l,
             _ => None,
         }
     }

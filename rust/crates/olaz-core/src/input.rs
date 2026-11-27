@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use olaz_api::{
-    AutoDeleteFetchOutcome, BlockedUserEntry, HiddenConversationsSnapshot, PollState,
-    SendMessageResult,
+    AutoDeleteFetchOutcome, BlockedUserEntry, GroupLink, GroupPendingMember,
+    HiddenConversationsSnapshot, PollState, SendMessageResult,
 };
 use olaz_net::{LoginAccount, NetError, QrScanResult, QrTicket, SessionStatus};
 use olaz_store::{
@@ -24,7 +24,9 @@ use crate::conversations::{
 };
 use crate::effect::OpResult;
 use crate::forward::{ComposerSendOutcome, FileResolutionOutcome, MediaResolutionOutcome};
-use crate::groups::GroupsState;
+use crate::groups::{
+    GroupAdminAction, GroupAvatarUpload, GroupDetailPurpose, GroupsState, MemberProfilesPurpose,
+};
 use crate::messages::{BlockedUserState, ContactsState, HistoryFreshness};
 use crate::state::{CoreFailKind, FailReason, PersistedTransportState};
 use crate::stickers::{StickerEntry, StickerSource, StickerSuggestSetting};
@@ -667,6 +669,90 @@ pub enum Command {
     },
     /// Reset composer state (drops confirms and fails in-flight contact-card sends).
     ResetComposer,
+
+    // U10 groups
+    CreateGroup {
+        name: String,
+        members: Vec<String>,
+        avatar: Option<GroupAvatarUpload>,
+        now_ms: i64,
+    },
+    RenameGroup {
+        group_id: String,
+        name: String,
+        now_ms: i64,
+    },
+    InviteGroupMembers {
+        group_id: String,
+        member_ids: Vec<String>,
+        now_ms: i64,
+    },
+    KickGroupMember {
+        group_id: String,
+        member_id: String,
+        now_ms: i64,
+    },
+    LeaveGroup {
+        group_id: String,
+        silent: bool,
+    },
+    RefreshGroupMetadata {
+        group_id: String,
+        now_ms: i64,
+    },
+    MentionCandidates {
+        group_id: String,
+        query: String,
+        excluding: Vec<String>,
+    },
+    LoadGroupMembers {
+        group_id: String,
+        now_ms: i64,
+    },
+    SetGroupAdmin {
+        group_id: String,
+        uid: String,
+        admin: bool,
+        now_ms: i64,
+    },
+    ChangeGroupOwner {
+        group_id: String,
+        uid: String,
+        now_ms: i64,
+    },
+    BlockGroupMember {
+        group_id: String,
+        uid: String,
+        now_ms: i64,
+    },
+    FetchGroupPending {
+        group_id: String,
+    },
+    ReviewGroupPending {
+        group_id: String,
+        uids: Vec<String>,
+        approve: bool,
+        now_ms: i64,
+    },
+    SetGroupJoinApproval {
+        group_id: String,
+        on: bool,
+        now_ms: i64,
+    },
+    FetchGroupLink {
+        group_id: String,
+    },
+    SetGroupLink {
+        group_id: String,
+        renew: bool,
+    },
+    HandleGroupEventNotice {
+        act: String,
+        data: Map<String, Value>,
+        ts: i64,
+        now_ms: i64,
+    },
+    ClearGroupNavigationRequest,
 }
 
 impl fmt::Debug for Command {
@@ -1188,6 +1274,57 @@ impl fmt::Debug for Command {
                 .field("outcome", outcome)
                 .finish(),
             Self::ResetComposer => f.write_str("ResetComposer"),
+            // U10 groups
+            Self::CreateGroup {
+                members, avatar, ..
+            } => f
+                .debug_struct("CreateGroup")
+                .field("members_count", &members.len())
+                .field("has_avatar", &avatar.is_some())
+                .finish(),
+            Self::RenameGroup { .. } => f.write_str("RenameGroup"),
+            Self::InviteGroupMembers { member_ids, .. } => f
+                .debug_struct("InviteGroupMembers")
+                .field("members_count", &member_ids.len())
+                .finish(),
+            Self::KickGroupMember { .. } => f.write_str("KickGroupMember"),
+            Self::LeaveGroup { silent, .. } => f
+                .debug_struct("LeaveGroup")
+                .field("silent", silent)
+                .finish(),
+            Self::RefreshGroupMetadata { .. } => f.write_str("RefreshGroupMetadata"),
+            Self::MentionCandidates { excluding, .. } => f
+                .debug_struct("MentionCandidates")
+                .field("excluding_count", &excluding.len())
+                .finish(),
+            Self::LoadGroupMembers { .. } => f.write_str("LoadGroupMembers"),
+            Self::SetGroupAdmin { admin, .. } => f
+                .debug_struct("SetGroupAdmin")
+                .field("admin", admin)
+                .finish(),
+            Self::ChangeGroupOwner { .. } => f.write_str("ChangeGroupOwner"),
+            Self::BlockGroupMember { .. } => f.write_str("BlockGroupMember"),
+            Self::FetchGroupPending { .. } => f.write_str("FetchGroupPending"),
+            Self::ReviewGroupPending { uids, approve, .. } => f
+                .debug_struct("ReviewGroupPending")
+                .field("uids_count", &uids.len())
+                .field("approve", approve)
+                .finish(),
+            Self::SetGroupJoinApproval { on, .. } => f
+                .debug_struct("SetGroupJoinApproval")
+                .field("on", on)
+                .finish(),
+            Self::FetchGroupLink { .. } => f.write_str("FetchGroupLink"),
+            Self::SetGroupLink { renew, .. } => f
+                .debug_struct("SetGroupLink")
+                .field("renew", renew)
+                .finish(),
+            Self::HandleGroupEventNotice { act, ts, .. } => f
+                .debug_struct("HandleGroupEventNotice")
+                .field("act", act)
+                .field("ts", ts)
+                .finish(),
+            Self::ClearGroupNavigationRequest => f.write_str("ClearGroupNavigationRequest"),
         }
     }
 }
@@ -1901,6 +2038,78 @@ pub enum Input {
     },
     ConfirmPromoteExpired {
         confirm_gen: u64,
+    },
+
+    // U10 groups
+    GroupCreatedApi {
+        op_id: Option<u64>,
+        name: String,
+        members: Vec<String>,
+        avatar: Option<GroupAvatarUpload>,
+        now_ms: i64,
+        result: Result<Map<String, Value>, SessionFailure>,
+    },
+    GroupAvatarUploadedApi {
+        op_id: Option<u64>,
+        gid: String,
+        failed: Vec<String>,
+        now_ms: i64,
+        result: Result<Map<String, Value>, SessionFailure>,
+    },
+    GroupRenamedApi {
+        op_id: Option<u64>,
+        gid: String,
+        name: String,
+        now_ms: i64,
+        result: Result<(), SessionFailure>,
+    },
+    GroupMembersInvitedApi {
+        op_id: Option<u64>,
+        gid: String,
+        clean_ids: Vec<String>,
+        now_ms: i64,
+        result: Result<Map<String, Value>, SessionFailure>,
+    },
+    GroupMemberKickedApi {
+        op_id: Option<u64>,
+        gid: String,
+        member_id: String,
+        now_ms: i64,
+        result: Result<(), SessionFailure>,
+    },
+    GroupLeftApi {
+        op_id: Option<u64>,
+        gid: String,
+        result: Result<(), SessionFailure>,
+    },
+    GroupDetailFetched {
+        gid: String,
+        purpose: GroupDetailPurpose,
+        group_info: Option<Map<String, Value>>,
+    },
+    GroupMemberProfilesFetched {
+        op_id: Option<u64>,
+        gid: String,
+        uids: Vec<String>,
+        purpose: MemberProfilesPurpose,
+        profiles_map: Option<Map<String, Value>>,
+    },
+    GroupAdminApiDone {
+        op_id: Option<u64>,
+        gid: String,
+        action: GroupAdminAction,
+        now_ms: i64,
+        result: Result<(), Option<i64>>,
+    },
+    GroupPendingFetched {
+        op_id: Option<u64>,
+        members: Option<Vec<GroupPendingMember>>,
+    },
+    GroupLinkFetched {
+        op_id: Option<u64>,
+        gid: String,
+        is_mutation: bool,
+        link: Option<GroupLink>,
     },
 }
 
@@ -2729,6 +2938,109 @@ impl fmt::Debug for Input {
             Self::ConfirmPromoteExpired { confirm_gen } => f
                 .debug_struct("ConfirmPromoteExpired")
                 .field("confirm_gen", confirm_gen)
+                .finish(),
+            // U10 groups
+            Self::GroupCreatedApi {
+                op_id,
+                members,
+                avatar,
+                result,
+                ..
+            } => f
+                .debug_struct("GroupCreatedApi")
+                .field("op_id", op_id)
+                .field("members_count", &members.len())
+                .field("has_avatar", &avatar.is_some())
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::GroupAvatarUploadedApi {
+                op_id,
+                failed,
+                result,
+                ..
+            } => f
+                .debug_struct("GroupAvatarUploadedApi")
+                .field("op_id", op_id)
+                .field("failed_count", &failed.len())
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::GroupRenamedApi { op_id, result, .. } => f
+                .debug_struct("GroupRenamedApi")
+                .field("op_id", op_id)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::GroupMembersInvitedApi {
+                op_id,
+                clean_ids,
+                result,
+                ..
+            } => f
+                .debug_struct("GroupMembersInvitedApi")
+                .field("op_id", op_id)
+                .field("clean_count", &clean_ids.len())
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::GroupMemberKickedApi { op_id, result, .. } => f
+                .debug_struct("GroupMemberKickedApi")
+                .field("op_id", op_id)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::GroupLeftApi { op_id, result, .. } => f
+                .debug_struct("GroupLeftApi")
+                .field("op_id", op_id)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::GroupDetailFetched {
+                purpose,
+                group_info,
+                ..
+            } => f
+                .debug_struct("GroupDetailFetched")
+                .field("purpose", purpose)
+                .field(
+                    "has_info",
+                    &group_info.as_ref().is_some_and(|m| !m.is_empty()),
+                )
+                .finish(),
+            Self::GroupMemberProfilesFetched {
+                op_id,
+                uids,
+                purpose,
+                profiles_map,
+                ..
+            } => f
+                .debug_struct("GroupMemberProfilesFetched")
+                .field("op_id", op_id)
+                .field("uids_count", &uids.len())
+                .field("purpose", purpose)
+                .field("profiles_count", &profiles_map.as_ref().map(Map::len))
+                .finish(),
+            Self::GroupAdminApiDone {
+                op_id,
+                action,
+                result,
+                ..
+            } => f
+                .debug_struct("GroupAdminApiDone")
+                .field("op_id", op_id)
+                .field("action", action)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::GroupPendingFetched { op_id, members } => f
+                .debug_struct("GroupPendingFetched")
+                .field("op_id", op_id)
+                .field("count", &members.as_ref().map(Vec::len))
+                .finish(),
+            Self::GroupLinkFetched {
+                op_id,
+                is_mutation,
+                link,
+                ..
+            } => f
+                .debug_struct("GroupLinkFetched")
+                .field("op_id", op_id)
+                .field("is_mutation", is_mutation)
+                .field("present", &link.is_some())
                 .finish(),
         }
     }

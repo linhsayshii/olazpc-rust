@@ -33,6 +33,7 @@ use olaz_core::effect::Effect;
 use olaz_core::forward::{
     ComposerSendOutcome, FileResolutionOutcome, ForwardOutcome, MediaResolutionOutcome,
 };
+use olaz_core::groups::{GroupAvatarUpload, GroupCreateOutcome, MentionCandidate};
 use olaz_core::input::{Command, E2eeQuoteArg, Input, LegacyCookie, SeenTarget, StickerSendError};
 use olaz_core::messages::{HistoryFreshness, MuteEntry};
 use olaz_core::reduce::classify::MobileSyncEvent;
@@ -49,7 +50,9 @@ use olaz_core::stickers::{
 use olaz_core::typed_chat::{
     PlainChatParse, TypedChatEnvelope, new_shared_parse, try_parse_plain_chat,
 };
-use olaz_crypto::{decode_aes, encode_aes, md5_hex, parse_any, parse_secret_key};
+use olaz_crypto::{
+    decode_aes, decode_foundation_base64, encode_aes, md5_hex, parse_any, parse_secret_key,
+};
 use olaz_net::http::{DEFAULT_REQUEST_TIMEOUT, RawResponse, RequestSpec, Transport};
 use olaz_net::{
     LoginAccount, NetError, NetworkErrorKind, SessionClient, ZaloDomains, ZaloSessionError,
@@ -3637,6 +3640,7 @@ struct LogCapturingRunner<R> {
     inner: Arc<R>,
     send_logs: Arc<Mutex<Vec<String>>>,
     action_logs: Arc<Mutex<Vec<String>>>,
+    group_logs: Arc<Mutex<Vec<String>>>,
 }
 
 impl<R: EffectRunner> EffectRunner for LogCapturingRunner<R> {
@@ -3650,6 +3654,10 @@ impl<R: EffectRunner> EffectRunner for LogCapturingRunner<R> {
                 .action_logs
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            let mut g_logs = self
+                .group_logs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             for eff in &effects {
                 if let Effect::EngineLog(line) = eff {
                     if line.starts_with("sendText ") {
@@ -3660,6 +3668,16 @@ impl<R: EffectRunner> EffectRunner for LogCapturingRunner<R> {
                         || line.starts_with("autodelete: ")
                     {
                         a_logs.push(line.clone());
+                    }
+                    if line.starts_with("group create failed: ")
+                        || line.starts_with("group avatar upload failed: ")
+                        || line.starts_with("rename group failed: ")
+                        || line.starts_with("invite group members failed: ")
+                        || line.starts_with("kick group member failed: ")
+                        || line.starts_with("leave group failed: ")
+                        || line.starts_with("group admin: failed code=")
+                    {
+                        g_logs.push(line.clone());
                     }
                 }
             }
@@ -4658,6 +4676,140 @@ fn enrich_u9_snapshot(
     obj.insert("last_alias_result".to_owned(), alias_res_val);
 }
 
+fn enrich_u10_snapshot(
+    obj: &mut Map<String, Value>,
+    full: &olaz_core::CoreSnapshot,
+    host: &RecordingHost,
+    results: &Map<String, Value>,
+    group_logs: &Mutex<Vec<String>>,
+) {
+    let mut details_obj = Map::new();
+    for (clean_grid, raw_json) in &full.groups.details_json {
+        if let Ok(parsed) = serde_json::from_str::<Value>(raw_json) {
+            details_obj.insert(clean_grid.clone(), parsed);
+        }
+    }
+    obj.insert(
+        "cached_group_details".to_owned(),
+        Value::Object(details_obj),
+    );
+
+    let mut member_cache_obj = Map::new();
+    for (gid, list) in &full.groups.member_cache {
+        let arr: Vec<Value> = list
+            .iter()
+            .map(|c| {
+                json!({
+                    "id": c.id,
+                    "name": c.name,
+                    "avatar": c.avatar,
+                    "is_all": c.is_all,
+                })
+            })
+            .collect();
+        member_cache_obj.insert(gid.clone(), Value::Array(arr));
+    }
+    obj.insert(
+        "group_member_cache".to_owned(),
+        Value::Object(member_cache_obj),
+    );
+
+    let mut cached_groups_obj = Map::new();
+    for (gid, cg) in &full.groups.cached_groups {
+        cached_groups_obj.insert(
+            gid.clone(),
+            json!({
+                "name": cg.name,
+                "avatar": cg.avatar,
+                "members": cg.members,
+            }),
+        );
+    }
+    obj.insert("cached_groups".to_owned(), Value::Object(cached_groups_obj));
+
+    let mut group_ids = std::collections::BTreeSet::new();
+    for clean_grid in full.groups.details_json.keys() {
+        let gid = olaz_wire::group_conv_id(clean_grid);
+        if !gid.is_empty() {
+            group_ids.insert(gid);
+        }
+    }
+    for g in &full.contacts.groups {
+        if !g.id.is_empty() {
+            group_ids.insert(g.id.clone());
+        }
+    }
+    for gid in full.groups.cached_groups.keys() {
+        if !gid.is_empty() {
+            group_ids.insert(gid.clone());
+        }
+    }
+    for gid in full.groups.member_cache.keys() {
+        if !gid.is_empty() {
+            group_ids.insert(gid.clone());
+        }
+    }
+    for conv in &full.conversations.conversations {
+        if conv.is_group && !conv.id.is_empty() {
+            group_ids.insert(conv.id.clone());
+        }
+    }
+    let mut roles_obj = Map::new();
+    for gid in group_ids {
+        let r = full.groups.roles(&gid);
+        roles_obj.insert(
+            gid,
+            json!({
+                "owner": r.owner,
+                "admins": r.admins,
+                "join_approval": r.join_approval,
+            }),
+        );
+    }
+    obj.insert("group_roles".to_owned(), Value::Object(roles_obj));
+
+    obj.insert(
+        "navigation_request".to_owned(),
+        full.groups
+            .navigation_request
+            .clone()
+            .map_or(Value::Null, Value::String),
+    );
+    obj.insert("results".to_owned(), Value::Object(results.clone()));
+
+    let g_logs: Vec<Value> = group_logs
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .cloned()
+        .map(Value::String)
+        .collect();
+    obj.insert("group_logs".to_owned(), Value::Array(g_logs));
+
+    if let Some(store_arc) = host.attached_store()
+        && let Some(Value::Object(store_obj)) = obj.get_mut("store")
+        && let Some(Value::Object(prefs_obj)) = store_obj.get_mut("prefs")
+    {
+        let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut cg_pref = Map::new();
+        if let Ok(Some(bytes)) = store.get_preference_data("cachedGroups")
+            && let Ok(parsed) = serde_json::from_slice::<BTreeMap<String, CachedGroup>>(&bytes)
+        {
+            for (gid, cg) in parsed {
+                cg_pref.insert(
+                    gid,
+                    json!({
+                        "name": cg.name,
+                        "avatar": cg.avatar,
+                        "members": cg.members,
+                    }),
+                );
+            }
+        }
+        prefs_obj.insert("cached_groups".to_owned(), Value::Object(cg_pref));
+    }
+}
+
 async fn run_u12_poll_model_checks(checks: &[Value], core: &CoreHandle) -> Value {
     let snap = core.full_snapshot().await.unwrap_or_default();
     let mut check_results = Vec::with_capacity(checks.len());
@@ -4937,6 +5089,7 @@ struct SnapshotOpts<'a> {
     is_u5: bool,
     is_u6: bool,
     is_u9: bool,
+    is_u10: bool,
     is_u8: bool,
     is_u12: bool,
     is_u11: bool,
@@ -4946,6 +5099,7 @@ struct SnapshotOpts<'a> {
     send_logs: &'a Mutex<Vec<String>>,
     prune_next_expiry_ms: Option<i64>,
     action_logs: &'a Mutex<Vec<String>>,
+    group_logs: &'a Mutex<Vec<String>>,
     u9_lookups: &'a BTreeMap<String, Value>,
     last_alias_result: Option<&'a olaz_core::SaveAliasOutcome>,
     selection: Option<&'a TestSelection>,
@@ -5142,6 +5296,7 @@ async fn capture_case_snapshot(
         is_u5,
         is_u6,
         is_u9,
+        is_u10,
         is_u8,
         is_u12,
         is_u11,
@@ -5151,6 +5306,7 @@ async fn capture_case_snapshot(
         send_logs,
         prune_next_expiry_ms,
         action_logs,
+        group_logs,
         u9_lookups,
         last_alias_result,
         selection,
@@ -5541,6 +5697,9 @@ async fn capture_case_snapshot(
     if is_u9 {
         enrich_u9_snapshot(&mut obj, &full, host, u9_lookups, last_alias_result);
     }
+    if is_u10 {
+        enrich_u10_snapshot(&mut obj, &full, host, results, group_logs);
+    }
     Some(Value::Object(obj))
 }
 
@@ -5568,7 +5727,8 @@ fn str_vec_arg(args: &Value, key: &str) -> Vec<String> {
 pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let is_u8 = case.domain == "forward";
     let is_u12 = case.domain == "polls";
-    let is_u9 = case.domain == "contacts";
+    let is_u10 = case.domain == "groups";
+    let is_u9 = case.domain == "contacts" || is_u10;
     let is_u11 = case.domain == "cloud";
     let is_u13 = case.domain == "stickers";
     let is_u14 = case.domain == "search";
@@ -5655,10 +5815,12 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     host.bind_store_slot(inner_runner.shared_store_slot());
     let send_logs = Arc::new(Mutex::new(Vec::<String>::new()));
     let action_logs = Arc::new(Mutex::new(Vec::<String>::new()));
+    let group_logs = Arc::new(Mutex::new(Vec::<String>::new()));
     let runner: Arc<dyn EffectRunner> = Arc::new(LogCapturingRunner {
         inner: Arc::clone(&inner_runner),
         send_logs: Arc::clone(&send_logs),
         action_logs: Arc::clone(&action_logs),
+        group_logs: Arc::clone(&group_logs),
     });
 
     let mut initial_state = CoreState::default();
@@ -5901,6 +6063,64 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 }
             }
             initial_state.contacts.blocked_users = Some(list);
+        }
+    }
+    if is_u10 {
+        if let Some(contacts) = &case.seed.contacts {
+            if let Some(b) = contacts.get("friends_loaded").and_then(Value::as_bool) {
+                initial_state.contacts.friends_loaded = b;
+            }
+            if let Some(b) = contacts.get("groups_loaded").and_then(Value::as_bool) {
+                initial_state.contacts.groups_loaded = b;
+            }
+        }
+        if let Some(details_obj) = case
+            .seed
+            .cached_group_details
+            .as_ref()
+            .and_then(Value::as_object)
+        {
+            for (k, v) in details_obj {
+                initial_state
+                    .groups
+                    .details_json
+                    .insert(k.clone(), canonical_json_string(v));
+            }
+        }
+        if let Some(mc_obj) = case
+            .seed
+            .group_member_cache
+            .as_ref()
+            .and_then(Value::as_object)
+        {
+            for (gid, arr_val) in mc_obj {
+                let mut list = Vec::new();
+                if let Some(arr) = arr_val.as_array() {
+                    for row in arr {
+                        let Some(id) = row.get("id").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let name = row
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        let avatar = row
+                            .get("avatar")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned);
+                        let is_all = row.get("is_all").and_then(Value::as_bool).unwrap_or(false);
+                        list.push(MentionCandidate {
+                            id: id.to_owned(),
+                            name,
+                            avatar,
+                            is_all,
+                        });
+                    }
+                }
+                initial_state.groups.member_cache.insert(gid.clone(), list);
+            }
         }
     }
     if is_u12 {
@@ -7903,6 +8123,276 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         .await;
                     let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
                 }
+                // U10 groups
+                "create_group" => {
+                    let name = str_arg(args, "name");
+                    let members = str_vec_arg(args, "members");
+                    let avatar = args.get("avatar").and_then(|av| {
+                        if av.is_null() {
+                            return None;
+                        }
+                        let b64 = av.get("jpeg_b64").and_then(Value::as_str)?;
+                        let side = av
+                            .get("side")
+                            .and_then(Value::as_u64)
+                            .and_then(|n| u32::try_from(n).ok())
+                            .unwrap_or(240);
+                        let jpeg = decode_foundation_base64(b64).ok()?;
+                        Some(GroupAvatarUpload { jpeg, side })
+                    });
+                    let step_now = now_ms.unwrap_or(FIXED_TEST_NOW_SECS * 1000);
+                    let outcome = core
+                        .request_group_create(Command::CreateGroup {
+                            name,
+                            members,
+                            avatar,
+                            now_ms: step_now,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let outcome_json = match outcome {
+                        GroupCreateOutcome::Created { id, failed } => json!({
+                            "status": "created",
+                            "id": id,
+                            "failed": failed,
+                        }),
+                        GroupCreateOutcome::Exists { id, text } => json!({
+                            "status": "exists",
+                            "id": id,
+                            "text": text,
+                        }),
+                        GroupCreateOutcome::Invalid { text, dropped } => json!({
+                            "status": "invalid",
+                            "text": text,
+                            "dropped": dropped,
+                        }),
+                        GroupCreateOutcome::Failed {
+                            title,
+                            message,
+                            closes,
+                        } => json!({
+                            "status": "failed",
+                            "title": title,
+                            "message": message,
+                            "closes": closes,
+                        }),
+                        GroupCreateOutcome::Pending { text } => json!({
+                            "status": "pending",
+                            "text": text,
+                        }),
+                    };
+                    results.insert(step_index.to_string(), outcome_json);
+                }
+                "rename_group" => {
+                    let group_id = str_arg(args, "id");
+                    let name = str_arg(args, "name");
+                    let step_now = now_ms.unwrap_or(FIXED_TEST_NOW_SECS * 1000);
+                    let _ = core
+                        .request_bool(Command::RenameGroup {
+                            group_id,
+                            name,
+                            now_ms: step_now,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "invite" => {
+                    let group_id = str_arg(args, "id");
+                    let member_ids = str_vec_arg(args, "members");
+                    let step_now = now_ms.unwrap_or(FIXED_TEST_NOW_SECS * 1000);
+                    let _ = core
+                        .request_bool(Command::InviteGroupMembers {
+                            group_id,
+                            member_ids,
+                            now_ms: step_now,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "kick" => {
+                    let group_id = str_arg(args, "id");
+                    let member_id = str_arg(args, "member");
+                    let step_now = now_ms.unwrap_or(FIXED_TEST_NOW_SECS * 1000);
+                    let _ = core
+                        .request_bool(Command::KickGroupMember {
+                            group_id,
+                            member_id,
+                            now_ms: step_now,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "leave_group" => {
+                    let group_id = str_arg(args, "id");
+                    let silent = args.get("silent").and_then(Value::as_bool).unwrap_or(false);
+                    let _ = core
+                        .request_bool(Command::LeaveGroup { group_id, silent })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "refresh_group" => {
+                    let group_id = str_arg(args, "id");
+                    let step_now = now_ms.unwrap_or(FIXED_TEST_NOW_SECS * 1000);
+                    core.request_unit(Command::RefreshGroupMetadata {
+                        group_id,
+                        now_ms: step_now,
+                    })
+                    .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "load_members" => {
+                    let group_id = str_arg(args, "id");
+                    let step_now = now_ms.unwrap_or(FIXED_TEST_NOW_SECS * 1000);
+                    let members = core
+                        .request_mention_candidates(Command::LoadGroupMembers {
+                            group_id,
+                            now_ms: step_now,
+                        })
+                        .await;
+                    let arr: Vec<Value> = members
+                        .into_iter()
+                        .map(|c| {
+                            json!({
+                                "id": c.id,
+                                "name": c.name,
+                                "avatar": c.avatar,
+                                "is_all": c.is_all,
+                            })
+                        })
+                        .collect();
+                    results.insert(step_index.to_string(), Value::Array(arr));
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "set_admin" => {
+                    let group_id = str_arg(args, "id");
+                    let uid = str_arg(args, "uid");
+                    let admin = args.get("admin").and_then(Value::as_bool).unwrap_or(true);
+                    let step_now = now_ms.unwrap_or(FIXED_TEST_NOW_SECS * 1000);
+                    let _ = core
+                        .request_bool(Command::SetGroupAdmin {
+                            group_id,
+                            uid,
+                            admin,
+                            now_ms: step_now,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "change_owner" => {
+                    let group_id = str_arg(args, "id");
+                    let uid = str_arg(args, "uid");
+                    let step_now = now_ms.unwrap_or(FIXED_TEST_NOW_SECS * 1000);
+                    let _ = core
+                        .request_bool(Command::ChangeGroupOwner {
+                            group_id,
+                            uid,
+                            now_ms: step_now,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "block_member" => {
+                    let group_id = str_arg(args, "id");
+                    let uid = str_arg(args, "uid");
+                    let step_now = now_ms.unwrap_or(FIXED_TEST_NOW_SECS * 1000);
+                    let _ = core
+                        .request_bool(Command::BlockGroupMember {
+                            group_id,
+                            uid,
+                            now_ms: step_now,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "pending" => {
+                    let group_id = str_arg(args, "id");
+                    let list = core.request_group_pending(group_id).await;
+                    let val = match list {
+                        Some(items) => Value::Array(
+                            items
+                                .into_iter()
+                                .map(|p| {
+                                    json!({
+                                        "id": p.id,
+                                        "name": p.name,
+                                        "avatar": p.avatar,
+                                    })
+                                })
+                                .collect(),
+                        ),
+                        None => Value::Null,
+                    };
+                    results.insert(step_index.to_string(), val);
+                }
+                "review_pending" => {
+                    let group_id = str_arg(args, "id");
+                    let uids = str_vec_arg(args, "uids");
+                    let approve = args.get("approve").and_then(Value::as_bool).unwrap_or(true);
+                    let step_now = now_ms.unwrap_or(FIXED_TEST_NOW_SECS * 1000);
+                    let _ = core
+                        .request_bool(Command::ReviewGroupPending {
+                            group_id,
+                            uids,
+                            approve,
+                            now_ms: step_now,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "join_approval" => {
+                    let group_id = str_arg(args, "id");
+                    let on = args.get("on").and_then(Value::as_bool).unwrap_or(true);
+                    let step_now = now_ms.unwrap_or(FIXED_TEST_NOW_SECS * 1000);
+                    let _ = core
+                        .request_bool(Command::SetGroupJoinApproval {
+                            group_id,
+                            on,
+                            now_ms: step_now,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "group_link" => {
+                    let group_id = str_arg(args, "id");
+                    let link = core
+                        .request_group_link(Command::FetchGroupLink { group_id })
+                        .await;
+                    let val = match link {
+                        Some(l) => json!({ "link": l.link, "enabled": l.enabled }),
+                        None => Value::Null,
+                    };
+                    results.insert(step_index.to_string(), val);
+                }
+                "set_group_link" => {
+                    let group_id = str_arg(args, "id");
+                    let renew = args.get("renew").and_then(Value::as_bool).unwrap_or(true);
+                    let link = core
+                        .request_group_link(Command::SetGroupLink { group_id, renew })
+                        .await;
+                    let val = match link {
+                        Some(l) => json!({ "link": l.link, "enabled": l.enabled }),
+                        None => Value::Null,
+                    };
+                    results.insert(step_index.to_string(), val);
+                }
+                "group_notice" => {
+                    let act = str_arg(args, "act");
+                    let data = args
+                        .get("data")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    let ts = args.get("ts").and_then(Value::as_i64).unwrap_or(0);
+                    let step_now = now_ms.unwrap_or(FIXED_TEST_NOW_SECS * 1000);
+                    core.request_unit(Command::HandleGroupEventNotice {
+                        act,
+                        data,
+                        ts,
+                        now_ms: step_now,
+                    })
+                    .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
                 other => return Err(format!("unknown step cmd: {other}")),
             },
             Step::Await {
@@ -7968,6 +8458,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         is_u5,
                         is_u6,
                         is_u9,
+                        is_u10,
                         is_u8,
                         is_u12,
                         is_u11,
@@ -7977,6 +8468,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         send_logs: &send_logs,
                         prune_next_expiry_ms,
                         action_logs: &action_logs,
+                        group_logs: &group_logs,
                         u9_lookups: &u9_lookups,
                         last_alias_result: last_alias_result.as_ref(),
                         selection: selection.as_ref(),
@@ -8040,6 +8532,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             is_u5,
             is_u6,
             is_u9,
+            is_u10,
             is_u8,
             is_u12,
             is_u11,
@@ -8049,6 +8542,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             send_logs: &send_logs,
             prune_next_expiry_ms,
             action_logs: &action_logs,
+            group_logs: &group_logs,
             u9_lookups: &u9_lookups,
             last_alias_result: last_alias_result.as_ref(),
             selection: selection.as_ref(),
