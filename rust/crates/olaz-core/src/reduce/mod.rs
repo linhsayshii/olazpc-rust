@@ -293,7 +293,8 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         Input::OpRequest { ref cmd, .. } if media::is_media_command(cmd) => {
             media::reduce_media(state, input, &mut out);
         }
-        Input::MediaOutgoingFileRead { .. }
+        Input::MediaE2eeThreadsLoaded { .. }
+        | Input::MediaOutgoingFileRead { .. }
         | Input::MediaImageDimensionsDone { .. }
         | Input::MediaVideoMetadataDone { .. }
         | Input::MediaUploadPhotoDone { .. }

@@ -1444,6 +1444,9 @@ pub enum Effect {
     CancelConfirmPromoteDelay,
 
     // U15 (all host I/O runs concurrently via runtime.spawn, never blocking HostWorker)
+    MediaLoadPersistedE2eeThreads {
+        op_id: u64,
+    },
     MediaReadOutgoingFile {
         op_id: u64,
         path: String,
@@ -2010,6 +2013,10 @@ impl fmt::Debug for Effect {
                 .finish(),
             Self::CancelConfirmPromoteDelay => f.write_str("CancelConfirmPromoteDelay"),
             // U15
+            Self::MediaLoadPersistedE2eeThreads { op_id } => f
+                .debug_struct("MediaLoadPersistedE2eeThreads")
+                .field("op_id", op_id)
+                .finish(),
             Self::MediaReadOutgoingFile { op_id, mode, .. } => f
                 .debug_struct("MediaReadOutgoingFile")
                 .field("op_id", op_id)

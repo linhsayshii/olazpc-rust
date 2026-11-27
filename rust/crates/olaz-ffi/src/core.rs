@@ -2520,6 +2520,7 @@ pub trait CoreHost: Send + Sync {
     async fn sleep_confirm_promote(&self, delay_ms: u64);
 
     // --- Media domain callbacks (U15) ---
+    async fn media_load_persisted_e2ee_threads(&self) -> Vec<String>;
     async fn media_read_outgoing_file(
         &self,
         op_id: u64,
@@ -3093,6 +3094,10 @@ impl Host for FfiHostBridge {
     }
 
     // --- Media domain callbacks (U15) ---
+    async fn media_load_persisted_e2ee_threads(&self) -> Vec<String> {
+        self.0.media_load_persisted_e2ee_threads().await
+    }
+
     async fn media_read_outgoing_file(
         &self,
         op_id: u64,
@@ -5664,6 +5669,9 @@ mod tests {
         }
         async fn sleep_confirm_promote(&self, delay_ms: u64) {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        async fn media_load_persisted_e2ee_threads(&self) -> Vec<String> {
+            Vec::new()
         }
         async fn media_read_outgoing_file(
             &self,

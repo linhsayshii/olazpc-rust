@@ -387,6 +387,10 @@ actor ZaloE2EEManager {
         return rt
     }
 
+    func hasLoadedPersistedThreads() -> Bool {
+        didLoadThreadsFromStore
+    }
+
     func loadPersistedThreads(store: ZaloSQLiteStore?) async {
         guard !didLoadThreadsFromStore, let store else { return }
         if let saved = try? await store.getPreferenceStrings(key: Self.e2eeThreadsPrefKey) {

@@ -127,6 +127,9 @@ pub fn reduce_media(state: &mut CoreState, input: Input, out: &mut ReduceOutput)
         Input::Command(cmd) => handle_command(state, None, cmd, out),
         Input::OpRequest { op_id, cmd } => handle_command(state, Some(op_id), cmd, out),
 
+        Input::MediaE2eeThreadsLoaded { op_id, threads } => {
+            on_e2ee_threads_loaded(state, op_id, threads, out);
+        }
         Input::MediaOutgoingFileRead { op_id, probe } => {
             on_outgoing_file_read(state, op_id, probe, out);
         }
@@ -260,6 +263,7 @@ fn handle_command(state: &mut CoreState, op_id: Option<u64>, cmd: Command, out: 
                 .media
                 .effective_file_limit(state.cloud.snapshot.plan.as_ref().map(|p| p.file_limit));
             let is_group = is_group_id(&conv_id);
+            let needs_e2ee_load = !is_group && !state.send.e2ee_threads_loaded;
             let is_e2ee = if is_group {
                 false
             } else {
@@ -283,7 +287,12 @@ fn handle_command(state: &mut CoreState, op_id: Option<u64>, cmd: Command, out: 
                     current_client_id: None,
                 },
             );
-            advance_send_files(state, op_id, out);
+            if needs_e2ee_load {
+                out.effects
+                    .push(Effect::MediaLoadPersistedE2eeThreads { op_id });
+            } else {
+                advance_send_files(state, op_id, out);
+            }
         }
 
         Command::ResolveMedia {
@@ -400,6 +409,20 @@ fn handle_command(state: &mut CoreState, op_id: Option<u64>, cmd: Command, out: 
 }
 
 // MARK: - Outgoing send_media / send_files
+
+fn on_e2ee_threads_loaded(
+    state: &mut CoreState,
+    op_id: u64,
+    threads: BTreeSet<String>,
+    out: &mut ReduceOutput,
+) {
+    state.send.e2ee_threads.extend(threads);
+    state.send.e2ee_threads_loaded = true;
+    if let Some(pending) = state.media.pending_send_files.get_mut(&op_id) {
+        pending.is_e2ee = !pending.is_group && state.send.e2ee_threads.contains(&pending.conv_id);
+        advance_send_files(state, op_id, out);
+    }
+}
 
 fn advance_send_media(state: &mut CoreState, op_id: u64, out: &mut ReduceOutput) {
     let Some(pending) = state.media.pending_send_media.get_mut(&op_id) else {
@@ -2123,5 +2146,103 @@ mod tests {
             out_expired_ttl.effects.as_slice(),
             [Effect::MediaCacheLookup { .. }]
         ));
+    }
+
+    #[test]
+    fn send_files_waits_for_persisted_e2ee_threads_on_cold_start_and_skips_groups() {
+        let mut state = CoreState::default();
+        assert!(!state.send.e2ee_threads_loaded);
+
+        // Cold-start 1-1 send must wait for persisted e2eeThreadsV1 before reading/uploading.
+        let out_load = reduce(
+            &mut state,
+            Input::OpRequest {
+                op_id: 100,
+                cmd: Command::SendFiles {
+                    conv_id: "3001003".into(),
+                    paths: vec!["/tmp/cold.pdf".into()],
+                    now_ms: 1_700_000_001_000,
+                },
+            },
+        );
+        assert!(matches!(
+            out_load.effects.as_slice(),
+            [Effect::MediaLoadPersistedE2eeThreads { op_id: 100 }]
+        ));
+
+        // Once persisted threads arrive, send proceeds and marks the upload E2EE.
+        let mut persisted = BTreeSet::new();
+        persisted.insert("3001003".to_owned());
+        let out_resume = reduce(
+            &mut state,
+            Input::MediaE2eeThreadsLoaded {
+                op_id: 100,
+                threads: persisted,
+            },
+        );
+        assert!(state.send.e2ee_threads_loaded);
+        assert!(matches!(
+            out_resume.effects.as_slice(),
+            [Effect::MediaReadOutgoingFile {
+                op_id: 100,
+                mode: OutgoingFileMode::File,
+                ..
+            }]
+        ));
+        let out_probe = reduce(
+            &mut state,
+            Input::MediaOutgoingFileRead {
+                op_id: 100,
+                probe: OutgoingFileProbe {
+                    exists: true,
+                    is_dir: false,
+                    readable: true,
+                    size: 128,
+                    media_type: None,
+                },
+            },
+        );
+        assert!(matches!(
+            out_probe.effects.as_slice(),
+            [Effect::MediaAllocClientId { op_id: 100 }]
+        ));
+        let out_upload = reduce(
+            &mut state,
+            Input::MediaClientIdAllocated {
+                op_id: 100,
+                client_id: 5001200000001,
+            },
+        );
+        assert!(out_upload.effects.iter().any(|e| matches!(
+            e,
+            Effect::MediaUploadFile {
+                op_id: 100,
+                is_e2ee: true,
+                ..
+            }
+        )));
+
+        // Group send on a fresh cold state must never wait for E2EE threads and stays non-E2EE.
+        let mut group_state = CoreState::default();
+        let out_group = reduce(
+            &mut group_state,
+            Input::OpRequest {
+                op_id: 101,
+                cmd: Command::SendFiles {
+                    conv_id: "g5001003".into(),
+                    paths: vec!["/tmp/group.pdf".into()],
+                    now_ms: 1_700_000_002_000,
+                },
+            },
+        );
+        assert!(matches!(
+            out_group.effects.as_slice(),
+            [Effect::MediaReadOutgoingFile {
+                op_id: 101,
+                mode: OutgoingFileMode::File,
+                ..
+            }]
+        ));
+        assert!(!group_state.send.e2ee_threads_loaded);
     }
 }

@@ -4845,6 +4845,8 @@ public protocol CoreHost: AnyObject, Sendable {
     
     func sleepConfirmPromote(delayMs: UInt64) async 
     
+    func mediaLoadPersistedE2eeThreads() async  -> [String]
+    
     func mediaReadOutgoingFile(opId: UInt64, path: String, name: String, mode: String) async  -> OutgoingFileProbeRecord
     
     func mediaReleaseOutgoingFile(opId: UInt64) async 
@@ -5872,6 +5874,23 @@ open func sleepConfirmPromote(delayMs: UInt64)async   {
             completeFunc: ffi_olaz_ffi_rust_future_complete_void,
             freeFunc: ffi_olaz_ffi_rust_future_free_void,
             liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+open func mediaLoadPersistedE2eeThreads()async  -> [String]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_media_load_persisted_e2ee_threads(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceString.lift,
             errorHandler: nil
             
         )
@@ -8495,6 +8514,46 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                 uniffiFutureCallback(
                     uniffiCallbackData,
                     UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        mediaLoadPersistedE2eeThreads: { (
+            uniffiHandle: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> [String] in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.mediaLoadPersistedE2eeThreads(
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: [String]) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterSequenceString.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
                         callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
                     )
                 )
@@ -34701,49 +34760,52 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_corehost_sleep_confirm_promote() != 53877) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_media_read_outgoing_file() != 26290) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_load_persisted_e2ee_threads() != 47976) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_media_release_outgoing_file() != 11834) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_read_outgoing_file() != 64021) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_media_image_dimensions() != 408) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_release_outgoing_file() != 54718) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_media_video_metadata() != 34756) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_image_dimensions() != 3593) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_media_upload_photo() != 43810) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_video_metadata() != 63445) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_media_upload_video() != 25537) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_upload_photo() != 37213) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_media_upload_file() != 44731) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_upload_video() != 29660) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_media_remove_own_local_file() != 1447) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_upload_file() != 53326) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_media_file_exists() != 21507) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_remove_own_local_file() != 22631) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_media_cache_lookup() != 22912) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_file_exists() != 33518) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_media_check_local_file() != 55971) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_cache_lookup() != 40593) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_media_loader_fetch_media() != 61124) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_check_local_file() != 53823) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_media_video_poster() != 16696) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_loader_fetch_media() != 268) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_media_loader_fetch_file() != 51518) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_video_poster() != 58575) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_media_stage_file() != 64916) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_loader_fetch_file() != 12743) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_stage_file() != 17525) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreofflineconversations_apply_preview_override() != 60866) {

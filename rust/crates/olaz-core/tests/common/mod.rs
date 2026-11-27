@@ -2968,6 +2968,51 @@ impl Host for RecordingHost {
     }
 
     // U15 media host methods
+    async fn media_load_persisted_e2ee_threads(&self) -> Vec<String> {
+        if let Some(store_arc) = self
+            .store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        {
+            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+            return store
+                .get_preference_strings("e2eeThreadsV1")
+                .unwrap_or_default();
+        }
+        let Some(dir) = &self.data_dir else {
+            return Vec::new();
+        };
+        let raw = if let Some(saved) = &self.saved_session {
+            saved.clone()
+        } else if let Ok(from_disk) = std::fs::read_to_string(dir.join("native-session.json")) {
+            from_disk
+        } else {
+            return Vec::new();
+        };
+        let Ok(val) = serde_json::from_str::<Value>(&raw) else {
+            return Vec::new();
+        };
+        let uid = val
+            .get("plainAccount")
+            .and_then(|p| p.get("userId"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if uid.is_empty() {
+            return Vec::new();
+        }
+        let db_path = dir.join("accounts").join(uid).join("history.sqlite3");
+        if !db_path.exists() {
+            return Vec::new();
+        }
+        let Ok(store) = Store::open(&db_path) else {
+            return Vec::new();
+        };
+        store
+            .get_preference_strings("e2eeThreadsV1")
+            .unwrap_or_default()
+    }
+
     async fn media_read_outgoing_file(
         &self,
         _op_id: u64,

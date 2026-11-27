@@ -815,6 +815,11 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
 
     // MARK: - U15 Media Host Callbacks
 
+    func mediaLoadPersistedE2eeThreads() async -> [String] {
+        guard let engine else { return [] }
+        return await engine.hostMediaLoadPersistedE2eeThreads()
+    }
+
     func mediaReadOutgoingFile(opId: UInt64, path: String, name: String, mode: String) async -> OutgoingFileProbeRecord {
         guard let engine else {
             return OutgoingFileProbeRecord(exists: false, isDir: false, readable: false, size: 0, mediaType: nil)

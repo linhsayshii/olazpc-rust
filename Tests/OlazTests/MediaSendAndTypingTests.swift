@@ -492,4 +492,56 @@ private func makeTinyVideoClip(
         coordinator.textDidChange(Notification(name: NSText.didChangeNotification, object: tv))
         #expect(recordedEdits == ["xin chao", ""])
     }
+
+    @MainActor
+    @Test("sendFiles detects persisted e2eeThreadsV1 on cold start before start()")
+    func sendFilesDetectsPersistedE2EEOnColdStartBeforeStart() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("olaz-cold-e2ee-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // Persist native-session.json + accounts/<uid>/history.sqlite3 with e2eeThreadsV1, without calling start().
+        let uid = "2009901"
+        let peerId = "3009901"
+        let sessionObj: [String: Any] = [
+            "plainAccount": [
+                "userId": uid,
+                "displayName": "Cold User",
+            ]
+        ]
+        let sessionData = try JSONSerialization.data(withJSONObject: sessionObj)
+        try sessionData.write(to: dir.appendingPathComponent("native-session.json"))
+
+        let dbURL = dir
+            .appendingPathComponent("accounts", isDirectory: true)
+            .appendingPathComponent(uid, isDirectory: true)
+            .appendingPathComponent("history.sqlite3")
+        let seedStore = try ZaloSQLiteStore(path: dbURL.path)
+        try await seedStore.setPreferenceStrings(key: "e2eeThreadsV1", value: [peerId])
+
+        let fileURL = dir.appendingPathComponent("cold.pdf")
+        try Data("hello e2ee".utf8).write(to: fileURL)
+
+        let engine = ZaloEngine(dataDirectory: dir, useKeychain: false)
+        var observedIsE2EE: Bool?
+        engine.uploadFileHostHandler = { args in
+            observedIsE2EE = args["is_e2ee"] as? Bool
+            return UploadedMediaResult(
+                url: "https://cdn.example.invalid/cold.pdf?e2esession=abc",
+                msgId: "99001",
+                cliMsgId: (args["client_id"] as? String) ?? "1",
+                width: 0,
+                height: 0
+            )
+        }
+
+        let outcome = await engine.sendFiles([fileURL], to: peerId)
+        #expect(outcome == .done)
+        #expect(observedIsE2EE == true)
+        let msg = engine.messages[peerId]?.first(where: { $0.id == "99001" })
+        #expect(msg?.isE2EE == true)
+
+        engine.stopCoreEngine()
+    }
 }

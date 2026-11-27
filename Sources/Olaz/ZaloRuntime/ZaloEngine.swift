@@ -622,6 +622,10 @@ final class ZaloEngine {
             await webSocket.seedQueueCursors(savedCursors)
         }
         await e2eeManager.loadPersistedThreads(store: store)
+        let persistedE2EE = e2eeManager.e2eeThreadIdsSync()
+        if !persistedE2EE.isEmpty {
+            coreLifecycle.core?.setE2eeThreads(threads: persistedE2EE)
+        }
         let client = sessionClient
         // The owner of an E2EE quote is nearly always one of the two people in the chat: their global ids come from
         // `/api/gid/encrypt` (cached), the same call that builds our own quotes; anyone else goes through `/api/gid/decrypt`.

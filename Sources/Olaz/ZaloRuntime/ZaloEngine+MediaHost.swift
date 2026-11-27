@@ -316,6 +316,35 @@ extension ZaloEngine {
 // MARK: - U15 Host I/O Adapters on ZaloEngine
 
 extension ZaloEngine {
+    /// Hydrates persisted `e2eeThreadsV1` from SQLite on cold start (before `start()` /
+    /// `prepareStoreAndLocalCache` has attached `sqliteStore`) so 1-1 sends wait for persisted
+    /// E2EE threads instead of falling back to plaintext.
+    nonisolated internal func hostMediaLoadPersistedE2eeThreads() async -> [String] {
+        if await e2eeManager.hasLoadedPersistedThreads() {
+            return e2eeManager.e2eeThreadIdsSync()
+        }
+        if let store = await MainActor.run(body: { self.sqliteStore }) {
+            await e2eeManager.loadPersistedThreads(store: store)
+            return e2eeManager.e2eeThreadIdsSync()
+        }
+        let sessionURL = dataDirectory.appendingPathComponent("native-session.json")
+        if let raw = try? Data(contentsOf: sessionURL),
+           let root = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any],
+           let plain = root["plainAccount"] as? [String: Any],
+           let uid = plain["userId"] as? String,
+           !uid.isEmpty {
+            let dbURL = dataDirectory
+                .appendingPathComponent("accounts", isDirectory: true)
+                .appendingPathComponent(uid, isDirectory: true)
+                .appendingPathComponent("history.sqlite3")
+            if FileManager.default.fileExists(atPath: dbURL.path),
+               let tempStore = try? ZaloSQLiteStore(path: dbURL.path) {
+                await e2eeManager.loadPersistedThreads(store: tempStore)
+            }
+        }
+        return e2eeManager.e2eeThreadIdsSync()
+    }
+
     nonisolated internal func hostMediaReadOutgoingFile(
         opId: UInt64,
         path: String,

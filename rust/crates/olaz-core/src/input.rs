@@ -1894,6 +1894,10 @@ pub enum Input {
         confirm_gen: u64,
     },
     // U15
+    MediaE2eeThreadsLoaded {
+        op_id: u64,
+        threads: BTreeSet<String>,
+    },
     MediaOutgoingFileRead {
         op_id: u64,
         probe: OutgoingFileProbe,
@@ -2729,6 +2733,11 @@ impl fmt::Debug for Input {
                 .field("confirm_gen", confirm_gen)
                 .finish(),
             // U15
+            Self::MediaE2eeThreadsLoaded { op_id, threads } => f
+                .debug_struct("MediaE2eeThreadsLoaded")
+                .field("op_id", op_id)
+                .field("count", &threads.len())
+                .finish(),
             Self::MediaOutgoingFileRead { op_id, probe } => f
                 .debug_struct("MediaOutgoingFileRead")
                 .field("op_id", op_id)

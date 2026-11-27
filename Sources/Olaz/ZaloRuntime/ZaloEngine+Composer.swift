@@ -278,9 +278,12 @@ extension ZaloEngine {
             return .failed(ComposerOutcome.genericFailure)
         }
         if !ZaloWireParser.isGroupId(id) {
-            _ = await e2eeManager.isE2EEConversation(id)
+            let loaded = await e2eeManager.hasLoadedPersistedThreads()
+            let threads = e2eeManager.e2eeThreadIdsSync()
+            if loaded || !threads.isEmpty {
+                core.setE2eeThreads(threads: threads)
+            }
         }
-        core.setE2eeThreads(threads: e2eeManager.e2eeThreadIdsSync())
         if let fileLimit = cloud.plan?.fileLimit {
             core.seedMediaCloudFileLimit(limit: fileLimit)
         }

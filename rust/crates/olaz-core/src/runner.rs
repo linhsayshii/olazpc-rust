@@ -578,6 +578,11 @@ pub trait Host: Send + Sync {
     }
 
     // --- Media domain callbacks (U15; executed concurrently on runtime.spawn) ---
+    /// Loads persisted `e2eeThreadsV1` from disk on cold start (before `prepare_store` attaches
+    /// the shared SQLite store) so 1-1 sends do not silently fall back to plaintext.
+    async fn media_load_persisted_e2ee_threads(&self) -> Vec<String> {
+        Vec::new()
+    }
     async fn media_read_outgoing_file(
         &self,
         _op_id: u64,
@@ -2913,6 +2918,40 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     self.cancel_confirm_promote_timer();
                 }
                 // U15
+                Effect::MediaLoadPersistedE2eeThreads { op_id } => {
+                    let shared_store = Arc::clone(&self.shared_store);
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let store_opt = shared_store
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .clone();
+                        let raw_threads: Vec<String> = if let Some(store_arc) = store_opt {
+                            tokio::task::spawn_blocking(move || {
+                                let store =
+                                    store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                store
+                                    .get_preference_strings("e2eeThreadsV1")
+                                    .unwrap_or_default()
+                            })
+                            .await
+                            .unwrap_or_default()
+                        } else {
+                            host.media_load_persisted_e2ee_threads().await
+                        };
+                        let threads: BTreeSet<String> = raw_threads
+                            .into_iter()
+                            .map(|raw| olaz_wire::strip_user_prefix(&raw).to_owned())
+                            .filter(|clean| {
+                                !clean.is_empty() && clean != "0" && !olaz_wire::is_group_id(clean)
+                            })
+                            .collect();
+                        sink.send(Input::MediaE2eeThreadsLoaded { op_id, threads });
+                        drop(guard);
+                    });
+                }
                 Effect::MediaReadOutgoingFile {
                     op_id,
                     path,

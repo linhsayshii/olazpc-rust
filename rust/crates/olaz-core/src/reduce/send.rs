@@ -50,6 +50,9 @@ struct PendingSend {
 #[derive(Clone, Default)]
 pub struct SendState {
     pub e2ee_threads: BTreeSet<String>,
+    /// True once persisted `e2eeThreadsV1` have been hydrated (either via `SetE2eeThreads`
+    /// with non-empty threads or via `MediaE2eeThreadsLoaded` on cold start).
+    pub e2ee_threads_loaded: bool,
     pub auto_delete_ttl_ms: BTreeMap<String, i64>,
     in_flight: BTreeMap<u64, PendingSend>,
     next_send_id: u64,
@@ -69,6 +72,7 @@ impl SendState {
     /// Resets session-scoped send state on logout/expiry and fails any in-flight send ops.
     pub(crate) fn reset(&mut self, out: &mut ReduceOutput) {
         self.e2ee_threads.clear();
+        self.e2ee_threads_loaded = false;
         self.auto_delete_ttl_ms.clear();
         let pending = std::mem::take(&mut self.in_flight);
         for (_, send) in pending {
@@ -166,6 +170,9 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
             conversations::mark_conversation_read(state, id, seen_target, op_id, out);
         }
         Command::SetE2eeThreads(threads) => {
+            if !threads.is_empty() {
+                state.send.e2ee_threads_loaded = true;
+            }
             state.send.e2ee_threads = threads;
             complete_op(op_id, OpResult::Unit, false, out);
         }
