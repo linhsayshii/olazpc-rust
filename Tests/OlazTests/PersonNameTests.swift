@@ -18,17 +18,17 @@ import Testing
     }
 
     @Test func mentionShowsAliasAndShiftsLaterRanges() {
-        let text = "@Hoàng Tùng Dạ vâng @Lan ok"
+        let text = "@Người A xin chào @Người B ok"
         let mentions = [
-            Mention(uid: "9760", pos: 0, len: 11, isAll: false),
-            Mention(uid: "42", pos: 20, len: 4, isAll: false),
+            Mention(uid: "3000104", pos: 0, len: 8, isAll: false),
+            Mention(uid: "3000105", pos: 18, len: 8, isAll: false),
         ]
-        let names = ["9760": "Thầy Tùng chôn lịch", "42": "Lan"]
+        let names = ["3000104": "Biệt danh Người A", "3000105": "Người B"]
         let out = ChatFormat.renamingMentions(text, mentions: mentions, name: { names[$0] })
-        #expect(out.text == "@Thầy Tùng chôn lịch Dạ vâng @Lan ok")
+        #expect(out.text == "@Biệt danh Người A xin chào @Người B ok")
         let ns = out.text as NSString
-        #expect(ns.substring(with: NSRange(location: out.mentions[0].pos, length: out.mentions[0].len)) == "@Thầy Tùng chôn lịch")
-        #expect(ns.substring(with: NSRange(location: out.mentions[1].pos, length: out.mentions[1].len)) == "@Lan")
+        #expect(ns.substring(with: NSRange(location: out.mentions[0].pos, length: out.mentions[0].len)) == "@Biệt danh Người A")
+        #expect(ns.substring(with: NSRange(location: out.mentions[1].pos, length: out.mentions[1].len)) == "@Người B")
     }
 
     @Test func unknownAllAndMalformedMentionsKeepSentText() {
@@ -44,15 +44,15 @@ import Testing
     @Test func listPreviewShowsMentionAlias() {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("olaz-preview-alias-\(UUID())")
         let engine = ZaloEngine(dataDirectory: dir, useKeychain: false)
-        engine.cachedAliases["9760"] = "Thầy Tùng chôn lịch"
+        engine.cachedAliases["3000104"] = "Biệt danh Người A"
         let msg = ChatMessage(
-            id: "m1", conversationId: "g1", senderId: "u1", senderName: "Kim Liên",
-            senderAvatar: nil, isMine: false, kind: .text, text: "@Hoàng Tùng Dạ vâng",
+            id: "m1", conversationId: "g1", senderId: "u1", senderName: "Người C",
+            senderAvatar: nil, isMine: false, kind: .text, text: "@Người A xin chào",
             date: Date(), status: .sent, quote: nil, reactions: [],
-            isE2EE: false, mentions: [Mention(uid: "9760", pos: 0, len: 11, isAll: false)], cardButtons: [],
+            isE2EE: false, mentions: [Mention(uid: "3000104", pos: 0, len: 8, isAll: false)], cardButtons: [],
             suggestsStickers: false, menu: MessageMenu(json: [:])
         )
         engine.updateConversationOnMessage(msg, incrementUnread: false)
-        #expect(engine.conversations.first(where: { $0.id == "g1" })?.preview?.text == "@Thầy Tùng chôn lịch Dạ vâng")
+        #expect(engine.conversations.first(where: { $0.id == "g1" })?.preview?.text == "@Biệt danh Người A xin chào")
     }
 }
