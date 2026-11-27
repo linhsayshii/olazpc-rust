@@ -14,8 +14,8 @@ use olaz_crypto::{md5_hex, sha256_hex};
 use olaz_json::{bool_value, int64, parse_any, parse_object, string, to_swift_json_string};
 use olaz_store::{Store, StoredConversation};
 use olaz_wire::{
-    ChatMessage, Kind, Mention, UNKNOWN_NAME, is_group_id, normalize_thread_id_from_list,
-    sanitize_profile_uid, strip_user_prefix,
+    ChatMessage, Kind, Mention, UNKNOWN_NAME, is_group_id, normalize_contact_uid,
+    normalize_thread_id_from_list, sanitize_profile_uid, strip_user_prefix,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -966,8 +966,14 @@ impl ConversationsState {
         my_uid: &str,
         my_avatar: Option<&str>,
     ) -> Option<String> {
-        let clean = strip_user_prefix(uid);
-        if clean.is_empty() || clean == "-1" || clean == strip_user_prefix(my_uid) {
+        let clean = normalize_contact_uid(uid);
+        if clean.is_empty() || clean == "-1" {
+            return None;
+        }
+        let clean_my = normalize_contact_uid(my_uid);
+        let sanitized_my = sanitize_profile_uid(&clean_my).unwrap_or_else(|| clean_my.clone());
+        let sanitized_clean = sanitize_profile_uid(&clean).unwrap_or_else(|| clean.clone());
+        if !clean_my.is_empty() && (clean == clean_my || sanitized_clean == sanitized_my) {
             return None;
         }
         let (raw_name, _) = self.lookup_person_info(contacts, &clean, my_uid, my_avatar)?;
@@ -1337,11 +1343,78 @@ impl ConversationsState {
     /// Merges self conversation, groups, pinned ids, and ranked active threads into `conversations`
     /// and updates metadata from contacts/aliases/groups (`ensureKnownContactsInConversations`).
     /// Returns `true` if `conversations` changed.
+    fn lookup_conversation_identity_indexed(
+        contacts: &ContactsState,
+        friends_by_id: &HashMap<&str, &crate::messages::FriendEntry>,
+        groups_by_id: &HashMap<&str, &crate::messages::GroupEntry>,
+        conv_id: &str,
+        self_conv_id: Option<&str>,
+    ) -> (String, Option<String>, i64) {
+        if self_conv_id == Some(conv_id) {
+            return ("Cloud của tôi".to_owned(), None, 0);
+        }
+        if is_group_id(conv_id) {
+            if let Some(g) = groups_by_id.get(conv_id) {
+                return (g.name.clone(), g.avatar.clone(), g.members);
+            }
+            if let Some(cg) = contacts.cached_groups.get(conv_id) {
+                let name = if cg.name.is_empty() {
+                    conv_id.to_owned()
+                } else {
+                    cg.name.clone()
+                };
+                let avatar = (!cg.avatar.is_empty()).then(|| cg.avatar.clone());
+                return (name, avatar, cg.members);
+            }
+            return (conv_id.to_owned(), None, 0);
+        }
+        let clean = normalize_contact_uid(conv_id);
+        let alias = contacts.aliases.get(&clean).map(String::as_str);
+        if let Some(f) = friends_by_id.get(clean.as_str()) {
+            let avt = f.avatar.clone().or_else(|| {
+                contacts
+                    .cached_profiles
+                    .get(&clean)
+                    .and_then(|p| (!p.avatar.is_empty()).then(|| p.avatar.clone()))
+            });
+            let name = match alias {
+                Some(a) if !a.is_empty() => a.to_owned(),
+                _ => f.name.clone(),
+            };
+            return (name, avt, 0);
+        }
+        if let Some(p) = contacts.cached_profiles.get(&clean) {
+            let best_name = match alias {
+                Some(a) if !a.is_empty() => a.to_owned(),
+                _ => p.name.clone(),
+            };
+            let avt = (!p.avatar.is_empty()).then(|| p.avatar.clone());
+            return (best_name, avt, 0);
+        }
+        if let Some(a) = alias
+            && !a.is_empty()
+        {
+            return (a.to_owned(), None, 0);
+        }
+        (String::new(), None, 0)
+    }
+
     pub fn ensure_known_contacts(
         &mut self,
         contacts: &ContactsState,
         self_conv_id: Option<&str>,
     ) -> bool {
+        let mut friends_by_id: HashMap<&str, &crate::messages::FriendEntry> =
+            HashMap::with_capacity(contacts.friends.len());
+        for f in &contacts.friends {
+            friends_by_id.entry(f.id.as_str()).or_insert(f);
+        }
+        let mut groups_by_id: HashMap<&str, &crate::messages::GroupEntry> =
+            HashMap::with_capacity(contacts.groups.len());
+        for g in &contacts.groups {
+            groups_by_id.entry(g.id.as_str()).or_insert(g);
+        }
+
         let mut existing: HashMap<String, ConversationSummary> = self
             .conversations
             .iter()
@@ -1388,7 +1461,13 @@ impl ConversationsState {
 
         for pinned_id in &self.pinned_ids {
             if !existing.contains_key(pinned_id) {
-                let info = self.lookup_conversation_identity(contacts, pinned_id, self_conv_id);
+                let info = Self::lookup_conversation_identity_indexed(
+                    contacts,
+                    &friends_by_id,
+                    &groups_by_id,
+                    pinned_id,
+                    self_conv_id,
+                );
                 existing.insert(
                     pinned_id.clone(),
                     ConversationSummary {
@@ -1422,7 +1501,13 @@ impl ConversationsState {
             {
                 continue;
             }
-            let info = self.lookup_conversation_identity(contacts, active_id, self_conv_id);
+            let info = Self::lookup_conversation_identity_indexed(
+                contacts,
+                &friends_by_id,
+                &groups_by_id,
+                active_id,
+                self_conv_id,
+            );
             existing.insert(
                 active_id.clone(),
                 ConversationSummary {
@@ -1442,10 +1527,16 @@ impl ConversationsState {
             );
         }
 
-        // Apply updated friend/alias/group metadata to existing entries.
+        // Apply updated friend/alias/group metadata to existing entries in O(1) per conversation.
         let ids: Vec<String> = existing.keys().cloned().collect();
         for id in ids {
-            let info = self.lookup_conversation_identity(contacts, &id, self_conv_id);
+            let info = Self::lookup_conversation_identity_indexed(
+                contacts,
+                &friends_by_id,
+                &groups_by_id,
+                &id,
+                self_conv_id,
+            );
             if let Some(summary) = existing.get_mut(&id) {
                 if !info.0.is_empty() && summary.name != info.0 {
                     summary.name = info.0;

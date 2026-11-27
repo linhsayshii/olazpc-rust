@@ -194,12 +194,10 @@ extension ZaloEngine {
 
     /// Name an @mention of `uid` shows (official `getMemberFriendlyName` -> `getDName`: alias, else the Zalo name);
     /// nil keeps the text as sent (me, everyone, or nobody known).
+    /// Resolves in O(1) directly from the `@Observable` mirror on `@MainActor` with zero per-row FFI hops.
     func mentionDisplayName(_ uid: String) -> String? {
-        if let core = coreLifecycle.core {
-            return core.mentionDisplayName(uid: uid)
-        }
-        let clean = ZaloWireParser.stripUserPrefix(uid)
-        let cleanMy = ZaloWireParser.stripUserPrefix(profile?.userId ?? "")
+        let clean = ZaloWireParser.normalizeContactUid(uid)
+        let cleanMy = ZaloWireParser.normalizeContactUid(profile?.userId ?? "")
         let sanitizedMy = ZaloWireParser.sanitizeProfileUid(cleanMy) ?? cleanMy
         let sanitizedClean = ZaloWireParser.sanitizeProfileUid(clean) ?? clean
         guard !clean.isEmpty, clean != "-1",

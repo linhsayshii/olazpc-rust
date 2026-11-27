@@ -5,7 +5,7 @@ use std::fmt;
 
 use olaz_json::{bool_value, int64, string};
 use olaz_net::{ApiRequest, Transport};
-use olaz_wire::strip_user_prefix;
+use olaz_wire::normalize_contact_uid;
 use olaz_wire::util::as_dict_array;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -59,7 +59,7 @@ pub fn build_search_friend_by_phone_payload(phone: &str, imei: &str) -> Value {
 #[must_use]
 pub fn build_send_friend_request_payload(to_uid: &str, message: &str, imei: &str) -> Value {
     json!({
-        "toid": strip_user_prefix(to_uid),
+        "toid": normalize_contact_uid(to_uid),
         "msg": message,
         "reqsrc": 30,
         "imei": imei,
@@ -71,7 +71,7 @@ pub fn build_send_friend_request_payload(to_uid: &str, message: &str, imei: &str
 #[must_use]
 pub fn build_accept_friend_request_payload(uid: &str, imei: &str) -> Value {
     json!({
-        "fid": strip_user_prefix(uid),
+        "fid": normalize_contact_uid(uid),
         "language": "vi",
         "imei": imei,
     })
@@ -82,7 +82,7 @@ pub fn build_accept_friend_request_payload(uid: &str, imei: &str) -> Value {
 #[must_use]
 pub fn build_fid_imei_payload(uid: &str, imei: &str) -> Value {
     json!({
-        "fid": strip_user_prefix(uid),
+        "fid": normalize_contact_uid(uid),
         "imei": imei,
     })
 }
@@ -90,7 +90,7 @@ pub fn build_fid_imei_payload(uid: &str, imei: &str) -> Value {
 /// Builds the `(path, payload)` pair for `ZaloSessionClient.setAliasAPI`.
 #[must_use]
 pub fn build_set_alias_request(uid: &str, alias: &str, imei: &str) -> (&'static str, Value) {
-    let clean_uid = strip_user_prefix(uid);
+    let clean_uid = normalize_contact_uid(uid);
     let trimmed = alias.trim();
     if trimmed.is_empty() {
         ("/api/alias/remove", json!({ "friendId": clean_uid }))
@@ -112,7 +112,7 @@ pub fn parse_blocked_users_page(data: &JsonObject) -> (Vec<BlockedUserEntry>, bo
     let rows = as_dict_array(data.get("profiles")).unwrap_or_default();
     let mut users = Vec::with_capacity(rows.len());
     for row in rows {
-        let id = strip_user_prefix(&string(row.get("userId").or_else(|| row.get("uid"))));
+        let id = normalize_contact_uid(&string(row.get("userId").or_else(|| row.get("uid"))));
         if id.is_empty() || id == "0" {
             continue;
         }
@@ -298,15 +298,23 @@ mod tests {
             })
         );
         assert_eq!(
-            build_set_alias_request(" 3001 ", "  Bí danh  ", "imei-1"),
+            build_set_alias_request(" u3001 ", "  Bí danh  ", "imei-1"),
             (
                 "/api/alias/update",
                 json!({"friendId": "3001", "alias": "Bí danh", "imei": "imei-1"}),
             )
         );
         assert_eq!(
-            build_set_alias_request("3001", "   ", "imei-1"),
+            build_set_alias_request("u3001", "   ", "imei-1"),
             ("/api/alias/remove", json!({"friendId": "3001"}))
+        );
+        assert_eq!(
+            build_send_friend_request_payload("u3009", "Hi", "imei-1")["toid"],
+            json!("3009")
+        );
+        assert_eq!(
+            build_fid_imei_payload("u3010", "imei-1")["fid"],
+            json!("3010")
         );
     }
 
@@ -358,7 +366,7 @@ mod tests {
 
         let blocked = api.fetch_blocked_users().await.unwrap();
         assert_eq!(blocked.len(), 2);
-        assert_eq!(blocked[0].id, "u3001");
+        assert_eq!(blocked[0].id, "3001");
         assert_eq!(blocked[0].name, "One");
         assert_eq!(blocked[1].id, "3002");
         assert_eq!(blocked[1].name, "Two");

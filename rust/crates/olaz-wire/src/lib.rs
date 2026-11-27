@@ -27,8 +27,8 @@ pub use envelope::{
     is_typed_chat_cmd,
 };
 pub use ids::{
-    clean_group_id, group_conv_id, is_group_id, normalize_thread_id_from_list,
-    sanitize_profile_uid, strip_user_prefix,
+    clean_group_id, group_conv_id, is_group_id, normalize_contact_uid,
+    normalize_thread_id_from_list, sanitize_profile_uid, strip_user_prefix,
 };
 pub use message::{
     CMD_PULL_MSG_GROUP, CMD_PUSH_MSG_GROUP, NameLookup, NameLookupFn, WireParseOptions,

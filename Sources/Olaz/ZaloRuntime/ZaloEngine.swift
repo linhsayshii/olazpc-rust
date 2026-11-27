@@ -64,6 +64,7 @@ final class ZaloEngine {
     private(set) var phase: Phase = .starting
     var conversations: [ConversationSummary] = [] {
         didSet {
+            conversationFallbackById = nil
             if !isApplyingCoreMirror {
                 coreLifecycle.core?.syncConversationsSnapshot(list: conversations.map(\.coreRecord))
             }
@@ -133,7 +134,18 @@ final class ZaloEngine {
             }
         }
     }
-    var contacts = ContactsState() { didSet { pushCoreIdentitiesIfRunning(); pushCoreContactsIfRunning() } }
+    var contacts = ContactsState() {
+        didSet {
+            friendsById = nil
+            groupsById = nil
+            pushCoreIdentitiesIfRunning()
+            pushCoreContactsIfRunning()
+        }
+    }
+    /// Monotonic counter bumped whenever `@ObservationIgnored` identity caches (`cachedAliases`,
+    /// `cachedProfiles`, `cachedGroups`, `cachedFriendGlobalIds`) mutate so `@Observable` views reading
+    /// `lookupPersonInfo` / `mentionDisplayName` / `lookupConversationIdentity` re-evaluate without FFI hops.
+    internal var identityCacheVersion: UInt64 = 0
     var notificationSettings = NotificationSettingsState()
     var cloud = CloudState()
     var call = CallState()
@@ -274,17 +286,41 @@ final class ZaloEngine {
     @ObservationIgnored internal var cachedSentRequestsRaw: [[String: Any]] = []
     @ObservationIgnored internal var cachedReceivedRequestsRaw: [[String: Any]] = []
     @ObservationIgnored internal var cachedGroupDetails: [String: [String: Any]] = [:] { didSet { pushCoreContactsIfRunning() } }
-    @ObservationIgnored internal var cachedFriendGlobalIds: [String: String] = [:] { didSet { friendUidByGlobalId = nil; pushCoreIdentitiesIfRunning() } }
-    /// `cachedFriendGlobalIds` reversed (global id → uid), built on first use: looking a sender up scanned the whole map for every
-    /// message (50 per chat opened, ~25 ms of main thread).
+    @ObservationIgnored internal var cachedFriendGlobalIds: [String: String] = [:] {
+        didSet {
+            friendUidByGlobalId = nil
+            identityCacheVersion &+= 1
+            pushCoreIdentitiesIfRunning()
+        }
+    }
+    /// `cachedFriendGlobalIds` reversed (global id → uid), built on first use in deterministic key order.
     @ObservationIgnored private var friendUidByGlobalId: [String: String]?
+    /// O(1) local mirror indexes rebuilt lazily when `contacts` or `conversations` mutate (U9).
+    @ObservationIgnored private var friendsById: [String: ContactsState.Friend]?
+    @ObservationIgnored private var groupsById: [String: ContactsState.Group]?
+    @ObservationIgnored private var conversationFallbackById: [String: (name: String, avatar: String)]?
     @ObservationIgnored internal var cachedPinnedIds: Set<String> = []
     @ObservationIgnored internal var cachedArchivedIds: Set<String> = []
     @ObservationIgnored internal var cachedStarredIds: Set<String> = []
     @ObservationIgnored internal var cachedUnreadMarks: Set<String> = []
-    @ObservationIgnored internal var cachedAliases: [String: String] = [:] { didSet { pushCoreIdentitiesIfRunning() } }
-    @ObservationIgnored internal var cachedProfiles: [String: ZaloWebKitMigrator.CachedProfile] = [:] { didSet { pushCoreIdentitiesIfRunning() } }
-    @ObservationIgnored internal var cachedGroups: [String: ZaloWebKitMigrator.CachedGroup] = [:] { didSet { pushCoreIdentitiesIfRunning() } }
+    @ObservationIgnored internal var cachedAliases: [String: String] = [:] {
+        didSet {
+            identityCacheVersion &+= 1
+            pushCoreIdentitiesIfRunning()
+        }
+    }
+    @ObservationIgnored internal var cachedProfiles: [String: ZaloWebKitMigrator.CachedProfile] = [:] {
+        didSet {
+            identityCacheVersion &+= 1
+            pushCoreIdentitiesIfRunning()
+        }
+    }
+    @ObservationIgnored internal var cachedGroups: [String: ZaloWebKitMigrator.CachedGroup] = [:] {
+        didSet {
+            identityCacheVersion &+= 1
+            pushCoreIdentitiesIfRunning()
+        }
+    }
     @ObservationIgnored internal var cachedActivityRanks: [String: Int64] = [:] { didSet { pushCoreIdentitiesIfRunning() } }
     /// Per-conversation result of the launch preload probe (see `ZaloEngine+HistoryFreshness.swift`).
     @ObservationIgnored internal var historyFreshness: [String: HistoryFreshness] = [:] { didSet { pushCoreHistoryFreshnessIfRunning() } }
@@ -954,36 +990,83 @@ final class ZaloEngine {
         }
     }
 
-    internal func lookupPersonInfo(_ uid: String) -> (name: String, avatar: String)? {
-        if let core = coreLifecycle.core {
-            guard let rec = core.lookupPersonInfo(uid: uid) else { return nil }
-            return (rec.name, rec.avatar)
+    private func ensureFriendsById() -> [String: ContactsState.Friend] {
+        if let existing = friendsById { return existing }
+        var map: [String: ContactsState.Friend] = [:]
+        map.reserveCapacity(contacts.friends.count)
+        for f in contacts.friends where map[f.id] == nil {
+            map[f.id] = f
         }
+        friendsById = map
+        return map
+    }
+
+    private func ensureGroupsById() -> [String: ContactsState.Group] {
+        if let existing = groupsById { return existing }
+        var map: [String: ContactsState.Group] = [:]
+        map.reserveCapacity(contacts.groups.count)
+        for g in contacts.groups where map[g.id] == nil {
+            map[g.id] = g
+        }
+        groupsById = map
+        return map
+    }
+
+    private func ensureConversationFallbackById() -> [String: (name: String, avatar: String)] {
+        if let existing = conversationFallbackById { return existing }
+        var map: [String: (name: String, avatar: String)] = [:]
+        map.reserveCapacity(conversations.count)
+        for conv in conversations {
+            let trimmedName = conv.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let validName = (!trimmedName.isEmpty && trimmedName != conv.id && trimmedName != ReactionDetail.unknownName) ? trimmedName : ""
+            let avt = conv.avatar?.absoluteString ?? ""
+            if (!validName.isEmpty || !avt.isEmpty), map[conv.id] == nil {
+                map[conv.id] = (validName, avt)
+            }
+        }
+        conversationFallbackById = map
+        return map
+    }
+
+    internal func lookupPersonInfo(_ uid: String) -> (name: String, avatar: String)? {
+        _ = (contacts, conversations, identityCacheVersion)
         let clean = ZaloWireParser.stripUserPrefix(uid)
         guard !clean.isEmpty, clean != "0", clean != "-1", clean != "__legacy__", clean != "unknown" else {
             return nil
         }
         var candidates: [String] = [clean]
-        if let sanitized = ZaloWireParser.sanitizeProfileUid(clean), sanitized != clean {
+        let norm = ZaloWireParser.normalizeContactUid(clean)
+        if !norm.isEmpty, norm != clean {
+            candidates.append(norm)
+        }
+        if let sanitized = ZaloWireParser.sanitizeProfileUid(clean), !candidates.contains(sanitized) {
             candidates.append(sanitized)
         }
         if friendUidByGlobalId == nil {
-            friendUidByGlobalId = Dictionary(cachedFriendGlobalIds.map { ($0.value, $0.key) }, uniquingKeysWith: { a, _ in a })
+            var rev: [String: String] = [:]
+            rev.reserveCapacity(cachedFriendGlobalIds.count)
+            for key in cachedFriendGlobalIds.keys.sorted() {
+                if let gid = cachedFriendGlobalIds[key], rev[gid] == nil {
+                    rev[gid] = key
+                }
+            }
+            friendUidByGlobalId = rev
         }
         if let mappedUid = candidates.lazy.compactMap({ self.friendUidByGlobalId?[$0] }).first,
            !candidates.contains(mappedUid) {
             candidates.append(mappedUid)
         }
 
-        let cleanMyUid = ZaloWireParser.stripUserPrefix(profile?.userId ?? "")
+        let cleanMyUid = ZaloWireParser.normalizeContactUid(profile?.userId ?? "")
         let sanitizedMyUid = ZaloWireParser.sanitizeProfileUid(cleanMyUid) ?? cleanMyUid
         if !cleanMyUid.isEmpty, candidates.contains(where: { $0 == cleanMyUid || $0 == sanitizedMyUid }) {
             return ("Bạn", profile?.avatar?.absoluteString ?? "")
         }
 
+        let friendMap = ensureFriendsById()
         for candidate in candidates {
             let alias = cachedAliases[candidate]
-            if let f = contacts.friends.first(where: { $0.id == candidate }) {
+            if let f = friendMap[candidate] {
                 let avt = f.avatar?.absoluteString ?? cachedProfiles[candidate]?.avatar ?? ""
                 return (alias?.isEmpty == false ? alias! : f.name, avt)
             }
@@ -998,25 +1081,22 @@ final class ZaloEngine {
                 return (alias, "")
             }
         }
+        let convFallbacks = ensureConversationFallbackById()
         for candidate in candidates {
-            if let conv = conversations.first(where: { $0.id == candidate }) {
-                let trimmedName = conv.name.trimmingCharacters(in: .whitespacesAndNewlines)
-                let validName = (!trimmedName.isEmpty && trimmedName != conv.id && trimmedName != ReactionDetail.unknownName) ? trimmedName : ""
-                let avt = conv.avatar?.absoluteString ?? ""
-                if !validName.isEmpty || !avt.isEmpty {
-                    return (validName, avt)
-                }
+            if let fallback = convFallbacks[candidate] {
+                return fallback
             }
         }
         return nil
     }
 
     internal func lookupConversationIdentity(_ convId: String) -> (name: String, avatar: URL?, members: Int) {
+        _ = (contacts, identityCacheVersion)
         if convId == selfConversationId {
             return ("Cloud của tôi", nil, 0)
         }
         if ZaloWireParser.isGroupId(convId) {
-            if let g = contacts.groups.first(where: { $0.id == convId }) {
+            if let g = ensureGroupsById()[convId] {
                 return (g.name, g.avatar, g.members)
             }
             if let cg = cachedGroups[convId] {
@@ -1028,9 +1108,9 @@ final class ZaloEngine {
             }
             return (convId, nil, 0)
         }
-        let clean = ZaloWireParser.stripUserPrefix(convId)
+        let clean = ZaloWireParser.normalizeContactUid(convId)
         let alias = cachedAliases[clean]
-        if let f = contacts.friends.first(where: { $0.id == clean }) {
+        if let f = ensureFriendsById()[clean] {
             let avt = f.avatar ?? cachedProfiles[clean].flatMap { $0.avatar.isEmpty ? nil : URL(string: $0.avatar) }
             return ((alias?.isEmpty == false) ? alias! : f.name, avt, 0)
         }

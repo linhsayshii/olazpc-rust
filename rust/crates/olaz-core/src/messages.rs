@@ -7,7 +7,8 @@ use olaz_store::StoredMessage as DbStoredMessage;
 use olaz_wire::{
     ChatMessage, Kind, NameLookup, ParsedWireEvent, StoredMessage as WireStoredMessage,
     UNKNOWN_NAME, WireParseOptions, clean_group_id, decode_stored_message, encode_chat_message,
-    extract_batch_events, group_conv_id, is_group_id, sanitize_profile_uid, strip_user_prefix,
+    extract_batch_events, group_conv_id, is_group_id, normalize_contact_uid, sanitize_profile_uid,
+    strip_user_prefix,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -591,6 +592,8 @@ pub struct IdentitySnapshot {
     pub identities: IdentityTable,
     /// Conversation fallback names/avatars (`conv.id -> (name, avatar)`).
     pub conversation_fallbacks: HashMap<String, (String, String)>,
+    friends_by_id: HashMap<String, usize>,
+    uid_by_global_id: HashMap<String, String>,
 }
 
 impl fmt::Debug for IdentitySnapshot {
@@ -623,6 +626,21 @@ impl IdentitySnapshot {
         conversation_fallbacks
     }
 
+    pub fn rebuild_identity_indexes(&mut self) {
+        let mut friends_by_id = HashMap::with_capacity(self.identities.friends.len());
+        for (idx, f) in self.identities.friends.iter().enumerate() {
+            friends_by_id.entry(f.id.clone()).or_insert(idx);
+        }
+        let mut uid_by_global_id = HashMap::with_capacity(self.identities.friend_global_ids.len());
+        for (u, g) in &self.identities.friend_global_ids {
+            uid_by_global_id
+                .entry(g.clone())
+                .or_insert_with(|| u.clone());
+        }
+        self.friends_by_id = friends_by_id;
+        self.uid_by_global_id = uid_by_global_id;
+    }
+
     #[must_use]
     pub fn from_core(
         my_uid: &str,
@@ -630,15 +648,19 @@ impl IdentitySnapshot {
         convs: &ConversationsState,
         contacts: &ContactsState,
     ) -> Self {
-        Self {
+        let mut snap = Self {
             my_uid: my_uid.to_owned(),
             my_avatar: my_avatar.map(str::to_owned),
             identities: contacts.to_identity_table(),
             conversation_fallbacks: Self::build_conversation_fallbacks(&convs.conversations),
-        }
+            friends_by_id: HashMap::new(),
+            uid_by_global_id: HashMap::new(),
+        };
+        snap.rebuild_identity_indexes();
+        snap
     }
 
-    /// Exact port of `ZaloEngine.lookupPersonInfo(_:)` (`conversations.rs:835`).
+    /// Exact port of `ZaloEngine.lookupPersonInfo(_:)` (`conversations.rs:835`), using O(1) indexes.
     #[must_use]
     pub fn lookup_person(&self, raw_uid: &str) -> Option<NameLookup> {
         let clean = strip_user_prefix(raw_uid);
@@ -646,22 +668,24 @@ impl IdentitySnapshot {
             return None;
         }
         let mut candidates = vec![clean.clone()];
+        let norm = normalize_contact_uid(&clean);
+        if !norm.is_empty() && norm != clean {
+            candidates.push(norm);
+        }
         if let Some(sanitized) = sanitize_profile_uid(&clean)
-            && sanitized != clean
+            && !candidates.contains(&sanitized)
         {
             candidates.push(sanitized);
         }
-        if let Some(mapped_uid) = candidates.iter().find_map(|cand| {
-            self.identities
-                .friend_global_ids
-                .iter()
-                .find_map(|(u, g)| (g == cand).then(|| u.clone()))
-        }) && !candidates.contains(&mapped_uid)
+        if let Some(mapped_uid) = candidates
+            .iter()
+            .find_map(|cand| self.uid_by_global_id.get(cand).cloned())
+            && !candidates.contains(&mapped_uid)
         {
             candidates.push(mapped_uid);
         }
 
-        let clean_my_uid = strip_user_prefix(&self.my_uid);
+        let clean_my_uid = normalize_contact_uid(&self.my_uid);
         let sanitized_my_uid =
             sanitize_profile_uid(&clean_my_uid).unwrap_or_else(|| clean_my_uid.clone());
         if !clean_my_uid.is_empty()
@@ -677,7 +701,9 @@ impl IdentitySnapshot {
 
         for candidate in &candidates {
             let alias = self.identities.aliases.get(candidate).map(String::as_str);
-            if let Some(f) = self.identities.friends.iter().find(|f| f.id == *candidate) {
+            if let Some(&idx) = self.friends_by_id.get(candidate)
+                && let Some(f) = self.identities.friends.get(idx)
+            {
                 let avt = f
                     .avatar
                     .as_deref()
@@ -733,11 +759,11 @@ impl IdentitySnapshot {
     /// Exact port of `ZaloEngine.mentionDisplayName(_:)` (`ZaloEngine+Contacts.swift:424`).
     #[must_use]
     pub fn mention_display_name(&self, raw_uid: &str) -> Option<String> {
-        let clean = strip_user_prefix(raw_uid);
+        let clean = normalize_contact_uid(raw_uid);
         if clean.is_empty() || clean == "-1" {
             return None;
         }
-        let clean_my = strip_user_prefix(&self.my_uid);
+        let clean_my = normalize_contact_uid(&self.my_uid);
         let sanitized_my = sanitize_profile_uid(&clean_my).unwrap_or_else(|| clean_my.clone());
         let sanitized_clean = sanitize_profile_uid(&clean).unwrap_or_else(|| clean.clone());
         if !clean_my.is_empty() && (clean == clean_my || sanitized_clean == sanitized_my) {
@@ -2402,7 +2428,7 @@ pub fn apply_fetched_contacts(
                 .get("userId")
                 .or_else(|| row.get("uid"))
                 .or_else(|| row.get("id"));
-            let uid = strip_user_prefix(&olaz_wire::lossless::string(uid_raw));
+            let uid = normalize_contact_uid(&olaz_wire::lossless::string(uid_raw));
             if uid.is_empty() {
                 continue;
             }
@@ -2533,7 +2559,7 @@ fn parse_friend_request_row(
     row: &Map<String, Value>,
     alt_uid_key: &str,
 ) -> Option<FriendRequestEntry> {
-    let uid = strip_user_prefix(&olaz_wire::lossless::string(
+    let uid = normalize_contact_uid(&olaz_wire::lossless::string(
         row.get("userId")
             .or_else(|| row.get("uid"))
             .or_else(|| row.get(alt_uid_key)),

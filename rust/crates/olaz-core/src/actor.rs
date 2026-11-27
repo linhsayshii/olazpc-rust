@@ -206,6 +206,7 @@ impl CoreHandle {
                     .unwrap_or_else(PoisonError::into_inner);
                 let mut next = (**guard).clone();
                 next.identities = table.clone();
+                next.rebuild_identity_indexes();
                 *guard = Arc::new(next);
             }
             Command::SyncConversationsSnapshot(list) => {
@@ -238,6 +239,7 @@ impl CoreHandle {
                     merged.activity_ranks = next.identities.activity_ranks.clone();
                 }
                 next.identities = merged;
+                next.rebuild_identity_indexes();
                 *guard = Arc::new(next);
             }
             Command::ApplyAccountProfile(acc) => {

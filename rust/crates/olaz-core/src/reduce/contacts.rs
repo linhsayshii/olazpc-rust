@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 
 use olaz_api::BlockedUserEntry;
-use olaz_wire::{lossless, sanitize_profile_uid, strip_user_prefix};
+use olaz_wire::{lossless, normalize_contact_uid, sanitize_profile_uid};
 use serde_json::{Map, Value};
 
 use crate::changes::DirtyKey;
@@ -42,8 +42,8 @@ fn bump_contacts_notice(contacts: &mut ContactsState, ok: bool, text: &str) {
 }
 
 fn candidate_uids_equal(a: &str, b: &str) -> bool {
-    let ca = strip_user_prefix(a);
-    let cb = strip_user_prefix(b);
+    let ca = normalize_contact_uid(a);
+    let cb = normalize_contact_uid(b);
     if ca.is_empty() || cb.is_empty() {
         return false;
     }
@@ -394,28 +394,28 @@ pub(crate) fn reduce_contacts_command(
 
         Command::AcceptFriendRequest { uid } => {
             out.effects.push(Effect::AcceptFriendRequestApi {
-                uid: strip_user_prefix(&uid),
+                uid: normalize_contact_uid(&uid),
                 op_id,
             });
         }
 
         Command::DeclineFriendRequest { uid } => {
             out.effects.push(Effect::DeclineFriendRequestApi {
-                uid: strip_user_prefix(&uid),
+                uid: normalize_contact_uid(&uid),
                 op_id,
             });
         }
 
         Command::CancelFriendRequest { uid } => {
             out.effects.push(Effect::CancelFriendRequestApi {
-                uid: strip_user_prefix(&uid),
+                uid: normalize_contact_uid(&uid),
                 op_id,
             });
         }
 
         Command::SendFriendRequest { uid, message } => {
             out.effects.push(Effect::SendFriendRequestApi {
-                uid: strip_user_prefix(&uid),
+                uid: normalize_contact_uid(&uid),
                 message,
                 op_id,
             });
@@ -463,7 +463,7 @@ pub(crate) fn reduce_contacts_command(
         }
 
         Command::SetBlocked { uid, blocked, name } => {
-            let clean = strip_user_prefix(&uid);
+            let clean = normalize_contact_uid(&uid);
             if clean.is_empty() {
                 complete_op(out, op_id, OpResult::Unit, false);
                 return;
@@ -479,7 +479,7 @@ pub(crate) fn reduce_contacts_command(
         }
 
         Command::SaveAlias { uid, name } => {
-            let clean = strip_user_prefix(&uid);
+            let clean = normalize_contact_uid(&uid);
             let trimmed = name.trim().to_owned();
             out.effects.push(Effect::SaveAliasApi {
                 uid: clean,
@@ -588,7 +588,7 @@ pub(crate) fn reduce_contacts_input(state: &mut CoreState, input: Input, out: &m
             match result {
                 Ok(resp) => {
                     let d = resp.get("data").and_then(Value::as_object).unwrap_or(&resp);
-                    let uid = strip_user_prefix(&lossless::string(
+                    let uid = normalize_contact_uid(&lossless::string(
                         d.get("uid").or_else(|| d.get("userId")),
                     ));
                     if uid.is_empty() {
@@ -600,18 +600,19 @@ pub(crate) fn reduce_contacts_input(state: &mut CoreState, input: Input, out: &m
                             user: None,
                         };
                     } else {
-                        // Fix #2: compare UIDs across `u`-prefixed / plain numeric forms.
+                        // Item 6.1 + 6.3: normalize UID and guard `is_friend` on `friends_loaded`.
                         let my_uid = state
                             .session
                             .profile
                             .as_ref()
                             .map_or("", |p| p.user_id.as_str());
-                        let is_self = candidate_uids_equal(&uid, my_uid);
-                        let is_friend = state
-                            .contacts
-                            .friends
-                            .iter()
-                            .any(|f| candidate_uids_equal(&f.id, &uid));
+                        let is_self = !my_uid.is_empty() && candidate_uids_equal(&uid, my_uid);
+                        let is_friend = state.contacts.friends_loaded
+                            && state
+                                .contacts
+                                .friends
+                                .iter()
+                                .any(|f| candidate_uids_equal(&f.id, &uid));
                         let requested = state
                             .contacts
                             .sent
@@ -673,7 +674,7 @@ pub(crate) fn reduce_contacts_input(state: &mut CoreState, input: Input, out: &m
                     let mapped: Vec<BlockedUserState> = entries
                         .into_iter()
                         .map(|BlockedUserEntry { id, name, avatar }| BlockedUserState {
-                            id,
+                            id: normalize_contact_uid(&id),
                             name,
                             avatar,
                         })
@@ -699,20 +700,30 @@ pub(crate) fn reduce_contacts_input(state: &mut CoreState, input: Input, out: &m
             ok,
             op_id,
         } => {
+            let uid = normalize_contact_uid(&uid);
             if ok {
                 let mut list = state.contacts.blocked_users.take().unwrap_or_default();
-                // Remove matching plain or `u`-prefixed duplicates.
+                // Item 6.2: capture any existing entry before retaining so re-blocking with an
+                // empty name preserves the previous name & avatar when lookup_person misses.
+                let prev = list
+                    .iter()
+                    .find(|u| candidate_uids_equal(&u.id, &uid))
+                    .cloned();
                 let mut seen = BTreeSet::new();
                 list.retain(|u| !candidate_uids_equal(&u.id, &uid) && seen.insert(u.id.clone()));
                 if blocked {
                     let snap = state.identity_snapshot();
                     let info = snap.lookup_person(&uid);
-                    let shown = if name.is_empty() {
-                        info.as_ref().map_or_else(String::new, |h| h.name.clone())
-                    } else {
+                    let shown = if !name.is_empty() {
                         name
+                    } else if let Some(h) = info.as_ref().filter(|h| !h.name.is_empty()) {
+                        h.name.clone()
+                    } else {
+                        prev.as_ref().map_or_else(String::new, |p| p.name.clone())
                     };
-                    let avatar = info.and_then(|h| is_valid_url_str(&h.avatar).then_some(h.avatar));
+                    let avatar = info
+                        .and_then(|h| is_valid_url_str(&h.avatar).then_some(h.avatar))
+                        .or_else(|| prev.and_then(|p| p.avatar));
                     list.insert(
                         0,
                         BlockedUserState {
@@ -753,10 +764,13 @@ pub(crate) fn reduce_contacts_input(state: &mut CoreState, input: Input, out: &m
             ok,
             op_id,
         } => {
+            let uid = normalize_contact_uid(&uid);
             if ok {
-                if trimmed_alias.is_empty() {
-                    state.contacts.aliases.remove(&uid);
-                } else {
+                state
+                    .contacts
+                    .aliases
+                    .retain(|k, _| normalize_contact_uid(k) != uid);
+                if !trimmed_alias.is_empty() {
                     state
                         .contacts
                         .aliases
@@ -851,5 +865,90 @@ mod tests {
         assert!(out2.dirty.contains(&DirtyKey::Contacts));
         assert_eq!(state.contacts.search.status, ContactSearchStatus::Idle);
         assert!(state.contacts.search.user.is_none());
+    }
+
+    #[test]
+    fn item6_fixes_uid_normalization_blocked_preserve_and_friends_loaded_guard() {
+        let mut state = CoreState::default();
+        // Seed a friend row while friends_loaded == false (item 6.3).
+        state.contacts.friends.push(FriendEntry {
+            id: "3000940".to_owned(),
+            name: "Seeded Unloaded".to_owned(),
+            zalo_name: "Seeded Unloaded".to_owned(),
+            avatar: None,
+            last_active_ms: None,
+            online: false,
+            section: "S".to_owned(),
+            sort_key: "seeded unloaded".to_owned(),
+        });
+        state.contacts.friends_loaded = false;
+        state.contacts.search_gen = 1;
+        let Ok(resp) = serde_json::from_value(json!({
+            "data": { "uid": "u3000940", "display_name": "Found Peer" }
+        })) else {
+            panic!("deserialize find response");
+        };
+        let _ = reduce(
+            &mut state,
+            Input::FriendFoundByPhone {
+                search_gen: 1,
+                result: Ok(resp),
+                op_id: None,
+            },
+        );
+        let Some(found) = state.contacts.search.user.as_ref() else {
+            panic!("expected found user");
+        };
+        assert_eq!(found.id, "3000940");
+        assert!(!found.is_friend);
+
+        // Once friends_loaded is true, is_friend becomes true.
+        state.contacts.friends_loaded = true;
+        state.contacts.search_gen = 2;
+        let Ok(resp2) = serde_json::from_value(json!({
+            "data": { "uid": "u3000940", "display_name": "Found Peer" }
+        })) else {
+            panic!("deserialize second find response");
+        };
+        let _ = reduce(
+            &mut state,
+            Input::FriendFoundByPhone {
+                search_gen: 2,
+                result: Ok(resp2),
+                op_id: None,
+            },
+        );
+        let Some(found2) = state.contacts.search.user.as_ref() else {
+            panic!("expected second found user");
+        };
+        assert!(found2.is_friend);
+
+        // Item 6.2: re-blocking an existing blocked user with empty name preserves previous name/avatar.
+        state.contacts.blocked_users = Some(vec![BlockedUserState {
+            id: "3000980".to_owned(),
+            name: "Existing Blocked".to_owned(),
+            avatar: Some("https://cdn.example.invalid/b.jpg".to_owned()),
+        }]);
+        let _ = reduce(
+            &mut state,
+            Input::BlockedUserUpdated {
+                uid: "u3000980".to_owned(),
+                blocked: true,
+                name: String::new(),
+                open_conv_id: None,
+                ok: true,
+                op_id: None,
+            },
+        );
+        let Some(blocked) = state.contacts.blocked_users.as_ref() else {
+            panic!("expected blocked users");
+        };
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].id, "3000980");
+        assert_eq!(blocked[0].name, "Existing Blocked");
+        assert_eq!(
+            blocked[0].avatar.as_deref(),
+            Some("https://cdn.example.invalid/b.jpg")
+        );
     }
 }

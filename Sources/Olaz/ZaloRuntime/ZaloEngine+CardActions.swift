@@ -52,16 +52,18 @@ extension ZaloEngine {
     }
 
     func contactCardState(_ uid: String) async -> (isSelf: Bool, isFriend: Bool) {
-        let clean = ZaloWireParser.stripUserPrefix(uid)
-        let isSelf = clean == profile?.userId
+        let clean = ZaloWireParser.normalizeContactUid(uid)
+        let myUid = ZaloWireParser.normalizeContactUid(profile?.userId ?? "")
+        let isSelf = !clean.isEmpty && clean == myUid
         let isFriend = contacts.friends.contains { $0.id == clean }
         return (isSelf, isFriend)
     }
 
     func contactProfile(_ uid: String) async -> ContactProfile? {
-        let clean = ZaloWireParser.stripUserPrefix(uid)
+        let clean = ZaloWireParser.normalizeContactUid(uid)
         guard !clean.isEmpty else { return nil }
-        if clean == profile?.userId, let p = profile {
+        let myUid = ZaloWireParser.normalizeContactUid(profile?.userId ?? "")
+        if clean == myUid, let p = profile {
             return ContactProfile(uid: clean, name: p.displayName, avatar: p.avatar, isSelf: true, isFriend: false)
         }
         if let f = contacts.friends.first(where: { $0.id == clean }) {
@@ -78,8 +80,9 @@ extension ZaloEngine {
     }
 
     func prepareFriendRequest(to uid: String, from conversationId: String, via: FriendRequestOrigin) async -> FriendRequestPrep {
-        let clean = ZaloWireParser.stripUserPrefix(uid)
-        if clean == profile?.userId { return FriendRequestPrep(state: .me) }
+        let clean = ZaloWireParser.normalizeContactUid(uid)
+        let myUid = ZaloWireParser.normalizeContactUid(profile?.userId ?? "")
+        if !clean.isEmpty, clean == myUid { return FriendRequestPrep(state: .me) }
         if contacts.friends.contains(where: { $0.id == clean }) { return FriendRequestPrep(state: .friend) }
         if contacts.sent.contains(where: { $0.id == clean }) { return FriendRequestPrep(state: .requested) }
         if contacts.received.contains(where: { $0.id == clean }) { return FriendRequestPrep(state: .requesting) }
@@ -89,7 +92,10 @@ extension ZaloEngine {
 
     func submitFriendRequest(to uid: String, message: String) async -> (ok: Bool, text: String, pending: Bool) {
         do {
-            _ = try await sessionClient.sendFriendRequestAPI(toUid: uid, message: message)
+            _ = try await sessionClient.sendFriendRequestAPI(
+                toUid: ZaloWireParser.normalizeContactUid(uid),
+                message: message
+            )
             refreshContacts()
             return (true, "Đã gửi lời mời kết bạn.", false)
         } catch {
