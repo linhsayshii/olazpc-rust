@@ -20,6 +20,7 @@ use crate::conversations::{
     ConversationPrompt, ConversationSummary,
 };
 use crate::forward::ForwardRequest;
+use crate::groups::GroupsState;
 use crate::messages::{
     ContactsState, HistoryFreshness, PendingWindowOp, WindowDelta, coalesce_window_op,
 };
@@ -43,6 +44,8 @@ pub enum DirtyKey {
     MessageMeta,
     MessagesResetAll,
     Contacts,
+    // U10
+    Groups,
     // U5
     Typing,
     // U8
@@ -103,8 +106,10 @@ pub struct CoreChanges {
     pub messages_reset_all: bool,
     /// Updated `has_more_history` / `history_ticks` / `history_freshness` maps.
     pub message_meta: Option<MessageMetaSnapshot>,
-    /// Updated partial-U9 contacts state.
+    /// Updated U9 contacts state.
     pub contacts: Option<ContactsState>,
+    /// Updated U10 groups state (`details_json`, `member_cache`, `cached_groups`).
+    pub groups: Option<GroupsState>,
     // U5
     pub typing: Option<BTreeMap<String, TypingStatus>>,
     // U8
@@ -149,6 +154,7 @@ impl fmt::Debug for CoreChanges {
             .field("messages_reset_all", &self.messages_reset_all)
             .field("has_message_meta", &self.message_meta.is_some())
             .field("has_contacts", &self.contacts.is_some())
+            .field("has_groups", &self.groups.is_some())
             .field("has_typing", &self.typing.is_some())
             .field("has_forward_request", &self.forward_request.is_some())
             .field("clear_selection", &self.clear_selection)
@@ -178,6 +184,7 @@ struct DirtyBuffer {
     messages_reset_all: bool,
     message_meta: Option<MessageMetaSnapshot>,
     contacts: Option<ContactsState>,
+    groups: Option<GroupsState>,
     // U5
     typing: Option<BTreeMap<String, TypingStatus>>,
     // U8
@@ -212,6 +219,7 @@ impl DirtyBuffer {
             || self.messages_reset_all
             || self.message_meta.is_some()
             || self.contacts.is_some()
+            || self.groups.is_some()
             || self.typing.is_some()
             || self.forward_request.is_some()
             || self.clear_selection
@@ -339,6 +347,10 @@ impl ChangeHub {
                 }
                 DirtyKey::Contacts => {
                     buf.contacts = Some(state.contacts.clone());
+                    buf.groups = Some(state.groups.clone());
+                }
+                DirtyKey::Groups => {
+                    buf.groups = Some(state.groups.clone());
                 }
                 // U5
                 DirtyKey::Typing => {
@@ -372,7 +384,7 @@ impl ChangeHub {
                     buf.cached_profiles = Some(state.contacts.cached_profiles.clone());
                 }
                 DirtyKey::CachedGroups => {
-                    buf.cached_groups = Some(state.contacts.cached_groups.clone());
+                    buf.cached_groups = Some(state.groups.cached_groups.clone());
                 }
                 DirtyKey::Cloud => {
                     buf.cloud = Some(state.cloud.snapshot.clone());
@@ -463,6 +475,7 @@ impl ChangeHub {
                             messages_reset_all: false,
                             message_meta: None,
                             contacts: None,
+                            groups: None,
                             // U5
                             typing: None,
                             // U8
@@ -539,6 +552,7 @@ impl ChangeHub {
                         messages_reset_all: reset_all,
                         message_meta: buf.message_meta.take(),
                         contacts: buf.contacts.take(),
+                        groups: buf.groups.take(),
                         // U5
                         typing: buf.typing.take(),
                         // U8

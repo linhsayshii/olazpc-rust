@@ -1523,8 +1523,15 @@ pub fn is_group_admin_or_creator_ffi(
     group_id: String,
     contacts: ContactsStateRecord,
 ) -> bool {
-    let c: ContactsState = contacts.into();
-    is_group_admin_or_creator(&uid, &group_id, &c)
+    let groups = olaz_core::GroupsState {
+        details_json: contacts
+            .group_details_json
+            .into_iter()
+            .map(|p| (p.key, p.value))
+            .collect(),
+        ..olaz_core::GroupsState::default()
+    };
+    is_group_admin_or_creator(&uid, &group_id, &groups)
 }
 
 #[uniffi::export]
@@ -1540,8 +1547,16 @@ pub fn normalize_poll_detail_ffi(
 ) -> Option<PollDetailRecord> {
     let payload = olaz_json::parse_object_str(&payload_json)?;
     let polls = PollsState::default();
+    let mut groups = olaz_core::GroupsState {
+        details_json: contacts
+            .group_details_json
+            .iter()
+            .map(|p| (p.key.clone(), p.value.clone()))
+            .collect(),
+        ..olaz_core::GroupsState::default()
+    };
     let mut c: ContactsState = contacts.into();
-    c.apply_identity_table(identities.into());
+    c.apply_identity_table(identities.into(), &mut groups);
     let convs = ConversationsState::default();
     let messages = MessagesState::default();
     let explicit = (!resolved_group_id.is_empty()).then_some(resolved_group_id.as_str());
@@ -1553,6 +1568,7 @@ pub fn normalize_poll_detail_ffi(
         my_avatar.as_deref(),
         &polls,
         &c,
+        &groups,
         &convs,
         &messages,
     )

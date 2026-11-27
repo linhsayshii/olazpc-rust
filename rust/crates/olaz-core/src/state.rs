@@ -16,6 +16,7 @@ use crate::cloud::{CloudSnapshotState, CloudState};
 use crate::composer::{ComposerConfirm, ComposerState};
 use crate::conversations::{CachedProfile, ConversationsState};
 use crate::forward::{ForwardRequest, ForwardState};
+use crate::groups::GroupsState;
 use crate::messages::{ContactsState, IdentitySnapshot, MessagesState};
 use crate::stickers::{StickerState, StickerSuggestSetting};
 use crate::typing::{TypingState, TypingStatus};
@@ -28,6 +29,8 @@ pub struct CoreState {
     pub conversations: ConversationsState,
     pub messages: MessagesState,
     pub contacts: ContactsState,
+    // U10
+    pub groups: GroupsState,
     // U4-bootstrap
     pub(crate) bootstrap: crate::reduce::bootstrap::BootstrapRuntimeState,
     // U5
@@ -62,6 +65,8 @@ impl CoreState {
             conversations: self.conversations.clone(),
             messages: self.messages.clone(),
             contacts: self.contacts.clone(),
+            // U10
+            groups: self.groups.clone(),
             // U5
             typing: self.typing.active.clone(),
             // U8
@@ -99,7 +104,13 @@ impl CoreState {
             .profile
             .as_ref()
             .and_then(|p| p.avatar.as_deref());
-        IdentitySnapshot::from_core(my_uid, my_avatar, &self.conversations, &self.contacts)
+        IdentitySnapshot::from_core(
+            my_uid,
+            my_avatar,
+            &self.conversations,
+            &self.contacts,
+            &self.groups,
+        )
     }
 }
 
@@ -111,6 +122,7 @@ impl fmt::Debug for CoreState {
             .field("conversations", &self.conversations)
             .field("messages", &self.messages)
             .field("contacts", &self.contacts)
+            .field("groups", &self.groups)
             .field("bootstrap", &self.bootstrap)
             // U5
             .field("typing", &self.typing)
@@ -140,6 +152,8 @@ pub struct CoreSnapshot {
     pub conversations: ConversationsState,
     pub messages: MessagesState,
     pub contacts: ContactsState,
+    // U10
+    pub groups: GroupsState,
     // U5
     pub typing: BTreeMap<String, TypingStatus>,
     // U8
@@ -170,6 +184,7 @@ impl fmt::Debug for CoreSnapshot {
             .field("conversations", &self.conversations)
             .field("messages", &self.messages)
             .field("contacts", &self.contacts)
+            .field("groups", &self.groups)
             // U5
             .field("typing_count", &self.typing.len())
             // U8

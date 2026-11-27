@@ -708,6 +708,7 @@ pub(crate) fn update_conversation_after_send(
     let preview_input = MessagePreviewInput::from_chat_message(msg);
     if state.conversations.update_conversation_on_message(
         &state.contacts,
+        &state.groups,
         &preview_input,
         false,
         &my_uid,

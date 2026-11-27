@@ -224,7 +224,7 @@ impl CoreHandle {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
                 let mut next = (**guard).clone();
-                let mut merged = contacts.to_identity_table();
+                let mut merged = contacts.to_identity_table(&crate::groups::GroupsState::default());
                 if merged.aliases.is_empty() && !next.identities.aliases.is_empty() {
                     merged.aliases = next.identities.aliases.clone();
                 }
@@ -241,6 +241,18 @@ impl CoreHandle {
                 next.identities = merged;
                 next.rebuild_identity_indexes();
                 *guard = Arc::new(next);
+            }
+            Command::SeedGroups(groups) => {
+                let mut guard = self
+                    .identity_snapshot
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let mut next = (**guard).clone();
+                if !groups.cached_groups.is_empty() {
+                    next.identities.cached_groups = groups.cached_groups.clone();
+                    next.rebuild_identity_indexes();
+                    *guard = Arc::new(next);
+                }
             }
             Command::ApplyAccountProfile(acc) => {
                 let mut guard = self
@@ -1072,6 +1084,39 @@ mod tests {
             full.contacts.aliases.get("u1").map(String::as_str),
             Some("alias-1999")
         );
+        core.stop();
+    }
+
+    #[tokio::test]
+    async fn loading_group_with_n_polls_coalesces_to_at_most_one_identity_update() {
+        let core = CoreHandle::start(Arc::new(NoopRunner), Handle::current());
+        let before = core.settle().await.expect("initial settle");
+        // Simulate loading a group with 25 polls where each poll mirrors an identity update burst.
+        for i in 0..25usize {
+            let mut tbl = IdentityTable::default();
+            tbl.cached_groups.insert(
+                "g500303".to_owned(),
+                crate::conversations::CachedGroup {
+                    name: format!("Group v{i}"),
+                    avatar: String::new(),
+                    members: i64::try_from(i + 1).unwrap_or(1),
+                },
+            );
+            core.send(Command::UpdateIdentities(tbl));
+        }
+        let after = core.settle().await.expect("settled");
+        core.wait_idle().await;
+        // Coalesced UpdateIdentities must not advance the change hub (no dirty push storm)
+        // and must settle to the latest table in a single coalesced pass.
+        assert_eq!(after, before);
+        let full = core.full_snapshot().await.expect("full snapshot");
+        let cached = full
+            .groups
+            .cached_groups
+            .get("g500303")
+            .expect("cached group retained in GroupsState");
+        assert_eq!(cached.name, "Group v24");
+        assert_eq!(cached.members, 25);
         core.stop();
     }
 }

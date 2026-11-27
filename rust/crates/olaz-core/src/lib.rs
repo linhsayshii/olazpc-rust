@@ -15,6 +15,7 @@ pub mod composer;
 pub mod conversations;
 pub mod effect;
 pub mod forward;
+pub mod groups;
 pub mod input;
 pub mod messages;
 // U12
@@ -77,6 +78,10 @@ pub use forward::{
     ComposerSendOutcome, FileResolutionOutcome, ForwardOutcome, ForwardRequest, ForwardState,
     MediaResolutionOutcome,
 };
+pub use groups::{
+    GroupMetadataPatch, GroupsState, MentionCandidate, MergedGroupMetadataPersistence,
+    apply_group_metadata_update, merge_fetched_group_metadata,
+};
 pub use input::StickerSendError;
 pub use input::{
     BootstrapAliasesError, Command, CompletedLogin, E2eeQuoteArg, HiddenPinSyncKind, Input,
@@ -97,14 +102,14 @@ pub use messages::{
 // U12
 pub use polls::{
     AddedPollOption, BoardPinItem, BoardPinList, BoardRawTopics, MAX_SEEN_POLL_MESSAGES,
-    MAX_WATCHED_POLLS, MergedGroupMetadataPersistence, POLL_DEBOUNCE_DELAY_MS,
-    POLL_MESSAGE_MAX_AGE_MS, PollAction, PollActionResult, PollCapabilities, PollClock, PollConfig,
-    PollCreateDraft, PollCreateIssue, PollDetail, PollMessageNotice, PollOption, PollPinConfirm,
-    PollPinOutcome, PollPinState, PollVoteDraft, PollVoterGroup, PollVoterUser, PollVoters,
-    PollsState, UNKNOWN_POLL_USER_NAME, WATCH_POLL_THROTTLE_MS, build_pin_limit_confirm,
-    build_poll_voters, clamped_int64, is_group_admin_or_creator, map_create_poll_net_error,
-    map_poll_pin_net_error, map_poll_pin_session_error, merge_fetched_group_metadata,
-    normalize_poll_detail, normalize_poll_uid, refresh_poll_pin_state, resolve_poll_group_id,
+    MAX_WATCHED_POLLS, POLL_DEBOUNCE_DELAY_MS, POLL_MESSAGE_MAX_AGE_MS, PollAction,
+    PollActionResult, PollCapabilities, PollClock, PollConfig, PollCreateDraft, PollCreateIssue,
+    PollDetail, PollMessageNotice, PollOption, PollPinConfirm, PollPinOutcome, PollPinState,
+    PollVoteDraft, PollVoterGroup, PollVoterUser, PollVoters, PollsState, UNKNOWN_POLL_USER_NAME,
+    WATCH_POLL_THROTTLE_MS, build_pin_limit_confirm, build_poll_voters, clamped_int64,
+    is_group_admin_or_creator, map_create_poll_net_error, map_poll_pin_net_error,
+    map_poll_pin_session_error, normalize_poll_detail, normalize_poll_uid, refresh_poll_pin_state,
+    resolve_poll_group_id,
 };
 pub use reduce::classify::{MobileSyncEvent, Route, classify, classify_poll};
 pub use reduce::contacts::apply_contacts_adapter_state;

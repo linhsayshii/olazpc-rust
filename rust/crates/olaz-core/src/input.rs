@@ -24,6 +24,7 @@ use crate::conversations::{
 };
 use crate::effect::OpResult;
 use crate::forward::{ComposerSendOutcome, FileResolutionOutcome, MediaResolutionOutcome};
+use crate::groups::GroupsState;
 use crate::messages::{BlockedUserState, ContactsState, HistoryFreshness};
 use crate::state::{CoreFailKind, FailReason, PersistedTransportState};
 use crate::stickers::{StickerEntry, StickerSource, StickerSuggestSetting};
@@ -295,6 +296,8 @@ pub enum Command {
     },
     SeedHistoryFreshness(BTreeMap<String, HistoryFreshness>),
     SeedContacts(Box<ContactsState>),
+    /// Seeds initial [`GroupsState`] (`details_json`, `member_cache`, `cached_groups`).
+    SeedGroups(Box<GroupsState>),
     // U5
     HandleTyping {
         state: Map<String, Value>,
@@ -845,6 +848,7 @@ impl fmt::Debug for Command {
                 .field("count", &m.len())
                 .finish(),
             Self::SeedContacts(c) => f.debug_tuple("SeedContacts").field(c).finish(),
+            Self::SeedGroups(g) => f.debug_tuple("SeedGroups").field(g).finish(),
             // U5
             Self::HandleTyping { state } => f
                 .debug_struct("HandleTyping")

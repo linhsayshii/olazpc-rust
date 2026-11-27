@@ -13,23 +13,18 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fmt;
 
-use olaz_api::{JsonObject, NewPollOptionPayload, clean_group_member_ids};
+use olaz_api::{JsonObject, NewPollOptionPayload};
 use olaz_net::{NetError, ZaloSessionError};
-use olaz_store::StoredConversation;
 use olaz_wire::{
-    Kind, clean_group_id, group_conv_id, is_group_id, lossless, sanitize_profile_uid,
-    strip_user_prefix,
+    Kind, group_conv_id, is_group_id, lossless, sanitize_profile_uid, strip_user_prefix,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::conversations::{
-    CachedGroup, ConversationSummary, ConversationsState, sort_conversations,
-};
-use crate::messages::{
-    ContactsState, GroupEntry, IdentitySnapshot, MessagesState, fold_contact_str, is_valid_url_str,
-    localized_standard_cmp, serialize_cached_groups_json,
-};
+use crate::conversations::ConversationsState;
+use crate::groups::GroupsState;
+pub use crate::groups::{MergedGroupMetadataPersistence, merge_fetched_group_metadata};
+use crate::messages::{ContactsState, IdentitySnapshot, MessagesState};
 
 /// Unified fallback display name for unknown poll creators and voters (Approved Fix #3).
 pub const UNKNOWN_POLL_USER_NAME: &str = "Người dùng Zalo";
@@ -1420,23 +1415,12 @@ pub fn resolve_poll_group_id(
 
 /// Port of `ZaloEngine.isGroupAdminOrCreator(_:inGroup:)`.
 #[must_use]
-pub fn is_group_admin_or_creator(uid: &str, group_id: &str, contacts: &ContactsState) -> bool {
+pub fn is_group_admin_or_creator(uid: &str, group_id: &str, groups: &GroupsState) -> bool {
     let clean_uid = normalize_poll_uid(uid);
     if clean_uid.is_empty() || clean_uid == "0" {
         return false;
     }
-    let clean_grid = clean_group_id(group_id);
-    let conv_id = group_conv_id(group_id);
-    let raw_json = (!clean_grid.is_empty())
-        .then(|| contacts.group_details_json.get(&clean_grid))
-        .flatten()
-        .or_else(|| {
-            (!conv_id.is_empty())
-                .then(|| contacts.group_details_json.get(&conv_id))
-                .flatten()
-        });
-    let Some(info) = raw_json.and_then(|s| serde_json::from_str::<Map<String, Value>>(s).ok())
-    else {
+    let Some(info) = groups.detail_object(group_id) else {
         return false;
     };
 
@@ -1480,8 +1464,9 @@ fn lookup_person_name_and_avatar(
     my_avatar: Option<&str>,
     convs: &ConversationsState,
     contacts: &ContactsState,
+    groups: &GroupsState,
 ) -> Option<(String, String)> {
-    let snap = IdentitySnapshot::from_core(my_uid, my_avatar, convs, contacts);
+    let snap = IdentitySnapshot::from_core(my_uid, my_avatar, convs, contacts, groups);
     snap.lookup_person(uid).map(|hit| (hit.name, hit.avatar))
 }
 
@@ -1500,6 +1485,7 @@ pub fn normalize_poll_detail(
     my_avatar: Option<&str>,
     polls: &PollsState,
     contacts: &ContactsState,
+    groups: &GroupsState,
     convs: &ConversationsState,
     messages: &MessagesState,
 ) -> Option<PollDetail> {
@@ -1509,7 +1495,7 @@ pub fn normalize_poll_detail(
     let is_poll_creator = !my_uid.is_empty() && creator_id == my_uid;
     let is_group_privileged = !my_uid.is_empty()
         && !resolved_group_id.is_empty()
-        && is_group_admin_or_creator(&my_uid, &resolved_group_id, contacts);
+        && is_group_admin_or_creator(&my_uid, &resolved_group_id, groups);
 
     let mut total_voters = HashSet::new();
     let mut options_json = Vec::new();
@@ -1544,7 +1530,7 @@ pub fn normalize_poll_detail(
     }
 
     let creator_name =
-        lookup_person_name_and_avatar(&creator_id, my_raw_uid, my_avatar, convs, contacts)
+        lookup_person_name_and_avatar(&creator_id, my_raw_uid, my_avatar, convs, contacts, groups)
             .map(|(name, _)| name)
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| UNKNOWN_POLL_USER_NAME.to_owned());
@@ -1589,10 +1575,11 @@ pub fn build_poll_voters(
     my_avatar: Option<&str>,
     convs: &ConversationsState,
     contacts: &ContactsState,
+    groups: &GroupsState,
 ) -> PollVoters {
     let anonymous = swift_json_bool(d.get("is_anonymous")).unwrap_or(false);
     let my_uid = normalize_poll_uid(my_raw_uid);
-    let snap = IdentitySnapshot::from_core(my_raw_uid, my_avatar, convs, contacts);
+    let snap = IdentitySnapshot::from_core(my_raw_uid, my_avatar, convs, contacts, groups);
 
     let mut groups_json = Vec::new();
     if let Some(Value::Array(options_raw)) = d.get("options") {
@@ -1783,216 +1770,6 @@ pub fn map_create_poll_net_error(err: &NetError) -> PollActionResult {
     PollActionResult::err(Some("network"))
 }
 
-// ---------------------------------------------------------------------------
-// Shared U12 / U10 group metadata merge (`refreshGroupMetadata`)
-// ---------------------------------------------------------------------------
-
-/// Persistence artifacts produced by [`merge_fetched_group_metadata`] for SQLite writeback.
-#[derive(Clone, PartialEq, Eq)]
-pub struct MergedGroupMetadataPersistence {
-    pub gid: String,
-    pub cached_groups_json: Option<Vec<u8>>,
-    pub stored_conversation: Option<StoredConversation>,
-}
-
-impl fmt::Debug for MergedGroupMetadataPersistence {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MergedGroupMetadataPersistence")
-            .field("has_cached_groups", &self.cached_groups_json.is_some())
-            .field("has_stored_conv", &self.stored_conversation.is_some())
-            .finish()
-    }
-}
-
-/// Shared port of `ZaloEngine.refreshGroupMetadata` + `applyGroupMetadataUpdate` +
-/// `persistSingleGroupConversation` for U12 (`refreshPoll`) and U10 (group management).
-pub fn merge_fetched_group_metadata(
-    group_id: &str,
-    info: &JsonObject,
-    contacts: &mut ContactsState,
-    convs: &mut ConversationsState,
-    self_conv_id: Option<&str>,
-    now_ms: i64,
-) -> Option<MergedGroupMetadataPersistence> {
-    let gid = group_conv_id(group_id);
-    let clean_grid = clean_group_id(group_id);
-    if gid.is_empty() || clean_grid.is_empty() || info.is_empty() {
-        return None;
-    }
-
-    let server_name = lossless::string(info.get("name"));
-    let avt_str = lossless::string(info.get("avt").or_else(|| info.get("fullAvt")));
-    let avt_url = is_valid_url_str(&avt_str).then_some(avt_str);
-
-    let mut raw_member_ids: Vec<String> = Vec::new();
-    if let Some(Value::Array(ver_list)) = info.get("memVerList")
-        && ver_list.iter().all(Value::is_string)
-    {
-        for v in ver_list {
-            if let Some(s) = v.as_str()
-                && let Some(first) = s.split('_').next()
-            {
-                raw_member_ids.push(first.to_owned());
-            }
-        }
-    }
-    if raw_member_ids.is_empty()
-        && let Some(Value::Array(mems)) = info.get("memIds")
-    {
-        raw_member_ids.extend(mems.iter().map(|v| lossless::string(Some(v))));
-    }
-    if raw_member_ids.is_empty()
-        && let Some(Value::Array(cur)) = info.get("currentMems")
-        && cur.iter().all(Value::is_object)
-    {
-        for v in cur {
-            if let Some(obj) = v.as_object() {
-                raw_member_ids.push(lossless::string(obj.get("id").or_else(|| obj.get("uid"))));
-            }
-        }
-    }
-    let clean_member_ids = clean_group_member_ids(&raw_member_ids);
-    let member_count = lossless::int64(info.get("totalMember").or_else(|| info.get("total")))
-        .unwrap_or_else(|| i64::try_from(clean_member_ids.len()).unwrap_or(0));
-
-    let opt_name = (!server_name.is_empty()).then_some(server_name.as_str());
-    let opt_members = (member_count > 0).then_some(member_count);
-
-    let mut detail = info.clone();
-    if let Some(n) = opt_name {
-        detail.insert("name".to_owned(), Value::from(n));
-    }
-    if let Some(ref avt) = avt_url {
-        detail.insert("avt".to_owned(), Value::from(avt.as_str()));
-    }
-    if let Some(mc) = opt_members {
-        detail.insert("totalMember".to_owned(), Value::from(mc));
-    }
-    if !clean_member_ids.is_empty() {
-        detail.insert("memIds".to_owned(), json!(clean_member_ids));
-        let ver_list: Vec<String> = clean_member_ids
-            .iter()
-            .map(|id| format!("{id}_0"))
-            .collect();
-        detail.insert("memVerList".to_owned(), json!(ver_list));
-        if detail.contains_key("currentMems") {
-            let cur_mems: Vec<Value> = clean_member_ids
-                .iter()
-                .map(|id| json!({ "id": id }))
-                .collect();
-            detail.insert("currentMems".to_owned(), Value::Array(cur_mems));
-        }
-    }
-    if let Ok(serialized) = serde_json::to_string(&Value::Object(detail)) {
-        contacts.group_details_json.insert(clean_grid, serialized);
-    }
-
-    if let Some(existing) = contacts.groups.iter_mut().find(|g| g.id == gid) {
-        let next_name = match opt_name {
-            Some(n) => n.to_owned(),
-            None => existing.name.clone(),
-        };
-        let next_avt = avt_url.clone().or_else(|| existing.avatar.clone());
-        let next_members = opt_members.unwrap_or(existing.members);
-        existing.sort_key = fold_contact_str(&next_name);
-        existing.name = next_name;
-        existing.avatar = next_avt;
-        existing.members = next_members;
-    } else {
-        let next_name = opt_name.unwrap_or("Nhóm").to_owned();
-        let sort_key = fold_contact_str(&next_name);
-        contacts.groups.push(GroupEntry {
-            id: gid.clone(),
-            name: next_name,
-            avatar: avt_url.clone(),
-            members: opt_members.unwrap_or(1),
-            sort_key,
-        });
-    }
-    contacts
-        .groups
-        .sort_by(|a, b| localized_standard_cmp(&a.sort_key, &b.sort_key));
-
-    if let Some(conv) = convs.conversations.iter_mut().find(|c| c.id == gid) {
-        if let Some(n) = opt_name {
-            conv.name = n.to_owned();
-        }
-        if let Some(ref avt) = avt_url {
-            conv.avatar = Some(avt.clone());
-        }
-        if let Some(mc) = opt_members {
-            conv.members = mc;
-        }
-    } else {
-        convs.conversations.push(ConversationSummary {
-            id: gid.clone(),
-            is_group: true,
-            name: opt_name.unwrap_or("Nhóm").to_owned(),
-            avatar: avt_url.clone(),
-            pinned: convs.pinned_ids.contains(&gid),
-            members: opt_members.unwrap_or(1),
-            unread: 0,
-            preview: None,
-        });
-    }
-    sort_conversations(&mut convs.conversations, &contacts.activity_ranks);
-
-    let existing_cached = contacts.cached_groups.get(&gid).cloned();
-    contacts.cached_groups.insert(
-        gid.clone(),
-        CachedGroup {
-            name: match opt_name {
-                Some(n) => n.to_owned(),
-                None => existing_cached
-                    .as_ref()
-                    .map_or_else(String::new, |c| c.name.clone()),
-            },
-            avatar: avt_url.unwrap_or_else(|| {
-                existing_cached
-                    .as_ref()
-                    .map_or_else(String::new, |c| c.avatar.clone())
-            }),
-            members: opt_members
-                .unwrap_or_else(|| existing_cached.as_ref().map_or(0, |c| c.members)),
-        },
-    );
-
-    convs.rebuild_conversation_flags(self_conv_id);
-    convs.rebuild_conversation_extras(contacts, self_conv_id);
-
-    let cached_groups_json = serialize_cached_groups_json(&contacts.cached_groups);
-    let stored_conversation = convs
-        .conversations
-        .iter()
-        .find(|c| c.id == gid)
-        .map(|summary| StoredConversation {
-            id: summary.id.clone(),
-            is_group: summary.is_group,
-            name: summary.name.clone(),
-            avatar: summary.avatar.clone().unwrap_or_default(),
-            pinned: summary.pinned,
-            members: summary.members,
-            unread: summary.unread,
-            preview_text: summary
-                .preview
-                .as_ref()
-                .map_or_else(String::new, |p| p.text.clone()),
-            preview_ts_ms: summary
-                .preview
-                .as_ref()
-                .and_then(|p| p.date_ms)
-                .unwrap_or(0),
-            preview_from_me: summary.preview.as_ref().is_some_and(|p| p.from_me),
-            updated_at_ms: now_ms,
-        });
-
-    Some(MergedGroupMetadataPersistence {
-        gid,
-        cached_groups_json,
-        stored_conversation,
-    })
-}
-
 #[cfg(test)]
 #[expect(
     clippy::unwrap_used,
@@ -2145,15 +1922,19 @@ mod tests {
 
         // Fix #3: normalized u-prefixed UIDs + unified "Người dùng Zalo" unknown default.
         let mut contacts = ContactsState::default();
+        let mut groups = GroupsState::default();
         let convs = ConversationsState::default();
-        contacts.apply_identity_table(crate::conversations::IdentityTable {
-            friends: vec![FriendIdentity {
-                id: "3001001".to_owned(),
-                name: "An Nguyễn".to_owned(),
-                avatar: Some("https://cdn.example.invalid/an.jpg".to_owned()),
-            }],
-            ..crate::conversations::IdentityTable::default()
-        });
+        contacts.apply_identity_table(
+            crate::conversations::IdentityTable {
+                friends: vec![FriendIdentity {
+                    id: "3001001".to_owned(),
+                    name: "An Nguyễn".to_owned(),
+                    avatar: Some("https://cdn.example.invalid/an.jpg".to_owned()),
+                }],
+                ..crate::conversations::IdentityTable::default()
+            },
+            &mut groups,
+        );
         let messages = MessagesState::default();
         let raw_payload = json!({
             "group_id": "500101",
@@ -2175,6 +1956,7 @@ mod tests {
             None,
             &polls,
             &contacts,
+            &GroupsState::default(),
             &convs,
             &messages,
         )
@@ -2191,6 +1973,7 @@ mod tests {
             None,
             &convs,
             &contacts,
+            &GroupsState::default(),
         );
         assert_eq!(voters.groups[0].users[0].uid, "2001001");
         assert!(voters.groups[0].users[0].is_me);
@@ -2237,6 +2020,7 @@ mod tests {
 
     #[test]
     fn shared_merge_fetched_group_metadata_updates_contacts_and_conversations() {
+        let mut groups = GroupsState::default();
         let mut contacts = ContactsState::default();
         let mut convs = ConversationsState::default();
         let info = json!({
@@ -2249,6 +2033,7 @@ mod tests {
         let persisted = merge_fetched_group_metadata(
             "g500202",
             info.as_object().unwrap(),
+            &mut groups,
             &mut contacts,
             &mut convs,
             Some("2001001"),
@@ -2256,8 +2041,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(persisted.gid, "g500202");
-        assert!(contacts.group_details_json.contains_key("500202"));
-        assert!(is_group_admin_or_creator("2001001", "g500202", &contacts));
+        assert!(groups.details_json.contains_key("500202"));
+        assert!(is_group_admin_or_creator("2001001", "g500202", &groups));
         assert_eq!(contacts.groups.len(), 1);
         assert_eq!(contacts.groups[0].members, 2);
         assert_eq!(convs.conversations.len(), 1);
@@ -2306,6 +2091,7 @@ mod tests {
             None,
             &polls,
             &contacts,
+            &GroupsState::default(),
             &convs,
             &messages,
         )
@@ -2321,6 +2107,7 @@ mod tests {
             None,
             &convs,
             &contacts,
+            &GroupsState::default(),
         );
         assert!(voters_anon.restricted);
         assert!(voters_anon.groups[0].users.is_empty());
@@ -2347,6 +2134,7 @@ mod tests {
             None,
             &polls,
             &contacts,
+            &GroupsState::default(),
             &convs,
             &messages,
         )
@@ -2362,6 +2150,7 @@ mod tests {
             None,
             &convs,
             &contacts,
+            &GroupsState::default(),
         );
         assert!(!voters_public.restricted);
         assert_eq!(voters_public.groups[0].users.len(), 1);
@@ -2389,6 +2178,7 @@ mod tests {
             None,
             &polls,
             &contacts,
+            &GroupsState::default(),
             &convs,
             &messages,
         )
@@ -2404,6 +2194,7 @@ mod tests {
             None,
             &convs,
             &contacts,
+            &GroupsState::default(),
         );
         assert!(!voters_nb.restricted);
         assert_eq!(voters_nb.groups[0].users.len(), 1);
@@ -2479,6 +2270,7 @@ mod tests {
             None,
             &polls,
             &contacts,
+            &GroupsState::default(),
             &convs,
             &messages,
         )
@@ -2513,6 +2305,7 @@ mod tests {
             None,
             &polls,
             &contacts,
+            &GroupsState::default(),
             &convs,
             &messages,
         )

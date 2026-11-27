@@ -595,11 +595,7 @@ impl From<ContactsState> for ContactsStateRecord {
                 .into_iter()
                 .map(|(key, value)| StringPairEntry { key, value })
                 .collect(),
-            group_details_json: c
-                .group_details_json
-                .into_iter()
-                .map(|(key, value)| StringPairEntry { key, value })
-                .collect(),
+            group_details_json: Vec::new(),
             received_raw_json: c.received_raw_json,
             sent_raw_json: c.sent_raw_json,
             friend_global_ids: c
@@ -628,11 +624,6 @@ impl From<ContactsStateRecord> for ContactsState {
                 .blocked_users
                 .map(|v| v.into_iter().map(Into::into).collect()),
             aliases: c.aliases.into_iter().map(|p| (p.key, p.value)).collect(),
-            group_details_json: c
-                .group_details_json
-                .into_iter()
-                .map(|p| (p.key, p.value))
-                .collect(),
             received_raw_json: c.received_raw_json,
             sent_raw_json: c.sent_raw_json,
             friend_global_ids: c
@@ -641,7 +632,6 @@ impl From<ContactsStateRecord> for ContactsState {
                 .map(|p| (p.key, p.value))
                 .collect(),
             cached_profiles: std::collections::BTreeMap::new(),
-            cached_groups: std::collections::BTreeMap::new(),
             activity_ranks: std::collections::BTreeMap::new(),
             search_gen: 0,
             sync_in_flight: 0,

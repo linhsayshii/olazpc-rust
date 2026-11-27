@@ -20,6 +20,7 @@ use olaz_wire::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::groups::GroupsState;
 use crate::messages::ContactsState;
 
 /// Official bitmask flags of `ConversationActionFlags` (`ZaloEngine+ConversationActions.swift`).
@@ -989,6 +990,7 @@ impl ConversationsState {
     pub fn lookup_conversation_identity(
         &self,
         contacts: &ContactsState,
+        groups: &GroupsState,
         conv_id: &str,
         self_conv_id: Option<&str>,
     ) -> (String, Option<String>, i64) {
@@ -999,7 +1001,7 @@ impl ConversationsState {
             if let Some(g) = contacts.groups.iter().find(|g| g.id == conv_id) {
                 return (g.name.clone(), g.avatar.clone(), g.members);
             }
-            if let Some(cg) = contacts.cached_groups.get(conv_id) {
+            if let Some(cg) = groups.cached_groups.get(conv_id) {
                 let name = if cg.name.is_empty() {
                     conv_id.to_owned()
                 } else {
@@ -1200,6 +1202,7 @@ impl ConversationsState {
     pub fn hydrate_from_local(
         &mut self,
         contacts: &mut ContactsState,
+        groups: &mut GroupsState,
         data: LocalAccountHydration,
         my_uid: &str,
         my_avatar: Option<&str>,
@@ -1215,7 +1218,7 @@ impl ConversationsState {
             contacts.cached_profiles = data.cached_profiles;
         }
         if !data.cached_groups.is_empty() {
-            contacts.cached_groups = data.cached_groups;
+            groups.cached_groups = data.cached_groups;
         }
         if !data.activity_ranks.is_empty() {
             contacts.activity_ranks = data.activity_ranks;
@@ -1228,7 +1231,8 @@ impl ConversationsState {
             .conversations
             .into_iter()
             .map(|c| {
-                let ident = self.lookup_conversation_identity(contacts, &c.id, self_conv_id);
+                let ident =
+                    self.lookup_conversation_identity(contacts, groups, &c.id, self_conv_id);
                 let effective_name = if !ident.0.is_empty() && ident.0 != c.id {
                     ident.0
                 } else if c.name.is_empty() {
@@ -1345,6 +1349,7 @@ impl ConversationsState {
     /// Returns `true` if `conversations` changed.
     fn lookup_conversation_identity_indexed(
         contacts: &ContactsState,
+        groups: &GroupsState,
         friends_by_id: &HashMap<&str, &crate::messages::FriendEntry>,
         groups_by_id: &HashMap<&str, &crate::messages::GroupEntry>,
         conv_id: &str,
@@ -1357,7 +1362,7 @@ impl ConversationsState {
             if let Some(g) = groups_by_id.get(conv_id) {
                 return (g.name.clone(), g.avatar.clone(), g.members);
             }
-            if let Some(cg) = contacts.cached_groups.get(conv_id) {
+            if let Some(cg) = groups.cached_groups.get(conv_id) {
                 let name = if cg.name.is_empty() {
                     conv_id.to_owned()
                 } else {
@@ -1402,6 +1407,7 @@ impl ConversationsState {
     pub fn ensure_known_contacts(
         &mut self,
         contacts: &ContactsState,
+        groups: &GroupsState,
         self_conv_id: Option<&str>,
     ) -> bool {
         let mut friends_by_id: HashMap<&str, &crate::messages::FriendEntry> =
@@ -1463,6 +1469,7 @@ impl ConversationsState {
             if !existing.contains_key(pinned_id) {
                 let info = Self::lookup_conversation_identity_indexed(
                     contacts,
+                    groups,
                     &friends_by_id,
                     &groups_by_id,
                     pinned_id,
@@ -1503,6 +1510,7 @@ impl ConversationsState {
             }
             let info = Self::lookup_conversation_identity_indexed(
                 contacts,
+                groups,
                 &friends_by_id,
                 &groups_by_id,
                 active_id,
@@ -1532,6 +1540,7 @@ impl ConversationsState {
         for id in ids {
             let info = Self::lookup_conversation_identity_indexed(
                 contacts,
+                groups,
                 &friends_by_id,
                 &groups_by_id,
                 &id,
@@ -1566,6 +1575,7 @@ impl ConversationsState {
     pub fn apply_batch_delta(
         &mut self,
         contacts: &ContactsState,
+        groups: &GroupsState,
         delta: &BatchApplyDelta,
         self_conv_id: Option<&str>,
     ) -> (bool, bool, bool) {
@@ -1584,7 +1594,8 @@ impl ConversationsState {
 
         for upd in &delta.updates {
             let is_grp = is_group_id(&upd.conv_id);
-            let info = self.lookup_conversation_identity(contacts, &upd.conv_id, self_conv_id);
+            let info =
+                self.lookup_conversation_identity(contacts, groups, &upd.conv_id, self_conv_id);
             let prev = ConversationPreview {
                 text: upd.preview_text.clone(),
                 date_ms: Some(upd.preview_date_ms),
@@ -1663,9 +1674,14 @@ impl ConversationsState {
 
     /// Updates a single conversation from one message (`ZaloEngine.updateConversationOnMessage`).
     /// Returns `true` if the conversation list mutated (caller should persist to SQLite).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "pure reducer helper taking explicit core state slices"
+    )]
     pub fn update_conversation_on_message(
         &mut self,
         contacts: &ContactsState,
+        groups: &GroupsState,
         input: &MessagePreviewInput,
         increment_unread: bool,
         my_uid: &str,
@@ -1702,7 +1718,7 @@ impl ConversationsState {
             list[idx] = item;
         } else {
             let identity =
-                self.lookup_conversation_identity(contacts, &input.conv_id, self_conv_id);
+                self.lookup_conversation_identity(contacts, groups, &input.conv_id, self_conv_id);
             list.push(ConversationSummary {
                 id: input.conv_id.clone(),
                 is_group: is_grp,
@@ -2760,7 +2776,8 @@ pub fn load_local_account_from_store(
 
     // Build temporary lookup state for rescuing legacy "g0" messages.
     let mut temp_contacts = ContactsState::default();
-    temp_contacts.apply_identity_table(existing_identities.clone());
+    let mut temp_groups = GroupsState::default();
+    temp_contacts.apply_identity_table(existing_identities.clone(), &mut temp_groups);
     let temp_state = ConversationsState {
         pinned_ids: out.pinned_ids.iter().cloned().collect(),
         ..ConversationsState::default()
@@ -2772,7 +2789,7 @@ pub fn load_local_account_from_store(
         temp_contacts.cached_profiles = out.cached_profiles.clone();
     }
     if !out.cached_groups.is_empty() {
-        temp_contacts.cached_groups = out.cached_groups.clone();
+        temp_groups.cached_groups = out.cached_groups.clone();
     }
     for (uid, gid) in &out.friend_global_ids {
         temp_contacts
@@ -2829,6 +2846,7 @@ pub fn load_local_account_from_store(
             for m in &rescued {
                 let ident = temp_state.lookup_conversation_identity(
                     &temp_contacts,
+                    &temp_groups,
                     &m.conv_id,
                     self_conv_id,
                 );
@@ -3196,15 +3214,18 @@ mod tests {
     fn stranger_box_and_label_filters_match_swift_rules() {
         let mut st = ConversationsState::default();
         let mut contacts = ContactsState::default();
-        contacts.apply_identity_table(IdentityTable {
-            friends_loaded: true,
-            friends: vec![FriendIdentity {
-                id: "f1".to_owned(),
-                name: "Friend".to_owned(),
-                avatar: None,
-            }],
-            ..IdentityTable::default()
-        });
+        contacts.apply_identity_table(
+            IdentityTable {
+                friends_loaded: true,
+                friends: vec![FriendIdentity {
+                    id: "f1".to_owned(),
+                    name: "Friend".to_owned(),
+                    avatar: None,
+                }],
+                ..IdentityTable::default()
+            },
+            &mut GroupsState::default(),
+        );
         st.conversations = vec![
             ConversationSummary {
                 id: "f1".to_owned(),
@@ -3337,7 +3358,12 @@ mod tests {
             }],
             persist_conversations: true,
         };
-        let (changed, _, _) = st.apply_batch_delta(&ContactsState::default(), &older, None);
+        let (changed, _, _) = st.apply_batch_delta(
+            &ContactsState::default(),
+            &GroupsState::default(),
+            &older,
+            None,
+        );
         assert!(!changed);
         assert_eq!(
             st.conversations[0]
@@ -3362,7 +3388,12 @@ mod tests {
             }],
             persist_conversations: true,
         };
-        let (changed, _, _) = st.apply_batch_delta(&ContactsState::default(), &recall, None);
+        let (changed, _, _) = st.apply_batch_delta(
+            &ContactsState::default(),
+            &GroupsState::default(),
+            &recall,
+            None,
+        );
         assert!(changed);
         assert_eq!(
             st.conversations[0]
@@ -3387,8 +3418,12 @@ mod tests {
             }],
             persist_conversations: true,
         };
-        let (changed, _, _) =
-            st.apply_batch_delta(&ContactsState::default(), &delete_to_older, None);
+        let (changed, _, _) = st.apply_batch_delta(
+            &ContactsState::default(),
+            &GroupsState::default(),
+            &delete_to_older,
+            None,
+        );
         assert!(changed);
         assert_eq!(st.conversations[0].id, "c2");
         assert_eq!(st.conversations[1].id, "c1");
@@ -3412,7 +3447,12 @@ mod tests {
             }],
             persist_conversations: true,
         };
-        let (changed, _, _) = st.apply_batch_delta(&ContactsState::default(), &delete_all, None);
+        let (changed, _, _) = st.apply_batch_delta(
+            &ContactsState::default(),
+            &GroupsState::default(),
+            &delete_all,
+            None,
+        );
         assert!(changed);
         assert_eq!(st.conversations[1].preview, None);
     }

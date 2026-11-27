@@ -102,10 +102,11 @@ fn start_contacts_sync(state: &mut CoreState, op_id: Option<u64>, out: &mut Redu
 /// `refreshReactionNames`.
 pub(crate) fn apply_post_contacts_sync_followups(state: &mut CoreState, out: &mut ReduceOutput) {
     let self_conv_id = state.session.self_conversation_id.clone();
-    if state
-        .conversations
-        .ensure_known_contacts(&state.contacts, self_conv_id.as_deref())
-    {
+    if state.conversations.ensure_known_contacts(
+        &state.contacts,
+        &state.groups,
+        self_conv_id.as_deref(),
+    ) {
         out.dirty.insert(DirtyKey::Conversations);
     }
     conversations::rebuild_flags_and_extras(state, out);
@@ -513,12 +514,14 @@ pub(crate) fn reduce_contacts_input(state: &mut CoreState, input: Input, out: &m
             }
             apply_fetched_contacts(
                 &mut state.contacts,
+                &mut state.groups,
                 friends_rows,
                 groups_dict,
                 sent_rows,
                 received_rows,
             );
             out.dirty.insert(DirtyKey::Contacts);
+            out.dirty.insert(DirtyKey::Groups);
             apply_post_contacts_sync_followups(state, out);
             complete_op(out, op_id, OpResult::Unit, true);
         }

@@ -130,14 +130,17 @@ fn m02_open_up_to_date_skips_history_fetch_and_emits_pins_and_mark_read() {
         .messages
         .history_freshness
         .insert("friend_1".to_owned(), HistoryFreshness::UpToDate);
-    state.contacts.apply_identity_table(IdentityTable {
-        friends: vec![FriendIdentity {
-            id: "friend_1".to_owned(),
-            name: "Alice".to_owned(),
-            avatar: Some("https://cdn.example.invalid/alice.jpg".to_owned()),
-        }],
-        ..IdentityTable::default()
-    });
+    state.contacts.apply_identity_table(
+        IdentityTable {
+            friends: vec![FriendIdentity {
+                id: "friend_1".to_owned(),
+                name: "Alice".to_owned(),
+                avatar: Some("https://cdn.example.invalid/alice.jpg".to_owned()),
+            }],
+            ..IdentityTable::default()
+        },
+        &mut state.groups,
+    );
 
     let preloaded = vec![make_msg(
         "101",

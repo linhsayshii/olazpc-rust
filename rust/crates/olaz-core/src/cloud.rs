@@ -454,10 +454,12 @@ pub fn resolve_cloud_conversation_meta(
         );
     }
     let self_id = state.session.self_conversation_id.as_deref();
-    let (ident_name, ident_avatar, _members) =
-        state
-            .conversations
-            .lookup_conversation_identity(&state.contacts, conv_id, self_id);
+    let (ident_name, ident_avatar, _members) = state.conversations.lookup_conversation_identity(
+        &state.contacts,
+        &state.groups,
+        conv_id,
+        self_id,
+    );
     let is_group = fallback_is_group.unwrap_or_else(|| is_group_id(conv_id));
     let resolved_name = if !ident_name.is_empty() && ident_name != conv_id {
         ident_name

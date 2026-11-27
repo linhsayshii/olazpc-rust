@@ -47,6 +47,7 @@ fn is_message_command(cmd: &Command) -> bool {
             | Command::RefreshReactionNames { .. }
             | Command::SeedHistoryFreshness(_)
             | Command::SeedContacts(_)
+            | Command::SeedGroups(_)
     )
 }
 

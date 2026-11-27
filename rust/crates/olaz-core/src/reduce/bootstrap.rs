@@ -276,12 +276,14 @@ pub(crate) fn reduce_bootstrap(state: &mut CoreState, input: Input, out: &mut Re
             }
             apply_fetched_contacts(
                 &mut state.contacts,
+                &mut state.groups,
                 friends_rows,
                 groups_dict,
                 sent_rows,
                 received_rows,
             );
             out.dirty.insert(DirtyKey::Contacts);
+            out.dirty.insert(DirtyKey::Groups);
             ensure_known_contacts_and_rebuild(state, out);
 
             state.bootstrap.stage = BootstrapStage::PreloadOverview;
@@ -739,6 +741,7 @@ fn ingest_bootstrap_batch(
         &mut state.messages,
         &mut state.conversations,
         &state.contacts,
+        &state.groups,
         &events,
         false,
         self_conv_id.as_deref(),
@@ -772,10 +775,11 @@ fn ingest_bootstrap_batch(
 
 fn finish_preload_overview(state: &mut CoreState, out: &mut ReduceOutput) {
     let self_conv_id = state.session.self_conversation_id.clone();
-    if state
-        .conversations
-        .ensure_known_contacts(&state.contacts, self_conv_id.as_deref())
-    {
+    if state.conversations.ensure_known_contacts(
+        &state.contacts,
+        &state.groups,
+        self_conv_id.as_deref(),
+    ) {
         out.dirty.insert(DirtyKey::Conversations);
     }
 
@@ -965,10 +969,11 @@ fn try_complete_finalize(state: &mut CoreState, out: &mut ReduceOutput) {
 
 fn ensure_known_contacts_and_rebuild(state: &mut CoreState, out: &mut ReduceOutput) {
     let self_conv_id = state.session.self_conversation_id.clone();
-    if state
-        .conversations
-        .ensure_known_contacts(&state.contacts, self_conv_id.as_deref())
-    {
+    if state.conversations.ensure_known_contacts(
+        &state.contacts,
+        &state.groups,
+        self_conv_id.as_deref(),
+    ) {
         out.dirty.insert(DirtyKey::Conversations);
     }
     conversations::rebuild_flags_and_extras(state, out);

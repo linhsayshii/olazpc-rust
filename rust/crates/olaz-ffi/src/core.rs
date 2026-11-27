@@ -1711,7 +1711,20 @@ impl From<CoreChanges> for CoreChangesRecord {
             window_deltas: c.window_deltas.into_iter().map(Into::into).collect(),
             messages_reset_all: c.messages_reset_all,
             message_meta: c.message_meta.map(Into::into),
-            contacts: c.contacts.map(Into::into),
+            contacts: c.contacts.map(|contacts| {
+                let mut rec: ContactsStateRecord = contacts.into();
+                if let Some(ref g) = c.groups {
+                    rec.group_details_json = g
+                        .details_json
+                        .iter()
+                        .map(|(key, value)| crate::StringPairEntry {
+                            key: key.clone(),
+                            value: value.clone(),
+                        })
+                        .collect();
+                }
+                rec
+            }),
             typing: c.typing.map(|map| {
                 map.into_iter()
                     .map(|(conv_id, status)| TypingEntryRecord {
@@ -2171,8 +2184,18 @@ impl CoreOfflineConversations {
                 DirtyKey::MessagesResetAll => {
                     rec.messages_reset_all = true;
                 }
-                DirtyKey::Contacts => {
-                    rec.contacts = Some(state.contacts.clone().into());
+                DirtyKey::Contacts | DirtyKey::Groups => {
+                    let mut c_rec: ContactsStateRecord = state.contacts.clone().into();
+                    c_rec.group_details_json = state
+                        .groups
+                        .details_json
+                        .iter()
+                        .map(|(key, value)| crate::StringPairEntry {
+                            key: key.clone(),
+                            value: value.clone(),
+                        })
+                        .collect();
+                    rec.contacts = Some(c_rec);
                 }
                 DirtyKey::Typing => {
                     rec.typing = Some(
@@ -2234,7 +2257,11 @@ impl CoreOfflineConversations {
     ) {
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let (state, _) = &mut *guard;
-        state.contacts.apply_identity_table(identities.into());
+        let mut groups = olaz_core::GroupsState::default();
+        state
+            .contacts
+            .apply_identity_table(identities.into(), &mut groups);
+        state.groups.cached_groups = groups.cached_groups;
         state.conversations.open_conversation_id = open_conv_id;
         state.session.self_conversation_id = self_conv_id;
         if !my_uid.is_empty() {
@@ -3719,8 +3746,18 @@ impl CoreEngine {
     }
 
     pub fn seed_contacts(&self, contacts: ContactsStateRecord) {
+        let details_json: std::collections::BTreeMap<String, String> = contacts
+            .group_details_json
+            .iter()
+            .map(|p| (p.key.clone(), p.value.clone()))
+            .collect();
         self.handle
             .send(Command::SeedContacts(Box::new(contacts.into())));
+        self.handle
+            .send(Command::SeedGroups(Box::new(olaz_core::GroupsState {
+                details_json,
+                ..olaz_core::GroupsState::default()
+            })));
     }
 
     pub async fn flush_all(&self) -> Result<u64, CoreError> {

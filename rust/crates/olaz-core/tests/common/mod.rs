@@ -4261,7 +4261,7 @@ fn enrich_u12_snapshot(
     // GroupSnapshot fields
     let mut details_map: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
     let mut cached_group_details_obj = Map::new();
-    for (clean_grid, raw_json) in &full.contacts.group_details_json {
+    for (clean_grid, raw_json) in &full.groups.details_json {
         if let Ok(Value::Object(parsed)) = serde_json::from_str::<Value>(raw_json) {
             details_map.insert(clean_grid.clone(), parsed.clone());
             cached_group_details_obj.insert(clean_grid.clone(), Value::Object(parsed));
@@ -4278,7 +4278,7 @@ fn enrich_u12_snapshot(
     obj.insert("group_member_cache".to_owned(), member_cache_val.clone());
 
     let mut cached_groups_obj = Map::new();
-    for (gid, cg) in &full.contacts.cached_groups {
+    for (gid, cg) in &full.groups.cached_groups {
         cached_groups_obj.insert(
             gid.clone(),
             json!({
@@ -4302,7 +4302,7 @@ fn enrich_u12_snapshot(
             group_ids.insert(g.id.clone());
         }
     }
-    for gid in full.contacts.cached_groups.keys() {
+    for gid in full.groups.cached_groups.keys() {
         if !gid.is_empty() {
             group_ids.insert(gid.clone());
         }
@@ -4628,8 +4628,8 @@ fn enrich_u9_snapshot(
     obj.insert("aliases".to_owned(), Value::Object(aliases_obj));
 
     let group_detail_keys: Vec<Value> = full
-        .contacts
-        .group_details_json
+        .groups
+        .details_json
         .keys()
         .cloned()
         .map(Value::String)
@@ -4689,7 +4689,7 @@ async fn run_u12_poll_model_checks(checks: &[Value], core: &CoreHandle) -> Value
             "is_group_admin" => {
                 let uid = str_arg(check, "uid");
                 let group_id = str_arg(check, "group_id");
-                let ok = olaz_core::is_group_admin_or_creator(&uid, &group_id, &snap.contacts);
+                let ok = olaz_core::is_group_admin_or_creator(&uid, &group_id, &snap.groups);
                 check_results.push(json!({
                     "kind": kind,
                     "uid": uid,
@@ -5666,7 +5666,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     if is_u3 {
         initial_state
             .contacts
-            .apply_identity_table(host.current_identities());
+            .apply_identity_table(host.current_identities(), &mut initial_state.groups);
         initial_state.conversations.open_conversation_id = case
             .seed
             .open_conversation_id
@@ -6005,8 +6005,8 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         {
             for (k, v) in details_obj {
                 initial_state
-                    .contacts
-                    .group_details_json
+                    .groups
+                    .details_json
                     .insert(k.clone(), canonical_json_string(v));
             }
         }

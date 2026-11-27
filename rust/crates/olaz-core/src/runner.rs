@@ -5880,21 +5880,24 @@ mod tests {
             avatar: None,
             phone: None,
         });
-        initial.contacts.apply_identity_table(IdentityTable {
-            friends: vec![
-                FriendIdentity {
-                    id: "3000515".to_owned(),
-                    name: "Alice".to_owned(),
-                    avatar: None,
-                },
-                FriendIdentity {
-                    id: "3000516".to_owned(),
-                    name: "Bob".to_owned(),
-                    avatar: None,
-                },
-            ],
-            ..IdentityTable::default()
-        });
+        initial.contacts.apply_identity_table(
+            IdentityTable {
+                friends: vec![
+                    FriendIdentity {
+                        id: "3000515".to_owned(),
+                        name: "Alice".to_owned(),
+                        avatar: None,
+                    },
+                    FriendIdentity {
+                        id: "3000516".to_owned(),
+                        name: "Bob".to_owned(),
+                        avatar: None,
+                    },
+                ],
+                ..IdentityTable::default()
+            },
+            &mut initial.groups,
+        );
         initial.transport.ws_phase = WsPhase::Running;
         initial.transport.ws_gen = 1;
 
@@ -6096,7 +6099,7 @@ mod tests {
             avatar: None,
             phone: None,
         });
-        initial.contacts.group_details_json.insert(
+        initial.groups.details_json.insert(
             "5001".to_owned(),
             r#"{"groupId":"5001","creatorId":"2001"}"#.to_owned(),
         );

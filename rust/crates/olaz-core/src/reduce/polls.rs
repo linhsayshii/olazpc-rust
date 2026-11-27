@@ -9,12 +9,13 @@ use serde_json::{Map, Value};
 
 use crate::changes::DirtyKey;
 use crate::effect::{Effect, OpResult, PollBoardContinuation, PollDetailPurpose, StoreOp};
+use crate::groups::merge_fetched_group_metadata;
 use crate::input::{Command, Input};
 use crate::polls::{
     BoardPinItem, BoardPinList, POLL_DEBOUNCE_DELAY_MS, PollActionResult, PollCapabilities,
     PollPinOutcome, build_pin_limit_confirm, build_poll_voters, clamped_int64,
-    merge_fetched_group_metadata, normalize_poll_detail, poll_detail_shape_anomaly_log_line,
-    refresh_poll_pin_state, resolve_poll_group_id,
+    normalize_poll_detail, poll_detail_shape_anomaly_log_line, refresh_poll_pin_state,
+    resolve_poll_group_id,
 };
 use crate::reduce::ReduceOutput;
 use crate::state::CoreState;
@@ -178,6 +179,7 @@ fn finish_poll_refresh(
         my_avatar,
         &state.polls,
         &state.contacts,
+        &state.groups,
         &state.conversations,
         &state.messages,
     ) {
@@ -312,6 +314,7 @@ pub fn reduce_polls(state: &mut CoreState, input: Input, out: &mut ReduceOutput)
                             my_avatar,
                             &state.conversations,
                             &state.contacts,
+                            &state.groups,
                         )
                     });
                 complete_op(out, op_id, OpResult::PollVoters(voters), false);
@@ -344,7 +347,7 @@ pub fn reduce_polls(state: &mut CoreState, input: Input, out: &mut ReduceOutput)
                 let clean_grid = clean_group_id(&gid);
                 if !gid.is_empty()
                     && !clean_grid.is_empty()
-                    && !state.contacts.group_details_json.contains_key(&clean_grid)
+                    && !state.groups.details_json.contains_key(&clean_grid)
                     && is_authenticated
                 {
                     out.effects.push(Effect::FetchPollGroupDetailApi {
@@ -373,12 +376,14 @@ pub fn reduce_polls(state: &mut CoreState, input: Input, out: &mut ReduceOutput)
                 && let Some(persisted) = merge_fetched_group_metadata(
                     &group_id,
                     &info,
+                    &mut state.groups,
                     &mut state.contacts,
                     &mut state.conversations,
                     state.session.self_conversation_id.as_deref(),
                     now_ms,
                 )
             {
+                out.dirty.insert(DirtyKey::Groups);
                 out.dirty.insert(DirtyKey::Contacts);
                 out.dirty.insert(DirtyKey::Conversations);
                 out.dirty.insert(DirtyKey::ConversationFlags);
@@ -1070,12 +1075,122 @@ mod tests {
         assert!(out.dirty.contains(&DirtyKey::CachedGroups));
         assert!(out.dirty.contains(&DirtyKey::Polls));
         let cached = state
-            .contacts
+            .groups
             .cached_groups
             .get("g500202")
             .expect("cached group updated");
         assert_eq!(cached.name, "Nhóm Poll");
         assert_eq!(cached.members, 2);
+    }
+
+    #[test]
+    fn loading_group_with_many_polls_triggers_at_most_one_identity_update() {
+        let mut state = CoreState::default();
+        let group_info = json!({
+            "groupId": "500303",
+            "name": "Nhóm Nhiều Poll",
+            "avt": "https://cdn.example.invalid/g303.jpg",
+            "creatorId": "2001001",
+            "memVerList": ["2001001_0", "3001001_1"],
+        })
+        .as_object()
+        .cloned()
+        .expect("object");
+
+        let mut group_fetch_count = 0usize;
+        let mut cached_groups_dirty_count = 0usize;
+        let mut contacts_dirty_count = 0usize;
+        let mut refresh_identity_count = 0usize;
+
+        for idx in 0..20usize {
+            let poll_id = format!("94{:02}", idx);
+            let payload = json!({
+                "data": {
+                    "group_id": "500303",
+                    "question": format!("Poll {idx}"),
+                    "creator": "2001001",
+                    "status": 1,
+                    "expired_time": 0,
+                    "allow_add_new_option": true,
+                    "allow_multi_choices": false,
+                    "is_anonymous": false,
+                    "is_hide_vote_preview": false,
+                    "options": [{"option_id": 1, "content": "A", "voters": []}],
+                }
+            });
+            let out = reduce(
+                &mut state,
+                Input::PollDetailFetched {
+                    op_id: None,
+                    poll_id: poll_id.clone(),
+                    purpose: PollDetailPurpose::Refresh {
+                        now_ms: 1_700_020_000_000 + i64::try_from(idx).unwrap_or(0),
+                    },
+                    payload: payload.as_object().cloned(),
+                    is_authenticated: true,
+                },
+            );
+            if out.dirty.contains(&DirtyKey::CachedGroups) {
+                cached_groups_dirty_count += 1;
+            }
+            if out.dirty.contains(&DirtyKey::Contacts) {
+                contacts_dirty_count += 1;
+            }
+            if out.refresh_identity_snapshot {
+                refresh_identity_count += 1;
+            }
+
+            for effect in out.effects {
+                if let Effect::FetchPollGroupDetailApi {
+                    op_id,
+                    poll_id,
+                    group_id,
+                    data_node,
+                    now_ms,
+                } = effect
+                {
+                    group_fetch_count += 1;
+                    let merged_out = reduce(
+                        &mut state,
+                        Input::PollGroupDetailFetched {
+                            op_id,
+                            poll_id,
+                            group_id,
+                            data_node,
+                            group_info: Some(group_info.clone()),
+                            now_ms,
+                        },
+                    );
+                    if merged_out.dirty.contains(&DirtyKey::CachedGroups) {
+                        cached_groups_dirty_count += 1;
+                    }
+                    if merged_out.dirty.contains(&DirtyKey::Contacts) {
+                        contacts_dirty_count += 1;
+                    }
+                    if merged_out.refresh_identity_snapshot {
+                        refresh_identity_count += 1;
+                    }
+                }
+            }
+        }
+
+        assert_eq!(state.polls.details.len(), 20);
+        assert_eq!(
+            group_fetch_count, 1,
+            "missing group metadata must be fetched at most once across N polls"
+        );
+        assert!(
+            cached_groups_dirty_count <= 1,
+            "cached_groups must update at most once across N polls, got {cached_groups_dirty_count}"
+        );
+        assert!(
+            contacts_dirty_count <= 1,
+            "contacts must update at most once across N polls, got {contacts_dirty_count}"
+        );
+        assert!(
+            refresh_identity_count <= 1,
+            "identity snapshot refresh must trigger at most once across N polls, got {refresh_identity_count}"
+        );
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub(crate) fn apply_message_preview_update(
     let self_conv_id = state.session.self_conversation_id.clone();
     let changed = state.conversations.update_conversation_on_message(
         &state.contacts,
+        &state.groups,
         msg,
         increment_unread,
         &my_uid,
@@ -78,10 +79,12 @@ pub(crate) fn apply_batch_delta(
     };
 
     let self_conv_id = state.session.self_conversation_id.clone();
-    let (convs_changed, flags_changed, extras_changed) =
-        state
-            .conversations
-            .apply_batch_delta(&state.contacts, &delta, self_conv_id.as_deref());
+    let (convs_changed, flags_changed, extras_changed) = state.conversations.apply_batch_delta(
+        &state.contacts,
+        &state.groups,
+        &delta,
+        self_conv_id.as_deref(),
+    );
     if convs_changed {
         out.dirty.insert(DirtyKey::Conversations);
     }
@@ -537,7 +540,9 @@ pub(crate) fn reduce_conversations(state: &mut CoreState, input: Input, out: &mu
 fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: &mut ReduceOutput) {
     match cmd {
         Command::UpdateIdentities(table) => {
-            state.contacts.apply_identity_table(table);
+            state
+                .contacts
+                .apply_identity_table(table, &mut state.groups);
             out.refresh_identity_snapshot = true;
             complete_op(op_id, OpResult::Unit, false, out);
         }
@@ -558,10 +563,11 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
 
         Command::EnsureKnownContacts => {
             let self_conv_id = state.session.self_conversation_id.clone();
-            if state
-                .conversations
-                .ensure_known_contacts(&state.contacts, self_conv_id.as_deref())
-            {
+            if state.conversations.ensure_known_contacts(
+                &state.contacts,
+                &state.groups,
+                self_conv_id.as_deref(),
+            ) {
                 out.dirty.insert(DirtyKey::Conversations);
             }
             rebuild_flags_and_extras(state, out);

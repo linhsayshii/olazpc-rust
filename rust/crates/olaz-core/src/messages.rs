@@ -17,6 +17,7 @@ use crate::conversations::{
     CachedGroup, CachedProfile, ConversationPreview, ConversationSummary, ConversationsState,
     FriendIdentity, GroupIdentity, IdentityTable, message_preview_label, sort_conversations,
 };
+use crate::groups::GroupsState;
 use crate::input::SeenTarget;
 
 /// 24-hour interval (in seconds) between full launch history refreshes.
@@ -398,8 +399,6 @@ pub struct ContactsState {
     pub notice: Option<ContactNotice>,
     /// `None` before `loadBlockedUsers` / `setBlocked` runs; `Some(...)` once loaded or mutated.
     pub blocked_users: Option<Vec<BlockedUserState>>,
-    /// Clean group id -> serialized JSON object string for `cachedGroupDetails`.
-    pub group_details_json: BTreeMap<String, String>,
     /// Serialized JSON array string of raw received friend requests (`cachedReceivedRequestsRaw`).
     pub received_raw_json: Option<String>,
     /// Serialized JSON array string of raw sent friend requests (`cachedSentRequestsRaw`).
@@ -408,7 +407,6 @@ pub struct ContactsState {
     pub friend_global_ids: BTreeMap<String, String>,
     pub aliases: BTreeMap<String, String>,
     pub cached_profiles: BTreeMap<String, CachedProfile>,
-    pub cached_groups: BTreeMap<String, CachedGroup>,
     pub activity_ranks: BTreeMap<String, i64>,
     #[serde(skip)]
     pub search_gen: u64,
@@ -427,7 +425,6 @@ impl fmt::Debug for ContactsState {
             .field("groups_loaded", &self.groups_loaded)
             .field("aliases", &self.aliases.len())
             .field("cached_profiles", &self.cached_profiles.len())
-            .field("cached_groups", &self.cached_groups.len())
             .field("activity_ranks", &self.activity_ranks.len())
             .finish()
     }
@@ -438,9 +435,9 @@ impl ContactsState {
         *self = Self::default();
     }
 
-    /// Projects the [`IdentityTable`] view of this contacts state.
+    /// Projects the [`IdentityTable`] view of this contacts state plus [`GroupsState`].
     #[must_use]
-    pub fn to_identity_table(&self) -> IdentityTable {
+    pub fn to_identity_table(&self, groups: &GroupsState) -> IdentityTable {
         IdentityTable {
             friends: self
                 .friends
@@ -465,7 +462,7 @@ impl ContactsState {
             groups_loaded: self.groups_loaded,
             aliases: self.aliases.clone(),
             cached_profiles: self.cached_profiles.clone(),
-            cached_groups: self.cached_groups.clone(),
+            cached_groups: groups.cached_groups.clone(),
             friend_global_ids: self.friend_global_ids.clone(),
             activity_ranks: self.activity_ranks.clone(),
         }
@@ -474,7 +471,7 @@ impl ContactsState {
     /// Applies an [`IdentityTable`] pushed by Swift / tests onto this state while preserving
     /// contacts-specific fields (`received`, `sent`, `zalo_name`, `online`, `sort_key`, etc.)
     /// for matching friend/group ids.
-    pub fn apply_identity_table(&mut self, table: IdentityTable) {
+    pub fn apply_identity_table(&mut self, table: IdentityTable, groups: &mut GroupsState) {
         let existing_friends: HashMap<String, FriendEntry> =
             self.friends.drain(..).map(|f| (f.id.clone(), f)).collect();
         self.friends = table
@@ -553,7 +550,7 @@ impl ContactsState {
         self.groups_loaded = table.groups_loaded;
         self.aliases = table.aliases;
         self.cached_profiles = table.cached_profiles;
-        self.cached_groups = table.cached_groups;
+        groups.cached_groups = table.cached_groups;
         self.friend_global_ids = table.friend_global_ids;
         self.activity_ranks = table.activity_ranks;
     }
@@ -567,9 +564,6 @@ impl ContactsState {
         }
         if next.cached_profiles.is_empty() && !self.cached_profiles.is_empty() {
             next.cached_profiles = std::mem::take(&mut self.cached_profiles);
-        }
-        if next.cached_groups.is_empty() && !self.cached_groups.is_empty() {
-            next.cached_groups = std::mem::take(&mut self.cached_groups);
         }
         if next.activity_ranks.is_empty() && !self.activity_ranks.is_empty() {
             next.activity_ranks = std::mem::take(&mut self.activity_ranks);
@@ -647,11 +641,12 @@ impl IdentitySnapshot {
         my_avatar: Option<&str>,
         convs: &ConversationsState,
         contacts: &ContactsState,
+        groups: &GroupsState,
     ) -> Self {
         let mut snap = Self {
             my_uid: my_uid.to_owned(),
             my_avatar: my_avatar.map(str::to_owned),
-            identities: contacts.to_identity_table(),
+            identities: contacts.to_identity_table(groups),
             conversation_fallbacks: Self::build_conversation_fallbacks(&convs.conversations),
             friends_by_id: HashMap::new(),
             uid_by_global_id: HashMap::new(),
@@ -1862,10 +1857,15 @@ pub fn parse_batch_events(
 
 /// Applies Pass 1 of `applyBatchResponse` / `applyParsedEvents` across `MessagesState` and
 /// `ConversationsState` (used by bootstrap preload/self/group history, LP drain, and WS pushes).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "pure batch projection over explicit core state slices"
+)]
 pub fn apply_batch_pass1(
     messages: &mut MessagesState,
     conversations: &mut ConversationsState,
     contacts: &ContactsState,
+    groups: &GroupsState,
     events: &[ParsedWireEvent],
     increment_unread: bool,
     self_conv_id: Option<&str>,
@@ -1956,7 +1956,8 @@ pub fn apply_batch_pass1(
     for (conv_id, latest) in latest_by_conv {
         poll_messages.push(latest.clone());
         let is_grp = is_group_id(&conv_id);
-        let info = conversations.lookup_conversation_identity(contacts, &conv_id, self_conv_id);
+        let info =
+            conversations.lookup_conversation_identity(contacts, groups, &conv_id, self_conv_id);
         let prev = ConversationPreview {
             text: message_preview_label(&latest),
             date_ms: Some(latest.date_ms),
@@ -2412,9 +2413,10 @@ pub fn localized_standard_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
-/// Parses raw responses from the 4 contact endpoints into unified `ContactsState`.
+/// Parses raw responses from the 4 contact endpoints into unified `ContactsState` and `GroupsState`.
 pub fn apply_fetched_contacts(
     contacts: &mut ContactsState,
+    groups: &mut GroupsState,
     friends_rows: Option<Vec<Map<String, Value>>>,
     groups_dict: Option<Map<String, Value>>,
     sent_rows: Option<Vec<Map<String, Value>>>,
@@ -2525,7 +2527,7 @@ pub fn apply_fetched_contacts(
             });
         }
         mapped_groups.sort_by(|a, b| localized_standard_cmp(&a.sort_key, &b.sort_key));
-        contacts.group_details_json = detail_cache;
+        groups.details_json = detail_cache;
         contacts.groups = mapped_groups;
         contacts.groups_loaded = true;
     }
