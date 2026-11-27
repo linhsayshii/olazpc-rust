@@ -743,7 +743,7 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         guard let engine else { return }
         await engine.waitForCoreMirrorDrain()
         await MainActor.run {
-            engine.showActionCard(text, in: convId.isEmpty ? nil : convId)
+            engine.showActionCard(text, in: (convId?.isEmpty == false) ? convId : nil)
         }
     }
 
