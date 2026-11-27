@@ -536,8 +536,6 @@ final class ZaloEngine {
         cachedUnreadMarks = []
         cachedAliases = [:]
         cachedBoardRawTopics = [:]
-        // U7: clear core's temporary board caches until U7 owns board pins.
-        coreLifecycle.core?.clearBoardCaches()
         failedDrafts = FailedDraftStore()
     }
 

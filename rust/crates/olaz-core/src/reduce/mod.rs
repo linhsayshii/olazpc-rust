@@ -10,6 +10,7 @@ pub mod contacts;
 pub mod conversations;
 pub mod forward;
 pub mod messages;
+pub mod pins;
 // U12
 pub mod polls;
 pub mod search;
@@ -66,6 +67,23 @@ fn is_contacts_command(cmd: &Command) -> bool {
             | Command::SetBlocked { .. }
             | Command::SaveAlias { .. }
             | Command::SeedBlockedUsers(_)
+    )
+}
+
+fn is_pin_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::RefreshBoardPins { .. }
+            | Command::RewatchPins
+            | Command::PinMessage { .. }
+            | Command::Pin { .. }
+            | Command::RequestUnpin { .. }
+            | Command::RequestUnpinMessage { .. }
+            | Command::Unpin { .. }
+            | Command::HandlePinsState { .. }
+            | Command::HandlePinTopicEvent { .. }
+            | Command::LoadPinnedMessage { .. }
+            | Command::SeedPins { .. }
     )
 }
 
@@ -376,6 +394,24 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::BlockedUserUpdated { .. }
         | Input::AliasSaved { .. } => {
             contacts::reduce_contacts_input(state, input, &mut out);
+        }
+
+        // U7
+        Input::Command(ref cmd) if is_pin_command(cmd) => {
+            pins::reduce_pins(state, input, &mut out);
+        }
+        Input::OpRequest { ref cmd, .. } if is_pin_command(cmd) => {
+            pins::reduce_pins(state, input, &mut out);
+        }
+        Input::BoardPinsFetched { .. }
+        | Input::BoardPinsFetchSkipped { .. }
+        | Input::UnpinBoardTopicDone { .. }
+        | Input::PinBoardMessageDone { .. }
+        | Input::PinTopicApproved { .. }
+        | Input::RefreshBoardPinsApproved { .. }
+        | Input::PinnedMessageLookupDone { .. }
+        | Input::PinnedEnsureMessageLoadedDone { .. } => {
+            pins::reduce_pins(state, input, &mut out);
         }
 
         Input::Command(_)

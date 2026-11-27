@@ -2,18 +2,17 @@
 //!
 //! Credentials and user-facing personal data never reach `Debug` output (ADR-008).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 
 use olaz_core::conversations::ConversationsState;
 use olaz_core::messages::{ContactsState, MessagesState};
 use olaz_core::polls::{
-    AddedPollOption, BoardPinItem, BoardPinList, POLL_DEBOUNCE_DELAY_MS, PollAction,
-    PollActionResult, PollCapabilities, PollClock, PollConfig, PollCreateDraft, PollCreateIssue,
-    PollDetail, PollMessageNotice, PollOption, PollPinConfirm, PollPinOutcome, PollPinState,
-    PollVoteDraft, PollVoterGroup, PollVoterUser, PollVoters, PollsState,
-    is_group_admin_or_creator, map_poll_pin_session_error, normalize_poll_detail,
-    resolve_poll_group_id,
+    AddedPollOption, POLL_DEBOUNCE_DELAY_MS, PollAction, PollActionResult, PollCapabilities,
+    PollClock, PollConfig, PollCreateDraft, PollCreateIssue, PollDetail, PollMessageNotice,
+    PollOption, PollPinConfirm, PollPinOutcome, PollPinState, PollVoteDraft, PollVoterGroup,
+    PollVoterUser, PollVoters, PollsState, is_group_admin_or_creator, map_poll_pin_session_error,
+    normalize_poll_detail, resolve_poll_group_id,
 };
 use olaz_json::to_swift_json_string;
 use olaz_wire::ChatMessage;
@@ -1010,73 +1009,6 @@ pub struct PollCapabilitiesOutcomeRecord {
 }
 
 // ---------------------------------------------------------------------------
-// Temporary U7 read-only board mirror records
-// ---------------------------------------------------------------------------
-
-/// Temporary U7 board pin item record (`// U7:`).
-#[derive(Clone, PartialEq, Eq, uniffi::Record)]
-pub struct BoardPinItemRecord {
-    pub ref_id: String,
-    pub kind: String,
-    pub title: String,
-    pub sender: String,
-    pub thumbnail: Option<String>,
-    pub msg_id: String,
-    pub cli_msg_id: String,
-}
-
-impl fmt::Debug for BoardPinItemRecord {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BoardPinItemRecord")
-            .field("kind", &self.kind)
-            .finish()
-    }
-}
-
-impl From<BoardPinItemRecord> for BoardPinItem {
-    fn from(r: BoardPinItemRecord) -> Self {
-        Self {
-            ref_id: r.ref_id,
-            kind: r.kind,
-            title: r.title,
-            sender: r.sender,
-            thumbnail: r.thumbnail,
-            msg_id: r.msg_id,
-            cli_msg_id: r.cli_msg_id,
-        }
-    }
-}
-
-/// Temporary U7 board pin list record (`// U7:`).
-#[derive(Clone, PartialEq, Eq, uniffi::Record)]
-pub struct BoardPinListRecord {
-    pub ready: bool,
-    pub can_pin: bool,
-    pub limit: i64,
-    pub items: Vec<BoardPinItemRecord>,
-}
-
-impl fmt::Debug for BoardPinListRecord {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BoardPinListRecord")
-            .field("ready", &self.ready)
-            .field("can_pin", &self.can_pin)
-            .field("limit", &self.limit)
-            .field("items", &self.items.len())
-            .finish()
-    }
-}
-
-impl From<BoardPinListRecord> for BoardPinList {
-    fn from(r: BoardPinListRecord) -> Self {
-        Self {
-            ready: r.ready,
-            can_pin: r.can_pin,
-            limit: r.limit,
-            items: r.items.into_iter().map(Into::into).collect(),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Pure FFI exports for Swift poll models, views, and offline unit tests
@@ -1557,22 +1489,6 @@ pub fn normalize_poll_detail_ffi(
         &messages,
     )
     .map(Into::into)
-}
-
-/// Parses a JSON object map `{topic_id: raw_topic_dict}` into `BTreeMap<String, JsonObject>` (`// U7:`).
-pub(crate) fn parse_raw_topics_json(
-    topics_json: &str,
-) -> BTreeMap<String, serde_json::Map<String, Value>> {
-    let Some(outer) = olaz_json::parse_object_str(topics_json) else {
-        return BTreeMap::new();
-    };
-    let mut out = BTreeMap::new();
-    for (k, v) in outer {
-        if let Value::Object(map) = v {
-            out.insert(k, map);
-        }
-    }
-    out
 }
 
 #[cfg(test)]

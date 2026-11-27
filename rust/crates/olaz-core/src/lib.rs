@@ -17,6 +17,7 @@ pub mod effect;
 pub mod forward;
 pub mod input;
 pub mod messages;
+pub mod pins;
 // U12
 pub mod polls;
 pub mod reduce;
@@ -96,19 +97,19 @@ pub use messages::{
 };
 // U12
 pub use polls::{
-    AddedPollOption, BoardPinItem, BoardPinList, BoardRawTopics, MAX_SEEN_POLL_MESSAGES,
-    MAX_WATCHED_POLLS, MergedGroupMetadataPersistence, POLL_DEBOUNCE_DELAY_MS,
-    POLL_MESSAGE_MAX_AGE_MS, PollAction, PollActionResult, PollCapabilities, PollClock, PollConfig,
-    PollCreateDraft, PollCreateIssue, PollDetail, PollMessageNotice, PollOption, PollPinConfirm,
-    PollPinOutcome, PollPinState, PollVoteDraft, PollVoterGroup, PollVoterUser, PollVoters,
-    PollsState, UNKNOWN_POLL_USER_NAME, WATCH_POLL_THROTTLE_MS, build_pin_limit_confirm,
-    build_poll_voters, clamped_int64, is_group_admin_or_creator, map_create_poll_net_error,
-    map_poll_pin_net_error, map_poll_pin_session_error, merge_fetched_group_metadata,
-    normalize_poll_detail, normalize_poll_uid, refresh_poll_pin_state, resolve_poll_group_id,
+    AddedPollOption, MAX_SEEN_POLL_MESSAGES, MAX_WATCHED_POLLS, MergedGroupMetadataPersistence,
+    POLL_DEBOUNCE_DELAY_MS, POLL_MESSAGE_MAX_AGE_MS, PollAction, PollActionResult,
+    PollCapabilities, PollClock, PollConfig, PollCreateDraft, PollCreateIssue, PollDetail,
+    PollMessageNotice, PollOption, PollPinConfirm, PollPinOutcome, PollPinState, PollVoteDraft,
+    PollVoterGroup, PollVoterUser, PollVoters, PollsState, UNKNOWN_POLL_USER_NAME,
+    WATCH_POLL_THROTTLE_MS, build_pin_limit_confirm, build_poll_voters, clamped_int64,
+    is_group_admin_or_creator, map_create_poll_net_error, map_poll_pin_net_error,
+    map_poll_pin_session_error, merge_fetched_group_metadata, normalize_poll_detail,
+    normalize_poll_uid, refresh_poll_pin_state, resolve_poll_group_id,
 };
 pub use reduce::classify::{MobileSyncEvent, Route, classify, classify_poll};
 pub use reduce::contacts::apply_contacts_adapter_state;
-pub use reduce::polls::{DEFAULT_BOARD_PIN_LIMIT, apply_pins_state_event};
+pub use reduce::polls::DEFAULT_BOARD_PIN_LIMIT;
 pub use reduce::send::SendState;
 pub use reduce::{ReduceOutput, reduce};
 pub use runner::{
@@ -133,4 +134,12 @@ pub use typed_chat::{
 pub use typing::{
     DEFAULT_TYPING_NAME, OUTGOING_TYPING_THROTTLE_MS, TYPING_DISPLAY_DURATION, TypingState,
     TypingStatus, clear_typing, set_typing,
+};
+
+// U7
+pub use pins::{
+    BoardPinItem, BoardPinList, BoardRawTopics, DEFAULT_PIN_LIMIT, PIN_FAILED_CARD_TEXT,
+    ParsedBoardTopics, PinLimitDecision, PinnedItem, PinnedList, PinsSnapshot, PinsState,
+    RefreshBoardFollowup, UNPIN_FAILED_CARD_TEXT, UnpinBoardPurpose, can_pin_message, is_pinned,
+    parse_board_topics, pin_error_shape,
 };

@@ -1178,6 +1178,12 @@ pub fn mutate_reactions<F>(
 pub(crate) enum PendingIdResolution {
     React(ReactDispatchArgs),
     Recall(RecallDispatchArgs),
+    // U7
+    Pin {
+        conv_id: String,
+        initial_msg_id: String,
+        pin_op_id: u64,
+    },
 }
 
 #[derive(Clone)]
@@ -1280,7 +1286,7 @@ impl fmt::Debug for ActionsState {
 }
 
 impl ActionsState {
-    fn next_id(&mut self) -> u64 {
+    pub(crate) fn next_id(&mut self) -> u64 {
         self.next_seq = self.next_seq.wrapping_add(1);
         if self.next_seq == 0 {
             self.next_seq = 1;
@@ -1735,8 +1741,28 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                 MessageConfirmAction::RecallMany { msg_ids } => {
                     start_recall_many(state, confirm.conv_id, msg_ids, now_ms, op_id, out);
                 }
-                MessageConfirmAction::Pin { .. } | MessageConfirmAction::Unpin { .. } => {
-                    complete_unit(op_id, out);
+                // U7
+                MessageConfirmAction::Pin {
+                    msg_id,
+                    replacing_ref,
+                } => {
+                    crate::reduce::pins::start_pin(
+                        state,
+                        &confirm.conv_id,
+                        &msg_id,
+                        replacing_ref,
+                        op_id,
+                        out,
+                    );
+                }
+                MessageConfirmAction::Unpin { topic_ref } => {
+                    crate::reduce::pins::start_unpin(
+                        state,
+                        &confirm.conv_id,
+                        &topic_ref,
+                        op_id,
+                        out,
+                    );
                 }
             }
         }
@@ -2400,6 +2426,11 @@ fn handle_ids_resolved(
     let (conv_id, initial_msg_id) = match &pending {
         PendingIdResolution::React(a) => (a.conv_id.clone(), a.initial_msg_id.clone()),
         PendingIdResolution::Recall(a) => (a.conv_id.clone(), a.initial_msg_id.clone()),
+        PendingIdResolution::Pin {
+            conv_id,
+            initial_msg_id,
+            ..
+        } => (conv_id.clone(), initial_msg_id.clone()),
     };
 
     if !effective_msg_id.is_empty()
@@ -2440,6 +2471,15 @@ fn handle_ids_resolved(
             dispatch_recall_after_id_resolution(
                 state,
                 args,
+                effective_msg_id,
+                resolved_cli_id,
+                out,
+            );
+        }
+        PendingIdResolution::Pin { pin_op_id, .. } => {
+            crate::reduce::pins::on_pin_ids_resolved(
+                state,
+                pin_op_id,
                 effective_msg_id,
                 resolved_cli_id,
                 out,

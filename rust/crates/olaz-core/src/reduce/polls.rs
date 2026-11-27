@@ -1,7 +1,6 @@
 //! Pure reducer for the group polls domain (`ZaloEngine+Poll.swift`, U12) and temporary U7
 //! read-only board-pin mirror write-throughs.
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use olaz_wire::{clean_group_id, is_group_id};
@@ -11,137 +10,16 @@ use crate::changes::DirtyKey;
 use crate::effect::{Effect, OpResult, PollBoardContinuation, PollDetailPurpose, StoreOp};
 use crate::input::{Command, Input};
 use crate::polls::{
-    BoardPinItem, BoardPinList, POLL_DEBOUNCE_DELAY_MS, PollActionResult, PollCapabilities,
-    PollPinOutcome, build_pin_limit_confirm, build_poll_voters, clamped_int64,
-    merge_fetched_group_metadata, normalize_poll_detail, poll_detail_shape_anomaly_log_line,
-    refresh_poll_pin_state, resolve_poll_group_id,
+    POLL_DEBOUNCE_DELAY_MS, PollActionResult, PollCapabilities, PollPinOutcome,
+    build_pin_limit_confirm, build_poll_voters, merge_fetched_group_metadata,
+    normalize_poll_detail, poll_detail_shape_anomaly_log_line, refresh_poll_pin_state,
+    resolve_poll_group_id,
 };
 use crate::reduce::ReduceOutput;
 use crate::state::CoreState;
 
 /// Default board pin limit when `PinnedList(json:)` receives no positive `limit` (`ZaloWireParser.defaultPinLimit`).
 pub const DEFAULT_BOARD_PIN_LIMIT: i64 = 3;
-
-fn json_bool(val: Option<&Value>) -> bool {
-    match val {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_f64().is_some_and(|x| x != 0.0),
-        _ => false,
-    }
-}
-
-fn json_i64(val: Option<&Value>) -> i64 {
-    match val {
-        Some(Value::Number(n)) => n
-            .as_i64()
-            .unwrap_or_else(|| clamped_int64(n.as_f64().unwrap_or(0.0))),
-        _ => 0,
-    }
-}
-
-impl BoardPinList {
-    /// Port of `PinnedList.init(json: [String: Any])` (`ZaloEngine+MessageActions.swift`).
-    #[must_use]
-    pub fn from_json(json: &Map<String, Value>) -> Self {
-        let ready = json_bool(json.get("ready"));
-        let can_pin = json_bool(json.get("canPin"));
-        let raw_limit = json_i64(json.get("limit"));
-        let limit = if raw_limit > 0 {
-            raw_limit
-        } else {
-            DEFAULT_BOARD_PIN_LIMIT
-        };
-        let items = json
-            .get("items")
-            .and_then(Value::as_array)
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|v| {
-                        let row = v.as_object()?;
-                        let ref_id = row
-                            .get("ref")
-                            .or_else(|| row.get("ref_id"))
-                            .and_then(Value::as_str)?;
-                        if ref_id.is_empty() {
-                            return None;
-                        }
-                        let raw_kind = row.get("kind").and_then(Value::as_str).unwrap_or("");
-                        let kind = match raw_kind {
-                            "message" | "note" | "link" | "poll" | "reminder" => raw_kind,
-                            _ => "note",
-                        }
-                        .to_owned();
-                        let title = row
-                            .get("title")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_owned();
-                        let sender = row
-                            .get("sender")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_owned();
-                        let thumbnail = row
-                            .get("thumb")
-                            .or_else(|| row.get("thumbnail"))
-                            .and_then(Value::as_str)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_owned);
-                        let msg_id = row
-                            .get("msgId")
-                            .or_else(|| row.get("msg_id"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_owned();
-                        let cli_msg_id = row
-                            .get("cliMsgId")
-                            .or_else(|| row.get("cli_msg_id"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_owned();
-                        Some(BoardPinItem {
-                            ref_id: ref_id.to_owned(),
-                            kind,
-                            title,
-                            sender,
-                            thumbnail,
-                            msg_id,
-                            cli_msg_id,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Self {
-            ready,
-            can_pin,
-            limit,
-            items,
-        }
-    }
-}
-
-/// Port of `ZaloEngine.handlePins(state:)` (`// U7:` temporary mirror helper until U7 lands).
-pub fn apply_pins_state_event(
-    board_pins: &mut BTreeMap<String, BoardPinList>,
-    state: &Map<String, Value>,
-) -> bool {
-    let Some(json) = state.get("pins").and_then(Value::as_object) else {
-        return false;
-    };
-    let Some(conv_id) = json.get("convId").and_then(Value::as_str) else {
-        return false;
-    };
-    if conv_id.is_empty() {
-        return false;
-    }
-    let list = BoardPinList::from_json(json);
-    if board_pins.get(conv_id) != Some(&list) {
-        board_pins.insert(conv_id.to_owned(), list);
-        return true;
-    }
-    false
-}
 
 fn complete_op(out: &mut ReduceOutput, op_id: Option<u64>, result: OpResult, after_store: bool) {
     if let Some(op_id) = op_id {
@@ -206,9 +84,11 @@ fn run_refresh_poll_pin_step(
     then_pin_done: Option<bool>,
     out: &mut ReduceOutput,
 ) {
-    if is_group_id(&conv_id) && !state.board_pins.contains_key(&conv_id) {
+    if is_group_id(&conv_id) && !state.pins.lists.contains_key(&conv_id) {
+        let req_gen = state.pins.current_gen(&conv_id);
         out.effects.push(Effect::RefreshBoardPinsForPoll {
             conv_id,
+            req_gen,
             require_auth: true,
             continuation: PollBoardContinuation::FinishRefreshPin {
                 op_id,
@@ -240,7 +120,7 @@ fn complete_refresh_poll_pin_now(
     out: &mut ReduceOutput,
 ) {
     let (pin_state, mutated) =
-        refresh_poll_pin_state(&mut state.polls, &state.board_pins, poll_id, conv_id);
+        refresh_poll_pin_state(&mut state.polls, &state.pins.lists, poll_id, conv_id);
     if mutated {
         out.dirty.insert(DirtyKey::Polls);
     }
@@ -280,11 +160,64 @@ pub(crate) fn is_poll_command(cmd: &Command) -> bool {
             | Command::HandlePollState { .. }
             | Command::ResetPolls { .. }
             | Command::SeedPolls { .. }
-            | Command::SyncBoardPins { .. }
-            | Command::SyncBoardRawTopics { .. }
-            | Command::HandlePinsState { .. }
-            | Command::ClearBoardCaches
     )
+}
+
+pub(crate) fn handle_poll_board_refreshed(
+    state: &mut CoreState,
+    conv_id: String,
+    continuation: PollBoardContinuation,
+    out: &mut ReduceOutput,
+) {
+    match continuation {
+        PollBoardContinuation::FinishRefreshPin {
+            op_id,
+            poll_id,
+            then_action_ok,
+            then_pin_done,
+        } => {
+            complete_refresh_poll_pin_now(
+                state,
+                &poll_id,
+                &conv_id,
+                op_id,
+                then_action_ok,
+                then_pin_done,
+                out,
+            );
+        }
+        PollBoardContinuation::AfterPinSuccess {
+            op_id,
+            poll_id,
+            for_create,
+        } => {
+            run_refresh_poll_pin_step(state, poll_id, conv_id, op_id, false, Some(for_create), out);
+        }
+        PollBoardContinuation::AfterPinLimitError {
+            op_id,
+            poll_id,
+            mapped,
+            for_create,
+        } => {
+            if for_create {
+                complete_op(
+                    out,
+                    op_id,
+                    OpResult::PollActionResult(PollActionResult::ok_pin_skipped()),
+                    false,
+                );
+                return;
+            }
+            let outcome = match build_pin_limit_confirm(&poll_id, state.pins.lists.get(&conv_id)) {
+                Some(confirm) => PollPinOutcome::NeedsConfirmation(confirm),
+                None => PollPinOutcome::Failed(mapped),
+            };
+            complete_op(out, op_id, OpResult::PollPinOutcome(outcome), false);
+        }
+        PollBoardContinuation::AfterUnpinSuccess { op_id, poll_id } => {
+            run_refresh_poll_pin_step(state, poll_id, conv_id, op_id, true, None, out);
+        }
+    }
 }
 
 pub fn reduce_polls(state: &mut CoreState, input: Input, out: &mut ReduceOutput) {
@@ -405,64 +338,9 @@ pub fn reduce_polls(state: &mut CoreState, input: Input, out: &mut ReduceOutput)
         Input::PollBoardRefreshed {
             conv_id,
             continuation,
-        } => match continuation {
-            PollBoardContinuation::FinishRefreshPin {
-                op_id,
-                poll_id,
-                then_action_ok,
-                then_pin_done,
-            } => {
-                complete_refresh_poll_pin_now(
-                    state,
-                    &poll_id,
-                    &conv_id,
-                    op_id,
-                    then_action_ok,
-                    then_pin_done,
-                    out,
-                );
-            }
-            PollBoardContinuation::AfterPinSuccess {
-                op_id,
-                poll_id,
-                for_create,
-            } => {
-                run_refresh_poll_pin_step(
-                    state,
-                    poll_id,
-                    conv_id,
-                    op_id,
-                    false,
-                    Some(for_create),
-                    out,
-                );
-            }
-            PollBoardContinuation::AfterPinLimitError {
-                op_id,
-                poll_id,
-                mapped,
-                for_create,
-            } => {
-                if for_create {
-                    complete_op(
-                        out,
-                        op_id,
-                        OpResult::PollActionResult(PollActionResult::ok_pin_skipped()),
-                        false,
-                    );
-                    return;
-                }
-                let outcome =
-                    match build_pin_limit_confirm(&poll_id, state.board_pins.get(&conv_id)) {
-                        Some(confirm) => PollPinOutcome::NeedsConfirmation(confirm),
-                        None => PollPinOutcome::Failed(mapped),
-                    };
-                complete_op(out, op_id, OpResult::PollPinOutcome(outcome), false);
-            }
-            PollBoardContinuation::AfterUnpinSuccess { op_id, poll_id } => {
-                run_refresh_poll_pin_step(state, poll_id, conv_id, op_id, true, None, out);
-            }
-        },
+        } => {
+            handle_poll_board_refreshed(state, conv_id, continuation, out);
+        }
 
         Input::PollPinApiDone {
             op_id,
@@ -472,8 +350,10 @@ pub fn reduce_polls(state: &mut CoreState, input: Input, out: &mut ReduceOutput)
             step_result,
         } => match step_result {
             Ok(()) => {
+                let req_gen = state.pins.current_gen(&conv_id);
                 out.effects.push(Effect::RefreshBoardPinsForPoll {
                     conv_id,
+                    req_gen,
                     require_auth: false,
                     continuation: PollBoardContinuation::AfterPinSuccess {
                         op_id,
@@ -484,8 +364,10 @@ pub fn reduce_polls(state: &mut CoreState, input: Input, out: &mut ReduceOutput)
             }
             Err(mapped) => {
                 if mapped.error.as_deref() == Some("limit") {
+                    let req_gen = state.pins.current_gen(&conv_id);
                     out.effects.push(Effect::RefreshBoardPinsForPoll {
                         conv_id,
+                        req_gen,
                         require_auth: false,
                         continuation: PollBoardContinuation::AfterPinLimitError {
                             op_id,
@@ -519,8 +401,10 @@ pub fn reduce_polls(state: &mut CoreState, input: Input, out: &mut ReduceOutput)
             ok,
         } => {
             if ok {
+                let req_gen = state.pins.current_gen(&conv_id);
                 out.effects.push(Effect::RefreshBoardPinsForPoll {
                     conv_id,
+                    req_gen,
                     require_auth: false,
                     continuation: PollBoardContinuation::AfterUnpinSuccess { op_id, poll_id },
                 });
@@ -774,7 +658,7 @@ fn reduce_poll_command(
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .map(|ref_id| {
-                    let cache = state.board_raw_topics.get(&conv_id);
+                    let cache = state.pins.raw_topics.get(&conv_id);
                     let raw = cache.and_then(|c| c.topics.get(ref_id)).cloned();
                     let version = cache.map_or(0, |c| c.version);
                     (ref_id.to_owned(), raw, version)
@@ -789,7 +673,7 @@ fn reduce_poll_command(
         }
 
         Command::UnpinPoll { id, conv_id } => {
-            let cache = state.board_raw_topics.get(&conv_id);
+            let cache = state.pins.raw_topics.get(&conv_id);
             let raw_topic = cache.and_then(|c| c.topics.get(&id)).cloned();
             let board_version = cache.map_or(0, |c| c.version);
             out.effects.push(Effect::UnpinPollApi {
@@ -928,39 +812,6 @@ fn reduce_poll_command(
 
         Command::SeedPolls { polls } => {
             state.polls = *polls;
-            complete_op(out, op_id, OpResult::Unit, false);
-        }
-
-        // U7: temporary write-throughs from Swift board pins until U7 lands (never dirty CoreChanges).
-        Command::SyncBoardPins { conv_id, list } => {
-            match list {
-                Some(list) => {
-                    state.board_pins.insert(conv_id, list);
-                }
-                None => {
-                    state.board_pins.remove(&conv_id);
-                }
-            }
-            complete_op(out, op_id, OpResult::Unit, false);
-        }
-        Command::SyncBoardRawTopics { conv_id, raw } => {
-            match raw {
-                Some(raw) => {
-                    state.board_raw_topics.insert(conv_id, raw);
-                }
-                None => {
-                    state.board_raw_topics.remove(&conv_id);
-                }
-            }
-            complete_op(out, op_id, OpResult::Unit, false);
-        }
-        Command::HandlePinsState { state: pins_state } => {
-            let _ = apply_pins_state_event(&mut state.board_pins, &pins_state);
-            complete_op(out, op_id, OpResult::Unit, false);
-        }
-        Command::ClearBoardCaches => {
-            state.board_pins.clear();
-            state.board_raw_topics.clear();
             complete_op(out, op_id, OpResult::Unit, false);
         }
 

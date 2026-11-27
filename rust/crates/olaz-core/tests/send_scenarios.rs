@@ -219,7 +219,9 @@ impl Host for SendScenarioHost {
             .unwrap_or_else(PoisonError::into_inner)
             .push((conv_id, uid, on_pc));
     }
-    async fn pin_topic(&self, _conv_id: String) {}
+    async fn pin_topic(&self, _conv_id: String) -> bool {
+        false
+    }
     async fn group_notice(&self, _act: String, _data: Map<String, Value>, _ts: i64) {}
     async fn mute(
         &self,

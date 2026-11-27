@@ -21,6 +21,8 @@ use olaz_wire::{
     strip_user_prefix,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::pins::PinnedList;
 use serde_json::{Map, Value, json};
 
 use crate::conversations::{
@@ -1073,63 +1075,6 @@ pub enum PollPinOutcome {
 // Temporary U7 read-only board mirror types
 // ---------------------------------------------------------------------------
 
-/// One item in a conversation's pinned board list (`PinnedItem` read-only mirror until U7).
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BoardPinItem {
-    pub ref_id: String,
-    pub kind: String,
-    pub title: String,
-    pub sender: String,
-    pub thumbnail: Option<String>,
-    pub msg_id: String,
-    pub cli_msg_id: String,
-}
-
-impl fmt::Debug for BoardPinItem {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BoardPinItem")
-            .field("kind", &self.kind)
-            .finish()
-    }
-}
-
-/// Conversation board pin list (`PinnedList` read-only mirror until U7).
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BoardPinList {
-    pub ready: bool,
-    pub can_pin: bool,
-    pub limit: i64,
-    pub items: Vec<BoardPinItem>,
-}
-
-impl fmt::Debug for BoardPinList {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BoardPinList")
-            .field("ready", &self.ready)
-            .field("can_pin", &self.can_pin)
-            .field("limit", &self.limit)
-            .field("items", &self.items.len())
-            .finish()
-    }
-}
-
-/// Raw board topic cache for a conversation (`cachedBoardRawTopics[convId]` until U7).
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BoardRawTopics {
-    pub version: i64,
-    /// `topic_id -> raw JSON object` (used to extract `type` for `unpinv2` / `multi_unpin`).
-    pub topics: BTreeMap<String, JsonObject>,
-}
-
-impl fmt::Debug for BoardRawTopics {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BoardRawTopics")
-            .field("version", &self.version)
-            .field("topics", &self.topics.len())
-            .finish()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // PollsState + PollClock
 // ---------------------------------------------------------------------------
@@ -1657,7 +1602,7 @@ pub fn build_poll_voters(
 /// Returns `(returned_state, mutated)`.
 pub fn refresh_poll_pin_state(
     polls: &mut PollsState,
-    board_pins: &BTreeMap<String, BoardPinList>,
+    board_pins: &BTreeMap<String, PinnedList>,
     id: &str,
     conv_id: &str,
 ) -> (PollPinState, bool) {
@@ -1693,7 +1638,7 @@ pub fn refresh_poll_pin_state(
 #[must_use]
 pub fn build_pin_limit_confirm(
     poll_id: &str,
-    board: Option<&BoardPinList>,
+    board: Option<&PinnedList>,
 ) -> Option<PollPinConfirm> {
     let board = board?;
     let oldest = board.items.last()?;
@@ -2120,11 +2065,11 @@ mod tests {
 
         boards.insert(
             "g500701".to_owned(),
-            BoardPinList {
+            crate::pins::PinnedList {
                 ready: true,
                 can_pin: true,
                 limit: 3,
-                items: vec![BoardPinItem {
+                items: vec![crate::pins::PinnedItem {
                     ref_id: "9701".to_owned(),
                     kind: "poll".to_owned(),
                     title: "Poll".to_owned(),
