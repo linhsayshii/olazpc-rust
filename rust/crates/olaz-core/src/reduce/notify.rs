@@ -97,6 +97,16 @@ fn complete_unit(op_id: Option<u64>, out: &mut ReduceOutput) {
 }
 
 fn resolve_reminder_id(state: &CoreState, conv_id: &str, msg_id: &str) -> String {
+    if let Some(list) = state.pins.lists.get(conv_id) {
+        if let Some(found) = list.items.iter().find(|r| {
+            r.kind == "reminder"
+                && !r.ref_id.is_empty()
+                && (r.msg_id == msg_id || r.cli_msg_id == msg_id)
+        }) {
+            return found.ref_id.clone();
+        }
+        return msg_id.to_owned();
+    }
     if let Some(refs) = state.notify.pin_reminder_refs.get(conv_id)
         && let Some(found) = refs
             .iter()

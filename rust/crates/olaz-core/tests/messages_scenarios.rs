@@ -159,11 +159,22 @@ fn m02_open_up_to_date_skips_history_fetch_and_emits_pins_and_mark_read() {
             ..
         }
     )));
-    assert!(out.effects.iter().any(|e| matches!(
-        e,
-        Effect::Host(HostCall::RefreshBoardPins { conv_id }) if conv_id == "friend_1"
-    )));
-    assert!(out.effects.iter().any(|e| matches!(
+    let followup = out.effects.iter().find_map(|e| match e {
+        Effect::RefreshBoardPins {
+            conv_id, followup, ..
+        } if conv_id == "friend_1" => Some(followup.clone()),
+        _ => None,
+    });
+    let followup = followup.expect("expected RefreshBoardPins effect");
+    let after_pins = reduce(
+        &mut state,
+        Input::BoardPinsFetchSkipped {
+            conv_id: "friend_1".to_owned(),
+            req_gen: 0,
+            followup,
+        },
+    );
+    assert!(after_pins.effects.iter().any(|e| matches!(
         e,
         Effect::Host(HostCall::MarkReadBoundary { conv_id, seen_target: Some(t) })
             if conv_id == "friend_1" && t.msg_id == "101"

@@ -4,6 +4,7 @@
 //! conversation lists (preload, pins, archive, mute, labels, groups, friends, friend-request lists,
 //! aliases, profiles, hidden chats, delete), message history (1-1 preload, group and self cloud
 //! paging), the HTTP long-poll queue, sending text (plain, quoted, E2EE envelope), typing, seen,
+//! unread marks, recall, delete-for-me, reactions, auto-delete settings, and board pins.
 //! unread marks, recall, delete-for-me, reactions, auto-delete settings, and group polls.
 //!
 //! Every method is a request builder (service, path, params payload with the exact Swift keys and
@@ -11,6 +12,10 @@
 //! [`build_reaction_request`], [`build_e2ee_message_request_payload`], ...) are free functions so tests
 //! can compare payloads without a transport. Login, QR and session state live in `olaz-net`
 //! (reach them with [`ZaloApi::client`]).
+//!
+//! Not ported here (later waves): media upload and file send, polls and reminders, cloud, stickers,
+//! group management, contact cards, friend-request mutations, call signalling, global-id
+//! encrypt/decrypt, mute set.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -25,6 +30,7 @@ mod groups;
 mod history;
 mod messaging;
 mod notify;
+mod pins;
 mod poll;
 mod profiles;
 mod reminders;
@@ -55,6 +61,9 @@ pub use messaging::{
     build_send_contact_card_request,
 };
 pub use notify::{build_set_mute_payload, extract_suggested_sticker_rows};
+pub use pins::{
+    board_topic_params, friend_board_list_box, friend_board_unpin_topics, pin_topic_params,
+};
 pub use poll::{PollQueueCursor, PollState};
 pub use reminders::{CreateReminderParams, build_create_reminder_request};
 pub use stickers::{
@@ -67,7 +76,7 @@ pub use group_polls::{
     CreatePollArgs, NewPollOptionPayload, build_add_poll_option_request, build_create_poll_request,
     build_fetch_poll_detail_request, build_lock_poll_request, build_pin_board_item_request,
     build_share_poll_request, build_unpin_board_topic_request, build_vote_poll_request,
-    extract_created_poll_id, friend_board_unpin_topics,
+    extract_created_poll_id,
 };
 pub use groups::{
     build_fetch_group_detail_request, clean_group_member_ids, parse_fetch_group_detail_response,

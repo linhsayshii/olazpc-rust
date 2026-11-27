@@ -1289,6 +1289,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func answerMessageConfirm(ok: Bool, nowMs: Int64) 
     
     /**
+     * Answers the active message-action confirmation dialog and awaits completion (e.g. pin/unpin/recallMany).
+     */
+    func answerMessageConfirmAsync(ok: Bool, nowMs: Int64) async throws  -> UInt64
+    
+    /**
      * Applies an account profile update and returns the monotonic change revision once reduced.
      * Swift awaits this revision in its `next_changes()` mirror before returning from
      * `async func applyAccountProfile(_:)`.
@@ -1331,8 +1336,6 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Checks whether `pin` matches the stored hidden-chat PIN digest (MD5 or offline SHA-256).
      */
     func checkHiddenPin(pin: String) async throws  -> Bool
-    
-    func clearBoardCaches() 
     
     /**
      * Dismisses the active forward picker request (e.g. sheet closed by user).
@@ -1490,6 +1493,14 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     
     func handleNotificationSettingsPayload(payloadJson: String) 
     
+    /**
+     * Handles a board pin topic WS push event for `conv_id` (refreshes if open, invalidates if closed).
+     */
+    func handlePinTopicEvent(convId: String) async throws  -> UInt64
+    
+    /**
+     * Applies an adapter-pushed `pins` JSON state payload (`{"pins": {convId, ...}}`).
+     */
     func handlePinsState(stateJson: String) 
     
     func handlePollState(stateJson: String) 
@@ -1531,6 +1542,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func loadOlderMessages(id: String) 
     
     func loadOlderMessagesAndWait(id: String) async throws  -> UInt64
+    
+    /**
+     * Locates a pinned message in memory or SQLite (+ `ensure_message_loaded`) and returns its loaded id.
+     */
+    func loadPinnedMessage(convId: String, topicRef: String) async throws  -> String?
     
     /**
      * Finds and loads the message quoted by `message` in `conv_id`, returning its id if found.
@@ -1605,9 +1621,24 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func persistConversations() async throws  -> UInt64
     
     /**
+     * Executes a pin directly (optionally replacing an older topic ref first) and awaits completion.
+     */
+    func pin(convId: String, msgId: String, replacing: String?) async throws  -> UInt64
+    
+    /**
      * Pins a conversation (or opens the `PinBoard` prompt when at the 10-pin limit).
      */
     func pinConversation(id: String) 
+    
+    /**
+     * Pins a message (applying limit checks / confirmation / ChooseMany card).
+     */
+    func pinMessage(convId: String, msgId: String) 
+    
+    /**
+     * Async variant of [`Self::pin_message`] that awaits the pin or confirmation state update.
+     */
+    func pinMessageAsync(convId: String, msgId: String) async throws  -> UInt64
     
     func pinPoll(id: String, convId: String, confirming: String?) async throws  -> PollPinActionOutcomeRecord
     
@@ -1658,6 +1689,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Records seen-reaction dedup keys in core and flushes `"seenReactionEventIds"` to SQLite.
      */
     func recordSeenReactionKeys(keys: [String]) async throws 
+    
+    /**
+     * Fetches a conversation's pinned board from Zalo (`group_board` or `friend_board`) and awaits mirror update.
+     */
+    func refreshBoardPins(convId: String) async throws  -> UInt64
     
     /**
      * Refreshes zCloud quota/settings/storage snapshot (server API + SQLite + memory merge)
@@ -1730,6 +1766,16 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func requestPinBoard(id: String) async throws  -> PinBoardRecord?
     
+    /**
+     * Prompts confirmation to unpin `topic_ref` in `conv_id`.
+     */
+    func requestUnpin(convId: String, topicRef: String) 
+    
+    /**
+     * Prompts confirmation to unpin the pinned item matching `msg_id` in `conv_id`.
+     */
+    func requestUnpinMessage(convId: String, msgId: String) 
+    
     func resetCardState() 
     
     /**
@@ -1773,6 +1819,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     
     func retryPoll(id: String, convId: String, nowMs: Int64) 
     
+    /**
+     * Re-fetches the board pins of the currently open conversation (if any).
+     */
+    func rewatchPins() async throws  -> UInt64
+    
     func rewatchPolls(nowMs: Int64) 
     
     func saveAlias(uid: String, name: String) async throws  -> SaveAliasRecord
@@ -1795,6 +1846,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func seedContacts(contacts: ContactsStateRecord) 
     
     func seedHistoryFreshness(entries: [FreshnessMapEntry]) 
+    
+    /**
+     * Seeds board pin lists and raw topic caches into core (used by tests and Swift state hydration).
+     */
+    func seedPins(listsJson: String, rawTopicsJson: String) 
     
     func seedPolls(polls: PollsMirrorRecord) 
     
@@ -1936,10 +1992,6 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     
     func suggestedStickers(convId: String, msgId: String) async throws  -> [SuggestedStickerRecord]
     
-    func syncBoardPins(convId: String, list: BoardPinListRecord?) 
-    
-    func syncBoardRawTopics(convId: String, version: Int64, topicsJson: String?) 
-    
     /**
      * Fetches and applies conversation labels from the server.
      */
@@ -1985,6 +2037,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func unmuteConversation(convId: String, nowMs: Int64) 
     
     func unmuteConversationAndWait(convId: String, nowMs: Int64) async throws  -> UInt64
+    
+    /**
+     * Unpins `topic_ref` in `conv_id` immediately and awaits completion.
+     */
+    func unpin(convId: String, topicRef: String) async throws  -> UInt64
     
     /**
      * Unpins a conversation.
@@ -2165,6 +2222,25 @@ open func answerMessageConfirm(ok: Bool, nowMs: Int64)  {try! rustCall() {
 }
     
     /**
+     * Answers the active message-action confirmation dialog and awaits completion (e.g. pin/unpin/recallMany).
+     */
+open func answerMessageConfirmAsync(ok: Bool, nowMs: Int64)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_answer_message_confirm_async(
+                        self.uniffiCloneHandle(),FfiConverterBool.lower(ok),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
      * Applies an account profile update and returns the monotonic change revision once reduced.
      * Swift awaits this revision in its `next_changes()` mirror before returning from
      * `async func applyAccountProfile(_:)`.
@@ -2332,14 +2408,6 @@ open func checkHiddenPin(pin: String)async throws  -> Bool  {
             liftFunc: FfiConverterBool.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
-}
-    
-open func clearBoardCaches()  {try! rustCall() {
-        uniffiCallStatus in
-    uniffi_olaz_ffi_fn_method_coreengine_clear_board_caches(
-            self.uniffiCloneHandle(),uniffiCallStatus
-    )
-}
 }
     
     /**
@@ -2861,6 +2929,28 @@ open func handleNotificationSettingsPayload(payloadJson: String)  {try! rustCall
 }
 }
     
+    /**
+     * Handles a board pin topic WS push event for `conv_id` (refreshes if open, invalidates if closed).
+     */
+open func handlePinTopicEvent(convId: String)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_handle_pin_topic_event(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Applies an adapter-pushed `pins` JSON state payload (`{"pins": {convId, ...}}`).
+     */
 open func handlePinsState(stateJson: String)  {try! rustCall() {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_method_coreengine_handle_pins_state(
@@ -3032,6 +3122,25 @@ open func loadOlderMessagesAndWait(id: String)async throws  -> UInt64  {
             completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
             freeFunc: ffi_olaz_ffi_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Locates a pinned message in memory or SQLite (+ `ensure_message_loaded`) and returns its loaded id.
+     */
+open func loadPinnedMessage(convId: String, topicRef: String)async throws  -> String?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_load_pinned_message(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(topicRef)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionString.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
 }
@@ -3312,6 +3421,25 @@ open func persistConversations()async throws  -> UInt64  {
 }
     
     /**
+     * Executes a pin directly (optionally replacing an older topic ref first) and awaits completion.
+     */
+open func pin(convId: String, msgId: String, replacing: String?)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_pin(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(msgId),FfiConverterOptionString.lower(replacing)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
      * Pins a conversation (or opens the `PinBoard` prompt when at the 10-pin limit).
      */
 open func pinConversation(id: String)  {try! rustCall() {
@@ -3321,6 +3449,38 @@ open func pinConversation(id: String)  {try! rustCall() {
         FfiConverterString.lower(id),uniffiCallStatus
     )
 }
+}
+    
+    /**
+     * Pins a message (applying limit checks / confirmation / ChooseMany card).
+     */
+open func pinMessage(convId: String, msgId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_pin_message(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(convId),
+        FfiConverterString.lower(msgId),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Async variant of [`Self::pin_message`] that awaits the pin or confirmation state update.
+     */
+open func pinMessageAsync(convId: String, msgId: String)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_pin_message_async(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(msgId)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
 open func pinPoll(id: String, convId: String, confirming: String?)async throws  -> PollPinActionOutcomeRecord  {
@@ -3519,6 +3679,25 @@ open func recordSeenReactionKeys(keys: [String])async throws   {
             completeFunc: ffi_olaz_ffi_rust_future_complete_void,
             freeFunc: ffi_olaz_ffi_rust_future_free_void,
             liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Fetches a conversation's pinned board from Zalo (`group_board` or `friend_board`) and awaits mirror update.
+     */
+open func refreshBoardPins(convId: String)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_refresh_board_pins(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
 }
@@ -3767,6 +3946,32 @@ open func requestPinBoard(id: String)async throws  -> PinBoardRecord?  {
         )
 }
     
+    /**
+     * Prompts confirmation to unpin `topic_ref` in `conv_id`.
+     */
+open func requestUnpin(convId: String, topicRef: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_request_unpin(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(convId),
+        FfiConverterString.lower(topicRef),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Prompts confirmation to unpin the pinned item matching `msg_id` in `conv_id`.
+     */
+open func requestUnpinMessage(convId: String, msgId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_request_unpin_message(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(convId),
+        FfiConverterString.lower(msgId),uniffiCallStatus
+    )
+}
+}
+    
 open func resetCardState()  {try! rustCall() {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_method_coreengine_reset_card_state(
@@ -3905,6 +4110,25 @@ open func retryPoll(id: String, convId: String, nowMs: Int64)  {try! rustCall() 
 }
 }
     
+    /**
+     * Re-fetches the board pins of the currently open conversation (if any).
+     */
+open func rewatchPins()async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_rewatch_pins(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
 open func rewatchPolls(nowMs: Int64)  {try! rustCall() {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_method_coreengine_rewatch_polls(
@@ -3995,6 +4219,19 @@ open func seedHistoryFreshness(entries: [FreshnessMapEntry])  {try! rustCall() {
     uniffi_olaz_ffi_fn_method_coreengine_seed_history_freshness(
             self.uniffiCloneHandle(),
         FfiConverterSequenceTypeFreshnessMapEntry.lower(entries),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Seeds board pin lists and raw topic caches into core (used by tests and Swift state hydration).
+     */
+open func seedPins(listsJson: String, rawTopicsJson: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_seed_pins(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(listsJson),
+        FfiConverterString.lower(rawTopicsJson),uniffiCallStatus
     )
 }
 }
@@ -4487,27 +4724,6 @@ open func suggestedStickers(convId: String, msgId: String)async throws  -> [Sugg
         )
 }
     
-open func syncBoardPins(convId: String, list: BoardPinListRecord?)  {try! rustCall() {
-        uniffiCallStatus in
-    uniffi_olaz_ffi_fn_method_coreengine_sync_board_pins(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(convId),
-        FfiConverterOptionTypeBoardPinListRecord.lower(list),uniffiCallStatus
-    )
-}
-}
-    
-open func syncBoardRawTopics(convId: String, version: Int64, topicsJson: String?)  {try! rustCall() {
-        uniffiCallStatus in
-    uniffi_olaz_ffi_fn_method_coreengine_sync_board_raw_topics(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(convId),
-        FfiConverterInt64.lower(version),
-        FfiConverterOptionString.lower(topicsJson),uniffiCallStatus
-    )
-}
-}
-    
     /**
      * Fetches and applies conversation labels from the server.
      */
@@ -4657,6 +4873,25 @@ open func unmuteConversationAndWait(convId: String, nowMs: Int64)async throws  -
             rustFutureFunc: {
                 uniffi_olaz_ffi_fn_method_coreengine_unmute_conversation_and_wait(
                         self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * Unpins `topic_ref` in `conv_id` immediately and awaits completion.
+     */
+open func unpin(convId: String, topicRef: String)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_unpin(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(topicRef)
                 )
             },
             pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
@@ -5050,7 +5285,7 @@ public protocol CoreHost: AnyObject, Sendable {
     
     func onCloseConversation() async 
     
-    func refreshBoardPins(convId: String) async 
+    func refreshBoardPins(convId: String) async  -> Bool
     
     func markReadBoundary(convId: String, seenTarget: SeenTargetRecord?) async 
     
@@ -5102,7 +5337,7 @@ public protocol CoreHost: AnyObject, Sendable {
     
     func showTyping(convId: String, uid: String, onPc: Bool) async 
     
-    func pinTopic(convId: String) async 
+    func pinTopic(convId: String) async  -> Bool
     
     func groupNotice(act: String, dataJson: String, ts: Int64) async 
     
@@ -5121,6 +5356,8 @@ public protocol CoreHost: AnyObject, Sendable {
     func sendMedia(convId: String, paths: [String], cleanupAfter: Bool) async  -> ComposerSendOutcomeRecord
     
     func sendFiles(convId: String, paths: [String]) async  -> ComposerSendOutcomeRecord
+    
+    func ensureMessageLoaded(convId: String, message: ChatMessageRecord) async  -> Bool
     
     func armPollDebounce(pollId: String, seq: UInt64, delayMs: UInt64) async  -> Bool
     
@@ -5451,7 +5688,7 @@ open func onCloseConversation()async   {
         )
 }
     
-open func refreshBoardPins(convId: String)async   {
+open func refreshBoardPins(convId: String)async  -> Bool  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
@@ -5459,10 +5696,10 @@ open func refreshBoardPins(convId: String)async   {
                         self.uniffiCloneHandle(),FfiConverterString.lower(convId)
                 )
             },
-            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
-            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
-            freeFunc: ffi_olaz_ffi_rust_future_free_void,
-            liftFunc: { $0 },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_i8,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_i8,
+            freeFunc: ffi_olaz_ffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
             errorHandler: nil
             
         )
@@ -5893,7 +6130,7 @@ open func showTyping(convId: String, uid: String, onPc: Bool)async   {
         )
 }
     
-open func pinTopic(convId: String)async   {
+open func pinTopic(convId: String)async  -> Bool  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
@@ -5901,10 +6138,10 @@ open func pinTopic(convId: String)async   {
                         self.uniffiCloneHandle(),FfiConverterString.lower(convId)
                 )
             },
-            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
-            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
-            freeFunc: ffi_olaz_ffi_rust_future_free_void,
-            liftFunc: { $0 },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_i8,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_i8,
+            freeFunc: ffi_olaz_ffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
             errorHandler: nil
             
         )
@@ -6058,6 +6295,23 @@ open func sendFiles(convId: String, paths: [String])async  -> ComposerSendOutcom
             completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeComposerSendOutcomeRecord_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func ensureMessageLoaded(convId: String, message: ChatMessageRecord)async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_ensure_message_loaded(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterTypeChatMessageRecord_lower(message)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_i8,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_i8,
+            freeFunc: ffi_olaz_ffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
             errorHandler: nil
             
         )
@@ -6882,12 +7136,12 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
         refreshBoardPins: { (
             uniffiHandle: UInt64,
             convId: RustBuffer,
-            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteI8,
             uniffiCallbackData: UInt64,
             uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
         ) in
             let makeCall = {
-                () async throws -> () in
+                () async throws -> Bool in
                 guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
@@ -6896,10 +7150,11 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                 )
             }
 
-            let uniffiHandleSuccess = { (returnValue: ()) in
+            let uniffiHandleSuccess = { (returnValue: Bool) in
                 uniffiFutureCallback(
                     uniffiCallbackData,
-                    UniffiForeignFutureResultVoid(
+                    UniffiForeignFutureResultI8(
+                        returnValue: FfiConverterBool.lower(returnValue),
                         callStatus: RustCallStatus()
                     )
                 )
@@ -6907,7 +7162,8 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
             let uniffiHandleError = { (statusCode, errorBuf) in
                 uniffiFutureCallback(
                     uniffiCallbackData,
-                    UniffiForeignFutureResultVoid(
+                    UniffiForeignFutureResultI8(
+                        returnValue: 0,
                         callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
                     )
                 )
@@ -7970,12 +8226,12 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
         pinTopic: { (
             uniffiHandle: UInt64,
             convId: RustBuffer,
-            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteI8,
             uniffiCallbackData: UInt64,
             uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
         ) in
             let makeCall = {
-                () async throws -> () in
+                () async throws -> Bool in
                 guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
@@ -7984,10 +8240,11 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                 )
             }
 
-            let uniffiHandleSuccess = { (returnValue: ()) in
+            let uniffiHandleSuccess = { (returnValue: Bool) in
                 uniffiFutureCallback(
                     uniffiCallbackData,
-                    UniffiForeignFutureResultVoid(
+                    UniffiForeignFutureResultI8(
+                        returnValue: FfiConverterBool.lower(returnValue),
                         callStatus: RustCallStatus()
                     )
                 )
@@ -7995,7 +8252,8 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
             let uniffiHandleError = { (statusCode, errorBuf) in
                 uniffiFutureCallback(
                     uniffiCallbackData,
-                    UniffiForeignFutureResultVoid(
+                    UniffiForeignFutureResultI8(
+                        returnValue: 0,
                         callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
                     )
                 )
@@ -8404,6 +8662,50 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                     uniffiCallbackData,
                     UniffiForeignFutureResultRustBuffer(
                         returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        ensureMessageLoaded: { (
+            uniffiHandle: UInt64,
+            convId: RustBuffer,
+            message: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteI8,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> Bool in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.ensureMessageLoaded(
+                     convId: try FfiConverterString.lift(convId),
+                     message: try FfiConverterTypeChatMessageRecord_lift(message)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: Bool) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultI8(
+                        returnValue: FfiConverterBool.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultI8(
+                        returnValue: 0,
                         callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
                     )
                 )
@@ -13800,28 +14102,19 @@ public func FfiConverterTypeAutoDeleteUpdateRecord_lower(_ value: AutoDeleteUpda
 }
 
 
-/**
- * Temporary U7 board pin item record (`// U7:`).
- */
-public struct BoardPinItemRecord: Equatable, Hashable {
-    public var refId: String
-    public var kind: String
-    public var title: String
-    public var sender: String
-    public var thumbnail: String?
-    public var msgId: String
-    public var cliMsgId: String
+public struct BoardRawTopicsEntryRecord: Equatable, Hashable {
+    public var convId: String
+    public var version: Int64
+    public var topicIds: [String]
+    public var topicsJson: String
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(refId: String, kind: String, title: String, sender: String, thumbnail: String?, msgId: String, cliMsgId: String) {
-        self.refId = refId
-        self.kind = kind
-        self.title = title
-        self.sender = sender
-        self.thumbnail = thumbnail
-        self.msgId = msgId
-        self.cliMsgId = cliMsgId
+    public init(convId: String, version: Int64, topicIds: [String], topicsJson: String) {
+        self.convId = convId
+        self.version = version
+        self.topicIds = topicIds
+        self.topicsJson = topicsJson
     }
 
     
@@ -13830,34 +14123,28 @@ public struct BoardPinItemRecord: Equatable, Hashable {
 }
 
 #if compiler(>=6)
-extension BoardPinItemRecord: Sendable {}
+extension BoardRawTopicsEntryRecord: Sendable {}
 #endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeBoardPinItemRecord: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BoardPinItemRecord {
+public struct FfiConverterTypeBoardRawTopicsEntryRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BoardRawTopicsEntryRecord {
         return
-            try BoardPinItemRecord(
-                refId: FfiConverterString.read(from: &buf), 
-                kind: FfiConverterString.read(from: &buf), 
-                title: FfiConverterString.read(from: &buf), 
-                sender: FfiConverterString.read(from: &buf), 
-                thumbnail: FfiConverterOptionString.read(from: &buf), 
-                msgId: FfiConverterString.read(from: &buf), 
-                cliMsgId: FfiConverterString.read(from: &buf)
+            try BoardRawTopicsEntryRecord(
+                convId: FfiConverterString.read(from: &buf), 
+                version: FfiConverterInt64.read(from: &buf), 
+                topicIds: FfiConverterSequenceString.read(from: &buf), 
+                topicsJson: FfiConverterString.read(from: &buf)
         )
     }
 
-    public static func write(_ value: BoardPinItemRecord, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.refId, into: &buf)
-        FfiConverterString.write(value.kind, into: &buf)
-        FfiConverterString.write(value.title, into: &buf)
-        FfiConverterString.write(value.sender, into: &buf)
-        FfiConverterOptionString.write(value.thumbnail, into: &buf)
-        FfiConverterString.write(value.msgId, into: &buf)
-        FfiConverterString.write(value.cliMsgId, into: &buf)
+    public static func write(_ value: BoardRawTopicsEntryRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.convId, into: &buf)
+        FfiConverterInt64.write(value.version, into: &buf)
+        FfiConverterSequenceString.write(value.topicIds, into: &buf)
+        FfiConverterString.write(value.topicsJson, into: &buf)
     }
 }
 
@@ -13865,80 +14152,15 @@ public struct FfiConverterTypeBoardPinItemRecord: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeBoardPinItemRecord_lift(_ buf: RustBuffer) throws -> BoardPinItemRecord {
-    return try FfiConverterTypeBoardPinItemRecord.lift(buf)
+public func FfiConverterTypeBoardRawTopicsEntryRecord_lift(_ buf: RustBuffer) throws -> BoardRawTopicsEntryRecord {
+    return try FfiConverterTypeBoardRawTopicsEntryRecord.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeBoardPinItemRecord_lower(_ value: BoardPinItemRecord) -> RustBuffer {
-    return FfiConverterTypeBoardPinItemRecord.lower(value)
-}
-
-
-/**
- * Temporary U7 board pin list record (`// U7:`).
- */
-public struct BoardPinListRecord: Equatable, Hashable {
-    public var ready: Bool
-    public var canPin: Bool
-    public var limit: Int64
-    public var items: [BoardPinItemRecord]
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(ready: Bool, canPin: Bool, limit: Int64, items: [BoardPinItemRecord]) {
-        self.ready = ready
-        self.canPin = canPin
-        self.limit = limit
-        self.items = items
-    }
-
-    
-
-    
-}
-
-#if compiler(>=6)
-extension BoardPinListRecord: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeBoardPinListRecord: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BoardPinListRecord {
-        return
-            try BoardPinListRecord(
-                ready: FfiConverterBool.read(from: &buf), 
-                canPin: FfiConverterBool.read(from: &buf), 
-                limit: FfiConverterInt64.read(from: &buf), 
-                items: FfiConverterSequenceTypeBoardPinItemRecord.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: BoardPinListRecord, into buf: inout [UInt8]) {
-        FfiConverterBool.write(value.ready, into: &buf)
-        FfiConverterBool.write(value.canPin, into: &buf)
-        FfiConverterInt64.write(value.limit, into: &buf)
-        FfiConverterSequenceTypeBoardPinItemRecord.write(value.items, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeBoardPinListRecord_lift(_ buf: RustBuffer) throws -> BoardPinListRecord {
-    return try FfiConverterTypeBoardPinListRecord.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeBoardPinListRecord_lower(_ value: BoardPinListRecord) -> RustBuffer {
-    return FfiConverterTypeBoardPinListRecord.lower(value)
+public func FfiConverterTypeBoardRawTopicsEntryRecord_lower(_ value: BoardRawTopicsEntryRecord) -> RustBuffer {
+    return FfiConverterTypeBoardRawTopicsEntryRecord.lower(value)
 }
 
 
@@ -16167,6 +16389,7 @@ public struct CoreChangesRecord: Equatable, Hashable {
     public var cachedProfiles: [CachedProfileEntry]?
     public var notificationSettings: NotificationSettingsRecord?
     public var aliases: [AliasEntryRecord]?
+    public var pins: PinsSnapshotRecord?
     public var cachedGroups: [CachedGroupEntry]?
     public var polls: PollsMirrorRecord?
     public var cloud: CloudStateRecord?
@@ -16176,7 +16399,7 @@ public struct CoreChangesRecord: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, typing: [TypingEntryRecord]?, forwardRequest: ForwardRequestUpdateRecord?, clearSelection: Bool, deleteUndo: DeleteUndoUpdateRecord?, messageConfirm: MessageConfirmUpdateRecord?, autoDelete: AutoDeleteUpdateRecord?, starredIds: [String]?, cachedProfiles: [CachedProfileEntry]?, notificationSettings: NotificationSettingsRecord? = nil, aliases: [AliasEntryRecord]? = nil, cachedGroups: [CachedGroupEntry]? = nil, polls: PollsMirrorRecord? = nil, cloud: CloudStateRecord? = nil, stickerSuggest: StickerSuggestUpdateRecord?, composerConfirm: ComposerConfirmUpdateRecord?, queuedComposerConfirms: [ComposerConfirmRecord]?) {
+    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, typing: [TypingEntryRecord]?, forwardRequest: ForwardRequestUpdateRecord?, clearSelection: Bool, deleteUndo: DeleteUndoUpdateRecord?, messageConfirm: MessageConfirmUpdateRecord?, autoDelete: AutoDeleteUpdateRecord?, starredIds: [String]?, cachedProfiles: [CachedProfileEntry]?, notificationSettings: NotificationSettingsRecord? = nil, aliases: [AliasEntryRecord]? = nil, pins: PinsSnapshotRecord? = nil, cachedGroups: [CachedGroupEntry]? = nil, polls: PollsMirrorRecord? = nil, cloud: CloudStateRecord? = nil, stickerSuggest: StickerSuggestUpdateRecord?, composerConfirm: ComposerConfirmUpdateRecord?, queuedComposerConfirms: [ComposerConfirmRecord]?) {
         self.version = version
         self.session = session
         self.conversations = conversations
@@ -16198,6 +16421,7 @@ public struct CoreChangesRecord: Equatable, Hashable {
         self.cachedProfiles = cachedProfiles
         self.notificationSettings = notificationSettings
         self.aliases = aliases
+        self.pins = pins
         self.cachedGroups = cachedGroups
         self.polls = polls
         self.cloud = cloud
@@ -16243,6 +16467,7 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
                 cachedProfiles: FfiConverterOptionSequenceTypeCachedProfileEntry.read(from: &buf), 
                 notificationSettings: FfiConverterOptionTypeNotificationSettingsRecord.read(from: &buf), 
                 aliases: FfiConverterOptionSequenceTypeAliasEntryRecord.read(from: &buf), 
+                pins: FfiConverterOptionTypePinsSnapshotRecord.read(from: &buf), 
                 cachedGroups: FfiConverterOptionSequenceTypeCachedGroupEntry.read(from: &buf), 
                 polls: FfiConverterOptionTypePollsMirrorRecord.read(from: &buf), 
                 cloud: FfiConverterOptionTypeCloudStateRecord.read(from: &buf), 
@@ -16274,6 +16499,7 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
         FfiConverterOptionSequenceTypeCachedProfileEntry.write(value.cachedProfiles, into: &buf)
         FfiConverterOptionTypeNotificationSettingsRecord.write(value.notificationSettings, into: &buf)
         FfiConverterOptionSequenceTypeAliasEntryRecord.write(value.aliases, into: &buf)
+        FfiConverterOptionTypePinsSnapshotRecord.write(value.pins, into: &buf)
         FfiConverterOptionSequenceTypeCachedGroupEntry.write(value.cachedGroups, into: &buf)
         FfiConverterOptionTypePollsMirrorRecord.write(value.polls, into: &buf)
         FfiConverterOptionTypeCloudStateRecord.write(value.cloud, into: &buf)
@@ -20301,6 +20527,200 @@ public func FfiConverterTypePinReminderRefRecord_lift(_ buf: RustBuffer) throws 
 #endif
 public func FfiConverterTypePinReminderRefRecord_lower(_ value: PinReminderRefRecord) -> RustBuffer {
     return FfiConverterTypePinReminderRefRecord.lower(value)
+}
+
+
+public struct PinnedItemRecord: Equatable, Hashable {
+    public var refId: String
+    public var kind: String
+    public var title: String
+    public var sender: String
+    public var thumbnail: String?
+    public var msgId: String
+    public var cliMsgId: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(refId: String, kind: String, title: String, sender: String, thumbnail: String?, msgId: String, cliMsgId: String) {
+        self.refId = refId
+        self.kind = kind
+        self.title = title
+        self.sender = sender
+        self.thumbnail = thumbnail
+        self.msgId = msgId
+        self.cliMsgId = cliMsgId
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PinnedItemRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePinnedItemRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PinnedItemRecord {
+        return
+            try PinnedItemRecord(
+                refId: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterString.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                sender: FfiConverterString.read(from: &buf), 
+                thumbnail: FfiConverterOptionString.read(from: &buf), 
+                msgId: FfiConverterString.read(from: &buf), 
+                cliMsgId: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PinnedItemRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.refId, into: &buf)
+        FfiConverterString.write(value.kind, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterString.write(value.sender, into: &buf)
+        FfiConverterOptionString.write(value.thumbnail, into: &buf)
+        FfiConverterString.write(value.msgId, into: &buf)
+        FfiConverterString.write(value.cliMsgId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePinnedItemRecord_lift(_ buf: RustBuffer) throws -> PinnedItemRecord {
+    return try FfiConverterTypePinnedItemRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePinnedItemRecord_lower(_ value: PinnedItemRecord) -> RustBuffer {
+    return FfiConverterTypePinnedItemRecord.lower(value)
+}
+
+
+public struct PinnedListEntryRecord: Equatable, Hashable {
+    public var convId: String
+    public var ready: Bool
+    public var canPin: Bool
+    public var limit: Int64
+    public var items: [PinnedItemRecord]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(convId: String, ready: Bool, canPin: Bool, limit: Int64, items: [PinnedItemRecord]) {
+        self.convId = convId
+        self.ready = ready
+        self.canPin = canPin
+        self.limit = limit
+        self.items = items
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PinnedListEntryRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePinnedListEntryRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PinnedListEntryRecord {
+        return
+            try PinnedListEntryRecord(
+                convId: FfiConverterString.read(from: &buf), 
+                ready: FfiConverterBool.read(from: &buf), 
+                canPin: FfiConverterBool.read(from: &buf), 
+                limit: FfiConverterInt64.read(from: &buf), 
+                items: FfiConverterSequenceTypePinnedItemRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PinnedListEntryRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.convId, into: &buf)
+        FfiConverterBool.write(value.ready, into: &buf)
+        FfiConverterBool.write(value.canPin, into: &buf)
+        FfiConverterInt64.write(value.limit, into: &buf)
+        FfiConverterSequenceTypePinnedItemRecord.write(value.items, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePinnedListEntryRecord_lift(_ buf: RustBuffer) throws -> PinnedListEntryRecord {
+    return try FfiConverterTypePinnedListEntryRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePinnedListEntryRecord_lower(_ value: PinnedListEntryRecord) -> RustBuffer {
+    return FfiConverterTypePinnedListEntryRecord.lower(value)
+}
+
+
+public struct PinsSnapshotRecord: Equatable, Hashable {
+    public var lists: [PinnedListEntryRecord]
+    public var rawTopics: [BoardRawTopicsEntryRecord]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(lists: [PinnedListEntryRecord], rawTopics: [BoardRawTopicsEntryRecord]) {
+        self.lists = lists
+        self.rawTopics = rawTopics
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PinsSnapshotRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePinsSnapshotRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PinsSnapshotRecord {
+        return
+            try PinsSnapshotRecord(
+                lists: FfiConverterSequenceTypePinnedListEntryRecord.read(from: &buf), 
+                rawTopics: FfiConverterSequenceTypeBoardRawTopicsEntryRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PinsSnapshotRecord, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypePinnedListEntryRecord.write(value.lists, into: &buf)
+        FfiConverterSequenceTypeBoardRawTopicsEntryRecord.write(value.rawTopics, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePinsSnapshotRecord_lift(_ buf: RustBuffer) throws -> PinsSnapshotRecord {
+    return try FfiConverterTypePinsSnapshotRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePinsSnapshotRecord_lower(_ value: PinsSnapshotRecord) -> RustBuffer {
+    return FfiConverterTypePinsSnapshotRecord.lower(value)
 }
 
 
@@ -30019,30 +30439,6 @@ fileprivate struct FfiConverterOptionTypeAutoDeleteUpdateRecord: FfiConverterRus
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionTypeBoardPinListRecord: FfiConverterRustBuffer {
-    typealias SwiftType = BoardPinListRecord?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterTypeBoardPinListRecord.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterTypeBoardPinListRecord.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterOptionTypeCloudPlanRecord: FfiConverterRustBuffer {
     typealias SwiftType = CloudPlanRecord?
 
@@ -30683,6 +31079,30 @@ fileprivate struct FfiConverterOptionTypePinBoardRecord: FfiConverterRustBuffer 
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypePinBoardRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypePinsSnapshotRecord: FfiConverterRustBuffer {
+    typealias SwiftType = PinsSnapshotRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePinsSnapshotRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePinsSnapshotRecord.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -31679,23 +32099,23 @@ fileprivate struct FfiConverterSequenceTypeAutoDeleteEntryRecord: FfiConverterRu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterSequenceTypeBoardPinItemRecord: FfiConverterRustBuffer {
-    typealias SwiftType = [BoardPinItemRecord]
+fileprivate struct FfiConverterSequenceTypeBoardRawTopicsEntryRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [BoardRawTopicsEntryRecord]
 
-    public static func write(_ value: [BoardPinItemRecord], into buf: inout [UInt8]) {
+    public static func write(_ value: [BoardRawTopicsEntryRecord], into buf: inout [UInt8]) {
         let len = Int32(value.count)
         writeInt(&buf, len)
         for item in value {
-            FfiConverterTypeBoardPinItemRecord.write(item, into: &buf)
+            FfiConverterTypeBoardRawTopicsEntryRecord.write(item, into: &buf)
         }
     }
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [BoardPinItemRecord] {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [BoardRawTopicsEntryRecord] {
         let len: Int32 = try readInt(&buf)
-        var seq = [BoardPinItemRecord]()
+        var seq = [BoardRawTopicsEntryRecord]()
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
-            seq.append(try FfiConverterTypeBoardPinItemRecord.read(from: &buf))
+            seq.append(try FfiConverterTypeBoardRawTopicsEntryRecord.read(from: &buf))
         }
         return seq
     }
@@ -32496,6 +32916,56 @@ fileprivate struct FfiConverterSequenceTypePinReminderRefRecord: FfiConverterRus
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypePinReminderRefRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePinnedItemRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [PinnedItemRecord]
+
+    public static func write(_ value: [PinnedItemRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePinnedItemRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PinnedItemRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PinnedItemRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePinnedItemRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePinnedListEntryRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [PinnedListEntryRecord]
+
+    public static func write(_ value: [PinnedListEntryRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePinnedListEntryRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PinnedListEntryRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PinnedListEntryRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePinnedListEntryRecord.read(from: &buf))
         }
         return seq
     }
@@ -34345,6 +34815,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_answer_message_confirm() != 27581) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_answer_message_confirm_async() != 33465) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_apply_account_profile() != 24350) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -34373,9 +34846,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_check_hidden_pin() != 2625) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_olaz_ffi_checksum_method_coreengine_clear_board_caches() != 46184) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_clear_forward_request() != 21403) {
@@ -34486,7 +34956,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_handle_notification_settings_payload() != 56660) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_coreengine_handle_pins_state() != 64079) {
+    if (uniffi_olaz_ffi_checksum_method_coreengine_handle_pin_topic_event() != 10307) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_handle_pins_state() != 53341) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_handle_poll_state() != 31987) {
@@ -34520,6 +34993,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_load_older_messages_and_wait() != 36746) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_load_pinned_message() != 4871) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_load_quoted_message() != 49356) {
@@ -34579,7 +35055,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_persist_conversations() != 32011) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_pin() != 48475) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_pin_conversation() != 58464) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_pin_message() != 2717) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_pin_message_async() != 42762) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_pin_poll() != 18803) {
@@ -34616,6 +35101,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_record_seen_reaction_keys() != 29165) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_refresh_board_pins() != 5831) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_refresh_cloud_async() != 58373) {
@@ -34669,6 +35157,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_request_pin_board() != 46027) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_request_unpin() != 13717) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_request_unpin_message() != 49445) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_reset_card_state() != 21216) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -34702,6 +35196,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_retry_poll() != 26921) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_rewatch_pins() != 27384) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_rewatch_polls() != 35928) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -34721,6 +35218,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_seed_history_freshness() != 1024) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_seed_pins() != 3767) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_seed_polls() != 61605) {
@@ -34825,12 +35325,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_suggested_stickers() != 61653) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_coreengine_sync_board_pins() != 22175) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_olaz_ffi_checksum_method_coreengine_sync_board_raw_topics() != 33854) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_sync_conversation_labels() != 43591) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -34862,6 +35356,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_unmute_conversation_and_wait() != 40093) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_unpin() != 8740) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_unpin_conversation() != 51397) {
@@ -34966,7 +35463,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_corehost_on_close_conversation() != 9691) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_refresh_board_pins() != 28711) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_refresh_board_pins() != 18619) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_corehost_mark_read_boundary() != 9532) {
@@ -35044,7 +35541,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_corehost_show_typing() != 5771) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_pin_topic() != 20520) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_pin_topic() != 3737) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_corehost_group_notice() != 57748) {
@@ -35074,40 +35571,43 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_corehost_send_files() != 24736) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_arm_poll_debounce() != 19949) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_ensure_message_loaded() != 61509) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_cancel_all_poll_debounces() != 34061) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_arm_poll_debounce() != 17050) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_notify_banners() != 39463) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_cancel_all_poll_debounces() != 16845) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_request_notif_auth() != 55198) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_notify_banners() != 19043) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_start_call() != 43167) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_request_notif_auth() != 57607) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_send_category_sticker() != 5153) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_start_call() != 15744) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_refresh_contacts() != 14080) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_send_category_sticker() != 54298) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_arm_reminder_watch_timer() != 39621) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_refresh_contacts() != 37066) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_cancel_reminder_watch_timer() != 11225) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_arm_reminder_watch_timer() != 47834) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_send_e2ee_sticker() != 43375) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_cancel_reminder_watch_timer() != 9904) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_send_e2ee_contact_card() != 28843) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_send_e2ee_sticker() != 61503) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_sleep_confirm_promote() != 3286) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_send_e2ee_contact_card() != 34468) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_sleep_confirm_promote() != 46529) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreofflineconversations_apply_preview_override() != 60866) {

@@ -256,6 +256,9 @@ for DOMAIN in "${DOMAINS[@]}"; do
         message_actions)
             RECORDER_FILTER="MessageActionRecorderTests"
             ;;
+        pins)
+            RECORDER_FILTER="PinRecorderTests"
+            ;;
         contacts)
             RECORDER_FILTER="ContactRecorderTests"
             ;;

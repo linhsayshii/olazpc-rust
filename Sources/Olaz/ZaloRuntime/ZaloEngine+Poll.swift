@@ -832,8 +832,6 @@ extension ZaloEngine {
     @discardableResult
     func refreshPollPin(_ id: String, in conversationId: String) async -> PollPinState {
         guard let core = await ensureCoreEngine() else { return PollPinState() }
-        // U7: keep core's read-only board mirror up to date before computing poll pin state.
-        pushCoreBoardStateIfRunning(for: conversationId)
         guard let out = try? await core.refreshPollPin(id: id, convId: conversationId) else {
             return polls.pins[id] ?? PollPinState()
         }
@@ -861,8 +859,6 @@ extension ZaloEngine {
         guard let core = await ensureCoreEngine() else {
             return .failed(PollActionResult(ok: false, error: "network"))
         }
-        // U7: sync board pins & raw topics into core before `pinPoll`.
-        pushCoreBoardStateIfRunning(for: conversationId)
         guard let out = try? await core.pinPoll(id: id, convId: conversationId, confirming: ref) else {
             return .failed(PollActionResult(ok: false, error: nil))
         }
@@ -874,8 +870,6 @@ extension ZaloEngine {
         guard let core = await ensureCoreEngine() else {
             return PollActionResult(ok: false, error: "network")
         }
-        // U7: sync board pins & raw topics into core before `unpinPoll`.
-        pushCoreBoardStateIfRunning(for: conversationId)
         guard let out = try? await core.unpinPoll(id: id, convId: conversationId) else {
             return PollActionResult(ok: false, error: "network")
         }
@@ -943,8 +937,6 @@ extension ZaloEngine {
         guard let core = await ensureCoreEngine() else {
             return PollActionResult(ok: false, error: "network")
         }
-        // U7: sync board pins & raw topics into core in case `createPoll` pins the newly created poll.
-        pushCoreBoardStateIfRunning(for: conversationId)
         guard let out = try? await core.createPoll(
             convId: conversationId,
             draft: draft.coreRecord,
