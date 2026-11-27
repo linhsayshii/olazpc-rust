@@ -644,35 +644,29 @@ extension ZaloEngine {
     // MARK: Danh thiếp
 
     func myCard() async -> MyCardInfo? {
-        guard let profile else { return nil }
-        return MyCardInfo(json: [
-            "uid": profile.userId,
-            "name": profile.displayName,
-            "avatar": profile.avatar?.absoluteString ?? "",
-            "phone": profile.phone ?? "",
-            "withPhone": !(profile.phone?.isEmpty ?? true)
-        ])
+        guard let core = await ensureCoreEngine() else { return nil }
+        guard let rec = try? await core.myCard() else { return nil }
+        return MyCardInfo(coreRecord: rec)
     }
 
     func sendMyCard(to id: String, withPhone: Bool) async -> ComposerOutcome {
-        guard let profile else { return .failed("Chưa đăng nhập.") }
+        guard let core = await ensureCoreEngine() else {
+            return .failed(ComposerOutcome.genericFailure)
+        }
+        let isE2EE: Bool = ZaloWireParser.isGroupId(id)
+            ? false
+            : await e2eeManager.isE2EEConversation(id)
+        let tsMs = nowMs()
         do {
-            let res = try await sessionClient.sendContactCardAPI(
+            let outcome = try await core.sendMyCard(
                 convId: id,
-                cardUid: profile.userId,
-                phone: withPhone ? profile.phone : nil
+                withPhone: withPhone,
+                clientId: nil,
+                nowMs: tsMs,
+                isE2ee: isE2EE
             )
-            let card = ChatMessage.ContactCard(
-                name: profile.displayName,
-                uid: profile.userId,
-                avatar: profile.avatar,
-                phone: withPhone ? (profile.phone ?? "") : ""
-            )
-            await recordUploadedMessage(
-                convId: id, msgId: res.msgId, cliId: res.cliMsgId,
-                kind: .contactCard(card), text: "[Danh thiếp] \(profile.displayName)"
-            )
-            return .done
+            await waitForCoreMirrorDrain()
+            return ComposerOutcome(coreRecord: outcome)
         } catch {
             return .failed(ComposerOutcome.genericFailure)
         }
@@ -681,29 +675,25 @@ extension ZaloEngine {
     // MARK: Nhắc hẹn
 
     func reminderComposeInfo(for id: String) async -> ReminderComposeInfo? {
-        let isGroup = ZaloWireParser.isGroupId(id)
-        return ReminderComposeInfo(json: [
-            "allowed": id != selfConversationId,
-            "hidden": false,
-            "text": "",
-            "isGroup": isGroup,
-            "canPin": isGroup,
-            "pinToggle": isGroup,
-            "titleMaxChars": 3000,
-            "titleMaxBytes": 3700
-        ])
+        guard let core = await ensureCoreEngine() else { return nil }
+        guard let rec = try? await core.reminderComposeInfo(convId: id) else { return nil }
+        return ReminderComposeInfo(coreRecord: rec)
     }
 
     func createReminder(in id: String, title: String, start: Date, repeat rule: ReminderRepeat, pin: Bool) async -> ComposerOutcome {
+        guard let core = await ensureCoreEngine() else {
+            return .failed("Không tạo được nhắc hẹn. Hãy thử lại.")
+        }
+        let startMs = Int64((start.timeIntervalSince1970 * 1000).rounded())
         do {
-            _ = try await sessionClient.createReminderAPI(
+            let outcome = try await core.createReminder(
                 convId: id,
                 title: title,
-                startTimeMs: Int64((start.timeIntervalSince1970 * 1000).rounded()),
-                repeatMode: rule.rawValue,
+                startMs: startMs,
+                repeatMode: Int64(rule.rawValue),
                 pin: pin
             )
-            return .done
+            return ComposerOutcome(coreRecord: outcome)
         } catch {
             return .failed("Không tạo được nhắc hẹn. Hãy thử lại.")
         }
@@ -714,18 +704,8 @@ extension ZaloEngine {
     func answerComposerConfirm(_ confirm: ComposerConfirm, ok: Bool) {
         guard composerConfirm?.id == confirm.id else { return }
         composerConfirm = nil
-        guard !queuedComposerConfirms.isEmpty else { return }
-        composerConfirmTask?.cancel()
-        composerConfirmTask = Task { @MainActor [weak self] in
-            let completed: Bool
-            if let sleepSeam = self?.composerConfirmSleep {
-                completed = await sleepSeam(300)
-            } else {
-                try? await Task.sleep(for: .milliseconds(300))
-                completed = !Task.isCancelled
-            }
-            guard completed, let self, self.composerConfirm == nil, !self.queuedComposerConfirms.isEmpty else { return }
-            self.composerConfirm = self.queuedComposerConfirms.removeFirst()
+        if !isApplyingCoreMirror {
+            coreLifecycle.core?.answerComposerConfirm(confirmId: confirm.id, ok: ok)
         }
     }
 
@@ -734,6 +714,9 @@ extension ZaloEngine {
         composerConfirmTask = nil
         composerConfirm = nil
         queuedComposerConfirms = []
+        if !isApplyingCoreMirror {
+            coreLifecycle.core?.dropComposerConfirms()
+        }
     }
 
     func handleCompose(state: [String: Any]) {
@@ -745,7 +728,13 @@ extension ZaloEngine {
     }
 
     func resetComposer() {
-        dropComposerConfirms()
+        composerConfirmTask?.cancel()
+        composerConfirmTask = nil
+        composerConfirm = nil
+        queuedComposerConfirms = []
+        if !isApplyingCoreMirror {
+            coreLifecycle.core?.resetComposer()
+        }
     }
 
     func report(_ outcome: ComposerOutcome, in id: String) {

@@ -677,7 +677,8 @@ extension ZaloSessionClient {
         isGroup: Bool,
         clientId: Int64,
         listParams: [[String: Any]],
-        destType: Int = 3
+        destType: Int = 3,
+        msgType: Int? = nil
     ) -> (service: String, path: String, payload: [String: Any]) {
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(threadId) : ZaloWireParser.stripUserPrefix(threadId)
         if isGroup {
@@ -687,12 +688,15 @@ extension ZaloSessionClient {
         }
         let listStr = (try? JSONSerialization.data(withJSONObject: listParams, options: [.sortedKeys]))
             .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "listParams": listStr,
             "destType": destType,
             "threadId": cleanId,
             "clientId": clientId,
         ]
+        if let msgType {
+            payload["msgType"] = msgType
+        }
         return ("chat_e2e", "/api/e2ee/pc/message/\(endpoint)", payload)
     }
 
@@ -734,7 +738,8 @@ extension ZaloSessionClient {
         isGroup: Bool,
         clientId: Int64,
         listParams: ZaloJSONArrayBox,
-        destType: Int = 3
+        destType: Int = 3,
+        msgType: Int? = nil
     ) async throws -> SendMessageResult {
         let spec = Self.buildE2EEMessageRequestPayload(
             endpoint: endpoint,
@@ -742,7 +747,8 @@ extension ZaloSessionClient {
             isGroup: isGroup,
             clientId: clientId,
             listParams: listParams.array,
-            destType: destType
+            destType: destType,
+            msgType: msgType
         )
         let resp = try await post(
             service: spec.service,
@@ -821,39 +827,11 @@ extension ZaloSessionClient {
     }
 
     func sendContactCardAPI(convId: String, cardUid: String, phone: String?) async throws -> SendMessageResult {
-        let isGroup = ZaloWireParser.isGroupId(convId)
-        let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
-        let cliInt = nextClientId()
-        let cliId = "\(cliInt)"
-        var payload: [String: Any] = [
-            "contactId": ZaloWireParser.stripUserPrefix(cardUid),
-            "clientId": cliInt,
-            "ttl": 0,
-            "imei": imei
-        ]
-        if let phone, !phone.isEmpty {
-            payload["phone"] = phone
-        }
-        let path: String
-        let service: String
-        if isGroup {
-            payload["grid"] = cleanId
-            payload["visibility"] = 0
-            service = "group"
-            path = "/api/group/contact"
-        } else {
-            payload["toId"] = cleanId
-            service = "chat"
-            path = "/api/message/contact"
-        }
-        let resp = try await post(service: service, path: path, encryptedPayload: payload)
-        let d = resp["data"] as? [String: Any] ?? [:]
-        let msgId = JSONLossless.string(d["msgId"])
-        return SendMessageResult(
-            msgId: msgId.isEmpty ? cliId : msgId,
-            cliMsgId: cliId,
-            tsMs: Int64(Date().timeIntervalSince1970 * 1000)
-        )
+        guard let core = coreApi() else { throw ZaloTransportError.notAuthenticated }
+        do {
+            let r = try await core.sendContactCard(convId: convId, cardUid: cardUid, phone: phone)
+            return SendMessageResult(msgId: r.msgId, cliMsgId: r.cliMsgId, tsMs: r.tsMs)
+        } catch { throw RustCore.mapError(error) }
     }
 
     // MARK: - Uploads (Photos & Files)

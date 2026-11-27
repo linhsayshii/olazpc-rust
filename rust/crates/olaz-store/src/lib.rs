@@ -9,12 +9,17 @@ mod error;
 mod helpers;
 pub mod model;
 pub mod schema;
+pub mod search_text;
 mod store;
 
 pub use error::{Result, StoreError};
 pub use model::{
     CloudMediaQuery, MessagesAround, SaveOptions, SharedMediaPage, StoredCloudConversationSummary,
     StoredCloudMediaItem, StoredConversation, StoredMessage,
+};
+pub use search_text::{
+    fold_search_text, folded_contains, is_swift_whitespace_or_newline, search_text_contains_folded,
+    trim_search_query,
 };
 pub use store::{ReadOnlyStore, Store};
 

@@ -19,13 +19,21 @@ use std::time::Duration;
 use async_trait::async_trait;
 use olaz_api::{PollState, SendMessageResult, ZaloApi};
 use olaz_core::actor::{ActorSink, CoreHandle};
+use olaz_core::cloud::{
+    CloudActionResult, CloudBreakdown, CloudConversation, CloudFetch, CloudItem, CloudItemKind,
+    CloudPage, CloudPlan, CloudSettings, CloudSnapshotState,
+};
+use olaz_core::composer::{ComposerConfirm, ComposerOutcome, MyCardInfo, ReminderComposeInfo};
 use olaz_core::conversations::{
     BatchApplyDelta, CachedGroup, CachedProfile, ConvMessageDelta, ConvPreviewOverride,
     ConversationPreview, FriendIdentity, GroupIdentity, IdentityTable, MessagePreviewInput,
     message_preview_label, to_wire_stored,
 };
 use olaz_core::effect::Effect;
-use olaz_core::input::{Command, E2eeQuoteArg, Input, LegacyCookie, SeenTarget};
+use olaz_core::forward::{
+    ComposerSendOutcome, FileResolutionOutcome, ForwardOutcome, MediaResolutionOutcome,
+};
+use olaz_core::input::{Command, E2eeQuoteArg, Input, LegacyCookie, SeenTarget, StickerSendError};
 use olaz_core::messages::{HistoryFreshness, MuteEntry};
 use olaz_core::reduce::classify::MobileSyncEvent;
 use olaz_core::runner::{
@@ -33,6 +41,10 @@ use olaz_core::runner::{
 };
 use olaz_core::state::{
     CoreFailKind, CoreState, LoginStep, PersistedTransportState, Phase, SessionSnapshot,
+};
+use olaz_core::stickers::{
+    CardActionOutcome, StickerAnimation, StickerEntry, StickerSource, StickerSuggestSetting,
+    StickerTab,
 };
 use olaz_core::typed_chat::{
     PlainChatParse, TypedChatEnvelope, new_shared_parse, try_parse_plain_chat,
@@ -45,7 +57,7 @@ use olaz_net::{
 use olaz_store::{Store, StoredConversation, StoredMessage};
 use olaz_wire::{
     Availability, ChatMessage, DeleteMode, Kind, Mention, NameLookup, ParsedWireEvent, StarMode,
-    TextStyle, WireParseOptions, decode_stored_message, extract_batch_events,
+    Status, TextStyle, WireParseOptions, decode_stored_message, extract_batch_events,
 };
 use olaz_ws::consts::{CMD_AUTHEN, CMD_PING, CMD_PING_ACTIVE, DEFAULT_WS_ENDPOINTS, FRAME_VERSION};
 use olaz_ws::frame::encode_frame_json;
@@ -177,9 +189,38 @@ pub struct Seed {
     #[serde(default)]
     pub e2ee_threads: Vec<String>,
     #[serde(default)]
-    pub auto_delete: BTreeMap<String, i64>,
+    pub auto_delete: Option<BTreeMap<String, i64>>,
     #[serde(default)]
     pub host_results: Option<Value>,
+    // U6
+    #[serde(default)]
+    pub starred_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub seen_reaction_event_ids: Option<Vec<String>>,
+    // U12
+    #[serde(default)]
+    pub cached_group_details: Option<Value>,
+    #[serde(default)]
+    pub group_member_cache: Option<Value>,
+    #[serde(default)]
+    pub polls: Option<Value>,
+    #[serde(default)]
+    pub pins: Option<Value>,
+    #[serde(default)]
+    pub board_raw_topics: Option<Value>,
+    #[serde(default)]
+    pub poll_clock: Option<Value>,
+    #[serde(default)]
+    pub watched_check_ids: Option<Vec<String>>,
+    // U13
+    #[serde(default)]
+    pub recent_stickers: Option<Value>,
+    #[serde(default)]
+    pub sticker_suggest: Option<bool>,
+    #[serde(default)]
+    pub composer_confirm: Option<Value>,
+    #[serde(default)]
+    pub queued_composer_confirms: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -547,24 +588,25 @@ fn derive_param_cipher_key(zcid: &str, zcid_ext: &str) -> Vec<u8> {
     key.into_bytes()
 }
 
+const VOLATILE_PARAM_KEYS: &[&str] = &["imei", "computer_name", "client_time", "ts"];
+
 fn is_volatile_key(key: &str) -> bool {
     VOLATILE_KEYS.contains(&key)
 }
 
-fn scrub_volatile_value(val: Value) -> Value {
+fn scrub_volatile_params(val: Value) -> Value {
     match val {
         Value::Object(map) => {
             let mut out = Map::new();
             for (k, v) in map {
-                if is_volatile_key(&k) {
+                if VOLATILE_PARAM_KEYS.contains(&k.as_str()) {
                     out.insert(k, Value::String("<volatile>".to_owned()));
                 } else {
-                    out.insert(k, scrub_volatile_value(v));
+                    out.insert(k, v);
                 }
             }
             Value::Object(out)
         }
-        Value::Array(arr) => Value::Array(arr.into_iter().map(scrub_volatile_value).collect()),
         other => other,
     }
 }
@@ -594,8 +636,8 @@ fn decrypt_request_params(
     let decrypted = decrypt_key
         .and_then(|k| decode_aes(k, &enc_params).ok())
         .and_then(|plain| parse_any(plain.as_bytes()))
-        .map(scrub_volatile_value)
-        .unwrap_or_else(|| Value::String("<volatile>".to_owned()));
+        .map(scrub_volatile_params)
+        .unwrap_or_else(|| Value::String("<undecryptable>".to_owned()));
 
     (decrypted, param_cipher_key)
 }
@@ -1286,6 +1328,54 @@ struct HostSelfProfile {
     self_conv_id: Option<String>,
 }
 
+#[derive(Default)]
+struct VirtualConfirmClockInner {
+    now_ms: u64,
+    waiters: Vec<(u64, oneshot::Sender<()>)>,
+}
+
+#[derive(Default)]
+struct VirtualConfirmClock {
+    inner: Mutex<VirtualConfirmClockInner>,
+}
+
+impl VirtualConfirmClock {
+    async fn sleep(&self, delay: Duration) {
+        let delta = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        if delta == 0 {
+            return;
+        }
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let deadline = inner.now_ms.saturating_add(delta);
+            inner.waiters.push((deadline, tx));
+        }
+        let _ = rx.await;
+    }
+
+    fn advance(&self, delta_ms: u64) {
+        let mut to_wake = Vec::new();
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            inner.now_ms = inner.now_ms.saturating_add(delta_ms);
+            let now = inner.now_ms;
+            let mut remaining = Vec::new();
+            for (deadline, tx) in inner.waiters.drain(..) {
+                if deadline <= now {
+                    to_wake.push(tx);
+                } else {
+                    remaining.push((deadline, tx));
+                }
+            }
+            inner.waiters = remaining;
+        }
+        for tx in to_wake {
+            let _ = tx.send(());
+        }
+    }
+}
+
 pub struct RecordingHost {
     saved_session: Option<String>,
     legacy_cookie: Option<LegacyCookie>,
@@ -1295,10 +1385,24 @@ pub struct RecordingHost {
     notify: Notify,
     is_u3: bool,
     is_u4: bool,
+    is_u6: bool,
+    is_u12: bool,
+    is_u13: bool,
     data_dir: Option<PathBuf>,
+    virtual_now_ms: Mutex<i64>,
+    virtual_poll_timers: Mutex<Vec<(String, u64, i64)>>,
     shared_store_slot: Mutex<Option<SharedStoreSlot>>,
     store: Mutex<Option<Arc<Mutex<Store>>>>,
     e2ee_send_results: Mutex<VecDeque<Result<SendMessageResult, String>>>,
+    resolve_media_results: Mutex<VecDeque<MediaResolutionOutcome>>,
+    resolve_file_results: Mutex<VecDeque<FileResolutionOutcome>>,
+    fetch_media_data_results: Mutex<VecDeque<bool>>,
+    send_media_results: Mutex<VecDeque<ComposerSendOutcome>>,
+    send_files_results: Mutex<VecDeque<ComposerSendOutcome>>,
+    fwd_photo_counter: Mutex<usize>,
+    e2ee_sticker_results: Mutex<VecDeque<Result<SendMessageResult, StickerSendError>>>,
+    e2ee_contact_card_results: Mutex<VecDeque<Result<SendMessageResult, String>>>,
+    confirm_clock: VirtualConfirmClock,
     messages: Mutex<HashMap<String, Vec<ChatMessage>>>,
     open_conversation_id: Mutex<Option<String>>,
     identities: Mutex<IdentityTable>,
@@ -1317,6 +1421,27 @@ impl RecordingHost {
         seed: &Seed,
         is_u3: bool,
         is_u4: bool,
+        data_dir: Option<PathBuf>,
+    ) -> Self {
+        Self::from_seed_with_all_modes(seed, is_u3, is_u4, false, data_dir)
+    }
+
+    pub fn from_seed_with_all_modes(
+        seed: &Seed,
+        is_u3: bool,
+        is_u4: bool,
+        is_u6: bool,
+        data_dir: Option<PathBuf>,
+    ) -> Self {
+        Self::from_seed_with_u13_modes(seed, is_u3, is_u4, is_u6, false, data_dir)
+    }
+
+    pub fn from_seed_with_u13_modes(
+        seed: &Seed,
+        is_u3: bool,
+        is_u4: bool,
+        is_u6: bool,
+        is_u13: bool,
         data_dir: Option<PathBuf>,
     ) -> Self {
         let saved_session = seed
@@ -1412,6 +1537,221 @@ impl RecordingHost {
                 }
             }
         }
+        let mut e2ee_sticker_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("send_e2ee_sticker"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                if item.as_str() == Some("e2ee_failed")
+                    || item.get("status").and_then(Value::as_str) == Some("e2ee_failed")
+                {
+                    e2ee_sticker_results.push_back(Err(StickerSendError::E2eeFailed));
+                } else if let Some(err_obj) = item.get("error").and_then(Value::as_object) {
+                    let code = err_obj.get("code").and_then(Value::as_i64).unwrap_or(500);
+                    let msg = err_obj
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("E2EE error");
+                    let url = err_obj
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .unwrap_or("/api/e2ee/pc/message/sticker");
+                    let formatted = if url.is_empty() {
+                        format!("Zalo error {code}: {msg}")
+                    } else {
+                        format!("Zalo error {code}: {msg} ({url})")
+                    };
+                    e2ee_sticker_results.push_back(Err(StickerSendError::Api(formatted)));
+                } else if let Some(err_str) = item.get("error").and_then(Value::as_str) {
+                    e2ee_sticker_results.push_back(Err(StickerSendError::Api(format!(
+                        "Zalo error 500: {err_str} (/api/e2ee/pc/message/sticker)"
+                    ))));
+                } else {
+                    let msg_id = item
+                        .get("msg_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let cli_msg_id = item
+                        .get("cli_msg_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let ts_ms = item.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
+                    e2ee_sticker_results.push_back(Ok(SendMessageResult {
+                        msg_id,
+                        cli_msg_id,
+                        ts_ms,
+                    }));
+                }
+            }
+        }
+        let mut e2ee_contact_card_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("send_e2ee_contact_card"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                if item.as_str() == Some("e2ee_failed")
+                    || item.get("status").and_then(Value::as_str) == Some("e2ee_failed")
+                {
+                    e2ee_contact_card_results.push_back(Err("e2ee_failed".to_owned()));
+                } else if let Some(err_obj) = item.get("error").and_then(Value::as_object) {
+                    let code = err_obj.get("code").and_then(Value::as_i64).unwrap_or(500);
+                    let msg = err_obj
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("E2EE error");
+                    let url = err_obj
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .unwrap_or("/api/e2ee/pc/message/forward");
+                    let formatted = if url.is_empty() {
+                        format!("Zalo error {code}: {msg}")
+                    } else {
+                        format!("Zalo error {code}: {msg} ({url})")
+                    };
+                    e2ee_contact_card_results.push_back(Err(formatted));
+                } else if let Some(err_str) = item.get("error").and_then(Value::as_str) {
+                    e2ee_contact_card_results.push_back(Err(err_str.to_owned()));
+                } else {
+                    let msg_id = item
+                        .get("msg_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let cli_msg_id = item
+                        .get("cli_msg_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let ts_ms = item.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
+                    e2ee_contact_card_results.push_back(Ok(SendMessageResult {
+                        msg_id,
+                        cli_msg_id,
+                        ts_ms,
+                    }));
+                }
+            }
+        }
+        let mut resolve_media_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("resolve_media"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                let outcome = match item
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unavailable")
+                {
+                    "file" | "ok" => match item.get("path").and_then(Value::as_str) {
+                        Some(path) if path.starts_with('/') => {
+                            MediaResolutionOutcome::File(path.to_owned())
+                        }
+                        _ => MediaResolutionOutcome::Unavailable,
+                    },
+                    "expired" => MediaResolutionOutcome::Expired,
+                    "unsupported" => MediaResolutionOutcome::Unsupported,
+                    _ => MediaResolutionOutcome::Unavailable,
+                };
+                resolve_media_results.push_back(outcome);
+            }
+        }
+        let mut resolve_file_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("resolve_file"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                let outcome = match item
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("failed")
+                {
+                    "ready" => match item.get("path").and_then(Value::as_str) {
+                        Some(path) if !path.is_empty() => {
+                            FileResolutionOutcome::Ready(path.to_owned())
+                        }
+                        _ => FileResolutionOutcome::Failed("Missing staged path".to_owned()),
+                    },
+                    "expired" => FileResolutionOutcome::Expired,
+                    _ => FileResolutionOutcome::Failed(
+                        item.get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Không tải được tệp.")
+                            .to_owned(),
+                    ),
+                };
+                resolve_file_results.push_back(outcome);
+            }
+        }
+        let mut fetch_media_data_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("fetch_media_data"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                let has_data = item.get("data_utf8").and_then(Value::as_str).is_some()
+                    || item.get("ok").and_then(Value::as_bool) == Some(true);
+                fetch_media_data_results.push_back(has_data);
+            }
+        }
+        let parse_composer = |item: &Value| -> ComposerSendOutcome {
+            match item
+                .get("outcome")
+                .and_then(Value::as_str)
+                .unwrap_or("failed")
+            {
+                "done" => ComposerSendOutcome::Done,
+                "cancelled" => ComposerSendOutcome::Cancelled,
+                "pending" => ComposerSendOutcome::Pending(
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Đang chờ...")
+                        .to_owned(),
+                ),
+                _ => ComposerSendOutcome::Failed(
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Có lỗi khi gửi tệp")
+                        .to_owned(),
+                ),
+            }
+        };
+        let mut send_media_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("send_media"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                send_media_results.push_back(parse_composer(item));
+            }
+        }
+        let mut send_files_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("send_files"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                send_files_results.push_back(parse_composer(item));
+            }
+        }
         Self {
             saved_session,
             legacy_cookie,
@@ -1424,14 +1764,32 @@ impl RecordingHost {
             notify: Notify::new(),
             is_u3,
             is_u4,
+            is_u6,
+            is_u12: false,
+            is_u13,
             data_dir,
+            virtual_now_ms: Mutex::new(1_700_000_000_000),
+            virtual_poll_timers: Mutex::new(Vec::new()),
             shared_store_slot: Mutex::new(None),
             store: Mutex::new(None),
             e2ee_send_results: Mutex::new(e2ee_send_results),
+            resolve_media_results: Mutex::new(resolve_media_results),
+            resolve_file_results: Mutex::new(resolve_file_results),
+            fetch_media_data_results: Mutex::new(fetch_media_data_results),
+            send_media_results: Mutex::new(send_media_results),
+            send_files_results: Mutex::new(send_files_results),
+            fwd_photo_counter: Mutex::new(0),
+            e2ee_sticker_results: Mutex::new(e2ee_sticker_results),
+            e2ee_contact_card_results: Mutex::new(e2ee_contact_card_results),
+            confirm_clock: VirtualConfirmClock::default(),
             messages: Mutex::new(HashMap::new()),
             open_conversation_id: Mutex::new(open_conv),
             identities: Mutex::new(identities),
         }
+    }
+
+    pub fn advance_confirm_ms(&self, delta_ms: u64) {
+        self.confirm_clock.advance(delta_ms);
     }
 
     pub fn bind_store_slot(&self, slot: SharedStoreSlot) {
@@ -1446,6 +1804,58 @@ impl RecordingHost {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    pub fn enable_u12_virtual_clock(mut self) -> Self {
+        self.is_u12 = true;
+        self
+    }
+
+    pub fn virtual_now_ms(&self) -> i64 {
+        *self
+            .virtual_now_ms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn set_virtual_now_ms(&self, now_ms: i64) {
+        *self
+            .virtual_now_ms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = now_ms;
+    }
+
+    pub fn advance_virtual_clock(&self, ms: i64) -> (i64, Vec<(String, u64)>) {
+        let now_after = {
+            let mut now = self
+                .virtual_now_ms
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *now += ms;
+            *now
+        };
+        let mut timers = self
+            .virtual_poll_timers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut ready = Vec::new();
+        let mut kept = Vec::new();
+        for (poll_id, seq, fire_at_ms) in timers.drain(..) {
+            if fire_at_ms <= now_after {
+                ready.push((poll_id, seq));
+            } else {
+                kept.push((poll_id, seq, fire_at_ms));
+            }
+        }
+        *timers = kept;
+        (now_after, ready)
+    }
+
+    pub fn clear_virtual_poll_timers(&self) {
+        self.virtual_poll_timers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
     pub fn set_open_conversation(&self, id: Option<String>) {
@@ -2224,6 +2634,192 @@ impl Host for RecordingHost {
             })
     }
 
+    async fn show_card(&self, conv_id: Option<String>, text: String) {
+        if self.is_u6 {
+            self.record(
+                "show_card",
+                json!({
+                    "conv_id": conv_id,
+                    "text": text,
+                }),
+            );
+        }
+    }
+
+    async fn resolve_media(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        kind: String,
+    ) -> MediaResolutionOutcome {
+        self.record(
+            "resolve_media",
+            json!({
+                "conv_id": conv_id,
+                "msg_id": msg_id,
+                "kind": kind,
+            }),
+        );
+        self.resolve_media_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or(MediaResolutionOutcome::Unavailable)
+    }
+
+    async fn resolve_file(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        name: String,
+        url: Option<String>,
+    ) -> FileResolutionOutcome {
+        self.record(
+            "resolve_file",
+            json!({
+                "conv_id": conv_id,
+                "msg_id": msg_id,
+                "name": name,
+                "url": url,
+            }),
+        );
+        self.resolve_file_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or_else(|| {
+                FileResolutionOutcome::Failed("No scripted resolve_file result".to_owned())
+            })
+    }
+
+    async fn fetch_media_data(&self, url: String) -> Option<String> {
+        self.record("fetch_media_data", json!({ "url": url }));
+        let ok = self
+            .fetch_media_data_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or(false);
+        if !ok {
+            return None;
+        }
+        let mut counter = self
+            .fwd_photo_counter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *counter += 1;
+        Some(format!("<tmp>/fwd-{}.jpg", *counter))
+    }
+
+    async fn send_media(
+        &self,
+        conv_id: String,
+        paths: Vec<String>,
+        _cleanup_after: bool,
+    ) -> ComposerSendOutcome {
+        self.record(
+            "send_media",
+            json!({
+                "conv_id": conv_id,
+                "paths": paths,
+            }),
+        );
+        self.send_media_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or_else(|| ComposerSendOutcome::Failed("Có lỗi khi gửi tệp".to_owned()))
+    }
+
+    async fn send_files(&self, conv_id: String, paths: Vec<String>) -> ComposerSendOutcome {
+        self.record(
+            "send_files",
+            json!({
+                "conv_id": conv_id,
+                "paths": paths,
+            }),
+        );
+        self.send_files_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or_else(|| ComposerSendOutcome::Failed("Có lỗi khi gửi tệp".to_owned()))
+    }
+
+    async fn send_e2ee_sticker(
+        &self,
+        conv_id: String,
+        cate_id: i64,
+        sticker_id: i64,
+        client_id: String,
+    ) -> Result<SendMessageResult, StickerSendError> {
+        self.record(
+            "send_e2ee_sticker",
+            json!({
+                "conv_id": conv_id,
+                "cate_id": cate_id,
+                "sticker_id": sticker_id,
+                "client_id": client_id,
+            }),
+        );
+        self.e2ee_sticker_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or_else(|| {
+                Err(StickerSendError::Api(
+                    "Zalo error 500: No scripted send_e2ee_sticker result (/api/e2ee/pc/message/sticker)"
+                        .to_owned(),
+                ))
+            })
+    }
+
+    async fn send_e2ee_contact_card(
+        &self,
+        conv_id: String,
+        client_id: String,
+        contact_uid: String,
+        title: String,
+        phone: String,
+        avatar: String,
+        qr_code_url: String,
+    ) -> Result<SendMessageResult, String> {
+        self.record(
+            "send_e2ee_contact_card",
+            json!({
+                "conv_id": conv_id,
+                "client_id": client_id,
+                "contact_uid": contact_uid,
+                "title": title,
+                "phone": phone,
+                "avatar": avatar,
+                "qr_code_url": qr_code_url,
+            }),
+        );
+        if let Some(scripted) = self
+            .e2ee_contact_card_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+        {
+            return scripted;
+        }
+        // Deterministic fallback ONLY for unscripted send_e2ee_contact_card (approved for U13).
+        Ok(SendMessageResult {
+            msg_id: client_id.clone(),
+            cli_msg_id: client_id,
+            ts_ms: 0,
+        })
+    }
+
+    async fn sleep_confirm_promote(&self, delay: Duration) {
+        if self.is_u13 {
+            self.confirm_clock.sleep(delay).await;
+        } else {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     async fn apply_remote_reaction(
         &self,
         conv_id: String,
@@ -2235,7 +2831,7 @@ impl Host for RecordingHost {
         event_id: String,
         react_client_id: String,
         sender_name: String,
-    ) {
+    ) -> bool {
         if self.is_u4 {
             self.record(
                 "apply_remote_reaction",
@@ -2252,6 +2848,7 @@ impl Host for RecordingHost {
                 }),
             );
         }
+        self.is_u6
     }
 
     async fn apply_remote_recall(
@@ -2261,7 +2858,7 @@ impl Host for RecordingHost {
         cli_msg_id: String,
         _update_conversation_preview: bool,
         _persist_conversations: bool,
-    ) {
+    ) -> bool {
         if self.is_u4 {
             self.record(
                 "apply_remote_recall",
@@ -2272,6 +2869,7 @@ impl Host for RecordingHost {
                 }),
             );
         }
+        self.is_u6
     }
 
     async fn apply_remote_delete(
@@ -2281,7 +2879,7 @@ impl Host for RecordingHost {
         cli_msg_id: String,
         _update_conversation_preview: bool,
         _persist_conversations: bool,
-    ) {
+    ) -> bool {
         if self.is_u4 {
             self.record(
                 "apply_remote_delete",
@@ -2292,6 +2890,7 @@ impl Host for RecordingHost {
                 }),
             );
         }
+        self.is_u6
     }
 
     async fn apply_batch(
@@ -2460,6 +3059,27 @@ impl Host for RecordingHost {
             "mute",
             json!({ "conv_id": conv_id, "set": set, "start": start_val, "duration": duration }),
         );
+    }
+
+    async fn arm_poll_debounce(&self, poll_id: String, seq: u64, delay_ms: u64) -> bool {
+        if !self.is_u12 {
+            return false;
+        }
+        let now = self.virtual_now_ms();
+        let fire_at_ms = now + i64::try_from(delay_ms).unwrap_or(i64::MAX);
+        let mut timers = self
+            .virtual_poll_timers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        timers.retain(|(pid, _, _)| pid != &poll_id);
+        timers.push((poll_id, seq, fire_at_ms));
+        true
+    }
+
+    async fn cancel_all_poll_debounces(&self) {
+        if self.is_u12 {
+            self.clear_virtual_poll_timers();
+        }
     }
 }
 
@@ -2774,6 +3394,21 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
             .set_preference_strings("hiddenIds", ids)
             .map_err(|e| format!("seed hiddenIds: {e}"))?;
     }
+    if let Some(ids) = &seed.starred_ids {
+        store
+            .set_preference_strings("starredIds", ids)
+            .map_err(|e| format!("seed starredIds: {e}"))?;
+    }
+    if let Some(ids) = &seed.seen_reaction_event_ids {
+        store
+            .set_preference_strings("seenReactionEventIds", ids)
+            .map_err(|e| format!("seed seenReactionEventIds: {e}"))?;
+    }
+    if !seed.e2ee_threads.is_empty() {
+        store
+            .set_preference_strings("e2eeThreadsV1", &seed.e2ee_threads)
+            .map_err(|e| format!("seed e2eeThreadsV1: {e}"))?;
+    }
     if let Some(md5) = &seed.hidden_pin_md5
         && !md5.is_empty()
     {
@@ -2803,6 +3438,20 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
         store
             .set_preference_data("activityRanks", &bytes)
             .map_err(|e| format!("seed activityRanks: {e}"))?;
+    }
+    // U13
+    if let Some(recents) = &seed.recent_stickers
+        && !recents.is_null()
+    {
+        let bytes = canonical_json_string(recents).into_bytes();
+        store
+            .set_preference_data("recentStickers", &bytes)
+            .map_err(|e| format!("seed recentStickers: {e}"))?;
+    }
+    if let Some(suggest) = seed.sticker_suggest {
+        store
+            .set_preference_bool("stickerSuggest", suggest)
+            .map_err(|e| format!("seed stickerSuggest: {e}"))?;
     }
     // U4-bootstrap
     if let Some(ts) = &seed.history_full_refresh_at
@@ -2984,20 +3633,31 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
 struct LogCapturingRunner<R> {
     inner: Arc<R>,
     send_logs: Arc<Mutex<Vec<String>>>,
+    action_logs: Arc<Mutex<Vec<String>>>,
 }
 
 impl<R: EffectRunner> EffectRunner for LogCapturingRunner<R> {
     fn dispatch(&self, effects: Vec<Effect>, sink: ActorSink) {
         {
-            let mut logs = self
+            let mut s_logs = self
                 .send_logs
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            let mut a_logs = self
+                .action_logs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             for eff in &effects {
-                if let Effect::EngineLog(line) = eff
-                    && line.starts_with("sendText ")
-                {
-                    logs.push(line.clone());
+                if let Effect::EngineLog(line) = eff {
+                    if line.starts_with("sendText ") {
+                        s_logs.push(line.clone());
+                    }
+                    if line.starts_with("react failed")
+                        || line.starts_with("recall failed")
+                        || line.starts_with("autodelete: ")
+                    {
+                        a_logs.push(line.clone());
+                    }
                 }
             }
         }
@@ -3082,15 +3742,1184 @@ fn enrich_send_message_json(m: &ChatMessage, base: &mut Map<String, Value>) {
     );
 }
 
-async fn capture_case_snapshot(
-    core: &CoreHandle,
+fn encode_cloud_breakdown(b: &CloudBreakdown) -> Value {
+    json!({
+        "photo": b.photo,
+        "video": b.video,
+        "file": b.file,
+        "voice": b.voice,
+        "total": b.total(),
+    })
+}
+
+fn encode_cloud_plan(p: &CloudPlan) -> Value {
+    json!({
+        "kind": p.kind.as_str(),
+        "name": p.name,
+        "quota": p.quota,
+        "usage": p.usage,
+        "family": p.family,
+        "cloud_media": p.cloud_media,
+        "message_backup": p.message_backup,
+        "my_cloud": p.my_cloud,
+        "expire_at_ms": p.expire_at_ms,
+        "auto_renew": p.auto_renew,
+        "months": p.months,
+        "has_key": p.has_key,
+        "backup_media": p.backup_media,
+        "backup_my_cloud": p.backup_my_cloud,
+        "backup_messages": p.backup_messages,
+        "file_limit": p.file_limit,
+    })
+}
+
+fn encode_cloud_conversation(c: &CloudConversation) -> Value {
+    json!({
+        "id": c.id,
+        "name": c.name,
+        "avatar": c.avatar,
+        "is_group": c.is_group,
+        "total": c.total,
+        "last_activity_ms": c.last_activity_ms,
+    })
+}
+
+fn encode_cloud_settings(s: &CloudSettings) -> Value {
+    json!({
+        "offload_enabled": s.offload_enabled,
+        "offload_available": s.offload_available,
+        "last_offload_at_ms": s.last_offload_at_ms,
+        "last_offload_size": s.last_offload_size,
+        "ttl_days": s.ttl_days,
+    })
+}
+
+fn encode_cloud_state(s: &CloudSnapshotState) -> Value {
+    json!({
+        "plan": s.plan.as_ref().map(encode_cloud_plan),
+        "media": encode_cloud_breakdown(&s.media),
+        "my_cloud_types": encode_cloud_breakdown(&s.my_cloud_types),
+        "conversations": s.conversations.iter().map(encode_cloud_conversation).collect::<Vec<_>>(),
+        "settings": encode_cloud_settings(&s.settings),
+        "changed": s.changed,
+        "loaded": s.loaded,
+        "hidden_lookup": s.hidden_lookup,
+        "self_id": s.self_id,
+    })
+}
+
+fn encode_cloud_item(item: &CloudItem) -> Value {
+    json!({
+        "id": item.id,
+        "kind": item.kind.as_str(),
+        "conv_id": item.conversation_id,
+        "conv_name": item.conversation_name,
+        "size": item.size,
+        "date_ms": item.date_ms,
+        "title": item.title,
+        "ext": item.ext,
+        "duration": item.duration.round() as i64,
+        "width": item.width,
+        "height": item.height,
+    })
+}
+
+fn encode_cloud_page(page: &CloudPage) -> Value {
+    json!({
+        "items": page.items.iter().map(encode_cloud_item).collect::<Vec<_>>(),
+        "has_more": page.has_more,
+        "error": page.error,
+    })
+}
+
+fn encode_cloud_fetch(fetch: &CloudFetch) -> Value {
+    match fetch {
+        CloudFetch::Ready(file) => {
+            let url = if file.path.starts_with('/') {
+                format!("file://{}", file.path)
+            } else {
+                format!("file:///{}", file.path)
+            };
+            json!({
+                "status": "ready",
+                "file": {
+                    "url": url,
+                    "kind": file.kind.as_str(),
+                    "title": file.title,
+                    "ext": file.ext,
+                    "size": file.size,
+                    "date_ms": file.date_ms,
+                },
+            })
+        }
+        CloudFetch::Expired => json!({ "status": "expired" }),
+        CloudFetch::Failed(err) => json!({ "status": "failed", "error": err }),
+    }
+}
+
+fn encode_media_resolution(res: &MediaResolutionOutcome) -> Value {
+    match res {
+        MediaResolutionOutcome::File(path) => json!({ "state": "file", "path": path }),
+        MediaResolutionOutcome::Expired => json!({ "state": "expired" }),
+        MediaResolutionOutcome::Unavailable => json!({ "state": "unavailable" }),
+        MediaResolutionOutcome::Unsupported => json!({ "state": "unsupported" }),
+    }
+}
+
+fn encode_cloud_action_result(res: &CloudActionResult) -> Value {
+    json!({
+        "ok": res.ok,
+        "deleted": res.deleted,
+        "failed": res.failed,
+        "error": res.error,
+    })
+}
+
+fn decode_step_message(msg_json: &Value, fallback_conv_id: &str) -> Option<ChatMessage> {
+    let mut obj = msg_json.as_object()?.clone();
+    let pairs = [
+        ("conversationId", "conv_id"),
+        ("clientId", "client_id"),
+        ("senderId", "sender_id"),
+        ("senderName", "sender_name"),
+        ("senderAvatar", "sender_avatar"),
+        ("isMine", "is_mine"),
+        ("isE2EE", "is_e2ee"),
+        ("date", "date_ms"),
+    ];
+    for (camel, snake) in pairs {
+        if !obj.contains_key(camel)
+            && let Some(v) = obj.get(snake).cloned()
+        {
+            obj.insert(camel.to_owned(), v);
+        }
+    }
+    if let Some(kind_str) = obj.get("kind").and_then(Value::as_str).map(str::to_owned) {
+        obj.insert("kind".to_owned(), json!({ "type": kind_str }));
+    }
+    ChatMessage::from_json(&obj, fallback_conv_id)
+}
+
+#[derive(Clone, Default)]
+struct TestSelection {
+    conv_id: String,
+    ids: Vec<String>,
+    anchor: Option<String>,
+}
+
+fn is_selectable_msg(m: &ChatMessage) -> bool {
+    !matches!(
+        m.kind,
+        Kind::System | Kind::Notice { .. } | Kind::Ecard(_) | Kind::Poll(_)
+    ) && m.status != Status::Sending
+}
+
+fn encode_forward_outcome_json(outcome: &ForwardOutcome) -> Value {
+    match outcome {
+        ForwardOutcome::Done(text) => json!({
+            "status": "done",
+            "text": text,
+        }),
+        ForwardOutcome::Pending(text) => json!({
+            "status": "pending",
+            "text": text,
+        }),
+        ForwardOutcome::Failed(text) => json!({
+            "status": "failed",
+            "text": text,
+        }),
+    }
+}
+
+fn encode_u12_poll_detail(d: &olaz_core::PollDetail) -> Value {
+    let opts: Vec<Value> = d
+        .options
+        .iter()
+        .map(|opt| {
+            let w = d.weight(opt);
+            json!({
+                "id": opt.id,
+                "content": opt.content,
+                "votes": opt.votes,
+                "voted": opt.voted,
+                "weight": w,
+            })
+        })
+        .collect();
+    json!({
+        "id": d.id,
+        "group_id": d.group_id,
+        "question": d.question,
+        "creator": d.creator,
+        "creator_name": d.creator_name,
+        "created_ms": d.created_ms,
+        "expires_ms": d.expires_ms,
+        "closed": d.closed,
+        "joined": d.joined,
+        "multi": d.multi,
+        "allow_add": d.allow_add,
+        "anonymous": d.anonymous,
+        "hide_preview": d.hide_preview,
+        "voter_count": d.voter_count,
+        "can_close": d.can_close,
+        "total_votes": d.total_votes(),
+        "results_hidden": d.results_hidden(),
+        "voters_visible": d.voters_visible(),
+        "options": opts,
+    })
+}
+
+fn encode_u12_poll_pin_state(p: &olaz_core::PollPinState) -> Value {
+    json!({
+        "ready": p.ready,
+        "can_pin": p.can_pin,
+        "pinned": p.pinned,
+        "limit": p.limit,
+        "offers_pin": p.offers_pin(),
+    })
+}
+
+fn encode_u12_board_pin_list(list: &olaz_core::BoardPinList) -> Value {
+    let items: Vec<Value> = list
+        .items
+        .iter()
+        .map(|item| {
+            json!({
+                "ref": item.ref_id,
+                "kind": item.kind,
+                "title": item.title,
+                "sender": item.sender,
+                "thumbnail": item.thumbnail,
+                "msg_id": item.msg_id,
+                "cli_msg_id": item.cli_msg_id,
+            })
+        })
+        .collect();
+    json!({
+        "ready": list.ready,
+        "can_pin": list.can_pin,
+        "limit": list.limit,
+        "items": items,
+    })
+}
+
+fn compute_u12_group_roles(info: &Map<String, Value>) -> Value {
+    let owner = olaz_wire::strip_user_prefix(&olaz_json::string(
+        info.get("creatorId")
+            .or_else(|| info.get("creator_id"))
+            .or_else(|| info.get("ownerId")),
+    ));
+    let mut admins = std::collections::BTreeSet::new();
+    for key in ["adminIds", "admin_ids", "admins"] {
+        if let Some(arr) = info.get(key).and_then(Value::as_array) {
+            for raw in arr {
+                let uid = olaz_wire::strip_user_prefix(&olaz_json::string(Some(raw)));
+                if !uid.is_empty() && uid != "0" && uid != owner {
+                    admins.insert(uid);
+                }
+            }
+        }
+    }
+    let join_approval = info
+        .get("setting")
+        .and_then(Value::as_object)
+        .is_some_and(|s| olaz_json::int64(s.get("joinAppr")) == Some(1));
+    let admins_vec: Vec<Value> = admins.into_iter().map(Value::String).collect();
+    json!({
+        "owner": owner,
+        "admins": admins_vec,
+        "join_approval": join_approval,
+    })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "layers MessageActionSnapshot + ContactSnapshot + GroupSnapshot + PollSnapshot 1:1"
+)]
+fn enrich_u12_snapshot(
+    obj: &mut Map<String, Value>,
+    full: &olaz_core::state::CoreSnapshot,
     host: &RecordingHost,
+    results: &BTreeMap<String, Value>,
+    watched_check_ids: Option<&[String]>,
+    seeded_member_cache: Option<&Value>,
+) {
+    // MessageActionSnapshot + ContactSnapshot message enrichments
+    if let Some(Value::Object(msgs_obj)) = obj.get_mut("messages") {
+        for (conv_id, list) in &full.messages.windows {
+            if let Some(Value::Array(arr)) = msgs_obj.get_mut(conv_id)
+                && arr.len() == list.len()
+            {
+                for (m, item) in list.iter().zip(arr.iter_mut()) {
+                    if let Value::Object(map) = item {
+                        let buttons: Vec<Value> = m
+                            .card_buttons
+                            .iter()
+                            .map(|b| {
+                                json!({
+                                    "ref": b.r#ref,
+                                    "label": b.label,
+                                    "enabled": b.enabled,
+                                    "help": b.help,
+                                })
+                            })
+                            .collect();
+                        map.insert("buttons".to_owned(), Value::Array(buttons));
+                        if let Some(Value::Array(r_arr)) = map.get_mut("reactions")
+                            && r_arr.len() == m.reactions.len()
+                        {
+                            for (r, r_item) in m.reactions.iter().zip(r_arr.iter_mut()) {
+                                if let Value::Object(r_map) = r_item {
+                                    let names: Vec<Value> =
+                                        r.names.iter().cloned().map(Value::String).collect();
+                                    r_map.insert("names".to_owned(), Value::Array(names));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    obj.insert("delete_undo".to_owned(), Value::Null);
+    obj.insert("message_confirm".to_owned(), Value::Null);
+    obj.insert("auto_delete".to_owned(), Value::Null);
+    obj.insert("starred_ids".to_owned(), json!([]));
+    obj.insert("prune_next_expiry_ms".to_owned(), Value::Null);
+
+    let mut cached_profiles = Map::new();
+    for (k, p) in &full.conversations.identities.cached_profiles {
+        cached_profiles.insert(
+            k.clone(),
+            json!({
+                "name": p.name,
+                "avatar": p.avatar,
+            }),
+        );
+    }
+    obj.insert("cached_profiles".to_owned(), Value::Object(cached_profiles));
+    obj.insert("action_logs".to_owned(), json!([]));
+
+    // Store enrichments (MessageActionSnapshot + ContactSnapshot + GroupSnapshot)
+    if let Some(store_arc) = host.attached_store()
+        && let Some(Value::Object(store_obj)) = obj.get_mut("store")
+    {
+        let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut stored_msgs = store.load_all_messages().unwrap_or_default();
+        stored_msgs.sort_by(|a, b| {
+            a.conv_id
+                .cmp(&b.conv_id)
+                .then_with(|| a.ts_ms.cmp(&b.ts_ms))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        if let Some(Value::Array(existing)) = store_obj.get_mut("messages")
+            && existing.len() == stored_msgs.len()
+        {
+            for (row, item) in stored_msgs.iter().zip(existing.iter_mut()) {
+                if let Value::Object(map) = item {
+                    let decoded = decode_stored_message(&to_wire_stored(row));
+                    let reactions_json: Vec<Value> = decoded
+                        .as_ref()
+                        .map(|d| {
+                            d.reactions
+                                .iter()
+                                .map(|r| {
+                                    let icon = if !r.icon.emoji.is_empty() {
+                                        &r.icon.emoji
+                                    } else if !r.icon.key.is_empty() {
+                                        &r.icon.key
+                                    } else {
+                                        &r.icon.r#type
+                                    };
+                                    json!({
+                                        "icon": icon,
+                                        "count": r.count,
+                                        "includes_me": r.includes_me,
+                                        "names": r.names,
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    map.insert("reactions".to_owned(), Value::Array(reactions_json));
+                    map.insert(
+                        "starred".to_owned(),
+                        Value::Bool(decoded.as_ref().is_some_and(|d| d.menu.starred)),
+                    );
+                }
+            }
+        }
+        if let Some(Value::Object(prefs_obj)) = store_obj.get_mut("prefs") {
+            let mut starred_ids = store
+                .get_preference_strings("starredIds")
+                .unwrap_or_default();
+            starred_ids.sort();
+            prefs_obj.insert("starred_ids".to_owned(), json!(starred_ids));
+            let seen_ids = store
+                .get_preference_strings("seenReactionEventIds")
+                .unwrap_or_default();
+            prefs_obj.insert("seen_reaction_event_ids".to_owned(), json!(seen_ids));
+
+            let mut cg_pref = Map::new();
+            if let Ok(Some(bytes)) = store.get_preference_data("cachedGroups")
+                && let Ok(parsed) = serde_json::from_slice::<BTreeMap<String, CachedGroup>>(&bytes)
+            {
+                for (k, cg) in parsed {
+                    cg_pref.insert(
+                        k,
+                        json!({
+                            "name": cg.name,
+                            "avatar": cg.avatar,
+                            "members": cg.members,
+                        }),
+                    );
+                }
+            }
+            prefs_obj.insert("cached_groups".to_owned(), Value::Object(cg_pref));
+        }
+    }
+
+    // ContactSnapshot fields
+    let friends_json: Vec<Value> = full
+        .contacts
+        .friends
+        .iter()
+        .map(|f| {
+            json!({
+                "id": f.id,
+                "name": f.name,
+                "zalo_name": f.zalo_name,
+                "avatar": f.avatar,
+                "last_active_ms": f.last_active_ms,
+                "online": f.online,
+                "section": f.section,
+                "sort_key": f.sort_key,
+            })
+        })
+        .collect();
+    let groups_json: Vec<Value> = full
+        .contacts
+        .groups
+        .iter()
+        .map(|g| {
+            json!({
+                "id": g.id,
+                "name": g.name,
+                "avatar": g.avatar,
+                "members": g.members,
+                "sort_key": g.sort_key,
+            })
+        })
+        .collect();
+    let req_json = |r: &olaz_core::messages::FriendRequestEntry| -> Value {
+        json!({
+            "id": r.id,
+            "name": r.name,
+            "avatar": r.avatar,
+            "message": r.message,
+            "date_ms": r.time_ms,
+        })
+    };
+    obj.insert(
+        "contacts".to_owned(),
+        json!({
+            "friends": friends_json,
+            "groups": groups_json,
+            "received": full.contacts.received.iter().map(req_json).collect::<Vec<_>>(),
+            "sent": full.contacts.sent.iter().map(req_json).collect::<Vec<_>>(),
+            "pending_request_count": full.contacts.pending_request_count,
+            "loading_requests": full.contacts.loading_requests,
+            "search": {
+                "status": "idle",
+                "error": Value::Null,
+                "user": Value::Null,
+            },
+            "notice": Value::Null,
+            "friends_loaded": full.contacts.friends_loaded,
+            "groups_loaded": full.contacts.groups_loaded,
+        }),
+    );
+    obj.insert("blocked_users".to_owned(), Value::Null);
+    let mut aliases_obj = Map::new();
+    for (k, v) in &full.conversations.identities.aliases {
+        aliases_obj.insert(k.clone(), Value::String(v.clone()));
+    }
+    obj.insert("aliases".to_owned(), Value::Object(aliases_obj));
+
+    let mut fg_obj = Map::new();
+    for (uid, gid) in &full.conversations.identities.friend_global_ids {
+        fg_obj.insert(gid.clone(), Value::String(uid.clone()));
+    }
+    obj.insert("friend_global_ids".to_owned(), Value::Object(fg_obj));
+    obj.insert("lookups".to_owned(), json!({}));
+    obj.insert("last_alias_result".to_owned(), Value::Null);
+
+    // GroupSnapshot fields
+    let mut details_map: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
+    let mut cached_group_details_obj = Map::new();
+    for (clean_grid, raw_json) in &full.contacts.group_details_json {
+        if let Ok(Value::Object(parsed)) = serde_json::from_str::<Value>(raw_json) {
+            details_map.insert(clean_grid.clone(), parsed.clone());
+            cached_group_details_obj.insert(clean_grid.clone(), Value::Object(parsed));
+        }
+    }
+    obj.insert(
+        "cached_group_details".to_owned(),
+        Value::Object(cached_group_details_obj),
+    );
+    let member_cache_val = seeded_member_cache
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    obj.insert("group_member_cache".to_owned(), member_cache_val.clone());
+
+    let mut cached_groups_obj = Map::new();
+    for (gid, cg) in &full.conversations.identities.cached_groups {
+        cached_groups_obj.insert(
+            gid.clone(),
+            json!({
+                "name": cg.name,
+                "avatar": cg.avatar,
+                "members": cg.members,
+            }),
+        );
+    }
+    obj.insert("cached_groups".to_owned(), Value::Object(cached_groups_obj));
+
+    let mut group_ids = std::collections::BTreeSet::new();
+    for clean_grid in details_map.keys() {
+        let gid = olaz_wire::group_conv_id(clean_grid);
+        if !gid.is_empty() {
+            group_ids.insert(gid);
+        }
+    }
+    for g in &full.contacts.groups {
+        if !g.id.is_empty() {
+            group_ids.insert(g.id.clone());
+        }
+    }
+    for gid in full.conversations.identities.cached_groups.keys() {
+        if !gid.is_empty() {
+            group_ids.insert(gid.clone());
+        }
+    }
+    if let Some(mc_obj) = member_cache_val.as_object() {
+        for gid in mc_obj.keys() {
+            if !gid.is_empty() {
+                group_ids.insert(gid.clone());
+            }
+        }
+    }
+    for conv in &full.conversations.conversations {
+        if conv.is_group && !conv.id.is_empty() {
+            group_ids.insert(conv.id.clone());
+        }
+    }
+    let mut roles_obj = Map::new();
+    let empty_map = Map::new();
+    for gid in group_ids {
+        let clean = olaz_wire::clean_group_id(&gid);
+        let info = details_map.get(&clean).unwrap_or(&empty_map);
+        roles_obj.insert(gid, compute_u12_group_roles(info));
+    }
+    obj.insert("group_roles".to_owned(), Value::Object(roles_obj));
+    obj.insert("navigation_request".to_owned(), Value::Null);
+    let mut results_obj = Map::new();
+    for (k, v) in results {
+        results_obj.insert(k.clone(), v.clone());
+    }
+    obj.insert("results".to_owned(), Value::Object(results_obj));
+    obj.insert("group_logs".to_owned(), json!([]));
+
+    // PollSnapshot fields
+    let mut poll_details_obj = Map::new();
+    for (pid, d) in &full.polls.details {
+        poll_details_obj.insert(pid.clone(), encode_u12_poll_detail(d));
+    }
+    let failed_arr: Vec<Value> = full
+        .polls
+        .failed
+        .iter()
+        .cloned()
+        .map(Value::String)
+        .collect();
+    let mut poll_pins_obj = Map::new();
+    for (pid, p) in &full.polls.pins {
+        poll_pins_obj.insert(pid.clone(), encode_u12_poll_pin_state(p));
+    }
+    obj.insert(
+        "polls".to_owned(),
+        json!({
+            "details": poll_details_obj,
+            "failed": failed_arr,
+            "pins": poll_pins_obj,
+        }),
+    );
+
+    let mut pins_obj = Map::new();
+    for (conv_id, list) in &full.board_pins {
+        pins_obj.insert(conv_id.clone(), encode_u12_board_pin_list(list));
+    }
+    obj.insert("pins".to_owned(), Value::Object(pins_obj));
+
+    let mask_watched = full.polls.clock.did_evict_watched;
+    let watched_val = if mask_watched {
+        Value::Null
+    } else {
+        let keys: Vec<Value> = full
+            .polls
+            .clock
+            .watched
+            .keys()
+            .cloned()
+            .map(Value::String)
+            .collect();
+        Value::Array(keys)
+    };
+    let watched_contains_val = if let (true, Some(check_ids)) = (mask_watched, watched_check_ids) {
+        let mut m = Map::new();
+        for id in check_ids {
+            m.insert(
+                id.clone(),
+                Value::Bool(full.polls.clock.watched.contains_key(id)),
+            );
+        }
+        Value::Object(m)
+    } else {
+        Value::Null
+    };
+    let check_set: std::collections::HashSet<&str> = watched_check_ids
+        .map(|ids| ids.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let mut last_attempt_obj = Map::new();
+    for (id, ms) in &full.polls.clock.last_attempt_ms {
+        if mask_watched && !check_set.contains(id.as_str()) {
+            continue;
+        }
+        last_attempt_obj.insert(id.clone(), json!(ms));
+    }
+    let pending_refresh_arr: Vec<Value> = full
+        .polls
+        .clock
+        .pending_refresh_ids()
+        .into_iter()
+        .map(Value::String)
+        .collect();
+    obj.insert(
+        "poll_clock".to_owned(),
+        json!({
+            "watched": watched_val,
+            "watched_count": full.polls.clock.watched.len(),
+            "watched_contains": watched_contains_val,
+            "last_attempt_ms": last_attempt_obj,
+            "seen_messages_count": full.polls.clock.seen_messages_count(),
+            "pending_refresh_ids": pending_refresh_arr,
+        }),
+    );
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "mirrors PollRecorderTests.swift poll_model_checks switch 1:1"
+)]
+async fn run_u12_poll_model_checks(checks: &[Value], core: &CoreHandle) -> Value {
+    let snap = core.full_snapshot().await.unwrap_or_default();
+    let mut check_results = Vec::with_capacity(checks.len());
+    for check in checks {
+        let kind = check
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match kind {
+            "resolve_group_explicit" => {
+                let poll_id = str_arg(check, "poll_id");
+                let explicit = check.get("explicit").and_then(Value::as_str);
+                let mut payload = Map::new();
+                if let Some(pg) = check.get("payload_group").and_then(Value::as_str) {
+                    payload.insert("group_id".to_owned(), Value::String(pg.to_owned()));
+                }
+                let resolved = olaz_core::resolve_poll_group_id(
+                    &poll_id,
+                    &payload,
+                    explicit,
+                    &snap.polls,
+                    &snap.messages,
+                );
+                check_results.push(json!({
+                    "kind": kind,
+                    "resolved": resolved,
+                }));
+            }
+            "is_group_admin" => {
+                let uid = str_arg(check, "uid");
+                let group_id = str_arg(check, "group_id");
+                let ok = olaz_core::is_group_admin_or_creator(&uid, &group_id, &snap.contacts);
+                check_results.push(json!({
+                    "kind": kind,
+                    "uid": uid,
+                    "group_id": group_id,
+                    "ok": ok,
+                }));
+            }
+            "poll_capabilities" => {
+                let conv_id = str_arg(check, "conv_id");
+                let caps = core.request_poll_capabilities(conv_id.clone()).await;
+                check_results.push(json!({
+                    "kind": kind,
+                    "conv_id": conv_id,
+                    "ready": caps.ready,
+                    "can_create": caps.can_create,
+                    "can_pin": caps.can_pin,
+                }));
+            }
+            "map_pin_error" => {
+                let res = if check.get("other").and_then(Value::as_bool) == Some(true) {
+                    olaz_core::PollActionResult::err(None)
+                } else {
+                    let code = check.get("code").and_then(Value::as_i64).unwrap_or(999);
+                    let msg = str_arg(check, "message");
+                    olaz_core::map_poll_pin_session_error(code, &msg, false)
+                };
+                check_results.push(json!({
+                    "kind": kind,
+                    "ok": res.ok,
+                    "error": res.error,
+                }));
+            }
+            "pin_confirm_message" => {
+                let ref_id = str_arg(check, "ref");
+                let limit = check.get("limit").and_then(Value::as_i64).unwrap_or(0);
+                let pin_kind = str_arg(check, "pin_kind");
+                let title = str_arg(check, "title");
+                let confirm = olaz_core::PollPinConfirm {
+                    ref_id,
+                    limit,
+                    kind: pin_kind,
+                    title,
+                };
+                check_results.push(json!({
+                    "kind": kind,
+                    "message": confirm.message(),
+                }));
+            }
+            "vote_draft_branches" => {
+                let zero_json = json!({
+                    "id": "vd1",
+                    "groupId": "g1",
+                    "question": "Single",
+                    "multi": false,
+                    "options": [
+                        { "id": "1", "content": "One", "votes": 0, "voted": false },
+                        { "id": "2", "content": "Two", "votes": 1, "voted": true },
+                    ],
+                });
+                let Some(zero_detail) = zero_json
+                    .as_object()
+                    .and_then(olaz_core::PollDetail::from_json)
+                else {
+                    continue;
+                };
+                let mut vd = olaz_core::PollVoteDraft::new(&zero_detail);
+                let no_change = vd.has_changes();
+                let initial_votes_nothing = vd.votes_nothing();
+                let r0 = vd.add_row();
+                vd.added[0].text = "  One  ".to_owned();
+                vd.set_added_voted(&r0, true);
+                let (_, after_add_voted_ids) = vd.request(&zero_detail);
+                let dup_row = vd.is_duplicate(&r0, &zero_detail);
+                let has_dups = vd.has_duplicates(&zero_detail);
+                vd.toggle("1");
+                let (after_toggle_new_opts, _) = vd.request(&zero_detail);
+                let after_toggle_json: Vec<Value> = after_toggle_new_opts
+                    .into_iter()
+                    .map(|o| json!({ "content": o.content, "voted": o.voted }))
+                    .collect();
+                vd.remove_added(&r0);
+                let after_remove = vd.votes_nothing();
+                vd.toggle("1");
+                let final_votes_nothing = vd.votes_nothing();
+                check_results.push(json!({
+                    "kind": kind,
+                    "initial_no_change": !no_change,
+                    "initial_votes_nothing": initial_votes_nothing,
+                    "after_add_voted_ids": after_add_voted_ids,
+                    "dup_row": dup_row,
+                    "has_dups": has_dups,
+                    "after_toggle_added_voted": after_toggle_json,
+                    "after_remove_votes_nothing": after_remove,
+                    "final_votes_nothing": final_votes_nothing,
+                }));
+            }
+            "detail_branches" => {
+                let zv_json = json!({
+                    "id": "db1",
+                    "groupId": "g1",
+                    "question": "Empty",
+                    "expired": 1_700_010_000_000_i64,
+                    "closed": false,
+                    "hidePreview": true,
+                    "joined": true,
+                    "options": [{ "id": "1", "content": "A", "votes": 0, "voted": false }],
+                });
+                let Some(zv) = zv_json
+                    .as_object()
+                    .and_then(olaz_core::PollDetail::from_json)
+                else {
+                    continue;
+                };
+                let before_exp = 1_700_009_999_000_i64;
+                let after_exp = 1_700_010_001_000_i64;
+                let w0 = zv.weight(&zv.options[0]);
+                check_results.push(json!({
+                    "kind": kind,
+                    "weight_zero": w0,
+                    "expired_before": zv.is_expired_at(before_exp),
+                    "expired_after": zv.is_expired_at(after_exp),
+                    "locked_before": zv.is_voting_locked_at(before_exp),
+                }));
+            }
+            "create_draft_branches" => {
+                let issue_tag = |issue: Option<olaz_core::PollCreateIssue>| -> String {
+                    match issue {
+                        None => "none".to_owned(),
+                        Some(olaz_core::PollCreateIssue::EmptyQuestion) => {
+                            "empty_question".to_owned()
+                        }
+                        Some(olaz_core::PollCreateIssue::Duplicate) => "duplicate".to_owned(),
+                        Some(olaz_core::PollCreateIssue::TooFewOptions(n)) => {
+                            format!("too_few_options({n})")
+                        }
+                        Some(olaz_core::PollCreateIssue::PastDeadline) => {
+                            "past_deadline".to_owned()
+                        }
+                    }
+                };
+                let cfg_json = json!({ "minOptions": 2 });
+                let cfg = olaz_core::PollConfig::from_json(cfg_json.as_object());
+                let ref_now = 1_700_010_000_000_i64;
+                let mut d = olaz_core::PollCreateDraft::new(&cfg, ref_now);
+                let empty_issue = issue_tag(d.issue(&cfg, ref_now));
+                d.question = "Q?".to_owned();
+                d.options = vec!["A".to_owned(), "A".to_owned()];
+                let dup0 = d.is_duplicate(0);
+                let dup_oob = d.is_duplicate(99);
+                let dup_issue = issue_tag(d.issue(&cfg, ref_now));
+                d.options = vec!["A".to_owned(), String::new()];
+                let few_issue = issue_tag(d.issue(&cfg, ref_now));
+                d.options = vec!["A".to_owned(), "B".to_owned()];
+                d.has_deadline = true;
+                d.deadline_ms = ref_now;
+                let past_issue = issue_tag(d.issue(&cfg, ref_now));
+                d.deadline_ms = ref_now + 60_000;
+                let ok_issue = d.issue(&cfg, ref_now).is_none();
+                check_results.push(json!({
+                    "kind": kind,
+                    "empty": empty_issue,
+                    "dup0": dup0,
+                    "dup_oob": dup_oob,
+                    "dup": dup_issue,
+                    "too_few": few_issue,
+                    "past": past_issue,
+                    "valid": ok_issue,
+                }));
+            }
+            "poll_config_branches" => {
+                let cfg_json = json!({
+                    "minOptions": 4,
+                    "maxOptions": 2,
+                    "maxQuestion": 0,
+                    "maxOption": -5,
+                    "displayOptions": 0,
+                    "enableAnonymous": false,
+                    "enableHidePreview": false,
+                });
+                let cfg = olaz_core::PollConfig::from_json(cfg_json.as_object());
+                let caps_json = json!({
+                    "ready": true,
+                    "canCreate": true,
+                    "canPin": false,
+                    "config": { "minOptions": 3 },
+                });
+                let caps = olaz_core::PollCapabilities::from_json(caps_json.as_object());
+                check_results.push(json!({
+                    "kind": kind,
+                    "min_options": cfg.min_options,
+                    "max_options": cfg.max_options,
+                    "max_question": cfg.max_question,
+                    "max_option": cfg.max_option,
+                    "display_options": cfg.display_options,
+                    "caps_min": caps.config.min_options,
+                }));
+            }
+            "action_result_messages" => {
+                use olaz_core::PollAction;
+                let cases: [(Option<&str>, PollAction); 17] = [
+                    (Some("closed"), PollAction::Vote),
+                    (Some("expired"), PollAction::Vote),
+                    (Some("network"), PollAction::Vote),
+                    (Some("duplicate"), PollAction::Vote),
+                    (Some("forbidden"), PollAction::Create),
+                    (Some("forbidden"), PollAction::Pin),
+                    (Some("forbidden"), PollAction::Unpin),
+                    (Some("forbidden"), PollAction::Lock),
+                    (Some("limit"), PollAction::Pin),
+                    (Some("partial"), PollAction::Pin),
+                    (Some("unknown"), PollAction::Vote),
+                    (None, PollAction::Vote),
+                    (None, PollAction::Lock),
+                    (None, PollAction::Share),
+                    (None, PollAction::Create),
+                    (None, PollAction::Pin),
+                    (None, PollAction::Unpin),
+                ];
+                let msgs: Vec<Value> = cases
+                    .iter()
+                    .map(|(err, act)| {
+                        Value::String(
+                            olaz_core::PollActionResult::err(*err)
+                                .message(*act)
+                                .to_owned(),
+                        )
+                    })
+                    .collect();
+                check_results.push(json!({
+                    "kind": kind,
+                    "messages": msgs,
+                }));
+            }
+            _ => {
+                check_results.push(json!({ "kind": kind }));
+            }
+        }
+    }
+    Value::Array(check_results)
+}
+
+struct SnapshotOpts<'a> {
     is_u3: bool,
     is_u4: bool,
     is_u5: bool,
+    is_u6: bool,
+    is_u8: bool,
+    is_u12: bool,
+    is_u11: bool,
+    is_u13: bool,
+    is_u14: bool,
     last_send_result: Option<bool>,
-    send_logs: &Mutex<Vec<String>>,
+    send_logs: &'a Mutex<Vec<String>>,
+    prune_next_expiry_ms: Option<i64>,
+    action_logs: &'a Mutex<Vec<String>>,
+    selection: Option<&'a TestSelection>,
+    forward_results: &'a Map<String, Value>,
+    u12_results: &'a BTreeMap<String, Value>,
+    watched_check_ids: Option<&'a [String]>,
+    seeded_member_cache: Option<&'a Value>,
+    search_results: &'a Map<String, Value>,
+    results: &'a Map<String, Value>,
+}
+
+fn encode_sticker_tabs(tabs: Option<Vec<StickerTab>>) -> Value {
+    match tabs {
+        None => Value::Null,
+        Some(list) => Value::Array(
+            list.into_iter()
+                .map(|t| {
+                    json!({
+                        "id": t.id,
+                        "name": t.name,
+                        "icon": t.icon,
+                        "count": t.count,
+                    })
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn encode_stickers(stickers: Option<Vec<StickerEntry>>) -> Value {
+    match stickers {
+        None => Value::Null,
+        Some(list) => Value::Array(
+            list.into_iter()
+                .map(|s| {
+                    let anim = match s.animation {
+                        None => Value::Null,
+                        Some(StickerAnimation::Sprite {
+                            url,
+                            frames,
+                            frame_ms,
+                        }) => json!({
+                            "kind": "sprite",
+                            "url": url,
+                            "frames": frames,
+                            "ms": frame_ms,
+                        }),
+                        Some(StickerAnimation::Animated { url }) => json!({
+                            "kind": "animated",
+                            "url": url,
+                        }),
+                    };
+                    json!({
+                        "cate_id": s.cate_id,
+                        "id": s.sticker_id,
+                        "url": s.url,
+                        "anim": anim,
+                    })
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn encode_suggest_setting(s: Option<StickerSuggestSetting>) -> Value {
+    match s {
+        None => Value::Null,
+        Some(v) => json!({
+            "enabled": v.enabled,
+            "debounce": v.debounce,
+        }),
+    }
+}
+
+fn encode_card_action_outcome(outcome: &CardActionOutcome) -> Value {
+    match outcome {
+        CardActionOutcome::Done => json!({"status": "done", "text": Value::Null}),
+        CardActionOutcome::OpenChat(s) => json!({"status": "open_chat", "text": s}),
+        CardActionOutcome::OpenProfile(s) => json!({"status": "open_profile", "text": s}),
+        CardActionOutcome::OpenUrl(s) => json!({"status": "open_url", "text": s}),
+        CardActionOutcome::Copy(s) => json!({"status": "copy", "text": s}),
+        CardActionOutcome::Present => json!({"status": "present", "text": Value::Null}),
+        CardActionOutcome::Unsupported(s) => json!({"status": "unsupported", "text": s}),
+        CardActionOutcome::Locked(s) => json!({"status": "locked", "text": s}),
+        CardActionOutcome::Failed(s) => json!({"status": "failed", "text": s}),
+        CardActionOutcome::Pending(s) => json!({"status": "pending", "text": s}),
+    }
+}
+
+fn encode_composer_outcome(outcome: &ComposerOutcome) -> Value {
+    match outcome {
+        ComposerOutcome::Done => json!({"status": "done", "text": Value::Null}),
+        ComposerOutcome::Cancelled => json!({"status": "cancelled", "text": Value::Null}),
+        ComposerOutcome::Failed(s) => json!({"status": "failed", "text": s}),
+        ComposerOutcome::Pending(s) => json!({"status": "pending", "text": s}),
+    }
+}
+
+fn decode_composer_outcome(v: &Value) -> ComposerOutcome {
+    let status = v.get("status").and_then(Value::as_str).unwrap_or("done");
+    let text = v
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    match status {
+        "cancelled" => ComposerOutcome::Cancelled,
+        "failed" => ComposerOutcome::Failed(text),
+        "pending" => ComposerOutcome::Pending(text),
+        _ => ComposerOutcome::Done,
+    }
+}
+
+fn encode_my_card(info: Option<MyCardInfo>) -> Value {
+    match info {
+        None => Value::Null,
+        Some(c) => json!({
+            "uid": c.uid,
+            "name": c.name,
+            "avatar": c.avatar,
+            "phone": c.phone,
+            "with_phone": c.with_phone,
+        }),
+    }
+}
+
+fn encode_reminder_info(info: Option<ReminderComposeInfo>) -> Value {
+    match info {
+        None => Value::Null,
+        Some(r) => json!({
+            "allowed": r.allowed,
+            "hidden": r.hidden,
+            "text": r.text,
+            "is_group": r.is_group,
+            "can_pin": r.can_pin,
+            "pin_toggle": r.pin_toggle,
+            "title_max_chars": r.title_max_chars,
+            "title_max_bytes": r.title_max_bytes,
+        }),
+    }
+}
+
+fn encode_composer_confirm(c: &ComposerConfirm) -> Value {
+    json!({
+        "id": c.id,
+        "conv_id": c.conv_id,
+        "title": c.title,
+        "message": c.message,
+        "ok": c.ok,
+        "cancel": c.cancel,
+    })
+}
+
+fn decode_composer_confirm(v: &Value) -> Option<ComposerConfirm> {
+    let id = v.get("id").and_then(Value::as_str)?.to_owned();
+    Some(ComposerConfirm {
+        id,
+        conv_id: v
+            .get("conv_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        title: v
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        message: v
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        ok: v
+            .get("ok")
+            .and_then(Value::as_str)
+            .unwrap_or("OK")
+            .to_owned(),
+        cancel: v
+            .get("cancel")
+            .and_then(Value::as_str)
+            .unwrap_or("Cancel")
+            .to_owned(),
+    })
+}
+
+async fn capture_case_snapshot(
+    core: &CoreHandle,
+    host: &RecordingHost,
+    opts: &SnapshotOpts<'_>,
 ) -> Option<Value> {
+    let SnapshotOpts {
+        is_u3,
+        is_u4,
+        is_u5,
+        is_u6,
+        is_u8,
+        is_u12,
+        is_u11,
+        is_u13,
+        is_u14,
+        last_send_result,
+        send_logs,
+        prune_next_expiry_ms,
+        action_logs,
+        selection,
+        forward_results,
+        u12_results,
+        watched_check_ids,
+        seeded_member_cache,
+        results,
+        search_results,
+    } = *opts;
     if !is_u3 {
         return core
             .snapshot()
@@ -3187,6 +5016,287 @@ async fn capture_case_snapshot(
             .collect();
         obj.insert("send_logs".to_owned(), Value::Array(logs));
     }
+    if is_u12 {
+        enrich_u12_snapshot(
+            &mut obj,
+            &full,
+            host,
+            u12_results,
+            watched_check_ids,
+            seeded_member_cache,
+        );
+    }
+    if is_u6 {
+        if let Some(Value::Object(msgs_obj)) = obj.get_mut("messages") {
+            for (conv_id, list) in &full.messages.windows {
+                if let Some(Value::Array(arr)) = msgs_obj.get_mut(conv_id)
+                    && arr.len() == list.len()
+                {
+                    for (m, item) in list.iter().zip(arr.iter_mut()) {
+                        if let Value::Object(map) = item {
+                            let buttons: Vec<Value> = m
+                                .card_buttons
+                                .iter()
+                                .map(|b| {
+                                    json!({
+                                        "ref": b.r#ref,
+                                        "label": b.label,
+                                        "enabled": b.enabled,
+                                        "help": b.help,
+                                    })
+                                })
+                                .collect();
+                            map.insert("buttons".to_owned(), Value::Array(buttons));
+                        }
+                    }
+                }
+            }
+        }
+        let undo_val = match &full.delete_undo {
+            Some(u) => json!({
+                "conv_id": u.conv_id,
+                "count": u.count,
+                "deadline_ms": u.deadline_ms,
+            }),
+            None => Value::Null,
+        };
+        obj.insert("delete_undo".to_owned(), undo_val);
+
+        let confirm_val = match &full.message_confirm {
+            Some(c) => json!({
+                "conv_id": c.conv_id,
+                "action": c.action.kind_name(),
+                "title": c.title,
+                "message": c.message,
+                "ok": c.ok,
+                "destructive": c.destructive,
+            }),
+            None => Value::Null,
+        };
+        obj.insert("message_confirm".to_owned(), confirm_val);
+
+        let auto_del_val = match &full.auto_delete {
+            Some(map) => {
+                let m: Map<String, Value> = map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Value::from(*v)))
+                    .collect();
+                Value::Object(m)
+            }
+            None => Value::Null,
+        };
+        obj.insert("auto_delete".to_owned(), auto_del_val);
+
+        let mut starred_sorted: Vec<String> = full.starred_ids.iter().cloned().collect();
+        starred_sorted.sort();
+        obj.insert(
+            "starred_ids".to_owned(),
+            Value::Array(starred_sorted.into_iter().map(Value::String).collect()),
+        );
+        obj.insert(
+            "prune_next_expiry_ms".to_owned(),
+            prune_next_expiry_ms.map_or(Value::Null, Value::from),
+        );
+        let mut profiles_obj = Map::new();
+        for (uid, prof) in &full.cached_profiles {
+            profiles_obj.insert(
+                uid.clone(),
+                json!({
+                    "name": prof.name,
+                    "avatar": prof.avatar,
+                }),
+            );
+        }
+        obj.insert("cached_profiles".to_owned(), Value::Object(profiles_obj));
+
+        let a_logs: Vec<Value> = action_logs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .map(Value::String)
+            .collect();
+        obj.insert("action_logs".to_owned(), Value::Array(a_logs));
+
+        if let Some(store_arc) = host.attached_store()
+            && let Some(Value::Object(store_obj)) = obj.get_mut("store")
+        {
+            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Ok(mut stored_msgs) = store.load_all_messages() {
+                stored_msgs.sort_by(|a, b| {
+                    a.conv_id
+                        .as_bytes()
+                        .cmp(b.conv_id.as_bytes())
+                        .then_with(|| a.ts_ms.cmp(&b.ts_ms))
+                        .then_with(|| a.id.as_bytes().cmp(b.id.as_bytes()))
+                });
+                if let Some(Value::Array(existing_arr)) = store_obj.get_mut("messages")
+                    && existing_arr.len() == stored_msgs.len()
+                {
+                    for (row, base) in stored_msgs.iter().zip(existing_arr.iter_mut()) {
+                        if let Value::Object(dict) = base {
+                            let decoded = decode_stored_message(&to_wire_stored(row));
+                            let reactions_json: Vec<Value> = decoded
+                                .as_ref()
+                                .map(|m| {
+                                    m.reactions
+                                        .iter()
+                                        .map(|r| {
+                                            let icon = if !r.icon.emoji.is_empty() {
+                                                r.icon.emoji.clone()
+                                            } else if !r.icon.key.is_empty() {
+                                                r.icon.key.clone()
+                                            } else {
+                                                r.icon.r#type.clone()
+                                            };
+                                            json!({
+                                                "icon": icon,
+                                                "count": r.count,
+                                                "includes_me": r.includes_me,
+                                            })
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            dict.insert("reactions".to_owned(), Value::Array(reactions_json));
+                            dict.insert(
+                                "starred".to_owned(),
+                                Value::Bool(decoded.as_ref().is_some_and(|m| m.menu.starred)),
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some(Value::Object(prefs_obj)) = store_obj.get_mut("prefs") {
+                let mut starred_pref = store
+                    .get_preference_strings("starredIds")
+                    .unwrap_or_default();
+                starred_pref.sort();
+                prefs_obj.insert(
+                    "starred_ids".to_owned(),
+                    Value::Array(starred_pref.into_iter().map(Value::String).collect()),
+                );
+                let seen_pref = store
+                    .get_preference_strings("seenReactionEventIds")
+                    .unwrap_or_default();
+                prefs_obj.insert(
+                    "seen_reaction_event_ids".to_owned(),
+                    Value::Array(seen_pref.into_iter().map(Value::String).collect()),
+                );
+            }
+        }
+        if is_u8 {
+            obj.insert(
+                "forward_request".to_owned(),
+                match &full.forward_request {
+                    Some(req) => json!({
+                        "conv_id": req.conversation_id,
+                        "msg_id": req.message.id,
+                        "more": req.more.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+                    }),
+                    None => Value::Null,
+                },
+            );
+            obj.insert(
+                "selection".to_owned(),
+                match selection {
+                    Some(sel) => json!({
+                        "conv_id": sel.conv_id,
+                        "ids": sel.ids,
+                        "anchor": sel.anchor,
+                    }),
+                    None => Value::Null,
+                },
+            );
+            obj.insert("results".to_owned(), Value::Object(forward_results.clone()));
+        }
+    }
+    if is_u11 {
+        obj.insert("cloud".to_owned(), encode_cloud_state(&full.cloud));
+        obj.insert("results".to_owned(), Value::Object(results.clone()));
+    }
+    if is_u14 {
+        obj.insert("results".to_owned(), Value::Object(search_results.clone()));
+    }
+    if is_u13 {
+        if let Some(Value::Object(msgs_obj)) = obj.get_mut("messages") {
+            for (conv_id, list) in &full.messages.windows {
+                if let Some(Value::Array(arr)) = msgs_obj.get_mut(conv_id)
+                    && arr.len() == list.len()
+                {
+                    for (m, item) in list.iter().zip(arr.iter_mut()) {
+                        if let Value::Object(map) = item {
+                            match &m.kind {
+                                Kind::Sticker { url } => {
+                                    map.insert(
+                                        "sticker_url".to_owned(),
+                                        url.clone().map_or(Value::Null, Value::String),
+                                    );
+                                    map.insert("contact_card".to_owned(), Value::Null);
+                                }
+                                Kind::ContactCard(card) => {
+                                    map.insert("sticker_url".to_owned(), Value::Null);
+                                    map.insert(
+                                        "contact_card".to_owned(),
+                                        json!({
+                                            "name": card.name,
+                                            "uid": card.uid,
+                                            "avatar": card.avatar,
+                                            "phone": card.phone,
+                                        }),
+                                    );
+                                }
+                                _ => {
+                                    map.insert("sticker_url".to_owned(), Value::Null);
+                                    map.insert("contact_card".to_owned(), Value::Null);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(store_arc) = host.attached_store()
+            && let Some(Value::Object(store_obj)) = obj.get_mut("store")
+            && let Some(Value::Object(prefs_obj)) = store_obj.get_mut("prefs")
+        {
+            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+            let recent_val = store
+                .get_preference_data("recentStickers")
+                .ok()
+                .flatten()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .unwrap_or_else(|| Value::Array(Vec::new()));
+            prefs_obj.insert("recent_stickers".to_owned(), recent_val);
+            let suggest_val = store
+                .get_preference_data("stickerSuggest")
+                .ok()
+                .flatten()
+                .and_then(|bytes| serde_json::from_slice::<bool>(&bytes).ok())
+                .map_or(Value::Null, Value::Bool);
+            prefs_obj.insert("sticker_suggest".to_owned(), suggest_val);
+        }
+        obj.insert(
+            "sticker_suggest_state".to_owned(),
+            encode_suggest_setting(full.sticker_suggest_setting),
+        );
+        obj.insert(
+            "composer_confirm".to_owned(),
+            full.composer_confirm
+                .as_ref()
+                .map_or(Value::Null, encode_composer_confirm),
+        );
+        obj.insert(
+            "queued_composer_confirms".to_owned(),
+            Value::Array(
+                full.queued_composer_confirms
+                    .iter()
+                    .map(encode_composer_confirm)
+                    .collect(),
+            ),
+        );
+        obj.insert("results".to_owned(), Value::Object(results.clone()));
+    }
     Some(Value::Object(obj))
 }
 
@@ -3212,7 +5322,13 @@ fn str_vec_arg(args: &Value, key: &str) -> Vec<String> {
 /// Runs a single Case format v1 [`Case`] under paused tokio time and returns the observed
 /// snapshots, final state, sorted canonical requests, and ordered host calls.
 pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
-    let is_u5 = case.domain == "send";
+    let is_u8 = case.domain == "forward";
+    let is_u12 = case.domain == "polls";
+    let is_u11 = case.domain == "cloud";
+    let is_u13 = case.domain == "stickers";
+    let is_u14 = case.domain == "search";
+    let is_u6 = case.domain == "message_actions" || is_u8 || is_u11 || is_u13 || is_u14;
+    let is_u5 = case.domain == "send" || is_u6 || is_u12;
     let is_u4 = case.domain == "bootstrap" || case.domain == "messages" || is_u5;
     let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions" || is_u4;
     let temp_dir = if is_u3 {
@@ -3270,12 +5386,19 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         client.seed_next_client_id(next_cid);
     }
 
-    let host = Arc::new(RecordingHost::from_seed_with_modes(
+    let base_host = RecordingHost::from_seed_with_u13_modes(
         &case.seed,
         is_u3,
         is_u4,
+        is_u6,
+        is_u13,
         temp_dir.as_ref().map(|d| d.path().to_path_buf()),
-    ));
+    );
+    let host = Arc::new(if is_u12 {
+        base_host.enable_u12_virtual_clock()
+    } else {
+        base_host
+    });
     let inner_runner = Arc::new(SessionEffectRunner::with_options(
         Arc::clone(&client),
         Arc::clone(&host) as Arc<dyn Host>,
@@ -3286,9 +5409,11 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     ));
     host.bind_store_slot(inner_runner.shared_store_slot());
     let send_logs = Arc::new(Mutex::new(Vec::<String>::new()));
+    let action_logs = Arc::new(Mutex::new(Vec::<String>::new()));
     let runner: Arc<dyn EffectRunner> = Arc::new(LogCapturingRunner {
         inner: Arc::clone(&inner_runner),
         send_logs: Arc::clone(&send_logs),
+        action_logs: Arc::clone(&action_logs),
     });
 
     let mut initial_state = CoreState::default();
@@ -3316,12 +5441,231 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     for tid in &case.seed.e2ee_threads {
         initial_state.send.e2ee_threads.insert(tid.clone());
     }
-    for (conv_id, ttl) in &case.seed.auto_delete {
-        if *ttl > 0 {
-            initial_state
-                .send
-                .auto_delete_ttl_ms
-                .insert(conv_id.clone(), *ttl);
+    if let Some(auto_del) = &case.seed.auto_delete {
+        let mut map = BTreeMap::new();
+        for (conv_id, ttl) in auto_del {
+            if *ttl > 0 {
+                initial_state
+                    .send
+                    .auto_delete_ttl_ms
+                    .insert(conv_id.clone(), *ttl);
+                map.insert(conv_id.clone(), *ttl);
+            }
+        }
+        initial_state.actions.auto_delete = Some(map);
+    }
+    if is_u13 {
+        if let Some(active_val) = &case.seed.composer_confirm
+            && !active_val.is_null()
+        {
+            initial_state.composer.active_confirm = decode_composer_confirm(active_val);
+        }
+        if let Some(queued_arr) = &case.seed.queued_composer_confirms {
+            initial_state.composer.queued_confirms = queued_arr
+                .iter()
+                .filter_map(decode_composer_confirm)
+                .collect();
+        }
+    }
+    if is_u12 {
+        if let Some(contacts) = &case.seed.contacts {
+            if let Some(b) = contacts.get("friends_loaded").and_then(Value::as_bool) {
+                initial_state.contacts.friends_loaded = b;
+            }
+            if let Some(b) = contacts.get("groups_loaded").and_then(Value::as_bool) {
+                initial_state.contacts.groups_loaded = b;
+            }
+            if let Some(arr) = contacts.get("friends").and_then(Value::as_array) {
+                for row in arr {
+                    let Some(id) = row.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let name = row
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(id)
+                        .to_owned();
+                    let zalo_name = row
+                        .get("zalo_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&name)
+                        .to_owned();
+                    let avatar = row
+                        .get("avatar")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    let last_active_ms = row.get("last_active_ms").and_then(Value::as_i64);
+                    let online = row.get("online").and_then(Value::as_bool).unwrap_or(false);
+                    let section = row
+                        .get("section")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| {
+                            let s: String = name.chars().take(1).collect::<String>().to_uppercase();
+                            if s.is_empty() { "#".to_owned() } else { s }
+                        });
+                    let sort_key = row
+                        .get("sort_key")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| name.to_lowercase());
+                    initial_state
+                        .contacts
+                        .friends
+                        .push(olaz_core::messages::FriendEntry {
+                            id: id.to_owned(),
+                            name,
+                            zalo_name,
+                            avatar,
+                            last_active_ms,
+                            online,
+                            section,
+                            sort_key,
+                        });
+                }
+            }
+            if let Some(arr) = contacts.get("groups").and_then(Value::as_array) {
+                for row in arr {
+                    let Some(id) = row.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let name = row
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(id)
+                        .to_owned();
+                    let avatar = row
+                        .get("avatar")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    let members = row.get("members").and_then(Value::as_i64).unwrap_or(0);
+                    let sort_key = row
+                        .get("sort_key")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| name.to_lowercase());
+                    initial_state
+                        .contacts
+                        .groups
+                        .push(olaz_core::messages::GroupEntry {
+                            id: id.to_owned(),
+                            name,
+                            avatar,
+                            members,
+                            sort_key,
+                        });
+                }
+            }
+        }
+        if let Some(details_obj) = case
+            .seed
+            .cached_group_details
+            .as_ref()
+            .and_then(Value::as_object)
+        {
+            for (k, v) in details_obj {
+                initial_state
+                    .contacts
+                    .group_details_json
+                    .insert(k.clone(), canonical_json_string(v));
+            }
+        }
+        if let Some(polls_seed) = case.seed.polls.as_ref().and_then(Value::as_object) {
+            if let Some(details_obj) = polls_seed.get("details").and_then(Value::as_object) {
+                for (pid, d_val) in details_obj {
+                    if let Some(d_obj) = d_val.as_object()
+                        && let Some(d) = olaz_core::PollDetail::from_json(d_obj)
+                    {
+                        initial_state.polls.details.insert(pid.clone(), d);
+                    }
+                }
+            }
+            if let Some(failed_arr) = polls_seed.get("failed").and_then(Value::as_array) {
+                for item in failed_arr {
+                    if let Some(s) = item.as_str() {
+                        initial_state.polls.failed.insert(s.to_owned());
+                    }
+                }
+            }
+            if let Some(pins_obj) = polls_seed.get("pins").and_then(Value::as_object) {
+                for (pid, p_val) in pins_obj {
+                    if let Some(mut p_map) = p_val.as_object().cloned() {
+                        if !p_map.contains_key("canPin")
+                            && let Some(snake) = p_map.get("can_pin").cloned()
+                        {
+                            p_map.insert("canPin".to_owned(), snake);
+                        }
+                        initial_state.polls.pins.insert(
+                            pid.clone(),
+                            olaz_core::PollPinState::from_json(Some(&p_map)),
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(pins_obj) = case.seed.pins.as_ref().and_then(Value::as_object) {
+            for (conv_id, list_val) in pins_obj {
+                if let Some(list_map) = list_val.as_object() {
+                    initial_state.board_pins.insert(
+                        conv_id.clone(),
+                        olaz_core::BoardPinList::from_json(list_map),
+                    );
+                }
+            }
+        }
+        if let Some(raw_obj) = case
+            .seed
+            .board_raw_topics
+            .as_ref()
+            .and_then(Value::as_object)
+        {
+            for (conv_id, entry) in raw_obj {
+                let version = entry.get("version").and_then(Value::as_i64).unwrap_or(0);
+                let mut topics = BTreeMap::new();
+                if let Some(t_obj) = entry.get("topics").and_then(Value::as_object) {
+                    for (tid, t_val) in t_obj {
+                        if let Some(t_map) = t_val.as_object() {
+                            topics.insert(tid.clone(), t_map.clone());
+                        }
+                    }
+                }
+                initial_state.board_raw_topics.insert(
+                    conv_id.clone(),
+                    olaz_core::BoardRawTopics { version, topics },
+                );
+            }
+        }
+        if let Some(clock_obj) = case.seed.poll_clock.as_ref().and_then(Value::as_object) {
+            if let Some(w_obj) = clock_obj.get("watched").and_then(Value::as_object) {
+                for (pid, conv_val) in w_obj {
+                    if let Some(conv_id) = conv_val.as_str() {
+                        initial_state
+                            .polls
+                            .clock
+                            .watched
+                            .insert(pid.clone(), conv_id.to_owned());
+                    }
+                }
+            }
+            if let Some(a_obj) = clock_obj.get("last_attempt_ms").and_then(Value::as_object) {
+                for (pid, ms_val) in a_obj {
+                    if let Some(ms) = ms_val.as_i64() {
+                        initial_state
+                            .polls
+                            .clock
+                            .last_attempt_ms
+                            .insert(pid.clone(), ms);
+                    }
+                }
+            }
+            if let Some(s_arr) = clock_obj.get("seen_messages").and_then(Value::as_array) {
+                initial_state
+                    .polls
+                    .clock
+                    .seed_seen_messages(s_arr.iter().filter_map(Value::as_str).map(str::to_owned));
+            }
         }
     }
     let core = Arc::new(CoreHandle::start_with_state(
@@ -3331,11 +5675,27 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     ));
 
     let mut snapshots = BTreeMap::new();
+    let mut results = Map::<String, Value>::new();
     let mut host_cursor = 0usize;
     let mut last_send_result: Option<bool> = None;
+    let mut prune_next_expiry_ms: Option<i64> = None;
     let mut pending_send_task: Option<tokio::task::JoinHandle<bool>> = None;
+    let mut pending_action_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut u12_results: BTreeMap<String, Value> = BTreeMap::new();
 
-    for step in &case.steps {
+    let mut search_results: Map<String, Value> = Map::new();
+    let mut selection: Option<TestSelection> = None;
+    let mut forward_results: Map<String, Value> = Map::new();
+    for (step_index, step) in case.steps.iter().enumerate() {
+        let step_idx = step_index;
+        if is_u12
+            && let Step::Cmd {
+                now_ms: Some(step_now),
+                ..
+            } = step
+        {
+            host.set_virtual_now_ms(*step_now);
+        }
         match step {
             Step::Cmd {
                 cmd,
@@ -3424,15 +5784,44 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         .get("persist_conversations")
                         .and_then(Value::as_bool)
                         .unwrap_or(true);
-                    let delta = host.process_direct_batch(
-                        &payload,
-                        default_cmd,
-                        fallback_conv_id,
-                        is_group_hint,
-                        increment_unread,
-                        persist_conversations,
-                    );
-                    core.request_unit(Command::ApplyBatchDelta(delta)).await;
+                    if is_u6 {
+                        let notify_incoming = args
+                            .get("notify_incoming")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let probe_freshness = args
+                            .get("probe_freshness")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let payload_map = payload.as_object().cloned().unwrap_or_default();
+                        let _ = core
+                            .request(Command::ApplyBatchDirect {
+                                payload: payload_map,
+                                default_cmd,
+                                fallback_conv_id: fallback_conv_id.map(str::to_owned),
+                                is_group_hint,
+                                increment_unread,
+                                notify_incoming,
+                                persist_conversations,
+                                probe_freshness,
+                                now_ms: *now_ms,
+                            })
+                            .await;
+                        if pending_send_task.is_none() && pending_action_task.is_none() {
+                            let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
+                                .await;
+                        }
+                    } else {
+                        let delta = host.process_direct_batch(
+                            &payload,
+                            default_cmd,
+                            fallback_conv_id,
+                            is_group_hint,
+                            increment_unread,
+                            persist_conversations,
+                        );
+                        core.request_unit(Command::ApplyBatchDelta(delta)).await;
+                    }
                 }
                 "ensure_known_contacts" => {
                     core.request_unit(Command::EnsureKnownContacts).await;
@@ -3853,6 +6242,1102 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         .await
                         .map_err(|_| format!("timed out awaiting typing expiry for `{id}`"))?;
                 }
+                "search" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let query = str_arg(args, "query");
+                    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(50);
+                    let (hits, _ver) = core.search_messages(conv_id, query, limit).await;
+                    search_results.insert(
+                        step_index.to_string(),
+                        Value::Array(hits.into_iter().map(|m| Value::String(m.id)).collect()),
+                    );
+                }
+                "ensure_loaded" => {
+                    if is_u11 {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                    let conv_id = str_arg(args, "conv_id");
+                    let target = if let Some(msg_json) = args.get("message") {
+                        decode_step_message(msg_json, &conv_id)
+                    } else if let Some(msg_id) = args.get("msg_id").and_then(Value::as_str) {
+                        let mem_hit = core.full_snapshot().await.and_then(|snap| {
+                            snap.messages.windows.get(&conv_id).and_then(|list| {
+                                list.iter()
+                                    .find(|m| m.id == msg_id || m.client_id == msg_id)
+                                    .cloned()
+                            })
+                        });
+                        if mem_hit.is_some() {
+                            mem_hit
+                        } else if let Some(store_arc) = host.attached_store() {
+                            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                            store
+                                .message(&conv_id, msg_id)
+                                .ok()
+                                .flatten()
+                                .and_then(|row| olaz_core::decode_db_stored(&row))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let msg = target.ok_or_else(|| {
+                        "ensure_loaded could not resolve target message".to_owned()
+                    })?;
+                    let (loaded, _ver) = core.ensure_message_loaded(conv_id, msg).await;
+                    if is_u11 {
+                        let _ = core.settle().await;
+                        results.insert(step_index.to_string(), Value::Bool(loaded));
+                    }
+                    search_results.insert(step_index.to_string(), Value::Bool(loaded));
+                }
+                "load_quoted" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let mem_hit = core.full_snapshot().await.and_then(|snap| {
+                        snap.messages
+                            .windows
+                            .get(&conv_id)
+                            .and_then(|list| list.iter().find(|m| m.id == msg_id).cloned())
+                    });
+                    let target = if mem_hit.is_some() {
+                        mem_hit
+                    } else if let Some(store_arc) = host.attached_store() {
+                        let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                        store
+                            .message(&conv_id, &msg_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|row| olaz_core::decode_db_stored(&row))
+                    } else {
+                        None
+                    };
+                    let msg = target
+                        .ok_or_else(|| format!("load_quoted could not find msg_id `{msg_id}`"))?;
+                    let (quoted_id, _ver) = core.load_quoted_message(conv_id, msg).await;
+                    search_results.insert(
+                        step_index.to_string(),
+                        quoted_id.map_or(Value::Null, Value::String),
+                    );
+                }
+                "request_forward" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let msg = core
+                        .full_snapshot()
+                        .await
+                        .and_then(|s| {
+                            s.messages
+                                .windows
+                                .get(&conv_id)?
+                                .iter()
+                                .find(|m| m.id == msg_id)
+                                .cloned()
+                        })
+                        .ok_or_else(|| {
+                            format!("request_forward missing msg {msg_id} in {conv_id}")
+                        })?;
+                    core.request_unit(Command::RequestForward {
+                        message: Box::new(msg),
+                    })
+                    .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "select" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let ids = str_vec_arg(args, "ids");
+                    if ids.is_empty() {
+                        selection = None;
+                    } else {
+                        let list = core
+                            .full_snapshot()
+                            .await
+                            .and_then(|s| s.messages.windows.get(&conv_id).cloned())
+                            .unwrap_or_default();
+                        let first_msg =
+                            list.iter()
+                                .find(|m| m.id == ids[0])
+                                .cloned()
+                                .ok_or_else(|| {
+                                    format!("select missing first msg {} in {conv_id}", ids[0])
+                                })?;
+                        let mut sel = TestSelection {
+                            conv_id: first_msg.conversation_id.clone(),
+                            ids: Vec::new(),
+                            anchor: None,
+                        };
+                        if is_selectable_msg(&first_msg) {
+                            sel.ids.push(first_msg.id.clone());
+                            sel.anchor = Some(first_msg.id.clone());
+                        }
+                        for toggle_id in ids.iter().skip(1) {
+                            let Some(target) = list.iter().find(|m| &m.id == toggle_id) else {
+                                continue;
+                            };
+                            if !is_selectable_msg(target) {
+                                continue;
+                            }
+                            if let Some(pos) = sel.ids.iter().position(|x| x == toggle_id) {
+                                sel.ids.remove(pos);
+                                sel.anchor = Some(toggle_id.clone());
+                            } else if sel.ids.len() < 100 {
+                                sel.ids.push(toggle_id.clone());
+                                sel.anchor = Some(toggle_id.clone());
+                            }
+                        }
+                        selection = Some(sel);
+                    }
+                }
+                "forward_selection" => {
+                    let selected: Vec<ChatMessage> = if let Some(sel) = selection.as_ref() {
+                        let id_set: std::collections::HashSet<&str> =
+                            sel.ids.iter().map(String::as_str).collect();
+                        core.full_snapshot()
+                            .await
+                            .and_then(|s| s.messages.windows.get(&sel.conv_id).cloned())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|m| id_set.contains(m.id.as_str()))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    core.request_unit(Command::ForwardSelection { messages: selected })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "forward" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let targets = str_vec_arg(args, "targets");
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    let msg = core
+                        .full_snapshot()
+                        .await
+                        .and_then(|s| {
+                            s.messages
+                                .windows
+                                .get(&conv_id)?
+                                .iter()
+                                .find(|m| m.id == msg_id)
+                                .cloned()
+                        })
+                        .ok_or_else(|| format!("forward missing msg {msg_id} in {conv_id}"))?;
+                    let outcome = core
+                        .request_forward_outcome(Command::Forward {
+                            message: Box::new(msg),
+                            targets,
+                            now_ms: ts_ms,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    forward_results
+                        .insert(step_idx.to_string(), encode_forward_outcome_json(&outcome));
+                }
+                "forward_all" => {
+                    let targets = str_vec_arg(args, "targets");
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    // Drain any earlier mirror changes so clear_selection reflects this op.
+                    while let Ok(Some(_)) =
+                        tokio::time::timeout(Duration::ZERO, core.next_changes()).await
+                    {
+                    }
+                    let outcome = core
+                        .request_forward_outcome(Command::ForwardAll {
+                            targets,
+                            now_ms: ts_ms,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    while let Ok(Some(batch)) =
+                        tokio::time::timeout(Duration::ZERO, core.next_changes()).await
+                    {
+                        if batch.clear_selection {
+                            selection = None;
+                        }
+                    }
+                    forward_results
+                        .insert(step_idx.to_string(), encode_forward_outcome_json(&outcome));
+                }
+                // U6 message_actions domain commands
+                "react" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let emoji = str_arg(args, "emoji");
+                    let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    let react_cmd = Command::React {
+                        conv_id,
+                        msg_id,
+                        emoji,
+                        remove_all: false,
+                        now_ms: ts_ms,
+                    };
+                    if is_async {
+                        let target_held = transport.held_arrived_count() + 1;
+                        let core_bg = Arc::clone(&core);
+                        pending_action_task = Some(tokio::spawn(async move {
+                            core_bg.request_unit(react_cmd).await;
+                        }));
+                        let _ = core.settle().await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(200),
+                            transport.wait_for_held_arrival(target_held),
+                        )
+                        .await;
+                    } else {
+                        core.request_unit(react_cmd).await;
+                        if pending_send_task.is_none() {
+                            let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
+                                .await;
+                        }
+                    }
+                }
+                "await_action" => {
+                    if let Some(handle) = pending_action_task.take() {
+                        handle
+                            .await
+                            .map_err(|e| format!("await_action join error: {e}"))?;
+                    }
+                    if pending_send_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "remove_my_reactions" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::React {
+                        conv_id,
+                        msg_id,
+                        emoji: String::new(),
+                        remove_all: true,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "recall" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::Recall {
+                        conv_id,
+                        msg_id,
+                        is_e2ee_thread: None,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "recall_many" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_ids = str_vec_arg(args, "msg_ids");
+                    let use_confirm = args.get("confirm").and_then(Value::as_bool).unwrap_or(true);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::RecallMany {
+                        conv_id,
+                        msg_ids,
+                        confirm: use_confirm,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "delete_for_me" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let confirmed = args
+                        .get("confirmed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::DeleteForMe {
+                        conv_id,
+                        msg_id,
+                        confirmed,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "delete_many" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_ids = str_vec_arg(args, "msg_ids");
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::DeleteMany {
+                        conv_id,
+                        msg_ids,
+                        confirm: true,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "undo_delete" => {
+                    core.request_unit(Command::UndoDelete).await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "dismiss_delete_undo" => {
+                    core.request_unit(Command::DismissDeleteUndo).await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "await_delete_undo_expiry" => {
+                    let dur = Duration::from_millis(timeout_ms.unwrap_or(8_000));
+                    let wait_fut = async {
+                        loop {
+                            if core
+                                .full_snapshot()
+                                .await
+                                .is_none_or(|snap| snap.delete_undo.is_none())
+                            {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    };
+                    tokio::time::timeout(dur, wait_fut)
+                        .await
+                        .map_err(|_| "timed out awaiting deleteUndo expiry".to_owned())?;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "answer_confirm" => {
+                    let ok = args.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                    if is_u13 {
+                        let confirm_id = if let Some(explicit) = args
+                            .get("confirm")
+                            .and_then(|c| c.get("id"))
+                            .and_then(Value::as_str)
+                        {
+                            explicit.to_owned()
+                        } else {
+                            core.full_snapshot()
+                                .await
+                                .and_then(|s| s.composer_confirm)
+                                .map(|c| c.id)
+                                .unwrap_or_default()
+                        };
+                        core.request_unit(Command::AnswerComposerConfirm { confirm_id, ok })
+                            .await;
+                        tokio::task::yield_now().await;
+                        tokio::task::yield_now().await;
+                    } else {
+                        let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                        core.request_unit(Command::AnswerMessageConfirm { ok, now_ms: ts_ms })
+                            .await;
+                        if pending_send_task.is_none() && pending_action_task.is_none() {
+                            let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
+                                .await;
+                        }
+                    }
+                }
+                "star" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let on = args.get("on").and_then(Value::as_bool).unwrap_or(true);
+                    core.request_unit(Command::SetStarred {
+                        conv_id,
+                        msg_id,
+                        on,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "load_auto_delete" => {
+                    core.request_unit(Command::LoadAutoDelete).await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "set_auto_delete" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let ttl = args.get("ttl").and_then(Value::as_i64).unwrap_or(0);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    core.request_unit(Command::SetAutoDelete {
+                        conv_id,
+                        ttl,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "prune_expired" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    prune_next_expiry_ms = core
+                        .request_opt_i64(Command::PruneExpiredMessages {
+                            conv_id,
+                            now_ms: ts_ms,
+                        })
+                        .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                // U12 polls domain commands
+                "watch_poll" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let conv_id = str_arg(args, "conv_id");
+                    let ts_ms = host.virtual_now_ms();
+                    core.request_unit(Command::WatchPoll {
+                        id,
+                        conv_id,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "retry_poll" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let conv_id = str_arg(args, "conv_id");
+                    let ts_ms = host.virtual_now_ms();
+                    core.request_unit(Command::RetryPoll {
+                        id,
+                        conv_id,
+                        now_ms: ts_ms,
+                    })
+                    .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "rewatch_polls" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let ts_ms = host.virtual_now_ms();
+                    core.request_unit(Command::RewatchPolls { now_ms: ts_ms })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "refresh_poll" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let ts_ms = host.virtual_now_ms();
+                    core.request_unit(Command::RefreshPoll { id, now_ms: ts_ms })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "poll_voters" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let voters = core.request_poll_voters(id).await;
+                    let val = match voters {
+                        None => Value::Null,
+                        Some(v) => {
+                            let groups: Vec<Value> = v
+                                .groups
+                                .iter()
+                                .map(|g| {
+                                    let users: Vec<Value> = g
+                                        .users
+                                        .iter()
+                                        .map(|u| {
+                                            json!({
+                                                "uid": u.uid,
+                                                "name": u.name,
+                                                "avatar": u.avatar,
+                                                "is_me": u.is_me,
+                                            })
+                                        })
+                                        .collect();
+                                    json!({
+                                        "id": g.id,
+                                        "content": g.content,
+                                        "votes": g.votes,
+                                        "users": users,
+                                    })
+                                })
+                                .collect();
+                            json!({
+                                "restricted": v.restricted,
+                                "groups": groups,
+                            })
+                        }
+                    };
+                    u12_results.insert(step_index.to_string(), val);
+                }
+                "refresh_poll_pin" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let conv_id = str_arg(args, "conv_id");
+                    let pin_state = core.request_poll_pin_state(id, conv_id).await;
+                    u12_results.insert(
+                        step_index.to_string(),
+                        encode_u12_poll_pin_state(&pin_state),
+                    );
+                }
+                "pin_poll" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let conv_id = str_arg(args, "conv_id");
+                    let confirming = args
+                        .get("confirming")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let outcome = core.request_poll_pin_outcome(id, conv_id, confirming).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let outcome_json = match outcome {
+                        olaz_core::PollPinOutcome::Done => json!({ "status": "done" }),
+                        olaz_core::PollPinOutcome::NeedsConfirmation(confirm) => json!({
+                            "status": "needs_confirmation",
+                            "ref": confirm.ref_id,
+                            "limit": confirm.limit,
+                            "kind": confirm.kind,
+                            "title": confirm.title,
+                            "message": confirm.message(),
+                        }),
+                        olaz_core::PollPinOutcome::Failed(res) => json!({
+                            "status": "failed",
+                            "ok": res.ok,
+                            "error": res.error,
+                            "pin_skipped": res.pin_skipped,
+                            "message": res.message(olaz_core::PollAction::Pin),
+                        }),
+                    };
+                    u12_results.insert(step_index.to_string(), outcome_json);
+                }
+                "unpin_poll" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let conv_id = str_arg(args, "conv_id");
+                    let res = core
+                        .request_poll_action(Command::UnpinPoll { id, conv_id })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    u12_results.insert(
+                        step_index.to_string(),
+                        json!({
+                            "ok": res.ok,
+                            "error": res.error,
+                            "pin_skipped": res.pin_skipped,
+                            "message": res.message(olaz_core::PollAction::Unpin),
+                        }),
+                    );
+                }
+                "vote_poll" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let conv_id = str_arg(args, "conv_id");
+                    let snap = core.full_snapshot().await.unwrap_or_default();
+                    let detail = if args.get("detail_from").and_then(Value::as_str) == Some("state")
+                    {
+                        snap.polls.details.get(&id).cloned()
+                    } else if let Some(df_obj) = args.get("detail_from").and_then(Value::as_object)
+                    {
+                        olaz_core::PollDetail::from_json(df_obj)
+                    } else {
+                        snap.polls.details.get(&id).cloned()
+                    };
+                    let detail =
+                        detail.ok_or_else(|| format!("vote_poll missing detail for {id}"))?;
+                    let mut draft = olaz_core::PollVoteDraft::new(&detail);
+                    if let Some(toggles) = args
+                        .get("draft")
+                        .and_then(|d| d.get("toggle"))
+                        .and_then(Value::as_array)
+                    {
+                        for item in toggles {
+                            if let Some(opt_id) = item.as_str() {
+                                draft.toggle(opt_id);
+                            }
+                        }
+                    }
+                    if let Some(added_arr) = args
+                        .get("draft")
+                        .and_then(|d| d.get("added"))
+                        .and_then(Value::as_array)
+                    {
+                        for item in added_arr {
+                            let row_id = draft.add_row();
+                            let idx = draft.added.len() - 1;
+                            draft.added[idx].text = item
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned();
+                            let voted = item.get("voted").and_then(Value::as_bool).unwrap_or(false);
+                            draft.set_added_voted(&row_id, voted);
+                        }
+                    }
+                    let (new_opts, voted_ids) = draft.request(&detail);
+                    let new_opts_json: Vec<Value> = new_opts
+                        .iter()
+                        .map(|o| json!({ "content": o.content, "voted": o.voted }))
+                        .collect();
+                    let applied = draft.applied(&detail);
+                    let has_changes = draft.has_changes();
+                    let votes_nothing = draft.votes_nothing();
+                    let has_duplicates = draft.has_duplicates(&detail);
+                    let can_submit = draft.can_submit();
+                    let ts_ms = host.virtual_now_ms();
+                    let res = core
+                        .request_poll_action(Command::VotePoll {
+                            id,
+                            conv_id,
+                            draft,
+                            detail: Some(detail),
+                            now_ms: ts_ms,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    u12_results.insert(
+                        step_index.to_string(),
+                        json!({
+                            "ok": res.ok,
+                            "error": res.error,
+                            "pin_skipped": res.pin_skipped,
+                            "message": res.message(olaz_core::PollAction::Vote),
+                            "request": {
+                                "new_options": new_opts_json,
+                                "voted_ids": voted_ids,
+                            },
+                            "applied": encode_u12_poll_detail(&applied),
+                            "has_changes": has_changes,
+                            "votes_nothing": votes_nothing,
+                            "has_duplicates": has_duplicates,
+                            "can_submit": can_submit,
+                        }),
+                    );
+                }
+                "lock_poll" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let conv_id = str_arg(args, "conv_id");
+                    let ts_ms = host.virtual_now_ms();
+                    let res = core
+                        .request_poll_action(Command::LockPoll {
+                            id,
+                            conv_id,
+                            now_ms: ts_ms,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    u12_results.insert(
+                        step_index.to_string(),
+                        json!({
+                            "ok": res.ok,
+                            "error": res.error,
+                            "pin_skipped": res.pin_skipped,
+                            "message": res.message(olaz_core::PollAction::Lock),
+                        }),
+                    );
+                }
+                "share_poll" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let id = str_arg(args, "id");
+                    let conv_id = str_arg(args, "conv_id");
+                    let res = core
+                        .request_poll_action(Command::SharePoll { id, conv_id })
+                        .await;
+                    u12_results.insert(
+                        step_index.to_string(),
+                        json!({
+                            "ok": res.ok,
+                            "error": res.error,
+                            "pin_skipped": res.pin_skipped,
+                            "message": res.message(olaz_core::PollAction::Share),
+                        }),
+                    );
+                }
+                "create_poll" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let conv_id = str_arg(args, "conv_id");
+                    let can_pin = args
+                        .get("can_pin")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let cfg = olaz_core::PollConfig::from_json(
+                        args.get("config").and_then(Value::as_object),
+                    );
+                    let ts_ms = host.virtual_now_ms();
+                    let mut draft = olaz_core::PollCreateDraft::new(&cfg, ts_ms);
+                    if let Some(d_obj) = args.get("draft").and_then(Value::as_object) {
+                        draft.question = d_obj
+                            .get("question")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        if let Some(opts) = d_obj.get("options").and_then(Value::as_array) {
+                            draft.options = opts
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect();
+                        }
+                        draft.has_deadline = d_obj
+                            .get("has_deadline")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        if let Some(dl_ms) = d_obj.get("deadline_ms").and_then(Value::as_i64) {
+                            draft.deadline_ms = dl_ms;
+                        }
+                        draft.pin = d_obj.get("pin").and_then(Value::as_bool).unwrap_or(false);
+                        draft.multi = d_obj.get("multi").and_then(Value::as_bool).unwrap_or(true);
+                        draft.allow_add = d_obj
+                            .get("allow_add")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true);
+                        draft.hide_preview = d_obj
+                            .get("hide_preview")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        draft.anonymous = d_obj
+                            .get("anonymous")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                    }
+                    let spec = draft.spec(&cfg, can_pin);
+                    let res = core
+                        .request_poll_action(Command::CreatePoll {
+                            conv_id,
+                            draft,
+                            config: cfg,
+                            can_pin,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    u12_results.insert(
+                        step_index.to_string(),
+                        json!({
+                            "ok": res.ok,
+                            "error": res.error,
+                            "pin_skipped": res.pin_skipped,
+                            "message": res.message(olaz_core::PollAction::Create),
+                            "spec": spec,
+                        }),
+                    );
+                }
+                "note_poll_messages" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let conv_id = str_arg(args, "conv_id");
+                    let items: Vec<olaz_core::PollMessageNotice> = args
+                        .get("ids")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|row| olaz_core::PollMessageNotice {
+                                    msg_id: str_arg(row, "id"),
+                                    poll_id: str_arg(row, "poll_id"),
+                                    conv_id: conv_id.clone(),
+                                    date_ms: row
+                                        .get("date_ms")
+                                        .and_then(Value::as_i64)
+                                        .unwrap_or(0),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let ts_ms = host.virtual_now_ms();
+                    core.request_unit(Command::NotePollMessages {
+                        notices: items,
+                        now_ms: ts_ms,
+                        host_already_armed: false,
+                    })
+                    .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "advance_ms" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let ms = args.get("ms").and_then(Value::as_i64).unwrap_or(0);
+                    let (now_after, ready) = host.advance_virtual_clock(ms);
+                    for (poll_id, seq) in ready {
+                        core.request_unit(Command::FirePollDebounce {
+                            poll_id,
+                            seq,
+                            now_ms: now_after,
+                        })
+                        .await;
+                    }
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "poll_state" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    if let Some(j_map) = args.get("json").and_then(Value::as_object).cloned() {
+                        core.request_unit(Command::HandlePollState { state: j_map })
+                            .await;
+                    }
+                }
+                "pins_state" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    if let Some(j_map) = args.get("json").and_then(Value::as_object).cloned() {
+                        core.request_unit(Command::HandlePinsState { state: j_map })
+                            .await;
+                    }
+                }
+                "reset_polls" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    host.clear_virtual_poll_timers();
+                    core.request_unit(Command::ResetPolls { sync_epoch: 0 })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "poll_model_checks" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let checks = args
+                        .get("checks")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let check_results = run_u12_poll_model_checks(checks, &core).await;
+                    u12_results.insert(step_index.to_string(), check_results);
+                }
+                // U11 cloud domain commands
+                "refresh_cloud" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    host.record("refresh_cloud", json!({}));
+                    core.request_unit(Command::RefreshCloud).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "cloud_list" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let conv_id = args
+                        .get("conv_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let kind = args
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .and_then(CloudItemKind::from_raw);
+                    let sort_by_size = args
+                        .get("sort_by_size")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let ascending = args
+                        .get("ascending")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let offset = args.get("offset").and_then(Value::as_i64).unwrap_or(0);
+                    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(60);
+                    let page = core
+                        .request_cloud_page(Command::CloudList {
+                            conv_id,
+                            kind,
+                            sort_by_size,
+                            ascending,
+                            offset,
+                            limit,
+                        })
+                        .await;
+                    results.insert(step_idx.to_string(), encode_cloud_page(&page));
+                }
+                "cloud_fetch" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let key = str_arg(args, "key");
+                    let fetch = core.request_cloud_fetch(Command::CloudFetch { key }).await;
+                    results.insert(step_idx.to_string(), encode_cloud_fetch(&fetch));
+                }
+                "cloud_thumbnail" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let key = str_arg(args, "key");
+                    let thumb = core
+                        .request_media_resolution(Command::CloudThumbnail { key })
+                        .await;
+                    results.insert(step_idx.to_string(), encode_media_resolution(&thumb));
+                }
+                "cloud_delete" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let keys = str_vec_arg(args, "keys");
+                    let res = core
+                        .request_cloud_action(Command::CloudDelete { keys })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    results.insert(step_idx.to_string(), encode_cloud_action_result(&res));
+                }
+                "cloud_set_offload" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let enabled = args
+                        .get("enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let res = core
+                        .request_cloud_action(Command::CloudSetOffload { enabled })
+                        .await;
+                    results.insert(step_idx.to_string(), encode_cloud_action_result(&res));
+                }
+                "reset_cloud" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    core.request_unit(Command::ResetCloud).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                // U13 stickers + composer side-actions commands
+                "sticker_tabs" => {
+                    let tabs = core.request_sticker_tabs().await;
+                    results.insert(step_index.to_string(), encode_sticker_tabs(tabs));
+                }
+                "stickers_in_tab" => {
+                    let id = args.get("id").and_then(Value::as_i64).unwrap_or(0);
+                    let list = core
+                        .request_sticker_entries(Command::StickersInTab { id })
+                        .await;
+                    results.insert(step_index.to_string(), encode_stickers(list));
+                }
+                "search_stickers" => {
+                    let text = str_arg(args, "text");
+                    let list = core
+                        .request_sticker_entries(Command::SearchStickers { text })
+                        .await;
+                    results.insert(step_index.to_string(), encode_stickers(list));
+                }
+                "typing_suggestions" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let text = str_arg(args, "text");
+                    let list = core
+                        .request_sticker_entries(Command::TypingStickerSuggestions {
+                            conv_id,
+                            text,
+                            is_e2ee: None,
+                        })
+                        .await;
+                    results.insert(step_index.to_string(), encode_stickers(list));
+                }
+                "send_sticker" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let st = args.get("sticker").unwrap_or(&Value::Null);
+                    let sticker = StickerEntry {
+                        cate_id: st.get("cate_id").and_then(Value::as_i64).unwrap_or(0),
+                        sticker_id: st.get("id").and_then(Value::as_i64).unwrap_or(0),
+                        url: st
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        animation: None,
+                    };
+                    let source = match args.get("source").and_then(Value::as_str) {
+                        Some("recent") => StickerSource::Recent,
+                        Some("search") => StickerSource::Search,
+                        Some("suggestion") => StickerSource::Suggestion,
+                        _ => StickerSource::Category,
+                    };
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    let client_id = client.next_client_id();
+                    let outcome = core
+                        .request_card_action(Command::SendSticker {
+                            conv_id,
+                            sticker,
+                            source,
+                            client_id,
+                            now_ms: ts_ms,
+                            is_e2ee: None,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    results.insert(step_index.to_string(), encode_card_action_outcome(&outcome));
+                }
+                "sticker_setting" => {
+                    let setting = core
+                        .request_sticker_suggest_setting(Command::StickerSetting)
+                        .await;
+                    results.insert(step_index.to_string(), encode_suggest_setting(setting));
+                }
+                "set_sticker_suggest" => {
+                    let enabled = args.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                    let setting = core
+                        .request_sticker_suggest_setting(Command::SetStickerSuggest { enabled })
+                        .await;
+                    results.insert(step_index.to_string(), encode_suggest_setting(setting));
+                }
+                "my_card" => {
+                    let info = core.request_my_card().await;
+                    results.insert(step_index.to_string(), encode_my_card(info));
+                }
+                "send_my_card" => {
+                    // Drain any in-flight boot HTTP/host work so `send_e2ee_contact_card`
+                    // lands deterministically after `start_bootstrap` in both Rust and Swift.
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let conv_id = str_arg(args, "conv_id");
+                    let with_phone = args
+                        .get("with_phone")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    let outcome = core
+                        .request_composer_outcome(Command::SendMyCard {
+                            conv_id,
+                            with_phone,
+                            client_id: None,
+                            now_ms: ts_ms,
+                            is_e2ee: None,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    results.insert(step_index.to_string(), encode_composer_outcome(&outcome));
+                }
+                "reminder_info" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let info = core.request_reminder_info(conv_id).await;
+                    results.insert(step_index.to_string(), encode_reminder_info(info));
+                }
+                "create_reminder" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let title = str_arg(args, "title");
+                    let start_ms = args.get("start_ms").and_then(Value::as_i64).unwrap_or(0);
+                    let repeat_mode = args.get("repeat").and_then(Value::as_i64).unwrap_or(0);
+                    let pin = args.get("pin").and_then(Value::as_bool).unwrap_or(false);
+                    let outcome = core
+                        .request_composer_outcome(Command::CreateReminder {
+                            conv_id,
+                            title,
+                            start_ms,
+                            repeat_mode,
+                            pin,
+                        })
+                        .await;
+                    results.insert(step_index.to_string(), encode_composer_outcome(&outcome));
+                }
+                "advance_confirm_ms" => {
+                    let ms = args.get("ms").and_then(Value::as_u64).unwrap_or(0);
+                    host.advance_confirm_ms(ms);
+                    tokio::task::yield_now().await;
+                    tokio::task::yield_now().await;
+                    let _ = core.settle().await;
+                }
+                "drop_confirms" => {
+                    core.request_unit(Command::DropComposerConfirms).await;
+                }
+                "composer_report" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let outcome = args
+                        .get("outcome")
+                        .map_or(ComposerOutcome::Done, decode_composer_outcome);
+                    core.request_unit(Command::ComposerReport { conv_id, outcome })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
                 other => return Err(format!("unknown step cmd: {other}")),
             },
             Step::Await {
@@ -3896,7 +7381,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             }
             Step::Snapshot { snapshot } => {
                 if is_u3 {
-                    if pending_send_task.is_some() {
+                    if pending_send_task.is_some() || pending_action_task.is_some() {
                         inner_runner.flush_host().await;
                         let _ = core.settle().await;
                         inner_runner.flush_store().await;
@@ -3909,11 +7394,28 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 if let Some(snap) = capture_case_snapshot(
                     &core,
                     &host,
-                    is_u3,
-                    is_u4,
-                    is_u5,
-                    last_send_result,
-                    &send_logs,
+                    &SnapshotOpts {
+                        is_u3,
+                        is_u4,
+                        is_u5,
+                        is_u6,
+                        is_u8,
+                        is_u12,
+                        is_u11,
+                        is_u13,
+                        is_u14,
+                        last_send_result,
+                        send_logs: &send_logs,
+                        prune_next_expiry_ms,
+                        action_logs: &action_logs,
+                        selection: selection.as_ref(),
+                        forward_results: &forward_results,
+                        u12_results: &u12_results,
+                        watched_check_ids: case.seed.watched_check_ids.as_deref(),
+                        seeded_member_cache: case.seed.group_member_cache.as_ref(),
+                        results: &results,
+                        search_results: &search_results,
+                    },
                 )
                 .await
                 {
@@ -3948,14 +7450,36 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             .map_err(|e| format!("trailing send task join error: {e}"))?;
         last_send_result = Some(ok);
     }
+    if let Some(handle) = pending_action_task.take() {
+        handle
+            .await
+            .map_err(|e| format!("trailing action task join error: {e}"))?;
+    }
     let final_state = capture_case_snapshot(
         &core,
         &host,
-        is_u3,
-        is_u4,
-        is_u5,
-        last_send_result,
-        &send_logs,
+        &SnapshotOpts {
+            is_u3,
+            is_u4,
+            is_u5,
+            is_u6,
+            is_u8,
+            is_u12,
+            is_u11,
+            is_u13,
+            is_u14,
+            last_send_result,
+            send_logs: &send_logs,
+            prune_next_expiry_ms,
+            action_logs: &action_logs,
+            selection: selection.as_ref(),
+            forward_results: &forward_results,
+            u12_results: &u12_results,
+            watched_check_ids: case.seed.watched_check_ids.as_deref(),
+            seeded_member_cache: case.seed.group_member_cache.as_ref(),
+            results: &results,
+            search_results: &search_results,
+        },
     )
     .await
     .ok_or_else(|| "actor stopped before final snapshot".to_owned())?;

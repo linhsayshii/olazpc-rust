@@ -65,6 +65,7 @@ extension ZaloEngine {
         hostTrace = nil
         sendE2EETextHostHandler = nil
         sendE2EEStickerHostHandler = nil
+        sendE2EEContactCardHostHandler = nil
         resolveMediaHostHandler = nil
         resolveFileHostHandler = nil
         fetchMediaDataHostHandler = nil
@@ -86,11 +87,14 @@ extension ZaloEngine {
         mediaResolver.now = { Date() }
         traceU4HostEnabled = false
         stateTrace = nil
+        transportSettleTrace = nil
         EngineLog.shared.onAppend = nil
-        stopCoreEngine()
+        pendingCoreCommands.removeAll()
         bootTask?.cancel()
         qrTask?.cancel()
         transferTask?.cancel()
+        batchImportTask?.cancel()
+        activeSyncBatchTasks.values.forEach { $0.cancel() }
         e2eePrepareTask?.cancel()
         webkitMigrateTask?.cancel()
         openConversationTask?.cancel()
@@ -112,10 +116,19 @@ extension ZaloEngine {
         composerConfirmTask = nil
         resetPolls()
         pollRefreshTasks.values.forEach { $0.cancel() }
+        pollRefreshTasks.removeAll()
         cloudRefreshTask?.cancel()
         cloudRefreshTask = nil
+        optimisticOverlayFenceTasks.values.forEach { $0.cancel() }
+        optimisticOverlayFenceTasks.removeAll()
+        composerConfirmSleep = nil
+        composerConfirmTask?.cancel()
+        composerConfirmTask = nil
         typingResetTasks.values.forEach { $0.cancel() }
         typingResetTasks = [:]
+        callBridge?.shutdown()
+        callBridge = nil
+        failAllMirrorWaiters()
     }
 
     internal func settleForRecording() async {
@@ -130,6 +143,19 @@ extension ZaloEngine {
         guard let core else { return }
         guard let version = try? await core.settle() else { return }
         await waitForMirrorVersion(version)
+        while !optimisticOverlayFenceTasks.isEmpty {
+            let pending = Array(optimisticOverlayFenceTasks.values)
+            for task in pending {
+                await task.value
+            }
+        }
+        if let maxResolved = optimisticMessageOverlays
+            .map(\.resolvedVersion)
+            .filter({ $0 != UInt64.max })
+            .max(),
+           appliedMirrorVersion < maxResolved {
+            await waitForMirrorVersion(maxResolved)
+        }
     }
 
     internal func awaitMarkReadTasksForRecording() async {
@@ -167,10 +193,20 @@ extension ZaloEngine {
     }
 
     internal func awaitMessageActionTasksForRecording() async {
+        await settleForRecording()
         while !messageActionTasks.isEmpty {
             let tasks = Array(messageActionTasks.values)
             messageActionTasks.removeAll()
             for task in tasks { _ = await task.value }
+        }
+        if let core = coreLifecycle.core {
+            if phase == .ready, activeSendTask == nil {
+                if let v = try? await core.waitIdle() {
+                    await waitForMirrorVersion(v)
+                }
+            } else if let v = try? await core.settle() {
+                await waitForMirrorVersion(v)
+            }
         }
         _ = await persistConversationsTask?.value
     }
@@ -190,6 +226,9 @@ extension ZaloEngine {
             pollRefreshTasks.removeAll()
             for task in tasks { _ = await task.value }
         }
+        if let core = coreLifecycle.core {
+            await drainCorePollWork(core)
+        }
         _ = await persistConversationsTask?.value
     }
 
@@ -203,16 +242,39 @@ extension ZaloEngine {
 
     internal func finishTearDownForRecording() async {
         await sessionClient.setSessionTrace(nil)
+        if let initTask = coreInitTask {
+            _ = await initTask.value
+            coreInitTask = nil
+        }
+        await coreLifecycle.shutdownAsync()
+        await webSocket.detachCore()
+        failAllMirrorWaiters()
+
         _ = await bootTask?.value
+        bootTask = nil
         _ = await qrTask?.value
+        qrTask = nil
+        _ = await transferTask?.value
+        transferTask = nil
+        _ = await batchImportTask?.value
+        batchImportTask = nil
+        while !activeSyncBatchTasks.isEmpty {
+            let tasks = Array(activeSyncBatchTasks.values)
+            activeSyncBatchTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
         _ = await e2eePrepareTask?.value
         e2eePrepareTask = nil
         _ = await webkitMigrateTask?.value
         webkitMigrateTask = nil
         _ = await openConversationTask?.value
+        openConversationTask = nil
         _ = await loadOlderTask?.value
+        loadOlderTask = nil
         _ = await activeSendTask?.value
+        activeSendTask = nil
         _ = await notifyTypingTask?.value
+        notifyTypingTask = nil
         while !markReadTasks.isEmpty {
             let tasks = Array(markReadTasks.values)
             markReadTasks.removeAll()
@@ -228,6 +290,11 @@ extension ZaloEngine {
             messageActionTasks.removeAll()
             for task in tasks { _ = await task.value }
         }
+        while !optimisticOverlayFenceTasks.isEmpty {
+            let tasks = Array(optimisticOverlayFenceTasks.values)
+            optimisticOverlayFenceTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
         while !pollRefreshTasks.isEmpty {
             let tasks = Array(pollRefreshTasks.values)
             pollRefreshTasks.removeAll()
@@ -235,7 +302,11 @@ extension ZaloEngine {
         }
         _ = await cloudRefreshTask?.value
         _ = await persistConversationsTask?.value
+        persistConversationsTask = nil
         _ = await pendingCleanupTask?.value
+        pendingCleanupTask = nil
+        await phoneSync.resetAll()
+        await e2eeManager.reset()
         await webSocket.stop()
         let oldStore = sqliteStore
         sqliteStore = nil

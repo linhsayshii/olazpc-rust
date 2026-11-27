@@ -1340,8 +1340,12 @@ actor ZaloPhoneSyncCoordinator {
         identityKey
     }
 
-    func resetAll() {
+    func resetAll() async {
         activeRequests.removeAll()
+        wasmReady = false
+        let oldRuntime = jsRuntime
+        jsRuntime = nil
+        await oldRuntime?.close()
     }
 
     func activeSyncIds() -> [String] {

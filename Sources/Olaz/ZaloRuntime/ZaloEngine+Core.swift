@@ -87,12 +87,19 @@ final class CoreEngineLifecycle: Sendable {
     /// Installs a freshly created `CoreEngine` and its change-stream task. Returns `false` if
     /// `shutdown()` was already called before installation completed.
     func install(core: CoreEngine, changeTask: Task<Void, Never>) -> Bool {
-        state.withLock { st in
-            guard !st.isShutDown else { return false }
+        let (installed, previousCore, previousTask): (Bool, CoreEngine?, Task<Void, Never>?) = state.withLock { st in
+            guard !st.isShutDown else { return (false, nil, nil) }
+            let oldCore = st.core
+            let oldTask = st.changeTask
             st.core = core
             st.changeTask = changeTask
-            return true
+            return (true, oldCore, oldTask)
         }
+        previousTask?.cancel()
+        if let previousCore, previousCore !== core {
+            previousCore.stop()
+        }
+        return installed
     }
 
     /// Replaces the gate in `slot`, finishing any previous gate. Returns `nil` if already shut down.
@@ -187,6 +194,61 @@ final class CoreEngineLifecycle: Sendable {
             gate.finish()
         }
     }
+
+    /// Stops the Rust actor, awaits its task + socket + host worker exit, awaits the change-mirror
+    /// task exit, and finishes all active gates so scenario teardown leaves zero lingering tasks.
+    func shutdownAsync() async {
+        let (core, task, gates): (CoreEngine?, Task<Void, Never>?, [CorePhaseGate]) = state.withLock { st in
+            st.isShutDown = true
+            let c = st.core
+            let t = st.changeTask
+            let g = [st.bootGate, st.qrGate, st.cleanupGate].compactMap { $0 }
+            st.core = nil
+            st.changeTask = nil
+            st.bootGate = nil
+            st.qrGate = nil
+            st.cleanupGate = nil
+            return (c, t, g)
+        }
+        core?.stop()
+        for gate in gates {
+            gate.finish()
+        }
+        await task?.value
+    }
+}
+
+/// Version-fenced MainActor overlay for optimistic U6 message actions (react, delete-for-me,
+/// undo-delete, star). Prevents an older `CoreChangesRecord` (`batch.version < resolvedVersion`)
+/// from reverting a newer optimistic UI change before core's authoritative batch arrives, while
+/// snapshotting suppressed authoritative values so that if core's authoritative batch (including an
+/// API error rollback) arrives before `resolveOptimisticOverlay` receives its target version, the
+/// authoritative state is immediately reconciled on resolution.
+internal struct OptimisticMessageOverlay {
+    enum Kind {
+        case reaction(msgId: String, clientId: String, reactions: [ChatMessage.Reaction])
+        case delete(msgIds: Set<String>, undo: DeleteUndo)
+        case undoDelete(restored: [ChatMessage])
+        case star(msgId: String, on: Bool)
+    }
+
+    let token: UUID
+    let convId: String
+    var kind: Kind
+    var resolvedVersion: UInt64 = .max
+
+    var suppressedReactionsVersion: UInt64 = 0
+    var suppressedReactions: [ChatMessage.Reaction]?
+    var suppressedMessagesVersion: UInt64 = 0
+    var suppressedRestored: [ChatMessage] = []
+    var suppressedRemovedIds: Set<String> = []
+    var suppressedUndoVersion: UInt64 = 0
+    var suppressedHasUndo: Bool = false
+    var suppressedUndo: DeleteUndo?
+    var suppressedStarMsgVersion: UInt64 = 0
+    var suppressedStarMsg: (starred: Bool, menuStar: MessageMenu.Star?)?
+    var suppressedStarSetVersion: UInt64 = 0
+    var suppressedStarInSet: Bool?
 }
 
 /// Commands queued on the MainActor while `CoreEngine` completes its one-time async creation.
@@ -373,20 +435,23 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         eventId: String,
         reactClientId: String,
         senderName: String
-    ) async {
-        guard let engine else { return }
+    ) async -> Bool {
+        guard let engine else { return false }
+        guard engine.hasU4HostTrace else { return true }
         await engine.waitForCoreMirrorDrain()
-        await engine.applyRemoteReaction(
-            convId: convId,
-            msgId: msgId,
-            cliMsgId: cliMsgId,
-            senderId: senderId,
-            rType: rType,
-            rIcon: rIcon,
-            eventId: eventId,
-            reactClientId: reactClientId,
-            senderName: senderName
-        )
+        return await MainActor.run {
+            engine.traceU4Host("apply_remote_reaction", args: [
+                "conv_id": convId,
+                "msg_id": msgId,
+                "cli_msg_id": cliMsgId,
+                "sender_id": senderId,
+                "r_type": rType,
+                "r_icon": rIcon,
+                "event_id": eventId,
+                "react_client_id": reactClientId,
+                "sender_name": senderName,
+            ])
+        }
     }
 
     func applyRemoteRecall(
@@ -395,16 +460,17 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         cliMsgId: String,
         updateConversationPreview: Bool,
         persistConversations: Bool
-    ) async {
-        guard let engine else { return }
+    ) async -> Bool {
+        guard let engine else { return false }
+        guard engine.hasU4HostTrace else { return true }
         await engine.waitForCoreMirrorDrain()
-        _ = await engine.applyRemoteRecall(
-            convId: convId,
-            msgId: msgId,
-            cliMsgId: cliMsgId,
-            updateConversationPreview: updateConversationPreview,
-            persistConversations: persistConversations
-        )
+        return await MainActor.run {
+            engine.traceU4Host("apply_remote_recall", args: [
+                "conv_id": convId,
+                "msg_id": msgId,
+                "cli_msg_id": cliMsgId,
+            ])
+        }
     }
 
     func applyRemoteDelete(
@@ -413,16 +479,17 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         cliMsgId: String,
         updateConversationPreview: Bool,
         persistConversations: Bool
-    ) async {
-        guard let engine else { return }
+    ) async -> Bool {
+        guard let engine else { return false }
+        guard engine.hasU4HostTrace else { return true }
         await engine.waitForCoreMirrorDrain()
-        _ = await engine.applyRemoteDelete(
-            convId: convId,
-            msgId: msgId,
-            cliMsgId: cliMsgId,
-            updateConversationPreview: updateConversationPreview,
-            persistConversations: persistConversations
-        )
+        return await MainActor.run {
+            engine.traceU4Host("apply_remote_delete", args: [
+                "conv_id": convId,
+                "msg_id": msgId,
+                "cli_msg_id": cliMsgId,
+            ])
+        }
     }
 
     func decryptEnvelope(payloadJson: String) async -> String {
@@ -647,6 +714,474 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
             text: text,
             clientId: clientId,
             quote: quote
+        )
+    }
+
+    func armPollDebounce(pollId: String, seq: UInt64, delayMs: UInt64) async -> Bool {
+        guard let engine else { return false }
+        await MainActor.run {
+            PollClock.pendingRefresh[pollId] = seq
+            if seq > PollClock.nextDebounceSeq {
+                PollClock.nextDebounceSeq = seq
+            }
+            engine.armLocalPollDebounceTask(pollId: pollId, seq: seq, delayMs: delayMs)
+        }
+        return true
+    }
+
+    func cancelAllPollDebounces() async {
+        await MainActor.run {
+            PollClock.refreshTasks.values.forEach { $0.cancel() }
+            PollClock.refreshTasks = [:]
+            PollClock.pendingRefresh = [:]
+        }
+    }
+
+    // MARK: - Forward & Message Action Host Effects (U6/U8)
+
+    func showCard(convId: String?, text: String) async {
+        guard let engine else { return }
+        await engine.waitForCoreMirrorDrain()
+        await MainActor.run {
+            engine.showActionCard(text, in: convId)
+        }
+    }
+
+    func sendE2eeSticker(
+        convId: String,
+        cateId: Int64,
+        stickerId: Int64,
+        clientId: String
+    ) async -> E2eeStickerSendOutcomeRecord {
+        guard let engine else { return .e2eeFailed }
+        return await engine.hostSendE2EESticker(
+            convId: convId,
+            cateId: cateId,
+            stickerId: stickerId,
+            clientId: clientId
+        )
+    }
+
+    func sendE2eeContactCard(
+        convId: String,
+        clientId: String,
+        contactUid: String,
+        title: String,
+        phone: String,
+        avatar: String,
+        qrCodeUrl: String
+    ) async -> E2eeSendOutcomeRecord {
+        guard let engine else { return .aborted }
+        return await engine.hostSendE2EEContactCard(
+            convId: convId,
+            clientId: clientId,
+            contactUid: contactUid,
+            title: title,
+            phone: phone,
+            avatar: avatar,
+            qrCodeUrl: qrCodeUrl
+        )
+    }
+
+    func sleepConfirmPromote(delayMs: UInt64) async {
+        guard let engine else { return }
+        await engine.hostSleepConfirmPromote(delayMs: delayMs)
+    }
+
+    func resolveMedia(convId: String, msgId: String, kind: String) async -> MediaResolutionRecord {
+        guard let engine else { return .unavailable }
+        return await engine.hostResolveMedia(convId: convId, msgId: msgId, kind: kind)
+    }
+
+    func resolveFile(convId: String, msgId: String, name: String, url: String?) async -> FileResolutionRecord {
+        guard let engine else { return .expired }
+        return await engine.hostResolveFile(convId: convId, msgId: msgId, name: name, url: url)
+    }
+
+    func fetchMediaData(url: String) async -> String? {
+        guard let engine else { return nil }
+        return await engine.hostFetchMediaData(url: url)
+    }
+
+    func sendMedia(convId: String, paths: [String], cleanupAfter: Bool) async -> ComposerSendOutcomeRecord {
+        guard let engine else { return .cancelled }
+        return await engine.hostSendMedia(convId: convId, paths: paths, cleanupAfter: cleanupAfter)
+    }
+
+    func sendFiles(convId: String, paths: [String]) async -> ComposerSendOutcomeRecord {
+        guard let engine else { return .cancelled }
+        return await engine.hostSendFiles(convId: convId, paths: paths)
+    }
+}
+
+extension ForwardRequest {
+    init(coreRecord record: ForwardRequestRecord) {
+        var bytes: uuid_t = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        let v = record.id.bigEndian
+        bytes.8 = UInt8((v >> 56) & 0xFF)
+        bytes.9 = UInt8((v >> 48) & 0xFF)
+        bytes.10 = UInt8((v >> 40) & 0xFF)
+        bytes.11 = UInt8((v >> 32) & 0xFF)
+        bytes.12 = UInt8((v >> 24) & 0xFF)
+        bytes.13 = UInt8((v >> 16) & 0xFF)
+        bytes.14 = UInt8((v >> 8) & 0xFF)
+        bytes.15 = UInt8(v & 0xFF)
+        self.init(
+            id: UUID(uuid: bytes),
+            conversationId: record.conversationId,
+            message: ChatMessage(record: record.message),
+            more: record.more.map(ChatMessage.init(record:))
+        )
+    }
+}
+
+// MARK: - U11 Cloud FFI Record Conversions
+
+extension CloudState.PlanKind {
+    init(coreRecord record: CloudPlanKindRecord) {
+        switch record {
+        case .paid: self = .paid
+        case .free: self = .free
+        case .grace: self = .grace
+        case .afterGrace: self = .afterGrace
+        }
+    }
+}
+
+extension CloudItemKind {
+    init(coreRecord record: CloudItemKindRecord) {
+        switch record {
+        case .photo: self = .photo
+        case .video: self = .video
+        case .file: self = .file
+        case .voice: self = .voice
+        case .other: self = .other
+        }
+    }
+
+    var coreRecord: CloudItemKindRecord {
+        switch self {
+        case .photo: .photo
+        case .video: .video
+        case .file: .file
+        case .voice: .voice
+        case .other: .other
+        }
+    }
+}
+
+extension CloudBreakdown {
+    init(coreRecord record: CloudBreakdownRecord) {
+        self.init(
+            photo: record.photo,
+            video: record.video,
+            file: record.file,
+            voice: record.voice
+        )
+    }
+}
+
+extension CloudState.Plan {
+    init(coreRecord record: CloudPlanRecord) {
+        self.init(
+            kind: CloudState.PlanKind(coreRecord: record.kind),
+            name: record.name,
+            quota: record.quota,
+            usage: record.usage,
+            family: record.family,
+            cloudMedia: record.cloudMedia,
+            messageBackup: record.messageBackup,
+            myCloud: record.myCloud,
+            expireAt: record.expireAtMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) },
+            autoRenew: record.autoRenew,
+            months: Int(record.months),
+            hasKey: record.hasKey,
+            backupMedia: record.backupMedia,
+            backupMyCloud: record.backupMyCloud,
+            backupMessages: record.backupMessages,
+            fileLimit: record.fileLimit
+        )
+    }
+}
+
+extension CloudState.Conversation {
+    init(coreRecord record: CloudConversationRecord) {
+        self.init(
+            id: record.id,
+            name: record.name,
+            avatar: record.avatar.flatMap { $0.isEmpty ? nil : URL(string: $0) },
+            isGroup: record.isGroup,
+            total: record.total,
+            lastActivity: record.lastActivityMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) }
+        )
+    }
+}
+
+extension CloudState.Settings {
+    init(coreRecord record: CloudSettingsRecord) {
+        self.init(
+            offloadEnabled: record.offloadEnabled,
+            offloadAvailable: record.offloadAvailable,
+            lastOffloadAt: record.lastOffloadAtMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) },
+            lastOffloadSize: record.lastOffloadSize,
+            ttlDays: Int(record.ttlDays)
+        )
+    }
+}
+
+extension CloudState {
+    init(coreRecord record: CloudStateRecord) {
+        self.init(
+            plan: record.plan.map(CloudState.Plan.init(coreRecord:)),
+            media: CloudBreakdown(coreRecord: record.media),
+            myCloudTypes: CloudBreakdown(coreRecord: record.myCloudTypes),
+            conversations: record.conversations.map(CloudState.Conversation.init(coreRecord:)),
+            settings: CloudState.Settings(coreRecord: record.settings),
+            changed: Int(record.changed),
+            loaded: record.loaded,
+            hiddenLookup: record.hiddenLookup,
+            selfId: record.selfId
+        )
+    }
+}
+
+extension CloudItem {
+    init(coreRecord record: CloudItemRecord) {
+        self.init(
+            id: record.id,
+            kind: CloudItemKind(coreRecord: record.kind),
+            conversationId: record.conversationId,
+            conversationName: record.conversationName,
+            size: record.size,
+            date: record.dateMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) },
+            title: record.title,
+            ext: record.ext,
+            duration: record.duration,
+            width: Int(record.width),
+            height: Int(record.height)
+        )
+    }
+}
+
+extension CloudPage {
+    init(coreRecord record: CloudPageRecord) {
+        self.init(
+            items: record.items.map(CloudItem.init(coreRecord:)),
+            hasMore: record.hasMore,
+            error: record.error
+        )
+    }
+}
+
+extension CloudFile {
+    init(coreRecord record: CloudFileRecord) {
+        self.init(
+            url: URL(fileURLWithPath: record.path),
+            kind: CloudItemKind(coreRecord: record.kind),
+            title: record.title,
+            ext: record.ext,
+            size: record.size,
+            date: record.dateMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) }
+        )
+    }
+}
+
+extension CloudFetch {
+    init(coreRecord record: CloudFetchRecord) {
+        switch record {
+        case .ready(let file):
+            self = .ready(CloudFile(coreRecord: file))
+        case .expired:
+            self = .expired
+        case .failed(let message):
+            self = .failed(message)
+        }
+    }
+}
+
+extension CloudActionResult {
+    init(coreRecord record: CloudActionResultRecord) {
+        self.init(
+            ok: record.ok,
+            deleted: record.deleted,
+            failed: record.failed,
+            error: record.error
+        )
+    }
+}
+
+extension MediaResolution {
+    init(coreRecord record: MediaResolutionRecord) {
+        switch record {
+        case .file(let path):
+            self = .file(URL(fileURLWithPath: path))
+        case .expired:
+            self = .expired
+        case .unsupported:
+            self = .unsupported
+        case .unavailable:
+            self = .unavailable
+        }
+    }
+}
+
+extension StickerAnimation {
+    init?(coreRecord record: StickerAnimationRecord) {
+        switch record {
+        case .sprite(let url, let frames, let frameMs):
+            guard let parsed = URL(string: url) else { return nil }
+            self = .sprite(url: parsed, frames: Int(frames), frameMs: Int(frameMs))
+        case .animated(let url):
+            guard let parsed = URL(string: url) else { return nil }
+            self = .animated(url: parsed)
+        }
+    }
+
+    var coreRecord: StickerAnimationRecord {
+        switch self {
+        case .sprite(let url, let frames, let frameMs):
+            return .sprite(url: url.absoluteString, frames: Int64(frames), frameMs: Int64(frameMs))
+        case .animated(let url):
+            return .animated(url: url.absoluteString)
+        }
+    }
+}
+
+extension StickerEntry {
+    init?(coreRecord record: StickerEntryRecord) {
+        guard let url = URL(string: record.url) else { return nil }
+        self.init(
+            cateId: Int(record.cateId),
+            stickerId: Int(record.stickerId),
+            url: url,
+            animation: record.animation.flatMap(StickerAnimation.init(coreRecord:))
+        )
+    }
+
+    var coreRecord: StickerEntryRecord {
+        StickerEntryRecord(
+            cateId: Int64(cateId),
+            stickerId: Int64(stickerId),
+            url: url.absoluteString,
+            animation: animation?.coreRecord
+        )
+    }
+}
+
+extension MessageActionOutcome {
+    init(forwardRecord record: ForwardOutcomeRecord) {
+        switch record {
+        case .done(let text):
+            self = .done(text: text)
+        case .pending(let text):
+            self = .pending(text)
+        case .failed(let text):
+            self = .failed(text)
+        }
+    }
+}
+
+extension StickerTab {
+    init(coreRecord record: StickerTabRecord) {
+        self.init(
+            id: Int(record.id),
+            name: record.name,
+            icon: record.icon.flatMap(URL.init(string:)),
+            count: Int(record.count)
+        )
+    }
+}
+
+extension StickerSuggestSetting {
+    init(coreRecord record: StickerSuggestSettingRecord) {
+        self.enabled = record.enabled
+        self.debounce = Int(record.debounce)
+    }
+}
+
+extension StickerSource {
+    var coreRecord: StickerSourceRecord {
+        switch self {
+        case .category: return .category
+        case .recent: return .recent
+        case .search: return .search
+        case .suggestion: return .suggestion
+        }
+    }
+}
+
+extension CardActionOutcome {
+    init(coreRecord record: CardActionOutcomeRecord) {
+        switch record {
+        case .done: self = .done
+        case .openChat(let id): self = .openChat(id)
+        case .openProfile(let uid): self = .openProfile(uid)
+        case .openUrl(let url):
+            self = URL(string: url).map(Self.openURL) ?? .failed("Không thực hiện được thao tác.")
+        case .copy(let text): self = .copy(text)
+        case .present: self = .unsupported(Self.defaultUnsupported)
+        case .unsupported(let text): self = .unsupported(text)
+        case .locked(let text): self = .locked(text)
+        case .failed(let text): self = .failed(text)
+        case .pending(let text): self = .pending(text)
+        }
+    }
+}
+
+extension ComposerOutcome {
+    init(coreRecord record: ComposerOutcomeRecord) {
+        switch record {
+        case .done: self = .done
+        case .cancelled: self = .cancelled
+        case .failed(let text): self = .failed(text)
+        case .pending(let text): self = .pending(text)
+        }
+    }
+}
+
+extension MyCardInfo {
+    init(coreRecord record: MyCardInfoRecord) {
+        self.uid = record.uid
+        self.name = record.name
+        self.avatar = record.avatar.flatMap { $0.isEmpty ? nil : URL(string: $0) }
+        self.phone = record.phone
+        self.withPhone = record.withPhone
+    }
+}
+
+extension ReminderComposeInfo {
+    init(coreRecord record: ReminderComposeInfoRecord) {
+        self.allowed = record.allowed
+        self.hidden = record.hidden
+        self.text = record.text
+        self.isGroup = record.isGroup
+        self.canPin = record.canPin
+        self.pinToggle = record.pinToggle
+        self.titleMaxChars = Int(record.titleMaxChars)
+        self.titleMaxBytes = Int(record.titleMaxBytes)
+    }
+}
+
+extension ComposerConfirm {
+    init(coreRecord record: ComposerConfirmRecord) {
+        self.init(
+            id: record.id,
+            conversationId: record.convId,
+            title: record.title,
+            message: record.message,
+            ok: record.ok,
+            cancel: record.cancel
+        )
+    }
+
+    var coreRecord: ComposerConfirmRecord {
+        ComposerConfirmRecord(
+            id: id,
+            convId: conversationId,
+            title: title,
+            message: message,
+            ok: ok,
+            cancel: cancel
         )
     }
 }
@@ -916,16 +1451,30 @@ extension ZaloEngine {
                 return nil
             }
 
+            await self.webSocket.attachCore(core)
+            guard !self.coreLifecycle.isShutDown else {
+                await self.webSocket.detachCore()
+                core.stop()
+                self.pendingCoreCommands.removeAll()
+                self.failAllMirrorWaiters()
+                self.coreLifecycle.finishAllGates()
+                return nil
+            }
+
+            self.appliedMirrorVersion = 0
             let lifecycle = self.coreLifecycle
             let changeTask = Task { @MainActor [weak self, core, lifecycle] in
                 defer {
-                    lifecycle.finishAllGates()
-                    self?.failAllMirrorWaiters()
+                    if lifecycle.core === core || lifecycle.core == nil {
+                        lifecycle.finishAllGates()
+                        self?.failAllMirrorWaiters()
+                    }
                 }
                 while !Task.isCancelled {
                     do {
                         guard let batch = try await core.nextChanges() else { break }
-                        guard let self else { break }
+                        guard !Task.isCancelled else { break }
+                        guard let self, self.coreLifecycle.core === core else { break }
                         self.applyCoreChanges(batch)
                     } catch {
                         break
@@ -933,7 +1482,6 @@ extension ZaloEngine {
                 }
             }
 
-            await self.webSocket.attachCore(core)
             guard self.coreLifecycle.install(core: core, changeTask: changeTask) else {
                 await self.webSocket.detachCore()
                 changeTask.cancel()
@@ -948,7 +1496,10 @@ extension ZaloEngine {
             if let store = self.sqliteStore {
                 core.attachStore(store: store.coreStoreHandle)
             }
-            core.updateIdentities(table: self.currentIdentityTableRecord())
+            self.sendIdentitiesToCore(core, force: true)
+            if !self.seenReactionEventOrder.isEmpty {
+                core.seedSeenReactionKeys(keys: self.seenReactionEventOrder)
+            }
             self.pushCoreContactsIfRunning()
             self.pushCoreHistoryFreshnessIfRunning()
             if let openId = self.openConversationId {
@@ -973,6 +1524,36 @@ extension ZaloEngine {
                 for (convId, ttl) in autoDel where ttl > 0 {
                     core.setAutoDeleteTtl(convId: convId, ttlMs: ttl)
                 }
+            }
+            if self.composerConfirm != nil || !self.queuedComposerConfirms.isEmpty {
+                core.seedComposerConfirms(
+                    active: self.composerConfirm?.coreRecord,
+                    queued: self.queuedComposerConfirms.map(\.coreRecord)
+                )
+            }
+            let initialPolls = self.currentPollsMirrorRecord()
+            if !initialPolls.details.isEmpty
+                || !initialPolls.pins.isEmpty
+                || !initialPolls.failed.isEmpty
+                || !initialPolls.watched.isEmpty
+                || !initialPolls.lastAttemptMs.isEmpty
+                || !initialPolls.seenMessages.isEmpty
+                || initialPolls.didEvictWatched
+                || !initialPolls.pendingRefresh.isEmpty
+                || initialPolls.syncEpoch > 0
+            {
+                core.seedPolls(polls: initialPolls)
+            }
+            // U7: seed temporary read-only board caches into core until U7 owns board pins.
+            for (convId, list) in self.pins {
+                core.syncBoardPins(convId: convId, list: list.boardPinListRecord)
+            }
+            for (convId, entry) in self.cachedBoardRawTopics {
+                core.syncBoardRawTopics(
+                    convId: convId,
+                    version: entry.version,
+                    topicsJson: Self.jsonString(for: entry.topics)
+                )
             }
 
             let queued = self.pendingCoreCommands
@@ -1062,6 +1643,7 @@ extension ZaloEngine {
     /// Stops `CoreEngine` and its change-mirror loop (used in tests and teardown).
     internal func stopCoreEngine() {
         pendingCoreCommands.removeAll()
+        lastPushedIdentityKey = nil
         coreLifecycle.shutdown()
         let ws = webSocket
         Task { await ws.detachCore() }
@@ -1192,6 +1774,65 @@ extension ZaloEngine {
         await saveNotificationPreferences()
     }
 
+    // MARK: - U8 Forward Host Helpers
+
+    internal func hostResolveMedia(convId: String, msgId: String, kind: String) async -> MediaResolutionRecord {
+        let mediaKind = MediaKind(rawValue: kind) ?? .photo
+        let res = await resolveMedia(conversationId: convId, messageId: msgId, kind: mediaKind)
+        switch res {
+        case .file(let url): return .file(path: url.path)
+        case .expired: return .expired
+        case .unsupported: return .unsupported
+        case .unavailable: return .unavailable
+        }
+    }
+
+    internal func hostResolveFile(convId: String, msgId: String, name: String, url: String?) async -> FileResolutionRecord {
+        let parsed = url.flatMap { $0.isEmpty ? nil : URL(string: $0) }
+        let res = await resolveFile(conversationId: convId, messageId: msgId, name: name, url: parsed)
+        switch res {
+        case .ready(let staged): return .ready(path: staged.path)
+        case .expired: return .expired
+        case .failed(let message): return .failed(message: message)
+        }
+    }
+
+    internal func hostFetchMediaData(url: String) async -> String? {
+        guard let parsed = URL(string: url),
+              let data = await fetchMediaData(for: parsed) else {
+            return nil
+        }
+        let tmp = makeForwardTempPhotoURL()
+        try? data.write(to: tmp, options: .atomic)
+        return tmp.path
+    }
+
+    internal func hostSendMedia(convId: String, paths: [String], cleanupAfter: Bool) async -> ComposerSendOutcomeRecord {
+        let urls = paths.map(URL.init(fileURLWithPath:))
+        defer {
+            if cleanupAfter {
+                for url in urls {
+                    try? FileManager.default.removeItem(at: url)
+                }
+            }
+        }
+        return Self.composerSendOutcomeRecord(await sendMedia(urls, to: convId))
+    }
+
+    internal func hostSendFiles(convId: String, paths: [String]) async -> ComposerSendOutcomeRecord {
+        let urls = paths.map(URL.init(fileURLWithPath:))
+        return Self.composerSendOutcomeRecord(await sendFiles(urls, to: convId))
+    }
+
+    nonisolated private static func composerSendOutcomeRecord(_ outcome: ComposerOutcome) -> ComposerSendOutcomeRecord {
+        switch outcome {
+        case .done: return .done
+        case .cancelled: return .cancelled
+        case .pending(let text): return .pending(text: text)
+        case .failed(let text): return .failed(text: text)
+        }
+    }
+
     private static func sendCommand(_ command: PendingCoreCommand, to core: CoreEngine) {
         switch command {
         case .start:
@@ -1206,6 +1847,9 @@ extension ZaloEngine {
     }
 
     internal func applyCoreChanges(_ batch: CoreChangesRecord) {
+        if batch.version > 0 && batch.version < appliedMirrorVersion {
+            return
+        }
         if let session = batch.session {
             let qrPayload: String?
             if case .login(let login) = session.phase {
@@ -1257,6 +1901,11 @@ extension ZaloEngine {
 
         isApplyingCoreMirror = true
         defer { isApplyingCoreMirror = false }
+
+        if !optimisticMessageOverlays.isEmpty {
+            let effectiveVersion = max(batch.version, appliedMirrorVersion)
+            optimisticMessageOverlays.removeAll { $0.resolvedVersion <= effectiveVersion }
+        }
 
         if let convRecords = batch.conversations {
             let mapped = convRecords.map(ConversationSummary.init(coreRecord:))
@@ -1394,6 +2043,10 @@ extension ZaloEngine {
             applyContactsMirror(cRec)
         }
 
+        if let pRec = batch.polls {
+            applyPollsMirror(pRec, fromLocalPlan: false)
+        }
+
         if let typingEntries = batch.typing {
             var nextTyping: [String: TypingStatus] = [:]
             nextTyping.reserveCapacity(typingEntries.count)
@@ -1405,10 +2058,506 @@ extension ZaloEngine {
             }
         }
 
+        if let fwdUpdate = batch.forwardRequest {
+            let mapped = fwdUpdate.request.map(ForwardRequest.init(coreRecord:))
+            if mapped != forwardRequest {
+                forwardRequest = mapped
+            }
+        }
+        if batch.clearSelection {
+            endSelection()
+        }
+
+        if let undoUpdate = batch.deleteUndo {
+            if let rec = undoUpdate.undo {
+                let next = DeleteUndo(
+                    id: deleteUndo?.id ?? UUID().uuidString,
+                    conversationId: rec.convId,
+                    count: Int(rec.count),
+                    deadline: Date(timeIntervalSince1970: Double(rec.deadlineMs) / 1000.0)
+                )
+                if deleteUndo != next {
+                    deleteUndo = next
+                }
+            } else if deleteUndo != nil {
+                deleteUndo = nil
+            }
+        }
+
+        if let confirmUpdate = batch.messageConfirm {
+            if let rec = confirmUpdate.confirm {
+                if mirroredMessageConfirmCoreId != rec.id {
+                    if let mappedAction = mapMessageConfirmAction(rec.action, convId: rec.convId) {
+                        if let existing = messageConfirm,
+                           mirroredMessageConfirmCoreId == nil,
+                           existing.conversationId == rec.convId,
+                           existing.action == mappedAction,
+                           existing.title == rec.title,
+                           existing.message == rec.message,
+                           existing.ok == rec.ok,
+                           existing.destructive == rec.destructive {
+                            mirroredMessageConfirmCoreId = rec.id
+                        } else {
+                            mirroredMessageConfirmCoreId = rec.id
+                            messageConfirm = MessageActionConfirm(
+                                conversationId: rec.convId,
+                                action: mappedAction,
+                                title: rec.title,
+                                message: rec.message,
+                                ok: rec.ok,
+                                destructive: rec.destructive
+                            )
+                        }
+                    }
+                }
+            } else {
+                mirroredMessageConfirmCoreId = nil
+                if messageConfirm != nil {
+                    messageConfirm = nil
+                }
+            }
+        }
+
+        if let autoDelUpdate = batch.autoDelete {
+            if let entries = autoDelUpdate.entries {
+                var next: [String: Int64] = [:]
+                next.reserveCapacity(entries.count)
+                for entry in entries {
+                    next[entry.convId] = entry.ttlMs
+                }
+                if autoDelete != next {
+                    autoDelete = next
+                }
+            } else if autoDelete != nil {
+                autoDelete = nil
+            }
+        }
+
+        if let starred = batch.starredIds {
+            let next = Set(starred)
+            if cachedStarredIds != next {
+                cachedStarredIds = next
+            }
+        }
+
+        if let profiles = batch.cachedProfiles {
+            var next: [String: ZaloWebKitMigrator.CachedProfile] = [:]
+            next.reserveCapacity(profiles.count)
+            for entry in profiles {
+                next[entry.uid] = ZaloWebKitMigrator.CachedProfile(name: entry.name, avatar: entry.avatar)
+            }
+            if next != cachedProfiles {
+                cachedProfiles = next
+            }
+        }
+
+        if let groups = batch.cachedGroups {
+            var next: [String: ZaloWebKitMigrator.CachedGroup] = [:]
+            next.reserveCapacity(groups.count)
+            for entry in groups {
+                next[entry.gid] = ZaloWebKitMigrator.CachedGroup(
+                    name: entry.name,
+                    avatar: entry.avatar,
+                    members: Int(entry.members)
+                )
+            }
+            if next != cachedGroups {
+                cachedGroups = next
+            }
+        }
+
+        if (batch.contacts != nil || batch.cachedProfiles != nil || batch.cachedGroups != nil),
+           let core = coreLifecycle.core {
+            lastPushedIdentityKey = currentIdentityPushKey(for: core)
+        }
+
+        if let cloudRecord = batch.cloud {
+            let nextCloud = CloudState(coreRecord: cloudRecord)
+            if cloud != nextCloud {
+                cloud = nextCloud
+            }
+        }
+
+        if let suggestUpdate = batch.stickerSuggest {
+            StickerSuggestState.shared.apply(
+                suggestUpdate.setting.map(StickerSuggestSetting.init(coreRecord:))
+            )
+        }
+
+        if let confirmUpdate = batch.composerConfirm {
+            let next = confirmUpdate.confirm.map(ComposerConfirm.init(coreRecord:))
+            if composerConfirm != next {
+                composerConfirm = next
+            }
+        }
+
+        if let queuedRecords = batch.queuedComposerConfirms {
+            let next = queuedRecords.map(ComposerConfirm.init(coreRecord:))
+            if queuedComposerConfirms != next {
+                queuedComposerConfirms = next
+            }
+        }
+
+        if !optimisticMessageOverlays.isEmpty {
+            reapplyActiveOptimisticOverlays(for: batch)
+        }
+
         if batch.version > appliedMirrorVersion {
             appliedMirrorVersion = batch.version
         }
         resumeMirrorWaiters(upTo: appliedMirrorVersion)
+    }
+
+    // MARK: - U6 Version-Fenced Optimistic Overlays
+
+    @discardableResult
+    internal func beginOptimisticReactionOverlay(
+        convId: String,
+        msgId: String,
+        clientId: String,
+        reactions: [ChatMessage.Reaction]
+    ) -> UUID {
+        let token = UUID()
+        optimisticMessageOverlays.append(OptimisticMessageOverlay(
+            token: token,
+            convId: convId,
+            kind: .reaction(msgId: msgId, clientId: clientId, reactions: reactions)
+        ))
+        return token
+    }
+
+    @discardableResult
+    internal func beginOptimisticDeleteOverlay(
+        convId: String,
+        messages deleted: [ChatMessage],
+        undo: DeleteUndo
+    ) -> UUID {
+        let token = UUID()
+        lastOptimisticDeletedMessages[convId] = deleted
+        optimisticMessageOverlays.removeAll { overlay in
+            guard overlay.convId == convId else { return false }
+            if case .undoDelete = overlay.kind {
+                optimisticOverlayFenceTasks.removeValue(forKey: overlay.token)?.cancel()
+                return true
+            }
+            return false
+        }
+        optimisticMessageOverlays.append(OptimisticMessageOverlay(
+            token: token,
+            convId: convId,
+            kind: .delete(msgIds: Set(deleted.map(\.id)), undo: undo)
+        ))
+        return token
+    }
+
+    @discardableResult
+    internal func beginOptimisticUndoDeleteOverlay(
+        convId: String,
+        restored: [ChatMessage]
+    ) -> UUID {
+        let token = UUID()
+        optimisticMessageOverlays.removeAll { overlay in
+            guard overlay.convId == convId else { return false }
+            if case .delete = overlay.kind {
+                optimisticOverlayFenceTasks.removeValue(forKey: overlay.token)?.cancel()
+                return true
+            }
+            return false
+        }
+        optimisticMessageOverlays.append(OptimisticMessageOverlay(
+            token: token,
+            convId: convId,
+            kind: .undoDelete(restored: restored)
+        ))
+        return token
+    }
+
+    @discardableResult
+    internal func beginOptimisticStarOverlay(
+        convId: String,
+        msgId: String,
+        on: Bool
+    ) -> UUID {
+        let token = UUID()
+        optimisticMessageOverlays.append(OptimisticMessageOverlay(
+            token: token,
+            convId: convId,
+            kind: .star(msgId: msgId, on: on)
+        ))
+        return token
+    }
+
+    internal func scheduleOptimisticOverlayFence(token: UUID, core: CoreEngine) {
+        let task = Task { @MainActor [weak self, core] in
+            defer { self?.optimisticOverlayFenceTasks.removeValue(forKey: token) }
+            if let v = try? await core.settle() {
+                self?.resolveOptimisticOverlay(token: token, targetVersion: v)
+            } else {
+                self?.cancelOptimisticOverlay(token: token)
+            }
+        }
+        optimisticOverlayFenceTasks[token] = task
+    }
+
+    internal func cancelOptimisticOverlay(token: UUID) {
+        optimisticOverlayFenceTasks.removeValue(forKey: token)?.cancel()
+        optimisticMessageOverlays.removeAll { $0.token == token }
+    }
+
+    internal func resolveOptimisticOverlay(token: UUID, targetVersion: UInt64) {
+        guard let idx = optimisticMessageOverlays.firstIndex(where: { $0.token == token }) else { return }
+        if appliedMirrorVersion < targetVersion {
+            optimisticMessageOverlays[idx].resolvedVersion = targetVersion
+            return
+        }
+        let overlay = optimisticMessageOverlays.remove(at: idx)
+        isApplyingCoreMirror = true
+        isSuppressingDirectMessageSync = true
+        defer {
+            isSuppressingDirectMessageSync = false
+            isApplyingCoreMirror = false
+        }
+        switch overlay.kind {
+        case .reaction(let msgId, let clientId, _):
+            if overlay.suppressedReactionsVersion >= targetVersion,
+               let authReactions = overlay.suppressedReactions,
+               var list = messages[overlay.convId],
+               let msgIdx = list.firstIndex(where: { $0.id == msgId || (!clientId.isEmpty && $0.clientId == clientId) }),
+               list[msgIdx].reactions != authReactions {
+                list[msgIdx].reactions = authReactions
+                messages[overlay.convId] = list
+            }
+        case .delete:
+            if overlay.suppressedMessagesVersion >= targetVersion, !overlay.suppressedRestored.isEmpty {
+                var list = messages[overlay.convId] ?? []
+                let existing = Set(list.map(\.id))
+                let toAdd = overlay.suppressedRestored.filter { !existing.contains($0.id) }
+                if !toAdd.isEmpty {
+                    list.append(contentsOf: toAdd)
+                    list.sort { a, b in a.date == b.date ? a.id < b.id : a.date < b.date }
+                    messages[overlay.convId] = list
+                }
+            }
+            if overlay.suppressedUndoVersion >= targetVersion,
+               overlay.suppressedHasUndo,
+               deleteUndo != overlay.suppressedUndo {
+                deleteUndo = overlay.suppressedUndo
+            }
+        case .undoDelete:
+            if overlay.suppressedMessagesVersion >= targetVersion,
+               !overlay.suppressedRemovedIds.isEmpty,
+               var list = messages[overlay.convId] {
+                let prev = list.count
+                list.removeAll { overlay.suppressedRemovedIds.contains($0.id) }
+                if list.count != prev { messages[overlay.convId] = list }
+            }
+            if overlay.suppressedUndoVersion >= targetVersion,
+               overlay.suppressedHasUndo,
+               deleteUndo != overlay.suppressedUndo {
+                deleteUndo = overlay.suppressedUndo
+            }
+        case .star(let msgId, _):
+            if overlay.suppressedStarMsgVersion >= targetVersion,
+               let authStar = overlay.suppressedStarMsg,
+               var list = messages[overlay.convId],
+               let msgIdx = list.firstIndex(where: { $0.id == msgId }) {
+                if list[msgIdx].menu.starred != authStar.starred || list[msgIdx].menu.star != authStar.menuStar {
+                    list[msgIdx].menu.starred = authStar.starred
+                    list[msgIdx].menu.star = authStar.menuStar
+                    messages[overlay.convId] = list
+                }
+            }
+            if overlay.suppressedStarSetVersion >= targetVersion,
+               let inCachedSet = overlay.suppressedStarInSet {
+                if inCachedSet {
+                    cachedStarredIds.insert(msgId)
+                } else {
+                    cachedStarredIds.remove(msgId)
+                }
+            }
+        }
+    }
+
+    private static func batchTouchesMessage(
+        _ batch: CoreChangesRecord,
+        convId: String,
+        msgId: String,
+        clientId: String
+    ) -> Bool {
+        if batch.messagesResetAll { return true }
+        for delta in batch.windowDeltas {
+            switch delta {
+            case .reset(let cid, _) where cid == convId:
+                return true
+            case .remove(let cid) where cid == convId:
+                return true
+            case .append(let cid, let records) where cid == convId:
+                if records.contains(where: { $0.id == msgId || (!clientId.isEmpty && $0.clientId == clientId) }) {
+                    return true
+                }
+            case .patch(let cid, let upserts, let removedIds) where cid == convId:
+                if upserts.contains(where: { $0.id == msgId || (!clientId.isEmpty && $0.clientId == clientId) })
+                    || removedIds.contains(msgId) {
+                    return true
+                }
+            default:
+                break
+            }
+        }
+        return false
+    }
+
+    private static func batchTouchesAnyMessage(
+        _ batch: CoreChangesRecord,
+        convId: String,
+        msgIds: Set<String>
+    ) -> Bool {
+        if batch.messagesResetAll { return true }
+        for delta in batch.windowDeltas {
+            switch delta {
+            case .reset(let cid, _) where cid == convId:
+                return true
+            case .remove(let cid) where cid == convId:
+                return true
+            case .append(let cid, let records) where cid == convId:
+                if records.contains(where: { msgIds.contains($0.id) }) {
+                    return true
+                }
+            case .patch(let cid, let upserts, let removedIds) where cid == convId:
+                if upserts.contains(where: { msgIds.contains($0.id) })
+                    || removedIds.contains(where: { msgIds.contains($0) }) {
+                    return true
+                }
+            default:
+                break
+            }
+        }
+        return false
+    }
+
+    private static func shouldRecordSuppressed(batchVersion: UInt64, previousVersion: UInt64) -> Bool {
+        previousVersion == 0 || batchVersion > previousVersion
+    }
+
+    private func reapplyActiveOptimisticOverlays(for batch: CoreChangesRecord) {
+        for i in optimisticMessageOverlays.indices {
+            let overlay = optimisticMessageOverlays[i]
+            guard batch.version < overlay.resolvedVersion else { continue }
+            switch overlay.kind {
+            case .reaction(let msgId, let clientId, let expectedReactions):
+                if Self.batchTouchesMessage(batch, convId: overlay.convId, msgId: msgId, clientId: clientId),
+                   var list = messages[overlay.convId],
+                   let idx = list.firstIndex(where: { $0.id == msgId || (!clientId.isEmpty && $0.clientId == clientId) }) {
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedReactionsVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedReactionsVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedReactions = list[idx].reactions
+                    }
+                    if list[idx].reactions != expectedReactions {
+                        list[idx].reactions = expectedReactions
+                        messages[overlay.convId] = list
+                    }
+                }
+            case .delete(let msgIds, let expectedUndo):
+                if Self.batchTouchesAnyMessage(batch, convId: overlay.convId, msgIds: msgIds),
+                   var list = messages[overlay.convId] {
+                    let present = list.filter { msgIds.contains($0.id) }
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedMessagesVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedMessagesVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedRestored = present
+                    }
+                    if !present.isEmpty {
+                        list.removeAll { msgIds.contains($0.id) }
+                        messages[overlay.convId] = list
+                    }
+                }
+                if batch.deleteUndo != nil {
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedUndoVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedUndoVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedHasUndo = true
+                        optimisticMessageOverlays[i].suppressedUndo = deleteUndo
+                    }
+                    if deleteUndo != expectedUndo {
+                        deleteUndo = expectedUndo
+                    }
+                }
+            case .undoDelete(let restored):
+                let restoredIds = Set(restored.map(\.id))
+                if Self.batchTouchesAnyMessage(batch, convId: overlay.convId, msgIds: restoredIds) {
+                    var list = messages[overlay.convId] ?? []
+                    let existingIds = Set(list.map(\.id))
+                    let missing = restored.filter { !existingIds.contains($0.id) }
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedMessagesVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedMessagesVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedRemovedIds = Set(missing.map(\.id))
+                    }
+                    if !missing.isEmpty {
+                        list.append(contentsOf: missing)
+                        list.sort { a, b in a.date == b.date ? a.id < b.id : a.date < b.date }
+                        messages[overlay.convId] = list
+                    }
+                }
+                if batch.deleteUndo != nil {
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedUndoVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedUndoVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedHasUndo = true
+                        optimisticMessageOverlays[i].suppressedUndo = deleteUndo
+                    }
+                    if deleteUndo != nil {
+                        deleteUndo = nil
+                    }
+                }
+            case .star(let msgId, let on):
+                if Self.batchTouchesMessage(batch, convId: overlay.convId, msgId: msgId, clientId: ""),
+                   var list = messages[overlay.convId],
+                   let idx = list.firstIndex(where: { $0.id == msgId }) {
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedStarMsgVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedStarMsgVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedStarMsg = (
+                            list[idx].menu.starred,
+                            list[idx].menu.star
+                        )
+                    }
+                    let targetMenuStar: MessageMenu.Star = on ? .unstar : .star
+                    if list[idx].menu.starred != on || list[idx].menu.star != targetMenuStar {
+                        list[idx].menu.starred = on
+                        list[idx].menu.star = targetMenuStar
+                        messages[overlay.convId] = list
+                    }
+                }
+                if batch.starredIds != nil {
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedStarSetVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedStarSetVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedStarInSet = cachedStarredIds.contains(msgId)
+                    }
+                    if on {
+                        cachedStarredIds.insert(msgId)
+                    } else {
+                        cachedStarredIds.remove(msgId)
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - U3 Conversations Core Bridge Helpers
@@ -1434,8 +2583,54 @@ extension ZaloEngine {
     }
 
 
+    internal func mapMessageConfirmAction(_ action: MessageConfirmActionRecord, convId: String) -> MessageActionConfirm.Action? {
+        let list = messages[convId] ?? []
+        func find(_ id: String) -> ChatMessage? {
+            list.first { $0.id == id || $0.clientId == id }
+        }
+        switch action {
+        case .deleteForMe(let msgId):
+            return find(msgId).map(MessageActionConfirm.Action.deleteForMe)
+        case .deleteMany(let msgIds):
+            let resolved = msgIds.compactMap(find)
+            return resolved.isEmpty ? nil : .deleteMany(resolved)
+        case .recallMany(let msgIds):
+            let resolved = msgIds.compactMap(find)
+            return resolved.isEmpty ? nil : .recallMany(resolved)
+        case .pin(let msgId, let replacingRef):
+            return find(msgId).map { .pin($0, replacing: replacingRef ?? "") }
+        case .unpin(let topicRef):
+            return .unpin(ref: topicRef)
+        }
+    }
+
+    internal func messageConfirmRecord(for confirm: MessageActionConfirm) -> MessageConfirmRecord {
+        let actionRecord: MessageConfirmActionRecord
+        switch confirm.action {
+        case .deleteForMe(let msg):
+            actionRecord = .deleteForMe(msgId: msg.id)
+        case .deleteMany(let list):
+            actionRecord = .deleteMany(msgIds: list.map(\.id))
+        case .recallMany(let list):
+            actionRecord = .recallMany(msgIds: list.map(\.id))
+        case .pin(let msg, let replacing):
+            actionRecord = .pin(msgId: msg.id, replacingRef: replacing.isEmpty ? nil : replacing)
+        case .unpin(let ref):
+            actionRecord = .unpin(topicRef: ref)
+        }
+        return MessageConfirmRecord(
+            id: 0,
+            convId: confirm.conversationId,
+            action: actionRecord,
+            title: confirm.title,
+            message: confirm.message,
+            ok: confirm.ok,
+            destructive: confirm.destructive
+        )
+    }
+
     internal func syncAutoDeleteToCore(from oldValue: [String: Int64]?, to newValue: [String: Int64]?) {
-        guard let core = coreLifecycle.core else { return }
+        guard !isApplyingCoreMirror, let core = coreLifecycle.core else { return }
         let oldMap = oldValue ?? [:]
         let newMap = newValue ?? [:]
         for convId in oldMap.keys where newMap[convId] == nil {
@@ -1571,6 +2766,217 @@ extension ZaloEngine {
         }
     }
 
+    internal func hostSendE2EESticker(
+        convId: String,
+        cateId: Int64,
+        stickerId: Int64,
+        clientId cliId: String
+    ) async -> E2eeStickerSendOutcomeRecord {
+        do {
+            let res: SendMessageResult
+            if let sendE2EEStickerHostHandler {
+                let args: [String: Any] = [
+                    "conv_id": convId,
+                    "cate_id": Int(cateId),
+                    "sticker_id": Int(stickerId),
+                    "client_id": cliId,
+                ]
+                _ = traceHost("send_e2ee_sticker", args: args)
+                guard let hostRes = try await sendE2EEStickerHostHandler(args) else {
+                    return .e2eeFailed
+                }
+                res = hostRes
+            } else {
+                let myUid = profile?.userId ?? ""
+                guard !myUid.isEmpty,
+                      await e2eeManager.ensureSessions(
+                          forPeer: convId,
+                          myUid: myUid,
+                          webSocket: webSocket,
+                          store: sqliteStore
+                      ) else {
+                    EngineLog.shared.write("sendSticker e2ee failed: no open Signal session for peer=\(convId)")
+                    return .e2eeFailed
+                }
+                let encryptedDevices = await e2eeManager.encryptStickerMessage(
+                    peerUid: convId,
+                    myUid: myUid,
+                    stickerId: Int(stickerId),
+                    cateId: Int(cateId),
+                    stickerType: 7,
+                    store: sqliteStore
+                )
+                guard !encryptedDevices.isEmpty else {
+                    EngineLog.shared.write("sendSticker e2ee failed: encryption produced no peer payloads for peer=\(convId)")
+                    return .e2eeFailed
+                }
+                let senderIid = await e2eeManager.localRegistrationId()
+                let imei = await sessionClient.imei
+                let cliInt: Int64
+                if let parsed = Int64(cliId) {
+                    cliInt = parsed
+                } else {
+                    cliInt = await sessionClient.nextClientId()
+                }
+                let listParams: [[String: Any]] = encryptedDevices.compactMap { dev in
+                    guard dev.ciphers.count >= 3 else { return nil }
+                    let extra: [String: Any] = [
+                        "stickerId": dev.ciphers[0],
+                        "cateId": dev.ciphers[1],
+                        "type": dev.ciphers[2],
+                        "zsource": 101,
+                    ]
+                    return ZaloSessionClient.buildE2EEListParamEntry(
+                        toId: dev.toId,
+                        platform: dev.platform,
+                        clientId: cliInt,
+                        imei: imei,
+                        registrationId: dev.registrationId,
+                        senderIid: senderIid,
+                        extraFields: extra
+                    )
+                }
+                guard !listParams.isEmpty else {
+                    EngineLog.shared.write("sendSticker e2ee failed: empty listParams for peer=\(convId)")
+                    return .e2eeFailed
+                }
+                res = try await sessionClient.sendE2EEMessageAPI(
+                    endpoint: "sticker",
+                    threadId: convId,
+                    isGroup: false,
+                    clientId: cliInt,
+                    listParams: ZaloJSONArrayBox(listParams)
+                )
+            }
+            return .sent(msgId: res.msgId, cliMsgId: res.cliMsgId, tsMs: res.tsMs)
+        } catch {
+            EngineLog.shared.write("sendSticker failed: \(error.localizedDescription)")
+            return .apiFailed(message: error.localizedDescription)
+        }
+    }
+
+    internal func hostSendE2EEContactCard(
+        convId: String,
+        clientId cliId: String,
+        contactUid: String,
+        title: String,
+        phone: String,
+        avatar: String,
+        qrCodeUrl: String
+    ) async -> E2eeSendOutcomeRecord {
+        do {
+            let res: SendMessageResult
+            if let sendE2EEContactCardHostHandler {
+                let args: [String: Any] = [
+                    "conv_id": convId,
+                    "client_id": cliId,
+                    "contact_uid": contactUid,
+                    "title": title,
+                    "phone": phone,
+                    "avatar": avatar,
+                    "qr_code_url": qrCodeUrl,
+                ]
+                _ = traceHost("send_e2ee_contact_card", args: args)
+                res = try await sendE2EEContactCardHostHandler(args)
+            } else {
+                let myUid = profile?.userId ?? ""
+                guard !myUid.isEmpty else {
+                    EngineLog.shared.write("sendContactCard e2ee failed: missing local uid")
+                    return .aborted
+                }
+                let ready = await e2eeManager.ensureSessions(
+                    forPeer: convId,
+                    myUid: myUid,
+                    webSocket: webSocket,
+                    store: sqliteStore
+                )
+                guard ready else {
+                    EngineLog.shared.write("sendContactCard e2ee failed: no open Signal session for peer=\(convId)")
+                    return .aborted
+                }
+                let cliInt: Int64
+                if let parsed = Int64(cliId) {
+                    cliInt = parsed
+                } else {
+                    cliInt = await sessionClient.nextClientId()
+                }
+                let cleanContact = ZaloWireParser.stripUserPrefix(contactUid)
+                let gUid: String
+                if let cached = cachedFriendGlobalIds[cleanContact], !cached.isEmpty {
+                    gUid = cached
+                } else {
+                    let resolved = await sessionClient.encryptGlobalIds([cleanContact])[cleanContact] ?? ""
+                    gUid = resolved.isEmpty ? cleanContact : resolved
+                }
+                var descObj: [String: Any] = ["gUid": gUid]
+                if !phone.isEmpty { descObj["phone"] = phone }
+                if !qrCodeUrl.isEmpty { descObj["qrCodeUrl"] = qrCodeUrl }
+                let descJSON = Self.jsonString(for: descObj)
+
+                let encryptedDevices = await e2eeManager.encryptContactCardMessage(
+                    peerUid: convId,
+                    myUid: myUid,
+                    title: title,
+                    avatar: avatar,
+                    descJSON: descJSON,
+                    store: sqliteStore
+                )
+                guard !encryptedDevices.isEmpty else {
+                    EngineLog.shared.write("sendContactCard e2ee failed: encryption produced no peer payloads for peer=\(convId)")
+                    return .aborted
+                }
+                let senderIid = await e2eeManager.localRegistrationId()
+                let imei = await sessionClient.imei
+                let listParams: [[String: Any]] = encryptedDevices.compactMap { dev in
+                    guard dev.ciphers.count >= 4 else { return nil }
+                    let msgInfo: [String: Any] = [
+                        "title": dev.ciphers[0],
+                        "thumb": dev.ciphers[1],
+                        "desc": dev.ciphers[2],
+                        "href": dev.ciphers[3],
+                        "action": "recommened.user",
+                    ]
+                    let msgInfoJSON = Self.jsonString(for: msgInfo)
+                    return ZaloSessionClient.buildE2EEListParamEntry(
+                        toId: dev.toId,
+                        platform: dev.platform,
+                        clientId: cliInt,
+                        imei: imei,
+                        registrationId: dev.registrationId,
+                        senderIid: senderIid,
+                        version: 1,
+                        compatVersion: 0,
+                        extraFields: ["msgInfo": msgInfoJSON]
+                    )
+                }
+                guard !listParams.isEmpty else {
+                    EngineLog.shared.write("sendContactCard e2ee failed: empty listParams for peer=\(convId)")
+                    return .aborted
+                }
+                res = try await sessionClient.sendE2EEMessageAPI(
+                    endpoint: "forward",
+                    threadId: convId,
+                    isGroup: false,
+                    clientId: cliInt,
+                    listParams: ZaloJSONArrayBox(listParams),
+                    destType: 3,
+                    msgType: 6
+                )
+            }
+            return .sent(msgId: res.msgId, cliMsgId: res.cliMsgId, tsMs: res.tsMs)
+        } catch {
+            return .failed(message: error.localizedDescription)
+        }
+    }
+
+    internal func hostSleepConfirmPromote(delayMs: UInt64) async {
+        if let sleepSeam = composerConfirmSleep {
+            _ = await sleepSeam(Int(delayMs))
+        } else {
+            try? await Task.sleep(for: .milliseconds(Int64(delayMs)))
+        }
+    }
+
     internal func syncDirectMessageChangesToCore(from oldValue: [String: [ChatMessage]], to newValue: [String: [ChatMessage]]) {
         guard !isApplyingCoreMirror, !isSuppressingDirectMessageSync, let core = coreLifecycle.core else { return }
         for convId in oldValue.keys where newValue[convId] == nil {
@@ -1581,9 +2987,47 @@ extension ZaloEngine {
         }
     }
 
+    internal struct IdentityPushKey: Equatable {
+        let coreId: ObjectIdentifier
+        let friends: [ContactsState.Friend]
+        let groups: [ContactsState.Group]
+        let friendsLoaded: Bool
+        let groupsLoaded: Bool
+        let aliases: [String: String]
+        let cachedProfiles: [String: ZaloWebKitMigrator.CachedProfile]
+        let cachedGroups: [String: ZaloWebKitMigrator.CachedGroup]
+        let activityRanks: [String: Int64]
+        let friendGlobalIds: [String: String]
+    }
+
+    internal func currentIdentityPushKey(for core: CoreEngine) -> IdentityPushKey {
+        IdentityPushKey(
+            coreId: ObjectIdentifier(core),
+            friends: contacts.friends,
+            groups: contacts.groups,
+            friendsLoaded: contacts.friendsLoaded,
+            groupsLoaded: contacts.groupsLoaded,
+            aliases: cachedAliases,
+            cachedProfiles: cachedProfiles,
+            cachedGroups: cachedGroups,
+            activityRanks: cachedActivityRanks,
+            friendGlobalIds: cachedFriendGlobalIds
+        )
+    }
+
+    internal func sendIdentitiesToCore(_ core: CoreEngine, force: Bool = false) {
+        let key = currentIdentityPushKey(for: core)
+        if !force, lastPushedIdentityKey == key {
+            return
+        }
+        lastPushedIdentityKey = key
+        onCoreUpdateIdentities?()
+        core.updateIdentities(table: currentIdentityTableRecord())
+    }
+
     internal func pushCoreIdentitiesIfRunning() {
         guard !isApplyingCoreMirror, let core = coreLifecycle.core else { return }
-        core.updateIdentities(table: currentIdentityTableRecord())
+        sendIdentitiesToCore(core, force: false)
     }
 
     internal func currentContactsStateRecord() -> ContactsStateRecord {
@@ -1795,35 +3239,58 @@ extension ZaloEngine {
         let ranksData = try? await store.getPreferenceData(key: "activityRanks")
         let gidData = try? await store.getPreferenceData(key: "gidToUidMap")
 
-        isApplyingCoreMirror = true
-        defer { isApplyingCoreMirror = false }
-
-        if let aliasesData,
-           let dict = (try? JSONSerialization.jsonObject(with: aliasesData)) as? [String: String] {
-            cachedAliases = dict
+        let decodedAliases = aliasesData.flatMap {
+            (try? JSONSerialization.jsonObject(with: $0)) as? [String: String]
         }
-        if let profData,
-           let decoded = try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedProfile].self, from: profData) {
-            cachedProfiles = decoded
+        let decodedProfiles = profData.flatMap {
+            try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedProfile].self, from: $0)
         }
-        if let grpData,
-           let decoded = try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedGroup].self, from: grpData) {
-            cachedGroups = decoded
+        let decodedGroups = grpData.flatMap {
+            try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedGroup].self, from: $0)
         }
-        if let ranksData,
-           let rawRanks = (try? JSONSerialization.jsonObject(with: ranksData)) as? [String: Any] {
+        let decodedRanks: [String: Int64]? = ranksData.flatMap { data in
+            guard let rawRanks = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
             var parsed: [String: Int64] = [:]
             for (k, v) in rawRanks {
                 if let val = JSONLossless.int64(v), val > 0 { parsed[k] = val }
             }
-            cachedActivityRanks = parsed
+            return parsed
         }
-        if let gidData,
-           let gidToUid = (try? JSONSerialization.jsonObject(with: gidData)) as? [String: String] {
-            await sessionClient.seedGlobalIdMappings(gidToUid)
-            for (gid, uid) in gidToUid where !gid.isEmpty && !uid.isEmpty {
-                cachedFriendGlobalIds[uid] = gid
+        let decodedGidToUid = gidData.flatMap {
+            (try? JSONSerialization.jsonObject(with: $0)) as? [String: String]
+        }
+        if let decodedGidToUid {
+            await sessionClient.seedGlobalIdMappings(decodedGidToUid)
+        }
+
+        // Keep all awaits outside the non-reentrant `isApplyingCoreMirror` guard.
+        isApplyingCoreMirror = true
+        defer { isApplyingCoreMirror = false }
+
+        if let decodedAliases, decodedAliases != cachedAliases {
+            cachedAliases = decodedAliases
+        }
+        if let decodedProfiles, decodedProfiles != cachedProfiles {
+            cachedProfiles = decodedProfiles
+        }
+        if let decodedGroups, decodedGroups != cachedGroups {
+            cachedGroups = decodedGroups
+        }
+        if let decodedRanks, decodedRanks != cachedActivityRanks {
+            cachedActivityRanks = decodedRanks
+        }
+        if let decodedGidToUid {
+            var nextGlobalIds = cachedFriendGlobalIds
+            nextGlobalIds.reserveCapacity(nextGlobalIds.count + decodedGidToUid.count)
+            for (gid, uid) in decodedGidToUid where !gid.isEmpty && !uid.isEmpty {
+                nextGlobalIds[uid] = gid
             }
+            if nextGlobalIds != cachedFriendGlobalIds {
+                cachedFriendGlobalIds = nextGlobalIds
+            }
+        }
+        if let core = coreLifecycle.core {
+            lastPushedIdentityKey = currentIdentityPushKey(for: core)
         }
     }
 
@@ -2024,5 +3491,127 @@ extension ZaloEngine {
         for waiter in waiters {
             waiter.continuation.resume()
         }
+    }
+
+    // MARK: - U12 Group Polls Mirror & Temporary U7 Board Write-Through Helpers
+
+    internal func currentPollsMirrorRecord() -> PollsMirrorRecord {
+        var orderedSeen = PollClock.seenMessagesOrder.filter { PollClock.seenMessages.contains($0) }
+        let inOrder = Set(orderedSeen)
+        if inOrder.count < PollClock.seenMessages.count {
+            let missing = PollClock.seenMessages.subtracting(inOrder)
+                .sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
+            orderedSeen.append(contentsOf: missing)
+        }
+        PollClock.seenMessagesOrder = orderedSeen
+
+        return PollsMirrorRecord(
+            details: polls.details.keys.sorted().compactMap { id in
+                polls.details[id].map { PollDetailEntryRecord(id: id, detail: $0.coreRecord) }
+            },
+            pins: polls.pins.keys.sorted().compactMap { id in
+                polls.pins[id].map { PollPinEntryRecord(id: id, state: $0.coreRecord) }
+            },
+            failed: polls.failed.sorted(),
+            watched: PollClock.watched.keys.sorted().compactMap { pid in
+                PollClock.watched[pid].map { PollWatchedEntryRecord(pollId: pid, convId: $0) }
+            },
+            lastAttemptMs: PollClock.lastAttempt.keys.sorted().compactMap { pid in
+                PollClock.lastAttempt[pid].map {
+                    PollAttemptEntryRecord(
+                        pollId: pid,
+                        lastAttemptMs: Int64(($0.timeIntervalSince1970 * 1000.0).rounded())
+                    )
+                }
+            },
+            seenMessages: orderedSeen,
+            didEvictWatched: PollClock.didEvictWatched,
+            pendingRefresh: PollClock.pendingRefresh.keys.sorted().compactMap { pid in
+                PollClock.pendingRefresh[pid].map { PollPendingRefreshEntryRecord(pollId: pid, seq: $0) }
+            },
+            nextDebounceSeq: PollClock.nextDebounceSeq,
+            syncEpoch: localPollSyncEpoch
+        )
+    }
+
+    internal func applyPollsMirror(_ rec: PollsMirrorRecord, fromLocalPlan: Bool = true) {
+        guard rec.syncEpoch >= localPollSyncEpoch else { return }
+        let epochAdvanced = rec.syncEpoch > localPollSyncEpoch
+        localPollSyncEpoch = rec.syncEpoch
+
+        let nextStore = PollStore(
+            details: Dictionary(uniqueKeysWithValues: rec.details.map { ($0.id, PollDetail(coreRecord: $0.detail)) }),
+            pins: Dictionary(uniqueKeysWithValues: rec.pins.map { ($0.id, PollPinState(coreRecord: $0.state)) }),
+            failed: Set(rec.failed)
+        )
+        if nextStore != polls {
+            polls = nextStore
+        }
+
+        PollClock.watched = Dictionary(uniqueKeysWithValues: rec.watched.map { ($0.pollId, $0.convId) })
+        PollClock.lastAttempt = Dictionary(uniqueKeysWithValues: rec.lastAttemptMs.map {
+            ($0.pollId, Date(timeIntervalSince1970: Double($0.lastAttemptMs) / 1000.0))
+        })
+        PollClock.didEvictWatched = rec.didEvictWatched
+
+        if epochAdvanced || fromLocalPlan || rec.nextDebounceSeq >= PollClock.nextDebounceSeq {
+            PollClock.seenMessagesOrder = rec.seenMessages
+            PollClock.seenMessages = Set(rec.seenMessages)
+            PollClock.nextDebounceSeq = rec.nextDebounceSeq
+
+            let nextPending = Dictionary(uniqueKeysWithValues: rec.pendingRefresh.map { ($0.pollId, $0.seq) })
+            for pid in Array(PollClock.refreshTasks.keys) where nextPending[pid] == nil {
+                PollClock.refreshTasks[pid]?.cancel()
+                PollClock.refreshTasks.removeValue(forKey: pid)
+            }
+            if fromLocalPlan || epochAdvanced {
+                PollClock.pendingRefresh = nextPending
+            } else {
+                PollClock.pendingRefresh = nextPending.filter { PollClock.refreshTasks[$0.key] != nil }
+            }
+        }
+    }
+
+    // U7: push Swift's board pins for one conversation into core's read-only board mirror.
+    internal func pushCoreBoardPinsIfRunning(for convId: String) {
+        guard let core = coreLifecycle.core else { return }
+        core.syncBoardPins(convId: convId, list: pins[convId]?.boardPinListRecord)
+    }
+
+    // U7: push Swift's board pins & raw topics for one conversation into core's read-only board mirror.
+    internal func pushCoreBoardStateIfRunning(for convId: String) {
+        guard let core = coreLifecycle.core else { return }
+        core.syncBoardPins(convId: convId, list: pins[convId]?.boardPinListRecord)
+        if let raw = cachedBoardRawTopics[convId] {
+            core.syncBoardRawTopics(
+                convId: convId,
+                version: raw.version,
+                topicsJson: Self.jsonString(for: raw.topics)
+            )
+        } else {
+            core.syncBoardRawTopics(convId: convId, version: 0, topicsJson: nil)
+        }
+    }
+}
+
+// U7: temporary conversion into `BoardPinListRecord` until U7 owns board pins.
+extension PinnedList {
+    var boardPinListRecord: BoardPinListRecord {
+        BoardPinListRecord(
+            ready: ready,
+            canPin: canPin,
+            limit: Int64(limit),
+            items: items.map { item in
+                BoardPinItemRecord(
+                    refId: item.ref,
+                    kind: item.kind.rawValue,
+                    title: item.title,
+                    sender: item.sender,
+                    thumbnail: item.thumbnail?.absoluteString,
+                    msgId: item.msgId,
+                    cliMsgId: item.cliMsgId
+                )
+            }
+        )
     }
 }

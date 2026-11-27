@@ -1,4 +1,5 @@
 import Foundation
+import OlazCore
 
 /// "Chọn nhiều tin nhắn" (official `STR_SELECT`): the messages picked in one conversation, in the order they were picked.
 struct MessageSelection: Equatable {
@@ -80,6 +81,10 @@ extension ZaloEngine {
     func forwardSelection() {
         let list = selectedMessages()
         guard let first = list.first else { return }
+        if let core = coreLifecycle.core {
+            core.forwardSelection(messages: list.map(ChatMessageRecord.init(message:)))
+            return
+        }
         guard selectionCanForward(list) else {
             showActionCard("Có tin nhắn không thể chia sẻ", in: first.conversationId)
             return
@@ -90,31 +95,71 @@ extension ZaloEngine {
     func recallSelection() {
         let list = selectedMessages()
         guard let first = list.first, selectionCanRecall(list) else { return }
-        ask(MessageActionConfirm(
+        let confirm = MessageActionConfirm(
             conversationId: first.conversationId,
             action: .recallMany(list),
             title: "Thu hồi tin nhắn",
             message: "Thu hồi các tin nhắn đã chọn cho tất cả mọi người?",
             ok: "Thu hồi",
             destructive: true
-        ))
+        )
+        if let core = coreLifecycle.core {
+            if openConversationId == confirm.conversationId, messageConfirm == nil {
+                mirroredMessageConfirmCoreId = nil
+                messageConfirm = confirm
+            }
+            core.recallMany(
+                convId: first.conversationId,
+                msgIds: list.map(\.id),
+                confirm: true,
+                nowMs: nowMs()
+            )
+            return
+        }
+        ask(confirm)
     }
 
     func deleteSelection() {
         let list = selectedMessages()
         guard let first = list.first else { return }
-        ask(MessageActionConfirm(
+        let confirm = MessageActionConfirm(
             conversationId: first.conversationId,
             action: .deleteMany(list),
             title: "Xóa tin nhắn",
             message: "Xóa các tin nhắn đã chọn chỉ ở phía bạn?",
             ok: "Xóa chỉ ở phía tôi",
             destructive: true
-        ))
+        )
+        if let core = coreLifecycle.core {
+            if openConversationId == confirm.conversationId, messageConfirm == nil {
+                mirroredMessageConfirmCoreId = nil
+                messageConfirm = confirm
+            }
+            core.deleteMany(
+                convId: first.conversationId,
+                msgIds: list.map(\.id),
+                confirm: true,
+                nowMs: nowMs()
+            )
+            return
+        }
+        ask(confirm)
     }
 
     func recallMessages(_ list: [ChatMessage]) {
         endSelection()
+        if let core = coreLifecycle.core {
+            guard let convId = list.first?.conversationId else { return }
+            let tsMs = nowMs()
+            let ids = list.map(\.id)
+            trackMessageActionTask { [weak self] in
+                guard let self else { return }
+                if let v = try? await core.recallManyAsync(convId: convId, msgIds: ids, nowMs: tsMs) {
+                    await self.waitForMirrorVersion(v)
+                }
+            }
+            return
+        }
         trackMessageActionTask { [weak self] in
             guard let self else { return }
             for message in list { await self.performRecall(message) }

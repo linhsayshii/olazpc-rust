@@ -2,7 +2,7 @@
 //! and the concrete [`SessionEffectRunner`] backed by `olaz_net::SessionClient`, `olaz_api::ZaloApi`,
 //! and `olaz_ws::WsClient`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,7 +12,7 @@ use olaz_api::{PollState, ZaloApi};
 use olaz_net::{
     LoginAccount, SessionClient, SessionSnapshot as NetSessionSnapshot, Transport, ZaloDomains,
 };
-use olaz_store::{SaveOptions, Store};
+use olaz_store::{CloudMediaQuery, SaveOptions, Store};
 use olaz_wire::{ChatMessage, decode_stored_message, extract_profiles_map};
 use olaz_ws::{CryptoDecryptor, CursorMap, WsClient, WsConfig, WsHandle};
 use serde_json::{Map, Value};
@@ -20,19 +20,23 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
+use crate::actions::swift_error_type_name;
 use crate::actor::{ActorSink, InFlightGuard};
+use crate::cloud::CloudServerSnapshot;
 use crate::conversations::{
     BatchApplyDelta, IdentityTable, MessagePreviewInput, hidden_pin_md5, hidden_pin_sha256,
     load_local_account_from_store, to_wire_stored,
 };
 use crate::effect::{Effect, HistoryFetchPurpose, HostCall, OpResult, StoreOp};
+use crate::forward::{ComposerSendOutcome, FileResolutionOutcome, MediaResolutionOutcome};
 use crate::input::{
     BootstrapAliasesError, Command, CompletedLogin, E2eeQuoteArg, Input, LegacyCookie,
-    PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
+    PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StickerSendError, StoreToken,
 };
-use crate::messages::MuteEntry;
+use crate::messages::{MuteEntry, decode_db_stored};
 use crate::reduce::classify::MobileSyncEvent;
 use crate::state::PersistedTransportState;
+use crate::stickers::{parse_recent_stickers_bytes, update_recent_stickers_json};
 use crate::typed_chat::{
     PlainChatParse, TypedChatEnvelope, new_shared_parse, try_parse_plain_chat,
 };
@@ -386,7 +390,8 @@ pub trait Host: Send + Sync {
         _event_id: String,
         _react_client_id: String,
         _sender_name: String,
-    ) {
+    ) -> bool {
+        true
     }
     async fn apply_remote_recall(
         &self,
@@ -395,7 +400,8 @@ pub trait Host: Send + Sync {
         _cli_msg_id: String,
         _update_conversation_preview: bool,
         _persist_conversations: bool,
-    ) {
+    ) -> bool {
+        true
     }
     async fn apply_remote_delete(
         &self,
@@ -404,7 +410,8 @@ pub trait Host: Send + Sync {
         _cli_msg_id: String,
         _update_conversation_preview: bool,
         _persist_conversations: bool,
-    ) {
+    ) -> bool {
+        true
     }
     async fn decrypt_envelope(&self, payload: Map<String, Value>) -> Map<String, Value> {
         payload
@@ -486,6 +493,82 @@ pub trait Host: Send + Sync {
     ) -> Result<olaz_api::SendMessageResult, String> {
         Err("send_e2ee_text not implemented by host".to_owned())
     }
+    // --- Forward & message-action / cloud domain callbacks (U6/U8/U11) ---
+    async fn show_card(&self, _conv_id: Option<String>, _text: String) {}
+    async fn resolve_media(
+        &self,
+        _conv_id: String,
+        _msg_id: String,
+        _kind: String,
+    ) -> MediaResolutionOutcome {
+        MediaResolutionOutcome::Unavailable
+    }
+    async fn resolve_file(
+        &self,
+        _conv_id: String,
+        _msg_id: String,
+        _name: String,
+        _url: Option<String>,
+    ) -> FileResolutionOutcome {
+        FileResolutionOutcome::Failed("resolve_file not implemented by host".to_owned())
+    }
+    async fn fetch_media_data(&self, _url: String) -> Option<String> {
+        None
+    }
+    async fn send_media(
+        &self,
+        _conv_id: String,
+        _paths: Vec<String>,
+        _cleanup_after: bool,
+    ) -> ComposerSendOutcome {
+        ComposerSendOutcome::Failed("send_media not implemented by host".to_owned())
+    }
+    async fn send_files(&self, _conv_id: String, _paths: Vec<String>) -> ComposerSendOutcome {
+        ComposerSendOutcome::Failed("send_files not implemented by host".to_owned())
+    }
+
+    // --- Group polls callbacks (U12) ---
+    /// Arms a per-poll incoming-message debounce timer on the host. Return `true` when the host
+    /// owns the sleep (e.g. Swift `ZaloEngine.pollDebounceSleep` seam) and will call back with
+    /// `Command::FirePollDebounce`; return `false` (default) to sleep inside `SessionEffectRunner`
+    /// on `tokio::time`.
+    async fn arm_poll_debounce(&self, _poll_id: String, _seq: u64, _delay_ms: u64) -> bool {
+        false
+    }
+    /// Cancels all pending host-owned poll debounce timers (`resetPolls` / `logOut` / `markExpired`).
+    async fn cancel_all_poll_debounces(&self) {}
+
+    // --- Stickers & composer E2EE callbacks (U13) ---
+    async fn send_e2ee_sticker(
+        &self,
+        _conv_id: String,
+        _cate_id: i64,
+        _sticker_id: i64,
+        _client_id: String,
+    ) -> Result<olaz_api::SendMessageResult, StickerSendError> {
+        Err(StickerSendError::E2eeFailed)
+    }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Matches send_e2ee_contact_card host boundary args 1-for-1"
+    )]
+    async fn send_e2ee_contact_card(
+        &self,
+        _conv_id: String,
+        _client_id: String,
+        _contact_uid: String,
+        _title: String,
+        _phone: String,
+        _avatar: String,
+        _qr_code_url: String,
+    ) -> Result<olaz_api::SendMessageResult, String> {
+        Err("send_e2ee_contact_card not implemented by host".to_owned())
+    }
+    /// Waits for the composer-confirm promotion delay (default: real tokio sleep; tests can
+    /// override with a deterministic virtual clock).
+    async fn sleep_confirm_promote(&self, delay: Duration) {
+        tokio::time::sleep(delay).await;
+    }
 }
 
 enum HostJob {
@@ -547,6 +630,16 @@ enum HostJob {
         conv_id: String,
         _guard: InFlightGuard,
     },
+    // U12
+    RefreshBoardPinsThen {
+        conv_id: String,
+        continuation: crate::effect::PollBoardContinuation,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    CancelAllPollDebounces {
+        _guard: InFlightGuard,
+    },
     MarkReadBoundary {
         conv_id: String,
         seen_target: Option<SeenTarget>,
@@ -562,6 +655,8 @@ enum HostJob {
         event_id: String,
         react_client_id: String,
         sender_name: String,
+        now_ms: i64,
+        sink: ActorSink,
         _guard: InFlightGuard,
     },
     ApplyRemoteRecall {
@@ -570,6 +665,9 @@ enum HostJob {
         cli_msg_id: String,
         update_conversation_preview: bool,
         persist_conversations: bool,
+        op_id: Option<u64>,
+        recall_many_id: Option<u64>,
+        sink: ActorSink,
         _guard: InFlightGuard,
     },
     ApplyRemoteDelete {
@@ -578,6 +676,8 @@ enum HostJob {
         cli_msg_id: String,
         update_conversation_preview: bool,
         persist_conversations: bool,
+        cloud_delete_op_id: Option<u64>,
+        sink: ActorSink,
         _guard: InFlightGuard,
     },
     DecryptEnvelope {
@@ -697,6 +797,11 @@ enum HostJob {
         on_pc: bool,
         _guard: InFlightGuard,
     },
+    ShowCard {
+        conv_id: Option<String>,
+        text: String,
+        _guard: InFlightGuard,
+    },
     PinTopic {
         conv_id: String,
         _guard: InFlightGuard,
@@ -715,6 +820,46 @@ enum HostJob {
         duration: i64,
         _guard: InFlightGuard,
     },
+    // U11
+    CloudResolveMedia {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
+        kind: String,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    CloudResolveFile {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
+        name: String,
+        url: Option<String>,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    // U13: queued behind earlier host calls without blocking the serial host worker on network I/O
+    SendE2eeSticker {
+        send_id: u64,
+        conv_id: String,
+        cate_id: i64,
+        sticker_id: i64,
+        client_id: String,
+        sink: ActorSink,
+        guard: InFlightGuard,
+    },
+    SendE2eeContactCard {
+        card_send_id: u64,
+        conv_id: String,
+        client_id: String,
+        contact_uid: String,
+        title: String,
+        phone: String,
+        avatar: String,
+        qr_code_url: String,
+        sink: ActorSink,
+        guard: InFlightGuard,
+    },
     Drain(oneshot::Sender<()>),
 }
 
@@ -727,9 +872,56 @@ enum StoreJob {
         sink: ActorSink,
         _guard: InFlightGuard,
     },
+    LoadRecentStickers {
+        reply: oneshot::Sender<Vec<Value>>,
+    },
+    LoadStickerSuggestPref {
+        reply: oneshot::Sender<bool>,
+    },
+    ResolveMessageIdsLookup {
+        conv_id: String,
+        msg_id: String,
+        cli_msg_id: String,
+        reply: oneshot::Sender<(String, String, bool)>,
+    },
+    UpgradeMessageId {
+        conv_id: String,
+        old_id: String,
+        new_id: String,
+        client_id: String,
+        _guard: InFlightGuard,
+    },
     FlushOp {
         op_id: u64,
         result: OpResult,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    // U11
+    CloudRefreshQuery {
+        op_id: Option<u64>,
+        server_snapshot: Option<CloudServerSnapshot>,
+        media_ids_by_conv: Vec<(String, Vec<String>)>,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    CloudListQuery {
+        op_id: u64,
+        conv_id: Option<String>,
+        excluding_self: Option<String>,
+        kind_tags: Vec<String>,
+        sort_by_size: bool,
+        ascending: bool,
+        offset: i64,
+        limit: i64,
+        memory_media: Vec<(String, Vec<String>, Vec<String>)>,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    CloudLookupMessage {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
         sink: ActorSink,
         _guard: InFlightGuard,
     },
@@ -760,6 +952,12 @@ pub struct SessionEffectRunner<T: Transport + 'static> {
     lp_fetch_abort: Mutex<Option<AbortHandle>>,
     // U5: per-conversation incoming typing expiry timers (`conv_id -> (expiry_gen, AbortHandle)`).
     typing_expiry_aborts: Arc<Mutex<BTreeMap<String, (u64, AbortHandle)>>>,
+    // U6: active delete-for-me undo bar expiry timer (`(undo_gen, AbortHandle)`).
+    delete_undo_abort: Arc<Mutex<Option<(u64, AbortHandle)>>>,
+    // U12: per-poll debounce timers (`poll_id -> (seq, AbortHandle)`).
+    poll_debounce_aborts: Arc<Mutex<BTreeMap<String, (u64, AbortHandle)>>>,
+    // U13: pending 300ms composer confirm promotion timer (`(confirm_gen, AbortHandle)`).
+    confirm_promote_abort: Arc<Mutex<Option<(u64, AbortHandle)>>>,
     host_worker_abort: AbortHandle,
     store_worker_abort: AbortHandle,
     runtime: Handle,
@@ -856,6 +1054,9 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
             lp_timer_abort,
             lp_fetch_abort: Mutex::new(None),
             typing_expiry_aborts: Arc::new(Mutex::new(BTreeMap::new())),
+            delete_undo_abort: Arc::new(Mutex::new(None)),
+            poll_debounce_aborts: Arc::new(Mutex::new(BTreeMap::new())),
+            confirm_promote_abort: Arc::new(Mutex::new(None)),
             host_worker_abort: worker_handle.abort_handle(),
             store_worker_abort: store_handle.abort_handle(),
             runtime,
@@ -946,6 +1147,9 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         for handle in handles {
             handle.abort();
         }
+        self.cancel_typing_expiry(None);
+        self.cancel_delete_undo_timer();
+        self.cancel_confirm_promote_timer();
     }
 
     fn cancel_typing_expiry(&self, conv_id: Option<&str>) {
@@ -964,6 +1168,48 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
                     abort.abort();
                 }
             }
+        }
+    }
+
+    // U12
+    fn cancel_poll_debounces(&self, poll_id: Option<&str>) {
+        let mut map = self
+            .poll_debounce_aborts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match poll_id {
+            Some(id) => {
+                if let Some((_, abort)) = map.remove(id) {
+                    abort.abort();
+                }
+            }
+            None => {
+                for (_, (_, abort)) in std::mem::take(&mut *map) {
+                    abort.abort();
+                }
+            }
+        }
+    }
+
+    fn cancel_delete_undo_timer(&self) {
+        if let Some((_, handle)) = self
+            .delete_undo_abort
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            handle.abort();
+        }
+    }
+
+    fn cancel_confirm_promote_timer(&self) {
+        if let Some((_, handle)) = self
+            .confirm_promote_abort
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            handle.abort();
         }
     }
 
@@ -1038,6 +1284,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 Effect::CancelSessionTasks => {
                     self.cancel_active_tasks();
                     self.cancel_bootstrap_tasks();
+                    self.cancel_poll_debounces(None);
                 }
                 Effect::ClearCoreSession => {
                     self.api.reset_state();
@@ -1920,6 +2167,302 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         drop(guard);
                     });
                 }
+                // U12
+                Effect::FetchPollDetailApi {
+                    op_id,
+                    poll_id,
+                    purpose,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let payload = api.fetch_poll_detail(&poll_id).await.ok();
+                        let is_authenticated = client.is_authenticated();
+                        sink.send(Input::PollDetailFetched {
+                            op_id,
+                            poll_id,
+                            purpose,
+                            payload,
+                            is_authenticated,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchPollGroupDetailApi {
+                    op_id,
+                    poll_id,
+                    group_id,
+                    data_node,
+                    now_ms,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let group_info = api.fetch_group_detail(&group_id).await.ok();
+                        sink.send(Input::PollGroupDetailFetched {
+                            op_id,
+                            poll_id,
+                            group_id,
+                            data_node,
+                            group_info,
+                            now_ms,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::RefreshBoardPinsForPoll {
+                    conv_id,
+                    require_auth,
+                    continuation,
+                } => {
+                    if require_auth && !self.client.is_authenticated() {
+                        sink.send(Input::PollBoardRefreshed {
+                            conv_id,
+                            continuation,
+                        });
+                    } else {
+                        let guard = sink.track();
+                        self.send_host(HostJob::RefreshBoardPinsThen {
+                            conv_id,
+                            continuation,
+                            sink: sink.clone(),
+                            _guard: guard,
+                        });
+                    }
+                }
+                Effect::UnpinThenPinPollApi {
+                    op_id,
+                    poll_id,
+                    conv_id,
+                    replace_ref,
+                    for_create,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let did_unpin_old =
+                            if let Some((ref_id, raw_topic, board_version)) = replace_ref {
+                                if let Err(err) = api
+                                    .unpin_board_topic_api(
+                                        &conv_id,
+                                        &ref_id,
+                                        raw_topic.as_ref(),
+                                        board_version,
+                                    )
+                                    .await
+                                {
+                                    let olaz_api::ApiError::Net(ref net_err) = err;
+                                    sink.send(Input::PollPinApiDone {
+                                        op_id,
+                                        poll_id,
+                                        conv_id,
+                                        for_create,
+                                        step_result: Err(crate::polls::map_poll_pin_net_error(
+                                            net_err, false,
+                                        )),
+                                    });
+                                    drop(guard);
+                                    return;
+                                }
+                                true
+                            } else {
+                                false
+                            };
+                        let step_result = api
+                            .pin_board_item_api(&conv_id, &poll_id, 3)
+                            .await
+                            .map(|_| ())
+                            .map_err(|olaz_api::ApiError::Net(ref net_err)| {
+                                crate::polls::map_poll_pin_net_error(net_err, did_unpin_old)
+                            });
+                        sink.send(Input::PollPinApiDone {
+                            op_id,
+                            poll_id,
+                            conv_id,
+                            for_create,
+                            step_result,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::UnpinPollApi {
+                    op_id,
+                    poll_id,
+                    conv_id,
+                    raw_topic,
+                    board_version,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let ok = api
+                            .unpin_board_topic_api(
+                                &conv_id,
+                                &poll_id,
+                                raw_topic.as_ref(),
+                                board_version,
+                            )
+                            .await
+                            .is_ok();
+                        sink.send(Input::PollUnpinApiDone {
+                            op_id,
+                            poll_id,
+                            conv_id,
+                            ok,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::VotePollApi {
+                    op_id,
+                    poll_id,
+                    new_options,
+                    voted_ids,
+                    now_ms,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let ok = if !new_options.is_empty() {
+                            api.add_poll_option_api(&poll_id, &new_options, &voted_ids)
+                                .await
+                                .is_ok()
+                        } else {
+                            api.vote_poll_api(&poll_id, &voted_ids).await.is_ok()
+                        };
+                        sink.send(Input::PollVoteApiDone {
+                            op_id,
+                            poll_id,
+                            ok,
+                            now_ms,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::LockPollApi {
+                    op_id,
+                    poll_id,
+                    now_ms,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let ok = api.lock_poll_api(&poll_id).await.is_ok();
+                        sink.send(Input::PollLockApiDone {
+                            op_id,
+                            poll_id,
+                            ok,
+                            now_ms,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::SharePollApi { op_id, poll_id } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let ok = api.share_poll_api(&poll_id).await.is_ok();
+                        sink.send(Input::PollShareApiDone { op_id, ok });
+                        drop(guard);
+                    });
+                }
+                Effect::CreatePollApi {
+                    op_id,
+                    conv_id,
+                    question,
+                    options,
+                    expired_time_ms,
+                    allow_multi,
+                    allow_add,
+                    hide_vote_preview,
+                    is_anonymous,
+                    should_pin,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let result = api
+                            .create_poll_api(
+                                &conv_id,
+                                &question,
+                                &options,
+                                expired_time_ms,
+                                allow_multi,
+                                allow_add,
+                                hide_vote_preview,
+                                is_anonymous,
+                            )
+                            .await
+                            .map(|box_map| olaz_api::extract_created_poll_id(&box_map))
+                            .map_err(|olaz_api::ApiError::Net(ref net_err)| {
+                                crate::polls::map_create_poll_net_error(net_err)
+                            });
+                        sink.send(Input::PollCreateApiDone {
+                            op_id,
+                            conv_id,
+                            should_pin,
+                            result,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::ArmPollDebounce {
+                    poll_id,
+                    seq,
+                    delay,
+                } => {
+                    let deadline = tokio::time::Instant::now() + delay;
+                    let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                    let aborts = Arc::clone(&self.poll_debounce_aborts);
+                    let aborts_inner = Arc::clone(&aborts);
+                    let host = Arc::clone(&self.host);
+                    let timer_sink = sink.clone();
+                    let poll_key = poll_id.clone();
+                    let arm_guard = sink.track();
+                    let handle = self
+                        .runtime
+                        .spawn(async move {
+                            let handled = host
+                                .arm_poll_debounce(poll_key.clone(), seq, delay_ms)
+                                .await;
+                            drop(arm_guard);
+                            if handled {
+                                return;
+                            }
+                            tokio::time::sleep_until(deadline).await;
+                            {
+                                let mut map =
+                                    aborts_inner.lock().unwrap_or_else(PoisonError::into_inner);
+                                if map.get(&poll_key).is_some_and(|(s, _)| *s == seq) {
+                                    map.remove(&poll_key);
+                                }
+                            }
+                            timer_sink.send(Input::PollDebounceFired {
+                                poll_id: poll_key,
+                                seq,
+                                now_ms: unix_now_ms(),
+                            });
+                        })
+                        .abort_handle();
+                    let mut map = aborts.lock().unwrap_or_else(PoisonError::into_inner);
+                    if let Some((_, prev)) = map.insert(poll_id, (seq, handle)) {
+                        prev.abort();
+                    }
+                }
+                Effect::CancelAllPollDebounces => {
+                    self.cancel_poll_debounces(None);
+                    let guard = sink.track();
+                    self.send_host(HostJob::CancelAllPollDebounces { _guard: guard });
+                }
                 Effect::Host(HostCall::SendE2eeText {
                     send_id,
                     conv_id,
@@ -1935,6 +2478,722 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         sink.send(Input::SendTextDone { send_id, result });
                         drop(guard);
                     });
+                }
+                // U13
+                Effect::FetchStickerCategories { op_id } => {
+                    let api = Arc::clone(&self.api);
+                    let store_tx = self.store_tx.clone();
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let res = match api.fetch_sticker_categories().await {
+                            Ok(fetched) => {
+                                let (tx, rx) = oneshot::channel();
+                                let _ = store_tx.send(StoreJob::LoadRecentStickers { reply: tx });
+                                let recents = rx.await.unwrap_or_default();
+                                Ok((fetched, recents.len()))
+                            }
+                            Err(err) => Err(err.display_without_url()),
+                        };
+                        sink.send(Input::StickerCategoriesFetched { op_id, result: res });
+                        drop(guard);
+                    });
+                }
+                Effect::LoadRecentStickersForTabs { op_id } => {
+                    let store_tx = self.store_tx.clone();
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let (tx, rx) = oneshot::channel();
+                        let _ = store_tx.send(StoreJob::LoadRecentStickers { reply: tx });
+                        let recents = rx.await.unwrap_or_default();
+                        sink.send(Input::StickerTabsRecentsLoaded {
+                            op_id,
+                            recent_count: recents.len(),
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::LoadRecentStickers { op_id } => {
+                    let store_tx = self.store_tx.clone();
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let (tx, rx) = oneshot::channel();
+                        let _ = store_tx.send(StoreJob::LoadRecentStickers { reply: tx });
+                        let rows = rx.await.unwrap_or_default();
+                        sink.send(Input::RecentStickersLoaded { op_id, rows });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchStickerCategoryDetail { op_id, cate_id } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = api
+                            .fetch_sticker_category_detail(cate_id)
+                            .await
+                            .map_err(|err| err.display_without_url());
+                        sink.send(Input::StickerCategoryDetailFetched {
+                            op_id,
+                            cate_id,
+                            result,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::SearchStickersApi {
+                    op_id,
+                    keyword,
+                    limit,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = api
+                            .search_stickers(&keyword, limit)
+                            .await
+                            .map_err(|err| err.display_without_url());
+                        sink.send(Input::StickerSearchFetched { op_id, result });
+                        drop(guard);
+                    });
+                }
+                Effect::SuggestStickersApi { op_id, keyword } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = api
+                            .suggest_stickers(&keyword)
+                            .await
+                            .map_err(|err| err.display_without_url());
+                        sink.send(Input::StickerSuggestFetched { op_id, result });
+                        drop(guard);
+                    });
+                }
+                Effect::SendStickerApi { send_id, params } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = api
+                            .send_sticker(&params)
+                            .await
+                            .map_err(|err| StickerSendError::Api(err.display_without_url()));
+                        sink.send(Input::SendStickerDone { send_id, result });
+                        drop(guard);
+                    });
+                }
+                Effect::Host(HostCall::SendE2eeSticker {
+                    send_id,
+                    conv_id,
+                    cate_id,
+                    sticker_id,
+                    client_id,
+                }) => {
+                    let guard = sink.track();
+                    self.send_host(HostJob::SendE2eeSticker {
+                        send_id,
+                        conv_id,
+                        cate_id,
+                        sticker_id,
+                        client_id,
+                        sink: sink.clone(),
+                        guard,
+                    });
+                }
+                Effect::LoadStickerSuggestPref { op_id } => {
+                    let store_tx = self.store_tx.clone();
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let (tx, rx) = oneshot::channel();
+                        let _ = store_tx.send(StoreJob::LoadStickerSuggestPref { reply: tx });
+                        let enabled = rx.await.unwrap_or(true);
+                        sink.send(Input::StickerSuggestPrefLoaded { op_id, enabled });
+                        drop(guard);
+                    });
+                }
+                Effect::SendContactCardApi {
+                    card_send_id,
+                    params,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = api
+                            .send_contact_card(&params)
+                            .await
+                            .map_err(|err| err.display_without_url());
+                        sink.send(Input::ContactCardSendDone {
+                            card_send_id,
+                            result,
+                        });
+                        drop(guard);
+                    });
+                }
+                // U8
+                Effect::AllocClientId { forward_id } => {
+                    let client_id = self.client.next_client_id();
+                    sink.send(Input::ForwardClientIdAllocated {
+                        forward_id,
+                        client_id,
+                    });
+                }
+                Effect::Host(HostCall::ResolveMedia {
+                    forward_id,
+                    conv_id,
+                    msg_id,
+                    kind,
+                }) => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let resolution = host.resolve_media(conv_id, msg_id, kind).await;
+                        sink.send(Input::ForwardMediaResolved {
+                            forward_id,
+                            resolution,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::Host(HostCall::SendE2eeContactCard {
+                    card_send_id,
+                    conv_id,
+                    client_id,
+                    contact_uid,
+                    title,
+                    phone,
+                    avatar,
+                    qr_code_url,
+                }) => {
+                    let effective_cli = if client_id.is_empty() {
+                        self.client.next_client_id().to_string()
+                    } else {
+                        client_id
+                    };
+                    let guard = sink.track();
+                    self.send_host(HostJob::SendE2eeContactCard {
+                        card_send_id,
+                        conv_id,
+                        client_id: effective_cli,
+                        contact_uid,
+                        title,
+                        phone,
+                        avatar,
+                        qr_code_url,
+                        sink: sink.clone(),
+                        guard,
+                    });
+                }
+                Effect::CreateReminderApi { op_id, params } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let conv_id = params.conv_id.clone();
+                        let pin = params.pin;
+                        match api.create_reminder(&params).await {
+                            Ok(resp) => {
+                                let data_node = resp
+                                    .get("data")
+                                    .and_then(serde_json::Value::as_object)
+                                    .unwrap_or(&resp);
+                                let mut create_keys: Vec<String> =
+                                    data_node.keys().cloned().collect();
+                                create_keys.sort_unstable();
+                                sink.send(Input::CreateReminderDone {
+                                    op_id,
+                                    conv_id,
+                                    pin,
+                                    ok: true,
+                                    create_keys,
+                                });
+                            }
+                            Err(_) => {
+                                sink.send(Input::CreateReminderDone {
+                                    op_id,
+                                    conv_id,
+                                    pin,
+                                    ok: false,
+                                    create_keys: Vec::new(),
+                                });
+                            }
+                        }
+                        drop(guard);
+                    });
+                }
+                Effect::StartConfirmPromoteDelay { confirm_gen, delay } => {
+                    // Untracked background timer (like StartDeleteUndoExpiry) so `wait_idle()`
+                    // does not block on the 300 ms confirm promotion delay.
+                    let timer_sink = sink.clone();
+                    let host = Arc::clone(&self.host);
+                    let aborts = Arc::clone(&self.confirm_promote_abort);
+                    let aborts_inner = Arc::clone(&aborts);
+                    let handle = self
+                        .runtime
+                        .spawn(async move {
+                            host.sleep_confirm_promote(delay).await;
+                            {
+                                let mut slot =
+                                    aborts_inner.lock().unwrap_or_else(PoisonError::into_inner);
+                                if slot.as_ref().is_some_and(|(g, _)| *g == confirm_gen) {
+                                    *slot = None;
+                                }
+                            }
+                            timer_sink.send(Input::ConfirmPromoteExpired { confirm_gen });
+                        })
+                        .abort_handle();
+                    let prev = {
+                        let mut slot = aborts.lock().unwrap_or_else(PoisonError::into_inner);
+                        slot.replace((confirm_gen, handle))
+                    };
+                    if let Some((_, prev_handle)) = prev {
+                        prev_handle.abort();
+                    }
+                }
+                Effect::CancelConfirmPromoteDelay => {
+                    self.cancel_confirm_promote_timer();
+                }
+                // U6
+                Effect::StartDeleteUndoExpiry { undo_gen, delay } => {
+                    // Untracked background timer (like StartTypingExpiry / StartLpTimer) so
+                    // `wait_idle()` does not block on the 5 s undo window.
+                    let timer_sink = sink.clone();
+                    let aborts = Arc::clone(&self.delete_undo_abort);
+                    let aborts_inner = Arc::clone(&aborts);
+                    let handle = self
+                        .runtime
+                        .spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            {
+                                let mut slot =
+                                    aborts_inner.lock().unwrap_or_else(PoisonError::into_inner);
+                                if slot.as_ref().is_some_and(|(g, _)| *g == undo_gen) {
+                                    *slot = None;
+                                }
+                            }
+                            timer_sink.send(Input::DeleteUndoExpired { undo_gen });
+                        })
+                        .abort_handle();
+                    let prev = {
+                        let mut slot = aborts.lock().unwrap_or_else(PoisonError::into_inner);
+                        slot.replace((undo_gen, handle))
+                    };
+                    if let Some((_, prev_handle)) = prev {
+                        prev_handle.abort();
+                    }
+                }
+                Effect::ResolveMessageIds {
+                    resolve_id,
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let store_tx = self.store_tx.clone();
+                    let sink_inner = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let (tx, rx) = oneshot::channel();
+                        let _ = store_tx.send(StoreJob::ResolveMessageIdsLookup {
+                            conv_id: conv_id.clone(),
+                            msg_id: msg_id.clone(),
+                            cli_msg_id: cli_msg_id.clone(),
+                            reply: tx,
+                        });
+                        let (mut effective_msg_id, resolved_cli_id, need_history) =
+                            rx.await.unwrap_or_else(|_| {
+                                let cli = cli_msg_id.trim();
+                                let resolved_cli = if cli.is_empty() {
+                                    msg_id.trim().to_owned()
+                                } else {
+                                    cli.to_owned()
+                                };
+                                let eff = msg_id.trim().to_owned();
+                                let need = eff.is_empty() || eff == resolved_cli;
+                                (eff, resolved_cli, need)
+                            });
+                        let mut upgraded_from_history = false;
+                        if need_history
+                            && let Ok(root_map) = api.fetch_history(&conv_id, None, 30, None).await
+                            && let Some(resolved) = crate::actions::find_server_msg_id(
+                                &Value::Object(root_map),
+                                &resolved_cli_id,
+                            )
+                        {
+                            effective_msg_id = resolved.clone();
+                            upgraded_from_history = true;
+                            let upgrade_guard = sink_inner.track();
+                            let _ = store_tx.send(StoreJob::UpgradeMessageId {
+                                conv_id: conv_id.clone(),
+                                old_id: msg_id.clone(),
+                                new_id: resolved,
+                                client_id: resolved_cli_id.clone(),
+                                _guard: upgrade_guard,
+                            });
+                        }
+                        if effective_msg_id.is_empty() {
+                            effective_msg_id = resolved_cli_id.clone();
+                        }
+                        sink_inner.send(Input::MessageIdsResolved {
+                            resolve_id,
+                            effective_msg_id,
+                            resolved_cli_id,
+                            upgraded_from_history,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::SendReactionApi {
+                    react_id,
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                    r_icon,
+                    r_type,
+                    msg_type,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let client = Arc::clone(&self.client);
+                    let sink_inner = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let first_cli = client.next_client_id();
+                        let mut final_cli = first_cli.to_string();
+                        let res = match api
+                            .send_reaction(
+                                &conv_id,
+                                &msg_id,
+                                &cli_msg_id,
+                                &r_icon,
+                                r_type,
+                                msg_type,
+                                Some(first_cli),
+                            )
+                            .await
+                        {
+                            Ok(_) => Ok(()),
+                            Err(err)
+                                if matches!(
+                                    err,
+                                    olaz_api::ApiError::Net(olaz_net::NetError::Session(_))
+                                ) && !err.is_auth_error()
+                                    && msg_type != 1 =>
+                            {
+                                let retry_cli = client.next_client_id();
+                                final_cli = retry_cli.to_string();
+                                api.send_reaction(
+                                    &conv_id,
+                                    &msg_id,
+                                    &cli_msg_id,
+                                    &r_icon,
+                                    r_type,
+                                    1,
+                                    Some(retry_cli),
+                                )
+                                .await
+                                .map(|_| ())
+                            }
+                            Err(err) => Err(err),
+                        };
+                        let error = res
+                            .err()
+                            .map(|e| crate::actions::ReactFailure::from_api_error(&e));
+                        sink_inner.send(Input::ReactDone {
+                            react_id,
+                            final_react_client_id: final_cli,
+                            error,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::RecallMessageApi {
+                    recall_id,
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                    primary_is_e2ee,
+                    can_try_alt,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink_inner = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let mut retried_alt = false;
+                        let res = match api
+                            .recall_message(&conv_id, &msg_id, &cli_msg_id, primary_is_e2ee)
+                            .await
+                        {
+                            Ok(()) => Ok(()),
+                            Err(olaz_api::ApiError::Net(olaz_net::NetError::Session(ref se)))
+                                if se.code == 112 && can_try_alt =>
+                            {
+                                retried_alt = true;
+                                api.recall_message(&conv_id, &msg_id, &cli_msg_id, !primary_is_e2ee)
+                                    .await
+                            }
+                            Err(err) => Err(err),
+                        };
+                        let error = res
+                            .err()
+                            .map(|e| crate::actions::RecallFailure::from_api_error(&e));
+                        sink_inner.send(Input::RecallDone {
+                            recall_id,
+                            retried_alt,
+                            error,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::Host(HostCall::ResolveFile {
+                    forward_id,
+                    conv_id,
+                    msg_id,
+                    name,
+                    url,
+                }) => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let resolution = host.resolve_file(conv_id, msg_id, name, url).await;
+                        sink.send(Input::ForwardFileResolved {
+                            forward_id,
+                            resolution,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::Host(HostCall::FetchMediaData { forward_id, url }) => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let temp_path = host.fetch_media_data(url).await;
+                        sink.send(Input::ForwardFetchMediaDone {
+                            forward_id,
+                            temp_path,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::Host(HostCall::SendMedia {
+                    forward_id,
+                    conv_id,
+                    paths,
+                    cleanup_after,
+                }) => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let outcome = host.send_media(conv_id, paths, cleanup_after).await;
+                        sink.send(Input::ForwardSendMediaDone {
+                            forward_id,
+                            outcome,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::Host(HostCall::SendFiles {
+                    forward_id,
+                    conv_id,
+                    paths,
+                }) => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let outcome = host.send_files(conv_id, paths).await;
+                        sink.send(Input::ForwardSendFilesDone {
+                            forward_id,
+                            outcome,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::CancelDeleteUndoExpiry => {
+                    self.cancel_delete_undo_timer();
+                    self.cancel_confirm_promote_timer();
+                }
+                Effect::CommitDeleteBatch { items } => {
+                    let client = Arc::clone(&self.client);
+                    let store_tx = self.store_tx.clone();
+                    let sink_inner = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        for item in items {
+                            let resolved_cli = if item.cli_msg_id.is_empty() {
+                                item.msg_id.as_str()
+                            } else {
+                                item.cli_msg_id.as_str()
+                            };
+                            let _ = api
+                                .delete_message_for_me(
+                                    &item.conv_id,
+                                    &item.msg_id,
+                                    resolved_cli,
+                                    &item.sender_id,
+                                )
+                                .await;
+                            let store_guard = sink_inner.track();
+                            let _ = store_tx.send(StoreJob::Op {
+                                op: StoreOp::DeleteMessage {
+                                    conv_id: item.conv_id,
+                                    id: item.msg_id,
+                                },
+                                sink: sink_inner.clone(),
+                                _guard: store_guard,
+                            });
+                        }
+                        drop(guard);
+                    });
+                }
+                Effect::FetchAutoDeleteApi { op_id } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let outcome = api.fetch_auto_delete().await.ok();
+                        sink.send(Input::AutoDeleteLoaded { outcome, op_id });
+                        drop(guard);
+                    });
+                }
+                Effect::UpdateAutoDeleteApi {
+                    conv_id,
+                    ttl,
+                    now_ms,
+                    op_id,
+                } => {
+                    let client = Arc::clone(&self.client);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let api = ZaloApi::from_shared(client);
+                        let error_type = match api.update_auto_delete(&conv_id, ttl).await {
+                            Ok(()) => None,
+                            Err(err) => Some(swift_error_type_name(&err).to_owned()),
+                        };
+                        sink.send(Input::AutoDeleteUpdated {
+                            conv_id,
+                            ttl,
+                            now_ms,
+                            error_type,
+                            op_id,
+                        });
+                        drop(guard);
+                    });
+                }
+                // U11
+                Effect::RefreshCloudData {
+                    op_id,
+                    media_ids_by_conv,
+                    skip_api_if_no_store,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let client = Arc::clone(&self.client);
+                    let shared_store = Arc::clone(&self.shared_store);
+                    let store_tx = self.store_tx.clone();
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let has_store = shared_store
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .is_some();
+                        if skip_api_if_no_store && !has_store {
+                            sink.send(Input::CloudRefreshLoaded {
+                                op_id,
+                                server_snapshot: None,
+                                sql_summaries: Vec::new(),
+                                existing_ids_by_conv: BTreeMap::new(),
+                            });
+                            drop(guard);
+                            return;
+                        }
+                        let server_snapshot = if client.account().is_some() {
+                            api.fetch_cloud_server_snapshot().await
+                        } else {
+                            None
+                        };
+                        let _ = store_tx.send(StoreJob::CloudRefreshQuery {
+                            op_id,
+                            server_snapshot,
+                            media_ids_by_conv,
+                            sink,
+                            _guard: guard,
+                        });
+                    });
+                }
+                Effect::CloudListStore {
+                    op_id,
+                    conv_id,
+                    excluding_self,
+                    kind_tags,
+                    sort_by_size,
+                    ascending,
+                    offset,
+                    limit,
+                    memory_media,
+                } => {
+                    let guard = sink.track();
+                    self.send_store(StoreJob::CloudListQuery {
+                        op_id,
+                        conv_id,
+                        excluding_self,
+                        kind_tags,
+                        sort_by_size,
+                        ascending,
+                        offset,
+                        limit,
+                        memory_media,
+                        sink: sink.clone(),
+                        _guard: guard,
+                    });
+                }
+                Effect::CloudLookupMessage {
+                    op_id,
+                    conv_id,
+                    msg_id,
+                } => {
+                    let guard = sink.track();
+                    self.send_store(StoreJob::CloudLookupMessage {
+                        op_id,
+                        conv_id,
+                        msg_id,
+                        sink: sink.clone(),
+                        _guard: guard,
+                    });
+                }
+                Effect::CloudDeleteMessageApi {
+                    op_id,
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                    sender_id,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let error = api
+                            .delete_message_for_me(&conv_id, &msg_id, &cli_msg_id, &sender_id)
+                            .await
+                            .err()
+                            .map(|err| err.display_without_url());
+                        sink.send(Input::CloudDeleteMessageApiDone { op_id, error });
+                        drop(guard);
+                    });
+                }
+                Effect::ClearCloudViewerKey => {
+                    self.api.clear_cloud_viewer_key();
                 }
                 Effect::Host(call) => {
                     let guard = sink.track();
@@ -2110,6 +3369,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             event_id,
                             react_client_id,
                             sender_name,
+                            now_ms,
                         } => HostJob::ApplyRemoteReaction {
                             conv_id,
                             msg_id,
@@ -2120,6 +3380,8 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             event_id,
                             react_client_id,
                             sender_name,
+                            now_ms,
+                            sink: sink.clone(),
                             _guard: guard,
                         },
                         HostCall::ApplyRemoteRecall {
@@ -2128,12 +3390,17 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             cli_msg_id,
                             update_conversation_preview,
                             persist_conversations,
+                            op_id,
+                            recall_many_id,
                         } => HostJob::ApplyRemoteRecall {
                             conv_id,
                             msg_id,
                             cli_msg_id,
                             update_conversation_preview,
                             persist_conversations,
+                            op_id,
+                            recall_many_id,
+                            sink: sink.clone(),
                             _guard: guard,
                         },
                         HostCall::ApplyRemoteDelete {
@@ -2142,12 +3409,15 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             cli_msg_id,
                             update_conversation_preview,
                             persist_conversations,
+                            cloud_delete_op_id,
                         } => HostJob::ApplyRemoteDelete {
                             conv_id,
                             msg_id,
                             cli_msg_id,
                             update_conversation_preview,
                             persist_conversations,
+                            cloud_delete_op_id,
+                            sink: sink.clone(),
                             _guard: guard,
                         },
                         HostCall::DecryptEnvelope {
@@ -2201,7 +3471,48 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         HostCall::TransportBatchSettled => {
                             HostJob::TransportBatchSettled { _guard: guard }
                         }
-                        HostCall::SendE2eeText { .. } => {
+                        HostCall::ShowCard { conv_id, text } => HostJob::ShowCard {
+                            conv_id,
+                            text,
+                            _guard: guard,
+                        },
+                        // U11
+                        HostCall::CloudResolveMedia {
+                            op_id,
+                            conv_id,
+                            msg_id,
+                            kind,
+                        } => HostJob::CloudResolveMedia {
+                            op_id,
+                            conv_id,
+                            msg_id,
+                            kind,
+                            sink: sink.clone(),
+                            _guard: guard,
+                        },
+                        HostCall::CloudResolveFile {
+                            op_id,
+                            conv_id,
+                            msg_id,
+                            name,
+                            url,
+                        } => HostJob::CloudResolveFile {
+                            op_id,
+                            conv_id,
+                            msg_id,
+                            name,
+                            url,
+                            sink: sink.clone(),
+                            _guard: guard,
+                        },
+                        HostCall::SendE2eeText { .. }
+                        | HostCall::SendE2eeSticker { .. }
+                        | HostCall::SendE2eeContactCard { .. }
+                        | HostCall::ResolveMedia { .. }
+                        | HostCall::ResolveFile { .. }
+                        | HostCall::FetchMediaData { .. }
+                        | HostCall::SendMedia { .. }
+                        | HostCall::SendFiles { .. } => {
                             continue;
                         }
                     };
@@ -2223,6 +3534,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
         self.cancel_active_tasks();
         self.cancel_bootstrap_tasks();
         self.cancel_typing_expiry(None);
+        self.cancel_poll_debounces(None);
         self.cancel_long_poll();
         self.ws_driver.stop(false);
         self.host_worker_abort.abort();
@@ -2353,6 +3665,117 @@ async fn run_store_worker(
                             op_id,
                         });
                     }
+                    // U14
+                    StoreOp::SearchMessagesPage {
+                        op_id,
+                        conv_id,
+                        query,
+                        before,
+                        limit,
+                    } => {
+                        let page_limit = usize::try_from(limit).unwrap_or(50);
+                        let rows = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let cursor = before.as_ref().map(|(ts, id)| (*ts, id.as_str()));
+                                    store
+                                        .search_messages_page(&conv_id, &query, cursor, limit)
+                                        .unwrap_or_default()
+                                })
+                                .await
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        sink.send(Input::SearchMessagesPageLoaded {
+                            op_id,
+                            rows,
+                            page_limit,
+                        });
+                    }
+                    StoreOp::LoadMessagesAround {
+                        op_id,
+                        conv_id,
+                        target_ts_ms,
+                        before_oldest_ts_ms,
+                    } => {
+                        let window = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    store
+                                        .messages_around(
+                                            &conv_id,
+                                            target_ts_ms,
+                                            before_oldest_ts_ms,
+                                            25,
+                                            3000,
+                                        )
+                                        .ok()
+                                })
+                                .await
+                                .ok()
+                                .flatten()
+                        } else {
+                            None
+                        };
+                        sink.send(Input::EnsureMessageWindowLoaded { op_id, window });
+                    }
+                    StoreOp::LookupMessage {
+                        op_id,
+                        conv_id,
+                        key,
+                    } => {
+                        let row = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    store.message(&conv_id, &key).ok().flatten()
+                                })
+                                .await
+                                .ok()
+                                .flatten()
+                        } else {
+                            None
+                        };
+                        sink.send(Input::QuotedLookupDone { op_id, row });
+                    }
+                    StoreOp::FindLegacyQuoted {
+                        op_id,
+                        conv_id,
+                        exclude_id,
+                        max_ts_ms,
+                        trimmed_text,
+                        mine_only,
+                        limit,
+                    } => {
+                        let rows = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    store
+                                        .find_legacy_quoted_candidates(
+                                            &conv_id,
+                                            &exclude_id,
+                                            max_ts_ms,
+                                            &trimmed_text,
+                                            mine_only,
+                                            limit,
+                                        )
+                                        .unwrap_or_default()
+                                })
+                                .await
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        sink.send(Input::LegacyQuotedLookupDone { op_id, rows });
+                    }
                     // U4-bootstrap
                     StoreOp::LoadPreferenceString { key, boot_gen } => {
                         let last_refresh_pref = if let Some(store_arc) = store_opt {
@@ -2421,6 +3844,142 @@ async fn run_store_worker(
                             });
                         }
                     }
+                    StoreOp::MarkRecalledAndCheckLatest {
+                        conv_id,
+                        target_id,
+                        cli_msg_id,
+                        found_in_memory,
+                        recalled_last,
+                        update_conversation_preview,
+                        persist_conversations,
+                        op_id,
+                        recall_many_id,
+                    } => {
+                        let conv_c = conv_id.clone();
+                        let target_c = target_id.clone();
+                        let cli_c = cli_msg_id.clone();
+                        let recalled_last_final = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let mut store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let _ = store.mark_recalled(&conv_c, &target_c, &cli_c);
+                                    let mut rl = recalled_last;
+                                    if !found_in_memory
+                                        && let Ok(rows) = store.messages(&conv_c, None, 1)
+                                        && let Some(latest) = rows.last()
+                                        && latest.kind_tag == "recalled"
+                                        && ((!target_c.is_empty()
+                                            && (latest.id == target_c
+                                                || latest.client_id == target_c))
+                                            || (!cli_c.is_empty()
+                                                && (latest.id == cli_c
+                                                    || latest.client_id == cli_c)))
+                                    {
+                                        rl = Some((latest.ts_ms, latest.is_mine));
+                                    }
+                                    rl
+                                })
+                                .await
+                                .unwrap_or(recalled_last)
+                        } else {
+                            recalled_last
+                        };
+                        sink.send(Input::RemoteRecallStoreDone {
+                            conv_id,
+                            recalled_last: recalled_last_final,
+                            update_conversation_preview,
+                            persist_conversations,
+                            op_id,
+                            recall_many_id,
+                        });
+                    }
+                    StoreOp::DeleteMessageAndCheckLatest {
+                        conv_id,
+                        msg_id,
+                        cli_msg_id,
+                        deleted_ts_ms,
+                        mem_latest,
+                        update_conversation_preview,
+                        persist_conversations,
+                        cloud_delete_op_id,
+                    } => {
+                        let conv_c = conv_id.clone();
+                        let msg_c = msg_id.clone();
+                        let cli_c = cli_msg_id.clone();
+                        let (resolved_deleted_ts_ms, store_latest) = if let Some(store_arc) =
+                            store_opt
+                        {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let mut store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let target_id = if !msg_c.is_empty() {
+                                        msg_c.as_str()
+                                    } else {
+                                        cli_c.as_str()
+                                    };
+                                    let mut del_ts = deleted_ts_ms;
+                                    if del_ts.is_none() {
+                                        let mut existing = if !target_id.is_empty() {
+                                            store.message(&conv_c, target_id).ok().flatten()
+                                        } else {
+                                            None
+                                        };
+                                        if existing.is_none() && !cli_c.is_empty() {
+                                            existing =
+                                                store.message(&conv_c, &cli_c).ok().flatten();
+                                        }
+                                        if let Some(row) = existing {
+                                            del_ts = Some(row.ts_ms);
+                                        }
+                                    }
+                                    for id in crate::actions::remote_delete_store_ids(
+                                        crate::actions::REMOTE_DELETE_MATCH_POLICY,
+                                        &msg_c,
+                                        &cli_c,
+                                    ) {
+                                        let _ = store.delete_message(&conv_c, &id);
+                                    }
+                                    let latest_preview = store
+                                        .messages(&conv_c, None, 1)
+                                        .ok()
+                                        .and_then(|rows| rows.into_iter().last())
+                                        .map(|latest| {
+                                            let text = if let Some(decoded) =
+                                                crate::messages::decode_db_stored(&latest)
+                                            {
+                                                crate::conversations::message_preview_label(
+                                                    &decoded,
+                                                )
+                                            } else if latest.kind_tag == "recalled" {
+                                                "Tin nhắn đã được thu hồi".to_owned()
+                                            } else {
+                                                latest.text.clone()
+                                            };
+                                            crate::conversations::ConversationPreview {
+                                                text,
+                                                date_ms: Some(latest.ts_ms),
+                                                from_me: latest.is_mine,
+                                            }
+                                        });
+                                    (del_ts, latest_preview)
+                                })
+                                .await
+                                .unwrap_or((deleted_ts_ms, None))
+                        } else {
+                            (deleted_ts_ms, None)
+                        };
+                        sink.send(Input::RemoteDeleteStoreDone {
+                            conv_id,
+                            deleted_ts_ms: resolved_deleted_ts_ms,
+                            mem_latest,
+                            store_latest,
+                            update_conversation_preview,
+                            persist_conversations,
+                            cloud_delete_op_id,
+                        });
+                    }
                     other => {
                         if let Some(store_arc) = store_opt {
                             let _ = runtime
@@ -2467,6 +4026,24 @@ async fn run_store_worker(
                                         StoreOp::SetPreferenceData { key, data } => {
                                             let _ = store.set_preference_data(&key, &data);
                                         }
+                                        StoreOp::SetPreferenceBool { key, value } => {
+                                            let _ = store.set_preference_bool(&key, value);
+                                        }
+                                        StoreOp::SaveRecentSticker { sticker } => {
+                                            let existing_bytes = store
+                                                .get_preference_data("recentStickers")
+                                                .ok()
+                                                .flatten();
+                                            let existing = parse_recent_stickers_bytes(
+                                                existing_bytes.as_deref(),
+                                            );
+                                            let updated =
+                                                update_recent_stickers_json(&existing, &sticker);
+                                            if let Ok(bytes) = serde_json::to_vec(&updated) {
+                                                let _ = store
+                                                    .set_preference_data("recentStickers", &bytes);
+                                            }
+                                        }
                                         StoreOp::DeletePreference { key } => {
                                             let _ = store.delete_preference(&key);
                                         }
@@ -2482,16 +4059,237 @@ async fn run_store_worker(
                                                 },
                                             );
                                         }
+                                        // U6
+                                        StoreOp::DeleteMessage { conv_id, id } => {
+                                            let _ = store.delete_message(&conv_id, &id);
+                                        }
+                                        StoreOp::ApplyRemoteReactionInStore {
+                                            conv_candidates,
+                                            msg_id,
+                                            cli_msg_id,
+                                            actor_uid,
+                                            my_uid,
+                                            is_me,
+                                            r_type,
+                                            r_icon,
+                                            allow_duplicate_same_user,
+                                            snap,
+                                        } => {
+                                            let mut found = None;
+                                            for candidate in &conv_candidates {
+                                                if found.is_some() {
+                                                    break;
+                                                }
+                                                if !msg_id.is_empty() {
+                                                    found = store
+                                                        .message(candidate, &msg_id)
+                                                        .ok()
+                                                        .flatten();
+                                                }
+                                                if found.is_none() && !cli_msg_id.is_empty() {
+                                                    found = store
+                                                        .message(candidate, &cli_msg_id)
+                                                        .ok()
+                                                        .flatten();
+                                                }
+                                            }
+                                            if let Some(row) = found
+                                                && let Some(mut msg) =
+                                                    crate::messages::decode_db_stored(&row)
+                                            {
+                                                crate::actions::mutate_reactions(
+                                                    &mut msg.reactions,
+                                                    &crate::actions::ReactionMutation {
+                                                        actor_uid: &actor_uid,
+                                                        my_uid: &my_uid,
+                                                        is_me,
+                                                        r_type: &r_type,
+                                                        r_icon: &r_icon,
+                                                        allow_duplicate_same_user,
+                                                    },
+                                                    |uid| {
+                                                        snap.lookup_person(uid)
+                                                            .map(|p| p.name)
+                                                            .unwrap_or_default()
+                                                    },
+                                                );
+                                                if let Some(wire_stored) =
+                                                    olaz_wire::encode_chat_message(
+                                                        &msg,
+                                                        &msg.client_id,
+                                                    )
+                                                {
+                                                    let _ = store.save_messages_with(
+                                                        &[crate::messages::to_db_stored(
+                                                            &wire_stored,
+                                                        )],
+                                                        SaveOptions {
+                                                            skip_twin_checks: false,
+                                                            preserve_existing_reactions: false,
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                        }
                                         StoreOp::LoadMentionPreviewMessages { .. }
                                         | StoreOp::LoadPreferenceString { .. }
                                         | StoreOp::ProbeAndSaveMessages { .. }
                                         | StoreOp::LoadOpenLocalMessages { .. }
-                                        | StoreOp::LoadOlderStoreMessages { .. } => {}
+                                        | StoreOp::LoadOlderStoreMessages { .. }
+                                        | StoreOp::SearchMessagesPage { .. }
+                                        | StoreOp::LoadMessagesAround { .. }
+                                        | StoreOp::LookupMessage { .. }
+                                        | StoreOp::FindLegacyQuoted { .. }
+                                        | StoreOp::MarkRecalledAndCheckLatest { .. }
+                                        | StoreOp::DeleteMessageAndCheckLatest { .. } => {}
                                     }
                                 })
                                 .await;
                         }
                     }
+                }
+            }
+            StoreJob::LoadRecentStickers { reply } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let rows = if let Some(store_arc) = store_opt {
+                    runtime
+                        .spawn_blocking(move || {
+                            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                            let raw = store.get_preference_data("recentStickers").ok().flatten();
+                            parse_recent_stickers_bytes(raw.as_deref())
+                        })
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let _ = reply.send(rows);
+            }
+            StoreJob::LoadStickerSuggestPref { reply } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let enabled = if let Some(store_arc) = store_opt {
+                    runtime
+                        .spawn_blocking(move || {
+                            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                            store
+                                .get_preference_bool("stickerSuggest", true)
+                                .unwrap_or(true)
+                        })
+                        .await
+                        .unwrap_or(true)
+                } else {
+                    true
+                };
+                let _ = reply.send(enabled);
+            }
+            StoreJob::ResolveMessageIdsLookup {
+                conv_id,
+                msg_id,
+                cli_msg_id,
+                reply,
+            } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let msg_id_fb = msg_id.clone();
+                let cli_msg_id_fb = cli_msg_id.clone();
+                let res = if let Some(store_arc) = store_opt {
+                    runtime
+                        .spawn_blocking(move || {
+                            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                            let mut resolved_cli = cli_msg_id.trim().to_owned();
+                            if resolved_cli.is_empty()
+                                && let Ok(Some(stored)) = store.message(&conv_id, &msg_id)
+                            {
+                                let col_cli = stored.client_id.trim();
+                                if !col_cli.is_empty() {
+                                    resolved_cli = col_cli.to_owned();
+                                } else if let Ok(Value::Object(map)) =
+                                    serde_json::from_slice::<Value>(&stored.raw_json_data)
+                                {
+                                    let raw_cli = map
+                                        .get("clientId")
+                                        .or_else(|| map.get("cliMsgId"))
+                                        .and_then(|v| match v {
+                                            Value::String(s) => Some(s.trim().to_owned()),
+                                            Value::Number(n) => Some(n.to_string()),
+                                            _ => None,
+                                        })
+                                        .unwrap_or_default();
+                                    if !raw_cli.is_empty() {
+                                        resolved_cli = raw_cli;
+                                    }
+                                }
+                            }
+                            if resolved_cli.is_empty() {
+                                resolved_cli = msg_id.clone();
+                            }
+                            let mut effective_msg_id = msg_id.trim().to_owned();
+                            let mut need_history = false;
+                            if effective_msg_id.is_empty() || effective_msg_id == resolved_cli {
+                                if let Ok(Some(stored)) = store.message(&conv_id, &resolved_cli)
+                                    && !stored.id.is_empty()
+                                    && stored.id != resolved_cli
+                                {
+                                    effective_msg_id = stored.id;
+                                } else {
+                                    need_history = true;
+                                }
+                            }
+                            (effective_msg_id, resolved_cli, need_history)
+                        })
+                        .await
+                        .unwrap_or_else(|_| {
+                            let cli = cli_msg_id_fb.trim();
+                            let r = if cli.is_empty() {
+                                msg_id_fb.clone()
+                            } else {
+                                cli.to_owned()
+                            };
+                            let eff = msg_id_fb.trim().to_owned();
+                            let need = eff.is_empty() || eff == r;
+                            (eff, r, need)
+                        })
+                } else {
+                    let cli = cli_msg_id_fb.trim();
+                    let r = if cli.is_empty() {
+                        msg_id_fb.clone()
+                    } else {
+                        cli.to_owned()
+                    };
+                    let eff = msg_id_fb.trim().to_owned();
+                    let need = eff.is_empty() || eff == r;
+                    (eff, r, need)
+                };
+                let _ = reply.send(res);
+            }
+            StoreJob::UpgradeMessageId {
+                conv_id,
+                old_id,
+                new_id,
+                client_id,
+                _guard,
+            } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                if let Some(store_arc) = store_opt {
+                    let _ = runtime
+                        .spawn_blocking(move || {
+                            let mut store =
+                                store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                            let _ =
+                                store.upgrade_message_id(&conv_id, &old_id, &new_id, &client_id);
+                        })
+                        .await;
                 }
             }
             StoreJob::FlushOp {
@@ -2501,6 +4299,163 @@ async fn run_store_worker(
                 _guard,
             } => {
                 sink.send(Input::OpStoreFlushed { op_id, result });
+            }
+            // U11
+            StoreJob::CloudRefreshQuery {
+                op_id,
+                server_snapshot,
+                media_ids_by_conv,
+                sink,
+                _guard,
+            } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let (sql_summaries, existing_ids_by_conv) = if let Some(store_arc) = store_opt {
+                    tokio::task::spawn_blocking(move || {
+                        let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                        let summaries = store.cloud_media_aggregation().unwrap_or_default();
+                        let mut existing: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+                        for (cid, ids) in media_ids_by_conv {
+                            if ids.is_empty() {
+                                continue;
+                            }
+                            let found = store
+                                .existing_message_ids(&cid, &ids)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .collect();
+                            existing.insert(cid, found);
+                        }
+                        (summaries, existing)
+                    })
+                    .await
+                    .unwrap_or_default()
+                } else {
+                    (Vec::new(), BTreeMap::new())
+                };
+                sink.send(Input::CloudRefreshLoaded {
+                    op_id,
+                    server_snapshot,
+                    sql_summaries,
+                    existing_ids_by_conv,
+                });
+            }
+            StoreJob::CloudListQuery {
+                op_id,
+                conv_id,
+                excluding_self,
+                kind_tags,
+                sort_by_size,
+                ascending,
+                offset,
+                limit,
+                memory_media,
+                sink,
+                _guard,
+            } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                if let Some(store_arc) = store_opt {
+                    let (existing_ids_by_conv, sql_items, sql_has_more, sql_error) =
+                        tokio::task::spawn_blocking(move || {
+                            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                            let mut existing: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+                            let mut has_unsynced = false;
+                            for (cid, all_ids, matching_ids) in memory_media {
+                                let found: BTreeSet<String> = store
+                                    .existing_message_ids(&cid, &all_ids)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .collect();
+                                if matching_ids.iter().any(|id| !found.contains(id)) {
+                                    has_unsynced = true;
+                                }
+                                existing.insert(cid, found);
+                            }
+                            if !has_unsynced {
+                                let q = CloudMediaQuery {
+                                    conv_id,
+                                    excluding_conv_id: excluding_self,
+                                    kind_tags,
+                                    sort_by_size,
+                                    ascending,
+                                    offset,
+                                    limit,
+                                };
+                                match store.cloud_media_items(&q) {
+                                    Ok((items, has_more)) => (existing, items, has_more, false),
+                                    Err(_) => (existing, Vec::new(), false, true),
+                                }
+                            } else {
+                                let q = CloudMediaQuery {
+                                    conv_id,
+                                    excluding_conv_id: excluding_self,
+                                    kind_tags,
+                                    sort_by_size,
+                                    ascending,
+                                    offset: 0,
+                                    limit: offset.saturating_add(limit),
+                                };
+                                let (items, has_more) =
+                                    store.cloud_media_items(&q).unwrap_or_default();
+                                (existing, items, has_more, false)
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|_| (BTreeMap::new(), Vec::new(), false, true));
+                    sink.send(Input::CloudListStoreDone {
+                        op_id,
+                        store_present: true,
+                        existing_ids_by_conv,
+                        sql_items,
+                        sql_has_more,
+                        sql_error,
+                    });
+                } else {
+                    sink.send(Input::CloudListStoreDone {
+                        op_id,
+                        store_present: false,
+                        existing_ids_by_conv: BTreeMap::new(),
+                        sql_items: Vec::new(),
+                        sql_has_more: false,
+                        sql_error: false,
+                    });
+                }
+            }
+            StoreJob::CloudLookupMessage {
+                op_id,
+                conv_id,
+                msg_id,
+                sink,
+                _guard,
+            } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let message = if let Some(store_arc) = store_opt {
+                    tokio::task::spawn_blocking(move || {
+                        let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                        store
+                            .message(&conv_id, &msg_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|row| decode_db_stored(&row))
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                } else {
+                    None
+                };
+                sink.send(Input::CloudLookupMessageDone {
+                    op_id,
+                    message: message.map(Box::new),
+                });
             }
             StoreJob::Drain(tx) => {
                 let _ = tx.send(());
@@ -2743,6 +4698,22 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
             HostJob::RefreshBoardPins { conv_id, _guard } => {
                 host.refresh_board_pins(conv_id).await;
             }
+            // U12
+            HostJob::RefreshBoardPinsThen {
+                conv_id,
+                continuation,
+                sink,
+                _guard,
+            } => {
+                host.refresh_board_pins(conv_id.clone()).await;
+                sink.send(Input::PollBoardRefreshed {
+                    conv_id,
+                    continuation,
+                });
+            }
+            HostJob::CancelAllPollDebounces { _guard } => {
+                host.cancel_all_poll_debounces().await;
+            }
             HostJob::MarkReadBoundary {
                 conv_id,
                 seen_target,
@@ -2760,20 +4731,38 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 event_id,
                 react_client_id,
                 sender_name,
+                now_ms,
+                sink,
                 _guard,
             } => {
-                host.apply_remote_reaction(
-                    conv_id,
-                    msg_id,
-                    cli_msg_id,
-                    sender_id,
-                    r_type,
-                    r_icon,
-                    event_id,
-                    react_client_id,
-                    sender_name,
-                )
-                .await;
+                let approved = host
+                    .apply_remote_reaction(
+                        conv_id.clone(),
+                        msg_id.clone(),
+                        cli_msg_id.clone(),
+                        sender_id.clone(),
+                        r_type.clone(),
+                        r_icon.clone(),
+                        event_id.clone(),
+                        react_client_id.clone(),
+                        sender_name.clone(),
+                    )
+                    .await;
+                if approved {
+                    let effective_now = if now_ms > 0 { now_ms } else { unix_now_ms() };
+                    sink.send(Input::RemoteReactionApproved {
+                        conv_id,
+                        msg_id,
+                        cli_msg_id,
+                        sender_id,
+                        r_type,
+                        r_icon,
+                        event_id,
+                        react_client_id,
+                        sender_name,
+                        now_ms: effective_now,
+                    });
+                }
             }
             HostJob::ApplyRemoteRecall {
                 conv_id,
@@ -2781,16 +4770,36 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 cli_msg_id,
                 update_conversation_preview,
                 persist_conversations,
+                op_id,
+                recall_many_id,
+                sink,
                 _guard,
             } => {
-                host.apply_remote_recall(
-                    conv_id,
-                    msg_id,
-                    cli_msg_id,
-                    update_conversation_preview,
-                    persist_conversations,
-                )
-                .await;
+                let approved = host
+                    .apply_remote_recall(
+                        conv_id.clone(),
+                        msg_id.clone(),
+                        cli_msg_id.clone(),
+                        update_conversation_preview,
+                        persist_conversations,
+                    )
+                    .await;
+                if approved {
+                    sink.send(Input::RemoteRecallApproved {
+                        conv_id,
+                        msg_id,
+                        cli_msg_id,
+                        update_conversation_preview,
+                        persist_conversations,
+                        op_id,
+                        recall_many_id,
+                    });
+                } else if op_id.is_some() || recall_many_id.is_some() {
+                    sink.send(Input::RemoteRecallSkipped {
+                        op_id,
+                        recall_many_id,
+                    });
+                }
             }
             HostJob::ApplyRemoteDelete {
                 conv_id,
@@ -2798,16 +4807,31 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 cli_msg_id,
                 update_conversation_preview,
                 persist_conversations,
+                cloud_delete_op_id,
+                sink,
                 _guard,
             } => {
-                host.apply_remote_delete(
-                    conv_id,
-                    msg_id,
-                    cli_msg_id,
-                    update_conversation_preview,
-                    persist_conversations,
-                )
-                .await;
+                let approved = host
+                    .apply_remote_delete(
+                        conv_id.clone(),
+                        msg_id.clone(),
+                        cli_msg_id.clone(),
+                        update_conversation_preview,
+                        persist_conversations,
+                    )
+                    .await;
+                if approved {
+                    sink.send(Input::RemoteDeleteApproved {
+                        conv_id,
+                        msg_id,
+                        cli_msg_id,
+                        update_conversation_preview,
+                        persist_conversations,
+                        cloud_delete_op_id,
+                    });
+                } else if let Some(op_id) = cloud_delete_op_id {
+                    sink.send(Input::CloudRemoteDeleteDone { op_id });
+                }
             }
             HostJob::DecryptEnvelope {
                 payload,
@@ -3031,6 +5055,13 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
             } => {
                 host.show_typing(conv_id, uid, on_pc).await;
             }
+            HostJob::ShowCard {
+                conv_id,
+                text,
+                _guard,
+            } => {
+                host.show_card(conv_id, text).await;
+            }
             HostJob::PinTopic { conv_id, _guard } => {
                 host.pin_topic(conv_id).await;
             }
@@ -3052,6 +5083,101 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
             } => {
                 host.mute(conv_id, set, start, start_explicit, duration)
                     .await;
+            }
+            // U11
+            HostJob::CloudResolveMedia {
+                op_id,
+                conv_id,
+                msg_id,
+                kind,
+                sink,
+                _guard,
+            } => {
+                let outcome = host.resolve_media(conv_id, msg_id, kind).await;
+                let file_size = match &outcome {
+                    MediaResolutionOutcome::File(path) => std::fs::metadata(path)
+                        .ok()
+                        .and_then(|m| i64::try_from(m.len()).ok()),
+                    _ => None,
+                };
+                sink.send(Input::CloudResolveMediaDone {
+                    op_id,
+                    outcome,
+                    file_size,
+                });
+            }
+            HostJob::CloudResolveFile {
+                op_id,
+                conv_id,
+                msg_id,
+                name,
+                url,
+                sink,
+                _guard,
+            } => {
+                let outcome = host.resolve_file(conv_id, msg_id, name, url).await;
+                let file_size = match &outcome {
+                    FileResolutionOutcome::Ready(path) => std::fs::metadata(path)
+                        .ok()
+                        .and_then(|m| i64::try_from(m.len()).ok()),
+                    _ => None,
+                };
+                sink.send(Input::CloudResolveFileDone {
+                    op_id,
+                    outcome,
+                    file_size,
+                });
+            }
+            // U13
+            HostJob::SendE2eeSticker {
+                send_id,
+                conv_id,
+                cate_id,
+                sticker_id,
+                client_id,
+                sink,
+                guard,
+            } => {
+                let host = Arc::clone(&host);
+                tokio::spawn(async move {
+                    let result = host
+                        .send_e2ee_sticker(conv_id, cate_id, sticker_id, client_id)
+                        .await;
+                    sink.send(Input::SendStickerDone { send_id, result });
+                    drop(guard);
+                });
+            }
+            HostJob::SendE2eeContactCard {
+                card_send_id,
+                conv_id,
+                client_id,
+                contact_uid,
+                title,
+                phone,
+                avatar,
+                qr_code_url,
+                sink,
+                guard,
+            } => {
+                let host = Arc::clone(&host);
+                tokio::spawn(async move {
+                    let result = host
+                        .send_e2ee_contact_card(
+                            conv_id,
+                            client_id,
+                            contact_uid,
+                            title,
+                            phone,
+                            avatar,
+                            qr_code_url,
+                        )
+                        .await;
+                    sink.send(Input::ContactCardSendDone {
+                        card_send_id,
+                        result,
+                    });
+                    drop(guard);
+                });
             }
             HostJob::Drain(tx) => {
                 let _ = tx.send(());
@@ -3780,6 +5906,520 @@ mod tests {
         });
         core.wait_idle().await;
         assert_eq!(client.transport().requests().len(), 2);
+
+        core.stop();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_debounce_timer_coalesces_and_cancels_on_reset() {
+        use olaz_net::http::RawResponse;
+        use olaz_net::mock::MockTransport;
+
+        use crate::actor::CoreHandle;
+        use crate::input::Command;
+        use crate::polls::{POLL_DEBOUNCE_DELAY_MS, PollDetail, PollMessageNotice};
+        use crate::state::{CoreState, Phase, Profile};
+
+        let transport = MockTransport::from_fn(|_| {
+            Ok(RawResponse::new(
+                200,
+                br#"{"error_code":0,"data":{"group_id":"5001","question":"Q","creator":"2001","status":1,"expired_time":0,"options":[]}}"#.to_vec(),
+            ))
+        });
+        let client = Arc::new(SessionClient::new(
+            transport,
+            "imei-poll-timer".to_owned(),
+            "Mac".to_owned(),
+        ));
+        client.update_credentials(
+            LoginAccount {
+                user_id: "2001".to_owned(),
+                ..LoginAccount::default()
+            },
+            b"0123456789abcdef".to_vec(),
+            "sek.1".to_owned(),
+            Some(ZaloDomains::default()),
+        );
+        // RecordingTypingHost uses the default Host::arm_poll_debounce -> false,
+        // exercising SessionEffectRunner's native tokio::time::sleep_until timer.
+        let runner = Arc::new(SessionEffectRunner::new(
+            Arc::clone(&client),
+            Arc::new(RecordingTypingHost::default()),
+            tokio::runtime::Handle::current(),
+        ));
+        let mut initial = CoreState::default();
+        initial.session.phase = Phase::Ready;
+        initial.session.profile = Some(Profile {
+            user_id: "2001".to_owned(),
+            display_name: "Tester".to_owned(),
+            avatar: None,
+            phone: None,
+        });
+        initial.contacts.group_details_json.insert(
+            "5001".to_owned(),
+            r#"{"groupId":"5001","creatorId":"2001"}"#.to_owned(),
+        );
+        let seeded_detail = serde_json::json!({
+            "id": "p1",
+            "groupId": "g5001",
+            "question": "Old",
+        });
+        if let Some(d) = seeded_detail.as_object().and_then(PollDetail::from_json) {
+            initial.polls.details.insert("p1".to_owned(), d);
+        }
+        let core = CoreHandle::start_with_state(initial, runner, tokio::runtime::Handle::current());
+
+        let now_ms = 1_700_000_000_000_i64;
+        core.send(Command::NotePollMessages {
+            notices: vec![PollMessageNotice {
+                msg_id: "m1".to_owned(),
+                poll_id: "p1".to_owned(),
+                conv_id: "g5001".to_owned(),
+                date_ms: now_ms,
+            }],
+            now_ms,
+            host_already_armed: false,
+        });
+        core.wait_idle().await;
+        tokio::task::yield_now().await;
+
+        // Second message 500 ms later re-arms p1; original 1.5 s deadline must not fire early.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        core.send(Command::NotePollMessages {
+            notices: vec![PollMessageNotice {
+                msg_id: "m2".to_owned(),
+                poll_id: "p1".to_owned(),
+                conv_id: "g5001".to_owned(),
+                date_ms: now_ms + 500,
+            }],
+            now_ms: now_ms + 500,
+            host_already_armed: false,
+        });
+        core.wait_idle().await;
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_millis(1_100)).await;
+        tokio::task::yield_now().await;
+        core.wait_idle().await;
+        assert_eq!(client.transport().requests().len(), 0);
+
+        // Reaching 1.5 s after m2 fires exactly one refresh.
+        tokio::time::advance(Duration::from_millis(POLL_DEBOUNCE_DELAY_MS - 1_100)).await;
+        tokio::task::yield_now().await;
+        core.wait_idle().await;
+        assert_eq!(client.transport().requests().len(), 1);
+        assert_eq!(
+            core.full_snapshot()
+                .await
+                .and_then(|s| s.polls.details.get("p1").map(|d| d.question.clone()))
+                .as_deref(),
+            Some("Q")
+        );
+
+        // ResetPolls cancels an armed native timer before it can fire.
+        core.send(Command::NotePollMessages {
+            notices: vec![PollMessageNotice {
+                msg_id: "m3".to_owned(),
+                poll_id: "p1".to_owned(),
+                conv_id: "g5001".to_owned(),
+                date_ms: now_ms + 2_000,
+            }],
+            now_ms: now_ms + 2_000,
+            host_already_armed: false,
+        });
+        core.wait_idle().await;
+        tokio::task::yield_now().await;
+        core.send(Command::ResetPolls { sync_epoch: 0 });
+        core.wait_idle().await;
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        core.wait_idle().await;
+        assert_eq!(client.transport().requests().len(), 1);
+
+        core.stop();
+    }
+
+    #[derive(Default)]
+    struct RecordingCardHost {
+        cards: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl Host for RecordingCardHost {
+        async fn load_saved_session(&self) -> Option<String> {
+            None
+        }
+        async fn load_legacy_cookie(&self) -> Option<LegacyCookie> {
+            None
+        }
+        async fn set_pref(&self, _key: String, _value: String) {}
+        async fn prepare_store(&self, _user_id: String, _account: LoginAccount) {}
+        async fn start_bootstrap(&self) {}
+        async fn offer_first_login_transfer(&self, _force: bool) {}
+        async fn reset_domains(&self) {}
+        async fn persist_session(&self, _snapshot_json: String) {}
+        async fn clear_session(&self) {}
+        async fn mark_expired(&self, _snapshot_json: String) {}
+        async fn persist_poll_state(&self, _state: PollState) {}
+        async fn persist_ws_cursors(&self, _cursors: CursorMap) {}
+        async fn apply_batch(
+            &self,
+            _cmd: Option<u16>,
+            _increment_unread: bool,
+            _notify_incoming: bool,
+            _payload: Map<String, Value>,
+        ) -> BatchApplyDelta {
+            BatchApplyDelta::default()
+        }
+        async fn apply_parsed_events(
+            &self,
+            _cmd: u16,
+            _increment_unread: bool,
+            _notify_incoming: bool,
+            _envelope: TypedChatEnvelope,
+        ) -> BatchApplyDelta {
+            BatchApplyDelta::default()
+        }
+        async fn mobile_sync(&self, _events: Vec<MobileSyncEvent>) {}
+        async fn e2ee_signal(&self, _cmd: u16, _payload: Map<String, Value>) {}
+        async fn e2ee_deliver_reports(&self, _cmd: u16, _payload: Map<String, Value>) {}
+        async fn e2ee_connected(&self, _uid: String) {}
+        async fn e2ee_disconnected(&self) {}
+        async fn voip_control(&self, _act: String, _raw_data: Value, _data: Map<String, Value>) {}
+        async fn show_typing(&self, _conv_id: String, _uid: String, _on_pc: bool) {}
+        async fn pin_topic(&self, _conv_id: String) {}
+        async fn group_notice(&self, _act: String, _data: Map<String, Value>, _ts: i64) {}
+        async fn mute(
+            &self,
+            _conv_id: String,
+            _set: bool,
+            _start: i64,
+            _start_explicit: bool,
+            _duration: i64,
+        ) {
+        }
+        async fn show_card(&self, conv_id: Option<String>, text: String) {
+            let conv_id = conv_id.unwrap_or_default();
+            self.cards
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((conv_id, text));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delete_undo_timer_commits_after_5s_and_undo_cancels_with_show_card() {
+        use crate::actions::{DELETE_UNDO_DURATION, DeleteUndoItem, RESTORE_SUCCESS_CARD_TEXT};
+        use crate::reduce::ReduceOutput;
+        use crate::state::CoreState;
+        use olaz_net::http::RawResponse;
+        use olaz_store::{Store, StoredMessage};
+
+        let transport = MockTransport::from_fn(|_req| {
+            Ok(RawResponse::new(
+                200,
+                serde_json::json!({"error_code": 0, "data": {}})
+                    .to_string()
+                    .into_bytes(),
+            ))
+        });
+        let client = Arc::new(SessionClient::new(
+            transport,
+            "imei-u6".to_owned(),
+            "Mac".to_owned(),
+        ));
+        client.update_credentials(
+            LoginAccount {
+                user_id: "2000620".to_owned(),
+                ..LoginAccount::default()
+            },
+            b"0123456789abcdef".to_vec(),
+            "sek.1".to_owned(),
+            Some(ZaloDomains::default()),
+        );
+        let host = Arc::new(RecordingCardHost::default());
+        let runner = Arc::new(SessionEffectRunner::new(
+            Arc::clone(&client),
+            Arc::clone(&host) as Arc<dyn Host>,
+            Handle::current(),
+        ));
+
+        // Seed an in-memory SQLite store with one message to confirm CommitDeleteBatch deletes it.
+        let Ok(mut store) = Store::open_in_memory() else {
+            panic!("failed to open in-memory store");
+        };
+        let seeded = StoredMessage {
+            id: "9020001".to_owned(),
+            conv_id: "3000620".to_owned(),
+            client_id: "c9020001".to_owned(),
+            sender_id: "2000620".to_owned(),
+            sender_name: "Me".to_owned(),
+            sender_avatar: String::new(),
+            is_mine: true,
+            text: "to delete".to_owned(),
+            kind_tag: "text".to_owned(),
+            ts_ms: 1_700_000_000_000,
+            status: "sent".to_owned(),
+            raw_json_data: Vec::new(),
+        };
+        let Ok(_) = store.save_messages(&[seeded]) else {
+            panic!("failed to save seeded message");
+        };
+        let store_arc = Arc::new(Mutex::new(store));
+        runner.attach_store(Arc::clone(&store_arc));
+
+        // 1) Undo before 5 s cancels timer, emits show_card, and never calls delete API.
+        let mut initial = CoreState::default();
+        let mut out = ReduceOutput::default();
+        initial.actions.delete_undo.start_batch(
+            "3000620".to_owned(),
+            vec![DeleteUndoItem {
+                conv_id: "3000620".to_owned(),
+                msg_id: "9020001".to_owned(),
+                cli_msg_id: "c9020001".to_owned(),
+                sender_id: "2000620".to_owned(),
+                message: None,
+            }],
+            1_700_000_011_000,
+            &mut out,
+        );
+        let core = CoreHandle::start_with_state(
+            initial,
+            Arc::clone(&runner) as Arc<dyn EffectRunner>,
+            Handle::current(),
+        );
+        core.request_unit(Command::UndoDelete).await;
+        core.wait_idle().await;
+        assert_eq!(
+            *host.cards.lock().unwrap_or_else(PoisonError::into_inner),
+            vec![("3000620".to_owned(), RESTORE_SUCCESS_CARD_TEXT.to_owned())]
+        );
+        assert!(client.transport().requests().is_empty());
+        core.stop();
+
+        // 2) DismissDeleteUndo commits batch via delete_message_for_me API + SQLite delete.
+        let mut initial2 = CoreState::default();
+        let mut out2 = ReduceOutput::default();
+        initial2.actions.delete_undo.start_batch(
+            "3000620".to_owned(),
+            vec![DeleteUndoItem {
+                conv_id: "3000620".to_owned(),
+                msg_id: "9020001".to_owned(),
+                cli_msg_id: "c9020001".to_owned(),
+                sender_id: "2000620".to_owned(),
+                message: None,
+            }],
+            1_700_000_011_000,
+            &mut out2,
+        );
+        let runner2 = Arc::new(SessionEffectRunner::new(
+            Arc::clone(&client),
+            Arc::clone(&host) as Arc<dyn Host>,
+            Handle::current(),
+        ));
+        runner2.attach_store(Arc::clone(&store_arc));
+        let core2 = CoreHandle::start_with_state(
+            initial2,
+            Arc::clone(&runner2) as Arc<dyn EffectRunner>,
+            Handle::current(),
+        );
+        core2.request_unit(Command::DismissDeleteUndo).await;
+        core2.wait_idle().await;
+        runner2.flush_store().await;
+
+        assert_eq!(client.transport().requests().len(), 1);
+        assert_eq!(
+            client.transport().requests()[0].path(),
+            "/api/message/delete"
+        );
+        let remaining = store_arc
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .read_messages_now("3000620", None, 10)
+            .unwrap_or_default();
+        assert!(remaining.is_empty());
+        core2.stop();
+
+        // 3) StartDeleteUndoExpiry fires after 5 s on paused time, clears the bar, and commits.
+        let mut initial3 = CoreState::default();
+        let mut out3 = ReduceOutput::default();
+        initial3.actions.delete_undo.start_batch(
+            "3000620".to_owned(),
+            vec![DeleteUndoItem {
+                conv_id: "3000620".to_owned(),
+                msg_id: "9020002".to_owned(),
+                cli_msg_id: "c9020002".to_owned(),
+                sender_id: "2000620".to_owned(),
+                message: None,
+            }],
+            1_700_000_020_000,
+            &mut out3,
+        );
+        let runner3 = Arc::new(SessionEffectRunner::new(
+            Arc::clone(&client),
+            Arc::clone(&host) as Arc<dyn Host>,
+            Handle::current(),
+        ));
+        let core3 = CoreHandle::start_with_state(
+            initial3,
+            Arc::clone(&runner3) as Arc<dyn EffectRunner>,
+            Handle::current(),
+        );
+        runner3.dispatch(out3.effects, core3.test_sink());
+        // wait_idle returns immediately while the 5 s timer is armed.
+        core3.wait_idle().await;
+
+        // Before 5 s: undo bar is still active, no new delete API request yet.
+        tokio::time::advance(Duration::from_millis(4_900)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            core3
+                .full_snapshot()
+                .await
+                .and_then(|s| s.delete_undo)
+                .is_some()
+        );
+        assert_eq!(client.transport().requests().len(), 1);
+
+        // At 5 s: timer fires DeleteUndoExpired -> clears bar + commits delete via API.
+        tokio::time::advance(DELETE_UNDO_DURATION).await;
+        let Some(change) = core3.next_changes().await else {
+            panic!("expected delete_undo clear change");
+        };
+        assert_eq!(change.delete_undo, Some(None));
+        core3.wait_idle().await;
+        assert_eq!(client.transport().requests().len(), 2);
+        assert_eq!(
+            client.transport().requests()[1].path(),
+            "/api/message/delete"
+        );
+        core3.stop();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_delete_load_and_set_runner_flow_updates_state_and_emits_show_card_on_error() {
+        use crate::actions::AUTO_DELETE_FAILED_CARD_TEXT;
+        use olaz_net::http::RawResponse;
+        use std::sync::atomic::AtomicUsize;
+
+        let load_calls = Arc::new(AtomicUsize::new(0));
+        let update_calls = Arc::new(AtomicUsize::new(0));
+        let lc = Arc::clone(&load_calls);
+        let uc = Arc::clone(&update_calls);
+        let transport = MockTransport::from_fn(move |req| match req.path().as_str() {
+            "/api/conv/autodelete/getConvers" => {
+                let n = lc.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // First call fails -> initializes empty map when None.
+                    Ok(RawResponse::new(
+                        200,
+                        serde_json::json!({"error_code": 500, "error_message": "fail"})
+                            .to_string()
+                            .into_bytes(),
+                    ))
+                } else {
+                    Ok(RawResponse::new(
+                        200,
+                        serde_json::json!({
+                            "error_code": 0,
+                            "data": {
+                                "convers": [
+                                    {"destId": "627", "isGroup": 1, "ttl": 86_400_000}
+                                ]
+                            }
+                        })
+                        .to_string()
+                        .into_bytes(),
+                    ))
+                }
+            }
+            "/api/conv/autodelete/updateConvers" => {
+                let n = uc.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Ok(RawResponse::new(
+                        200,
+                        serde_json::json!({"error_code": 112, "error_message": "bad"})
+                            .to_string()
+                            .into_bytes(),
+                    ))
+                } else {
+                    Ok(RawResponse::new(
+                        200,
+                        serde_json::json!({"error_code": 0, "data": {}})
+                            .to_string()
+                            .into_bytes(),
+                    ))
+                }
+            }
+            _ => Ok(RawResponse::new(404, b"{}".to_vec())),
+        });
+        let client = Arc::new(SessionClient::new(
+            transport,
+            "imei-ad".to_owned(),
+            "Mac".to_owned(),
+        ));
+        client.update_credentials(
+            LoginAccount {
+                user_id: "2000627".to_owned(),
+                ..LoginAccount::default()
+            },
+            b"0123456789abcdef".to_vec(),
+            "sek.1".to_owned(),
+            Some(ZaloDomains::default()),
+        );
+        let host = Arc::new(RecordingCardHost::default());
+        let runner = Arc::new(SessionEffectRunner::new(
+            Arc::clone(&client),
+            Arc::clone(&host) as Arc<dyn Host>,
+            Handle::current(),
+        ));
+        let core = CoreHandle::start(runner, Handle::current());
+
+        // 1) Load failure when None sets Some({}).
+        core.request_unit(Command::LoadAutoDelete).await;
+        let snap1 = core.full_snapshot().await;
+        assert_eq!(snap1.and_then(|s| s.auto_delete), Some(BTreeMap::new()));
+
+        // 2) Load success populates map.
+        core.request_unit(Command::LoadAutoDelete).await;
+        let snap2 = core.full_snapshot().await;
+        assert_eq!(
+            snap2.and_then(|s| s.auto_delete),
+            Some(BTreeMap::from([("g627".to_owned(), 86_400_000)]))
+        );
+
+        // 3) SetAutoDelete failure leaves map intact and emits show_card.
+        core.request_unit(Command::SetAutoDelete {
+            conv_id: "3000628".to_owned(),
+            ttl: 3_600_000,
+            now_ms: 1_700_000_000_000,
+        })
+        .await;
+        core.wait_idle().await;
+        assert_eq!(
+            *host.cards.lock().unwrap_or_else(PoisonError::into_inner),
+            vec![(
+                "3000628".to_owned(),
+                AUTO_DELETE_FAILED_CARD_TEXT.to_owned()
+            )]
+        );
+
+        // 4) SetAutoDelete success updates map and publishes CoreChanges.auto_delete.
+        core.request_unit(Command::SetAutoDelete {
+            conv_id: "3000628".to_owned(),
+            ttl: 3_600_000,
+            now_ms: 1_700_000_005_000,
+        })
+        .await;
+        let snap4 = core.full_snapshot().await;
+        assert_eq!(
+            snap4.and_then(|s| s.auto_delete),
+            Some(BTreeMap::from([
+                ("3000628".to_owned(), 3_600_000),
+                ("g627".to_owned(), 86_400_000),
+            ]))
+        );
 
         core.stop();
     }

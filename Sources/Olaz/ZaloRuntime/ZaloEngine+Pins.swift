@@ -120,8 +120,8 @@ extension ZaloWireParser {
             let kind: String
             switch JSONLossless.int64(row["type"]) ?? 2 {
             case 3: kind = "poll"
-            // Official topic types: 0 note ("tạo ghi chú"), 1 reminder.
-            case 0: kind = "note"
+            // Official topic types: 0 TEXT_TOPIC (note when startTime <= 0, reminder when startTime > 0), 1 reminder/link.
+            case 0: kind = (JSONLossless.int64(row["startTime"]) ?? 0) > 0 ? "reminder" : "note"
             case 1: kind = "reminder"
             default: kind = "message"
             }
@@ -205,12 +205,16 @@ extension ZaloEngine {
         )
         list.items.insert(item, at: 0)
         pins[conversation] = list
+        // U7: write-through optimistic pin board mutation until U7 owns board pins.
+        pushCoreBoardPinsIfRunning(for: conversation)
     }
 
     internal func removePinOptimistically(_ ref: String, in conversationId: String) {
         guard var list = pins[conversationId] else { return }
         list.items.removeAll { $0.ref == ref }
         pins[conversationId] = list
+        // U7: write-through optimistic pin board removal until U7 owns board pins.
+        pushCoreBoardPinsIfRunning(for: conversationId)
     }
 
     /// Loads the pinned message into the open chat (from the local store when it is older than what is shown); its row id, or nil.
@@ -234,6 +238,8 @@ extension ZaloEngine {
             }
         } else {
             pins[conversationId] = nil
+            // U7: write-through board cache invalidation until U7 owns board pins.
+            pushCoreBoardPinsIfRunning(for: conversationId)
         }
     }
 }

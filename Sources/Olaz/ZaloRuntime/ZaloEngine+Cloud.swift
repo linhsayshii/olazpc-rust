@@ -172,6 +172,14 @@ extension ZaloEngine {
         guard traceU4Host("refresh_cloud") else {
             return
         }
+        if let core = coreLifecycle.core {
+            cloudRefreshTask = Task { [weak self] in
+                if let version = try? await core.refreshCloudAsync() {
+                    await self?.waitForMirrorVersion(version)
+                }
+            }
+            return
+        }
         if sqliteStore == nil {
             applyCloudSnapshot(sqlSummaries: [], existingIdsByConv: [:])
             return
@@ -182,6 +190,12 @@ extension ZaloEngine {
     }
 
     func performRefreshCloud() async {
+        if let core = coreLifecycle.core {
+            if let version = try? await core.refreshCloudAsync() {
+                await waitForMirrorVersion(version)
+            }
+            return
+        }
         let serverSnapshot = (await sessionClient.account) != nil
             ? await sessionClient.fetchCloudServerSnapshot()
             : nil
@@ -332,7 +346,11 @@ extension ZaloEngine {
 
         next.media = mediaBreakdown
         next.myCloudTypes = myCloudBreakdown
-        next.conversations = convEntries.sorted { $0.total > $1.total }
+        next.conversations = convEntries.sorted {
+            if $0.total != $1.total { return $0.total > $1.total }
+            if $0.name != $1.name { return $0.name < $1.name }
+            return $0.id < $1.id
+        }
 
         if let serverSnapshot {
             let previousHasKey = next.plan?.hasKey ?? true
@@ -485,6 +503,19 @@ extension ZaloEngine {
     }
 
     func cloudList(conversationId: String?, kind: CloudItemKind?, sortBySize: Bool, ascending: Bool, offset: Int, limit: Int = 60) async -> CloudPage {
+        if let core = coreLifecycle.core {
+            if let record = try? await core.cloudList(
+                convId: conversationId,
+                kind: kind?.coreRecord,
+                sortBySize: sortBySize,
+                ascending: ascending,
+                offset: Int64(offset),
+                limit: Int64(limit)
+            ) {
+                return CloudPage(coreRecord: record)
+            }
+            return CloudPage(items: [], hasMore: false, error: "Không đọc được dữ liệu zCloud từ bộ nhớ cục bộ.")
+        }
         let safeOffset = max(0, offset)
         let safeLimit = max(1, limit)
         let tags: [String] = kind.map { [$0.rawValue] } ?? ["photo", "video", "file", "voice"]
@@ -560,6 +591,10 @@ extension ZaloEngine {
     }
 
     func cloudThumbnail(for key: String) async -> MediaResolution {
+        if let core = coreLifecycle.core {
+            guard let record = try? await core.cloudThumbnail(key: key) else { return .unavailable }
+            return MediaResolution(coreRecord: record)
+        }
         let parts = key.split(separator: "|", maxSplits: 2).map(String.init)
         guard parts.count >= 2 else { return .unavailable }
         let kind: MediaKind = (parts.count >= 3 && parts[2] == "video") ? .videoThumb : .photo
@@ -567,6 +602,12 @@ extension ZaloEngine {
     }
 
     func cloudFetch(_ key: String) async -> CloudFetch {
+        if let core = coreLifecycle.core {
+            guard let record = try? await core.cloudFetch(key: key) else {
+                return .failed("Không tải được nội dung này lúc này. Vui lòng thử lại sau.")
+            }
+            return CloudFetch(coreRecord: record)
+        }
         let parts = key.split(separator: "|", maxSplits: 2).map(String.init)
         guard parts.count >= 2 else { return .failed("Không tìm thấy tệp.") }
         let cid = parts[0]
@@ -622,6 +663,14 @@ extension ZaloEngine {
     }
 
     func cloudDelete(_ keys: [String]) async -> CloudActionResult {
+        if let core = coreLifecycle.core {
+            guard let record = try? await core.cloudDelete(keys: keys) else {
+                await waitForCoreMirrorDrain()
+                return CloudActionResult(ok: false, deleted: [], failed: keys)
+            }
+            await waitForCoreMirrorDrain()
+            return CloudActionResult(coreRecord: record)
+        }
         var deleted: [String] = []
         for key in keys {
             let parts = key.split(separator: "|", maxSplits: 2).map(String.init)
@@ -638,6 +687,17 @@ extension ZaloEngine {
     }
 
     func cloudSetOffload(_ enabled: Bool) async -> CloudActionResult {
+        if let core = coreLifecycle.core {
+            guard let record = try? await core.cloudSetOffload(enabled: enabled) else {
+                await waitForCoreMirrorDrain()
+                return CloudActionResult(
+                    ok: false,
+                    error: "Tự động giải phóng dung lượng zCloud hiện chưa được hỗ trợ trên Olaz. Vui lòng quản lý trên Zalo điện thoại."
+                )
+            }
+            await waitForCoreMirrorDrain()
+            return CloudActionResult(coreRecord: record)
+        }
         var next = cloud
         next.settings.offloadEnabled = false
         next.settings.offloadAvailable = false
@@ -650,6 +710,7 @@ extension ZaloEngine {
 
     func resetCloud() {
         cloud = CloudState()
+        coreLifecycle.core?.resetCloud()
         CloudThumbnails.shared.reset()
         CloudFiles.purgeAll()
     }

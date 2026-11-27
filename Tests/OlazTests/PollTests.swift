@@ -3,7 +3,7 @@ import Foundation
 @testable import Olaz
 
 /// Poll JSON shaped like `snapshot` in poll-adapter.js, the vote / create rules of the official popups, and the engine state.
-@Suite struct PollTests {
+@Suite(.serialized) struct PollTests {
     private func object(_ json: String) throws -> [String: Any] {
         try #require(try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
     }
@@ -168,6 +168,20 @@ import Foundation
         #expect(PollActionResult(ok: false, error: nil).message(for: .vote).contains("bình chọn"))
     }
 
+    @Test func friendBoardDefaultHostAndHeal() {
+        var domains = ZaloDomains()
+        #expect(!ZaloDomains.defaultServiceMapV3.keys.contains("friend_board"))
+        #expect(domains.candidates(for: "friend_board") == ["https://friendboard-wpa.chat.zalo.me"])
+        domains.rememberWinner(for: "friend_board", host: "https://friendboard-wpa.chat.zalo.me")
+        domains.rememberWinner(for: "chat", host: "https://tt-chat3-wpa.chat.zalo.me")
+        domains.healFromVerified()
+        #expect(domains.preferredHosts["friend_board"] == "https://friendboard-wpa.chat.zalo.me")
+        #expect(domains.preferredHosts["chat"] == nil)
+
+        let isolated = ZaloDomains(isolated: true)
+        #expect(isolated.candidates(for: "friend_board").isEmpty)
+    }
+
     @MainActor @Test func engineKeepsLatestSnapshotAndFailures() throws {
         let engine = ZaloEngine()
         engine.handlePoll(state: ["page": "main", "poll": ["id": "77", "error": "fetch"]])
@@ -180,5 +194,310 @@ import Foundation
         #expect(engine.polls.details["77"] != nil && engine.polls.failed.isEmpty)
         engine.resetPolls()
         #expect(engine.polls == PollStore())
+    }
+
+    @MainActor @Test func numericFlagsBridgeLikeSwiftAsBool() throws {
+        let engine = ZaloEngine()
+        let numericOn = engine.normalizePollDetail(
+            [
+                "group_id": "500101",
+                "question": "Ăn trưa?",
+                "creator": "2001001",
+                "status": 1,
+                "expired_time": 0,
+                "is_multi_choice": 1,
+                "is_add_new_option": 1,
+                "is_anonymous": 1,
+                "is_hide_vote_preview": 1,
+                "options": [["option_id": 1, "content": "Phở", "voters": []]],
+            ],
+            id: "9401"
+        )
+        let detailOn = try #require(PollDetail(json: numericOn))
+        #expect(detailOn.multi)
+        #expect(detailOn.allowAdd)
+        #expect(detailOn.anonymous)
+        #expect(detailOn.hidePreview)
+
+        let numericOff = engine.normalizePollDetail(
+            [
+                "group_id": "500101",
+                "question": "Ăn tối?",
+                "creator": "2001001",
+                "status": 1,
+                "expired_time": 0,
+                "is_multi_choice": 0,
+                "is_add_new_option": 0,
+                "is_anonymous": 0,
+                "is_hide_vote_preview": 0,
+                "options": [["option_id": 1, "content": "Bún", "voters": []]],
+            ],
+            id: "9402"
+        )
+        let detailOff = try #require(PollDetail(json: numericOff))
+        #expect(!detailOff.multi)
+        #expect(!detailOff.allowAdd)
+        #expect(!detailOff.anonymous)
+        #expect(!detailOff.hidePreview)
+
+        // Numbers outside 0/1 and strings must evaluate to false, matching Swift `as? Bool`.
+        let nonBridging = engine.normalizePollDetail(
+            [
+                "group_id": "500101",
+                "question": "Kiểm tra?",
+                "creator": "2001001",
+                "status": 1,
+                "expired_time": 0,
+                "is_multi_choice": 2,
+                "is_add_new_option": "1",
+                "is_anonymous": "true",
+                "is_hide_vote_preview": -1,
+                "options": [["option_id": 1, "content": "Cơm", "voters": []]],
+            ],
+            id: "9403"
+        )
+        let detailNb = try #require(PollDetail(json: nonBridging))
+        #expect(!detailNb.multi)
+        #expect(!detailNb.allowAdd)
+        #expect(!detailNb.anonymous)
+        #expect(!detailNb.hidePreview)
+    }
+
+    @MainActor @Test func watchPollsWithLargeGidMapBoundsIdentityUpdatesAndMirrorsCachedGroups() async throws {
+        let myUid = "2000888"
+        let groupId = "500888"
+        let convId = "g500888"
+        let testEnk = Data("0123456789abcdef0123456789abcdef".utf8).base64EncodedString()
+        let secretKey = ZaloCrypto.parseSecretKey(testEnk)
+
+        let serverScript: [CaseJSON] = [
+            .object([
+                "kind": .string("http"),
+                "path": .string("/api/login/getLoginInfo"),
+                "response": .object([
+                    "status": .int(200),
+                    "json": .object([
+                        "error_code": .int(0),
+                        "data": .object([
+                            "uid": .string(myUid),
+                            "zpw_enk": .string(testEnk),
+                            "zpw_sek": .string("sek.poll.storm"),
+                            "display_name": .string("Storm Tester"),
+                            "send2me_id": .string("9200888"),
+                            "zpw_ws": .array([.string("ws://fake")]),
+                            "zpw_service_map_v3": .object([
+                                "chat": .array([.string("http://fake")]),
+                                "group": .array([.string("http://fake")]),
+                                "group_poll": .array([.string("http://fake")]),
+                                "profile": .array([.string("http://fake")]),
+                            ]),
+                        ]),
+                    ]),
+                ]),
+            ]),
+            .object([
+                "kind": .string("http"),
+                "path": .string("/api/social/profile/me-v2"),
+                "response": .object([
+                    "status": .int(200),
+                    "json": .object([
+                        "error_code": .int(0),
+                        "data": .object([
+                            "userId": .string(myUid),
+                            "displayName": .string("Storm Tester"),
+                        ]),
+                    ]),
+                ]),
+            ]),
+            .object([
+                "kind": .string("http"),
+                "path": .string("/api/poll/detail"),
+                "method": .string("GET"),
+                "repeat": .bool(true),
+                "response": .object([
+                    "status": .int(200),
+                    "json": .object([
+                        "error_code": .int(0),
+                        "data": .object([
+                            "group_id": .string(groupId),
+                            "question": .string("Ăn gì?"),
+                            "creator": .string(myUid),
+                            "status": .int(1),
+                            "expired_time": .int(0),
+                            "is_multi_choice": .int(1),
+                            "is_add_new_option": .int(1),
+                            "is_anonymous": .int(0),
+                            "is_hide_vote_preview": .int(0),
+                            "options": .array([
+                                .object([
+                                    "option_id": .int(1),
+                                    "content": .string("Phở"),
+                                    "voters": .array([.string(myUid)]),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                ]),
+            ]),
+            .object([
+                "kind": .string("http"),
+                "path": .string("/api/group/getmg-v2"),
+                "method": .string("POST"),
+                "repeat": .bool(true),
+                "response": .object([
+                    "status": .int(200),
+                    "json": .object([
+                        "error_code": .int(0),
+                        "data": .object([
+                            "gridInfoMap": .object([
+                                groupId: .object([
+                                    "groupId": .string(groupId),
+                                    "name": .string("Nhóm Poll Stress"),
+                                    "creatorId": .string(myUid),
+                                    "totalMember": .int(5),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                ]),
+            ]),
+        ]
+
+        let server = try FakeZaloServer(serverScript: serverScript, initialSecretKey: secretKey)
+        try await server.start()
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("olaz-poll-storm-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let dbURL = root
+            .appendingPathComponent("accounts", isDirectory: true)
+            .appendingPathComponent(myUid, isDirectory: true)
+            .appendingPathComponent("history.sqlite3")
+        let seedStore = try ZaloSQLiteStore(path: dbURL.path)
+        try await seedStore.setPreferenceString(key: ZaloWebKitMigrator.donePrefKey, value: "1")
+
+        // Seed 2,000 gid -> uid mappings in SQLite to reproduce the production identity table size.
+        var gidToUid: [String: String] = [:]
+        gidToUid.reserveCapacity(2_000)
+        for i in 0..<2_000 {
+            gidToUid["gid_\(i)"] = "uid_\(i)"
+        }
+        let gidData = try JSONSerialization.data(withJSONObject: gidToUid)
+        try await seedStore.setPreferenceData(key: "gidToUidMap", data: gidData)
+        await seedStore.close()
+
+        var isolatedDomains = ZaloDomains()
+        isolatedDomains.auth = server.baseURLString
+        isolatedDomains.wpaChat = server.baseURLString
+        isolatedDomains.lpChat = server.baseURLString
+        isolatedDomains.lpControl = server.baseURLString
+        isolatedDomains.ws = [server.wsBaseURLString]
+        isolatedDomains.serviceCandidates = [
+            "chat": [server.baseURLString],
+            "group": [server.baseURLString],
+            "group_poll": [server.baseURLString],
+            "profile": [server.baseURLString],
+        ]
+        isolatedDomains.isolated = true
+
+        let savedSession: CaseJSON = .object([
+            "zpwType": .string(ZaloDomains.zpwType),
+            "imei": .string("00000000-0000-4000-8000-000000000000-00000000000000000000000000000000"),
+            "computerName": .string("PollStormMac"),
+            "domains": .object([
+                "auth": .string(server.baseURLString),
+                "wpaChat": .string(server.baseURLString),
+                "lpChat": .string(server.baseURLString),
+                "lpControl": .string(server.baseURLString),
+                "ws": .array([.string(server.wsBaseURLString)]),
+                "serviceCandidates": .object([
+                    "chat": .array([.string(server.baseURLString)]),
+                    "group": .array([.string(server.baseURLString)]),
+                    "group_poll": .array([.string(server.baseURLString)]),
+                    "profile": .array([.string(server.baseURLString)]),
+                ]),
+                "preferredHosts": .object([:]),
+                "isolated": .bool(true),
+            ]),
+            "sealedSecretsBase64": .null,
+            "expiredAt": .null,
+            "plainAccount": .object([
+                "userId": .string(myUid),
+                "displayName": .string("Storm Tester"),
+                "avatar": .string(""),
+                "phone": .string(""),
+                "send2MeId": .string("9200888"),
+                "dkey": .string("dk-poll-storm"),
+                "zpwEnk": .string(testEnk),
+                "zpwSek": .string("sek.poll.storm"),
+            ]),
+        ])
+        try Data(savedSession.canonicalString().utf8)
+            .write(to: root.appendingPathComponent("native-session.json"), options: .atomic)
+
+        let storage = RecorderStorageIsolation(prefix: "olaz.poll-storm")
+        let engine = ZaloEngine(
+            dataDirectory: root,
+            useKeychain: false,
+            domains: isolatedDomains,
+            userDefaultsSuiteName: storage.userDefaultsSuiteName,
+            cookieStorage: storage.cookieStorage
+        )
+        engine.resetPolls()
+
+        defer {
+            engine.onCoreUpdateIdentities = nil
+            engine.resetPolls()
+            engine.cancelTasksForRecording()
+            server.stop()
+            storage.cleanup()
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        var updateIdentitiesCount = 0
+        engine.onCoreUpdateIdentities = {
+            updateIdentitiesCount += 1
+        }
+        engine.hostTrace = { name, _ in
+            name == "prepare_store"
+        }
+
+        engine.start()
+        _ = await engine.bootTask?.value
+        #expect(engine.phase == .ready)
+        #expect(engine.cachedFriendGlobalIds.count == 2_000)
+        // Boot + prepareStore must NOT fire didSet per gid entry (<= 2 total pushes).
+        #expect(updateIdentitiesCount <= 2)
+
+        let callsBeforePolls = updateIdentitiesCount
+        let start = ContinuousClock.now
+        for i in 1...20 {
+            engine.watchPoll("poll_\(i)", in: convId)
+        }
+        while !engine.pollRefreshTasks.isEmpty {
+            for task in Array(engine.pollRefreshTasks.values) {
+                await task.value
+            }
+        }
+        let elapsed = ContinuousClock.now - start
+
+        #expect(engine.polls.details.count == 20)
+        #expect(engine.polls.details["poll_1"]?.allowAdd == true)
+        #expect(engine.polls.details["poll_1"]?.multi == true)
+        #expect(engine.polls.details["poll_1"]?.anonymous == false)
+        #expect(engine.polls.details["poll_1"]?.hidePreview == false)
+        #expect(engine.cachedGroups[convId]?.name == "Nhóm Poll Stress")
+        #expect(engine.cachedGroups[convId]?.members == 5)
+        // Zero identity pushes during all 20 watched poll refreshes + group metadata merge.
+        #expect(updateIdentitiesCount - callsBeforePolls == 0)
+        #expect(elapsed < .seconds(5))
+
+        // Direct store preference sync with 2,000 gid->uid entries must also emit 0 identity pushes.
+        let callsBeforeSync = updateIdentitiesCount
+        await engine.syncCachedIdentityPreferencesFromStore()
+        #expect(updateIdentitiesCount == callsBeforeSync)
+
+        await engine.finishTearDownForRecording()
     }
 }

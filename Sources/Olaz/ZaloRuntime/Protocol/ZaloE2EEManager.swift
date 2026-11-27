@@ -92,10 +92,13 @@ actor ZaloE2EEManager {
 
     var debugHasRustStore: Bool { rust != nil }
 
-    func reset() {
+    func reset() async {
         if configuredMode == .shadow, !shadowStats.isIdle || shadowStats.snapshot != E2EEShadowStats.Snapshot() {
             logSink(shadowStats.summaryLine)
         }
+        let oldRuntime = runtime
+        runtime = nil
+        await oldRuntime?.close()
         rust = nil
         effectiveMode = configuredMode
         jsSnapshotCache = nil
@@ -472,6 +475,12 @@ actor ZaloE2EEManager {
         storeDirty = false
         if let json = await exportStoreJSON(), !json.isEmpty {
             try? await store.setPreferenceString(key: Self.storePrefKey, value: json)
+        }
+    }
+
+    nonisolated func e2eeThreadIdsSync() -> [String] {
+        threadCache.withLock { cache in
+            cache.e2eeThreads.filter { $0 != cache.loadedUid }
         }
     }
 
@@ -896,6 +905,37 @@ actor ZaloE2EEManager {
             myUid: myUid,
             values: [.number(Double(stickerId)), .number(Double(cateId)), .number(Double(stickerType))],
             formats: ["uint32", "uint32", "uint32"],
+            store: store
+        )
+    }
+
+    // Official VNG desktop bundle wire format (function names & offsets only):
+    // - `_extractForwardContent` (@ 12102699): encrypts [title, avatar, descJSON, "https://zaloapp.com"]
+    //   as four strings, with descJSON = { gUid, phone?, qrCodeUrl? }.
+    // - `_rebuildEncryptedForwardContent` (@ 12105222): per-device `msgInfo` JSON with
+    //   { title, thumb, desc, href, action: "recommened.user" } (`Ko` @ 1685411).
+    // - `transformForwardMessage` (@ 14483318) & `sendMsgE2ee` (@ 14475355):
+    //   service `chat_e2e`, path `/api/e2ee/pc/message/forward`, `destType: 3`, `msgType: 6` (`In` @ 1689196),
+    //   `VERSION_MSG.FWD_CONTACT_MSG = { version: 1, compat_version: 0 }` (@ 3681775).
+    func encryptContactCardMessage(
+        peerUid: String,
+        myUid: String,
+        title: String,
+        avatar: String,
+        descJSON: String,
+        href: String = "https://zaloapp.com",
+        store: ZaloSQLiteStore?
+    ) async -> [(toId: String, platform: Int, registrationId: Int, ciphers: [String])] {
+        await encryptBatch(
+            peerUid: peerUid,
+            myUid: myUid,
+            values: [
+                .string(title),
+                .string(avatar),
+                .string(descJSON),
+                .string(href),
+            ],
+            formats: ["string", "string", "string", "string"],
             store: store
         )
     }

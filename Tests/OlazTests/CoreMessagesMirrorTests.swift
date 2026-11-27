@@ -49,7 +49,18 @@ import Testing
             messagesResetAll: messagesResetAll,
             messageMeta: messageMeta,
             contacts: contacts,
-            typing: nil
+            typing: nil,
+            forwardRequest: nil,
+            clearSelection: false,
+            deleteUndo: nil,
+            messageConfirm: nil,
+            autoDelete: nil,
+            starredIds: nil,
+            cachedProfiles: nil,
+            cloud: nil,
+            stickerSuggest: nil,
+            composerConfirm: nil,
+            queuedComposerConfirms: nil
         )
     }
 
