@@ -16,6 +16,7 @@ use crate::cloud::{CloudSnapshotState, CloudState};
 use crate::composer::{ComposerConfirm, ComposerState};
 use crate::conversations::{CachedProfile, ConversationsState};
 use crate::forward::{ForwardRequest, ForwardState};
+use crate::media::MediaState;
 use crate::messages::{ContactsState, IdentitySnapshot, MessagesState};
 use crate::stickers::{StickerState, StickerSuggestSetting};
 use crate::typing::{TypingState, TypingStatus};
@@ -51,6 +52,8 @@ pub struct CoreState {
     // U13
     pub stickers: StickerState,
     pub composer: ComposerState,
+    // U15
+    pub media: MediaState,
 }
 
 impl CoreState {
@@ -83,6 +86,9 @@ impl CoreState {
             sticker_suggest_setting: self.stickers.suggest_setting,
             composer_confirm: self.composer.active_confirm.clone(),
             queued_composer_confirms: self.composer.queued_confirms.iter().cloned().collect(),
+            // U15
+            downloaded_file_paths: self.media.downloaded_file_paths.clone(),
+            media_cloud_file_limit: self.media.seeded_cloud_file_limit,
         }
     }
 
@@ -129,6 +135,8 @@ impl fmt::Debug for CoreState {
             // U13
             .field("stickers", &self.stickers)
             .field("composer", &self.composer)
+            // U15
+            .field("media", &self.media)
             .finish()
     }
 }
@@ -161,6 +169,9 @@ pub struct CoreSnapshot {
     pub sticker_suggest_setting: Option<StickerSuggestSetting>,
     pub composer_confirm: Option<ComposerConfirm>,
     pub queued_composer_confirms: Vec<ComposerConfirm>,
+    // U15
+    pub downloaded_file_paths: BTreeMap<String, String>,
+    pub media_cloud_file_limit: Option<i64>,
 }
 
 impl fmt::Debug for CoreSnapshot {
@@ -195,6 +206,11 @@ impl fmt::Debug for CoreSnapshot {
             .field(
                 "queued_composer_confirms_count",
                 &self.queued_composer_confirms.len(),
+            )
+            // U15
+            .field(
+                "downloaded_file_paths_count",
+                &self.downloaded_file_paths.len(),
             )
             .finish()
     }

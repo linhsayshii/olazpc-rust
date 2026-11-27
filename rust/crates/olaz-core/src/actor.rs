@@ -17,6 +17,7 @@ use crate::conversations::{ConversationActionResult, IdentityTable, PinBoard};
 use crate::effect::{Effect, OpResult};
 use crate::forward::ForwardOutcome;
 use crate::input::{Command, Input};
+use crate::media::{FileResolution, MediaResolution, SharedMediaPage};
 use crate::messages::IdentitySnapshot;
 use crate::reduce::reduce;
 use crate::runner::EffectRunner;
@@ -520,6 +521,37 @@ impl CoreHandle {
     pub async fn request_reminder_info(&self, conv_id: String) -> Option<ReminderComposeInfo> {
         match self.request(Command::ReminderComposeInfo { conv_id }).await {
             Some(OpResult::ReminderComposeInfo(r)) => r,
+            _ => None,
+        }
+    }
+
+    // U15 typed request helpers
+    pub async fn request_resolve_media(&self, command: Command) -> MediaResolution {
+        match self.request(command).await {
+            Some(OpResult::MediaResolution(r)) => r,
+            _ => MediaResolution::Unavailable,
+        }
+    }
+
+    pub async fn request_resolve_file(&self, command: Command) -> FileResolution {
+        match self.request(command).await {
+            Some(OpResult::FileResolution(r)) => r,
+            _ => FileResolution::Failed(
+                "Không tải được tệp. Kiểm tra kết nối mạng và thử lại.".to_owned(),
+            ),
+        }
+    }
+
+    pub async fn request_shared_media(&self, command: Command) -> Option<SharedMediaPage> {
+        match self.request(command).await {
+            Some(OpResult::SharedMedia(p)) => p,
+            _ => None,
+        }
+    }
+
+    pub async fn request_optional_string(&self, command: Command) -> Option<String> {
+        match self.request(command).await {
+            Some(OpResult::OptionalString(s)) => s,
             _ => None,
         }
     }

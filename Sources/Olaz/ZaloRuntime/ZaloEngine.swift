@@ -149,6 +149,7 @@ final class ZaloEngine {
     @ObservationIgnored internal var messageActionsBusy: Set<String> = []
 
     @ObservationIgnored internal let mediaResolver = MediaResolver()
+    @ObservationIgnored internal let mediaHostIO = MediaHostIOState()
     @ObservationIgnored internal let sessionClient: ZaloSessionClient
     @ObservationIgnored internal let webSocket = ZaloWebSocket()
     @ObservationIgnored internal let dataDirectory: URL
@@ -309,7 +310,17 @@ final class ZaloEngine {
     /// Kept for menu toggle binding compatibility; native engine has no hidden WebKit window.
     var isDebugRendererVisible = false
     /// Remembers user-saved `~/Downloads` destinations keyed by message/file key so file cards reflect saved state across scroll.
-    var downloadedFilePaths: [String: URL] = [:]
+    var downloadedFilePaths: [String: URL] = [:] {
+        didSet {
+            if !isApplyingCoreMirror, let core = coreLifecycle.core {
+                let entries = downloadedFilePaths.keys.sorted().compactMap { key -> DownloadedFilePathEntryRecord? in
+                    guard let url = downloadedFilePaths[key] else { return nil }
+                    return DownloadedFilePathEntryRecord(key: key, path: url.path)
+                }
+                core.seedDownloadedFilePaths(entries: entries)
+            }
+        }
+    }
 
     /// Strictly side-effect-free initializer so unit tests and previews instantiate safely.
     init(
@@ -350,6 +361,7 @@ final class ZaloEngine {
     }
 
     deinit {
+        mediaHostIO.releaseAll()
         coreLifecycle.shutdown()
     }
 
@@ -489,6 +501,7 @@ final class ZaloEngine {
         resetStickers()
         resetCardState()
         resetCloud()
+        resetMedia()
         pendingDeletedMessages = [:]
         pendingLocalReactions = []
         seenReactionEventIds = []

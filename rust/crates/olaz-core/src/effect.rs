@@ -20,7 +20,12 @@ use crate::conversations::{
     ConversationActionResult, ConversationPreview, IdentityTable, PinBoard,
 };
 use crate::forward::ForwardOutcome;
+// U15
 use crate::input::{E2eeQuoteArg, HiddenPinSyncKind, SeenTarget, StoreToken};
+use crate::media::{
+    FileExistsPurpose, FileResolution, MediaKind, OutgoingFileMode, SharedMediaKind,
+    SharedMediaPage,
+};
 use crate::messages::{IdentitySnapshot, MuteEntry};
 use crate::reduce::classify::MobileSyncEvent;
 use crate::stickers::{CardActionOutcome, StickerEntry, StickerSuggestSetting, StickerTab};
@@ -463,6 +468,9 @@ pub enum OpResult {
     ComposerOutcome(ComposerOutcome),
     MyCard(Option<MyCardInfo>),
     ReminderComposeInfo(Option<ReminderComposeInfo>),
+    // U15
+    FileResolution(FileResolution),
+    SharedMedia(Option<SharedMediaPage>),
 }
 
 impl fmt::Debug for OpResult {
@@ -517,6 +525,9 @@ impl fmt::Debug for OpResult {
             Self::ComposerOutcome(o) => f.debug_tuple("ComposerOutcome").field(o).finish(),
             Self::MyCard(c) => f.debug_tuple("MyCard").field(c).finish(),
             Self::ReminderComposeInfo(r) => f.debug_tuple("ReminderComposeInfo").field(r).finish(),
+            // U15
+            Self::FileResolution(r) => f.debug_tuple("FileResolution").field(r).finish(),
+            Self::SharedMedia(p) => f.debug_tuple("SharedMedia").field(p).finish(),
         }
     }
 }
@@ -1432,6 +1443,118 @@ pub enum Effect {
     },
     CancelConfirmPromoteDelay,
 
+    // U15 (all host I/O runs concurrently via runtime.spawn, never blocking HostWorker)
+    MediaReadOutgoingFile {
+        op_id: u64,
+        path: String,
+        name: String,
+        mode: OutgoingFileMode,
+    },
+    MediaReleaseOutgoingFile {
+        op_id: u64,
+    },
+    MediaImageDimensions {
+        op_id: u64,
+        path: String,
+        name: String,
+        size: i64,
+    },
+    MediaVideoMetadata {
+        op_id: u64,
+        path: String,
+        name: String,
+        size: i64,
+    },
+    MediaUploadPhoto {
+        op_id: u64,
+        conv_id: String,
+        file_name: String,
+        size: i64,
+        width: i64,
+        height: i64,
+    },
+    MediaUploadVideo {
+        op_id: u64,
+        conv_id: String,
+        file_name: String,
+        size: i64,
+        duration_ms: i64,
+        width: i64,
+        height: i64,
+        has_thumb: bool,
+    },
+    MediaAllocClientId {
+        op_id: u64,
+    },
+    MediaUploadFile {
+        op_id: u64,
+        conv_id: String,
+        file_name: String,
+        size: i64,
+        client_id: Option<String>,
+        is_e2ee: bool,
+    },
+    MediaRemoveOwnLocalFile {
+        path: String,
+    },
+    MediaCheckFileExists {
+        path: String,
+        purpose: FileExistsPurpose,
+    },
+    MediaLookupMessageInStore {
+        flight_id: u64,
+        conv_id: String,
+        msg_id: String,
+    },
+    MediaCacheLookup {
+        flight_id: u64,
+        key: String,
+        hash_prefix: String,
+        conv_id: String,
+        msg_id: String,
+        kind: MediaKind,
+    },
+    MediaCheckLocalFile {
+        flight_id: u64,
+        url: String,
+    },
+    MediaLoaderFetchMedia {
+        flight_id: u64,
+        url: String,
+        kind: MediaKind,
+        hash_prefix: String,
+        force: bool,
+    },
+    MediaVideoPoster {
+        flight_id: u64,
+        path: String,
+        from_cache: bool,
+    },
+    MediaLookupFileMessageInStore {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
+    },
+    MediaLoaderFetchFile {
+        op_id: u64,
+        url: String,
+        force: bool,
+        request_token: u64,
+    },
+    MediaStageFile {
+        op_id: u64,
+        source_path: String,
+        stem: String,
+        ext: Option<String>,
+    },
+    MediaQuerySharedMedia {
+        op_id: u64,
+        conv_id: String,
+        kind: SharedMediaKind,
+        after_cursor: Option<String>,
+        limit: usize,
+    },
+
     /// Domain activity delegated to Swift via `CoreHost`.
     Host(HostCall),
 }
@@ -1886,6 +2009,128 @@ impl fmt::Debug for Effect {
                 .field("delay_ms", &delay.as_millis())
                 .finish(),
             Self::CancelConfirmPromoteDelay => f.write_str("CancelConfirmPromoteDelay"),
+            // U15
+            Self::MediaReadOutgoingFile { op_id, mode, .. } => f
+                .debug_struct("MediaReadOutgoingFile")
+                .field("op_id", op_id)
+                .field("mode", mode)
+                .finish(),
+            Self::MediaReleaseOutgoingFile { op_id } => f
+                .debug_struct("MediaReleaseOutgoingFile")
+                .field("op_id", op_id)
+                .finish(),
+            Self::MediaImageDimensions { op_id, size, .. } => f
+                .debug_struct("MediaImageDimensions")
+                .field("op_id", op_id)
+                .field("size", size)
+                .finish(),
+            Self::MediaVideoMetadata { op_id, size, .. } => f
+                .debug_struct("MediaVideoMetadata")
+                .field("op_id", op_id)
+                .field("size", size)
+                .finish(),
+            Self::MediaUploadPhoto {
+                op_id,
+                size,
+                width,
+                height,
+                ..
+            } => f
+                .debug_struct("MediaUploadPhoto")
+                .field("op_id", op_id)
+                .field("size", size)
+                .field("width", width)
+                .field("height", height)
+                .finish(),
+            Self::MediaUploadVideo {
+                op_id,
+                size,
+                duration_ms,
+                has_thumb,
+                ..
+            } => f
+                .debug_struct("MediaUploadVideo")
+                .field("op_id", op_id)
+                .field("size", size)
+                .field("duration_ms", duration_ms)
+                .field("has_thumb", has_thumb)
+                .finish(),
+            Self::MediaAllocClientId { op_id } => f
+                .debug_struct("MediaAllocClientId")
+                .field("op_id", op_id)
+                .finish(),
+            Self::MediaUploadFile {
+                op_id,
+                size,
+                is_e2ee,
+                ..
+            } => f
+                .debug_struct("MediaUploadFile")
+                .field("op_id", op_id)
+                .field("size", size)
+                .field("is_e2ee", is_e2ee)
+                .finish(),
+            Self::MediaRemoveOwnLocalFile { .. } => f.write_str("MediaRemoveOwnLocalFile"),
+            Self::MediaCheckFileExists { purpose, .. } => f
+                .debug_struct("MediaCheckFileExists")
+                .field("purpose", purpose)
+                .finish(),
+            Self::MediaLookupMessageInStore { flight_id, .. } => f
+                .debug_struct("MediaLookupMessageInStore")
+                .field("flight_id", flight_id)
+                .finish(),
+            Self::MediaCacheLookup {
+                flight_id, kind, ..
+            } => f
+                .debug_struct("MediaCacheLookup")
+                .field("flight_id", flight_id)
+                .field("kind", kind)
+                .finish(),
+            Self::MediaCheckLocalFile { flight_id, .. } => f
+                .debug_struct("MediaCheckLocalFile")
+                .field("flight_id", flight_id)
+                .finish(),
+            Self::MediaLoaderFetchMedia {
+                flight_id,
+                kind,
+                force,
+                ..
+            } => f
+                .debug_struct("MediaLoaderFetchMedia")
+                .field("flight_id", flight_id)
+                .field("kind", kind)
+                .field("force", force)
+                .finish(),
+            Self::MediaVideoPoster {
+                flight_id,
+                from_cache,
+                ..
+            } => f
+                .debug_struct("MediaVideoPoster")
+                .field("flight_id", flight_id)
+                .field("from_cache", from_cache)
+                .finish(),
+            Self::MediaLookupFileMessageInStore { op_id, .. } => f
+                .debug_struct("MediaLookupFileMessageInStore")
+                .field("op_id", op_id)
+                .finish(),
+            Self::MediaLoaderFetchFile { op_id, force, .. } => f
+                .debug_struct("MediaLoaderFetchFile")
+                .field("op_id", op_id)
+                .field("force", force)
+                .finish(),
+            Self::MediaStageFile { op_id, .. } => f
+                .debug_struct("MediaStageFile")
+                .field("op_id", op_id)
+                .finish(),
+            Self::MediaQuerySharedMedia {
+                op_id, kind, limit, ..
+            } => f
+                .debug_struct("MediaQuerySharedMedia")
+                .field("op_id", op_id)
+                .field("kind", kind)
+                .field("limit", limit)
+                .finish(),
             Self::Host(call) => f.debug_tuple("Host").field(call).finish(),
         }
     }

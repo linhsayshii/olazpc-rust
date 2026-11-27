@@ -20,7 +20,13 @@ use crate::conversations::{
     IdentityTable, LocalAccountHydration, MessagePreviewInput,
 };
 use crate::effect::OpResult;
+// U15
 use crate::forward::{ComposerSendOutcome, FileResolutionOutcome, MediaResolutionOutcome};
+use crate::media::{
+    FileExistsPurpose, FileFetchOutcome, MediaCacheHit, MediaFetchOutcome, MediaKind,
+    OutgoingFileProbe, SharedMediaKind, SharedMediaPage, UploadFileError, UploadedFileResult,
+    UploadedPhotoResult, UploadedVideoResult, VideoMetadata,
+};
 use crate::messages::{ContactsState, HistoryFreshness};
 use crate::state::{CoreFailKind, FailReason, PersistedTransportState};
 use crate::stickers::{StickerEntry, StickerSource, StickerSuggestSetting};
@@ -93,6 +99,14 @@ pub enum BootstrapAliasesError {
 }
 
 /// Commands sent from Swift (or test scripts) into the actor.
+/// Outcome of `Effect::MediaQuerySharedMedia` from the SQLite store (U15).
+#[derive(Clone, Debug, PartialEq)]
+pub enum SharedMediaLoadOutcome {
+    StoreOk(SharedMediaPage),
+    StoreError,
+    NoStore,
+}
+
 #[derive(Clone)]
 pub enum Command {
     Start,
@@ -626,6 +640,67 @@ pub enum Command {
     },
     /// Reset composer state (drops confirms and fails in-flight contact-card sends).
     ResetComposer,
+    // U15
+    /// Send one or more photos/videos/files via `ZaloEngine.sendMedia`.
+    SendMedia {
+        conv_id: String,
+        paths: Vec<String>,
+        now_ms: i64,
+    },
+    /// Send one or more file attachments via `ZaloEngine.sendFiles`.
+    SendFiles {
+        conv_id: String,
+        paths: Vec<String>,
+        now_ms: i64,
+    },
+    /// Resolve a message's photo, video, or video thumbnail (`ZaloEngine.resolveMedia`).
+    ResolveMedia {
+        conv_id: String,
+        msg_id: String,
+        kind: MediaKind,
+        force: bool,
+        now_ms: i64,
+    },
+    /// Cancel a pending `ResolveMedia` waiter (`op_id`).
+    CancelMediaResolve {
+        op_id: u64,
+    },
+    /// Resolve and stage a file attachment (`ZaloEngine.resolveFile`).
+    ResolveFile {
+        conv_id: String,
+        msg_id: String,
+        name: String,
+        url: Option<String>,
+        force: bool,
+        request_token: u64,
+    },
+    /// Query one page of shared media (`ZaloEngine.sharedMedia`).
+    SharedMedia {
+        conv_id: String,
+        kind: SharedMediaKind,
+        after_cursor: Option<String>,
+        limit: usize,
+        simulate_store_error: bool,
+    },
+    /// Record a downloaded file path in `MediaState::downloaded_file_paths`.
+    RememberDownloadedFile {
+        key: String,
+        path: String,
+    },
+    /// Remove a remembered downloaded file path.
+    ForgetDownloadedFile {
+        key: String,
+    },
+    /// Verify on disk whether a remembered downloaded file still exists (forgets if missing).
+    CheckRememberedDownloadedFile {
+        key: String,
+    },
+    /// Seed `downloaded_file_paths` map (pre-boot sync / tests).
+    SeedDownloadedFilePaths(BTreeMap<String, String>),
+    /// Seed cloud plan file-size limit before `cloud.snapshot.plan` is loaded.
+    SeedMediaCloudFileLimit(Option<i64>),
+    /// Reset media resolver, flights, and downloaded file paths.
+    ResetMedia,
 }
 
 impl fmt::Debug for Command {
@@ -1117,6 +1192,45 @@ impl fmt::Debug for Command {
                 .field("outcome", outcome)
                 .finish(),
             Self::ResetComposer => f.write_str("ResetComposer"),
+            // U15
+            Self::SendMedia { paths, .. } => f
+                .debug_struct("SendMedia")
+                .field("paths", &paths.len())
+                .finish(),
+            Self::SendFiles { paths, .. } => f
+                .debug_struct("SendFiles")
+                .field("paths", &paths.len())
+                .finish(),
+            Self::ResolveMedia { kind, force, .. } => f
+                .debug_struct("ResolveMedia")
+                .field("kind", kind)
+                .field("force", force)
+                .finish(),
+            Self::CancelMediaResolve { op_id } => f
+                .debug_struct("CancelMediaResolve")
+                .field("op_id", op_id)
+                .finish(),
+            Self::ResolveFile { force, .. } => {
+                f.debug_struct("ResolveFile").field("force", force).finish()
+            }
+            Self::SharedMedia { kind, limit, .. } => f
+                .debug_struct("SharedMedia")
+                .field("kind", kind)
+                .field("limit", limit)
+                .finish(),
+            Self::RememberDownloadedFile { .. } => f.write_str("RememberDownloadedFile"),
+            Self::ForgetDownloadedFile { .. } => f.write_str("ForgetDownloadedFile"),
+            Self::CheckRememberedDownloadedFile { .. } => {
+                f.write_str("CheckRememberedDownloadedFile")
+            }
+            Self::SeedDownloadedFilePaths(m) => f
+                .debug_struct("SeedDownloadedFilePaths")
+                .field("count", &m.len())
+                .finish(),
+            Self::SeedMediaCloudFileLimit(l) => {
+                f.debug_tuple("SeedMediaCloudFileLimit").field(l).finish()
+            }
+            Self::ResetMedia => f.write_str("ResetMedia"),
         }
     }
 }
@@ -1778,6 +1892,82 @@ pub enum Input {
     },
     ConfirmPromoteExpired {
         confirm_gen: u64,
+    },
+    // U15
+    MediaOutgoingFileRead {
+        op_id: u64,
+        probe: OutgoingFileProbe,
+    },
+    MediaImageDimensionsDone {
+        op_id: u64,
+        width: i64,
+        height: i64,
+    },
+    MediaVideoMetadataDone {
+        op_id: u64,
+        meta: VideoMetadata,
+    },
+    MediaUploadPhotoDone {
+        op_id: u64,
+        result: Result<UploadedPhotoResult, String>,
+    },
+    MediaUploadVideoDone {
+        op_id: u64,
+        result: Result<UploadedVideoResult, String>,
+    },
+    MediaClientIdAllocated {
+        op_id: u64,
+        client_id: i64,
+    },
+    MediaUploadFileDone {
+        op_id: u64,
+        result: Result<UploadedFileResult, UploadFileError>,
+    },
+    MediaFileExistsChecked {
+        purpose: FileExistsPurpose,
+        exists: bool,
+    },
+    MediaStoreMessageLoaded {
+        flight_id: u64,
+        message: Option<ChatMessage>,
+    },
+    MediaCacheLookupDone {
+        flight_id: u64,
+        hit: Option<MediaCacheHit>,
+    },
+    MediaLocalFileChecked {
+        flight_id: u64,
+        allowed: bool,
+        path: String,
+        is_video: bool,
+    },
+    MediaLoaderFetchMediaDone {
+        flight_id: u64,
+        outcome: MediaFetchOutcome,
+    },
+    MediaVideoPosterDone {
+        flight_id: u64,
+        poster_path: Option<String>,
+        from_cache: bool,
+    },
+    MediaFileMessageLoaded {
+        op_id: u64,
+        message: Option<ChatMessage>,
+    },
+    MediaLoaderFetchFileDone {
+        op_id: u64,
+        outcome: FileFetchOutcome,
+    },
+    MediaFileStaged {
+        op_id: u64,
+        staged_path: Option<String>,
+    },
+    MediaSharedMediaLoaded {
+        op_id: u64,
+        conv_id: String,
+        kind: SharedMediaKind,
+        limit: usize,
+        outcome: SharedMediaLoadOutcome,
     },
 }
 
@@ -2537,6 +2727,110 @@ impl fmt::Debug for Input {
             Self::ConfirmPromoteExpired { confirm_gen } => f
                 .debug_struct("ConfirmPromoteExpired")
                 .field("confirm_gen", confirm_gen)
+                .finish(),
+            // U15
+            Self::MediaOutgoingFileRead { op_id, probe } => f
+                .debug_struct("MediaOutgoingFileRead")
+                .field("op_id", op_id)
+                .field("probe", probe)
+                .finish(),
+            Self::MediaImageDimensionsDone {
+                op_id,
+                width,
+                height,
+            } => f
+                .debug_struct("MediaImageDimensionsDone")
+                .field("op_id", op_id)
+                .field("width", width)
+                .field("height", height)
+                .finish(),
+            Self::MediaVideoMetadataDone { op_id, meta } => f
+                .debug_struct("MediaVideoMetadataDone")
+                .field("op_id", op_id)
+                .field("meta", meta)
+                .finish(),
+            Self::MediaUploadPhotoDone { op_id, result } => f
+                .debug_struct("MediaUploadPhotoDone")
+                .field("op_id", op_id)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::MediaUploadVideoDone { op_id, result } => f
+                .debug_struct("MediaUploadVideoDone")
+                .field("op_id", op_id)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::MediaClientIdAllocated { op_id, .. } => f
+                .debug_struct("MediaClientIdAllocated")
+                .field("op_id", op_id)
+                .finish(),
+            Self::MediaUploadFileDone { op_id, result } => f
+                .debug_struct("MediaUploadFileDone")
+                .field("op_id", op_id)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::MediaFileExistsChecked { purpose, exists } => f
+                .debug_struct("MediaFileExistsChecked")
+                .field("purpose", purpose)
+                .field("exists", exists)
+                .finish(),
+            Self::MediaStoreMessageLoaded { flight_id, message } => f
+                .debug_struct("MediaStoreMessageLoaded")
+                .field("flight_id", flight_id)
+                .field("found", &message.is_some())
+                .finish(),
+            Self::MediaCacheLookupDone { flight_id, hit } => f
+                .debug_struct("MediaCacheLookupDone")
+                .field("flight_id", flight_id)
+                .field("hit", &hit.is_some())
+                .finish(),
+            Self::MediaLocalFileChecked {
+                flight_id,
+                allowed,
+                is_video,
+                ..
+            } => f
+                .debug_struct("MediaLocalFileChecked")
+                .field("flight_id", flight_id)
+                .field("allowed", allowed)
+                .field("is_video", is_video)
+                .finish(),
+            Self::MediaLoaderFetchMediaDone { flight_id, outcome } => f
+                .debug_struct("MediaLoaderFetchMediaDone")
+                .field("flight_id", flight_id)
+                .field("outcome", outcome)
+                .finish(),
+            Self::MediaVideoPosterDone {
+                flight_id,
+                poster_path,
+                from_cache,
+            } => f
+                .debug_struct("MediaVideoPosterDone")
+                .field("flight_id", flight_id)
+                .field("found", &poster_path.is_some())
+                .field("from_cache", from_cache)
+                .finish(),
+            Self::MediaFileMessageLoaded { op_id, message } => f
+                .debug_struct("MediaFileMessageLoaded")
+                .field("op_id", op_id)
+                .field("found", &message.is_some())
+                .finish(),
+            Self::MediaLoaderFetchFileDone { op_id, outcome } => f
+                .debug_struct("MediaLoaderFetchFileDone")
+                .field("op_id", op_id)
+                .field("outcome", outcome)
+                .finish(),
+            Self::MediaFileStaged { op_id, staged_path } => f
+                .debug_struct("MediaFileStaged")
+                .field("op_id", op_id)
+                .field("staged", &staged_path.is_some())
+                .finish(),
+            Self::MediaSharedMediaLoaded {
+                op_id, kind, limit, ..
+            } => f
+                .debug_struct("MediaSharedMediaLoaded")
+                .field("op_id", op_id)
+                .field("kind", kind)
+                .field("limit", limit)
                 .finish(),
         }
     }

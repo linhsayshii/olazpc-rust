@@ -8,6 +8,7 @@ pub mod cloud;
 pub mod composer;
 pub mod conversations;
 pub mod forward;
+pub mod media;
 pub mod messages;
 // U12
 pub mod polls;
@@ -283,6 +284,33 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::CreateReminderDone { .. }
         | Input::ConfirmPromoteExpired { .. } => {
             composer::reduce_composer(state, input, &mut out);
+        }
+
+        // U15
+        Input::Command(ref cmd) if media::is_media_command(cmd) => {
+            media::reduce_media(state, input, &mut out);
+        }
+        Input::OpRequest { ref cmd, .. } if media::is_media_command(cmd) => {
+            media::reduce_media(state, input, &mut out);
+        }
+        Input::MediaOutgoingFileRead { .. }
+        | Input::MediaImageDimensionsDone { .. }
+        | Input::MediaVideoMetadataDone { .. }
+        | Input::MediaUploadPhotoDone { .. }
+        | Input::MediaUploadVideoDone { .. }
+        | Input::MediaClientIdAllocated { .. }
+        | Input::MediaUploadFileDone { .. }
+        | Input::MediaFileExistsChecked { .. }
+        | Input::MediaStoreMessageLoaded { .. }
+        | Input::MediaCacheLookupDone { .. }
+        | Input::MediaLocalFileChecked { .. }
+        | Input::MediaLoaderFetchMediaDone { .. }
+        | Input::MediaVideoPosterDone { .. }
+        | Input::MediaFileMessageLoaded { .. }
+        | Input::MediaLoaderFetchFileDone { .. }
+        | Input::MediaFileStaged { .. }
+        | Input::MediaSharedMediaLoaded { .. } => {
+            media::reduce_media(state, input, &mut out);
         }
 
         // U11

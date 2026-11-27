@@ -812,6 +812,85 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         guard let engine else { return .cancelled }
         return await engine.hostSendFiles(convId: convId, paths: paths)
     }
+
+    // MARK: - U15 Media Host Callbacks
+
+    func mediaReadOutgoingFile(opId: UInt64, path: String, name: String, mode: String) async -> OutgoingFileProbeRecord {
+        guard let engine else {
+            return OutgoingFileProbeRecord(exists: false, isDir: false, readable: false, size: 0, mediaType: nil)
+        }
+        return await engine.hostMediaReadOutgoingFile(opId: opId, path: path, name: name, mode: mode)
+    }
+
+    func mediaReleaseOutgoingFile(opId: UInt64) async {
+        guard let engine else { return }
+        await engine.hostMediaReleaseOutgoingFile(opId: opId)
+    }
+
+    func mediaImageDimensions(opId: UInt64, path: String, name: String, size: Int64) async -> ImageDimensionsRecord {
+        guard let engine else { return ImageDimensionsRecord(width: 800, height: 600) }
+        return await engine.hostMediaImageDimensions(opId: opId, path: path, name: name, size: size)
+    }
+
+    func mediaVideoMetadata(opId: UInt64, path: String, name: String, size: Int64) async -> VideoMetadataRecord {
+        guard let engine else { return VideoMetadataRecord(durationMs: 0, width: 0, height: 0, hasThumb: false) }
+        return await engine.hostMediaVideoMetadata(opId: opId, path: path, name: name, size: size)
+    }
+
+    func mediaUploadPhoto(opId: UInt64, convId: String, fileName: String, size: Int64, width: Int64, height: Int64) async -> UploadPhotoOutcomeRecord {
+        guard let engine else { return .err(message: ComposerOutcome.genericFailure) }
+        return await engine.hostMediaUploadPhoto(opId: opId, convId: convId, fileName: fileName, size: size, width: width, height: height)
+    }
+
+    func mediaUploadVideo(opId: UInt64, convId: String, fileName: String, size: Int64, durationMs: Int64, width: Int64, height: Int64, hasThumb: Bool) async -> UploadVideoOutcomeRecord {
+        guard let engine else { return .err(message: ComposerOutcome.genericFailure) }
+        return await engine.hostMediaUploadVideo(opId: opId, convId: convId, fileName: fileName, size: size, durationMs: durationMs, width: width, height: height, hasThumb: hasThumb)
+    }
+
+    func mediaUploadFile(opId: UInt64, convId: String, fileName: String, size: Int64, clientId: String?, isE2ee: Bool) async -> UploadFileOutcomeRecord {
+        guard let engine else { return .otherError(message: ComposerOutcome.genericFailure) }
+        return await engine.hostMediaUploadFile(opId: opId, convId: convId, fileName: fileName, size: size, clientId: clientId, isE2ee: isE2ee)
+    }
+
+    func mediaRemoveOwnLocalFile(path: String) async {
+        guard let engine else { return }
+        await engine.hostMediaRemoveOwnLocalFile(path: path)
+    }
+
+    func mediaFileExists(path: String) async -> Bool {
+        guard let engine else { return false }
+        return await engine.hostMediaFileExists(path: path)
+    }
+
+    func mediaCacheLookup(key: String, hashPrefix: String, convId: String, msgId: String, kind: String) async -> MediaCacheHitRecord? {
+        guard let engine else { return nil }
+        return await engine.hostMediaCacheLookup(key: key, hashPrefix: hashPrefix, convId: convId, msgId: msgId, kind: kind)
+    }
+
+    func mediaCheckLocalFile(url: String) async -> LocalFileCheckRecord {
+        guard let engine else { return LocalFileCheckRecord(allowed: false, path: "", isVideo: false) }
+        return await engine.hostMediaCheckLocalFile(url: url)
+    }
+
+    func mediaLoaderFetchMedia(url: String, kind: String, hashPrefix: String, force: Bool) async -> MediaFetchOutcomeRecord {
+        guard let engine else { return .transient }
+        return await engine.hostMediaLoaderFetchMedia(url: url, kind: kind, hashPrefix: hashPrefix, force: force)
+    }
+
+    func mediaVideoPoster(path: String) async -> String? {
+        guard let engine else { return nil }
+        return await engine.hostMediaVideoPoster(path: path)
+    }
+
+    func mediaLoaderFetchFile(url: String, force: Bool, requestToken: UInt64) async -> FileFetchOutcomeRecord {
+        guard let engine else { return .error(kind: .other) }
+        return await engine.hostMediaLoaderFetchFile(url: url, force: force, requestToken: requestToken)
+    }
+
+    func mediaStageFile(sourcePath: String, stem: String, ext: String?) async -> String? {
+        guard let engine else { return nil }
+        return await engine.hostMediaStageFile(sourcePath: sourcePath, stem: stem, ext: ext)
+    }
 }
 
 extension ForwardRequest {
@@ -1555,6 +1634,20 @@ extension ZaloEngine {
                     topicsJson: Self.jsonString(for: entry.topics)
                 )
             }
+            if let fileLimit = self.cloud.plan?.fileLimit {
+                core.seedMediaCloudFileLimit(limit: fileLimit)
+            }
+            if !self.downloadedFilePaths.isEmpty {
+                let entries = self.downloadedFilePaths.keys.sorted().compactMap { key -> DownloadedFilePathEntryRecord? in
+                    guard let url = self.downloadedFilePaths[key] else { return nil }
+                    return DownloadedFilePathEntryRecord(key: key, path: url.path)
+                }
+                core.seedDownloadedFilePaths(entries: entries)
+            }
+            let e2eeThreads = self.e2eeManager.e2eeThreadIdsSync()
+            if !e2eeThreads.isEmpty {
+                core.setE2eeThreads(threads: e2eeThreads)
+            }
 
             let queued = self.pendingCoreCommands
             self.pendingCoreCommands.removeAll()
@@ -2195,6 +2288,17 @@ extension ZaloEngine {
             let next = queuedRecords.map(ComposerConfirm.init(coreRecord:))
             if queuedComposerConfirms != next {
                 queuedComposerConfirms = next
+            }
+        }
+
+        if let dlEntries = batch.downloadedFilePaths {
+            var next: [String: URL] = [:]
+            next.reserveCapacity(dlEntries.count)
+            for entry in dlEntries {
+                next[entry.key] = URL(fileURLWithPath: entry.path)
+            }
+            if downloadedFilePaths != next {
+                downloadedFilePaths = next
             }
         }
 

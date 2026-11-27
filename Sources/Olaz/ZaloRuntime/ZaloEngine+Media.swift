@@ -1,6 +1,7 @@
 import AVFoundation
 import Foundation
 import ImageIO
+import OlazCore
 import UniformTypeIdentifiers
 
 /// What the official client's media loader made of a message's photo / video thumbnail / video.
@@ -154,53 +155,15 @@ enum FileResolution: Equatable, Sendable {
 
 enum ChatFileResolver {
     nonisolated static func sanitizedFileName(_ rawName: String, fallbackExtension: String? = nil) -> String {
-        var clean = rawName
-            .replacingOccurrences(of: "\0", with: "")
-            .replacingOccurrences(of: "/", with: "-")
-            .replacingOccurrences(of: "\\", with: "-")
-            .replacingOccurrences(of: ":", with: "-")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        while clean.hasPrefix(".") { clean.removeFirst() }
-        if clean.isEmpty || clean == "." || clean == ".." {
-            clean = "Tệp đính kèm"
-        }
-        let ownExt = (clean as NSString).pathExtension
-        if ownExt.isEmpty, let fb = fallbackExtension?.trimmingCharacters(in: CharacterSet(charactersIn: ". ")), !fb.isEmpty {
-            clean += "." + fb
-        }
-        return clean
+        mediaSanitizedFileName(rawName: rawName, fallbackExtension: fallbackExtension)
     }
 
     nonisolated static func isPermanentGone(_ error: Error) -> Bool {
-        if let loadErr = error as? MediaLoader.LoadError {
-            switch loadErr {
-            case .http(404), .http(410), .hostNotFound:
-                return true
-            default:
-                return false
-            }
-        }
-        return false
+        mediaFileLoadErrorIsPermanentGone(kind: FileLoadErrorKindRecord(error: error))
     }
 
     nonisolated static func userMessage(for error: Error) -> String {
-        if let loadErr = error as? MediaLoader.LoadError {
-            switch loadErr {
-            case .http(404), .http(410), .hostNotFound:
-                return "Tệp đã quá hạn lưu trữ trên máy chủ Zalo."
-            case .undecodable:
-                return "Không giải mã được tệp đính kèm."
-            case .timedOut:
-                return "Tải tệp quá thời gian chờ. Vui lòng thử lại."
-            case .tooLarge:
-                return "Tệp vượt quá giới hạn dung lượng cho phép."
-            case .http(let code):
-                return "Máy chủ trả lỗi HTTP \(code) khi tải tệp."
-            case .badURL:
-                return "Liên kết tệp không hợp lệ."
-            }
-        }
-        return "Không tải được tệp. Kiểm tra kết nối mạng và thử lại."
+        mediaFileLoadErrorUserMessage(kind: FileLoadErrorKindRecord(error: error))
     }
 
     nonisolated static func resolve(
@@ -290,7 +253,7 @@ extension ZaloEngine {
         return nil
     }
 
-    private nonisolated static func mediaExtension(for container: CloudContainer, fallbackKind: MediaKind) -> String {
+    internal nonisolated static func mediaExtension(for container: CloudContainer, fallbackKind: MediaKind) -> String {
         switch container {
         case .jpeg: return "jpg"
         case .jxl, .png, .gif, .webp, .heic, .mp4, .m4a:
@@ -300,7 +263,7 @@ extension ZaloEngine {
         }
     }
 
-    private nonisolated static func isValidMediaFile(_ url: URL, kind: MediaKind) -> Bool {
+    internal nonisolated static func isValidMediaFile(_ url: URL, kind: MediaKind) -> Bool {
         guard FileManager.default.fileExists(atPath: url.path) else { return false }
         let container = CloudContainer(fileAt: url)
         switch kind {
@@ -339,9 +302,8 @@ extension ZaloEngine {
         return nil
     }
 
-    /// Downloads and caches media from CDN URLs into Olaz's local `MediaCache/` directory (inside `dataDirectory`),
-    /// decrypting `?e2esession=...` payloads, trying fallback URLs (`hd`/`normal`/`ori`/`thumb`), consulting SQLite
-    /// when messages are outside the 50-item memory window, and generating first-frame posters for videos.
+    /// Downloads and caches media from CDN URLs into Olaz's local `MediaCache/` directory,
+    /// orchestrated by `olaz-core` (single-flight 3-slot LIFO + 30 s `Unavailable` TTL, ADR-031).
     func resolveMedia(conversationId: String, messageId: String, kind: MediaKind = .photo, force: Bool = false) async -> MediaResolution {
         if let resolveMediaHostHandler {
             let args: [String: Any] = [
@@ -352,194 +314,19 @@ extension ZaloEngine {
             _ = traceHost("resolve_media", args: args)
             return await resolveMediaHostHandler(args)
         }
-        let key = "\(conversationId)|\(messageId)|\(kind.rawValue)"
-        if force, case .file(let bad)? = mediaResolver.known(key), MediaLoader.isOwnLocalFile(bad) {
-            try? FileManager.default.removeItem(at: bad)
-        }
-        return await mediaResolver.resolve(key: key, force: force) { [weak self] in
-            guard let self else { return .unavailable }
-            guard let msg = await self.findMessageForMedia(conversationId: conversationId, messageId: messageId) else {
-                return .unavailable
-            }
-
-            var rawCandidates: [URL] = []
-            switch (kind, msg.kind) {
-            case (.photo, .photo(let u, _, _)):
-                if let u { rawCandidates.append(u) }
-                rawCandidates.append(contentsOf: msg.fallbackURLs)
-            case (.video, .video(_, _, let u)):
-                if let u { rawCandidates.append(u) }
-                rawCandidates.append(contentsOf: msg.fallbackURLs)
-            case (.videoThumb, .video(let thumb, _, let vid)):
-                if let thumb { rawCandidates.append(thumb) }
-                if let vid { rawCandidates.append(vid) }
-                rawCandidates.append(contentsOf: msg.fallbackURLs)
-            case (.photo, .gif(let u)):
-                if let u { rawCandidates.append(u) }
-                rawCandidates.append(contentsOf: msg.fallbackURLs)
-            default:
-                return .unsupported
-            }
-
-            var seen = Set<String>()
-            let candidates = rawCandidates.filter { seen.insert($0.absoluteString).inserted }
-            guard !candidates.isEmpty else { return .unavailable }
-
-            let cacheDir = self.dataDirectory.appendingPathComponent("MediaCache", isDirectory: true)
-            try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
-            let hashPrefix = MediaLoader.stableHash(key)
-
-            if !force {
-                let existing: URL?
-                if let mediaCacheLookupHostHandler {
-                    let cacheArgs: [String: Any] = [
-                        "key": key,
-                        "hash_prefix": hashPrefix,
-                        "conv_id": conversationId,
-                        "msg_id": messageId,
-                        "kind": kind.rawValue,
-                    ]
-                    _ = self.traceHost("media_cache_lookup", args: cacheArgs)
-                    existing = await mediaCacheLookupHostHandler(cacheArgs)
-                } else {
-                    existing = Self.findCachedMediaFile(hashPrefix: hashPrefix, in: cacheDir, kind: kind)
-                }
-                if let existing {
-                    if kind == .videoThumb, VideoPoster.isVideo(existing) {
-                        return await self.resolveVideoPoster(for: existing).map(MediaResolution.file) ?? .unavailable
-                    }
-                    return .file(existing)
-                }
-            }
-
-            var sawPermanentGone = false
-            var sawTransientError = false
-
-            for remoteURL in candidates {
-                if remoteURL.isFileURL {
-                    let allowed: Bool
-                    if let allowedLocalFileHostHandler = self.allowedLocalFileHostHandler {
-                        let checkArgs: [String: Any] = ["url": remoteURL.absoluteString]
-                        _ = self.traceHost("check_local_file", args: checkArgs)
-                        allowed = await allowedLocalFileHostHandler(checkArgs)
-                    } else {
-                        allowed = MediaLoader.isAllowedLocalFile(remoteURL) && FileManager.default.fileExists(atPath: remoteURL.path)
-                    }
-                    if allowed {
-                        if kind == .videoThumb, VideoPoster.isVideo(remoteURL) {
-                            if let poster = await self.resolveVideoPoster(for: remoteURL) { return .file(poster) }
-                        } else {
-                            return .file(remoteURL)
-                        }
-                    }
-                    continue
-                }
-                guard let scheme = remoteURL.scheme?.lowercased(), scheme == "https" || scheme == "http" else { continue }
-                if force && self.mediaLoaderFetchHostHandler == nil {
-                    await MediaLoader.shared.forgetFailures(for: remoteURL)
-                    await MediaLoader.shared.evictCachedFile(for: remoteURL)
-                }
-
-                if kind == .video {
-                    do {
-                        let fetchedFile: URL
-                        if let mediaLoaderFetchHostHandler = self.mediaLoaderFetchHostHandler {
-                            let fetchArgs: [String: Any] = [
-                                "mode": "file",
-                                "url": remoteURL.absoluteString,
-                                "force": force,
-                            ]
-                            _ = self.traceHost("loader_fetch", args: fetchArgs)
-                            switch try await mediaLoaderFetchHostHandler(fetchArgs) {
-                            case .file(let u):
-                                fetchedFile = u
-                            case .data(let bytes):
-                                let probe = cacheDir.appendingPathComponent(".\(UUID().uuidString).probe")
-                                try bytes.write(to: probe, options: .atomic)
-                                let container = CloudContainer(fileAt: probe)
-                                let ext = Self.mediaExtension(for: container, fallbackKind: .video)
-                                let dest = cacheDir.appendingPathComponent("\(hashPrefix).\(ext)")
-                                try? FileManager.default.removeItem(at: dest)
-                                try FileManager.default.moveItem(at: probe, to: dest)
-                                return .file(dest)
-                            }
-                        } else {
-                            fetchedFile = try await MediaLoader.shared.localFile(for: remoteURL)
-                        }
-                        let container = CloudContainer(fileAt: fetchedFile)
-                        let ext = Self.mediaExtension(for: container, fallbackKind: .video)
-                        let dest = cacheDir.appendingPathComponent("\(hashPrefix).\(ext)")
-                        try? FileManager.default.removeItem(at: dest)
-                        try FileManager.default.copyItem(at: fetchedFile, to: dest)
-                        return .file(dest)
-                    } catch {
-                        if ChatFileResolver.isPermanentGone(error) { sawPermanentGone = true } else { sawTransientError = true }
-                        continue
-                    }
-                } else {
-                    do {
-                        let data: Data
-                        if let mediaLoaderFetchHostHandler = self.mediaLoaderFetchHostHandler {
-                            let fetchArgs: [String: Any] = [
-                                "mode": "data",
-                                "url": remoteURL.absoluteString,
-                                "force": force,
-                            ]
-                            _ = self.traceHost("loader_fetch", args: fetchArgs)
-                            switch try await mediaLoaderFetchHostHandler(fetchArgs) {
-                            case .data(let bytes):
-                                data = bytes
-                            case .file(let u):
-                                data = try Data(contentsOf: u)
-                            }
-                        } else {
-                            data = try await MediaLoader.shared.data(for: remoteURL)
-                        }
-                        guard !data.isEmpty else { sawTransientError = true; continue }
-                        let tempProbe = cacheDir.appendingPathComponent(".\(UUID().uuidString).probe")
-                        try data.write(to: tempProbe, options: .atomic)
-                        guard Self.isValidMediaFile(tempProbe, kind: kind) else {
-                            try? FileManager.default.removeItem(at: tempProbe)
-                            sawTransientError = true
-                            continue
-                        }
-                        let container = CloudContainer(fileAt: tempProbe)
-                        let ext = Self.mediaExtension(for: container, fallbackKind: kind)
-                        let dest = cacheDir.appendingPathComponent("\(hashPrefix).\(ext)")
-                        try? FileManager.default.removeItem(at: dest)
-                        try FileManager.default.moveItem(at: tempProbe, to: dest)
-
-                        if kind == .videoThumb, VideoPoster.isVideo(dest) {
-                            if let poster = await self.resolveVideoPoster(for: dest) {
-                                return .file(poster)
-                            }
-                            continue
-                        }
-                        return .file(dest)
-                    } catch {
-                        if ChatFileResolver.isPermanentGone(error) { sawPermanentGone = true } else { sawTransientError = true }
-                        continue
-                    }
-                }
-            }
-
-            if sawPermanentGone && !sawTransientError {
-                return .expired
-            }
-            return .unavailable
-        }
+        guard let core = await ensureCoreEngine() else { return .unavailable }
+        let res = await core.resolveMediaCore(
+            convId: conversationId,
+            msgId: messageId,
+            kind: kind.rawValue,
+            force: force,
+            nowMs: nowMs()
+        )
+        return MediaResolution(coreRecord: res)
     }
 
-    private func resolveVideoPoster(for video: URL) async -> URL? {
-        if let videoPosterHostHandler {
-            let args: [String: Any] = ["path": video.path]
-            _ = traceHost("video_poster", args: args)
-            return await videoPosterHostHandler(args)
-        }
-        return await VideoPoster.poster(for: video)
-    }
-
-    /// Downloads, decrypts (`?e2esession=...`), and stages a file attachment with its sanitized real filename + extension.
+    /// Downloads, decrypts (`?e2esession=...`), and stages a file attachment with its sanitized real filename + extension,
+    /// orchestrated by `olaz-core` (ADR-031).
     func resolveFile(
         conversationId: String = "",
         messageId: String = "",
@@ -558,69 +345,29 @@ extension ZaloEngine {
             _ = traceHost("resolve_file", args: args)
             return await resolveFileHostHandler(args)
         }
-        var resolvedURL = url
-        var resolvedName = name
-        if resolvedURL == nil, (!conversationId.isEmpty || !messageId.isEmpty),
-           let msg = await findMessageForMedia(conversationId: conversationId, messageId: messageId),
-           case .file(let dbName, _, let dbURL) = msg.kind {
-            resolvedURL = dbURL
-            if resolvedName.isEmpty { resolvedName = dbName }
+        guard let core = await ensureCoreEngine() else {
+            return .failed("Không tải được tệp. Kiểm tra kết nối mạng và thử lại.")
         }
-        if let mediaLoaderFetchHostHandler {
-            guard let remoteURL = resolvedURL else {
-                return .failed("Tin nhắn không có đường dẫn tải tệp.")
-            }
-            let fetchArgs: [String: Any] = [
-                "mode": "file",
-                "url": remoteURL.absoluteString,
-                "force": force,
-            ]
-            _ = traceHost("loader_fetch", args: fetchArgs)
-            let cachedFile: URL
-            do {
-                switch try await mediaLoaderFetchHostHandler(fetchArgs) {
-                case .file(let u):
-                    cachedFile = u
-                case .data(let bytes):
-                    let tempDir = dataDirectory.appendingPathComponent("MediaCache", isDirectory: true)
-                    try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-                    let temp = tempDir.appendingPathComponent(".\(UUID().uuidString).dl")
-                    try bytes.write(to: temp, options: .atomic)
-                    cachedFile = temp
-                }
-            } catch is CancellationError {
-                return .failed("Đã huỷ tải tệp.")
-            } catch {
-                if ChatFileResolver.isPermanentGone(error) {
-                    return .expired
-                }
-                return .failed(ChatFileResolver.userMessage(for: error))
-            }
-            let container = CloudContainer(fileAt: cachedFile)
-            let safeFull = ChatFileResolver.sanitizedFileName(resolvedName, fallbackExtension: container.fileExtension)
-            let ext = (safeFull as NSString).pathExtension
-            let stem = ext.isEmpty ? safeFull : (safeFull as NSString).deletingPathExtension
-            let cleanStem = stem.isEmpty ? "Tệp đính kèm" : stem
-            let cleanExt = ext.isEmpty ? nil : ext
-            if let stageFileHostHandler {
-                if let staged = await stageFileHostHandler(cachedFile, cleanStem, cleanExt) {
-                    return .ready(staged)
-                }
-                return .ready(cachedFile)
-            }
-            if let staged = CloudFiles.stage(cachedFile, name: cleanStem, ext: cleanExt) {
-                return .ready(staged)
-            }
-            return .ready(cachedFile)
-        }
-        return await ChatFileResolver.resolve(name: resolvedName, url: resolvedURL, force: force, progress: progress)
+        let token = mediaHostIO.registerProgress(progress)
+        defer { mediaHostIO.unregisterProgress(token: token) }
+        let res = await core.resolveFileCore(
+            convId: conversationId,
+            msgId: messageId,
+            name: name,
+            url: url?.absoluteString,
+            force: force,
+            requestToken: token
+        )
+        return FileResolution(coreRecord: res)
     }
 
     func fileDownloadKey(conversationId: String, messageId: String, url: URL?, name: String) -> String {
-        if !conversationId.isEmpty && !messageId.isEmpty {
-            return "\(conversationId)|\(messageId)"
-        }
-        return url?.absoluteString ?? name
+        mediaFileDownloadKey(
+            convId: conversationId,
+            msgId: messageId,
+            url: url?.absoluteString,
+            name: name
+        )
     }
 
     func rememberedDownloadedFile(for key: String) -> URL? {
@@ -630,6 +377,14 @@ extension ZaloEngine {
         }
         downloadedFilePaths.removeValue(forKey: key)
         return nil
+    }
+
+    func resetMedia() {
+        mediaHostIO.releaseAll()
+        downloadedFilePaths = [:]
+        if !isApplyingCoreMirror {
+            coreLifecycle.core?.resetMedia()
+        }
     }
 }
 

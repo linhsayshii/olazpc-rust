@@ -1454,6 +1454,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     
     func flushAll() async throws  -> UInt64
     
+    func forgetDownloadedFile(key: String) 
+    
     /**
      * Forwards one message to `targets`, returning the outcome and settled mirror revision.
      */
@@ -1662,6 +1664,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func relockHidden() 
     
+    func rememberDownloadedFile(key: String, path: String) 
+    
     /**
      * Queries reminder compose capabilities and title limits for `conv_id`.
      */
@@ -1722,6 +1726,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func resetHiddenPin() async throws  -> ConversationActionResultRecord
     
+    func resetMedia() 
+    
     /**
      * Clears the outgoing typing throttle for `conv_id`.
      */
@@ -1733,6 +1739,10 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Resets sticker pack cache and in-memory suggest setting.
      */
     func resetStickers() 
+    
+    func resolveFileCore(convId: String, msgId: String, name: String, url: String?, force: Bool, requestToken: UInt64) async  -> FileResolutionRecord
+    
+    func resolveMediaCore(convId: String, msgId: String, kind: String, force: Bool, nowMs: Int64) async  -> MediaResolutionRecord
     
     /**
      * Resolves missing conversation display names in 50-UID chunks via `get_profiles`.
@@ -1760,7 +1770,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     
     func seedContacts(contacts: ContactsStateRecord) 
     
+    func seedDownloadedFilePaths(entries: [DownloadedFilePathEntryRecord]) 
+    
     func seedHistoryFreshness(entries: [FreshnessMapEntry]) 
+    
+    func seedMediaCloudFileLimit(limit: Int64?) 
     
     func seedPolls(polls: PollsMirrorRecord) 
     
@@ -1773,6 +1787,10 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Seeds in-memory sticker suggest setting (for tests / state sync).
      */
     func seedStickerSuggestSetting(setting: StickerSuggestSettingRecord?) 
+    
+    func sendFilesCore(convId: String, paths: [String], nowMs: Int64) async  -> ComposerOutcomeRecord
+    
+    func sendMediaCore(convId: String, paths: [String], nowMs: Int64) async  -> ComposerOutcomeRecord
     
     /**
      * Sends own contact card (plain or 1-1 E2EE via `send_e2ee_contact_card`).
@@ -1855,6 +1873,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func sharePoll(id: String, convId: String) async throws  -> PollActionOutcomeRecord
     
     func sharedApi()  -> CoreApi
+    
+    func sharedMediaCore(convId: String, kind: String, afterCursor: String?, limit: UInt32, simulateStoreError: Bool) async  -> SharedMediaPageRecord?
     
     /**
      * Sets or refreshes an incoming typing indicator directly in core (10 s expiry timer).
@@ -2664,6 +2684,15 @@ open func flushAll()async throws  -> UInt64  {
         )
 }
     
+open func forgetDownloadedFile(key: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_forget_downloaded_file(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(key),uniffiCallStatus
+    )
+}
+}
+    
     /**
      * Forwards one message to `targets`, returning the outcome and settled mirror revision.
      */
@@ -3390,6 +3419,16 @@ open func relockHidden()  {try! rustCall() {
 }
 }
     
+open func rememberDownloadedFile(key: String, path: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_remember_downloaded_file(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(key),
+        FfiConverterString.lower(path),uniffiCallStatus
+    )
+}
+}
+    
     /**
      * Queries reminder compose capabilities and title limits for `conv_id`.
      */
@@ -3558,6 +3597,14 @@ open func resetHiddenPin()async throws  -> ConversationActionResultRecord  {
         )
 }
     
+open func resetMedia()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_reset_media(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
     /**
      * Clears the outgoing typing throttle for `conv_id`.
      */
@@ -3588,6 +3635,40 @@ open func resetStickers()  {try! rustCall() {
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
+}
+    
+open func resolveFileCore(convId: String, msgId: String, name: String, url: String?, force: Bool, requestToken: UInt64)async  -> FileResolutionRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_resolve_file_core(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(msgId),FfiConverterString.lower(name),FfiConverterOptionString.lower(url),FfiConverterBool.lower(force),FfiConverterUInt64.lower(requestToken)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeFileResolutionRecord_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func resolveMediaCore(convId: String, msgId: String, kind: String, force: Bool, nowMs: Int64)async  -> MediaResolutionRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_resolve_media_core(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(msgId),FfiConverterString.lower(kind),FfiConverterBool.lower(force),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeMediaResolutionRecord_lift,
+            errorHandler: nil
+            
+        )
 }
     
     /**
@@ -3689,11 +3770,29 @@ open func seedContacts(contacts: ContactsStateRecord)  {try! rustCall() {
 }
 }
     
+open func seedDownloadedFilePaths(entries: [DownloadedFilePathEntryRecord])  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_seed_downloaded_file_paths(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceTypeDownloadedFilePathEntryRecord.lower(entries),uniffiCallStatus
+    )
+}
+}
+    
 open func seedHistoryFreshness(entries: [FreshnessMapEntry])  {try! rustCall() {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_method_coreengine_seed_history_freshness(
             self.uniffiCloneHandle(),
         FfiConverterSequenceTypeFreshnessMapEntry.lower(entries),uniffiCallStatus
+    )
+}
+}
+    
+open func seedMediaCloudFileLimit(limit: Int64?)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_seed_media_cloud_file_limit(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionInt64.lower(limit),uniffiCallStatus
     )
 }
 }
@@ -3729,6 +3828,40 @@ open func seedStickerSuggestSetting(setting: StickerSuggestSettingRecord?)  {try
         FfiConverterOptionTypeStickerSuggestSettingRecord.lower(setting),uniffiCallStatus
     )
 }
+}
+    
+open func sendFilesCore(convId: String, paths: [String], nowMs: Int64)async  -> ComposerOutcomeRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_send_files_core(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterSequenceString.lower(paths),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeComposerOutcomeRecord_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func sendMediaCore(convId: String, paths: [String], nowMs: Int64)async  -> ComposerOutcomeRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_send_media_core(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterSequenceString.lower(paths),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeComposerOutcomeRecord_lift,
+            errorHandler: nil
+            
+        )
 }
     
     /**
@@ -3991,6 +4124,23 @@ open func sharedApi() -> CoreApi  {
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
+}
+    
+open func sharedMediaCore(convId: String, kind: String, afterCursor: String?, limit: UInt32, simulateStoreError: Bool)async  -> SharedMediaPageRecord?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_shared_media_core(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(convId),FfiConverterString.lower(kind),FfiConverterOptionString.lower(afterCursor),FfiConverterUInt32.lower(limit),FfiConverterBool.lower(simulateStoreError)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeSharedMediaPageRecord.lift,
+            errorHandler: nil
+            
+        )
 }
     
     /**
@@ -4694,6 +4844,36 @@ public protocol CoreHost: AnyObject, Sendable {
     func sendE2eeContactCard(convId: String, clientId: String, contactUid: String, title: String, phone: String, avatar: String, qrCodeUrl: String) async  -> E2eeSendOutcomeRecord
     
     func sleepConfirmPromote(delayMs: UInt64) async 
+    
+    func mediaReadOutgoingFile(opId: UInt64, path: String, name: String, mode: String) async  -> OutgoingFileProbeRecord
+    
+    func mediaReleaseOutgoingFile(opId: UInt64) async 
+    
+    func mediaImageDimensions(opId: UInt64, path: String, name: String, size: Int64) async  -> ImageDimensionsRecord
+    
+    func mediaVideoMetadata(opId: UInt64, path: String, name: String, size: Int64) async  -> VideoMetadataRecord
+    
+    func mediaUploadPhoto(opId: UInt64, convId: String, fileName: String, size: Int64, width: Int64, height: Int64) async  -> UploadPhotoOutcomeRecord
+    
+    func mediaUploadVideo(opId: UInt64, convId: String, fileName: String, size: Int64, durationMs: Int64, width: Int64, height: Int64, hasThumb: Bool) async  -> UploadVideoOutcomeRecord
+    
+    func mediaUploadFile(opId: UInt64, convId: String, fileName: String, size: Int64, clientId: String?, isE2ee: Bool) async  -> UploadFileOutcomeRecord
+    
+    func mediaRemoveOwnLocalFile(path: String) async 
+    
+    func mediaFileExists(path: String) async  -> Bool
+    
+    func mediaCacheLookup(key: String, hashPrefix: String, convId: String, msgId: String, kind: String) async  -> MediaCacheHitRecord?
+    
+    func mediaCheckLocalFile(url: String) async  -> LocalFileCheckRecord
+    
+    func mediaLoaderFetchMedia(url: String, kind: String, hashPrefix: String, force: Bool) async  -> MediaFetchOutcomeRecord
+    
+    func mediaVideoPoster(path: String) async  -> String?
+    
+    func mediaLoaderFetchFile(url: String, force: Bool, requestToken: UInt64) async  -> FileFetchOutcomeRecord
+    
+    func mediaStageFile(sourcePath: String, stem: String, ext: String?) async  -> String?
     
 }
 /**
@@ -5692,6 +5872,261 @@ open func sleepConfirmPromote(delayMs: UInt64)async   {
             completeFunc: ffi_olaz_ffi_rust_future_complete_void,
             freeFunc: ffi_olaz_ffi_rust_future_free_void,
             liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+open func mediaReadOutgoingFile(opId: UInt64, path: String, name: String, mode: String)async  -> OutgoingFileProbeRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_media_read_outgoing_file(
+                        self.uniffiCloneHandle(),FfiConverterUInt64.lower(opId),FfiConverterString.lower(path),FfiConverterString.lower(name),FfiConverterString.lower(mode)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeOutgoingFileProbeRecord_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func mediaReleaseOutgoingFile(opId: UInt64)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_media_release_outgoing_file(
+                        self.uniffiCloneHandle(),FfiConverterUInt64.lower(opId)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
+            freeFunc: ffi_olaz_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+open func mediaImageDimensions(opId: UInt64, path: String, name: String, size: Int64)async  -> ImageDimensionsRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_media_image_dimensions(
+                        self.uniffiCloneHandle(),FfiConverterUInt64.lower(opId),FfiConverterString.lower(path),FfiConverterString.lower(name),FfiConverterInt64.lower(size)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeImageDimensionsRecord_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func mediaVideoMetadata(opId: UInt64, path: String, name: String, size: Int64)async  -> VideoMetadataRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_media_video_metadata(
+                        self.uniffiCloneHandle(),FfiConverterUInt64.lower(opId),FfiConverterString.lower(path),FfiConverterString.lower(name),FfiConverterInt64.lower(size)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeVideoMetadataRecord_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func mediaUploadPhoto(opId: UInt64, convId: String, fileName: String, size: Int64, width: Int64, height: Int64)async  -> UploadPhotoOutcomeRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_media_upload_photo(
+                        self.uniffiCloneHandle(),FfiConverterUInt64.lower(opId),FfiConverterString.lower(convId),FfiConverterString.lower(fileName),FfiConverterInt64.lower(size),FfiConverterInt64.lower(width),FfiConverterInt64.lower(height)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeUploadPhotoOutcomeRecord_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func mediaUploadVideo(opId: UInt64, convId: String, fileName: String, size: Int64, durationMs: Int64, width: Int64, height: Int64, hasThumb: Bool)async  -> UploadVideoOutcomeRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_media_upload_video(
+                        self.uniffiCloneHandle(),FfiConverterUInt64.lower(opId),FfiConverterString.lower(convId),FfiConverterString.lower(fileName),FfiConverterInt64.lower(size),FfiConverterInt64.lower(durationMs),FfiConverterInt64.lower(width),FfiConverterInt64.lower(height),FfiConverterBool.lower(hasThumb)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeUploadVideoOutcomeRecord_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func mediaUploadFile(opId: UInt64, convId: String, fileName: String, size: Int64, clientId: String?, isE2ee: Bool)async  -> UploadFileOutcomeRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_media_upload_file(
+                        self.uniffiCloneHandle(),FfiConverterUInt64.lower(opId),FfiConverterString.lower(convId),FfiConverterString.lower(fileName),FfiConverterInt64.lower(size),FfiConverterOptionString.lower(clientId),FfiConverterBool.lower(isE2ee)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeUploadFileOutcomeRecord_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func mediaRemoveOwnLocalFile(path: String)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_media_remove_own_local_file(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(path)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_void,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_void,
+            freeFunc: ffi_olaz_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+open func mediaFileExists(path: String)async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_media_file_exists(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(path)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_i8,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_i8,
+            freeFunc: ffi_olaz_ffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func mediaCacheLookup(key: String, hashPrefix: String, convId: String, msgId: String, kind: String)async  -> MediaCacheHitRecord?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_media_cache_lookup(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(key),FfiConverterString.lower(hashPrefix),FfiConverterString.lower(convId),FfiConverterString.lower(msgId),FfiConverterString.lower(kind)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeMediaCacheHitRecord.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func mediaCheckLocalFile(url: String)async  -> LocalFileCheckRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_media_check_local_file(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(url)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeLocalFileCheckRecord_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func mediaLoaderFetchMedia(url: String, kind: String, hashPrefix: String, force: Bool)async  -> MediaFetchOutcomeRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_media_loader_fetch_media(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(url),FfiConverterString.lower(kind),FfiConverterString.lower(hashPrefix),FfiConverterBool.lower(force)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeMediaFetchOutcomeRecord_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func mediaVideoPoster(path: String)async  -> String?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_media_video_poster(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(path)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionString.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func mediaLoaderFetchFile(url: String, force: Bool, requestToken: UInt64)async  -> FileFetchOutcomeRecord  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_media_loader_fetch_file(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(url),FfiConverterBool.lower(force),FfiConverterUInt64.lower(requestToken)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeFileFetchOutcomeRecord_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func mediaStageFile(sourcePath: String, stem: String, ext: String?)async  -> String?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_corehost_media_stage_file(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(sourcePath),FfiConverterString.lower(stem),FfiConverterOptionString.lower(ext)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionString.lift,
             errorHandler: nil
             
         )
@@ -8060,6 +8495,706 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                 uniffiFutureCallback(
                     uniffiCallbackData,
                     UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        mediaReadOutgoingFile: { (
+            uniffiHandle: UInt64,
+            opId: UInt64,
+            path: RustBuffer,
+            name: RustBuffer,
+            mode: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> OutgoingFileProbeRecord in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.mediaReadOutgoingFile(
+                     opId: try FfiConverterUInt64.lift(opId),
+                     path: try FfiConverterString.lift(path),
+                     name: try FfiConverterString.lift(name),
+                     mode: try FfiConverterString.lift(mode)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: OutgoingFileProbeRecord) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterTypeOutgoingFileProbeRecord_lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        mediaReleaseOutgoingFile: { (
+            uniffiHandle: UInt64,
+            opId: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.mediaReleaseOutgoingFile(
+                     opId: try FfiConverterUInt64.lift(opId)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        mediaImageDimensions: { (
+            uniffiHandle: UInt64,
+            opId: UInt64,
+            path: RustBuffer,
+            name: RustBuffer,
+            size: Int64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> ImageDimensionsRecord in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.mediaImageDimensions(
+                     opId: try FfiConverterUInt64.lift(opId),
+                     path: try FfiConverterString.lift(path),
+                     name: try FfiConverterString.lift(name),
+                     size: try FfiConverterInt64.lift(size)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ImageDimensionsRecord) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterTypeImageDimensionsRecord_lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        mediaVideoMetadata: { (
+            uniffiHandle: UInt64,
+            opId: UInt64,
+            path: RustBuffer,
+            name: RustBuffer,
+            size: Int64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> VideoMetadataRecord in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.mediaVideoMetadata(
+                     opId: try FfiConverterUInt64.lift(opId),
+                     path: try FfiConverterString.lift(path),
+                     name: try FfiConverterString.lift(name),
+                     size: try FfiConverterInt64.lift(size)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: VideoMetadataRecord) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterTypeVideoMetadataRecord_lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        mediaUploadPhoto: { (
+            uniffiHandle: UInt64,
+            opId: UInt64,
+            convId: RustBuffer,
+            fileName: RustBuffer,
+            size: Int64,
+            width: Int64,
+            height: Int64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> UploadPhotoOutcomeRecord in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.mediaUploadPhoto(
+                     opId: try FfiConverterUInt64.lift(opId),
+                     convId: try FfiConverterString.lift(convId),
+                     fileName: try FfiConverterString.lift(fileName),
+                     size: try FfiConverterInt64.lift(size),
+                     width: try FfiConverterInt64.lift(width),
+                     height: try FfiConverterInt64.lift(height)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: UploadPhotoOutcomeRecord) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterTypeUploadPhotoOutcomeRecord_lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        mediaUploadVideo: { (
+            uniffiHandle: UInt64,
+            opId: UInt64,
+            convId: RustBuffer,
+            fileName: RustBuffer,
+            size: Int64,
+            durationMs: Int64,
+            width: Int64,
+            height: Int64,
+            hasThumb: Int8,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> UploadVideoOutcomeRecord in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.mediaUploadVideo(
+                     opId: try FfiConverterUInt64.lift(opId),
+                     convId: try FfiConverterString.lift(convId),
+                     fileName: try FfiConverterString.lift(fileName),
+                     size: try FfiConverterInt64.lift(size),
+                     durationMs: try FfiConverterInt64.lift(durationMs),
+                     width: try FfiConverterInt64.lift(width),
+                     height: try FfiConverterInt64.lift(height),
+                     hasThumb: try FfiConverterBool.lift(hasThumb)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: UploadVideoOutcomeRecord) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterTypeUploadVideoOutcomeRecord_lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        mediaUploadFile: { (
+            uniffiHandle: UInt64,
+            opId: UInt64,
+            convId: RustBuffer,
+            fileName: RustBuffer,
+            size: Int64,
+            clientId: RustBuffer,
+            isE2ee: Int8,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> UploadFileOutcomeRecord in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.mediaUploadFile(
+                     opId: try FfiConverterUInt64.lift(opId),
+                     convId: try FfiConverterString.lift(convId),
+                     fileName: try FfiConverterString.lift(fileName),
+                     size: try FfiConverterInt64.lift(size),
+                     clientId: try FfiConverterOptionString.lift(clientId),
+                     isE2ee: try FfiConverterBool.lift(isE2ee)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: UploadFileOutcomeRecord) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterTypeUploadFileOutcomeRecord_lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        mediaRemoveOwnLocalFile: { (
+            uniffiHandle: UInt64,
+            path: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteVoid,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.mediaRemoveOwnLocalFile(
+                     path: try FfiConverterString.lift(path)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: ()) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultVoid(
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        mediaFileExists: { (
+            uniffiHandle: UInt64,
+            path: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteI8,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> Bool in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.mediaFileExists(
+                     path: try FfiConverterString.lift(path)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: Bool) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultI8(
+                        returnValue: FfiConverterBool.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultI8(
+                        returnValue: 0,
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        mediaCacheLookup: { (
+            uniffiHandle: UInt64,
+            key: RustBuffer,
+            hashPrefix: RustBuffer,
+            convId: RustBuffer,
+            msgId: RustBuffer,
+            kind: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> MediaCacheHitRecord? in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.mediaCacheLookup(
+                     key: try FfiConverterString.lift(key),
+                     hashPrefix: try FfiConverterString.lift(hashPrefix),
+                     convId: try FfiConverterString.lift(convId),
+                     msgId: try FfiConverterString.lift(msgId),
+                     kind: try FfiConverterString.lift(kind)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: MediaCacheHitRecord?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterOptionTypeMediaCacheHitRecord.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        mediaCheckLocalFile: { (
+            uniffiHandle: UInt64,
+            url: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> LocalFileCheckRecord in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.mediaCheckLocalFile(
+                     url: try FfiConverterString.lift(url)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: LocalFileCheckRecord) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterTypeLocalFileCheckRecord_lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        mediaLoaderFetchMedia: { (
+            uniffiHandle: UInt64,
+            url: RustBuffer,
+            kind: RustBuffer,
+            hashPrefix: RustBuffer,
+            force: Int8,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> MediaFetchOutcomeRecord in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.mediaLoaderFetchMedia(
+                     url: try FfiConverterString.lift(url),
+                     kind: try FfiConverterString.lift(kind),
+                     hashPrefix: try FfiConverterString.lift(hashPrefix),
+                     force: try FfiConverterBool.lift(force)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: MediaFetchOutcomeRecord) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterTypeMediaFetchOutcomeRecord_lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        mediaVideoPoster: { (
+            uniffiHandle: UInt64,
+            path: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> String? in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.mediaVideoPoster(
+                     path: try FfiConverterString.lift(path)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: String?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterOptionString.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        mediaLoaderFetchFile: { (
+            uniffiHandle: UInt64,
+            url: RustBuffer,
+            force: Int8,
+            requestToken: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> FileFetchOutcomeRecord in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.mediaLoaderFetchFile(
+                     url: try FfiConverterString.lift(url),
+                     force: try FfiConverterBool.lift(force),
+                     requestToken: try FfiConverterUInt64.lift(requestToken)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: FileFetchOutcomeRecord) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterTypeFileFetchOutcomeRecord_lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            uniffiTraitInterfaceCallAsync(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                droppedCallback: uniffiOutDroppedCallback
+            )
+        },
+        mediaStageFile: { (
+            uniffiHandle: UInt64,
+            sourcePath: RustBuffer,
+            stem: RustBuffer,
+            ext: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
+        ) in
+            let makeCall = {
+                () async throws -> String? in
+                guard let uniffiObj = try? FfiConverterTypeCoreHost.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return await uniffiObj.mediaStageFile(
+                     sourcePath: try FfiConverterString.lift(sourcePath),
+                     stem: try FfiConverterString.lift(stem),
+                     ext: try FfiConverterOptionString.lift(ext)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: String?) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: FfiConverterOptionString.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureResultRustBuffer(
+                        returnValue: RustBuffer.empty(),
                         callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
                     )
                 )
@@ -15125,10 +16260,11 @@ public struct CoreChangesRecord: Equatable, Hashable {
     public var stickerSuggest: StickerSuggestUpdateRecord?
     public var composerConfirm: ComposerConfirmUpdateRecord?
     public var queuedComposerConfirms: [ComposerConfirmRecord]?
+    public var downloadedFilePaths: [DownloadedFilePathEntryRecord]?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, typing: [TypingEntryRecord]?, forwardRequest: ForwardRequestUpdateRecord?, clearSelection: Bool, deleteUndo: DeleteUndoUpdateRecord?, messageConfirm: MessageConfirmUpdateRecord?, autoDelete: AutoDeleteUpdateRecord?, starredIds: [String]?, cachedProfiles: [CachedProfileEntry]?, cachedGroups: [CachedGroupEntry]? = nil, polls: PollsMirrorRecord? = nil, cloud: CloudStateRecord? = nil, stickerSuggest: StickerSuggestUpdateRecord?, composerConfirm: ComposerConfirmUpdateRecord?, queuedComposerConfirms: [ComposerConfirmRecord]?) {
+    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, typing: [TypingEntryRecord]?, forwardRequest: ForwardRequestUpdateRecord?, clearSelection: Bool, deleteUndo: DeleteUndoUpdateRecord?, messageConfirm: MessageConfirmUpdateRecord?, autoDelete: AutoDeleteUpdateRecord?, starredIds: [String]?, cachedProfiles: [CachedProfileEntry]?, cachedGroups: [CachedGroupEntry]? = nil, polls: PollsMirrorRecord? = nil, cloud: CloudStateRecord? = nil, stickerSuggest: StickerSuggestUpdateRecord?, composerConfirm: ComposerConfirmUpdateRecord?, queuedComposerConfirms: [ComposerConfirmRecord]?, downloadedFilePaths: [DownloadedFilePathEntryRecord]? = nil) {
         self.version = version
         self.session = session
         self.conversations = conversations
@@ -15154,6 +16290,7 @@ public struct CoreChangesRecord: Equatable, Hashable {
         self.stickerSuggest = stickerSuggest
         self.composerConfirm = composerConfirm
         self.queuedComposerConfirms = queuedComposerConfirms
+        self.downloadedFilePaths = downloadedFilePaths
     }
 
     
@@ -15196,7 +16333,8 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
                 cloud: FfiConverterOptionTypeCloudStateRecord.read(from: &buf), 
                 stickerSuggest: FfiConverterOptionTypeStickerSuggestUpdateRecord.read(from: &buf), 
                 composerConfirm: FfiConverterOptionTypeComposerConfirmUpdateRecord.read(from: &buf), 
-                queuedComposerConfirms: FfiConverterOptionSequenceTypeComposerConfirmRecord.read(from: &buf)
+                queuedComposerConfirms: FfiConverterOptionSequenceTypeComposerConfirmRecord.read(from: &buf), 
+                downloadedFilePaths: FfiConverterOptionSequenceTypeDownloadedFilePathEntryRecord.read(from: &buf)
         )
     }
 
@@ -15226,6 +16364,7 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
         FfiConverterOptionTypeStickerSuggestUpdateRecord.write(value.stickerSuggest, into: &buf)
         FfiConverterOptionTypeComposerConfirmUpdateRecord.write(value.composerConfirm, into: &buf)
         FfiConverterOptionSequenceTypeComposerConfirmRecord.write(value.queuedComposerConfirms, into: &buf)
+        FfiConverterOptionSequenceTypeDownloadedFilePathEntryRecord.write(value.downloadedFilePaths, into: &buf)
     }
 }
 
@@ -15417,6 +16556,63 @@ public func FfiConverterTypeDeleteUndoUpdateRecord_lift(_ buf: RustBuffer) throw
 #endif
 public func FfiConverterTypeDeleteUndoUpdateRecord_lower(_ value: DeleteUndoUpdateRecord) -> RustBuffer {
     return FfiConverterTypeDeleteUndoUpdateRecord.lower(value)
+}
+
+
+/**
+ * One entry in `downloaded_file_paths` (`key -> path`).
+ */
+public struct DownloadedFilePathEntryRecord: Equatable, Hashable {
+    public var key: String
+    public var path: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(key: String, path: String) {
+        self.key = key
+        self.path = path
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension DownloadedFilePathEntryRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDownloadedFilePathEntryRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DownloadedFilePathEntryRecord {
+        return
+            try DownloadedFilePathEntryRecord(
+                key: FfiConverterString.read(from: &buf), 
+                path: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DownloadedFilePathEntryRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.key, into: &buf)
+        FfiConverterString.write(value.path, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDownloadedFilePathEntryRecord_lift(_ buf: RustBuffer) throws -> DownloadedFilePathEntryRecord {
+    return try FfiConverterTypeDownloadedFilePathEntryRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDownloadedFilePathEntryRecord_lower(_ value: DownloadedFilePathEntryRecord) -> RustBuffer {
+    return FfiConverterTypeDownloadedFilePathEntryRecord.lower(value)
 }
 
 
@@ -16531,6 +17727,63 @@ public func FfiConverterTypeIdentityTableRecord_lower(_ value: IdentityTableReco
 }
 
 
+/**
+ * Pixel dimensions returned by `media_image_dimensions`.
+ */
+public struct ImageDimensionsRecord: Equatable, Hashable {
+    public var width: Int64
+    public var height: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(width: Int64, height: Int64) {
+        self.width = width
+        self.height = height
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ImageDimensionsRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeImageDimensionsRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ImageDimensionsRecord {
+        return
+            try ImageDimensionsRecord(
+                width: FfiConverterInt64.read(from: &buf), 
+                height: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ImageDimensionsRecord, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.width, into: &buf)
+        FfiConverterInt64.write(value.height, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImageDimensionsRecord_lift(_ buf: RustBuffer) throws -> ImageDimensionsRecord {
+    return try FfiConverterTypeImageDimensionsRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImageDimensionsRecord_lower(_ value: ImageDimensionsRecord) -> RustBuffer {
+    return FfiConverterTypeImageDimensionsRecord.lower(value)
+}
+
+
 public struct LabelAssignmentEntry: Equatable, Hashable {
     public var convId: String
     public var labelId: String
@@ -16754,6 +18007,67 @@ public func FfiConverterTypeLoadQuotedMessageResultRecord_lower(_ value: LoadQuo
 }
 
 
+/**
+ * Result of `CoreHost::media_check_local_file`.
+ */
+public struct LocalFileCheckRecord: Equatable, Hashable {
+    public var allowed: Bool
+    public var path: String
+    public var isVideo: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(allowed: Bool, path: String, isVideo: Bool) {
+        self.allowed = allowed
+        self.path = path
+        self.isVideo = isVideo
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension LocalFileCheckRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLocalFileCheckRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LocalFileCheckRecord {
+        return
+            try LocalFileCheckRecord(
+                allowed: FfiConverterBool.read(from: &buf), 
+                path: FfiConverterString.read(from: &buf), 
+                isVideo: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LocalFileCheckRecord, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.allowed, into: &buf)
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterBool.write(value.isVideo, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLocalFileCheckRecord_lift(_ buf: RustBuffer) throws -> LocalFileCheckRecord {
+    return try FfiConverterTypeLocalFileCheckRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLocalFileCheckRecord_lower(_ value: LocalFileCheckRecord) -> RustBuffer {
+    return FfiConverterTypeLocalFileCheckRecord.lower(value)
+}
+
+
 public struct LocationRecord: Equatable, Hashable {
     public var title: String
     public var address: String
@@ -16960,6 +18274,63 @@ public func FfiConverterTypeLoginStateRecord_lift(_ buf: RustBuffer) throws -> L
 #endif
 public func FfiConverterTypeLoginStateRecord_lower(_ value: LoginStateRecord) -> RustBuffer {
     return FfiConverterTypeLoginStateRecord.lower(value)
+}
+
+
+/**
+ * Cached media hit returned by `CoreHost::media_cache_lookup`.
+ */
+public struct MediaCacheHitRecord: Equatable, Hashable {
+    public var path: String
+    public var isVideo: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(path: String, isVideo: Bool) {
+        self.path = path
+        self.isVideo = isVideo
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MediaCacheHitRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMediaCacheHitRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MediaCacheHitRecord {
+        return
+            try MediaCacheHitRecord(
+                path: FfiConverterString.read(from: &buf), 
+                isVideo: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MediaCacheHitRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterBool.write(value.isVideo, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMediaCacheHitRecord_lift(_ buf: RustBuffer) throws -> MediaCacheHitRecord {
+    return try FfiConverterTypeMediaCacheHitRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMediaCacheHitRecord_lower(_ value: MediaCacheHitRecord) -> RustBuffer {
+    return FfiConverterTypeMediaCacheHitRecord.lower(value)
 }
 
 
@@ -18592,6 +19963,75 @@ public func FfiConverterTypeOaPartRecord_lift(_ buf: RustBuffer) throws -> OaPar
 #endif
 public func FfiConverterTypeOaPartRecord_lower(_ value: OaPartRecord) -> RustBuffer {
     return FfiConverterTypeOaPartRecord.lower(value)
+}
+
+
+/**
+ * Host probe result for an outgoing local file.
+ */
+public struct OutgoingFileProbeRecord: Equatable, Hashable {
+    public var exists: Bool
+    public var isDir: Bool
+    public var readable: Bool
+    public var size: Int64
+    public var mediaType: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(exists: Bool, isDir: Bool, readable: Bool, size: Int64, mediaType: String?) {
+        self.exists = exists
+        self.isDir = isDir
+        self.readable = readable
+        self.size = size
+        self.mediaType = mediaType
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension OutgoingFileProbeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutgoingFileProbeRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutgoingFileProbeRecord {
+        return
+            try OutgoingFileProbeRecord(
+                exists: FfiConverterBool.read(from: &buf), 
+                isDir: FfiConverterBool.read(from: &buf), 
+                readable: FfiConverterBool.read(from: &buf), 
+                size: FfiConverterInt64.read(from: &buf), 
+                mediaType: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OutgoingFileProbeRecord, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.exists, into: &buf)
+        FfiConverterBool.write(value.isDir, into: &buf)
+        FfiConverterBool.write(value.readable, into: &buf)
+        FfiConverterInt64.write(value.size, into: &buf)
+        FfiConverterOptionString.write(value.mediaType, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutgoingFileProbeRecord_lift(_ buf: RustBuffer) throws -> OutgoingFileProbeRecord {
+    return try FfiConverterTypeOutgoingFileProbeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutgoingFileProbeRecord_lower(_ value: OutgoingFileProbeRecord) -> RustBuffer {
+    return FfiConverterTypeOutgoingFileProbeRecord.lower(value)
 }
 
 
@@ -21989,6 +23429,67 @@ public func FfiConverterTypeSessionStateRecord_lower(_ value: SessionStateRecord
 
 
 /**
+ * One page of shared-media messages (`SharedMediaPage`).
+ */
+public struct SharedMediaPageRecord: Equatable, Hashable {
+    public var items: [ChatMessageRecord]
+    public var cursor: String?
+    public var more: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(items: [ChatMessageRecord], cursor: String?, more: Bool) {
+        self.items = items
+        self.cursor = cursor
+        self.more = more
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SharedMediaPageRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSharedMediaPageRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SharedMediaPageRecord {
+        return
+            try SharedMediaPageRecord(
+                items: FfiConverterSequenceTypeChatMessageRecord.read(from: &buf), 
+                cursor: FfiConverterOptionString.read(from: &buf), 
+                more: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SharedMediaPageRecord, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeChatMessageRecord.write(value.items, into: &buf)
+        FfiConverterOptionString.write(value.cursor, into: &buf)
+        FfiConverterBool.write(value.more, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSharedMediaPageRecord_lift(_ buf: RustBuffer) throws -> SharedMediaPageRecord {
+    return try FfiConverterTypeSharedMediaPageRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSharedMediaPageRecord_lower(_ value: SharedMediaPageRecord) -> RustBuffer {
+    return FfiConverterTypeSharedMediaPageRecord.lower(value)
+}
+
+
+/**
  * Result of an encrypt: what `encryptCipher` returns in JS.
  */
 public struct SignalCipherRecord: Equatable, Hashable {
@@ -23056,6 +24557,71 @@ public func FfiConverterTypeUserCountRecord_lift(_ buf: RustBuffer) throws -> Us
 #endif
 public func FfiConverterTypeUserCountRecord_lower(_ value: UserCountRecord) -> RustBuffer {
     return FfiConverterTypeUserCountRecord.lower(value)
+}
+
+
+/**
+ * Video metadata returned by `media_video_metadata`.
+ */
+public struct VideoMetadataRecord: Equatable, Hashable {
+    public var durationMs: Int64
+    public var width: Int64
+    public var height: Int64
+    public var hasThumb: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(durationMs: Int64, width: Int64, height: Int64, hasThumb: Bool) {
+        self.durationMs = durationMs
+        self.width = width
+        self.height = height
+        self.hasThumb = hasThumb
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension VideoMetadataRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVideoMetadataRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VideoMetadataRecord {
+        return
+            try VideoMetadataRecord(
+                durationMs: FfiConverterInt64.read(from: &buf), 
+                width: FfiConverterInt64.read(from: &buf), 
+                height: FfiConverterInt64.read(from: &buf), 
+                hasThumb: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VideoMetadataRecord, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.durationMs, into: &buf)
+        FfiConverterInt64.write(value.width, into: &buf)
+        FfiConverterInt64.write(value.height, into: &buf)
+        FfiConverterBool.write(value.hasThumb, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVideoMetadataRecord_lift(_ buf: RustBuffer) throws -> VideoMetadataRecord {
+    return try FfiConverterTypeVideoMetadataRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVideoMetadataRecord_lower(_ value: VideoMetadataRecord) -> RustBuffer {
+    return FfiConverterTypeVideoMetadataRecord.lower(value)
 }
 
 
@@ -25077,6 +26643,196 @@ public func FfiConverterTypeFailReasonRecord_lower(_ value: FailReasonRecord) ->
 
 
 /**
+ * Result of `CoreHost::media_loader_fetch_file`.
+ */
+
+public enum FileFetchOutcomeRecord: Equatable, Hashable {
+    
+    case fetched(cachedPath: String, containerExt: String?
+    )
+    case error(kind: FileLoadErrorKindRecord
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FileFetchOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFileFetchOutcomeRecord: FfiConverterRustBuffer {
+    typealias SwiftType = FileFetchOutcomeRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FileFetchOutcomeRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .fetched(cachedPath: try FfiConverterString.read(from: &buf), containerExt: try FfiConverterOptionString.read(from: &buf)
+        )
+        
+        case 2: return .error(kind: try FfiConverterTypeFileLoadErrorKindRecord.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FileFetchOutcomeRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .fetched(cachedPath,containerExt):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(cachedPath, into: &buf)
+            FfiConverterOptionString.write(containerExt, into: &buf)
+            
+        
+        case let .error(kind):
+            writeInt(&buf, Int32(2))
+            FfiConverterTypeFileLoadErrorKindRecord.write(kind, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFileFetchOutcomeRecord_lift(_ buf: RustBuffer) throws -> FileFetchOutcomeRecord {
+    return try FfiConverterTypeFileFetchOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFileFetchOutcomeRecord_lower(_ value: FileFetchOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypeFileFetchOutcomeRecord.lower(value)
+}
+
+
+
+/**
+ * Typed load error kind for `resolve_file`.
+ */
+
+public enum FileLoadErrorKindRecord: Equatable, Hashable {
+    
+    case http(code: UInt16
+    )
+    case hostNotFound
+    case undecodable
+    case timedOut
+    case tooLarge
+    case badUrl
+    case cancelled
+    case other
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FileLoadErrorKindRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFileLoadErrorKindRecord: FfiConverterRustBuffer {
+    typealias SwiftType = FileLoadErrorKindRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FileLoadErrorKindRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .http(code: try FfiConverterUInt16.read(from: &buf)
+        )
+        
+        case 2: return .hostNotFound
+        
+        case 3: return .undecodable
+        
+        case 4: return .timedOut
+        
+        case 5: return .tooLarge
+        
+        case 6: return .badUrl
+        
+        case 7: return .cancelled
+        
+        case 8: return .other
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FileLoadErrorKindRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .http(code):
+            writeInt(&buf, Int32(1))
+            FfiConverterUInt16.write(code, into: &buf)
+            
+        
+        case .hostNotFound:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .undecodable:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .timedOut:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .tooLarge:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .badUrl:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .cancelled:
+            writeInt(&buf, Int32(7))
+        
+        
+        case .other:
+            writeInt(&buf, Int32(8))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFileLoadErrorKindRecord_lift(_ buf: RustBuffer) throws -> FileLoadErrorKindRecord {
+    return try FfiConverterTypeFileLoadErrorKindRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFileLoadErrorKindRecord_lower(_ value: FileLoadErrorKindRecord) -> RustBuffer {
+    return FfiConverterTypeFileLoadErrorKindRecord.lower(value)
+}
+
+
+
+/**
  * Host return value for `resolve_file` (U8/U11).
  */
 
@@ -26059,6 +27815,86 @@ public func FfiConverterTypeMediaDownloadSource_lift(_ buf: RustBuffer) throws -
 #endif
 public func FfiConverterTypeMediaDownloadSource_lower(_ value: MediaDownloadSource) -> RustBuffer {
     return FfiConverterTypeMediaDownloadSource.lower(value)
+}
+
+
+
+/**
+ * Result of `CoreHost::media_loader_fetch_media`.
+ */
+
+public enum MediaFetchOutcomeRecord: Equatable, Hashable {
+    
+    case cached(path: String, isVideo: Bool
+    )
+    case permanentGone
+    case transient
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MediaFetchOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMediaFetchOutcomeRecord: FfiConverterRustBuffer {
+    typealias SwiftType = MediaFetchOutcomeRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MediaFetchOutcomeRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .cached(path: try FfiConverterString.read(from: &buf), isVideo: try FfiConverterBool.read(from: &buf)
+        )
+        
+        case 2: return .permanentGone
+        
+        case 3: return .transient
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MediaFetchOutcomeRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .cached(path,isVideo):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(path, into: &buf)
+            FfiConverterBool.write(isVideo, into: &buf)
+            
+        
+        case .permanentGone:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .transient:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMediaFetchOutcomeRecord_lift(_ buf: RustBuffer) throws -> MediaFetchOutcomeRecord {
+    return try FfiConverterTypeMediaFetchOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMediaFetchOutcomeRecord_lower(_ value: MediaFetchOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypeMediaFetchOutcomeRecord.lower(value)
 }
 
 
@@ -27291,6 +29127,261 @@ public func FfiConverterTypeStickerSourceRecord_lower(_ value: StickerSourceReco
 
 
 /**
+ * Result of `CoreHost::media_upload_file`.
+ */
+
+public enum UploadFileOutcomeRecord: Equatable, Hashable {
+    
+    case ok(url: String, msgId: String, cliMsgId: String
+    )
+    case sessionError(code: Int64, message: String
+    )
+    case networkError
+    case otherError(message: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension UploadFileOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeUploadFileOutcomeRecord: FfiConverterRustBuffer {
+    typealias SwiftType = UploadFileOutcomeRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UploadFileOutcomeRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .ok(url: try FfiConverterString.read(from: &buf), msgId: try FfiConverterString.read(from: &buf), cliMsgId: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .sessionError(code: try FfiConverterInt64.read(from: &buf), message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .networkError
+        
+        case 4: return .otherError(message: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: UploadFileOutcomeRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .ok(url,msgId,cliMsgId):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(url, into: &buf)
+            FfiConverterString.write(msgId, into: &buf)
+            FfiConverterString.write(cliMsgId, into: &buf)
+            
+        
+        case let .sessionError(code,message):
+            writeInt(&buf, Int32(2))
+            FfiConverterInt64.write(code, into: &buf)
+            FfiConverterString.write(message, into: &buf)
+            
+        
+        case .networkError:
+            writeInt(&buf, Int32(3))
+        
+        
+        case let .otherError(message):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(message, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUploadFileOutcomeRecord_lift(_ buf: RustBuffer) throws -> UploadFileOutcomeRecord {
+    return try FfiConverterTypeUploadFileOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUploadFileOutcomeRecord_lower(_ value: UploadFileOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypeUploadFileOutcomeRecord.lower(value)
+}
+
+
+
+/**
+ * Result of `CoreHost::media_upload_photo`.
+ */
+
+public enum UploadPhotoOutcomeRecord: Equatable, Hashable {
+    
+    case ok(url: String, msgId: String, cliMsgId: String, width: Int64, height: Int64
+    )
+    case err(message: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension UploadPhotoOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeUploadPhotoOutcomeRecord: FfiConverterRustBuffer {
+    typealias SwiftType = UploadPhotoOutcomeRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UploadPhotoOutcomeRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .ok(url: try FfiConverterString.read(from: &buf), msgId: try FfiConverterString.read(from: &buf), cliMsgId: try FfiConverterString.read(from: &buf), width: try FfiConverterInt64.read(from: &buf), height: try FfiConverterInt64.read(from: &buf)
+        )
+        
+        case 2: return .err(message: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: UploadPhotoOutcomeRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .ok(url,msgId,cliMsgId,width,height):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(url, into: &buf)
+            FfiConverterString.write(msgId, into: &buf)
+            FfiConverterString.write(cliMsgId, into: &buf)
+            FfiConverterInt64.write(width, into: &buf)
+            FfiConverterInt64.write(height, into: &buf)
+            
+        
+        case let .err(message):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(message, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUploadPhotoOutcomeRecord_lift(_ buf: RustBuffer) throws -> UploadPhotoOutcomeRecord {
+    return try FfiConverterTypeUploadPhotoOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUploadPhotoOutcomeRecord_lower(_ value: UploadPhotoOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypeUploadPhotoOutcomeRecord.lower(value)
+}
+
+
+
+/**
+ * Result of `CoreHost::media_upload_video`.
+ */
+
+public enum UploadVideoOutcomeRecord: Equatable, Hashable {
+    
+    case ok(url: String, thumbUrl: String, msgId: String, cliMsgId: String, width: Int64, height: Int64, durationMs: Int64
+    )
+    case err(message: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension UploadVideoOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeUploadVideoOutcomeRecord: FfiConverterRustBuffer {
+    typealias SwiftType = UploadVideoOutcomeRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UploadVideoOutcomeRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .ok(url: try FfiConverterString.read(from: &buf), thumbUrl: try FfiConverterString.read(from: &buf), msgId: try FfiConverterString.read(from: &buf), cliMsgId: try FfiConverterString.read(from: &buf), width: try FfiConverterInt64.read(from: &buf), height: try FfiConverterInt64.read(from: &buf), durationMs: try FfiConverterInt64.read(from: &buf)
+        )
+        
+        case 2: return .err(message: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: UploadVideoOutcomeRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .ok(url,thumbUrl,msgId,cliMsgId,width,height,durationMs):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(url, into: &buf)
+            FfiConverterString.write(thumbUrl, into: &buf)
+            FfiConverterString.write(msgId, into: &buf)
+            FfiConverterString.write(cliMsgId, into: &buf)
+            FfiConverterInt64.write(width, into: &buf)
+            FfiConverterInt64.write(height, into: &buf)
+            FfiConverterInt64.write(durationMs, into: &buf)
+            
+        
+        case let .err(message):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(message, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUploadVideoOutcomeRecord_lift(_ buf: RustBuffer) throws -> UploadVideoOutcomeRecord {
+    return try FfiConverterTypeUploadVideoOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUploadVideoOutcomeRecord_lower(_ value: UploadVideoOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypeUploadVideoOutcomeRecord.lower(value)
+}
+
+
+
+/**
  * Coalesced per-conversation message window update delivered via `CoreChangesRecord.window_deltas`.
  */
 
@@ -28243,6 +30334,30 @@ fileprivate struct FfiConverterOptionTypeLegacyCookieRecord: FfiConverterRustBuf
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeMediaCacheHitRecord: FfiConverterRustBuffer {
+    typealias SwiftType = MediaCacheHitRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMediaCacheHitRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMediaCacheHitRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeMediaFailureRecord: FfiConverterRustBuffer {
     typealias SwiftType = MediaFailureRecord?
 
@@ -28723,6 +30838,30 @@ fileprivate struct FfiConverterOptionTypeSessionStateRecord: FfiConverterRustBuf
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeSharedMediaPageRecord: FfiConverterRustBuffer {
+    typealias SwiftType = SharedMediaPageRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSharedMediaPageRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSharedMediaPageRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeStickerSuggestSettingRecord: FfiConverterRustBuffer {
     typealias SwiftType = StickerSuggestSettingRecord?
 
@@ -29123,6 +31262,30 @@ fileprivate struct FfiConverterOptionSequenceTypeConversationSummaryRecord: FfiC
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterSequenceTypeConversationSummaryRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionSequenceTypeDownloadedFilePathEntryRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [DownloadedFilePathEntryRecord]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceTypeDownloadedFilePathEntryRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceTypeDownloadedFilePathEntryRecord.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -29643,6 +31806,31 @@ fileprivate struct FfiConverterSequenceTypeCursorEntry: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeCursorEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeDownloadedFilePathEntryRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [DownloadedFilePathEntryRecord]
+
+    public static func write(_ value: [DownloadedFilePathEntryRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeDownloadedFilePathEntryRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [DownloadedFilePathEntryRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [DownloadedFilePathEntryRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeDownloadedFilePathEntryRecord.read(from: &buf))
         }
         return seq
     }
@@ -31074,6 +33262,52 @@ public func mediaStableHash(text: String) -> String  {
     )
 })
 }
+public func mediaFileDownloadKey(convId: String, msgId: String, url: String?, name: String) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_media_file_download_key(
+        FfiConverterString.lower(convId),
+        FfiConverterString.lower(msgId),
+        FfiConverterOptionString.lower(url),
+        FfiConverterString.lower(name),uniffiCallStatus
+    )
+})
+}
+public func mediaFileLoadErrorIsPermanentGone(kind: FileLoadErrorKindRecord) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_media_file_load_error_is_permanent_gone(
+        FfiConverterTypeFileLoadErrorKindRecord_lower(kind),uniffiCallStatus
+    )
+})
+}
+public func mediaFileLoadErrorUserMessage(kind: FileLoadErrorKindRecord) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_media_file_load_error_user_message(
+        FfiConverterTypeFileLoadErrorKindRecord_lower(kind),uniffiCallStatus
+    )
+})
+}
+public func mediaSanitizedFileName(rawName: String, fallbackExtension: String?) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_media_sanitized_file_name(
+        FfiConverterString.lower(rawName),
+        FfiConverterOptionString.lower(fallbackExtension),uniffiCallStatus
+    )
+})
+}
+public func mediaValidateOutgoingFileProbe(name: String, probe: OutgoingFileProbeRecord, maxBytes: Int64) -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_media_validate_outgoing_file_probe(
+        FfiConverterString.lower(name),
+        FfiConverterTypeOutgoingFileProbeRecord_lower(probe),
+        FfiConverterInt64.lower(maxBytes),uniffiCallStatus
+    )
+})
+}
 public func applyNotePollMessagesFfi(mirror: PollsMirrorRecord, notices: [PollMessageNoticeRecord], nowMs: Int64) -> NotePollMessagesPlanRecord  {
     return try!  FfiConverterTypeNotePollMessagesPlanRecord_lift(try! rustCall() {
         uniffiCallStatus in
@@ -31555,6 +33789,21 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_func_media_stable_hash() != 42448) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_func_media_file_download_key() != 54273) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_media_file_load_error_is_permanent_gone() != 38655) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_media_file_load_error_user_message() != 16306) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_media_sanitized_file_name() != 62384) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_media_validate_outgoing_file_probe() != 41861) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_func_apply_note_poll_messages_ffi() != 34924) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -31873,6 +34122,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_flush_all() != 42808) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_forget_downloaded_file() != 42663) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_forward() != 47586) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -32020,6 +34272,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_relock_hidden() != 28977) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_remember_downloaded_file() != 26807) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_reminder_compose_info() != 61775) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -32056,6 +34311,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_reset_hidden_pin() != 13854) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_reset_media() != 18535) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_reset_outgoing_typing() != 50171) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -32063,6 +34321,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_reset_stickers() != 51996) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_resolve_file_core() != 24271) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_resolve_media_core() != 17945) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_resolve_missing_names() != 34703) {
@@ -32086,7 +34350,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_seed_contacts() != 13201) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_seed_downloaded_file_paths() != 18605) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_seed_history_freshness() != 1024) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_seed_media_cloud_file_limit() != 32710) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_seed_polls() != 61605) {
@@ -32096,6 +34366,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_seed_sticker_suggest_setting() != 40980) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_send_files_core() != 36608) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_send_media_core() != 37040) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_send_my_card() != 33199) {
@@ -32147,6 +34423,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_shared_api() != 19658) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_shared_media_core() != 50399) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_show_typing_indicator() != 3406) {
@@ -32420,6 +34699,51 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_corehost_sleep_confirm_promote() != 53877) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_read_outgoing_file() != 26290) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_release_outgoing_file() != 11834) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_image_dimensions() != 408) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_video_metadata() != 34756) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_upload_photo() != 43810) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_upload_video() != 25537) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_upload_file() != 44731) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_remove_own_local_file() != 1447) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_file_exists() != 21507) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_cache_lookup() != 22912) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_check_local_file() != 55971) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_loader_fetch_media() != 61124) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_video_poster() != 16696) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_loader_fetch_file() != 51518) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_stage_file() != 64916) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreofflineconversations_apply_preview_override() != 60866) {

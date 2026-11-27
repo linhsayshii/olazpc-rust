@@ -16,6 +16,7 @@ pub mod conversations;
 pub mod effect;
 pub mod forward;
 pub mod input;
+pub mod media;
 pub mod messages;
 // U12
 pub mod polls;
@@ -77,10 +78,22 @@ pub use forward::{
     ComposerSendOutcome, FileResolutionOutcome, ForwardOutcome, ForwardRequest, ForwardState,
     MediaResolutionOutcome,
 };
-pub use input::StickerSendError;
 pub use input::{
     BootstrapAliasesError, Command, CompletedLogin, E2eeQuoteArg, HiddenPinSyncKind, Input,
     LegacyCookie, PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
+};
+pub use input::{SharedMediaLoadOutcome, StickerSendError};
+// U15
+pub use media::{
+    CandidateScheme, FileExistsPurpose, FileFetchOutcome, FileLoadError, FileResolution,
+    MEDIA_DEFAULT_MAX_CONCURRENT, MEDIA_SETTLED_PRUNE_THRESHOLD, MEDIA_UNAVAILABLE_TTL_MS,
+    MediaCacheHit, MediaFetchOutcome, MediaKind, MediaResolution, MediaState,
+    OUTGOING_FILE_LIMIT_FLOOR_BYTES, OutgoingFileMode, OutgoingFileProbe, SettledMedia,
+    SharedMediaKind, SharedMediaPage, UploadFileError, UploadedFileResult, UploadedPhotoResult,
+    UploadedVideoResult, VideoMetadata, classify_candidate_scheme, extract_media_candidates,
+    file_download_key, file_url_path, format_upload_file_error, is_image_extension,
+    is_video_extension, last_path_component, sanitized_file_name, shared_media_memory,
+    split_sanitized_stem_ext, stable_hash, swift_path_extension, validate_outgoing_file_probe,
 };
 pub use messages::{
     BatchPass1Outcome, BootstrapFlowState, ContactsState, DeleteWindowOutcome,

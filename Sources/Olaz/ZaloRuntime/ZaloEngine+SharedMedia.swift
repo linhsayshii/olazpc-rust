@@ -1,11 +1,9 @@
 import Foundation
+import OlazCore
 
-// Shared media of a conversation ("Kho lưu trữ"), bridged to `HostScripts/media-store-adapter.js` (`window.__zaloMediaStore`).
-// Everything ever shared comes from the official media service (its local DB plus the sources the account allows), not from the
-// messages loaded in the chat box.
-// Swift → JS : page(convId, kind, cursor, limit) → Promise<{items:[ChatMessageJSON], cursor: string|null, more: Bool} | null>
-//   Items are ordinary chat messages (photo / video / file / link kinds, same ids as the loaded copy of the message), newest first.
-//   `cursor` is what the next page is asked after (nil on the first); `more` false at the end. null = service unavailable / failed.
+// Shared media of a conversation ("Kho lưu trữ"), orchestrated by `olaz-core` (ADR-031).
+// Everything ever shared comes from Olaz's local SQLite message index (or the in-memory fallback
+// when no store is open), newest first.
 
 /// What the three lists of the storage panel hold.
 enum SharedMediaKind: String, CaseIterable, Identifiable, Sendable {
@@ -53,31 +51,20 @@ protocol SharedMediaSource: AnyObject {
 
 extension ZaloEngine: SharedMediaSource {
     /// A page of the photos / videos, files or links ever shared in `conversationId`, older than `cursor` (nil = the newest),
-    /// backed by Olaz's local SQLite message index.
+    /// orchestrated by `olaz-core` over `olaz-store` (or in-memory fallback when no store is open).
     func sharedMedia(in conversationId: String, kind: SharedMediaKind, after cursor: String?, limit: Int) async -> SharedMediaPage? {
-        if simulateSharedMediaStoreErrorOnce {
+        let simulateError = simulateSharedMediaStoreErrorOnce
+        if simulateError {
             simulateSharedMediaStoreErrorOnce = false
-            return nil
         }
-        guard let store = sqliteStore else {
-            // Fall back to in-memory loaded messages if store is not open.
-            let mem = (messages[conversationId] ?? [])
-                .filter { kind.accepts($0.kind) }
-                .sorted { $0.date > $1.date }
-            return SharedMediaPage(items: Array(mem.prefix(limit)), cursor: nil, more: false)
-        }
-        let tags: [String] = switch kind {
-        case .images: ["photo", "video"]
-        case .files: ["file"]
-        case .links: ["link"]
-        }
-        guard let page = try? await store.sharedMediaRaw(convId: conversationId, kindTags: tags, afterCursor: cursor, limit: limit) else {
-            return nil
-        }
-        let items = page.rows.compactMap { data -> ChatMessage? in
-            guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
-            return ChatMessage(json: json, fallbackConversation: conversationId)
-        }
-        return SharedMediaPage(items: items, cursor: page.cursor, more: page.more)
+        guard let core = await ensureCoreEngine() else { return nil }
+        let page = await core.sharedMediaCore(
+            convId: conversationId,
+            kind: kind.rawValue,
+            afterCursor: cursor,
+            limit: UInt32(max(0, limit)),
+            simulateStoreError: simulateError
+        )
+        return page.map(SharedMediaPage.init(coreRecord:))
     }
 }

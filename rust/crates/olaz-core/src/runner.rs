@@ -29,9 +29,16 @@ use crate::conversations::{
 };
 use crate::effect::{Effect, HistoryFetchPurpose, HostCall, OpResult, StoreOp};
 use crate::forward::{ComposerSendOutcome, FileResolutionOutcome, MediaResolutionOutcome};
+// U15
 use crate::input::{
     BootstrapAliasesError, Command, CompletedLogin, E2eeQuoteArg, Input, LegacyCookie,
-    PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StickerSendError, StoreToken,
+    PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, SharedMediaLoadOutcome,
+    StickerSendError, StoreToken,
+};
+use crate::media::{
+    FileFetchOutcome, FileLoadError, MediaCacheHit, MediaFetchOutcome, MediaKind, OutgoingFileMode,
+    OutgoingFileProbe, SharedMediaKind, SharedMediaPage, UploadFileError, UploadedFileResult,
+    UploadedPhotoResult, UploadedVideoResult, VideoMetadata,
 };
 use crate::messages::{MuteEntry, decode_db_stored};
 use crate::reduce::classify::MobileSyncEvent;
@@ -569,6 +576,136 @@ pub trait Host: Send + Sync {
     async fn sleep_confirm_promote(&self, delay: Duration) {
         tokio::time::sleep(delay).await;
     }
+
+    // --- Media domain callbacks (U15; executed concurrently on runtime.spawn) ---
+    async fn media_read_outgoing_file(
+        &self,
+        _op_id: u64,
+        _path: String,
+        _name: String,
+        _mode: OutgoingFileMode,
+    ) -> OutgoingFileProbe {
+        OutgoingFileProbe {
+            exists: false,
+            is_dir: false,
+            readable: false,
+            size: 0,
+            media_type: None,
+        }
+    }
+    async fn media_release_outgoing_file(&self, _op_id: u64) {}
+    async fn media_image_dimensions(
+        &self,
+        _op_id: u64,
+        _path: String,
+        _name: String,
+        _size: i64,
+    ) -> (i64, i64) {
+        (800, 600)
+    }
+    async fn media_video_metadata(
+        &self,
+        _op_id: u64,
+        _path: String,
+        _name: String,
+        _size: i64,
+    ) -> VideoMetadata {
+        VideoMetadata::default()
+    }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Matches upload_photo host boundary"
+    )]
+    async fn media_upload_photo(
+        &self,
+        _op_id: u64,
+        _conv_id: String,
+        _file_name: String,
+        _size: i64,
+        _width: i64,
+        _height: i64,
+    ) -> Result<UploadedPhotoResult, String> {
+        Err("media_upload_photo not implemented by host".to_owned())
+    }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Matches upload_video host boundary"
+    )]
+    async fn media_upload_video(
+        &self,
+        _op_id: u64,
+        _conv_id: String,
+        _file_name: String,
+        _size: i64,
+        _duration_ms: i64,
+        _width: i64,
+        _height: i64,
+        _has_thumb: bool,
+    ) -> Result<UploadedVideoResult, String> {
+        Err("media_upload_video not implemented by host".to_owned())
+    }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Matches upload_file host boundary"
+    )]
+    async fn media_upload_file(
+        &self,
+        _op_id: u64,
+        _conv_id: String,
+        _file_name: String,
+        _size: i64,
+        _client_id: Option<String>,
+        _is_e2ee: bool,
+    ) -> Result<UploadedFileResult, UploadFileError> {
+        Err(UploadFileError::Other(
+            "media_upload_file not implemented by host".to_owned(),
+        ))
+    }
+    async fn media_remove_own_local_file(&self, _path: String) {}
+    async fn media_file_exists(&self, path: String) -> bool {
+        std::path::Path::new(&path).exists()
+    }
+    async fn media_cache_lookup(
+        &self,
+        _key: String,
+        _hash_prefix: String,
+        _conv_id: String,
+        _msg_id: String,
+        _kind: MediaKind,
+    ) -> Option<MediaCacheHit> {
+        None
+    }
+    async fn media_check_local_file(&self, _url: String) -> (bool, String, bool) {
+        (false, String::new(), false)
+    }
+    async fn media_loader_fetch_media(
+        &self,
+        _url: String,
+        _kind: MediaKind,
+        _hash_prefix: String,
+        _force: bool,
+    ) -> MediaFetchOutcome {
+        MediaFetchOutcome::Transient
+    }
+    async fn media_video_poster(&self, _path: String) -> Option<String> {
+        None
+    }
+    async fn media_loader_fetch_file(
+        &self,
+        _url: String,
+        _force: bool,
+        _request_token: u64,
+    ) -> FileFetchOutcome {
+        FileFetchOutcome::Error(FileLoadError::Other)
+    }
+    async fn media_stage_file(
+        &self,
+        _source_path: String,
+        _stem: String,
+        _ext: Option<String>,
+    ) -> Option<String> {
+        None
+    }
 }
 
 enum HostJob {
@@ -922,6 +1059,30 @@ enum StoreJob {
         op_id: u64,
         conv_id: String,
         msg_id: String,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    // U15
+    MediaLookupMessage {
+        flight_id: u64,
+        conv_id: String,
+        msg_id: String,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    MediaLookupFileMessage {
+        op_id: u64,
+        conv_id: String,
+        msg_id: String,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    MediaQuerySharedMedia {
+        op_id: u64,
+        conv_id: String,
+        kind: SharedMediaKind,
+        after_cursor: Option<String>,
+        limit: usize,
         sink: ActorSink,
         _guard: InFlightGuard,
     },
@@ -2759,6 +2920,303 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 Effect::CancelConfirmPromoteDelay => {
                     self.cancel_confirm_promote_timer();
                 }
+                // U15
+                Effect::MediaReadOutgoingFile {
+                    op_id,
+                    path,
+                    name,
+                    mode,
+                } => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let probe = host.media_read_outgoing_file(op_id, path, name, mode).await;
+                        sink.send(Input::MediaOutgoingFileRead { op_id, probe });
+                        drop(guard);
+                    });
+                }
+                Effect::MediaReleaseOutgoingFile { op_id } => {
+                    let host = Arc::clone(&self.host);
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        host.media_release_outgoing_file(op_id).await;
+                        drop(guard);
+                    });
+                }
+                Effect::MediaImageDimensions {
+                    op_id,
+                    path,
+                    name,
+                    size,
+                } => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let (width, height) =
+                            host.media_image_dimensions(op_id, path, name, size).await;
+                        sink.send(Input::MediaImageDimensionsDone {
+                            op_id,
+                            width,
+                            height,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::MediaVideoMetadata {
+                    op_id,
+                    path,
+                    name,
+                    size,
+                } => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let meta = host.media_video_metadata(op_id, path, name, size).await;
+                        sink.send(Input::MediaVideoMetadataDone { op_id, meta });
+                        drop(guard);
+                    });
+                }
+                Effect::MediaUploadPhoto {
+                    op_id,
+                    conv_id,
+                    file_name,
+                    size,
+                    width,
+                    height,
+                } => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = host
+                            .media_upload_photo(op_id, conv_id, file_name, size, width, height)
+                            .await;
+                        sink.send(Input::MediaUploadPhotoDone { op_id, result });
+                        drop(guard);
+                    });
+                }
+                Effect::MediaUploadVideo {
+                    op_id,
+                    conv_id,
+                    file_name,
+                    size,
+                    duration_ms,
+                    width,
+                    height,
+                    has_thumb,
+                } => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = host
+                            .media_upload_video(
+                                op_id,
+                                conv_id,
+                                file_name,
+                                size,
+                                duration_ms,
+                                width,
+                                height,
+                                has_thumb,
+                            )
+                            .await;
+                        sink.send(Input::MediaUploadVideoDone { op_id, result });
+                        drop(guard);
+                    });
+                }
+                Effect::MediaAllocClientId { op_id } => {
+                    let client_id = self.client.next_client_id();
+                    sink.send(Input::MediaClientIdAllocated { op_id, client_id });
+                }
+                Effect::MediaUploadFile {
+                    op_id,
+                    conv_id,
+                    file_name,
+                    size,
+                    client_id,
+                    is_e2ee,
+                } => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = host
+                            .media_upload_file(op_id, conv_id, file_name, size, client_id, is_e2ee)
+                            .await;
+                        sink.send(Input::MediaUploadFileDone { op_id, result });
+                        drop(guard);
+                    });
+                }
+                Effect::MediaRemoveOwnLocalFile { path } => {
+                    let host = Arc::clone(&self.host);
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        host.media_remove_own_local_file(path).await;
+                        drop(guard);
+                    });
+                }
+                Effect::MediaCheckFileExists { path, purpose } => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let exists = host.media_file_exists(path).await;
+                        sink.send(Input::MediaFileExistsChecked { purpose, exists });
+                        drop(guard);
+                    });
+                }
+                Effect::MediaLookupMessageInStore {
+                    flight_id,
+                    conv_id,
+                    msg_id,
+                } => {
+                    let guard = sink.track();
+                    self.send_store(StoreJob::MediaLookupMessage {
+                        flight_id,
+                        conv_id,
+                        msg_id,
+                        sink: sink.clone(),
+                        _guard: guard,
+                    });
+                }
+                Effect::MediaCacheLookup {
+                    flight_id,
+                    key,
+                    hash_prefix,
+                    conv_id,
+                    msg_id,
+                    kind,
+                } => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let hit = host
+                            .media_cache_lookup(key, hash_prefix, conv_id, msg_id, kind)
+                            .await;
+                        sink.send(Input::MediaCacheLookupDone { flight_id, hit });
+                        drop(guard);
+                    });
+                }
+                Effect::MediaCheckLocalFile { flight_id, url } => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let (allowed, path, is_video) = host.media_check_local_file(url).await;
+                        sink.send(Input::MediaLocalFileChecked {
+                            flight_id,
+                            allowed,
+                            path,
+                            is_video,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::MediaLoaderFetchMedia {
+                    flight_id,
+                    url,
+                    kind,
+                    hash_prefix,
+                    force,
+                } => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let outcome = host
+                            .media_loader_fetch_media(url, kind, hash_prefix, force)
+                            .await;
+                        sink.send(Input::MediaLoaderFetchMediaDone { flight_id, outcome });
+                        drop(guard);
+                    });
+                }
+                Effect::MediaVideoPoster {
+                    flight_id,
+                    path,
+                    from_cache,
+                } => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let poster_path = host.media_video_poster(path).await;
+                        sink.send(Input::MediaVideoPosterDone {
+                            flight_id,
+                            poster_path,
+                            from_cache,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::MediaLookupFileMessageInStore {
+                    op_id,
+                    conv_id,
+                    msg_id,
+                } => {
+                    let guard = sink.track();
+                    self.send_store(StoreJob::MediaLookupFileMessage {
+                        op_id,
+                        conv_id,
+                        msg_id,
+                        sink: sink.clone(),
+                        _guard: guard,
+                    });
+                }
+                Effect::MediaLoaderFetchFile {
+                    op_id,
+                    url,
+                    force,
+                    request_token,
+                } => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let outcome = host
+                            .media_loader_fetch_file(url, force, request_token)
+                            .await;
+                        sink.send(Input::MediaLoaderFetchFileDone { op_id, outcome });
+                        drop(guard);
+                    });
+                }
+                Effect::MediaStageFile {
+                    op_id,
+                    source_path,
+                    stem,
+                    ext,
+                } => {
+                    let host = Arc::clone(&self.host);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let staged_path = host.media_stage_file(source_path, stem, ext).await;
+                        sink.send(Input::MediaFileStaged { op_id, staged_path });
+                        drop(guard);
+                    });
+                }
+                Effect::MediaQuerySharedMedia {
+                    op_id,
+                    conv_id,
+                    kind,
+                    after_cursor,
+                    limit,
+                } => {
+                    let guard = sink.track();
+                    self.send_store(StoreJob::MediaQuerySharedMedia {
+                        op_id,
+                        conv_id,
+                        kind,
+                        after_cursor,
+                        limit,
+                        sink: sink.clone(),
+                        _guard: guard,
+                    });
+                }
                 // U6
                 Effect::StartDeleteUndoExpiry { undo_gen, delay } => {
                     // Untracked background timer (like StartTypingExpiry / StartLpTimer) so
@@ -4455,6 +4913,119 @@ async fn run_store_worker(
                 sink.send(Input::CloudLookupMessageDone {
                     op_id,
                     message: message.map(Box::new),
+                });
+            }
+            // U15
+            StoreJob::MediaLookupMessage {
+                flight_id,
+                conv_id,
+                msg_id,
+                sink,
+                _guard,
+            } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let message = if let Some(store_arc) = store_opt {
+                    tokio::task::spawn_blocking(move || {
+                        let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                        store
+                            .message(&conv_id, &msg_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|row| decode_db_stored(&row))
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                } else {
+                    None
+                };
+                sink.send(Input::MediaStoreMessageLoaded { flight_id, message });
+            }
+            StoreJob::MediaLookupFileMessage {
+                op_id,
+                conv_id,
+                msg_id,
+                sink,
+                _guard,
+            } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let message = if let Some(store_arc) = store_opt {
+                    tokio::task::spawn_blocking(move || {
+                        let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                        store
+                            .message(&conv_id, &msg_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|row| decode_db_stored(&row))
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                } else {
+                    None
+                };
+                sink.send(Input::MediaFileMessageLoaded { op_id, message });
+            }
+            StoreJob::MediaQuerySharedMedia {
+                op_id,
+                conv_id,
+                kind,
+                after_cursor,
+                limit,
+                sink,
+                _guard,
+            } => {
+                let store_opt = shared_store
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let conv_id_out = conv_id.clone();
+                let outcome = if let Some(store_arc) = store_opt {
+                    let tags = kind.kind_tags();
+                    let limit_i64 = i64::try_from(limit).unwrap_or(60);
+                    let conv_for_decode = conv_id.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                        store.shared_media_raw(&conv_id, &tags, after_cursor.as_deref(), limit_i64)
+                    })
+                    .await
+                    {
+                        Ok(Ok(page)) => {
+                            let items: Vec<ChatMessage> = page
+                                .rows
+                                .iter()
+                                .filter_map(|raw| {
+                                    let Value::Object(dict) =
+                                        serde_json::from_slice::<Value>(raw).ok()?
+                                    else {
+                                        return None;
+                                    };
+                                    ChatMessage::from_json(&dict, &conv_for_decode)
+                                })
+                                .collect();
+                            SharedMediaLoadOutcome::StoreOk(SharedMediaPage {
+                                items,
+                                cursor: page.cursor,
+                                more: page.more,
+                            })
+                        }
+                        _ => SharedMediaLoadOutcome::StoreError,
+                    }
+                } else {
+                    SharedMediaLoadOutcome::NoStore
+                };
+                sink.send(Input::MediaSharedMediaLoaded {
+                    op_id,
+                    conv_id: conv_id_out,
+                    kind,
+                    limit,
+                    outcome,
                 });
             }
             StoreJob::Drain(tx) => {

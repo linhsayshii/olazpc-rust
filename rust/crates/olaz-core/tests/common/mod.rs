@@ -9,6 +9,13 @@
     reason = "shared test helper used selectively by each test binary"
 )]
 
+mod media;
+
+use olaz_core::media::{
+    FileFetchOutcome, MediaCacheHit, MediaFetchOutcome, MediaKind, OutgoingFileMode,
+    OutgoingFileProbe, SharedMediaKind, UploadFileError, UploadedFileResult, UploadedPhotoResult,
+    UploadedVideoResult, VideoMetadata, file_download_key,
+};
 use olaz_core::runner::{BatchHookOutcome, ParsedEventsHookOutcome};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
@@ -221,6 +228,19 @@ pub struct Seed {
     pub composer_confirm: Option<Value>,
     #[serde(default)]
     pub queued_composer_confirms: Option<Vec<Value>>,
+    // U15
+    #[serde(default)]
+    pub cloud_plan: Option<Value>,
+    #[serde(default)]
+    pub memory_messages: Option<Map<String, Value>>,
+    #[serde(default)]
+    pub existing_download_files: Vec<String>,
+    #[serde(default)]
+    pub downloaded_file_paths: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub preseeded_media_cache: Vec<Value>,
+    #[serde(default)]
+    pub allowed_local_files: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -302,6 +322,9 @@ pub enum Step {
     },
     HttpRelease {
         http_release: usize,
+    },
+    UploadRelease {
+        upload_release: usize,
     },
     Snapshot {
         snapshot: String,
@@ -1406,6 +1429,7 @@ pub struct RecordingHost {
     messages: Mutex<HashMap<String, Vec<ChatMessage>>>,
     open_conversation_id: Mutex<Option<String>>,
     identities: Mutex<IdentityTable>,
+    media: Mutex<media::MediaTestState>,
 }
 
 impl RecordingHost {
@@ -1785,7 +1809,27 @@ impl RecordingHost {
             messages: Mutex::new(HashMap::new()),
             open_conversation_id: Mutex::new(open_conv),
             identities: Mutex::new(identities),
+            media: Mutex::new(media::MediaTestState::from_seed(
+                seed.host_results.as_ref(),
+                &seed.existing_download_files,
+                &seed.preseeded_media_cache,
+                &seed.allowed_local_files,
+            )),
         }
+    }
+
+    pub fn register_media_step_files(&self, files: &[Value]) -> Vec<String> {
+        self.media
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .register_step_files(files)
+    }
+
+    pub fn release_media_uploads(&self, count: usize) {
+        self.media
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release_uploads(count);
     }
 
     pub fn advance_confirm_ms(&self, delta_ms: u64) {
@@ -2818,6 +2862,274 @@ impl Host for RecordingHost {
         } else {
             tokio::time::sleep(delay).await;
         }
+    }
+
+    // U15 media host methods
+    async fn media_read_outgoing_file(
+        &self,
+        _op_id: u64,
+        path: String,
+        name: String,
+        mode: OutgoingFileMode,
+    ) -> OutgoingFileProbe {
+        self.record(
+            "read_file",
+            media::normalize_media_paths(&json!({
+                "mode": mode.as_str(),
+                "name": name,
+                "path": path,
+            })),
+        );
+        self.media
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .probe_outgoing(&path)
+    }
+
+    async fn media_image_dimensions(
+        &self,
+        _op_id: u64,
+        path: String,
+        name: String,
+        size: i64,
+    ) -> (i64, i64) {
+        self.record(
+            "image_dimensions",
+            media::normalize_media_paths(&json!({
+                "name": name,
+                "path": path,
+                "size": size,
+            })),
+        );
+        self.media
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_image_dims()
+    }
+
+    async fn media_video_metadata(
+        &self,
+        _op_id: u64,
+        path: String,
+        name: String,
+        size: i64,
+    ) -> VideoMetadata {
+        self.record(
+            "video_metadata",
+            media::normalize_media_paths(&json!({
+                "name": name,
+                "path": path,
+                "size": size,
+            })),
+        );
+        self.media
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_video_meta()
+    }
+
+    async fn media_upload_photo(
+        &self,
+        _op_id: u64,
+        conv_id: String,
+        file_name: String,
+        size: i64,
+        width: i64,
+        height: i64,
+    ) -> Result<UploadedPhotoResult, String> {
+        self.record(
+            "upload_photo",
+            json!({
+                "conv_id": conv_id,
+                "file_name": file_name,
+                "size": size,
+                "width": width,
+                "height": height,
+            }),
+        );
+        self.media
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_upload_photo()
+    }
+
+    async fn media_upload_video(
+        &self,
+        _op_id: u64,
+        conv_id: String,
+        file_name: String,
+        size: i64,
+        duration_ms: i64,
+        width: i64,
+        height: i64,
+        has_thumb: bool,
+    ) -> Result<UploadedVideoResult, String> {
+        self.record(
+            "upload_video",
+            json!({
+                "conv_id": conv_id,
+                "file_name": file_name,
+                "size": size,
+                "duration_ms": duration_ms,
+                "width": width,
+                "height": height,
+                "has_thumb": has_thumb,
+            }),
+        );
+        self.media
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_upload_video()
+    }
+
+    async fn media_upload_file(
+        &self,
+        _op_id: u64,
+        conv_id: String,
+        file_name: String,
+        size: i64,
+        client_id: Option<String>,
+        is_e2ee: bool,
+    ) -> Result<UploadedFileResult, UploadFileError> {
+        let (spec, hold_rx) = self
+            .media
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take_upload_file_spec();
+        self.record(
+            "upload_file",
+            json!({
+                "conv_id": conv_id,
+                "file_name": file_name,
+                "size": size,
+                "client_id": client_id,
+                "is_e2ee": is_e2ee,
+            }),
+        );
+        if let Some(rx) = hold_rx {
+            let _ = rx.await;
+        }
+        media::MediaTestState::resolve_upload_file_spec(spec, client_id.as_deref())
+    }
+
+    async fn media_remove_own_local_file(&self, path: String) {
+        self.media
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .virtual_files
+            .remove(&path);
+    }
+
+    async fn media_file_exists(&self, path: String) -> bool {
+        self.media
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .virtual_files
+            .contains_key(&path)
+    }
+
+    async fn media_cache_lookup(
+        &self,
+        key: String,
+        hash_prefix: String,
+        conv_id: String,
+        msg_id: String,
+        kind: MediaKind,
+    ) -> Option<MediaCacheHit> {
+        self.record(
+            "media_cache_lookup",
+            json!({
+                "key": key,
+                "hash_prefix": hash_prefix,
+                "conv_id": conv_id,
+                "msg_id": msg_id,
+                "kind": kind.as_str(),
+            }),
+        );
+        self.media
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cache_lookup(&hash_prefix, kind)
+    }
+
+    async fn media_check_local_file(&self, url: String) -> (bool, String, bool) {
+        self.record(
+            "check_local_file",
+            media::normalize_media_paths(&json!({ "url": url })),
+        );
+        self.media
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .check_local_file(&url)
+    }
+
+    async fn media_loader_fetch_media(
+        &self,
+        url: String,
+        kind: MediaKind,
+        hash_prefix: String,
+        force: bool,
+    ) -> MediaFetchOutcome {
+        let mode = if kind == MediaKind::Video {
+            "file"
+        } else {
+            "data"
+        };
+        self.record(
+            "loader_fetch",
+            json!({
+                "url": url,
+                "mode": mode,
+                "force": force,
+            }),
+        );
+        self.media
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .loader_fetch_media(&url, kind, &hash_prefix)
+    }
+
+    async fn media_video_poster(&self, path: String) -> Option<String> {
+        self.record(
+            "video_poster",
+            media::normalize_media_paths(&json!({ "path": path })),
+        );
+        self.media
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_video_poster()
+    }
+
+    async fn media_loader_fetch_file(
+        &self,
+        url: String,
+        force: bool,
+        _request_token: u64,
+    ) -> FileFetchOutcome {
+        self.record(
+            "loader_fetch",
+            json!({
+                "url": url,
+                "mode": "file",
+                "force": force,
+            }),
+        );
+        self.media
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .loader_fetch_file(&url)
+    }
+
+    async fn media_stage_file(
+        &self,
+        source_path: String,
+        stem: String,
+        ext: Option<String>,
+    ) -> Option<String> {
+        self.media
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .stage_file(&source_path, &stem, ext.as_deref())
     }
 
     async fn apply_remote_reaction(
@@ -4706,6 +5018,7 @@ struct SnapshotOpts<'a> {
     is_u11: bool,
     is_u13: bool,
     is_u14: bool,
+    is_u15: bool,
     last_send_result: Option<bool>,
     send_logs: &'a Mutex<Vec<String>>,
     prune_next_expiry_ms: Option<i64>,
@@ -4908,6 +5221,7 @@ async fn capture_case_snapshot(
         is_u11,
         is_u13,
         is_u14,
+        is_u15,
         last_send_result,
         send_logs,
         prune_next_expiry_ms,
@@ -5218,6 +5532,17 @@ async fn capture_case_snapshot(
     if is_u14 {
         obj.insert("results".to_owned(), Value::Object(search_results.clone()));
     }
+    if is_u15 {
+        media::enrich_media_snapshot(
+            &mut obj,
+            &full.messages.windows,
+            host.attached_store(),
+            full.media_cloud_file_limit,
+            &full.downloaded_file_paths,
+            results,
+        );
+        return Some(media::normalize_media_paths(&Value::Object(obj)));
+    }
     if is_u13 {
         if let Some(Value::Object(msgs_obj)) = obj.get_mut("messages") {
             for (conv_id, list) in &full.messages.windows {
@@ -5327,7 +5652,8 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let is_u11 = case.domain == "cloud";
     let is_u13 = case.domain == "stickers";
     let is_u14 = case.domain == "search";
-    let is_u6 = case.domain == "message_actions" || is_u8 || is_u11 || is_u13 || is_u14;
+    let is_u15 = case.domain == "media";
+    let is_u6 = case.domain == "message_actions" || is_u8 || is_u11 || is_u13 || is_u14 || is_u15;
     let is_u5 = case.domain == "send" || is_u6 || is_u12;
     let is_u4 = case.domain == "bootstrap" || case.domain == "messages" || is_u5;
     let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions" || is_u4;
@@ -5348,7 +5674,15 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             .and_then(Value::as_str)
         && !uid.is_empty()
     {
-        seed_sqlite_store(uid, dir.path(), &case.seed)?;
+        let mut seeded_copy = case.seed.clone();
+        if is_u15 {
+            if let Some(msgs) = seeded_copy.local_messages.as_mut() {
+                for m in msgs.iter_mut() {
+                    *m = media::substitute_media_paths(m);
+                }
+            }
+        }
+        seed_sqlite_store(uid, dir.path(), &seeded_copy)?;
     }
 
     let seed_domains = extract_seed_domains(&case.seed);
@@ -5441,6 +5775,76 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     for tid in &case.seed.e2ee_threads {
         initial_state.send.e2ee_threads.insert(tid.clone());
     }
+    if is_u15 {
+        if let Some(plan) = case.seed.cloud_plan.as_ref().and_then(Value::as_object) {
+            let limit = plan
+                .get("file_limit")
+                .and_then(Value::as_i64)
+                .unwrap_or(100 * 1_048_576);
+            initial_state.media.seeded_cloud_file_limit = Some(limit);
+        }
+        if let Some(mem_map) = &case.seed.memory_messages {
+            for (conv_id, arr_val) in mem_map {
+                let Some(arr) = arr_val.as_array() else {
+                    continue;
+                };
+                let mut msgs = Vec::new();
+                for item in arr {
+                    let Some(obj) = item.as_object() else {
+                        continue;
+                    };
+                    let id = obj.get("id").and_then(Value::as_str).unwrap_or_default();
+                    let sender_id = obj
+                        .get("sender_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let text = obj.get("text").and_then(Value::as_str).unwrap_or_default();
+                    let ts_ms = obj.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
+                    let kind = obj
+                        .get("kind")
+                        .cloned()
+                        .unwrap_or_else(|| json!({ "type": "text" }));
+                    let mut raw = json!({
+                        "id": id,
+                        "conversationId": conv_id,
+                        "clientId": format!("cli_{id}"),
+                        "senderId": sender_id,
+                        "senderName": "Peer",
+                        "isMine": false,
+                        "text": text,
+                        "date": ts_ms,
+                        "status": "sent",
+                        "isE2EE": false,
+                        "kind": kind,
+                    });
+                    if let Some(fbs) = obj.get("fallback_urls")
+                        && let Value::Object(m) = &mut raw
+                    {
+                        m.insert("fallbacks".to_owned(), fbs.clone());
+                    }
+                    let raw_sub = media::substitute_media_paths(&raw);
+                    if let Value::Object(dict) = raw_sub
+                        && let Some(msg) = ChatMessage::from_json(&dict, conv_id)
+                    {
+                        msgs.push(msg);
+                    }
+                }
+                initial_state.messages.windows.insert(conv_id.clone(), msgs);
+            }
+        }
+        if let Some(dl_map) = &case.seed.downloaded_file_paths {
+            for (k, v) in dl_map {
+                let sub = media::substitute_media_paths(&Value::String(v.clone()));
+                if let Value::String(path) = sub {
+                    initial_state
+                        .media
+                        .downloaded_file_paths
+                        .insert(k.clone(), path);
+                }
+            }
+        }
+    }
+
     if let Some(auto_del) = &case.seed.auto_delete {
         let mut map = BTreeMap::new();
         for (conv_id, ttl) in auto_del {
@@ -5681,6 +6085,9 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     let mut prune_next_expiry_ms: Option<i64> = None;
     let mut pending_send_task: Option<tokio::task::JoinHandle<bool>> = None;
     let mut pending_action_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut pending_media_send_task: Option<(usize, tokio::task::JoinHandle<ComposerOutcome>)> =
+        None;
+    let mut last_shared_media_cursor: Option<String> = None;
     let mut u12_results: BTreeMap<String, Value> = BTreeMap::new();
 
     let mut search_results: Map<String, Value> = Map::new();
@@ -6179,6 +6586,15 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                     }
                 }
                 "await_send" => {
+                    if let Some((idx, handle)) = pending_media_send_task.take() {
+                        let outcome = handle
+                            .await
+                            .map_err(|e| format!("await_send join error: {e}"))?;
+                        results.insert(
+                            idx.to_string(),
+                            media::normalize_media_paths(&media::encode_composer_outcome(&outcome)),
+                        );
+                    }
                     if let Some(handle) = pending_send_task.take() {
                         let ok = handle
                             .await
@@ -7338,6 +7754,171 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         .await;
                     let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
                 }
+                "send_media" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let files = args
+                        .get("files")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let paths = host.register_media_step_files(&files);
+                    let ms = now_ms.unwrap_or(1_700_000_000_000);
+                    let outcome = core
+                        .request_composer_outcome(Command::SendMedia {
+                            conv_id,
+                            paths,
+                            now_ms: ms,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    results.insert(
+                        step_idx.to_string(),
+                        media::normalize_media_paths(&media::encode_composer_outcome(&outcome)),
+                    );
+                }
+                "send_files" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let files = args
+                        .get("files")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let paths = host.register_media_step_files(&files);
+                    let ms = now_ms.unwrap_or(1_700_000_000_000);
+                    let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
+                    if is_async {
+                        let core_clone = core.clone();
+                        let handle = tokio::spawn(async move {
+                            core_clone
+                                .request_composer_outcome(Command::SendFiles {
+                                    conv_id,
+                                    paths,
+                                    now_ms: ms,
+                                })
+                                .await
+                        });
+                        pending_media_send_task = Some((step_idx, handle));
+                    } else {
+                        let outcome = core
+                            .request_composer_outcome(Command::SendFiles {
+                                conv_id,
+                                paths,
+                                now_ms: ms,
+                            })
+                            .await;
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                        results.insert(
+                            step_idx.to_string(),
+                            media::normalize_media_paths(&media::encode_composer_outcome(&outcome)),
+                        );
+                    }
+                }
+                "resolve_media" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let kind = args
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .and_then(MediaKind::from_str_tag)
+                        .unwrap_or(MediaKind::Photo);
+                    let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+                    let ms = now_ms.unwrap_or(1_700_000_000_000);
+                    let res = core
+                        .request_resolve_media(Command::ResolveMedia {
+                            conv_id,
+                            msg_id,
+                            kind,
+                            force,
+                            now_ms: ms,
+                        })
+                        .await;
+                    results.insert(
+                        step_idx.to_string(),
+                        media::normalize_media_paths(&media::encode_media_resolution(&res)),
+                    );
+                }
+                "resolve_file" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let name = str_arg(args, "name");
+                    let url = args.get("url").and_then(Value::as_str).map(str::to_owned);
+                    let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+                    let res = core
+                        .request_resolve_file(Command::ResolveFile {
+                            conv_id,
+                            msg_id,
+                            name,
+                            url,
+                            force,
+                            request_token: 0,
+                        })
+                        .await;
+                    results.insert(
+                        step_idx.to_string(),
+                        media::normalize_media_paths(&media::encode_file_resolution(&res)),
+                    );
+                }
+                "shared_media" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let kind = args
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .and_then(SharedMediaKind::from_str_tag)
+                        .unwrap_or(SharedMediaKind::Images);
+                    let use_prev = args
+                        .get("after_prev")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let after_cursor = if use_prev {
+                        last_shared_media_cursor.clone()
+                    } else {
+                        args.get("after").and_then(Value::as_str).map(str::to_owned)
+                    };
+                    let limit = args
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .map_or(60, |n| usize::try_from(n).unwrap_or(60));
+                    let simulate_store_error = args
+                        .get("simulate_store_error")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let page = core
+                        .request_shared_media(Command::SharedMedia {
+                            conv_id,
+                            kind,
+                            after_cursor,
+                            limit,
+                            simulate_store_error,
+                        })
+                        .await;
+                    last_shared_media_cursor = page.as_ref().and_then(|p| p.cursor.clone());
+                    results.insert(
+                        step_idx.to_string(),
+                        media::normalize_media_paths(&media::encode_shared_media_page(
+                            page.as_ref(),
+                        )),
+                    );
+                }
+                "file_key" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let name = str_arg(args, "name");
+                    let url = args.get("url").and_then(Value::as_str);
+                    let key = file_download_key(&conv_id, &msg_id, url, &name);
+                    let remembered = core
+                        .request_optional_string(Command::CheckRememberedDownloadedFile {
+                            key: key.clone(),
+                        })
+                        .await;
+                    results.insert(
+                        step_idx.to_string(),
+                        media::normalize_media_paths(&json!({
+                            "key": key,
+                            "path": remembered,
+                        })),
+                    );
+                }
                 other => return Err(format!("unknown step cmd: {other}")),
             },
             Step::Await {
@@ -7379,9 +7960,15 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             Step::HttpRelease { http_release } => {
                 transport.release_http(*http_release);
             }
+            Step::UploadRelease { upload_release } => {
+                host.release_media_uploads(*upload_release);
+            }
             Step::Snapshot { snapshot } => {
                 if is_u3 {
-                    if pending_send_task.is_some() || pending_action_task.is_some() {
+                    if pending_send_task.is_some()
+                        || pending_action_task.is_some()
+                        || pending_media_send_task.is_some()
+                    {
                         inner_runner.flush_host().await;
                         let _ = core.settle().await;
                         inner_runner.flush_store().await;
@@ -7404,6 +7991,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         is_u11,
                         is_u13,
                         is_u14,
+                        is_u15,
                         last_send_result,
                         send_logs: &send_logs,
                         prune_next_expiry_ms,
@@ -7468,6 +8056,7 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             is_u11,
             is_u13,
             is_u14,
+            is_u15,
             last_send_result,
             send_logs: &send_logs,
             prune_next_expiry_ms,

@@ -62,6 +62,8 @@ pub enum DirtyKey {
     // U13
     StickerSuggest,
     ComposerConfirm,
+    // U15
+    DownloadedFilePaths,
 }
 
 /// Set of keys dirtied by one `reduce` step.
@@ -137,6 +139,9 @@ pub struct CoreChanges {
     pub composer_confirm: Option<Option<ComposerConfirm>>,
     /// Updated queued composer confirms.
     pub queued_composer_confirms: Option<Vec<ComposerConfirm>>,
+    // U15
+    /// Updated downloaded file path map (`downloadedFilePaths`).
+    pub downloaded_file_paths: Option<BTreeMap<String, String>>,
 }
 
 impl fmt::Debug for CoreChanges {
@@ -198,6 +203,8 @@ struct DirtyBuffer {
     sticker_suggest: Option<Option<StickerSuggestSetting>>,
     composer_confirm: Option<Option<ComposerConfirm>>,
     queued_composer_confirms: Option<Vec<ComposerConfirm>>,
+    // U15
+    downloaded_file_paths: Option<BTreeMap<String, String>>,
     closed: bool,
 }
 
@@ -226,6 +233,7 @@ impl DirtyBuffer {
             || self.sticker_suggest.is_some()
             || self.composer_confirm.is_some()
             || self.queued_composer_confirms.is_some()
+            || self.downloaded_file_paths.is_some()
     }
 }
 
@@ -387,6 +395,10 @@ impl ChangeHub {
                     buf.queued_composer_confirms =
                         Some(state.composer.queued_confirms.iter().cloned().collect());
                 }
+                // U15
+                DirtyKey::DownloadedFilePaths => {
+                    buf.downloaded_file_paths = Some(state.media.downloaded_file_paths.clone());
+                }
             }
             buf.dirty.insert(key);
         }
@@ -484,6 +496,8 @@ impl ChangeHub {
                             sticker_suggest: None,
                             composer_confirm: None,
                             queued_composer_confirms: None,
+                            // U15
+                            downloaded_file_paths: None,
                         });
                     }
                 }
@@ -560,6 +574,8 @@ impl ChangeHub {
                         sticker_suggest: buf.sticker_suggest.take(),
                         composer_confirm: buf.composer_confirm.take(),
                         queued_composer_confirms: buf.queued_composer_confirms.take(),
+                        // U15
+                        downloaded_file_paths: buf.downloaded_file_paths.take(),
                     });
                 }
                 if buf.closed {

@@ -1,6 +1,7 @@
 import AVFoundation
 import AppKit
 import ImageIO
+import OlazCore
 import UniformTypeIdentifiers
 
 // Native composer "+" actions — Ảnh hoặc Video, Tệp, Danh thiếp, Nhắc hẹn.
@@ -232,178 +233,36 @@ extension ZaloEngine {
             _ = traceHost("send_media", args: args)
             return await sendMediaHostHandler(args)
         }
-        guard !urls.isEmpty, !id.isEmpty else { return .cancelled }
-        var sentAny = false
-        for url in urls {
-            let scoped = readOutgoingFileHostHandler == nil ? url.startAccessingSecurityScopedResource() : false
-            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-
-            let data: Data
-            let fileSize: Int64
-            let isImage: Bool
-            let isVideo: Bool
-            if let readOutgoingFileHostHandler {
-                let readArgs: [String: Any] = [
-                    "path": url.path,
-                    "name": url.lastPathComponent,
-                    "mode": "media",
-                ]
-                _ = traceHost("read_file", args: readArgs)
-                let probe = await readOutgoingFileHostHandler(readArgs)
-                guard probe.exists, !probe.isDirectory, probe.readable else { continue }
-                if let hint = probe.mediaType {
-                    isImage = hint == "image"
-                    isVideo = hint == "video"
-                } else {
-                    let utType = UTType(filenameExtension: url.pathExtension)
-                    isImage = utType?.conforms(to: .image) ?? false
-                    isVideo = !isImage && Self.isVideoURL(url)
-                }
-                data = probe.data
-                fileSize = probe.size
-            } else {
-                guard let raw = try? Data(contentsOf: url) else { continue }
-                let utType = UTType(filenameExtension: url.pathExtension)
-                isImage = utType?.conforms(to: .image) ?? false
-                isVideo = !isImage && Self.isVideoURL(url)
-                data = raw
-                fileSize = Int64(raw.count)
-            }
-
-            do {
-                if isImage {
-                    let dims: (width: Int, height: Int)
-                    if let imageDimensionsHostHandler {
-                        let dimArgs: [String: Any] = [
-                            "path": url.path,
-                            "name": url.lastPathComponent,
-                            "size": fileSize,
-                        ]
-                        _ = traceHost("image_dimensions", args: dimArgs)
-                        dims = await imageDimensionsHostHandler(dimArgs)
-                    } else {
-                        dims = imageDimensions(data)
-                    }
-                    let res: UploadedMediaResult
-                    if let uploadPhotoHostHandler {
-                        let uploadArgs: [String: Any] = [
-                            "conv_id": id,
-                            "file_name": url.lastPathComponent,
-                            "size": fileSize,
-                            "width": dims.width,
-                            "height": dims.height,
-                        ]
-                        _ = traceHost("upload_photo", args: uploadArgs)
-                        res = try await uploadPhotoHostHandler(uploadArgs)
-                    } else {
-                        res = try await sessionClient.uploadAndSendPhoto(
-                            convId: id, fileName: url.lastPathComponent, data: data, width: dims.width, height: dims.height
-                        )
-                    }
-                    await recordUploadedMessage(
-                        convId: id, msgId: res.msgId, cliId: res.cliMsgId,
-                        kind: .photo(url: URL(string: res.url), width: res.width, height: res.height),
-                        text: ""
-                    )
-                } else if isVideo {
-                    let meta: VideoMetadata
-                    if let videoMetadataHostHandler {
-                        let metaArgs: [String: Any] = [
-                            "path": url.path,
-                            "name": url.lastPathComponent,
-                            "size": fileSize,
-                        ]
-                        _ = traceHost("video_metadata", args: metaArgs)
-                        meta = await videoMetadataHostHandler(metaArgs)
-                    } else {
-                        meta = await Self.extractVideoMetadata(from: url)
-                    }
-                    let res: UploadedVideoResult
-                    if let uploadVideoHostHandler {
-                        let uploadArgs: [String: Any] = [
-                            "conv_id": id,
-                            "file_name": url.lastPathComponent,
-                            "size": fileSize,
-                            "duration_ms": meta.durationMs,
-                            "width": meta.width,
-                            "height": meta.height,
-                            "has_thumb": !meta.thumbnailData.isEmpty,
-                        ]
-                        _ = traceHost("upload_video", args: uploadArgs)
-                        res = try await uploadVideoHostHandler(uploadArgs)
-                    } else {
-                        res = try await sessionClient.uploadAndSendVideo(
-                            convId: id,
-                            fileName: url.lastPathComponent,
-                            data: data,
-                            thumbnailData: meta.thumbnailData,
-                            durationMs: meta.durationMs,
-                            width: meta.width,
-                            height: meta.height,
-                            webSocket: webSocket
-                        )
-                    }
-                    let thumbURL = res.thumbUrl.isEmpty ? nil : URL(string: res.thumbUrl)
-                    let videoURL = res.url.isEmpty ? nil : URL(string: res.url)
-                    let durSec = res.durationMs > 0 ? max(1, Int((Double(res.durationMs) / 1000.0).rounded())) : 0
-                    await recordUploadedMessage(
-                        convId: id, msgId: res.msgId, cliId: res.cliMsgId,
-                        kind: .video(thumbnail: thumbURL, duration: durSec, url: videoURL),
-                        text: ""
-                    )
-                } else {
-                    let res: UploadedMediaResult
-                    if let uploadFileHostHandler {
-                        let uploadArgs: [String: Any] = [
-                            "conv_id": id,
-                            "file_name": url.lastPathComponent,
-                            "size": fileSize,
-                            "client_id": NSNull(),
-                            "is_e2ee": false,
-                        ]
-                        _ = traceHost("upload_file", args: uploadArgs)
-                        res = try await uploadFileHostHandler(uploadArgs)
-                    } else {
-                        res = try await sessionClient.uploadAndSendFile(
-                            convId: id, fileName: url.lastPathComponent, data: data, webSocket: webSocket
-                        )
-                    }
-                    await recordUploadedMessage(
-                        convId: id, msgId: res.msgId, cliId: res.cliMsgId,
-                        kind: .file(name: url.lastPathComponent, size: fileSize, url: URL(string: res.url)),
-                        text: url.lastPathComponent
-                    )
-                }
-                sentAny = true
-            } catch {
-                EngineLog.shared.write("sendMedia failed: \(error.localizedDescription)")
-            }
+        guard let core = await ensureCoreEngine() else {
+            return .failed(ComposerOutcome.genericFailure)
         }
-        return sentAny ? .done : .failed(ComposerOutcome.genericFailure)
+        let outcome = await core.sendMediaCore(
+            convId: id,
+            paths: urls.map(\.path),
+            nowMs: nowMs()
+        )
+        await waitForCoreMirrorDrain()
+        return ComposerOutcome(coreRecord: outcome)
     }
 
     nonisolated static func validateOutgoingFile(_ url: URL, maxBytes: Int64) -> String? {
         var isDir: ObjCBool = false
         let exists = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
-        if isDir.boolValue {
-            return "Chưa hỗ trợ gửi thư mục (\(url.lastPathComponent)). Hãy nén thành .zip trước."
-        }
-        guard exists,
-              let vals = try? url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey]) else {
-            return "Không đọc được tệp \(url.lastPathComponent)."
-        }
-        if vals.isDirectory == true {
-            return "Chưa hỗ trợ gửi thư mục (\(url.lastPathComponent)). Hãy nén thành .zip trước."
-        }
-        let size = Int64(vals.fileSize ?? 0)
-        if size <= 0 {
-            return "Tệp \(url.lastPathComponent) rỗng (0 byte) nên không thể gửi."
-        }
-        if maxBytes > 0 && size > maxBytes {
-            let limitMB = max(1, maxBytes / 1_048_576)
-            return "Tệp \(url.lastPathComponent) vượt quá giới hạn \(limitMB) MB."
-        }
-        return nil
+        let vals = exists
+            ? (try? url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey]))
+            : nil
+        let probe = OutgoingFileProbeRecord(
+            exists: exists && vals != nil,
+            isDir: isDir.boolValue || (vals?.isDirectory == true),
+            readable: true,
+            size: Int64(vals?.fileSize ?? 0),
+            mediaType: nil
+        )
+        return mediaValidateOutgoingFileProbe(
+            name: url.lastPathComponent,
+            probe: probe,
+            maxBytes: maxBytes
+        )
     }
 
     func sendFiles(_ urls: [URL], to id: String) async -> ComposerOutcome {
@@ -415,181 +274,26 @@ extension ZaloEngine {
             _ = traceHost("send_files", args: args)
             return await sendFilesHostHandler(args)
         }
-        guard !urls.isEmpty, !id.isEmpty else { return .cancelled }
-        let maxBytes = max(cloud.plan?.fileLimit ?? 0, 100 * 1_048_576)
-        let isGroup = ZaloWireParser.isGroupId(id)
-        let isE2EE = isGroup ? false : await e2eeManager.isE2EEConversation(id)
-        var sentAny = false
-        var lastFailure: String?
-
-        for url in urls {
-            let scoped = readOutgoingFileHostHandler == nil ? url.startAccessingSecurityScopedResource() : false
-            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-
-            let data: Data
-            let fileSize: Int64
-            if let readOutgoingFileHostHandler {
-                let readArgs: [String: Any] = [
-                    "path": url.path,
-                    "name": url.lastPathComponent,
-                    "mode": "file",
-                ]
-                _ = traceHost("read_file", args: readArgs)
-                let probe = await readOutgoingFileHostHandler(readArgs)
-                if probe.isDirectory {
-                    lastFailure = "Chưa hỗ trợ gửi thư mục (\(url.lastPathComponent)). Hãy nén thành .zip trước."
-                    continue
-                }
-                guard probe.exists else {
-                    lastFailure = "Không đọc được tệp \(url.lastPathComponent)."
-                    continue
-                }
-                if probe.size <= 0 {
-                    lastFailure = "Tệp \(url.lastPathComponent) rỗng (0 byte) nên không thể gửi."
-                    continue
-                }
-                if maxBytes > 0 && probe.size > maxBytes {
-                    let limitMB = max(1, maxBytes / 1_048_576)
-                    lastFailure = "Tệp \(url.lastPathComponent) vượt quá giới hạn \(limitMB) MB."
-                    continue
-                }
-                guard probe.readable else {
-                    lastFailure = "Không đọc được tệp \(url.lastPathComponent)."
-                    continue
-                }
-                data = probe.data
-                fileSize = probe.size
-            } else {
-                if let reason = Self.validateOutgoingFile(url, maxBytes: maxBytes) {
-                    lastFailure = reason
-                    continue
-                }
-                let raw: Data
-                do {
-                    raw = try Data(contentsOf: url)
-                } catch {
-                    lastFailure = "Không đọc được tệp \(url.lastPathComponent)."
-                    continue
-                }
-                guard !raw.isEmpty else {
-                    lastFailure = "Tệp \(url.lastPathComponent) rỗng (0 byte) nên không thể gửi."
-                    continue
-                }
-                data = raw
-                fileSize = Int64(raw.count)
-            }
-
-            let cliInt = await sessionClient.nextClientId()
-            let cliId = "\(cliInt)"
-            let isSelf = (id == selfConversationId)
-            let optimistic = ChatMessage(
-                id: cliId,
-                conversationId: id,
-                senderId: profile?.userId ?? "",
-                senderName: profile?.displayName ?? "Bạn",
-                senderAvatar: profile?.avatar,
-                isMine: true,
-                kind: .file(name: url.lastPathComponent, size: fileSize, url: nil),
-                text: url.lastPathComponent,
-                date: Date(timeIntervalSince1970: Double(nowMs()) / 1000.0),
-                status: .sending,
-                quote: nil,
-                reactions: [],
-                isE2EE: isE2EE,
-                mentions: [],
-                cardButtons: [],
-                suggestsStickers: false,
-                menu: MessageMenu(json: [
-                    "forward": "ok",
-                    "recall": !isSelf,
-                    "delete": isSelf ? "plain" : "forMe",
-                    "pin": isGroup && !isSelf,
-                    "star": "star",
-                ]),
-                clientId: cliId
-            )
-            mergeMessageIntoMemory(optimistic)
-
-            func removeOptimistic() {
-                var removed: [String] = [cliId]
-                if var list = messages[id] {
-                    removed.append(contentsOf: list.filter { $0.id == cliId || $0.clientId == cliId }.map(\.id))
-                    list.removeAll { $0.id == cliId || $0.clientId == cliId }
-                    messages[id] = list
-                }
-                coreLifecycle.core?.writeThroughRemoveMessages(convId: id, ids: Array(Set(removed)))
-            }
-
-            do {
-                let res: UploadedMediaResult
-                if let uploadFileHostHandler {
-                    let uploadArgs: [String: Any] = [
-                        "conv_id": id,
-                        "file_name": url.lastPathComponent,
-                        "size": fileSize,
-                        "client_id": cliId,
-                        "is_e2ee": isE2EE,
-                    ]
-                    _ = traceHost("upload_file", args: uploadArgs)
-                    res = try await uploadFileHostHandler(uploadArgs)
-                } else if isE2EE {
-                    res = try await sessionClient.uploadAndSendE2EEFile(
-                        convId: id,
-                        fileName: url.lastPathComponent,
-                        plaintextData: data,
-                        clientId: cliInt,
-                        e2eeManager: e2eeManager,
-                        store: sqliteStore,
-                        webSocket: webSocket
-                    )
-                } else {
-                    res = try await sessionClient.uploadAndSendFile(
-                        convId: id,
-                        fileName: url.lastPathComponent,
-                        data: data,
-                        clientId: cliInt,
-                        webSocket: webSocket
-                    )
-                }
-                await recordUploadedMessage(
-                    convId: id,
-                    msgId: res.msgId,
-                    cliId: res.cliMsgId,
-                    kind: .file(name: url.lastPathComponent, size: fileSize, url: URL(string: res.url)),
-                    text: url.lastPathComponent,
-                    isE2EE: isE2EE
-                )
-                sentAny = true
-            } catch let sessionErr as ZaloSessionError {
-                removeOptimistic()
-                EngineLog.shared.write("sendFiles failed: code=\(sessionErr.code) msg=\(sessionErr.message)")
-                if !sessionErr.message.isEmpty {
-                    lastFailure = sessionErr.message
-                } else if sessionErr.code == -108 || sessionErr.code == -104 || sessionErr.code == 401 {
-                    lastFailure = "Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại."
-                } else {
-                    lastFailure = "Gửi tệp \(url.lastPathComponent) thất bại (mã \(sessionErr.code))."
-                }
-            } catch is URLError {
-                removeOptimistic()
-                EngineLog.shared.write("sendFiles failed: network error")
-                lastFailure = "Không có kết nối mạng. Vui lòng kiểm tra và thử lại."
-            } catch {
-                removeOptimistic()
-                EngineLog.shared.write("sendFiles failed: \(error.localizedDescription)")
-                lastFailure = "Không thể gửi tệp \(url.lastPathComponent)."
-            }
+        guard let core = await ensureCoreEngine() else {
+            return .failed(ComposerOutcome.genericFailure)
         }
-        if sentAny {
-            if let lastFailure {
-                showActionCard(lastFailure, in: id)
-            }
-            return .done
+        if !ZaloWireParser.isGroupId(id) {
+            _ = await e2eeManager.isE2EEConversation(id)
         }
-        return .failed(lastFailure ?? ComposerOutcome.genericFailure)
+        core.setE2eeThreads(threads: e2eeManager.e2eeThreadIdsSync())
+        if let fileLimit = cloud.plan?.fileLimit {
+            core.seedMediaCloudFileLimit(limit: fileLimit)
+        }
+        let outcome = await core.sendFilesCore(
+            convId: id,
+            paths: urls.map(\.path),
+            nowMs: nowMs()
+        )
+        await waitForCoreMirrorDrain()
+        return ComposerOutcome(coreRecord: outcome)
     }
 
-    private func imageDimensions(_ data: Data) -> (width: Int, height: Int) {
+    nonisolated internal static func computeImageDimensions(_ data: Data) -> (width: Int, height: Int) {
         guard let src = CGImageSourceCreateWithData(data as CFData, nil),
               let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
               let w = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,

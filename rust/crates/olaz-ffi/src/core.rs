@@ -48,6 +48,12 @@ use crate::conversations::{
     SeenTargetRecord,
 };
 use crate::error::{CoreError, NetworkKind};
+use crate::media_core::{
+    DownloadedFilePathEntryRecord, FileFetchOutcomeRecord, ImageDimensionsRecord,
+    LocalFileCheckRecord, MediaCacheHitRecord, MediaFetchOutcomeRecord, OutgoingFileProbeRecord,
+    SharedMediaPageRecord, UploadFileOutcomeRecord, UploadPhotoOutcomeRecord,
+    UploadVideoOutcomeRecord, VideoMetadataRecord,
+};
 use crate::messages::{
     ContactsStateRecord, FreshnessMapEntry, MessageMetaRecord, MuteEntryRecord, WindowDeltaRecord,
     records_to_chat_messages,
@@ -779,6 +785,16 @@ pub enum FileResolutionRecord {
     Ready { path: String },
     Expired,
     Failed { message: String },
+}
+
+impl From<olaz_core::FileResolution> for FileResolutionRecord {
+    fn from(r: olaz_core::FileResolution) -> Self {
+        match r {
+            olaz_core::FileResolution::Ready(path) => Self::Ready { path },
+            olaz_core::FileResolution::Expired => Self::Expired,
+            olaz_core::FileResolution::Failed(message) => Self::Failed { message },
+        }
+    }
 }
 
 impl fmt::Debug for FileResolutionRecord {
@@ -1670,6 +1686,9 @@ pub struct CoreChangesRecord {
     pub sticker_suggest: Option<StickerSuggestUpdateRecord>,
     pub composer_confirm: Option<ComposerConfirmUpdateRecord>,
     pub queued_composer_confirms: Option<Vec<ComposerConfirmRecord>>,
+    // U15
+    #[uniffi(default = None)]
+    pub downloaded_file_paths: Option<Vec<DownloadedFilePathEntryRecord>>,
 }
 
 impl fmt::Debug for CoreChangesRecord {
@@ -1769,6 +1788,11 @@ impl From<CoreChanges> for CoreChangesRecord {
             queued_composer_confirms: c
                 .queued_composer_confirms
                 .map(|list| list.into_iter().map(Into::into).collect()),
+            downloaded_file_paths: c.downloaded_file_paths.map(|m| {
+                m.into_iter()
+                    .map(|(key, path)| DownloadedFilePathEntryRecord { key, path })
+                    .collect()
+            }),
         }
     }
 }
@@ -2135,6 +2159,7 @@ impl CoreOfflineConversations {
             sticker_suggest: None,
             composer_confirm: None,
             queued_composer_confirms: None,
+            downloaded_file_paths: None,
         };
         for key in out.dirty {
             match key {
@@ -2205,7 +2230,8 @@ impl CoreOfflineConversations {
                 | DirtyKey::CachedGroups
                 | DirtyKey::Cloud
                 | DirtyKey::StickerSuggest
-                | DirtyKey::ComposerConfirm => {}
+                | DirtyKey::ComposerConfirm
+                | DirtyKey::DownloadedFilePaths => {}
                 DirtyKey::Polls => {
                     rec.polls = Some(state.polls.clone().into());
                 }
@@ -2492,6 +2518,102 @@ pub trait CoreHost: Send + Sync {
         qr_code_url: String,
     ) -> E2eeSendOutcomeRecord;
     async fn sleep_confirm_promote(&self, delay_ms: u64);
+
+    // --- Media domain callbacks (U15) ---
+    async fn media_read_outgoing_file(
+        &self,
+        op_id: u64,
+        path: String,
+        name: String,
+        mode: String,
+    ) -> OutgoingFileProbeRecord;
+    async fn media_release_outgoing_file(&self, op_id: u64);
+    async fn media_image_dimensions(
+        &self,
+        op_id: u64,
+        path: String,
+        name: String,
+        size: i64,
+    ) -> ImageDimensionsRecord;
+    async fn media_video_metadata(
+        &self,
+        op_id: u64,
+        path: String,
+        name: String,
+        size: i64,
+    ) -> VideoMetadataRecord;
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Matches upload_photo host boundary"
+    )]
+    async fn media_upload_photo(
+        &self,
+        op_id: u64,
+        conv_id: String,
+        file_name: String,
+        size: i64,
+        width: i64,
+        height: i64,
+    ) -> UploadPhotoOutcomeRecord;
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Matches upload_video host boundary"
+    )]
+    async fn media_upload_video(
+        &self,
+        op_id: u64,
+        conv_id: String,
+        file_name: String,
+        size: i64,
+        duration_ms: i64,
+        width: i64,
+        height: i64,
+        has_thumb: bool,
+    ) -> UploadVideoOutcomeRecord;
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Matches upload_file host boundary"
+    )]
+    async fn media_upload_file(
+        &self,
+        op_id: u64,
+        conv_id: String,
+        file_name: String,
+        size: i64,
+        client_id: Option<String>,
+        is_e2ee: bool,
+    ) -> UploadFileOutcomeRecord;
+    async fn media_remove_own_local_file(&self, path: String);
+    async fn media_file_exists(&self, path: String) -> bool;
+    async fn media_cache_lookup(
+        &self,
+        key: String,
+        hash_prefix: String,
+        conv_id: String,
+        msg_id: String,
+        kind: String,
+    ) -> Option<MediaCacheHitRecord>;
+    async fn media_check_local_file(&self, url: String) -> LocalFileCheckRecord;
+    async fn media_loader_fetch_media(
+        &self,
+        url: String,
+        kind: String,
+        hash_prefix: String,
+        force: bool,
+    ) -> MediaFetchOutcomeRecord;
+    async fn media_video_poster(&self, path: String) -> Option<String>;
+    async fn media_loader_fetch_file(
+        &self,
+        url: String,
+        force: bool,
+        request_token: u64,
+    ) -> FileFetchOutcomeRecord;
+    async fn media_stage_file(
+        &self,
+        source_path: String,
+        stem: String,
+        ext: Option<String>,
+    ) -> Option<String>;
 }
 
 struct FfiHostBridge(Arc<dyn CoreHost>);
@@ -2976,6 +3098,169 @@ impl Host for FfiHostBridge {
     async fn sleep_confirm_promote(&self, delay: Duration) {
         let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
         self.0.sleep_confirm_promote(delay_ms).await;
+    }
+
+    // --- Media domain callbacks (U15) ---
+    async fn media_read_outgoing_file(
+        &self,
+        op_id: u64,
+        path: String,
+        name: String,
+        mode: olaz_core::OutgoingFileMode,
+    ) -> olaz_core::OutgoingFileProbe {
+        self.0
+            .media_read_outgoing_file(op_id, path, name, mode.as_str().to_owned())
+            .await
+            .into()
+    }
+
+    async fn media_release_outgoing_file(&self, op_id: u64) {
+        self.0.media_release_outgoing_file(op_id).await;
+    }
+
+    async fn media_image_dimensions(
+        &self,
+        op_id: u64,
+        path: String,
+        name: String,
+        size: i64,
+    ) -> (i64, i64) {
+        let d = self.0.media_image_dimensions(op_id, path, name, size).await;
+        (d.width, d.height)
+    }
+
+    async fn media_video_metadata(
+        &self,
+        op_id: u64,
+        path: String,
+        name: String,
+        size: i64,
+    ) -> olaz_core::VideoMetadata {
+        self.0
+            .media_video_metadata(op_id, path, name, size)
+            .await
+            .into()
+    }
+
+    async fn media_upload_photo(
+        &self,
+        op_id: u64,
+        conv_id: String,
+        file_name: String,
+        size: i64,
+        width: i64,
+        height: i64,
+    ) -> Result<olaz_core::UploadedPhotoResult, String> {
+        self.0
+            .media_upload_photo(op_id, conv_id, file_name, size, width, height)
+            .await
+            .into()
+    }
+
+    async fn media_upload_video(
+        &self,
+        op_id: u64,
+        conv_id: String,
+        file_name: String,
+        size: i64,
+        duration_ms: i64,
+        width: i64,
+        height: i64,
+        has_thumb: bool,
+    ) -> Result<olaz_core::UploadedVideoResult, String> {
+        self.0
+            .media_upload_video(
+                op_id,
+                conv_id,
+                file_name,
+                size,
+                duration_ms,
+                width,
+                height,
+                has_thumb,
+            )
+            .await
+            .into()
+    }
+
+    async fn media_upload_file(
+        &self,
+        op_id: u64,
+        conv_id: String,
+        file_name: String,
+        size: i64,
+        client_id: Option<String>,
+        is_e2ee: bool,
+    ) -> Result<olaz_core::UploadedFileResult, olaz_core::UploadFileError> {
+        self.0
+            .media_upload_file(op_id, conv_id, file_name, size, client_id, is_e2ee)
+            .await
+            .into()
+    }
+
+    async fn media_remove_own_local_file(&self, path: String) {
+        self.0.media_remove_own_local_file(path).await;
+    }
+
+    async fn media_file_exists(&self, path: String) -> bool {
+        self.0.media_file_exists(path).await
+    }
+
+    async fn media_cache_lookup(
+        &self,
+        key: String,
+        hash_prefix: String,
+        conv_id: String,
+        msg_id: String,
+        kind: olaz_core::MediaKind,
+    ) -> Option<olaz_core::MediaCacheHit> {
+        self.0
+            .media_cache_lookup(key, hash_prefix, conv_id, msg_id, kind.as_str().to_owned())
+            .await
+            .map(Into::into)
+    }
+
+    async fn media_check_local_file(&self, url: String) -> (bool, String, bool) {
+        let r = self.0.media_check_local_file(url).await;
+        (r.allowed, r.path, r.is_video)
+    }
+
+    async fn media_loader_fetch_media(
+        &self,
+        url: String,
+        kind: olaz_core::MediaKind,
+        hash_prefix: String,
+        force: bool,
+    ) -> olaz_core::MediaFetchOutcome {
+        self.0
+            .media_loader_fetch_media(url, kind.as_str().to_owned(), hash_prefix, force)
+            .await
+            .into()
+    }
+
+    async fn media_video_poster(&self, path: String) -> Option<String> {
+        self.0.media_video_poster(path).await
+    }
+
+    async fn media_loader_fetch_file(
+        &self,
+        url: String,
+        force: bool,
+        request_token: u64,
+    ) -> olaz_core::FileFetchOutcome {
+        self.0
+            .media_loader_fetch_file(url, force, request_token)
+            .await
+            .into()
+    }
+
+    async fn media_stage_file(
+        &self,
+        source_path: String,
+        stem: String,
+        ext: Option<String>,
+    ) -> Option<String> {
+        self.0.media_stage_file(source_path, stem, ext).await
     }
 }
 
@@ -5025,6 +5310,162 @@ impl CoreEngine {
         self.handle.send(Command::ClearBoardCaches);
     }
 
+    // --- U15 media methods ---
+    pub async fn send_media_core(
+        &self,
+        conv_id: String,
+        paths: Vec<String>,
+        now_ms: i64,
+    ) -> ComposerOutcomeRecord {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle
+                .request_composer_outcome(Command::SendMedia {
+                    conv_id,
+                    paths,
+                    now_ms,
+                })
+                .await
+                .into()
+        })
+        .await
+        .unwrap_or(ComposerOutcomeRecord::Failed {
+            text: olaz_core::composer::COMPOSER_GENERIC_FAILURE.to_owned(),
+        })
+    }
+
+    pub async fn send_files_core(
+        &self,
+        conv_id: String,
+        paths: Vec<String>,
+        now_ms: i64,
+    ) -> ComposerOutcomeRecord {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle
+                .request_composer_outcome(Command::SendFiles {
+                    conv_id,
+                    paths,
+                    now_ms,
+                })
+                .await
+                .into()
+        })
+        .await
+        .unwrap_or(ComposerOutcomeRecord::Failed {
+            text: olaz_core::composer::COMPOSER_GENERIC_FAILURE.to_owned(),
+        })
+    }
+
+    pub async fn resolve_media_core(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        kind: String,
+        force: bool,
+        now_ms: i64,
+    ) -> MediaResolutionRecord {
+        let parsed_kind =
+            olaz_core::MediaKind::from_str_tag(&kind).unwrap_or(olaz_core::MediaKind::Photo);
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle
+                .request_resolve_media(Command::ResolveMedia {
+                    conv_id,
+                    msg_id,
+                    kind: parsed_kind,
+                    force,
+                    now_ms,
+                })
+                .await
+                .into()
+        })
+        .await
+        .unwrap_or(MediaResolutionRecord::Unavailable)
+    }
+
+    pub async fn resolve_file_core(
+        &self,
+        conv_id: String,
+        msg_id: String,
+        name: String,
+        url: Option<String>,
+        force: bool,
+        request_token: u64,
+    ) -> FileResolutionRecord {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle
+                .request_resolve_file(Command::ResolveFile {
+                    conv_id,
+                    msg_id,
+                    name,
+                    url,
+                    force,
+                    request_token,
+                })
+                .await
+                .into()
+        })
+        .await
+        .unwrap_or(FileResolutionRecord::Failed {
+            message: "Không tải được tệp. Kiểm tra kết nối mạng và thử lại.".to_owned(),
+        })
+    }
+
+    pub async fn shared_media_core(
+        &self,
+        conv_id: String,
+        kind: String,
+        after_cursor: Option<String>,
+        limit: u32,
+        simulate_store_error: bool,
+    ) -> Option<SharedMediaPageRecord> {
+        let parsed_kind = olaz_core::SharedMediaKind::from_str_tag(&kind)
+            .unwrap_or(olaz_core::SharedMediaKind::Images);
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            handle
+                .request_shared_media(Command::SharedMedia {
+                    conv_id,
+                    kind: parsed_kind,
+                    after_cursor,
+                    limit: usize::try_from(limit).unwrap_or(60),
+                    simulate_store_error,
+                })
+                .await
+                .map(Into::into)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    pub fn remember_downloaded_file(&self, key: String, path: String) {
+        self.handle
+            .send(Command::RememberDownloadedFile { key, path });
+    }
+
+    pub fn forget_downloaded_file(&self, key: String) {
+        self.handle.send(Command::ForgetDownloadedFile { key });
+    }
+
+    pub fn seed_downloaded_file_paths(&self, entries: Vec<DownloadedFilePathEntryRecord>) {
+        let map = entries
+            .into_iter()
+            .map(|e| (e.key, e.path))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        self.handle.send(Command::SeedDownloadedFilePaths(map));
+    }
+
+    pub fn seed_media_cloud_file_limit(&self, limit: Option<i64>) {
+        self.handle.send(Command::SeedMediaCloudFileLimit(limit));
+    }
+
+    pub fn reset_media(&self) {
+        self.handle.send(Command::ResetMedia);
+    }
+
     /// Stops the actor, aborts in-flight session & transport tasks, and closes `next_changes()`.
     pub fn stop(&self) {
         self.handle.stop();
@@ -5231,6 +5672,140 @@ mod tests {
         }
         async fn sleep_confirm_promote(&self, delay_ms: u64) {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        async fn media_read_outgoing_file(
+            &self,
+            _op_id: u64,
+            _path: String,
+            _name: String,
+            _mode: String,
+        ) -> OutgoingFileProbeRecord {
+            OutgoingFileProbeRecord {
+                exists: false,
+                is_dir: false,
+                readable: false,
+                size: 0,
+                media_type: None,
+            }
+        }
+        async fn media_release_outgoing_file(&self, _op_id: u64) {}
+        async fn media_image_dimensions(
+            &self,
+            _op_id: u64,
+            _path: String,
+            _name: String,
+            _size: i64,
+        ) -> ImageDimensionsRecord {
+            ImageDimensionsRecord {
+                width: 800,
+                height: 600,
+            }
+        }
+        async fn media_video_metadata(
+            &self,
+            _op_id: u64,
+            _path: String,
+            _name: String,
+            _size: i64,
+        ) -> VideoMetadataRecord {
+            VideoMetadataRecord {
+                duration_ms: 0,
+                width: 0,
+                height: 0,
+                has_thumb: false,
+            }
+        }
+        async fn media_upload_photo(
+            &self,
+            _op_id: u64,
+            _conv_id: String,
+            _file_name: String,
+            _size: i64,
+            _width: i64,
+            _height: i64,
+        ) -> UploadPhotoOutcomeRecord {
+            UploadPhotoOutcomeRecord::Err {
+                message: "stub".to_owned(),
+            }
+        }
+        async fn media_upload_video(
+            &self,
+            _op_id: u64,
+            _conv_id: String,
+            _file_name: String,
+            _size: i64,
+            _duration_ms: i64,
+            _width: i64,
+            _height: i64,
+            _has_thumb: bool,
+        ) -> UploadVideoOutcomeRecord {
+            UploadVideoOutcomeRecord::Err {
+                message: "stub".to_owned(),
+            }
+        }
+        async fn media_upload_file(
+            &self,
+            _op_id: u64,
+            _conv_id: String,
+            _file_name: String,
+            _size: i64,
+            _client_id: Option<String>,
+            _is_e2ee: bool,
+        ) -> UploadFileOutcomeRecord {
+            UploadFileOutcomeRecord::OtherError {
+                message: "stub".to_owned(),
+            }
+        }
+        async fn media_remove_own_local_file(&self, _path: String) {}
+        async fn media_file_exists(&self, _path: String) -> bool {
+            false
+        }
+        async fn media_cache_lookup(
+            &self,
+            _key: String,
+            _hash_prefix: String,
+            _conv_id: String,
+            _msg_id: String,
+            _kind: String,
+        ) -> Option<MediaCacheHitRecord> {
+            None
+        }
+        async fn media_check_local_file(&self, _url: String) -> LocalFileCheckRecord {
+            LocalFileCheckRecord {
+                allowed: false,
+                path: String::new(),
+                is_video: false,
+            }
+        }
+        async fn media_loader_fetch_media(
+            &self,
+            _url: String,
+            _kind: String,
+            _hash_prefix: String,
+            _force: bool,
+        ) -> MediaFetchOutcomeRecord {
+            MediaFetchOutcomeRecord::Transient
+        }
+        async fn media_video_poster(&self, _path: String) -> Option<String> {
+            None
+        }
+        async fn media_loader_fetch_file(
+            &self,
+            _url: String,
+            _force: bool,
+            _request_token: u64,
+        ) -> FileFetchOutcomeRecord {
+            FileFetchOutcomeRecord::Error {
+                kind: crate::media_core::FileLoadErrorKindRecord::Other,
+            }
+        }
+        async fn media_stage_file(
+            &self,
+            _source_path: String,
+            _stem: String,
+            _ext: Option<String>,
+        ) -> Option<String> {
+            None
         }
     }
 
