@@ -2543,6 +2543,10 @@ pub trait CoreHost: Send + Sync {
         name: String,
         size: i64,
     ) -> VideoMetadataRecord;
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Matches upload_photo host boundary including E2EE flag"
+    )]
     async fn media_upload_photo(
         &self,
         op_id: u64,
@@ -2551,10 +2555,11 @@ pub trait CoreHost: Send + Sync {
         size: i64,
         width: i64,
         height: i64,
+        is_e2ee: bool,
     ) -> UploadPhotoOutcomeRecord;
     #[expect(
         clippy::too_many_arguments,
-        reason = "Matches upload_video host boundary"
+        reason = "Matches upload_video host boundary including E2EE flag"
     )]
     async fn media_upload_video(
         &self,
@@ -2566,6 +2571,7 @@ pub trait CoreHost: Send + Sync {
         width: i64,
         height: i64,
         has_thumb: bool,
+        is_e2ee: bool,
     ) -> UploadVideoOutcomeRecord;
     async fn media_upload_file(
         &self,
@@ -3147,9 +3153,10 @@ impl Host for FfiHostBridge {
         size: i64,
         width: i64,
         height: i64,
+        is_e2ee: bool,
     ) -> Result<olaz_core::UploadedPhotoResult, String> {
         self.0
-            .media_upload_photo(op_id, conv_id, file_name, size, width, height)
+            .media_upload_photo(op_id, conv_id, file_name, size, width, height, is_e2ee)
             .await
             .into()
     }
@@ -3164,6 +3171,7 @@ impl Host for FfiHostBridge {
         width: i64,
         height: i64,
         has_thumb: bool,
+        is_e2ee: bool,
     ) -> Result<olaz_core::UploadedVideoResult, String> {
         self.0
             .media_upload_video(
@@ -3175,6 +3183,7 @@ impl Host for FfiHostBridge {
                 width,
                 height,
                 has_thumb,
+                is_e2ee,
             )
             .await
             .into()
@@ -5723,6 +5732,7 @@ mod tests {
             _size: i64,
             _width: i64,
             _height: i64,
+            _is_e2ee: bool,
         ) -> UploadPhotoOutcomeRecord {
             UploadPhotoOutcomeRecord::Err {
                 message: "stub".to_owned(),
@@ -5738,6 +5748,7 @@ mod tests {
             _width: i64,
             _height: i64,
             _has_thumb: bool,
+            _is_e2ee: bool,
         ) -> UploadVideoOutcomeRecord {
             UploadVideoOutcomeRecord::Err {
                 message: "stub".to_owned(),

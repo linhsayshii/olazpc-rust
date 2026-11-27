@@ -236,6 +236,13 @@ extension ZaloEngine {
         guard let core = await ensureCoreEngine() else {
             return .failed(ComposerOutcome.genericFailure)
         }
+        if !ZaloWireParser.isGroupId(id) {
+            let loaded = await e2eeManager.hasLoadedPersistedThreads()
+            let threads = e2eeManager.e2eeThreadIdsSync()
+            if loaded || !threads.isEmpty {
+                core.setE2eeThreads(threads: threads)
+            }
+        }
         let outcome = await core.sendMediaCore(
             convId: id,
             paths: urls.map(\.path),

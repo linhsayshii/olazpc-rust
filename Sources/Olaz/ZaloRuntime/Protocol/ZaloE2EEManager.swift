@@ -967,6 +967,62 @@ actor ZaloE2EEManager {
         )
     }
 
+    /// Official `sendFileAsync(..., isPhoto: true)` (cmd 16004): 7-element Signal cipher array
+    /// `[desc, prmE2EE, thumbKey, normalKey, hdKey, rawKey, oriKey]`.
+    func encryptPhotoMessage(
+        peerUid: String,
+        myUid: String,
+        desc: String = "",
+        photoParamsJSON: String,
+        thumbSessionB64: String,
+        normalSessionB64: String,
+        hdSessionB64: String,
+        rawSessionB64: String,
+        oriSessionB64: String,
+        store: ZaloSQLiteStore?
+    ) async -> [(toId: String, platform: Int, registrationId: Int, ciphers: [String])] {
+        await encryptBatch(
+            peerUid: peerUid,
+            myUid: myUid,
+            values: [
+                .string(desc),
+                .string(photoParamsJSON),
+                .string(thumbSessionB64),
+                .string(normalSessionB64),
+                .string(hdSessionB64),
+                .string(rawSessionB64),
+                .string(oriSessionB64),
+            ],
+            formats: ["string", "string", "string", "string", "string", "string", "string"],
+            store: store
+        )
+    }
+
+    /// Official `forwardMessage(..., MSGTYPE_FORWARD_VIDEO)` (cmd 16012, msgType 5): 4-element
+    /// Signal cipher array `[title, videoKey, thumbKey, videoParamsJSON]`.
+    func encryptVideoForwardMessage(
+        peerUid: String,
+        myUid: String,
+        title: String = "",
+        videoSessionB64: String,
+        thumbSessionB64: String,
+        videoParamsJSON: String,
+        store: ZaloSQLiteStore?
+    ) async -> [(toId: String, platform: Int, registrationId: Int, ciphers: [String])] {
+        await encryptBatch(
+            peerUid: peerUid,
+            myUid: myUid,
+            values: [
+                .string(title),
+                .string(videoSessionB64),
+                .string(thumbSessionB64),
+                .string(videoParamsJSON),
+            ],
+            formats: ["string", "string", "string", "string"],
+            store: store
+        )
+    }
+
     private func encryptBatch(
         peerUid: String,
         myUid: String,

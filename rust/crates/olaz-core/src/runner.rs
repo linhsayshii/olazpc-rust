@@ -617,6 +617,10 @@ pub trait Host: Send + Sync {
     ) -> VideoMetadata {
         VideoMetadata::default()
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Matches upload_photo host boundary including E2EE routing flag"
+    )]
     async fn media_upload_photo(
         &self,
         _op_id: u64,
@@ -625,12 +629,13 @@ pub trait Host: Send + Sync {
         _size: i64,
         _width: i64,
         _height: i64,
+        _is_e2ee: bool,
     ) -> Result<UploadedPhotoResult, String> {
         Err("media_upload_photo not implemented by host".to_owned())
     }
     #[expect(
         clippy::too_many_arguments,
-        reason = "Matches upload_video host boundary"
+        reason = "Matches upload_video host boundary including E2EE routing flag"
     )]
     async fn media_upload_video(
         &self,
@@ -642,6 +647,7 @@ pub trait Host: Send + Sync {
         _width: i64,
         _height: i64,
         _has_thumb: bool,
+        _is_e2ee: bool,
     ) -> Result<UploadedVideoResult, String> {
         Err("media_upload_video not implemented by host".to_owned())
     }
@@ -3017,13 +3023,16 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     size,
                     width,
                     height,
+                    is_e2ee,
                 } => {
                     let host = Arc::clone(&self.host);
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.runtime.spawn(async move {
                         let result = host
-                            .media_upload_photo(op_id, conv_id, file_name, size, width, height)
+                            .media_upload_photo(
+                                op_id, conv_id, file_name, size, width, height, is_e2ee,
+                            )
                             .await;
                         sink.send(Input::MediaUploadPhotoDone { op_id, result });
                         drop(guard);
@@ -3038,6 +3047,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     width,
                     height,
                     has_thumb,
+                    is_e2ee,
                 } => {
                     let host = Arc::clone(&self.host);
                     let sink = sink.clone();
@@ -3053,6 +3063,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                                 width,
                                 height,
                                 has_thumb,
+                                is_e2ee,
                             )
                             .await;
                         sink.send(Input::MediaUploadVideoDone { op_id, result });

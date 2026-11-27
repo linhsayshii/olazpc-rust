@@ -4855,9 +4855,9 @@ public protocol CoreHost: AnyObject, Sendable {
     
     func mediaVideoMetadata(opId: UInt64, path: String, name: String, size: Int64) async  -> VideoMetadataRecord
     
-    func mediaUploadPhoto(opId: UInt64, convId: String, fileName: String, size: Int64, width: Int64, height: Int64) async  -> UploadPhotoOutcomeRecord
+    func mediaUploadPhoto(opId: UInt64, convId: String, fileName: String, size: Int64, width: Int64, height: Int64, isE2ee: Bool) async  -> UploadPhotoOutcomeRecord
     
-    func mediaUploadVideo(opId: UInt64, convId: String, fileName: String, size: Int64, durationMs: Int64, width: Int64, height: Int64, hasThumb: Bool) async  -> UploadVideoOutcomeRecord
+    func mediaUploadVideo(opId: UInt64, convId: String, fileName: String, size: Int64, durationMs: Int64, width: Int64, height: Int64, hasThumb: Bool, isE2ee: Bool) async  -> UploadVideoOutcomeRecord
     
     func mediaUploadFile(opId: UInt64, convId: String, fileName: String, size: Int64, clientId: String?, isE2ee: Bool) async  -> UploadFileOutcomeRecord
     
@@ -5964,12 +5964,12 @@ open func mediaVideoMetadata(opId: UInt64, path: String, name: String, size: Int
         )
 }
     
-open func mediaUploadPhoto(opId: UInt64, convId: String, fileName: String, size: Int64, width: Int64, height: Int64)async  -> UploadPhotoOutcomeRecord  {
+open func mediaUploadPhoto(opId: UInt64, convId: String, fileName: String, size: Int64, width: Int64, height: Int64, isE2ee: Bool)async  -> UploadPhotoOutcomeRecord  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_olaz_ffi_fn_method_corehost_media_upload_photo(
-                        self.uniffiCloneHandle(),FfiConverterUInt64.lower(opId),FfiConverterString.lower(convId),FfiConverterString.lower(fileName),FfiConverterInt64.lower(size),FfiConverterInt64.lower(width),FfiConverterInt64.lower(height)
+                        self.uniffiCloneHandle(),FfiConverterUInt64.lower(opId),FfiConverterString.lower(convId),FfiConverterString.lower(fileName),FfiConverterInt64.lower(size),FfiConverterInt64.lower(width),FfiConverterInt64.lower(height),FfiConverterBool.lower(isE2ee)
                 )
             },
             pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
@@ -5981,12 +5981,12 @@ open func mediaUploadPhoto(opId: UInt64, convId: String, fileName: String, size:
         )
 }
     
-open func mediaUploadVideo(opId: UInt64, convId: String, fileName: String, size: Int64, durationMs: Int64, width: Int64, height: Int64, hasThumb: Bool)async  -> UploadVideoOutcomeRecord  {
+open func mediaUploadVideo(opId: UInt64, convId: String, fileName: String, size: Int64, durationMs: Int64, width: Int64, height: Int64, hasThumb: Bool, isE2ee: Bool)async  -> UploadVideoOutcomeRecord  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_olaz_ffi_fn_method_corehost_media_upload_video(
-                        self.uniffiCloneHandle(),FfiConverterUInt64.lower(opId),FfiConverterString.lower(convId),FfiConverterString.lower(fileName),FfiConverterInt64.lower(size),FfiConverterInt64.lower(durationMs),FfiConverterInt64.lower(width),FfiConverterInt64.lower(height),FfiConverterBool.lower(hasThumb)
+                        self.uniffiCloneHandle(),FfiConverterUInt64.lower(opId),FfiConverterString.lower(convId),FfiConverterString.lower(fileName),FfiConverterInt64.lower(size),FfiConverterInt64.lower(durationMs),FfiConverterInt64.lower(width),FfiConverterInt64.lower(height),FfiConverterBool.lower(hasThumb),FfiConverterBool.lower(isE2ee)
                 )
             },
             pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
@@ -8757,6 +8757,7 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
             size: Int64,
             width: Int64,
             height: Int64,
+            isE2ee: Int8,
             uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
             uniffiCallbackData: UInt64,
             uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
@@ -8772,7 +8773,8 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                      fileName: try FfiConverterString.lift(fileName),
                      size: try FfiConverterInt64.lift(size),
                      width: try FfiConverterInt64.lift(width),
-                     height: try FfiConverterInt64.lift(height)
+                     height: try FfiConverterInt64.lift(height),
+                     isE2ee: try FfiConverterBool.lift(isE2ee)
                 )
             }
 
@@ -8811,6 +8813,7 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
             width: Int64,
             height: Int64,
             hasThumb: Int8,
+            isE2ee: Int8,
             uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
             uniffiCallbackData: UInt64,
             uniffiOutDroppedCallback: UnsafeMutablePointer<UniffiForeignFutureDroppedCallbackStruct>
@@ -8828,7 +8831,8 @@ fileprivate struct UniffiCallbackInterfaceCoreHost {
                      durationMs: try FfiConverterInt64.lift(durationMs),
                      width: try FfiConverterInt64.lift(width),
                      height: try FfiConverterInt64.lift(height),
-                     hasThumb: try FfiConverterBool.lift(hasThumb)
+                     hasThumb: try FfiConverterBool.lift(hasThumb),
+                     isE2ee: try FfiConverterBool.lift(isE2ee)
                 )
             }
 
@@ -34775,10 +34779,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_corehost_media_video_metadata() != 63445) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_media_upload_photo() != 37213) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_upload_photo() != 30473) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corehost_media_upload_video() != 29660) {
+    if (uniffi_olaz_ffi_checksum_method_corehost_media_upload_video() != 43880) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_corehost_media_upload_file() != 53326) {

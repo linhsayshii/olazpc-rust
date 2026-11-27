@@ -842,14 +842,14 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         return await engine.hostMediaVideoMetadata(opId: opId, path: path, name: name, size: size)
     }
 
-    func mediaUploadPhoto(opId: UInt64, convId: String, fileName: String, size: Int64, width: Int64, height: Int64) async -> UploadPhotoOutcomeRecord {
+    func mediaUploadPhoto(opId: UInt64, convId: String, fileName: String, size: Int64, width: Int64, height: Int64, isE2ee: Bool) async -> UploadPhotoOutcomeRecord {
         guard let engine else { return .err(message: ComposerOutcome.genericFailure) }
-        return await engine.hostMediaUploadPhoto(opId: opId, convId: convId, fileName: fileName, size: size, width: width, height: height)
+        return await engine.hostMediaUploadPhoto(opId: opId, convId: convId, fileName: fileName, size: size, width: width, height: height, isE2ee: isE2ee)
     }
 
-    func mediaUploadVideo(opId: UInt64, convId: String, fileName: String, size: Int64, durationMs: Int64, width: Int64, height: Int64, hasThumb: Bool) async -> UploadVideoOutcomeRecord {
+    func mediaUploadVideo(opId: UInt64, convId: String, fileName: String, size: Int64, durationMs: Int64, width: Int64, height: Int64, hasThumb: Bool, isE2ee: Bool) async -> UploadVideoOutcomeRecord {
         guard let engine else { return .err(message: ComposerOutcome.genericFailure) }
-        return await engine.hostMediaUploadVideo(opId: opId, convId: convId, fileName: fileName, size: size, durationMs: durationMs, width: width, height: height, hasThumb: hasThumb)
+        return await engine.hostMediaUploadVideo(opId: opId, convId: convId, fileName: fileName, size: size, durationMs: durationMs, width: width, height: height, hasThumb: hasThumb, isE2ee: isE2ee)
     }
 
     func mediaUploadFile(opId: UInt64, convId: String, fileName: String, size: Int64, clientId: String?, isE2ee: Bool) async -> UploadFileOutcomeRecord {

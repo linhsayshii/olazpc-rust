@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import os
 @testable import Olaz
 
 @Suite struct JSRuntimeShims {
@@ -373,5 +374,361 @@ import Foundation
             Issue.record("quote reply did not parse as a message"); return
         }
         #expect(parsed.quote?.senderName == "Bạn")
+    }
+
+    /// Extracts the raw binary payload of the first multipart part (`chunkContent`) from a `FakeZaloServer.HTTPRequest`.
+    private static func extractMultipartPartBytes(from req: FakeZaloServer.HTTPRequest) -> Data? {
+        guard let ct = req.header("content-type"),
+              let bRange = ct.range(of: "boundary=") else {
+            return nil
+        }
+        let boundary = String(ct[bRange.upperBound...]).trimmingCharacters(in: CharacterSet(charactersIn: "\" "))
+        let sep = Data("\r\n\r\n".utf8)
+        let closing = Data("\r\n--\(boundary)".utf8)
+        guard let headerEnd = req.body.range(of: sep),
+              let bodyEnd = req.body.range(of: closing, in: headerEnd.upperBound..<req.body.endIndex) else {
+            return nil
+        }
+        return req.body.subdata(in: headerEnd.upperBound..<bodyEnd.lowerBound)
+    }
+
+    private static func extractQueryParam(_ name: String, from urlStr: String) -> String? {
+        guard let qIdx = urlStr.firstIndex(of: "?") else { return nil }
+        let query = String(urlStr[urlStr.index(after: qIdx)...])
+        for pair in query.split(separator: "&") {
+            let parts = pair.split(separator: "=", maxSplits: 1)
+            if parts.count == 2, parts[0] == name {
+                return String(parts[1])
+            }
+        }
+        return nil
+    }
+
+    @Test("E2EE photo (16004), video (16012), video fallback (16005), AES-256-GCM round-trip, and fail-closed")
+    func e2eePhotoAndVideoWireFormatRoundTripAndFailClosed() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("olaz-e2ee-media-wire-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // Establish a real Signal session between Alice (ZaloE2EEManager) and Bob (independent JSRuntime).
+        let storeAlice = try ZaloSQLiteStore(path: root.appendingPathComponent("history.sqlite3").path)
+        let mgrAlice = ZaloE2EEManager()
+        await mgrAlice.prepare(uid: "alice_uid", store: storeAlice)
+
+        let aliceStoreJSON = try #require(try await storeAlice.getPreferenceString(key: ZaloE2EEManager.storePrefKey))
+        let bobRT = try JSRuntime(name: "test-bob-media")
+        try await bobRT.loadModule("vendor/libsignal-protocol.js")
+        try await bobRT.loadModule("zalo-e2ee.js")
+        _ = try await bobRT.callAsync("ZaloE2EE.pc.initOrRestore", [.string("bob_uid"), .string("")])
+
+        let aliceParsed = try #require(JSONLossless.parseObject(Data(aliceStoreJSON.utf8)))
+        let spk = try #require((aliceParsed["signedPreKeys"] as? [String: Any])?["1"] as? [String: Any])
+        let pk = try #require((aliceParsed["preKeys"] as? [String: Any])?["1"] as? [String: Any])
+        let identity = try #require(aliceParsed["identity"] as? [String: Any])
+        let regId = try #require(aliceParsed["registrationId"])
+        let zBundle = ZaloE2EEManager.nativeToJSValue([
+            "deviceId": 2,
+            "preKey": [
+                "iKey": ["id": regId, "key": identity["pubKey"] as Any],
+                "signature": spk["signature"] as Any,
+                "spKey": ["id": 1, "key": spk["pubKey"] as Any],
+            ],
+            "opKey": ["id": 1, "key": pk["pubKey"] as Any],
+        ])
+        let bobProc = try await bobRT.callAsync("ZaloE2EE.pc.processPreKeyBundle", [.string("bob_uid"), .string("alice_uid"), .number(2), zBundle])
+        #expect(bobProc["ok"]?.boolValue == true)
+        let bobFirst = try await bobRT.callAsync("ZaloE2EE.pc.encryptCipher", [
+            .string("bob_uid"), .string("alice_uid"), .number(2), .string("Hi Alice"), .string("string"),
+        ])
+        let bobCipher = try #require(bobFirst["cipher"]?.stringValue)
+        _ = await mgrAlice.decryptEnvelopeIfNeeded(ZaloJSONBox([
+            "data": ["msgs": [[
+                "msgId": "1001", "cliMsgId": "1001", "uidFrom": "bob_uid", "idTo": "alice_uid",
+                "msgType": "webchat", "ts": 1_795_000_000_000,
+                "paramsExt": ["platformType": 2], "content": bobCipher,
+            ]]]
+        ]), myUid: "alice_uid", store: storeAlice)
+
+        func bobDecrypt(_ cipher: String) async throws -> String {
+            let res = try await bobRT.callAsync("ZaloE2EE.pc.decryptCipher", [
+                .string("bob_uid"), .string("alice_uid"), .number(2), .string(cipher), .string("string"),
+            ])
+            #expect(res["ok"]?.boolValue == true)
+            guard let text = res["text"]?.stringValue else {
+                throw NSError(domain: "E2EETest", code: 2, userInfo: [NSLocalizedDescriptionKey: "Missing decrypted text"])
+            }
+            return text
+        }
+
+        let key = Data("0123456789abcdef".utf8)
+        let failVideoForward = OSAllocatedUnfairLock<Bool>(initialState: false)
+        struct RecordedReq: @unchecked Sendable {
+            let path: String
+            let query: String
+            let payload: ZaloJSONBox
+            let chunkBytes: Data?
+        }
+        let captured = OSAllocatedUnfairLock<[RecordedReq]>(initialState: [])
+
+        let server = try FakeZaloServer { req in
+            let box = ZaloJSONBox(req.decodeEncryptedParams(key: key) ?? [:])
+            let chunk = Self.extractMultipartPartBytes(from: req)
+            captured.withLock { $0.append(RecordedReq(path: req.path, query: req.query, payload: box, chunkBytes: chunk)) }
+
+            switch req.path {
+            case "/api/message/photo_original/upload":
+                let eeType = box.dict["eeType"] as? String
+                if eeType == "normal" {
+                    return .json(200, ["error_code": 0, "data": [
+                        "rawUrl": "https://cdn.example/e2ee_photo_thumb.jpg",
+                        "normalUrl": "https://cdn.example/e2ee_photo_thumb.jpg",
+                        "photoId": "88002",
+                    ]])
+                }
+                return .json(200, ["error_code": 0, "data": [
+                    "normalUrl": "https://cdn.example/e2ee_photo_normal.jpg",
+                    "hdUrl": "https://cdn.example/e2ee_photo_hd.jpg",
+                    "rawUrl": "https://cdn.example/e2ee_photo_raw.jpg",
+                    "oriUrl": "https://cdn.example/e2ee_photo_ori.jpg",
+                    "thumbUrl": "https://cdn.example/server_raw_thumb.jpg",
+                    "photoId": "88001",
+                ]])
+            case "/api/e2ee/pc/message/photo":
+                return .json(200, ["error_code": 0, "data": ["minGlobalMsgId": "77001"]])
+            case "/api/message/video/file/upload":
+                return .json(200, ["error_code": 0, "data": [
+                    "fileId": "66001",
+                    "fileUrl": "https://cdn.example/e2ee_video.mp4",
+                ]])
+            case "/api/message/video/thumb/upload":
+                return .json(200, ["error_code": 0, "data": [
+                    "thumbUrl": "https://cdn.example/e2ee_video_thumb.jpg",
+                ]])
+            case "/api/e2ee/pc/message/forward":
+                if failVideoForward.withLock({ $0 }) {
+                    return .json(200, ["error_code": 114, "error_message": "Forward rejected"])
+                }
+                return .json(200, ["error_code": 0, "data": ["minGlobalMsgId": "77002"]])
+            case "/api/message/asyncfile/upload":
+                return .json(200, ["error_code": 0, "data": [
+                    "fileId": "66002",
+                    "url": "https://cdn.example/e2ee_video_as_file.mp4",
+                ]])
+            case "/api/e2ee/pc/message/file":
+                return .json(200, ["error_code": 0, "data": ["minGlobalMsgId": "77003"]])
+            case "/api/e2ee/pc/key/get":
+                return .json(200, ["error_code": 0, "data": [:]])
+            default:
+                return .json(404, ["error_code": -1])
+            }
+        }
+        try await server.start()
+        defer { server.stop() }
+
+        let client = ZaloSessionClient(dataDirectory: root, useKeychain: false)
+        let ws = ZaloWebSocket()
+        let domains = server.domains(for: ["file", "chat_e2e", "e2ee"])
+        var account = ZaloLoginAccount()
+        account.userId = "alice_uid"
+        await client.updateCredentials(account: account, secretKey: key, zpwSek: "sek.1.2", domains: domains)
+
+        // 1) E2EE Photo (cmd 16004): HD upload (`isE2EE: 1, eeType: "HD"`), thumb upload (`isE2EE: 1, eeType: "normal"`),
+        //    /api/e2ee/pc/message/photo request shape, Signal decryption, and AES-256-GCM byte-for-byte round trip.
+        let plainPNG = MediaRecorderTests.onePixelPNG
+        let photoRes = try await client.uploadAndSendE2EEPhoto(
+            convId: "bob_uid",
+            fileName: "secret.png",
+            plaintextData: plainPNG,
+            width: 1,
+            height: 1,
+            e2eeManager: mgrAlice,
+            store: storeAlice,
+            webSocket: ws
+        )
+        #expect(photoRes.msgId == "77001")
+        #expect(photoRes.url.hasPrefix("https://cdn.example/e2ee_photo_hd.jpg?e2esession="))
+
+        let photoReqs = captured.withLock { $0 }
+        let hdUpload = try #require(photoReqs.first(where: { $0.path == "/api/message/photo_original/upload" && ($0.payload.dict["eeType"] as? String) == "HD" }))
+        let thumbUpload = try #require(photoReqs.first(where: { $0.path == "/api/message/photo_original/upload" && ($0.payload.dict["eeType"] as? String) == "normal" }))
+        #expect(JSONLossless.int64(hdUpload.payload.dict["isE2EE"]) == 1)
+        #expect(JSONLossless.int64(thumbUpload.payload.dict["isE2EE"]) == 1)
+        let uploadedPhotoBytes = try #require(hdUpload.chunkBytes)
+        let uploadedThumbBytes = try #require(thumbUpload.chunkBytes)
+        #expect(uploadedPhotoBytes != plainPNG)
+
+        let sendPhotoReq = try #require(photoReqs.first(where: { $0.path == "/api/e2ee/pc/message/photo" }))
+        #expect(JSONLossless.int64(sendPhotoReq.payload.dict["destType"]) == 3)
+        #expect(JSONLossless.string(sendPhotoReq.payload.dict["threadId"]) == "bob_uid")
+        let photoListStr = try #require(sendPhotoReq.payload.dict["listParams"] as? String)
+        let photoList = try #require(try JSONSerialization.jsonObject(with: Data(photoListStr.utf8)) as? [[String: Any]])
+        let photoEntry = try #require(photoList.first)
+        #expect(photoEntry["toId"] as? String == "bob_uid")
+        #expect(JSONLossless.int64(photoEntry["platform"]) == 2)
+        #expect(JSONLossless.int64(photoEntry["photoId"]) == 88001)
+
+        func decryptFromURL(_ urlStr: String, ciphertext: Data) throws -> Data {
+            guard let parsedURL = URL(string: urlStr),
+                  let mediaURL = ZaloMediaURL.parse(parsedURL),
+                  case .stream(let stream) = mediaURL.encryption else {
+                throw NSError(domain: "E2EETest", code: 1, userInfo: [NSLocalizedDescriptionKey: "Expected valid SecureStream"])
+            }
+            return try stream.decrypt(ciphertext)
+        }
+
+        // Bob decrypts the Signal ciphers embedded in URLs + prmE2EE, then AES-256-GCM decrypts uploaded photo & thumb.
+        let hdUrlStr = try #require(photoEntry["hdUrl"] as? String)
+        let thumbUrlStr = try #require(photoEntry["thumbUrl"] as? String)
+        let normalUrlStr = try #require(photoEntry["normalUrl"] as? String)
+        let encHdKey = try #require(Self.extractQueryParam("e2esession", from: hdUrlStr))
+        let encThumbKey = try #require(Self.extractQueryParam("e2esession", from: thumbUrlStr))
+        let encNormalKey = try #require(Self.extractQueryParam("e2esession", from: normalUrlStr))
+        let decDesc = try await bobDecrypt(try #require(photoEntry["desc"] as? String))
+        let decPhotoParams = try await bobDecrypt(try #require(photoEntry["prmE2EE"] as? String))
+        let decThumbSession = try await bobDecrypt(encThumbKey)
+        let decNormalSession = try await bobDecrypt(encNormalKey)
+        let decHdSession = try await bobDecrypt(encHdKey)
+        #expect(decDesc == "")
+        #expect(decNormalSession == decHdSession)
+        #expect(decThumbSession != decHdSession)
+        let photoParamsObj = try #require(JSONLossless.parseObject(Data(decPhotoParams.utf8)))
+        #expect(JSONLossless.int64(photoParamsObj["width"]) == 1)
+        #expect(JSONLossless.int64(photoParamsObj["height"]) == 1)
+        #expect(photoParamsObj["hd"] as? String == "https://cdn.example/e2ee_photo_hd.jpg?e2esession=\(decHdSession)")
+
+        let recoveredPNG = try decryptFromURL("https://cdn.example/e2ee_photo_hd.jpg?e2esession=\(decHdSession)", ciphertext: uploadedPhotoBytes)
+        #expect(recoveredPNG == plainPNG)
+
+        let recoveredThumb = try decryptFromURL("https://cdn.example/e2ee_photo_thumb.jpg?e2esession=\(decThumbSession)", ciphertext: uploadedThumbBytes)
+        #expect(recoveredThumb.starts(with: [0xFF, 0xD8, 0xFF]))
+
+        // 2) E2EE Video (cmd 16012, msgType 5): video & thumb upload (`isE2EE: 1`),
+        //    /api/e2ee/pc/message/forward request shape, Signal decryption, and AES-256-GCM round trip.
+        captured.withLock { $0.removeAll() }
+        let plainVideo = Data((0..<4096).map { UInt8(($0 * 31) & 0xFF) })
+        let plainVideoThumb = Data([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01])
+        let vidRes = try await client.uploadAndSendE2EEVideo(
+            convId: "bob_uid",
+            fileName: "clip.mp4",
+            plaintextData: plainVideo,
+            thumbnailData: plainVideoThumb,
+            durationMs: 4200,
+            width: 1280,
+            height: 720,
+            e2eeManager: mgrAlice,
+            store: storeAlice,
+            webSocket: ws
+        )
+        #expect(vidRes.msgId == "77002")
+        #expect(vidRes.url.hasPrefix("https://cdn.example/e2ee_video.mp4?e2esession="))
+        #expect(vidRes.thumbUrl.hasPrefix("https://cdn.example/e2ee_video_thumb.jpg?e2esession="))
+
+        let vidReqs = captured.withLock { $0 }
+        let vidUpload = try #require(vidReqs.first(where: { $0.path == "/api/message/video/file/upload" }))
+        let vidThumbUpload = try #require(vidReqs.first(where: { $0.path == "/api/message/video/thumb/upload" }))
+        #expect(JSONLossless.int64(vidUpload.payload.dict["isE2EE"]) == 1)
+        #expect(JSONLossless.int64(vidThumbUpload.payload.dict["isE2EE"]) == 1)
+        let uploadedVidBytes = try #require(vidUpload.chunkBytes)
+        let uploadedVidThumbBytes = try #require(vidThumbUpload.chunkBytes)
+        #expect(uploadedVidBytes != plainVideo)
+        #expect(uploadedVidThumbBytes != plainVideoThumb)
+
+        let fwdReq = try #require(vidReqs.first(where: { $0.path == "/api/e2ee/pc/message/forward" }))
+        #expect(JSONLossless.int64(fwdReq.payload.dict["msgType"]) == 5)
+        #expect(JSONLossless.int64(fwdReq.payload.dict["destType"]) == 3)
+        #expect(JSONLossless.string(fwdReq.payload.dict["threadId"]) == "bob_uid")
+        let fwdListStr = try #require(fwdReq.payload.dict["listParams"] as? String)
+        let fwdList = try #require(try JSONSerialization.jsonObject(with: Data(fwdListStr.utf8)) as? [[String: Any]])
+        let fwdEntry = try #require(fwdList.first)
+        let msgInfoStr = try #require(fwdEntry["msgInfo"] as? String)
+        let msgInfo = try #require(JSONLossless.parseObject(Data(msgInfoStr.utf8)))
+        let vidUrlStr = try #require(msgInfo["videoUrl"] as? String)
+        let vidThumbUrlStr = try #require(msgInfo["thumbUrl"] as? String)
+        let decVidTitle = try await bobDecrypt(try #require(msgInfo["title"] as? String))
+        let decVidSession = try await bobDecrypt(try #require(Self.extractQueryParam("e2esession", from: vidUrlStr)))
+        let decVidThumbSession = try await bobDecrypt(try #require(Self.extractQueryParam("e2esession", from: vidThumbUrlStr)))
+        let decVidParams = try await bobDecrypt(try #require(msgInfo["prmE2EE"] as? String))
+        #expect(decVidTitle == "")
+        #expect(decVidSession != decVidThumbSession)
+        let vidParamsObj = try #require(JSONLossless.parseObject(Data(decVidParams.utf8)))
+        #expect(JSONLossless.int64(vidParamsObj["duration"]) == 4200)
+        #expect(JSONLossless.int64(vidParamsObj["video_width"]) == 1280)
+        #expect(JSONLossless.int64(vidParamsObj["video_height"]) == 720)
+        #expect(JSONLossless.int64(vidParamsObj["fileSize"]) == Int64(plainVideo.count))
+
+        #expect(try decryptFromURL("https://cdn.example/e2ee_video.mp4?e2esession=\(decVidSession)", ciphertext: uploadedVidBytes) == plainVideo)
+        #expect(try decryptFromURL("https://cdn.example/e2ee_video_thumb.jpg?e2esession=\(decVidThumbSession)", ciphertext: uploadedVidThumbBytes) == plainVideoThumb)
+
+        // 3) E2EE Video fallback (cmd 16005) when 16012 rejects: falls back to /api/e2ee/pc/message/file, NEVER plaintext.
+        captured.withLock { $0.removeAll() }
+        failVideoForward.withLock { $0 = true }
+        let fbRes = try await client.uploadAndSendE2EEVideo(
+            convId: "bob_uid",
+            fileName: "fallback.mp4",
+            plaintextData: plainVideo,
+            thumbnailData: plainVideoThumb,
+            durationMs: 2000,
+            width: 640,
+            height: 360,
+            e2eeManager: mgrAlice,
+            store: storeAlice,
+            webSocket: ws
+        )
+        #expect(fbRes.msgId == "77003")
+        #expect(fbRes.url.hasPrefix("https://cdn.example/e2ee_video_as_file.mp4?e2esession="))
+        let fbReqs = captured.withLock { $0 }
+        #expect(!fbReqs.contains(where: { $0.path == "/api/message/forward" || $0.path == "/api/message/asyncfile/msg" }))
+        let asyncUp = try #require(fbReqs.first(where: { $0.path == "/api/message/asyncfile/upload" }))
+        #expect(JSONLossless.int64(asyncUp.payload.dict["isE2EE"]) == 1)
+        let fileSendReq = try #require(fbReqs.first(where: { $0.path == "/api/e2ee/pc/message/file" }))
+        let fileListStr = try #require(fileSendReq.payload.dict["listParams"] as? String)
+        let fileList = try #require(try JSONSerialization.jsonObject(with: Data(fileListStr.utf8)) as? [[String: Any]])
+        let fileEntry = try #require(fileList.first)
+        let fileUrlStr = try #require(fileEntry["fileUrl"] as? String)
+        let decFileSession = try await bobDecrypt(try #require(Self.extractQueryParam("e2esession", from: fileUrlStr)))
+        let decFileParams = try await bobDecrypt(try #require(fileEntry["prmE2EE"] as? String))
+        let decFileName = try await bobDecrypt(try #require(fileEntry["fileName"] as? String))
+        #expect(decFileName == "fallback.mp4")
+        #expect(decFileParams.contains("\"fileExt\":\"mp4\""))
+        let uploadedAsyncBytes = try #require(asyncUp.chunkBytes)
+        #expect(try decryptFromURL("https://cdn.example/e2ee_video_as_file.mp4?e2esession=\(decFileSession)", ciphertext: uploadedAsyncBytes) == plainVideo)
+
+        // 4) Fail-closed when recipient has no E2EE session: zero upload/send requests leave the device.
+        captured.withLock { $0.removeAll() }
+        do {
+            _ = try await client.uploadAndSendE2EEPhoto(
+                convId: "no_session_peer",
+                fileName: "secret.png",
+                plaintextData: plainPNG,
+                width: 1,
+                height: 1,
+                e2eeManager: mgrAlice,
+                store: storeAlice,
+                webSocket: ws
+            )
+            Issue.record("Expected uploadAndSendE2EEPhoto to fail closed without a session")
+        } catch is ZaloSessionError {
+            // expected
+        }
+        do {
+            _ = try await client.uploadAndSendE2EEVideo(
+                convId: "no_session_peer",
+                fileName: "secret.mp4",
+                plaintextData: plainVideo,
+                thumbnailData: plainVideoThumb,
+                durationMs: 1000,
+                width: 640,
+                height: 360,
+                e2eeManager: mgrAlice,
+                store: storeAlice,
+                webSocket: ws
+            )
+            Issue.record("Expected uploadAndSendE2EEVideo to fail closed without a session")
+        } catch is ZaloSessionError {
+            // expected
+        }
+        let failClosedPaths = captured.withLock { $0.map(\.path) }
+        #expect(!failClosedPaths.contains(where: { $0.contains("upload") || $0.contains("/message/photo") || $0.contains("/message/forward") || $0.contains("/message/file") }))
     }
 }

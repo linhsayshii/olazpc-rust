@@ -456,6 +456,8 @@ pub(crate) struct PendingSendMedia {
     pub conv_id: String,
     pub paths: Vec<String>,
     pub idx: usize,
+    pub is_group: bool,
+    pub is_e2ee: bool,
     pub sent_any: bool,
     pub now_ms: i64,
     pub current_file_name: String,

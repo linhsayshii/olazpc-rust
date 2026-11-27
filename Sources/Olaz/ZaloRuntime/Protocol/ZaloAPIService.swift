@@ -1,6 +1,8 @@
 import CryptoKit
 import Foundation
+import ImageIO
 import OlazCore
+import UniformTypeIdentifiers
 
 struct SendMessageResult: Sendable {
     var msgId: String
@@ -595,6 +597,12 @@ extension ZaloSessionClient {
         return str
     }
 
+    static func appendE2EESession(_ url: String, session: String) -> String {
+        guard !url.isEmpty, !session.isEmpty else { return url }
+        let sep = url.contains("?") ? "&e2esession=" : "?e2esession="
+        return "\(url)\(sep)\(session)"
+    }
+
     static func buildE2EEFileListParamEntry(
         toId: String,
         platform: Int,
@@ -610,7 +618,6 @@ extension ZaloSessionClient {
         cipherThumb: String,
         ttl: Int = 0
     ) -> [String: Any] {
-        let sep = rawFileUrl.contains("?") ? "&e2esession=" : "?e2esession="
         let fidVal: Any = Int64(fileId) ?? fileId
         return buildE2EEListParamEntry(
             toId: toId,
@@ -624,12 +631,164 @@ extension ZaloSessionClient {
             compatVersion: 0,
             extraFields: [
                 "fileId": fidVal,
-                "fileUrl": "\(rawFileUrl)\(sep)\(cipherSession)",
+                "fileUrl": appendE2EESession(rawFileUrl, session: cipherSession),
                 "prmE2EE": cipherParams,
                 "fileName": cipherFileName,
                 "thumb": cipherThumb,
             ]
         )
+    }
+
+    /// Builds the multipart chunk upload spec for 1-1 / group photos (plaintext or E2EE with `isE2EE: 1` and `eeType` `"HD"` / `"normal"`).
+    static func buildPhotoChunkUploadSpec(
+        convId: String,
+        fileName: String,
+        totalChunk: Int,
+        chunkId: Int,
+        totalSize: Int,
+        clientId: Int64,
+        imei: String,
+        isE2EE: Bool = false,
+        eeType: String? = nil
+    ) -> VideoUploadRequestSpec {
+        let isGroup = ZaloWireParser.isGroupId(convId)
+        let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
+        var payload: [String: Any] = [
+            "totalChunk": totalChunk,
+            "fileName": fileName,
+            "clientId": clientId,
+            "totalSize": totalSize,
+            "imei": imei,
+            "isE2EE": isE2EE ? 1 : 0,
+            "jxl": 0,
+            "chunkId": chunkId,
+        ]
+        if isE2EE, let eeType, !eeType.isEmpty {
+            payload["eeType"] = eeType
+        }
+        if isGroup {
+            payload["grid"] = cleanId
+        } else {
+            payload["toid"] = cleanId
+        }
+        return VideoUploadRequestSpec(
+            service: "file",
+            path: isGroup ? "/api/group/photo_original/upload" : "/api/message/photo_original/upload",
+            queryParams: ["type": isGroup ? "11" : "2"],
+            encryptedPayload: payload,
+            fieldName: "chunkContent",
+            fileName: fileName,
+            mimeType: mimeType(forFileName: fileName)
+        )
+    }
+
+    /// Official `sendMsgPhotoAsync` `prmE2EE` JSON payload encrypted per device for cmd `16004`.
+    static func buildPhotoMsgParamsJSON(
+        width: Int,
+        height: Int,
+        hdUrl: String,
+        rawUrl: String,
+        rawThumbUrl: String
+    ) -> String {
+        var obj: [String: Any] = [
+            "width": max(0, width),
+            "height": max(0, height),
+            "hd": hdUrl.isEmpty ? rawUrl : hdUrl,
+        ]
+        if !hdUrl.isEmpty { obj["hdUrl"] = hdUrl }
+        if !rawUrl.isEmpty { obj["rawUrl"] = rawUrl }
+        if !rawThumbUrl.isEmpty { obj["rawThumbUrl"] = rawThumbUrl }
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: obj,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        ) else {
+            return "{}"
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Official `sendFileAsync(..., isPhoto: true)` `listParams` entry for `/api/e2ee/pc/message/photo` (cmd `16004`).
+    static func buildE2EEPhotoListParamEntry(
+        toId: String,
+        platform: Int,
+        clientId: Int64,
+        imei: String,
+        registrationId: Int,
+        senderIid: Int,
+        photoId: String,
+        width: Int,
+        height: Int,
+        hdSize: Int,
+        rawThumbUrl: String,
+        rawNormalUrl: String,
+        rawHdUrl: String,
+        rawRawUrl: String,
+        rawOriUrl: String,
+        cipherDesc: String,
+        cipherParams: String,
+        cipherThumbKey: String,
+        cipherNormalKey: String,
+        cipherHdKey: String,
+        cipherRawKey: String,
+        cipherOriKey: String,
+        ttl: Int = 0
+    ) -> [String: Any] {
+        let pidVal: Any = Int64(photoId) ?? photoId
+        return buildE2EEListParamEntry(
+            toId: toId,
+            platform: platform,
+            clientId: clientId,
+            imei: imei,
+            registrationId: registrationId,
+            senderIid: senderIid,
+            ttl: ttl,
+            version: 0,
+            compatVersion: 0,
+            extraFields: [
+                "photoId": pidVal,
+                "desc": cipherDesc,
+                "prmE2EE": cipherParams,
+                "width": max(0, width),
+                "height": max(0, height),
+                "hdSize": max(0, hdSize),
+                "thumbUrl": appendE2EESession(rawThumbUrl, session: cipherThumbKey),
+                "normalUrl": appendE2EESession(rawNormalUrl, session: cipherNormalKey),
+                "hdUrl": appendE2EESession(rawHdUrl, session: cipherHdKey),
+                "rawUrl": appendE2EESession(rawRawUrl, session: cipherRawKey),
+                "oriUrl": appendE2EESession(rawOriUrl, session: cipherOriKey),
+                "zsource": -1,
+                "jcp": "{\"convertible\":true}",
+            ]
+        )
+    }
+
+    /// Generates a bounded JPEG thumbnail for E2EE photo uploads (encrypted separately under `eeType: "normal"`).
+    static func makeE2EEPhotoThumbnailJPEG(_ data: Data, maxPixelSize: Int = 360) -> Data? {
+        guard !data.isEmpty,
+              let src = CGImageSourceCreateWithData(data as CFData, nil) else {
+            return nil
+        }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else {
+            return nil
+        }
+        let out = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(
+            out,
+            UTType.jpeg.identifier as CFString,
+            1,
+            nil
+        ) else {
+            return nil
+        }
+        let encOpts: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.75]
+        CGImageDestinationAddImage(dest, cgImage, encOpts as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return out as Data
     }
 
     static func buildAsyncFileMsgPayload(
@@ -863,6 +1022,232 @@ extension ZaloSessionClient {
             }
         }
         return ""
+    }
+
+    /// Encrypts photo bytes + thumbnail with separate AES-256-GCM keys, uploads with `isE2EE: 1`
+    /// (`eeType: "HD"` / `"normal"`), and sends via `/api/e2ee/pc/message/photo` (cmd `16004`).
+    /// Fails closed when no E2EE Signal session is available — never falls back to plaintext.
+    func uploadAndSendE2EEPhoto(
+        convId: String,
+        fileName: String,
+        plaintextData: Data,
+        width: Int,
+        height: Int,
+        e2eeManager: ZaloE2EEManager,
+        store: ZaloSQLiteStore?,
+        webSocket: ZaloWebSocket
+    ) async throws -> UploadedMediaResult {
+        guard !ZaloWireParser.isGroupId(convId) else {
+            throw ZaloSessionError(
+                code: -1,
+                message: "Ảnh nhóm không dùng mã hóa đầu cuối 1-1.",
+                url: "/api/e2ee/pc/message/photo"
+            )
+        }
+        let cleanId = ZaloWireParser.stripUserPrefix(convId)
+        guard let rawMyUid = account?.userId, !rawMyUid.isEmpty else {
+            throw ZaloSessionError(
+                code: -108,
+                message: "Chưa đăng nhập.",
+                url: "/api/e2ee/pc/message/photo"
+            )
+        }
+        let myUid = ZaloWireParser.stripUserPrefix(rawMyUid)
+
+        // Fail closed before uploading any bytes if no Signal session exists for recipient.
+        let ready = await e2eeManager.ensureSessions(
+            forPeer: cleanId,
+            myUid: myUid,
+            webSocket: webSocket,
+            store: store
+        )
+        guard ready else {
+            throw ZaloSessionError(
+                code: -1,
+                message: "Chưa có phiên mã hóa đầu cuối với người nhận.",
+                url: "/api/e2ee/pc/message/photo"
+            )
+        }
+
+        let (encData, photoSessionB64) = try SecureStream.encryptE2EEFile(plaintextData)
+        let cliInt = nextClientId()
+        let cliId = "\(cliInt)"
+        let w = width > 0 ? width : 800
+        let h = height > 0 ? height : 600
+        let chunkSize = 1024 * 1024
+        let totalChunk = max(1, (encData.count + chunkSize - 1) / chunkSize)
+        var uploadDataDict: [String: Any] = [:]
+
+        for chunkIndex in 0..<totalChunk {
+            let start = chunkIndex * chunkSize
+            let end = min(start + chunkSize, encData.count)
+            let slice = encData.subdata(in: start..<end)
+            let spec = Self.buildPhotoChunkUploadSpec(
+                convId: cleanId,
+                fileName: fileName,
+                totalChunk: totalChunk,
+                chunkId: chunkIndex + 1,
+                totalSize: encData.count,
+                clientId: cliInt,
+                imei: imei,
+                isE2EE: true,
+                eeType: "HD"
+            )
+            let resp = try await postMultipart(
+                service: spec.service,
+                path: spec.path,
+                queryParams: spec.queryParams,
+                encryptedPayload: spec.encryptedPayload,
+                fieldName: spec.fieldName,
+                fileName: spec.fileName,
+                mimeType: spec.mimeType,
+                chunkData: slice
+            )
+            if let d = resp["data"] as? [String: Any],
+               !JSONLossless.string(d["normalUrl"] ?? d["hdUrl"] ?? d["rawUrl"] ?? d["oriUrl"]).isEmpty {
+                uploadDataDict = d
+            }
+        }
+
+        let rawNormalUrl = JSONLossless.string(uploadDataDict["normalUrl"])
+        let rawHdUrl = JSONLossless.string(uploadDataDict["hdUrl"]).isEmpty ? rawNormalUrl : JSONLossless.string(uploadDataDict["hdUrl"])
+        let rawRawUrl = JSONLossless.string(uploadDataDict["rawUrl"]).isEmpty ? rawNormalUrl : JSONLossless.string(uploadDataDict["rawUrl"])
+        let rawOriUrl = JSONLossless.string(uploadDataDict["oriUrl"]).isEmpty ? rawNormalUrl : JSONLossless.string(uploadDataDict["oriUrl"])
+        let serverRawThumbUrl = JSONLossless.string(uploadDataDict["thumbUrl"])
+        let photoId = JSONLossless.string(uploadDataDict["photoId"])
+
+        let effectiveNormalUrl = !rawNormalUrl.isEmpty ? rawNormalUrl : (!rawHdUrl.isEmpty ? rawHdUrl : rawRawUrl)
+        guard !effectiveNormalUrl.isEmpty else {
+            throw ZaloSessionError(
+                code: -1,
+                message: "Tải ảnh mã hóa lên thất bại.",
+                url: "/api/message/photo_original/upload"
+            )
+        }
+
+        // Encrypt & upload thumbnail separately (`eeType: "normal"`). If thumbnail creation/upload fails,
+        // fall back to the encrypted main image URL + key (still E2EE).
+        var rawThumbUrl = effectiveNormalUrl
+        var thumbSessionB64 = photoSessionB64
+        if let thumbJPEG = Self.makeE2EEPhotoThumbnailJPEG(plaintextData),
+           let (encThumb, genThumbSession) = try? SecureStream.encryptE2EEFile(thumbJPEG) {
+            let thumbCliInt = nextClientId()
+            let thumbSpec = Self.buildPhotoChunkUploadSpec(
+                convId: cleanId,
+                fileName: "thumb.jpg",
+                totalChunk: 1,
+                chunkId: 1,
+                totalSize: encThumb.count,
+                clientId: thumbCliInt,
+                imei: imei,
+                isE2EE: true,
+                eeType: "normal"
+            )
+            if let thumbResp = try? await postMultipart(
+                service: thumbSpec.service,
+                path: thumbSpec.path,
+                queryParams: thumbSpec.queryParams,
+                encryptedPayload: thumbSpec.encryptedPayload,
+                fieldName: thumbSpec.fieldName,
+                fileName: thumbSpec.fileName,
+                mimeType: "image/jpeg",
+                chunkData: encThumb
+            ),
+               let td = thumbResp["data"] as? [String: Any] {
+                let candidate = JSONLossless.string(
+                    td["rawUrl"] ?? td["oriUrl"] ?? td["hdUrl"] ?? td["normalUrl"] ?? td["thumbUrl"]
+                )
+                if !candidate.isEmpty {
+                    rawThumbUrl = candidate
+                    thumbSessionB64 = genThumbSession
+                }
+            }
+        }
+
+        let hdUrlFinal = rawHdUrl.isEmpty ? effectiveNormalUrl : rawHdUrl
+        let rawUrlFinal = rawRawUrl.isEmpty ? effectiveNormalUrl : rawRawUrl
+        let oriUrlFinal = rawOriUrl.isEmpty ? effectiveNormalUrl : rawOriUrl
+        let photoParamsJSON = Self.buildPhotoMsgParamsJSON(
+            width: w,
+            height: h,
+            hdUrl: Self.appendE2EESession(hdUrlFinal, session: photoSessionB64),
+            rawUrl: Self.appendE2EESession(rawUrlFinal, session: photoSessionB64),
+            rawThumbUrl: serverRawThumbUrl
+        )
+
+        let targets = await e2eeManager.encryptPhotoMessage(
+            peerUid: cleanId,
+            myUid: myUid,
+            desc: "",
+            photoParamsJSON: photoParamsJSON,
+            thumbSessionB64: thumbSessionB64,
+            normalSessionB64: photoSessionB64,
+            hdSessionB64: photoSessionB64,
+            rawSessionB64: photoSessionB64,
+            oriSessionB64: photoSessionB64,
+            store: store
+        )
+        guard !targets.isEmpty else {
+            throw ZaloSessionError(
+                code: -1,
+                message: "Không thể mã hóa ảnh đầu cuối.",
+                url: "/api/e2ee/pc/message/photo"
+            )
+        }
+
+        let senderIid = await e2eeManager.localRegistrationId()
+        let listParams: [[String: Any]] = targets.compactMap { target in
+            guard target.ciphers.count >= 7 else { return nil }
+            return Self.buildE2EEPhotoListParamEntry(
+                toId: target.toId,
+                platform: target.platform,
+                clientId: cliInt,
+                imei: imei,
+                registrationId: target.registrationId,
+                senderIid: senderIid,
+                photoId: photoId,
+                width: w,
+                height: h,
+                hdSize: encData.count,
+                rawThumbUrl: rawThumbUrl,
+                rawNormalUrl: effectiveNormalUrl,
+                rawHdUrl: hdUrlFinal,
+                rawRawUrl: rawUrlFinal,
+                rawOriUrl: oriUrlFinal,
+                cipherDesc: target.ciphers[0],
+                cipherParams: target.ciphers[1],
+                cipherThumbKey: target.ciphers[2],
+                cipherNormalKey: target.ciphers[3],
+                cipherHdKey: target.ciphers[4],
+                cipherRawKey: target.ciphers[5],
+                cipherOriKey: target.ciphers[6]
+            )
+        }
+        guard !listParams.isEmpty else {
+            throw ZaloSessionError(
+                code: -1,
+                message: "Không thể đóng gói ảnh mã hóa đầu cuối.",
+                url: "/api/e2ee/pc/message/photo"
+            )
+        }
+
+        let sendRes = try await sendE2EEMessageAPI(
+            endpoint: "photo",
+            threadId: cleanId,
+            isGroup: false,
+            clientId: cliInt,
+            listParams: ZaloJSONArrayBox(listParams),
+            destType: 3
+        )
+        let msgId = sendRes.msgId.isEmpty ? cliId : sendRes.msgId
+        let localURL = Self.appendE2EESession(hdUrlFinal, session: photoSessionB64)
+        return UploadedMediaResult(
+            url: localURL,
+            msgId: msgId,
+            cliMsgId: cliId,
+            width: w,
+            height: h
+        )
     }
 
     func uploadAndSendPhoto(

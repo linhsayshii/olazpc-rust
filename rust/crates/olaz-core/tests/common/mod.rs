@@ -1422,6 +1422,7 @@ pub struct RecordingHost {
     e2ee_send_results: Mutex<VecDeque<Result<SendMessageResult, String>>>,
     resolve_media_results: Mutex<VecDeque<MediaResolutionOutcome>>,
     resolve_file_results: Mutex<VecDeque<FileResolutionOutcome>>,
+    has_fetch_media_data_hook: bool,
     fetch_media_data_results: Mutex<VecDeque<bool>>,
     send_media_results: Mutex<VecDeque<ComposerSendOutcome>>,
     send_files_results: Mutex<VecDeque<ComposerSendOutcome>>,
@@ -1722,6 +1723,11 @@ impl RecordingHost {
                 resolve_file_results.push_back(outcome);
             }
         }
+        let has_fetch_media_data_hook = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("fetch_media_data"))
+            .is_some();
         let mut fetch_media_data_results = VecDeque::new();
         if let Some(arr) = seed
             .host_results
@@ -1805,6 +1811,7 @@ impl RecordingHost {
             e2ee_send_results: Mutex::new(e2ee_send_results),
             resolve_media_results: Mutex::new(resolve_media_results),
             resolve_file_results: Mutex::new(resolve_file_results),
+            has_fetch_media_data_hook,
             fetch_media_data_results: Mutex::new(fetch_media_data_results),
             send_media_results: Mutex::new(send_media_results),
             send_files_results: Mutex::new(send_files_results),
@@ -2813,7 +2820,9 @@ impl Host for RecordingHost {
     }
 
     async fn fetch_media_data(&self, url: String) -> Option<String> {
-        self.record("fetch_media_data", json!({ "url": url }));
+        if self.has_fetch_media_data_hook {
+            self.record("fetch_media_data", json!({ "url": url }));
+        }
         let ok = self
             .fetch_media_data_results
             .lock()
@@ -3084,6 +3093,7 @@ impl Host for RecordingHost {
         size: i64,
         width: i64,
         height: i64,
+        is_e2ee: bool,
     ) -> Result<UploadedPhotoResult, String> {
         let has_hook = self
             .media
@@ -3091,21 +3101,26 @@ impl Host for RecordingHost {
             .unwrap_or_else(PoisonError::into_inner)
             .has_upload_photo_hook;
         if has_hook {
-            self.record(
-                "upload_photo",
-                json!({
-                    "conv_id": conv_id,
-                    "file_name": file_name,
-                    "size": size,
-                    "width": width,
-                    "height": height,
-                }),
-            );
+            let mut args = json!({
+                "conv_id": conv_id,
+                "file_name": file_name,
+                "size": size,
+                "width": width,
+                "height": height,
+            });
+            if is_e2ee && let Some(obj) = args.as_object_mut() {
+                obj.insert("is_e2ee".to_owned(), Value::Bool(true));
+            }
+            self.record("upload_photo", args);
             return self
                 .media
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .pop_upload_photo();
+        }
+        if is_e2ee {
+            // Fail closed when no E2EE Signal session is available (never silently upload plaintext).
+            return Err("Chưa có phiên mã hóa đầu cuối với người nhận.".to_owned());
         }
         let Some(client) = self
             .session_client
@@ -3249,6 +3264,7 @@ impl Host for RecordingHost {
         width: i64,
         height: i64,
         has_thumb: bool,
+        is_e2ee: bool,
     ) -> Result<UploadedVideoResult, String> {
         let has_hook = self
             .media
@@ -3256,23 +3272,28 @@ impl Host for RecordingHost {
             .unwrap_or_else(PoisonError::into_inner)
             .has_upload_video_hook;
         if has_hook {
-            self.record(
-                "upload_video",
-                json!({
-                    "conv_id": conv_id,
-                    "file_name": file_name,
-                    "size": size,
-                    "duration_ms": duration_ms,
-                    "width": width,
-                    "height": height,
-                    "has_thumb": has_thumb,
-                }),
-            );
+            let mut args = json!({
+                "conv_id": conv_id,
+                "file_name": file_name,
+                "size": size,
+                "duration_ms": duration_ms,
+                "width": width,
+                "height": height,
+                "has_thumb": has_thumb,
+            });
+            if is_e2ee && let Some(obj) = args.as_object_mut() {
+                obj.insert("is_e2ee".to_owned(), Value::Bool(true));
+            }
+            self.record("upload_video", args);
             return self
                 .media
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .pop_upload_video();
+        }
+        if is_e2ee {
+            // Fail closed when no E2EE Signal session is available (never silently upload plaintext).
+            return Err("Chưa có phiên mã hóa đầu cuối với người nhận.".to_owned());
         }
         let Some(client) = self
             .session_client

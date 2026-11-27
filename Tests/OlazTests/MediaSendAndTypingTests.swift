@@ -544,4 +544,55 @@ private func makeTinyVideoClip(
 
         engine.stopCoreEngine()
     }
+
+    @MainActor
+    @Test("sendMedia detects persisted e2eeThreadsV1 on cold start before start()")
+    func sendMediaDetectsPersistedE2EEOnColdStartBeforeStart() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("olaz-cold-media-e2ee-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let uid = "2009902"
+        let peerId = "3009902"
+        let sessionObj: [String: Any] = [
+            "plainAccount": [
+                "userId": uid,
+                "displayName": "Cold Media User",
+            ]
+        ]
+        try JSONSerialization.data(withJSONObject: sessionObj)
+            .write(to: dir.appendingPathComponent("native-session.json"))
+
+        let dbURL = dir
+            .appendingPathComponent("accounts", isDirectory: true)
+            .appendingPathComponent(uid, isDirectory: true)
+            .appendingPathComponent("history.sqlite3")
+        let seedStore = try ZaloSQLiteStore(path: dbURL.path)
+        try await seedStore.setPreferenceStrings(key: "e2eeThreadsV1", value: [peerId])
+
+        let photoURL = dir.appendingPathComponent("cold.png")
+        try MediaRecorderTests.onePixelPNG.write(to: photoURL)
+
+        let engine = ZaloEngine(dataDirectory: dir, useKeychain: false)
+        var observedPhotoIsE2EE: Bool?
+        engine.uploadPhotoHostHandler = { args in
+            observedPhotoIsE2EE = args["is_e2ee"] as? Bool
+            return UploadedMediaResult(
+                url: "https://cdn.example.invalid/cold.png?e2esession=abc",
+                msgId: "99002",
+                cliMsgId: "5009902",
+                width: 1,
+                height: 1
+            )
+        }
+
+        let outcome = await engine.sendMedia([photoURL], to: peerId)
+        #expect(outcome == .done)
+        #expect(observedPhotoIsE2EE == true)
+        let msg = engine.messages[peerId]?.first(where: { $0.id == "99002" })
+        #expect(msg?.isE2EE == true)
+
+        engine.stopCoreEngine()
+    }
 }

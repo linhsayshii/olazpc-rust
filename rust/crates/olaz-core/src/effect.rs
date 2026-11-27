@@ -1475,6 +1475,7 @@ pub enum Effect {
         size: i64,
         width: i64,
         height: i64,
+        is_e2ee: bool,
     },
     MediaUploadVideo {
         op_id: u64,
@@ -1485,6 +1486,7 @@ pub enum Effect {
         width: i64,
         height: i64,
         has_thumb: bool,
+        is_e2ee: bool,
     },
     MediaAllocClientId {
         op_id: u64,
@@ -2041,6 +2043,7 @@ impl fmt::Debug for Effect {
                 size,
                 width,
                 height,
+                is_e2ee,
                 ..
             } => f
                 .debug_struct("MediaUploadPhoto")
@@ -2048,12 +2051,14 @@ impl fmt::Debug for Effect {
                 .field("size", size)
                 .field("width", width)
                 .field("height", height)
+                .field("is_e2ee", is_e2ee)
                 .finish(),
             Self::MediaUploadVideo {
                 op_id,
                 size,
                 duration_ms,
                 has_thumb,
+                is_e2ee,
                 ..
             } => f
                 .debug_struct("MediaUploadVideo")
@@ -2061,6 +2066,7 @@ impl fmt::Debug for Effect {
                 .field("size", size)
                 .field("duration_ms", duration_ms)
                 .field("has_thumb", has_thumb)
+                .field("is_e2ee", is_e2ee)
                 .finish(),
             Self::MediaAllocClientId { op_id } => f
                 .debug_struct("MediaAllocClientId")

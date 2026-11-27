@@ -226,6 +226,13 @@ fn handle_command(state: &mut CoreState, op_id: Option<u64>, cmd: Command, out: 
             let Some(op_id) = op_id else {
                 return;
             };
+            let is_group = is_group_id(&conv_id);
+            let needs_e2ee_load = !is_group && !state.send.e2ee_threads_loaded;
+            let is_e2ee = if is_group {
+                false
+            } else {
+                state.send.e2ee_threads.contains(&conv_id)
+            };
             state.media.pending_send_media.insert(
                 op_id,
                 PendingSendMedia {
@@ -233,13 +240,20 @@ fn handle_command(state: &mut CoreState, op_id: Option<u64>, cmd: Command, out: 
                     conv_id,
                     paths,
                     idx: 0,
+                    is_group,
+                    is_e2ee,
                     sent_any: false,
                     now_ms,
                     current_file_name: String::new(),
                     current_size: 0,
                 },
             );
-            advance_send_media(state, op_id, out);
+            if needs_e2ee_load {
+                out.effects
+                    .push(Effect::MediaLoadPersistedE2eeThreads { op_id });
+            } else {
+                advance_send_media(state, op_id, out);
+            }
         }
 
         Command::SendFiles {
@@ -421,6 +435,11 @@ fn on_e2ee_threads_loaded(
     if let Some(pending) = state.media.pending_send_files.get_mut(&op_id) {
         pending.is_e2ee = !pending.is_group && state.send.e2ee_threads.contains(&pending.conv_id);
         advance_send_files(state, op_id, out);
+        return;
+    }
+    if let Some(pending) = state.media.pending_send_media.get_mut(&op_id) {
+        pending.is_e2ee = !pending.is_group && state.send.e2ee_threads.contains(&pending.conv_id);
+        advance_send_media(state, op_id, out);
     }
 }
 
@@ -525,6 +544,7 @@ fn on_outgoing_file_read(
         let path = pending.paths[pending.idx.saturating_sub(1)].clone();
         let name = pending.current_file_name.clone();
         let conv_id = pending.conv_id.clone();
+        let is_e2ee = pending.is_e2ee;
         let size = probe.size;
         pending.current_size = size;
 
@@ -557,7 +577,7 @@ fn on_outgoing_file_read(
                 file_name: name,
                 size,
                 client_id: None,
-                is_e2ee: false,
+                is_e2ee,
             });
         }
         return;
@@ -594,6 +614,7 @@ fn on_image_dimensions_done(
         size: pending.current_size,
         width,
         height,
+        is_e2ee: pending.is_e2ee,
     });
 }
 
@@ -615,6 +636,7 @@ fn on_video_metadata_done(
         width: meta.width,
         height: meta.height,
         has_thumb: meta.has_thumb,
+        is_e2ee: pending.is_e2ee,
     });
 }
 
@@ -625,11 +647,11 @@ fn on_upload_photo_done(
     out: &mut ReduceOutput,
 ) {
     out.effects.push(Effect::MediaReleaseOutgoingFile { op_id });
-    let Some((conv_id, now_ms)) = state
+    let Some((conv_id, is_e2ee, now_ms)) = state
         .media
         .pending_send_media
         .get(&op_id)
-        .map(|p| (p.conv_id.clone(), p.now_ms))
+        .map(|p| (p.conv_id.clone(), p.is_e2ee, p.now_ms))
     else {
         return;
     };
@@ -647,7 +669,7 @@ fn on_upload_photo_done(
                     height: res.height,
                 },
                 String::new(),
-                false,
+                is_e2ee,
                 now_ms,
                 out,
             );
@@ -670,11 +692,11 @@ fn on_upload_video_done(
     out: &mut ReduceOutput,
 ) {
     out.effects.push(Effect::MediaReleaseOutgoingFile { op_id });
-    let Some((conv_id, now_ms)) = state
+    let Some((conv_id, is_e2ee, now_ms)) = state
         .media
         .pending_send_media
         .get(&op_id)
-        .map(|p| (p.conv_id.clone(), p.now_ms))
+        .map(|p| (p.conv_id.clone(), p.is_e2ee, p.now_ms))
     else {
         return;
     };
@@ -703,7 +725,7 @@ fn on_upload_video_done(
                     url: non_empty_url(res.url),
                 },
                 String::new(),
-                false,
+                is_e2ee,
                 now_ms,
                 out,
             );
@@ -799,12 +821,13 @@ fn on_upload_file_done(
     out.effects.push(Effect::MediaReleaseOutgoingFile { op_id });
 
     // Branch 1: non-image/non-video fallback inside `send_media`.
-    if let Some((conv_id, file_name, file_size, now_ms)) =
+    if let Some((conv_id, file_name, file_size, is_e2ee, now_ms)) =
         state.media.pending_send_media.get(&op_id).map(|p| {
             (
                 p.conv_id.clone(),
                 p.current_file_name.clone(),
                 p.current_size,
+                p.is_e2ee,
                 p.now_ms,
             )
         })
@@ -822,7 +845,7 @@ fn on_upload_file_done(
                         url: non_empty_url(res.url),
                     },
                     file_name,
-                    false,
+                    is_e2ee,
                     now_ms,
                     out,
                 );
@@ -2244,5 +2267,203 @@ mod tests {
             }]
         ));
         assert!(!group_state.send.e2ee_threads_loaded);
+    }
+
+    #[test]
+    fn send_media_routes_photo_video_and_file_as_e2ee_after_cold_start_load() {
+        let mut state = CoreState::default();
+
+        // Cold-start 1-1 send_media waits for persisted e2eeThreadsV1.
+        let out_load = reduce(
+            &mut state,
+            Input::OpRequest {
+                op_id: 200,
+                cmd: Command::SendMedia {
+                    conv_id: "3001001".into(),
+                    paths: vec![
+                        "/tmp/p.jpg".into(),
+                        "/tmp/v.mp4".into(),
+                        "/tmp/d.pdf".into(),
+                    ],
+                    now_ms: 1_700_000_010_000,
+                },
+            },
+        );
+        assert!(matches!(
+            out_load.effects.as_slice(),
+            [Effect::MediaLoadPersistedE2eeThreads { op_id: 200 }]
+        ));
+
+        let mut persisted = BTreeSet::new();
+        persisted.insert("3001001".to_owned());
+        let out_read_photo = reduce(
+            &mut state,
+            Input::MediaE2eeThreadsLoaded {
+                op_id: 200,
+                threads: persisted,
+            },
+        );
+        assert!(matches!(
+            out_read_photo.effects.as_slice(),
+            [Effect::MediaReadOutgoingFile {
+                op_id: 200,
+                mode: OutgoingFileMode::Media,
+                ..
+            }]
+        ));
+
+        // 1) Photo -> MediaUploadPhoto { is_e2ee: true } -> recorded ChatMessage.is_e2ee == true
+        let _ = reduce(
+            &mut state,
+            Input::MediaOutgoingFileRead {
+                op_id: 200,
+                probe: OutgoingFileProbe {
+                    exists: true,
+                    is_dir: false,
+                    readable: true,
+                    size: 512,
+                    media_type: Some("image".into()),
+                },
+            },
+        );
+        let out_up_photo = reduce(
+            &mut state,
+            Input::MediaImageDimensionsDone {
+                op_id: 200,
+                width: 800,
+                height: 600,
+            },
+        );
+        assert!(matches!(
+            out_up_photo.effects.as_slice(),
+            [Effect::MediaUploadPhoto {
+                op_id: 200,
+                is_e2ee: true,
+                ..
+            }]
+        ));
+        let _ = reduce(
+            &mut state,
+            Input::MediaUploadPhotoDone {
+                op_id: 200,
+                result: Ok(crate::media::UploadedPhotoResult {
+                    url: "https://cdn.example/p.jpg?e2esession=abc".into(),
+                    msg_id: "m_photo_e2ee".into(),
+                    cli_msg_id: "c_photo_e2ee".into(),
+                    width: 800,
+                    height: 600,
+                }),
+            },
+        );
+
+        // 2) Video -> MediaUploadVideo { is_e2ee: true } -> recorded ChatMessage.is_e2ee == true
+        let _ = reduce(
+            &mut state,
+            Input::MediaOutgoingFileRead {
+                op_id: 200,
+                probe: OutgoingFileProbe {
+                    exists: true,
+                    is_dir: false,
+                    readable: true,
+                    size: 4096,
+                    media_type: Some("video".into()),
+                },
+            },
+        );
+        let out_up_video = reduce(
+            &mut state,
+            Input::MediaVideoMetadataDone {
+                op_id: 200,
+                meta: crate::media::VideoMetadata {
+                    duration_ms: 3000,
+                    width: 1280,
+                    height: 720,
+                    has_thumb: true,
+                },
+            },
+        );
+        assert!(matches!(
+            out_up_video.effects.as_slice(),
+            [Effect::MediaUploadVideo {
+                op_id: 200,
+                is_e2ee: true,
+                ..
+            }]
+        ));
+        let _ = reduce(
+            &mut state,
+            Input::MediaUploadVideoDone {
+                op_id: 200,
+                result: Ok(crate::media::UploadedVideoResult {
+                    url: "https://cdn.example/v.mp4?e2esession=def".into(),
+                    thumb_url: "https://cdn.example/t.jpg?e2esession=ghi".into(),
+                    msg_id: "m_video_e2ee".into(),
+                    cli_msg_id: "c_video_e2ee".into(),
+                    width: 1280,
+                    height: 720,
+                    duration_ms: 3000,
+                }),
+            },
+        );
+
+        // 3) Fallback file inside send_media -> MediaUploadFile { is_e2ee: true }
+        let out_up_file = reduce(
+            &mut state,
+            Input::MediaOutgoingFileRead {
+                op_id: 200,
+                probe: OutgoingFileProbe {
+                    exists: true,
+                    is_dir: false,
+                    readable: true,
+                    size: 1024,
+                    media_type: Some("file".into()),
+                },
+            },
+        );
+        assert!(matches!(
+            out_up_file.effects.as_slice(),
+            [Effect::MediaUploadFile {
+                op_id: 200,
+                is_e2ee: true,
+                ..
+            }]
+        ));
+        let _ = reduce(
+            &mut state,
+            Input::MediaUploadFileDone {
+                op_id: 200,
+                result: Ok(crate::media::UploadedFileResult {
+                    url: "https://cdn.example/d.pdf?e2esession=jkl".into(),
+                    msg_id: "m_file_e2ee".into(),
+                    cli_msg_id: "c_file_e2ee".into(),
+                }),
+            },
+        );
+
+        let msgs = state.messages.windows.get("3001001");
+        assert_eq!(msgs.map(Vec::len), Some(3));
+        assert!(msgs.is_some_and(|list| list.iter().all(|m| m.is_e2ee)));
+
+        // 4) Group send_media never waits for E2EE threads and stays is_e2ee: false.
+        let mut group_state = CoreState::default();
+        let out_group = reduce(
+            &mut group_state,
+            Input::OpRequest {
+                op_id: 201,
+                cmd: Command::SendMedia {
+                    conv_id: "g5001001".into(),
+                    paths: vec!["/tmp/g.jpg".into()],
+                    now_ms: 1_700_000_011_000,
+                },
+            },
+        );
+        assert!(matches!(
+            out_group.effects.as_slice(),
+            [Effect::MediaReadOutgoingFile {
+                op_id: 201,
+                mode: OutgoingFileMode::Media,
+                ..
+            }]
+        ));
     }
 }

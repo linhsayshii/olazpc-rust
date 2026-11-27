@@ -53,7 +53,8 @@ extension ZaloSessionClient {
         chunkId: Int,
         totalSize: Int,
         clientId: Int64,
-        imei: String
+        imei: String,
+        isE2EE: Bool = false
     ) -> VideoUploadRequestSpec {
         buildMultipartSpec(
             convId: convId,
@@ -65,7 +66,8 @@ extension ZaloSessionClient {
             chunkId: chunkId,
             totalSize: totalSize,
             clientId: clientId,
-            imei: imei
+            imei: imei,
+            isE2EE: isE2EE
         )
     }
 
@@ -76,7 +78,8 @@ extension ZaloSessionClient {
         chunkId: Int = 1,
         totalSize: Int,
         clientId: Int64,
-        imei: String
+        imei: String,
+        isE2EE: Bool = false
     ) -> VideoUploadRequestSpec {
         buildMultipartSpec(
             convId: convId,
@@ -88,7 +91,8 @@ extension ZaloSessionClient {
             chunkId: chunkId,
             totalSize: totalSize,
             clientId: clientId,
-            imei: imei
+            imei: imei,
+            isE2EE: isE2EE
         )
     }
 
@@ -102,7 +106,8 @@ extension ZaloSessionClient {
         chunkId: Int,
         totalSize: Int,
         clientId: Int64,
-        imei: String
+        imei: String,
+        isE2EE: Bool = false
     ) -> VideoUploadRequestSpec {
         let isGroup = ZaloWireParser.isGroupId(convId)
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
@@ -112,7 +117,7 @@ extension ZaloSessionClient {
             "clientId": clientId,
             "totalSize": totalSize,
             "imei": imei,
-            "isE2EE": 0,
+            "isE2EE": isE2EE ? 1 : 0,
             "chunkId": chunkId,
         ]
         if isGroup {
@@ -279,6 +284,292 @@ extension ZaloSessionClient {
                 // Non-auth chunk failures allow fallback handling by caller.
             }
         }
+    }
+
+    /// Official `_extractForwardContent(MSGTYPE_FORWARD_VIDEO)` `prmE2EE` JSON payload for cmd `16012`.
+    static func buildE2EEVideoParamsJSON(
+        durationMs: Int,
+        fileSize: Int,
+        width: Int,
+        height: Int,
+        rotation: Int = 0
+    ) -> String {
+        let obj: [String: Any] = [
+            "duration": max(0, durationMs),
+            "fileSize": max(0, fileSize),
+            "video_height": max(0, height),
+            "video_rotation": rotation,
+            "video_width": max(0, width),
+        ]
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: obj,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        ) else {
+            return "{}"
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Official `forwardMessage(..., MSGTYPE_FORWARD_VIDEO)` `listParams` entry for `/api/e2ee/pc/message/forward` (cmd `16012`, `msgType: 5`).
+    static func buildE2EEVideoForwardListParamEntry(
+        toId: String,
+        platform: Int,
+        clientId: Int64,
+        imei: String,
+        registrationId: Int,
+        senderIid: Int,
+        rawVideoUrl: String,
+        rawThumbUrl: String,
+        durationMs: Int,
+        width: Int,
+        height: Int,
+        fileSize: Int,
+        cipherTitle: String,
+        cipherVideoKey: String,
+        cipherThumbKey: String,
+        cipherParams: String,
+        ttl: Int = 0
+    ) -> [String: Any] {
+        let info: [String: Any] = [
+            "videoUrl": appendE2EESession(rawVideoUrl, session: cipherVideoKey),
+            "thumbUrl": rawThumbUrl.isEmpty ? "" : appendE2EESession(rawThumbUrl, session: cipherThumbKey),
+            "prmE2EE": cipherParams,
+            "title": cipherTitle,
+            "duration": max(0, durationMs),
+            "width": max(0, width),
+            "height": max(0, height),
+            "fileSize": max(0, fileSize),
+        ]
+        let msgInfoJSON: String
+        if let data = try? JSONSerialization.data(
+            withJSONObject: info,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        ) {
+            msgInfoJSON = String(decoding: data, as: UTF8.self)
+        } else {
+            msgInfoJSON = "{}"
+        }
+        return buildE2EEListParamEntry(
+            toId: toId,
+            platform: platform,
+            clientId: clientId,
+            imei: imei,
+            registrationId: registrationId,
+            senderIid: senderIid,
+            ttl: ttl,
+            version: 0,
+            compatVersion: 0,
+            extraFields: [
+                "msgInfo": msgInfoJSON,
+            ]
+        )
+    }
+
+    /// Encrypts video bytes + thumbnail with separate AES-256-GCM keys, uploads with `isE2EE: 1`,
+    /// sends via `/api/e2ee/pc/message/forward` (cmd `16012`, `msgType: 5`), and falls back ONLY to
+    /// `uploadAndSendE2EEFile` (cmd `16005`) — never plaintext. Fails closed when no E2EE session exists.
+    func uploadAndSendE2EEVideo(
+        convId: String,
+        fileName: String,
+        plaintextData: Data,
+        thumbnailData: Data,
+        durationMs: Int,
+        width: Int,
+        height: Int,
+        e2eeManager: ZaloE2EEManager,
+        store: ZaloSQLiteStore?,
+        webSocket: ZaloWebSocket
+    ) async throws -> UploadedVideoResult {
+        guard !ZaloWireParser.isGroupId(convId) else {
+            throw ZaloSessionError(
+                code: -1,
+                message: "Video nhóm không dùng mã hóa đầu cuối 1-1.",
+                url: "/api/e2ee/pc/message/forward"
+            )
+        }
+        let cleanId = ZaloWireParser.stripUserPrefix(convId)
+        guard let rawMyUid = account?.userId, !rawMyUid.isEmpty else {
+            throw ZaloSessionError(
+                code: -108,
+                message: "Chưa đăng nhập.",
+                url: "/api/e2ee/pc/message/forward"
+            )
+        }
+        let myUid = ZaloWireParser.stripUserPrefix(rawMyUid)
+
+        // Fail closed before uploading any bytes if no Signal session exists for recipient.
+        let ready = await e2eeManager.ensureSessions(
+            forPeer: cleanId,
+            myUid: myUid,
+            webSocket: webSocket,
+            store: store
+        )
+        guard ready else {
+            throw ZaloSessionError(
+                code: -1,
+                message: "Chưa có phiên mã hóa đầu cuối với người nhận.",
+                url: "/api/e2ee/pc/message/forward"
+            )
+        }
+
+        let (encVideoData, videoSessionB64) = try SecureStream.encryptE2EEFile(plaintextData)
+        let cliInt = nextClientId()
+        let cliId = "\(cliInt)"
+        var uploadDataDict: [String: Any] = [:]
+
+        try await uploadChunkedMultipart(
+            data: encVideoData,
+            makeSpec: { totalChunk, chunkId in
+                Self.buildVideoChunkUploadSpec(
+                    convId: cleanId,
+                    fileName: fileName,
+                    totalChunk: totalChunk,
+                    chunkId: chunkId,
+                    totalSize: encVideoData.count,
+                    clientId: cliInt,
+                    imei: imei,
+                    isE2EE: true
+                )
+            },
+            onData: { d in
+                if !JSONLossless.string(d["fileId"] ?? d["clientFileId"]).isEmpty
+                    || !JSONLossless.string(d["fileUrl"] ?? d["videoUrl"] ?? d["url"]).isEmpty {
+                    uploadDataDict = d
+                }
+            }
+        )
+
+        let fileId = JSONLossless.string(uploadDataDict["fileId"] ?? uploadDataDict["clientFileId"])
+        var rawVideoUrl = JSONLossless.string(uploadDataDict["fileUrl"] ?? uploadDataDict["videoUrl"] ?? uploadDataDict["url"])
+        if rawVideoUrl.isEmpty, !fileId.isEmpty {
+            for _ in 0..<20 where !(await webSocket.isAuthed) {
+                try? await Task.sleep(for: .milliseconds(150))
+            }
+            if await webSocket.isAuthed {
+                rawVideoUrl = await webSocket.waitForFileDone(fileId: fileId, timeoutSeconds: 15) ?? ""
+            }
+        }
+
+        var rawThumbUrl = ""
+        var thumbSessionB64 = ""
+        if !thumbnailData.isEmpty, !rawVideoUrl.isEmpty,
+           let (encThumbData, genThumbSession) = try? SecureStream.encryptE2EEFile(thumbnailData) {
+            let thumbCliInt = nextClientId()
+            try await uploadChunkedMultipart(
+                data: encThumbData,
+                makeSpec: { totalChunk, chunkId in
+                    Self.buildVideoThumbUploadSpec(
+                        convId: cleanId,
+                        totalChunk: totalChunk,
+                        chunkId: chunkId,
+                        totalSize: encThumbData.count,
+                        clientId: thumbCliInt,
+                        imei: imei,
+                        isE2EE: true
+                    )
+                },
+                onData: { td in
+                    let candidate = JSONLossless.string(
+                        td["thumbUrl"] ?? td["url"] ?? td["normalUrl"] ?? td["hdUrl"] ?? td["fileUrl"] ?? td["oriUrl"]
+                    )
+                    if !candidate.isEmpty {
+                        rawThumbUrl = candidate
+                        thumbSessionB64 = genThumbSession
+                    }
+                }
+            )
+        }
+
+        let localThumbUrl = rawThumbUrl.isEmpty ? "" : Self.appendE2EESession(rawThumbUrl, session: thumbSessionB64)
+
+        if !rawVideoUrl.isEmpty {
+            let videoParamsJSON = Self.buildE2EEVideoParamsJSON(
+                durationMs: durationMs,
+                fileSize: plaintextData.count,
+                width: width,
+                height: height
+            )
+            let targets = await e2eeManager.encryptVideoForwardMessage(
+                peerUid: cleanId,
+                myUid: myUid,
+                title: "",
+                videoSessionB64: videoSessionB64,
+                thumbSessionB64: thumbSessionB64,
+                videoParamsJSON: videoParamsJSON,
+                store: store
+            )
+            if !targets.isEmpty {
+                let senderIid = await e2eeManager.localRegistrationId()
+                let listParams: [[String: Any]] = targets.compactMap { target in
+                    guard target.ciphers.count >= 4 else { return nil }
+                    return Self.buildE2EEVideoForwardListParamEntry(
+                        toId: target.toId,
+                        platform: target.platform,
+                        clientId: cliInt,
+                        imei: imei,
+                        registrationId: target.registrationId,
+                        senderIid: senderIid,
+                        rawVideoUrl: rawVideoUrl,
+                        rawThumbUrl: rawThumbUrl,
+                        durationMs: durationMs,
+                        width: width,
+                        height: height,
+                        fileSize: plaintextData.count,
+                        cipherTitle: target.ciphers[0],
+                        cipherVideoKey: target.ciphers[1],
+                        cipherThumbKey: target.ciphers[2],
+                        cipherParams: target.ciphers[3]
+                    )
+                }
+                if !listParams.isEmpty {
+                    do {
+                        let sendRes = try await sendE2EEMessageAPI(
+                            endpoint: "forward",
+                            threadId: cleanId,
+                            isGroup: false,
+                            clientId: cliInt,
+                            listParams: ZaloJSONArrayBox(listParams),
+                            destType: 3,
+                            msgType: 5
+                        )
+                        let msgId = sendRes.msgId.isEmpty ? cliId : sendRes.msgId
+                        return UploadedVideoResult(
+                            url: Self.appendE2EESession(rawVideoUrl, session: videoSessionB64),
+                            thumbUrl: localThumbUrl,
+                            msgId: msgId,
+                            cliMsgId: cliId,
+                            width: width,
+                            height: height,
+                            durationMs: durationMs
+                        )
+                    } catch let err as ZaloSessionError where err.isAuthError {
+                        throw err
+                    } catch {
+                        // Fall through to E2EE file fallback (`16005`) below — never plaintext.
+                    }
+                }
+            }
+        }
+
+        // Fallback: send as E2EE file (`16005`, `/api/e2ee/pc/message/file`) — never plaintext.
+        let fallback = try await uploadAndSendE2EEFile(
+            convId: cleanId,
+            fileName: fileName,
+            plaintextData: plaintextData,
+            clientId: cliInt,
+            e2eeManager: e2eeManager,
+            store: store,
+            webSocket: webSocket
+        )
+        return UploadedVideoResult(
+            url: fallback.url,
+            thumbUrl: localThumbUrl,
+            msgId: fallback.msgId,
+            cliMsgId: fallback.cliMsgId,
+            width: width,
+            height: height,
+            durationMs: durationMs
+        )
     }
 
     /// Uploads a video in 1MB chunks plus its JPEG thumbnail, sends via `/forward`, and falls back to `asyncfile/msg`.

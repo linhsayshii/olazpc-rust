@@ -199,16 +199,20 @@ extension ZaloEngine {
         fileName: String,
         size: Int64,
         width: Int64,
-        height: Int64
+        height: Int64,
+        isE2ee: Bool
     ) async throws -> UploadedMediaResult? {
         guard let handler = uploadPhotoHostHandler else { return nil }
-        let uploadArgs: [String: Any] = [
+        var uploadArgs: [String: Any] = [
             "conv_id": convId,
             "file_name": fileName,
             "size": size,
             "width": Int(width),
             "height": Int(height),
         ]
+        if isE2ee {
+            uploadArgs["is_e2ee"] = true
+        }
         _ = traceHost("upload_photo", args: uploadArgs)
         return try await handler(uploadArgs)
     }
@@ -220,10 +224,11 @@ extension ZaloEngine {
         durationMs: Int64,
         width: Int64,
         height: Int64,
-        hasThumb: Bool
+        hasThumb: Bool,
+        isE2ee: Bool
     ) async throws -> UploadedVideoResult? {
         guard let handler = uploadVideoHostHandler else { return nil }
-        let uploadArgs: [String: Any] = [
+        var uploadArgs: [String: Any] = [
             "conv_id": convId,
             "file_name": fileName,
             "size": size,
@@ -232,6 +237,9 @@ extension ZaloEngine {
             "height": Int(height),
             "has_thumb": hasThumb,
         ]
+        if isE2ee {
+            uploadArgs["is_e2ee"] = true
+        }
         _ = traceHost("upload_video", args: uploadArgs)
         return try await handler(uploadArgs)
     }
@@ -537,7 +545,8 @@ extension ZaloEngine {
         fileName: String,
         size: Int64,
         width: Int64,
-        height: Int64
+        height: Int64,
+        isE2ee: Bool
     ) async -> UploadPhotoOutcomeRecord {
         do {
             let res: UploadedMediaResult
@@ -546,18 +555,33 @@ extension ZaloEngine {
                 fileName: fileName,
                 size: size,
                 width: width,
-                height: height
+                height: height,
+                isE2ee: isE2ee
             ) {
                 res = hooked
             } else {
                 let data = mediaHostIO.entry(for: opId)?.data ?? Data()
-                res = try await sessionClient.uploadAndSendPhoto(
-                    convId: convId,
-                    fileName: fileName,
-                    data: data,
-                    width: Int(width),
-                    height: Int(height)
-                )
+                if isE2ee {
+                    let store = await MainActor.run { self.sqliteStore }
+                    res = try await sessionClient.uploadAndSendE2EEPhoto(
+                        convId: convId,
+                        fileName: fileName,
+                        plaintextData: data,
+                        width: Int(width),
+                        height: Int(height),
+                        e2eeManager: e2eeManager,
+                        store: store,
+                        webSocket: webSocket
+                    )
+                } else {
+                    res = try await sessionClient.uploadAndSendPhoto(
+                        convId: convId,
+                        fileName: fileName,
+                        data: data,
+                        width: Int(width),
+                        height: Int(height)
+                    )
+                }
             }
             return .ok(
                 url: res.url,
@@ -582,7 +606,8 @@ extension ZaloEngine {
         durationMs: Int64,
         width: Int64,
         height: Int64,
-        hasThumb: Bool
+        hasThumb: Bool,
+        isE2ee: Bool
     ) async -> UploadVideoOutcomeRecord {
         do {
             let res: UploadedVideoResult
@@ -593,23 +618,40 @@ extension ZaloEngine {
                 durationMs: durationMs,
                 width: width,
                 height: height,
-                hasThumb: hasThumb
+                hasThumb: hasThumb,
+                isE2ee: isE2ee
             ) {
                 res = hooked
             } else {
                 let entry = mediaHostIO.entry(for: opId)
                 let data = entry?.data ?? Data()
                 let thumb = entry?.videoThumbData ?? Data()
-                res = try await sessionClient.uploadAndSendVideo(
-                    convId: convId,
-                    fileName: fileName,
-                    data: data,
-                    thumbnailData: thumb,
-                    durationMs: Int(durationMs),
-                    width: Int(width),
-                    height: Int(height),
-                    webSocket: webSocket
-                )
+                if isE2ee {
+                    let store = await MainActor.run { self.sqliteStore }
+                    res = try await sessionClient.uploadAndSendE2EEVideo(
+                        convId: convId,
+                        fileName: fileName,
+                        plaintextData: data,
+                        thumbnailData: thumb,
+                        durationMs: Int(durationMs),
+                        width: Int(width),
+                        height: Int(height),
+                        e2eeManager: e2eeManager,
+                        store: store,
+                        webSocket: webSocket
+                    )
+                } else {
+                    res = try await sessionClient.uploadAndSendVideo(
+                        convId: convId,
+                        fileName: fileName,
+                        data: data,
+                        thumbnailData: thumb,
+                        durationMs: Int(durationMs),
+                        width: Int(width),
+                        height: Int(height),
+                        webSocket: webSocket
+                    )
+                }
             }
             return .ok(
                 url: res.url,
