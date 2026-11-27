@@ -4,7 +4,8 @@
 //! conversation lists (preload, pins, archive, mute, labels, groups, friends, friend-request lists,
 //! aliases, profiles, hidden chats, delete), message history (1-1 preload, group and self cloud
 //! paging), the HTTP long-poll queue, sending text (plain, quoted, E2EE envelope), typing, seen,
-//! unread marks, recall, delete-for-me, reactions, auto-delete settings, and group polls.
+//! unread marks, recall, delete-for-me, reactions, auto-delete settings, group management/admin,
+//! and group polls.
 //!
 //! Every method is a request builder (service, path, params payload with the exact Swift keys and
 //! JSON types) plus a response parser. The pure builders ([`build_recall_message_request`],
@@ -74,5 +75,10 @@ pub use group_polls::{
     extract_created_poll_id, friend_board_unpin_topics,
 };
 pub use groups::{
-    build_fetch_group_detail_request, clean_group_member_ids, parse_fetch_group_detail_response,
+    GroupAvatarUploadSpec, GroupLink, GroupPendingMember, build_create_group_request,
+    build_fetch_group_detail_request, build_group_members_payload,
+    build_invite_group_members_request, build_kick_group_members_request,
+    build_leave_group_request, build_rename_group_request, build_upload_group_avatar_request,
+    clean_group_member_ids, parse_fetch_group_detail_response, parse_group_link,
+    parse_group_pending_members,
 };

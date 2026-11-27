@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use olaz_net::{ApiRequest, SessionClient, Transport};
+use olaz_net::{ApiRequest, MultipartPart, SessionClient, Transport};
 use serde_json::{Map, Value};
 
 use crate::error::ApiError;
@@ -91,5 +91,13 @@ impl<T: Transport> ZaloApi<T> {
 
     pub(crate) async fn post(&self, req: ApiRequest) -> Result<JsonObject, ApiError> {
         Ok(self.client.post(&req).await?)
+    }
+
+    pub(crate) async fn post_multipart(
+        &self,
+        req: ApiRequest,
+        part: MultipartPart,
+    ) -> Result<JsonObject, ApiError> {
+        Ok(self.client.post_multipart(&req, &part).await?)
     }
 }
