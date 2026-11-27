@@ -34,6 +34,10 @@ use crate::input::{
     PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StickerSendError, StoreToken,
 };
 use crate::messages::{MuteEntry, decode_db_stored};
+use crate::notify::{
+    CARD_DEFAULT_UNSUPPORTED, CardActionOutcomeData, MuteInfo, NotifAuthorization,
+    NotifyBannerPayload,
+};
 use crate::pins::{RefreshBoardFollowup, pin_error_shape};
 use crate::reduce::classify::MobileSyncEvent;
 use crate::state::PersistedTransportState;
@@ -546,6 +550,32 @@ pub trait Host: Send + Sync {
     /// Cancels all pending host-owned poll debounce timers (`resetPolls` / `logOut` / `markExpired`).
     async fn cancel_all_poll_debounces(&self) {}
 
+    // --- Notifications, mutes, cards, reminder watch (U16) ---
+    async fn notify_banner(&self, _banner: NotifyBannerPayload) {}
+    async fn notify_banners(&self, banners: Vec<NotifyBannerPayload>) {
+        for banner in banners {
+            self.notify_banner(banner).await;
+        }
+    }
+    async fn request_notif_auth(&self) -> NotifAuthorization {
+        NotifAuthorization::Unavailable
+    }
+    async fn start_call(&self, _uid: String, _video: bool) {}
+    // Swift supplies client-id/time and E2EE mode before re-entering U13's core send path.
+    async fn send_category_sticker(
+        &self,
+        _conv_id: String,
+        _cate_id: i32,
+        _sticker_id: i32,
+    ) -> CardActionOutcomeData {
+        CardActionOutcomeData::Unsupported(CARD_DEFAULT_UNSUPPORTED.to_owned())
+    }
+    // U9: Refresh contacts via Swift host until U9 merges.
+    async fn refresh_contacts(&self) {}
+    async fn arm_reminder_watch_timer(&self, _waiter_id: u64, _delay_secs: f64) -> bool {
+        false
+    }
+    async fn cancel_reminder_watch_timer(&self, _waiter_id: u64) {}
     // --- Stickers & composer E2EE callbacks (U13) ---
     async fn send_e2ee_sticker(
         &self,
@@ -838,6 +868,35 @@ enum HostJob {
         duration: i64,
         _guard: InFlightGuard,
     },
+    // U16
+    NotifyBanners {
+        banners: Vec<NotifyBannerPayload>,
+        _guard: InFlightGuard,
+    },
+    RequestNotifAuth {
+        op_id: Option<u64>,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    StartCall {
+        uid: String,
+        video: bool,
+        _guard: InFlightGuard,
+    },
+    SendCategorySticker {
+        op_id: u64,
+        conv_id: String,
+        cate_id: i32,
+        sticker_id: i32,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
+    RefreshContacts {
+        op_id: Option<u64>,
+        result: OpResult,
+        sink: ActorSink,
+        _guard: InFlightGuard,
+    },
     // U14
     EnsureMessageLoaded {
         conv_id: String,
@@ -980,6 +1039,8 @@ pub struct SessionEffectRunner<T: Transport + 'static> {
     typing_expiry_aborts: Arc<Mutex<BTreeMap<String, (u64, AbortHandle)>>>,
     // U6: active delete-for-me undo bar expiry timer (`(undo_gen, AbortHandle)`).
     delete_undo_abort: Arc<Mutex<Option<(u64, AbortHandle)>>>,
+    // U16: active reminder watch timers (`waiter_id -> AbortHandle`).
+    reminder_watch_aborts: Arc<Mutex<BTreeMap<u64, AbortHandle>>>,
     // U12: per-poll debounce timers (`poll_id -> (seq, AbortHandle)`).
     poll_debounce_aborts: Arc<Mutex<BTreeMap<String, (u64, AbortHandle)>>>,
     // U13: pending 300ms composer confirm promotion timer (`(confirm_gen, AbortHandle)`).
@@ -1082,6 +1143,7 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
             lp_fetch_abort: Mutex::new(None),
             typing_expiry_aborts: Arc::new(Mutex::new(BTreeMap::new())),
             delete_undo_abort: Arc::new(Mutex::new(None)),
+            reminder_watch_aborts: Arc::new(Mutex::new(BTreeMap::new())),
             poll_debounce_aborts: Arc::new(Mutex::new(BTreeMap::new())),
             confirm_promote_abort: Arc::new(Mutex::new(None)),
             host_worker_abort: worker_handle.abort_handle(),
@@ -1175,6 +1237,14 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
             handle.abort();
         }
         self.cancel_typing_expiry(None);
+        for (_, h) in std::mem::take(
+            &mut *self
+                .reminder_watch_aborts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        ) {
+            h.abort();
+        }
         self.cancel_delete_undo_timer();
         self.cancel_confirm_promote_timer();
     }
@@ -1306,7 +1376,23 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
 
 impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
     fn dispatch(&self, effects: Vec<Effect>, sink: ActorSink) {
+        let mut pending_banners: Vec<NotifyBannerPayload> = Vec::new();
+        let flush_banners = |pending: &mut Vec<NotifyBannerPayload>| {
+            if !pending.is_empty() {
+                let banners = std::mem::take(pending);
+                let guard = sink.track();
+                self.send_host(HostJob::NotifyBanners {
+                    banners,
+                    _guard: guard,
+                });
+            }
+        };
         for effect in effects {
+            if let Effect::Host(HostCall::NotifyBanner(banner)) = effect {
+                pending_banners.push(banner);
+                continue;
+            }
+            flush_banners(&mut pending_banners);
             match effect {
                 Effect::CancelSessionTasks => {
                     self.cancel_active_tasks();
@@ -3095,6 +3181,249 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         drop(guard);
                     });
                 }
+                // U16
+                Effect::SetMuteApi {
+                    req_id,
+                    conv_id,
+                    is_group,
+                    duration_secs,
+                    unmute,
+                    start_time_sec,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let ok = api
+                            .set_mute(
+                                &conv_id,
+                                is_group,
+                                duration_secs,
+                                unmute,
+                                Some(start_time_sec),
+                            )
+                            .await
+                            .is_ok();
+                        sink.send(Input::SetMuteApiDone { req_id, ok });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchNotifyProfilesApi { batch_id, uids } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let profiles = match api.fetch_profiles(&uids).await {
+                            Ok(resp) => olaz_wire::extract_profiles_map(&resp),
+                            Err(_) => Map::new(),
+                        };
+                        sink.send(Input::NotifyProfilesFetched { batch_id, profiles });
+                        drop(guard);
+                    });
+                }
+                Effect::CardSuggestStickersApi { op_id, keyword } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let rows = api.suggest_stickers(&keyword).await.ok();
+                        sink.send(Input::SuggestedStickersFetched { op_id, rows });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchContactProfileApi { op_id, uid } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let row = match api.fetch_profiles(std::slice::from_ref(&uid)).await {
+                            Ok(resp) => olaz_wire::extract_profiles_map(&resp)
+                                .remove(&uid)
+                                .and_then(|v| match v {
+                                    Value::Object(m) => Some(m),
+                                    _ => None,
+                                }),
+                            Err(_) => None,
+                        };
+                        sink.send(Input::ContactProfileFetched { op_id, uid, row });
+                        drop(guard);
+                    });
+                }
+                Effect::SubmitFriendRequestApi {
+                    op_id,
+                    uid,
+                    message,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let ok = api.send_friend_request(&uid, &message).await.is_ok();
+                        sink.send(Input::SubmitFriendDone { op_id, ok });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchGroupInvitePreviewApi { op_id, url } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let resp = api.fetch_group_link_detail(&url).await.ok();
+                        sink.send(Input::GroupInvitePreviewDone { op_id, url, resp });
+                        drop(guard);
+                    });
+                }
+                Effect::JoinGroupByLinkApi {
+                    op_id,
+                    url,
+                    fallback_group_id,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let result = api.join_group_by_link(&url).await;
+                        sink.send(Input::JoinGroupDone {
+                            op_id,
+                            fallback_group_id,
+                            result,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::StartReminderWatchTimer { waiter_id, delay } => {
+                    let deadline = tokio::time::Instant::now() + delay;
+                    let delay_secs = delay.as_secs_f64();
+                    let host = Arc::clone(&self.host);
+                    let timer_sink = sink.clone();
+                    let aborts = Arc::clone(&self.reminder_watch_aborts);
+                    let aborts_inner = Arc::clone(&aborts);
+                    let arm_guard = sink.track();
+                    let handle = self
+                        .runtime
+                        .spawn(async move {
+                            let handled =
+                                host.arm_reminder_watch_timer(waiter_id, delay_secs).await;
+                            drop(arm_guard);
+                            if handled {
+                                return;
+                            }
+                            tokio::time::sleep_until(deadline).await;
+                            aborts_inner
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .remove(&waiter_id);
+                            timer_sink.send(Input::ReminderWatchTimeout { waiter_id });
+                        })
+                        .abort_handle();
+                    if let Some(prev) = aborts
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(waiter_id, handle)
+                    {
+                        prev.abort();
+                    }
+                }
+                Effect::CancelReminderWatchTimer { waiter_id } => {
+                    if let Some(prev) = self
+                        .reminder_watch_aborts
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&waiter_id)
+                    {
+                        prev.abort();
+                    }
+                    let host = Arc::clone(&self.host);
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        host.cancel_reminder_watch_timer(waiter_id).await;
+                        drop(guard);
+                    });
+                }
+                Effect::FetchReminderDetailApi {
+                    op_id,
+                    conv_id,
+                    msg_id,
+                    event_id,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let resp = api.fetch_reminder_detail(&event_id).await.ok();
+                        sink.send(Input::ReminderDetailFetched {
+                            op_id,
+                            conv_id,
+                            msg_id,
+                            event_id,
+                            resp,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::RespondReminderApi {
+                    op_id,
+                    conv_id,
+                    msg_id,
+                    event_id,
+                    accept,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let ok = api
+                            .respond_reminder(&conv_id, &event_id, accept)
+                            .await
+                            .is_ok();
+                        let detail_resp = if ok {
+                            api.fetch_reminder_detail(&event_id).await.ok()
+                        } else {
+                            None
+                        };
+                        sink.send(Input::RespondReminderDone {
+                            op_id,
+                            conv_id,
+                            msg_id,
+                            event_id,
+                            accept,
+                            ok,
+                            detail_resp,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchReminderRespondersApi { op_id, event_id } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let resp = api.fetch_reminder_responders(&event_id).await.ok();
+                        sink.send(Input::ReminderRespondersFetched { op_id, resp });
+                        drop(guard);
+                    });
+                }
+                Effect::FetchResponderProfilesApi {
+                    op_id,
+                    buckets,
+                    uids,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let profiles = match api.fetch_profiles(&uids).await {
+                            Ok(resp) => olaz_wire::extract_profiles_map(&resp),
+                            Err(_) => Map::new(),
+                        };
+                        sink.send(Input::ReminderResponderProfilesFetched {
+                            op_id,
+                            buckets,
+                            profiles,
+                        });
+                        drop(guard);
+                    });
+                }
                 Effect::UpdateAutoDeleteApi {
                     conv_id,
                     ttl,
@@ -3731,6 +4060,37 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             text,
                             _guard: guard,
                         },
+                        // U16 (coalesced above into HostJob::NotifyBanners)
+                        HostCall::NotifyBanner(_) => continue,
+                        HostCall::RequestNotifAuth { op_id } => HostJob::RequestNotifAuth {
+                            op_id,
+                            sink: sink.clone(),
+                            _guard: guard,
+                        },
+                        HostCall::StartCall { uid, video } => HostJob::StartCall {
+                            uid,
+                            video,
+                            _guard: guard,
+                        },
+                        HostCall::SendCategorySticker {
+                            op_id,
+                            conv_id,
+                            cate_id,
+                            sticker_id,
+                        } => HostJob::SendCategorySticker {
+                            op_id,
+                            conv_id,
+                            cate_id,
+                            sticker_id,
+                            sink: sink.clone(),
+                            _guard: guard,
+                        },
+                        HostCall::RefreshContacts { op_id, result } => HostJob::RefreshContacts {
+                            op_id,
+                            result,
+                            sink: sink.clone(),
+                            _guard: guard,
+                        },
                         // U11
                         HostCall::CloudResolveMedia {
                             op_id,
@@ -3787,6 +4147,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
             }
         }
+        flush_banners(&mut pending_banners);
     }
 
     fn shutdown(&self) {
@@ -3801,6 +4162,14 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
         self.cancel_active_tasks();
         self.cancel_bootstrap_tasks();
         self.cancel_typing_expiry(None);
+        for (_, h) in std::mem::take(
+            &mut *self
+                .reminder_watch_aborts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        ) {
+            h.abort();
+        }
         self.cancel_poll_debounces(None);
         self.cancel_long_poll();
         self.ws_driver.stop(false);
@@ -4247,6 +4616,53 @@ async fn run_store_worker(
                             cloud_delete_op_id,
                         });
                     }
+                    StoreOp::LoadNotificationPrefs { op_id } => {
+                        let (enabled, sound, mutes) = if let Some(store_arc) = store_opt {
+                            runtime
+                                .spawn_blocking(move || {
+                                    let store =
+                                        store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let enabled = store
+                                        .get_preference_bool("notifEnabled", true)
+                                        .unwrap_or(true);
+                                    let sound = store
+                                        .get_preference_bool("notifSound", true)
+                                        .unwrap_or(true);
+                                    let mutes = store
+                                        .get_preference_data("mutedThreads")
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|data| {
+                                            let Some(Value::Array(rows)) =
+                                                olaz_wire::lossless::parse_any(&data)
+                                            else {
+                                                return None;
+                                            };
+                                            let mut map = BTreeMap::new();
+                                            for row in rows {
+                                                if let Some(obj) = row.as_object()
+                                                    && let Some((id, info)) =
+                                                        MuteInfo::parse_row(obj)
+                                                {
+                                                    map.insert(id, info);
+                                                }
+                                            }
+                                            Some(map)
+                                        });
+                                    (enabled, sound, mutes)
+                                })
+                                .await
+                                .unwrap_or((true, true, None))
+                        } else {
+                            (true, true, None)
+                        };
+                        sink.send(Input::NotificationPrefsLoaded {
+                            enabled,
+                            sound,
+                            mutes,
+                            op_id,
+                        });
+                    }
                     // U7
                     StoreOp::LookupPinnedMessage {
                         conv_id,
@@ -4320,11 +4736,11 @@ async fn run_store_worker(
                                         StoreOp::SetPreferenceStrings { key, values } => {
                                             let _ = store.set_preference_strings(&key, &values);
                                         }
-                                        StoreOp::SetPreferenceData { key, data } => {
-                                            let _ = store.set_preference_data(&key, &data);
-                                        }
                                         StoreOp::SetPreferenceBool { key, value } => {
                                             let _ = store.set_preference_bool(&key, value);
+                                        }
+                                        StoreOp::SetPreferenceData { key, data } => {
+                                            let _ = store.set_preference_data(&key, &data);
                                         }
                                         StoreOp::SaveRecentSticker { sticker } => {
                                             let existing_bytes = store
@@ -4439,6 +4855,7 @@ async fn run_store_worker(
                                         | StoreOp::FindLegacyQuoted { .. }
                                         | StoreOp::MarkRecalledAndCheckLatest { .. }
                                         | StoreOp::DeleteMessageAndCheckLatest { .. }
+                                        | StoreOp::LoadNotificationPrefs { .. }
                                         | StoreOp::LookupPinnedMessage { .. } => {}
                                     }
                                 })
@@ -5456,6 +5873,51 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                 host.mute(conv_id, set, start, start_explicit, duration)
                     .await;
             }
+            // U16
+            HostJob::NotifyBanners { banners, _guard } => {
+                host.notify_banners(banners).await;
+            }
+            HostJob::RequestNotifAuth {
+                op_id,
+                sink,
+                _guard,
+            } => {
+                let auth = host.request_notif_auth().await;
+                sink.send(Input::NotifAuthResolved { auth, op_id });
+            }
+            HostJob::StartCall { uid, video, _guard } => {
+                host.start_call(uid, video).await;
+            }
+            HostJob::SendCategorySticker {
+                op_id,
+                conv_id,
+                cate_id,
+                sticker_id,
+                sink,
+                _guard,
+            } => {
+                // The Swift adapter re-enters U13 and may enqueue an E2EE host send.
+                // Keep its in-flight guard until completion without holding this worker.
+                let host = Arc::clone(&host);
+                tokio::spawn(async move {
+                    let outcome = host
+                        .send_category_sticker(conv_id, cate_id, sticker_id)
+                        .await;
+                    sink.send(Input::CategoryStickerSent { op_id, outcome });
+                    drop(_guard);
+                });
+            }
+            HostJob::RefreshContacts {
+                op_id,
+                result,
+                sink,
+                _guard,
+            } => {
+                host.refresh_contacts().await;
+                if let Some(id) = op_id {
+                    sink.send(Input::OpApiDone { op_id: id, result });
+                }
+            }
             // U14
             HostJob::EnsureMessageLoaded {
                 conv_id,
@@ -5589,6 +6051,7 @@ mod tests {
         log: Mutex<Vec<&'static str>>,
         active: AtomicUsize,
         max_concurrent: AtomicUsize,
+        category_runner: Mutex<Option<std::sync::Weak<SessionEffectRunner<MockTransport>>>>,
     }
 
     impl SlowOrderedHost {
@@ -5597,6 +6060,7 @@ mod tests {
                 log: Mutex::new(Vec::new()),
                 active: AtomicUsize::new(0),
                 max_concurrent: AtomicUsize::new(0),
+                category_runner: Mutex::new(None),
             }
         }
 
@@ -5626,6 +6090,25 @@ mod tests {
         async fn offer_first_login_transfer(&self, _force: bool) {}
         async fn reset_domains(&self) {
             self.record("reset_domains", 5).await;
+        }
+        async fn send_category_sticker(
+            &self,
+            _conv_id: String,
+            _cate_id: i32,
+            _sticker_id: i32,
+        ) -> CardActionOutcomeData {
+            let runner = self
+                .category_runner
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade);
+            if let Some(runner) = runner {
+                // A category sticker can re-enter core and require another host callback
+                // (for example the U13 E2EE sender) before it completes.
+                runner.flush_host().await;
+            }
+            CardActionOutcomeData::Done
         }
         async fn persist_session(&self, _snapshot_json: String) {}
         async fn clear_session(&self) {
@@ -5698,6 +6181,44 @@ mod tests {
             vec!["clear_session", "reset_domains"]
         );
         core.stop();
+    }
+
+    #[tokio::test]
+    async fn category_sticker_callback_can_reenter_host_worker() {
+        let host = Arc::new(SlowOrderedHost::new());
+        let client = Arc::new(SessionClient::new(
+            MockTransport::scripted(vec![]),
+            "imei-category".to_owned(),
+            "Mac".to_owned(),
+        ));
+        let runner = Arc::new(SessionEffectRunner::new(
+            client,
+            Arc::clone(&host) as Arc<dyn Host>,
+            Handle::current(),
+        ));
+        *host
+            .category_runner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::downgrade(&runner));
+        let core = CoreHandle::start(
+            Arc::clone(&runner) as Arc<dyn EffectRunner>,
+            Handle::current(),
+        );
+        runner.dispatch(
+            vec![Effect::Host(HostCall::SendCategorySticker {
+                op_id: 1,
+                conv_id: "3001".to_owned(),
+                cate_id: 12,
+                sticker_id: 34,
+            })],
+            core.test_sink(),
+        );
+        let result = tokio::time::timeout(Duration::from_secs(1), core.wait_idle()).await;
+        core.stop();
+        assert!(
+            result.is_ok(),
+            "category sticker blocked its own host worker"
+        );
     }
 
     #[tokio::test]

@@ -133,9 +133,11 @@ fn body_prefix(body: &[u8]) -> String {
 ///
 /// 404 -> `Http{404, ""}`, other non-2xx -> `Http{status, first 200 bytes}`, 2xx -> parsed,
 /// decrypted and checked for `error_code`.
-pub fn decode_response(
+/// Same as [`decode_response`] without converting non-zero `error_code` into `ZaloSessionError`,
+/// so callers like `join_group_by_link` can inspect both `error_code` and `data` (e.g. code 178
+/// returning `data.groupId`).
+pub fn decode_response_unchecked(
     response: &RawResponse,
-    request_path: &str,
     key: Option<&[u8]>,
     decrypt: bool,
 ) -> Result<Map<String, Value>, NetError> {
@@ -151,7 +153,16 @@ pub fn decode_response(
             body: body_prefix(&response.body),
         });
     }
-    let result = parse_and_decrypt_response(&response.body, decrypt, key)?;
+    parse_and_decrypt_response(&response.body, decrypt, key)
+}
+
+pub fn decode_response(
+    response: &RawResponse,
+    request_path: &str,
+    key: Option<&[u8]>,
+    decrypt: bool,
+) -> Result<Map<String, Value>, NetError> {
+    let result = decode_response_unchecked(response, key, decrypt)?;
     check_response_error(&result, request_path)?;
     Ok(result)
 }

@@ -3,6 +3,7 @@ import CoreText
 import ImageIO
 @preconcurrency import Intents
 import Observation
+import OlazCore
 import UniformTypeIdentifiers
 @preconcurrency import UserNotifications
 import os
@@ -76,20 +77,26 @@ enum NotificationPolicy {
     /// the one case that must never notify: the user is looking at the very conversation the message is in.
     static func shouldSuppress(appIsActive: Bool, mainWindowVisible: Bool, openConversation: String?,
                                tag: String, userIdleSeconds: TimeInterval, idleThreshold: TimeInterval = 180) -> Bool {
-        guard appIsActive, mainWindowVisible, !tag.isEmpty, openConversation == tag else { return false }
-        return userIdleSeconds < idleThreshold
+        OlazCore.notificationPolicyShouldSuppress(
+            appIsActive: appIsActive,
+            mainWindowVisible: mainWindowVisible,
+            openConversation: openConversation,
+            tag: tag,
+            userIdleSeconds: userIdleSeconds,
+            idleThreshold: idleThreshold
+        )
     }
 
     /// The banner's inline "Trả lời" must not send into a hidden chat that is locked, nor while the hidden state is still unknown.
-    static func refusesReply(hiddenStateKnown: Bool, conversationLocked: Bool) -> Bool { !hiddenStateKnown || conversationLocked }
+    static func refusesReply(hiddenStateKnown: Bool, conversationLocked: Bool) -> Bool { OlazCore.notificationPolicyRefusesReply(hiddenStateKnown: hiddenStateKnown, conversationLocked: conversationLocked) }
 
     /// Conversations that became hidden between two snapshots (their delivered banners are removed).
-    static func newlyHidden(old: Set<String>, new: Set<String>) -> Set<String> { new.subtracting(old) }
+    static func newlyHidden(old: Set<String>, new: Set<String>) -> Set<String> { Set(OlazCore.notificationPolicyNewlyHidden(old: Array(old), new: Array(new))) }
 
     /// Official text for a message whose content must stay hidden (app lock: `STR_PASS_CODE_NOTIFY_MESSAGE`).
     static let hiddenPreviewBody = "Bạn có tin nhắn mới"
 
-    static func body(_ body: String, showsPreview: Bool) -> String { showsPreview ? body : hiddenPreviewBody }
+    static func body(_ body: String, showsPreview: Bool) -> String { OlazCore.notificationPolicyBody(rawBody: body, showsPreview: showsPreview) }
 
     /// Image type UNNotificationAttachment accepts, sniffed from the bytes (the CDN URLs have no extension).
     static func attachmentType(for data: Data) -> (type: UTType, ext: String)? {

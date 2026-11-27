@@ -479,4 +479,352 @@ import Testing
         #expect(abs(coreAcc - baseAcc) < 1e-6 && abs(perGetterAcc - baseAcc) < 1e-6 && abs(sheetAcc - baseSheetAcc) < 1e-6)
         #expect(coreFlags == baseFlags && perGetterFlags == baseFlags && sheetAcc > 0)
     }
+
+    // MARK: (f) U16 incoming notification decision, 200-message burst vs origin/main
+
+    /// Verbatim `origin/main` Swift incoming-notification loop (`ZaloEngine.notifyIncomingBatchMessages`
+    /// + `lookupPersonInfo`), returning the banners that would be passed to `NativeNotifier`.
+    private struct OriginMainIncomingBaseline {
+        let myUid: String
+        let conversations: [ZaloEngine.ConversationSummary]
+        let friends: [ContactsState.Friend]
+        let cachedAliases: [String: String]
+        let cachedProfiles: [String: ZaloWebKitMigrator.CachedProfile]
+        let friendUidByGlobalId: [String: String]
+        let mutes: [String: MuteInfo]
+        let enabled: Bool
+        let sound: Bool
+        let showsPreview: Bool
+
+        private func isMuted(_ convId: String, now: Date) -> Bool {
+            guard let info = mutes[convId] else { return false }
+            return info.isActive(at: now)
+        }
+
+        private func lookupPersonInfo(_ uid: String) -> (name: String, avatar: String)? {
+            let clean = ZaloWireParser.stripUserPrefix(uid)
+            guard !clean.isEmpty, clean != "0", clean != "-1", clean != "__legacy__", clean != "unknown" else {
+                return nil
+            }
+            var candidates: [String] = [clean]
+            if let sanitized = ZaloWireParser.sanitizeProfileUid(clean), sanitized != clean {
+                candidates.append(sanitized)
+            }
+            if let mappedUid = candidates.lazy.compactMap({ self.friendUidByGlobalId[$0] }).first,
+               !candidates.contains(mappedUid) {
+                candidates.append(mappedUid)
+            }
+
+            let cleanMyUid = ZaloWireParser.stripUserPrefix(myUid)
+            let sanitizedMyUid = ZaloWireParser.sanitizeProfileUid(cleanMyUid) ?? cleanMyUid
+            if !cleanMyUid.isEmpty, candidates.contains(where: { $0 == cleanMyUid || $0 == sanitizedMyUid }) {
+                return ("Bạn", "")
+            }
+
+            for candidate in candidates {
+                let alias = cachedAliases[candidate]
+                if let f = friends.first(where: { $0.id == candidate }) {
+                    let avt = f.avatar?.absoluteString ?? cachedProfiles[candidate]?.avatar ?? ""
+                    return (alias?.isEmpty == false ? alias! : f.name, avt)
+                }
+                if let p = cachedProfiles[candidate] {
+                    let best = (alias?.isEmpty == false) ? alias! : p.name
+                    let validBest = (best == ReactionDetail.unknownName) ? "" : best
+                    if !validBest.isEmpty || !p.avatar.isEmpty {
+                        return (validBest, p.avatar)
+                    }
+                }
+                if let alias, !alias.isEmpty, alias != ReactionDetail.unknownName {
+                    return (alias, "")
+                }
+            }
+            for candidate in candidates {
+                if let conv = conversations.first(where: { $0.id == candidate }) {
+                    let trimmedName = conv.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let validName = (!trimmedName.isEmpty && trimmedName != conv.id && trimmedName != ReactionDetail.unknownName) ? trimmedName : ""
+                    let avt = conv.avatar?.absoluteString ?? ""
+                    if !validName.isEmpty || !avt.isEmpty {
+                        return (validName, avt)
+                    }
+                }
+            }
+            return nil
+        }
+
+        @MainActor
+        func run(_ incoming: [ChatMessage], now: Date) -> [NotifyBannerRecord] {
+            var out: [NotifyBannerRecord] = []
+            out.reserveCapacity(incoming.count)
+            for msg in incoming where !isMuted(msg.conversationId, now: now) && enabled {
+                let convId = msg.conversationId
+                let isGroup = ZaloWireParser.isGroupId(convId)
+                let cleanSenderId = ZaloWireParser.stripUserPrefix(msg.senderId)
+                let convSummary = conversations.first(where: { $0.id == convId })
+                let person = (!cleanSenderId.isEmpty && cleanSenderId != "0") ? lookupPersonInfo(cleanSenderId) : nil
+
+                let resolvedAvatarURL: URL? = msg.senderAvatar
+                    ?? (person?.avatar.isEmpty == false ? URL(string: person!.avatar) : nil)
+                    ?? (!isGroup ? convSummary?.avatar : nil)
+
+                let title: String = {
+                    if let convName = convSummary?.displayName, !convName.isEmpty, convName != convId {
+                        return convName
+                    }
+                    if let pName = person?.name, !pName.isEmpty, pName != cleanSenderId {
+                        return pName
+                    }
+                    return msg.senderName.isEmpty ? convId : msg.senderName
+                }()
+
+                let senderName: String = {
+                    if !isGroup {
+                        return title
+                    }
+                    if let pName = person?.name, !pName.isEmpty, pName != cleanSenderId, pName != "Người dùng Zalo" {
+                        return pName
+                    }
+                    return msg.senderName
+                }()
+
+                let rawBody = ZaloEngine.messagePreviewLabel(msg)
+                let body = showsPreview ? rawBody : NotificationPolicy.hiddenPreviewBody
+                out.append(NotifyBannerRecord(
+                    title: title,
+                    body: body,
+                    convId: convId,
+                    senderId: cleanSenderId,
+                    senderName: senderName,
+                    isGroup: isGroup,
+                    avatarURL: resolvedAvatarURL?.absoluteString,
+                    silent: !sound
+                ))
+            }
+            return out
+        }
+    }
+
+    @MainActor
+    @Test func incomingDecisionBurst200() async throws {
+        let fixedNowMs: Int64 = 1_795_000_000_000
+        let fixedNowSecs = Double(fixedNowMs) / 1000.0
+        let fixedNow = Date(timeIntervalSince1970: fixedNowSecs)
+        let dir = Self.tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let storage = RecorderStorageIsolation(prefix: "olaz.u16-perf")
+        defer { storage.cleanup() }
+        let engine = ZaloEngine(
+            dataDirectory: dir,
+            useKeychain: false,
+            userDefaultsSuiteName: storage.userDefaultsSuiteName,
+            cookieStorage: storage.cookieStorage
+        )
+        defer { engine.cancelTasksForRecording() }
+        engine.nowMs = { fixedNowMs }
+
+        // Corpus: 700 conversations (250 groups + 450 1-1), 500 friends, aliases, cachedProfiles, 100 mutes.
+        let conversations: [ZaloEngine.ConversationSummary] = (0..<700).map { i in
+            let isGroup = i < 250
+            let id = isGroup ? "g\(100_000 + i)" : "\(200_000 + i - 250)"
+            let name = isGroup ? "Nhóm dự án \(i)" : "Bạn bè \(i - 250)"
+            return ZaloEngine.ConversationSummary(
+                id: id,
+                isGroup: isGroup,
+                name: name,
+                avatar: URL(string: "https://cdn.example/conv/\(id).jpg"),
+                pinned: i % 50 == 0,
+                members: isGroup ? 12 + (i % 40) : 2,
+                unread: i % 5,
+                preview: nil
+            )
+        }
+        let friends: [ContactsState.Friend] = (0..<500).map { i in
+            let uid = "\(200_000 + i)"
+            return ContactsState.Friend(
+                id: uid,
+                name: "Người liên hệ \(i)",
+                zaloName: "Zalo \(i)",
+                avatar: URL(string: "https://cdn.example/friend/\(uid).jpg"),
+                lastActive: nil,
+                online: i % 4 == 0,
+                section: "N",
+                sortKey: "nguoi lien he \(i)"
+            )
+        }
+        var aliases: [String: String] = [:]
+        var profiles: [String: ZaloWebKitMigrator.CachedProfile] = [:]
+        var globalIds: [String: String] = [:]
+        for i in 0..<120 {
+            let uid = "\(200_000 + i * 3)"
+            aliases[uid] = "Biệt danh \(i)"
+            globalIds[uid] = "gid_\(uid)"
+        }
+        for i in 0..<150 {
+            let uid = "\(200_500 + i)"
+            let name = (i % 10 == 0) ? "Người dùng Zalo" : "Hồ sơ \(i)"
+            profiles[uid] = ZaloWebKitMigrator.CachedProfile(name: name, avatar: "https://cdn.example/prof/\(uid).jpg")
+        }
+
+        var mutePayloadRows: [[String: Any]] = []
+        var mutesMap: [String: MuteInfo] = [:]
+        for i in 0..<100 {
+            let convId = (i % 2 == 0) ? "g\(100_000 + i)" : "\(200_000 + i)"
+            let start: TimeInterval
+            let duration: TimeInterval
+            if i < 40 {
+                // Active indefinite
+                start = fixedNowSecs - 1200
+                duration = -1
+            } else if i < 80 {
+                // Active timed (expires in the future)
+                start = fixedNowSecs - 600
+                duration = 3600
+            } else {
+                // Expired timed (should notify)
+                start = fixedNowSecs - 7200
+                duration = 3600
+            }
+            mutePayloadRows.append(["id": convId, "startTime": start, "duration": duration])
+            mutesMap[convId] = MuteInfo(startTime: start, duration: duration)
+        }
+
+        let core = try #require(await engine.ensureCoreEngine())
+        engine.conversations = conversations
+        var contactsState = ContactsState()
+        contactsState.friends = friends
+        engine.contacts = contactsState
+        engine.cachedAliases = aliases
+        engine.cachedProfiles = profiles
+        engine.cachedFriendGlobalIds = globalIds
+        engine.handleNotification(state: [
+            "notification": [
+                "kind": "settings",
+                "enabled": true,
+                "sound": true,
+                "mutes": mutePayloadRows,
+            ]
+        ])
+        let settled = try await core.settle()
+        await engine.waitForMirrorVersion(settled)
+
+        // 200-message burst mixing 1-1, group, muted, expired-mute, aliases, globalIds, cachedProfiles, fallback names.
+        let burst: [ChatMessage] = (0..<200).map { i in
+            let isGroup = i % 2 == 0
+            let convId: String
+            let senderId: String
+            if i < 40 {
+                // Actively muted (20 group + 20 1-1)
+                convId = isGroup ? "g\(100_000 + (i / 2) * 2)" : "\(200_000 + (i / 2) * 2 + 1)"
+                senderId = "\(200_000 + i)"
+            } else if i < 50 {
+                // Expired mute (must notify)
+                let muteIdx = 80 + (i - 40) * 2
+                convId = isGroup ? "g\(100_000 + muteIdx)" : "\(200_000 + muteIdx + 1)"
+                senderId = "\(200_000 + 300 + (i - 40))"
+            } else if isGroup {
+                let gIdx = 100 + (i % 140)
+                convId = "g\(100_000 + gIdx)"
+                if i % 6 == 0 {
+                    // Sender resolved via globalId -> alias/friend
+                    let uid = "\(200_000 + ((i / 6) % 100) * 3)"
+                    senderId = "gid_\(uid)"
+                } else if i % 6 == 2 {
+                    // Sender in cachedProfiles (including "Người dùng Zalo" fallback)
+                    senderId = "\(200_500 + (i % 150))"
+                } else {
+                    senderId = "\(200_000 + 200 + (i % 250))"
+                }
+            } else {
+                let cIdx = 100 + (i % 340)
+                convId = "\(200_000 + cIdx)"
+                senderId = convId
+            }
+
+            let kind: ChatMessage.Kind
+            let text: String
+            switch i % 5 {
+            case 0: kind = .text; text = "Tin nhắn burst số \(i) từ hệ thống"
+            case 1: kind = .photo(url: URL(string: "https://cdn.example/img/\(i).jpg"), width: 640, height: 480); text = ""
+            case 2: kind = .sticker(url: URL(string: "https://cdn.example/sticker/\(i).png")); text = ""
+            case 3: kind = .text; text = "Cuộc họp lúc 15h hôm nay nhé (#\(i))"
+            default: kind = .file(name: "bao-cao-\(i).pdf", size: 120_000, url: nil); text = ""
+            }
+
+            return ChatMessage(
+                id: "9900\(1000 + i)",
+                conversationId: convId,
+                senderId: senderId,
+                senderName: "Tên dây \(i)",
+                senderAvatar: (i % 4 == 0) ? URL(string: "https://cdn.example/msg/\(i).jpg") : nil,
+                isMine: false,
+                kind: kind,
+                text: text,
+                date: Date(timeIntervalSince1970: fixedNowSecs + Double(i)),
+                status: .sent,
+                quote: nil,
+                reactions: [],
+                isE2EE: false
+            )
+        }
+
+        let baseline = OriginMainIncomingBaseline(
+            myUid: "",
+            conversations: conversations,
+            friends: friends,
+            cachedAliases: aliases,
+            cachedProfiles: profiles,
+            friendUidByGlobalId: Dictionary(globalIds.map { ($0.value, $0.key) }, uniquingKeysWith: { a, _ in a }),
+            mutes: mutesMap,
+            enabled: true,
+            sound: true,
+            showsPreview: true
+        )
+
+        var coreBanners: [NotifyBannerRecord] = []
+        engine.notifyBannerHook = { rec in
+            coreBanners.append(rec)
+        }
+        engine.traceNotifyHostEnabled = true
+        engine.hostTrace = { _, _ in false }
+
+        var baseBanners: [NotifyBannerRecord] = []
+        var coreSamples: [Double] = []
+        var baseSamples: [Double] = []
+
+        for round in 0..<8 {
+            let runCore: () async -> Void = {
+                coreBanners.removeAll(keepingCapacity: true)
+                await engine.notifyIncomingBatchMessages(burst)
+            }
+            let runBase: () -> Void = {
+                baseBanners = baseline.run(burst, now: fixedNow)
+            }
+            if round == 0 {
+                await runCore()
+                runBase()
+                #expect(coreBanners == baseBanners)
+                #expect(coreBanners.count == 160)
+                continue
+            }
+            if round % 2 == 1 {
+                let t1 = ContinuousClock.now; await runCore(); let d1 = ContinuousClock.now - t1
+                let t2 = ContinuousClock.now; runBase(); let d2 = ContinuousClock.now - t2
+                coreSamples.append(Double(d1.components.seconds) * 1000 + Double(d1.components.attoseconds) / 1e15)
+                baseSamples.append(Double(d2.components.seconds) * 1000 + Double(d2.components.attoseconds) / 1e15)
+            } else {
+                let t2 = ContinuousClock.now; runBase(); let d2 = ContinuousClock.now - t2
+                let t1 = ContinuousClock.now; await runCore(); let d1 = ContinuousClock.now - t1
+                baseSamples.append(Double(d2.components.seconds) * 1000 + Double(d2.components.attoseconds) / 1e15)
+                coreSamples.append(Double(d1.components.seconds) * 1000 + Double(d1.components.attoseconds) / 1e15)
+            }
+        }
+
+        let coreMs = coreSamples.sorted()[coreSamples.count / 2]
+        let baseMs = baseSamples.sorted()[baseSamples.count / 2]
+        print(Self.row("(f) 200-msg incoming decision burst (Rust core via FFI)", ms: coreMs, note: String(format: "%.1f µs/msg", coreMs * 1000.0 / 200.0)))
+        print(Self.row("(f) .. origin/main Swift loop baseline", ms: baseMs, note: String(format: "%.1f µs/msg", baseMs * 1000.0 / 200.0)))
+        #expect(coreBanners == baseBanners)
+        #expect(coreBanners.count == 160)
+    }
 }

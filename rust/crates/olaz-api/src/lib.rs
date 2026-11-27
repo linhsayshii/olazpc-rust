@@ -30,6 +30,7 @@ mod group_polls;
 mod groups;
 mod history;
 mod messaging;
+mod notify;
 mod pins;
 mod poll;
 mod profiles;
@@ -65,6 +66,7 @@ pub use messaging::{
     SendTextArgs, SendTextParams, build_reaction_request, build_recall_message_request,
     build_send_contact_card_request,
 };
+pub use notify::{build_set_mute_payload, extract_suggested_sticker_rows};
 pub use pins::{
     board_topic_params, friend_board_list_box, friend_board_unpin_topics, pin_topic_params,
 };

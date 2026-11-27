@@ -6,7 +6,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value};
 
 use crate::cookie::{extract_zpw_sek_cookie, is_valid_zpw_sek};
-use crate::decode::{check_response_error, decode_response, parse_and_decrypt_response};
+use crate::decode::{
+    check_response_error, decode_response, decode_response_unchecked, parse_and_decrypt_response,
+};
 use crate::error::NetError;
 use crate::http::{Method, RawResponse, RequestOptions, Transport, build_request, url_path};
 use crate::request::{
@@ -251,6 +253,49 @@ impl<T: Transport> SessionClient<T> {
             req.decrypt_response,
         )
         .await
+    }
+
+    /// Authenticated GET with failover that returns the decrypted response map even when
+    /// `error_code != 0`, preserving `data` alongside `error_code` (e.g. `join_group_by_link` 178).
+    pub async fn get_unchecked(&self, req: &ApiRequest) -> Result<Map<String, Value>, NetError> {
+        let suffix = get_suffix(req, self.secret_key().as_deref())?;
+        let hosts = self.lock().domains.candidates(&req.service);
+        let mut last_error = NetError::InvalidUrl(req.service.clone());
+        for host in hosts {
+            let url = format!("{host}{suffix}");
+            let options = RequestOptions {
+                method: Method::Get,
+                url: url.clone(),
+                body: None,
+                content_type: None,
+                timeout: None,
+                extra_headers: req.headers.clone(),
+            };
+            let outcome = match self.raw_request(options).await {
+                Ok(o) => o,
+                Err(NetError::InvalidUrl(_)) => continue,
+                Err(e) if e.should_failover() => {
+                    last_error = e;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let key = self.secret_key();
+            match decode_response_unchecked(&outcome.response, key.as_deref(), req.decrypt_response)
+            {
+                Ok(result) => {
+                    if check_response_error(&result, &url_path(&url)).is_ok() {
+                        self.lock().domains.remember_winner(&req.service, &host);
+                    }
+                    return Ok(result);
+                }
+                Err(e) if e.should_failover() => {
+                    last_error = e;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_error)
     }
 
     /// Swift `post`: payload goes into a `params=` form body.

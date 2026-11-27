@@ -796,6 +796,7 @@ fn dispatch_reduce_output(
         || out.dirty.contains(&crate::changes::DirtyKey::Session)
         || out.dirty.contains(&crate::changes::DirtyKey::Conversations)
         || out.dirty.contains(&crate::changes::DirtyKey::Contacts)
+        || out.dirty.contains(&crate::changes::DirtyKey::Aliases)
         || out
             .dirty
             .contains(&crate::changes::DirtyKey::CachedProfiles)
