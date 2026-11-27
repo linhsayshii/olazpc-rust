@@ -330,9 +330,11 @@ import Testing
         let mentionStats = summarize("localMirrorMentionDisplayName_x1000", localMentionSamples)
         _ = summarize("coreFfiLookupPersonInfo_x1000", ffiLookupSamples)
 
-        // Generous ceiling so debug CI never flakes while verifying O(1) dictionary speed.
-        #expect(lookupStats.p50 < 25.0)
-        #expect(mentionStats.p50 < 25.0)
+        // 25 ms is the budget, enforced on a quiet host (gate-core check 7). Shared CI runners only have to tell an
+        // O(n) regression apart from O(1) dictionary speed.
+        let budgetMs = ProcessInfo.processInfo.environment["CI"] == nil ? 25.0 : 50.0
+        #expect(lookupStats.p50 < budgetMs)
+        #expect(mentionStats.p50 < budgetMs)
 
         engine.cancelTasksForRecording()
         server.stop()

@@ -3,11 +3,10 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use olaz_wire::ids::normalize_contact_uid;
 use olaz_wire::lossless::string;
 use olaz_wire::{
-    ChatMessage, ECard, ECardStyle, Kind, UNKNOWN_NAME, is_group_id, sanitize_profile_uid,
-    strip_user_prefix, web_link_sanitized,
+    ChatMessage, ECard, ECardStyle, Kind, UNKNOWN_NAME, is_group_id, normalize_contact_uid,
+    sanitize_profile_uid, strip_user_prefix, web_link_sanitized,
 };
 use serde_json::{Map, Value};
 
@@ -641,6 +640,7 @@ pub(crate) fn reduce_notify(state: &mut CoreState, input: Input, out: &mut Reduc
             }
             if updated_any {
                 out.dirty.insert(DirtyKey::CachedProfiles);
+                out.refresh_identity_snapshot = true;
                 if let Ok(bytes) = serde_json::to_vec(&state.contacts.cached_profiles) {
                     out.effects.push(Effect::Store(StoreOp::SetPreferenceData {
                         key: "cachedProfiles".to_owned(),
@@ -927,6 +927,7 @@ pub(crate) fn reduce_notify(state: &mut CoreState, input: Input, out: &mut Reduc
             if updated_any {
                 // Quirk preserved as recorded: updates in-memory `cachedProfiles` without persisting SQLite.
                 out.dirty.insert(DirtyKey::CachedProfiles);
+                out.refresh_identity_snapshot = true;
             }
             let snap = state.identity_snapshot();
             let my_uid = state
@@ -1171,14 +1172,11 @@ fn handle_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                 return;
             };
             let clean = normalize_contact_uid(&uid);
-            let my_uid = normalize_contact_uid(
-                state
-                    .session
-                    .profile
-                    .as_ref()
-                    .map(|p| p.user_id.as_str())
-                    .unwrap_or(""),
-            );
+            let my_uid = state
+                .session
+                .profile
+                .as_ref()
+                .map_or_else(String::new, |p| normalize_contact_uid(&p.user_id));
             let is_self = !clean.is_empty() && clean == my_uid;
             let is_friend = state.contacts.friends.iter().any(|f| f.id == clean);
             out.effects.push(Effect::CompleteOp {
@@ -1250,14 +1248,11 @@ fn handle_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                 return;
             };
             let clean = normalize_contact_uid(&uid);
-            let my_uid = normalize_contact_uid(
-                state
-                    .session
-                    .profile
-                    .as_ref()
-                    .map(|p| p.user_id.as_str())
-                    .unwrap_or(""),
-            );
+            let my_uid = state
+                .session
+                .profile
+                .as_ref()
+                .map_or_else(String::new, |p| normalize_contact_uid(&p.user_id));
             let prep = if !clean.is_empty() && clean == my_uid {
                 FriendRequestPrepResult {
                     state: "self".to_owned(),
@@ -1690,7 +1685,7 @@ mod tests {
             state.contacts.friends.push(FriendEntry {
                 id: format!("300{:03}", i),
                 name: format!("Friend {i}"),
-                zalo_name: String::new(),
+                zalo_name: format!("Friend {i}"),
                 avatar: Some(format!("https://cdn.example/f{i}.jpg")),
                 last_active_ms: None,
                 online: false,

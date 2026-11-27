@@ -123,13 +123,15 @@ extension ZaloEngine {
 
     func saveAlias(uid: String, name: String) async -> (ok: Bool, text: String) {
         guard let core = await ensureCoreEngine(),
-              let res = try? await core.saveAlias(uid: uid, name: name) else {
+              let rec = try? await core.saveAlias(uid: uid, name: name) else {
             return (false, "Không lưu được tên gợi nhớ.")
         }
         if let v = try? await core.settle() {
             await waitForMirrorVersion(v)
+        } else {
+            await waitForMirrorVersion(core.currentVersion())
         }
-        return (res.ok, res.text)
+        return (rec.ok, rec.text)
     }
 
     func groupInvitePreview(_ url: URL) async -> GroupInvitePreview {

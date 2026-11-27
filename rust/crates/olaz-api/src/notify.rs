@@ -8,6 +8,8 @@
 //! - `fetchReminderDetail` (`GET /api/board/topic/getReminder`)
 //! - `respondReminderAPI` (`POST /api/board/topic/updateEventResponse`)
 //! - `fetchReminderRespondersAPI` (`GET /api/board/topic/listResponseEvent`)
+//!
+//! (`send_friend_request` and `set_alias` live in `contacts.rs`, U9.)
 
 use olaz_net::{ApiRequest, Transport};
 use olaz_wire::{clean_group_id, strip_user_prefix};

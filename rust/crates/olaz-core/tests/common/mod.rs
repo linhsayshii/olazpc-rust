@@ -8816,29 +8816,6 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                             tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
                     }
                 }
-                "save_alias" => {
-                    if !is_u16 {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                    }
-                    let uid = str_arg(args, "uid");
-                    let name = str_arg(args, "name");
-                    let res = core.request_save_alias(uid, name).await;
-                    if is_u16 {
-                        u16_results.insert(
-                            step_index.to_string(),
-                            op_result_to_u16_json(OpResult::SaveAlias(res)),
-                        );
-                        if pending_watch_task.is_none() {
-                            let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
-                                .await;
-                        }
-                    } else {
-                        inner_runner.flush_store().await;
-                        let _ = core.settle().await;
-                        last_alias_result = Some(res);
-                    }
-                }
                 "invite_preview" => {
                     let url = str_arg(args, "url");
                     if let Some(res) = core.request(Command::GroupInvitePreview { url }).await {
@@ -9635,6 +9612,25 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         .await;
                     inner_runner.flush_host().await;
                     let _ = core.settle().await;
+                }
+                "save_alias" => {
+                    if pending_watch_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                    let uid = str_arg(args, "uid");
+                    let name = str_arg(args, "name");
+                    let res = core.request_save_alias(uid, name).await;
+                    inner_runner.flush_store().await;
+                    let _ = core.settle().await;
+                    u16_results.insert(
+                        step_index.to_string(),
+                        json!({
+                            "ok": res.ok,
+                            "text": res.text,
+                        }),
+                    );
+                    last_alias_result = Some(res);
                 }
                 // U11 cloud domain commands
                 "refresh_cloud" => {

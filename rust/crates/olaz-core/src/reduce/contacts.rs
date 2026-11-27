@@ -785,6 +785,7 @@ pub(crate) fn reduce_contacts_input(state: &mut CoreState, input: Input, out: &m
                 }
                 out.dirty.insert(DirtyKey::Contacts);
                 out.dirty.insert(DirtyKey::Aliases);
+                out.refresh_identity_snapshot = true;
                 out.effects.push(Effect::Store(StoreOp::SetPreferenceData {
                     key: "aliases".to_owned(),
                     data: serialize_aliases_json(&state.contacts.aliases),
