@@ -72,22 +72,22 @@ fn wire_parser_control_types_and_round_trip() {
         other => panic!("expected reaction, got {other:?}"),
     }
 
-    // Self-cloud push arriving over cmdPushMsgGroup must route to selfConvId, never "g217477...".
+    // Self-cloud push arriving over cmdPushMsgGroup must route to selfConvId, never "g9200101".
     let o = WireParseOptions {
         cmd: CMD_PUSH_MSG_GROUP,
-        self_conv_id: Some("2174771368031376212"),
+        self_conv_id: Some("9200101"),
         ..opts()
     };
     let ev = parse_wire_message(
         &obj(
-            r#"{"msgId":"888","cliMsgId":"c888","uidFrom":"me","idTo":"2174771368031376212",
+            r#"{"msgId":"888","cliMsgId":"c888","uidFrom":"me","idTo":"9200101",
             "msgType":"share.file","content":{"title":"probe.txt","href":"https://cdn.example/probe.txt"},"ts":4000}"#,
         ),
         "me",
         &o,
     );
     let (msg, _) = msg_of(ev);
-    assert_eq!(msg.conversation_id, "2174771368031376212");
+    assert_eq!(msg.conversation_id, "9200101");
     assert!(msg.is_mine);
 }
 
@@ -211,31 +211,31 @@ fn extract_batch_events_cloud_routing_int_types_contact_cards_and_reactions() {
 #[test]
 fn batch_envelope_never_routes_1on1_to_ghost_g0_and_prefers_alias() {
     let root = val(
-        r#"{"data":{"msgs":[{"msgId":"8500861956467","cliMsgId":"1795000000001",
-        "uidFrom":"31612076530602762","idTo":"0","dName":"Ha","msgType":"chat.recommended",
-        "ts":1795000000000,"content":{"action":"recommened.calltime","params":"{\"duration\":42,\"callType\":1}"}}],
+        r#"{"data":{"msgs":[{"msgId":"9000000001001","cliMsgId":"1700000000001",
+        "uidFrom":"3000101","idTo":"0","dName":"Người B","msgType":"chat.recommended",
+        "ts":1700000000000,"content":{"action":"recommened.calltime","params":"{\"duration\":42,\"callType\":1}"}}],
         "groupMsgs":[]}}"#,
     );
     let lookup = |uid: &str| {
-        (uid == "31612076530602762").then(|| NameLookup {
-            name: "Mẹ".into(),
-            avatar: "https://ava.example/me.jpg".into(),
+        (uid == "3000101").then(|| NameLookup {
+            name: "Người A".into(),
+            avatar: "https://ava.example/peer.jpg".into(),
         })
     };
     let o = WireParseOptions {
-        self_conv_id: Some("2174771368031376212"),
+        self_conv_id: Some("9200101"),
         name_lookup: Some(&lookup),
         ..opts()
     };
-    let events = extract_batch_events(&root, "2072032406797762235", &o);
+    let events = extract_batch_events(&root, "2000101", &o);
     assert_eq!(events.len(), 1);
     let (msg, stored) = msg_of(events[0].clone());
-    assert_eq!(msg.conversation_id, "31612076530602762");
-    assert_eq!(stored.conv_id, "31612076530602762");
-    assert_eq!(msg.sender_name, "Mẹ");
+    assert_eq!(msg.conversation_id, "3000101");
+    assert_eq!(stored.conv_id, "3000101");
+    assert_eq!(msg.sender_name, "Người A");
     assert_eq!(
         msg.sender_avatar.as_deref(),
-        Some("https://ava.example/me.jpg")
+        Some("https://ava.example/peer.jpg")
     );
     assert_eq!(msg.text, "Cuộc gọi thoại");
     assert_eq!(
@@ -253,20 +253,20 @@ fn batch_envelope_never_routes_1on1_to_ghost_g0_and_prefers_alias() {
 
     // Explicit 1-1 uidFrom must never be overridden by an unrelated fallbackConvId
     let o = WireParseOptions {
-        fallback_conv_id: Some("8964177950559533085"),
+        fallback_conv_id: Some("3000102"),
         is_group_hint: Some(false),
         ..opts()
     };
     let ev = parse_wire_message(
         &obj(
-            r#"{"msgId":"8500861956467","uidFrom":"31612076530602762","idTo":"0","msgType":"webchat",
-            "ts":1795000000000,"content":"Alo con"}"#,
+            r#"{"msgId":"9000000001001","uidFrom":"3000101","idTo":"0","msgType":"webchat",
+            "ts":1700000000000,"content":"Xin chào"}"#,
         ),
-        "2072032406797762235",
+        "2000101",
         &o,
     );
     let (m, _) = msg_of(ev);
-    assert_eq!(m.conversation_id, "31612076530602762");
+    assert_eq!(m.conversation_id, "3000101");
 }
 
 #[test]
@@ -309,9 +309,10 @@ fn wire_file_extension_normalization_and_photo_group_array_parsing() {
     );
 }
 
-const PREKEY_CIPHER: &str = "AzMovwMIpFUwoVUSIQVNUKcMqQKEDdK1jcEt8He7V15D1iWl9ngJgOPtsXiUIRohBZSX4D1qiBhXbdSPciObevx/DTnpfki5s5eI0wzTTQp/InIzCiEFCFnb614YZfaOg7R9/7/DIagW4nsLw5V5jK1ELLEbY1IQCBgAIkDL6XqJXgMKkj5gMtM5+CCkjt5p+Xm4q0wQjhLXMOgyl8M137oQAjyDi9fCjALZOCaCQpyjgm5/eW2crnxEu3JybU+y/enV2FQ=";
+const PREKEY_CIPHER: &str =
+    "AzMIAQgPFh0kKzI5QEdOVVxjanF4f4aNlJuiqbC3vsXM09rh6O/2/QQLEhkgJy41PENKUVhfZm10e4KJ";
 const WHISPER_CIPHER: &str =
-    "AjMKIQXfGtZEt75pr2/KWoTA8W8Bu0oNpGDv9ITalIBSb69UaxAOGAAiENtYix7GNUB1eR/LgY4IuK2Blmqxld2njA==";
+    "AjMKAw4ZJC86RVBbZnF8h5KdqLO+ydTf6vUACxYhLDdCTVhjbnmEj5qlsLvG0dzn8v0IEx4pND9KVWBr";
 
 #[test]
 fn e2ee_signal_detection_and_placeholders() {
@@ -319,18 +320,18 @@ fn e2ee_signal_detection_and_placeholders() {
         format!("https://api.zaloapp.com/api/emoticon/sticker/webpc?eid={PREKEY_CIPHER}&size=130");
     assert!(is_signal_ciphertext(PREKEY_CIPHER));
     assert!(is_signal_ciphertext(WHISPER_CIPHER));
-    assert!(!is_signal_ciphertext("miế ngan trộn"));
+    assert!(!is_signal_ciphertext("xin chào bạn"));
     assert!(!is_signal_ciphertext(
         "https://api.zaloapp.com/api/emoticon/sticker/webpc?eid=34840&size=130"
     ));
     assert!(url_has_undecrypted_signal_cipher(&broken_url));
 
     let locked_text = serde_json::json!({
-        "msgId": "8502116332010", "cliMsgId": "1794982452921", "uidFrom": "31612076530602762",
-        "idTo": "2072032406797762235", "msgType": "webchat", "ts": 1_794_982_453_589_i64,
+        "msgId": "9000000002001", "cliMsgId": "1700000002001", "uidFrom": "3000101",
+        "idTo": "2000101", "msgType": "webchat", "ts": 1_700_000_002_000_i64,
         "content": PREKEY_CIPHER
     });
-    let (locked, stored) = msg_of(parse(&locked_text.to_string(), "2072032406797762235"));
+    let (locked, stored) = msg_of(parse(&locked_text.to_string(), "2000101"));
     assert!(locked.is_e2ee);
     assert_eq!(stored.status, "e2ee_locked");
     match &locked.kind {
@@ -343,11 +344,11 @@ fn e2ee_signal_detection_and_placeholders() {
     assert_eq!(locked.text, "🔒 Tin nhắn mã hóa đầu cuối");
 
     let locked_sticker = serde_json::json!({
-        "msgId": "8502117270115", "cliMsgId": "1794982471828", "uidFrom": "31612076530602762",
-        "idTo": "2072032406797762235", "msgType": "chat.sticker", "ts": 1_794_982_472_463_i64,
+        "msgId": "9000000002002", "cliMsgId": "1700000002002", "uidFrom": "3000101",
+        "idTo": "2000101", "msgType": "chat.sticker", "ts": 1_700_000_003_000_i64,
         "content": {"id": PREKEY_CIPHER, "catId": PREKEY_CIPHER, "type": PREKEY_CIPHER}
     });
-    let (s_msg, s_stored) = msg_of(parse(&locked_sticker.to_string(), "2072032406797762235"));
+    let (s_msg, s_stored) = msg_of(parse(&locked_sticker.to_string(), "2000101"));
     assert_eq!(s_stored.status, "e2ee_locked");
     match &s_msg.kind {
         Kind::Placeholder { text, .. } => assert!(text.contains("Sticker mã hóa đầu cuối")),
@@ -356,13 +357,13 @@ fn e2ee_signal_detection_and_placeholders() {
 
     // Sync2 arrives with real plaintext for the exact same message.
     let plain = serde_json::json!({
-        "msgId": "8502116332010", "cliMsgId": "1794982452921", "uidFrom": "31612076530602762",
-        "idTo": "2072032406797762235", "msgType": "webchat", "ts": 1_794_982_453_589_i64,
-        "content": "Con về ăn cơm nhé"
+        "msgId": "9000000002001", "cliMsgId": "1700000002001", "uidFrom": "3000101",
+        "idTo": "2000101", "msgType": "webchat", "ts": 1_700_000_002_000_i64,
+        "content": "Hẹn gặp lúc 10 giờ nhé"
     });
-    let (plain_msg, plain_stored) = msg_of(parse(&plain.to_string(), "2072032406797762235"));
+    let (plain_msg, plain_stored) = msg_of(parse(&plain.to_string(), "2000101"));
     assert_eq!(plain_stored.status, "sent");
-    assert_eq!(plain_stored.text, "Con về ăn cơm nhé");
+    assert_eq!(plain_stored.text, "Hẹn gặp lúc 10 giờ nhé");
     assert_eq!(plain_stored.id, locked.id);
     assert!(matches!(plain_msg.kind, Kind::Text));
 }
@@ -371,14 +372,14 @@ fn e2ee_signal_detection_and_placeholders() {
 fn decrypted_e2ee_envelope_parses_text_and_sticker() {
     // Shape of the envelope after `decryptEnvelopeIfNeeded` (plaintext content, id 34840 / cat 420).
     let root = val(r#"{"data":{"msgs":[
-        {"msgId":"9001","cliMsgId":"9001","uidFrom":"mom_uid","idTo":"me_uid","msgType":"webchat","ts":1795000001000,
-         "paramsExt":{"platformType":0},"content":"Mẹ nấu canh chua rồi!","isE2EE":true},
-        {"msgId":"9002","cliMsgId":"9002","uidFrom":"mom_uid","idTo":"me_uid","msgType":"chat.sticker","ts":1795000002000,
+        {"msgId":"9001","cliMsgId":"9001","uidFrom":"peer_uid","idTo":"me_uid","msgType":"webchat","ts":1700000004000,
+         "paramsExt":{"platformType":0},"content":"Hôm nay trời đẹp quá!","isE2EE":true},
+        {"msgId":"9002","cliMsgId":"9002","uidFrom":"peer_uid","idTo":"me_uid","msgType":"chat.sticker","ts":1700000005000,
          "paramsExt":{"platformType":0},"content":{"id":34840,"catId":420,"type":7},"e2eeStatus":1}]}}"#);
     let events = extract_batch_events(&root, "me_uid", &opts());
     assert_eq!(events.len(), 2);
     let (m1, _) = msg_of(events[0].clone());
-    assert_eq!(m1.text, "Mẹ nấu canh chua rồi!");
+    assert_eq!(m1.text, "Hôm nay trời đẹp quá!");
     assert!(m1.is_e2ee);
     let (m2, _) = msg_of(events[1].clone());
     match m2.kind {
@@ -710,9 +711,9 @@ fn media_kinds_round_trip_with_e2ee_locked_status() {
 fn huge_unquoted_ids_stay_exact() {
     let root = val(
         r#"{"data":{"msgs":[{"msgId":7412345678901234567,"cliMsgId":7412345678901234568,"uidFrom":7412345678901234569,
-        "idTo":2072032406797762235,"msgType":"webchat","content":"hi","ts":1795000000000}]}}"#,
+        "idTo":7412345678901234570,"msgType":"webchat","content":"hi","ts":1700000000000}]}}"#,
     );
-    let events = extract_batch_events(&root, "2072032406797762235", &opts());
+    let events = extract_batch_events(&root, "7412345678901234570", &opts());
     assert_eq!(events.len(), 1);
     let (m, s) = msg_of(events[0].clone());
     assert_eq!(m.id, "7412345678901234567");
@@ -1112,15 +1113,15 @@ fn web_link_sanitizing_in_link_cards() {
 #[test]
 fn webchat_msginfo_actionlist_is_system() {
     let (m, s) = msg_of(parse(
-        r#"{"msgId":"8522","cliMsgId":"1795","msgType":"webchat","uidFrom":"0","idTo":"peer","ts":"1795463690898",
-            "content":{"action":"msginfo.actionlist","title":"Hoàng Việt Linh đã ghim tin nhắn a đi dạy về ah.","description":"","href":"","params":"{}","thumb":"","type":"","childnumber":0}}"#,
+        r#"{"msgId":"5001","cliMsgId":"4001","msgType":"webchat","uidFrom":"0","idTo":"peer","ts":"1700000001000",
+            "content":{"action":"msginfo.actionlist","title":"Người A đã ghim tin nhắn Hẹn gặp lúc 10 giờ nhé.","description":"","href":"","params":"{}","thumb":"","type":"","childnumber":0}}"#,
         "me",
     ));
     assert_eq!(s.kind_tag, "system");
-    assert_eq!(m.text, "Hoàng Việt Linh đã ghim tin nhắn a đi dạy về ah.");
+    assert_eq!(m.text, "Người A đã ghim tin nhắn Hẹn gặp lúc 10 giờ nhé.");
     // A plain webchat with an object content stays text.
     let (_, plain) = msg_of(parse(
-        r#"{"msgId":"8523","msgType":"webchat","uidFrom":"peer","idTo":"me","ts":"1","content":{"title":"hi"}}"#,
+        r#"{"msgId":"5002","msgType":"webchat","uidFrom":"peer","idTo":"me","ts":"1","content":{"title":"hi"}}"#,
         "me",
     ));
     assert_eq!(plain.kind_tag, "text");
@@ -1132,8 +1133,8 @@ fn webchat_msginfo_actionlist_is_system() {
 fn group_poll_event_info_line() {
     let ev = |action: &str, from: &str| {
         let raw = format!(
-            r#"{{"msgId":"9{action}","msgType":"group.poll","uidFrom":"{from}","idTo":"3993665107146848278","ts":"1",
-                "content":{{"action":"{action}","title":"","description":"","params":"{{\"pollId\":1192926841,\"question\":\"Khỏe không\",\"uid\":\"{from}\",\"dName\":\"Việt Linh\",\"pollVer\":2}}"}}}}"#
+            r#"{{"msgId":"9{action}","msgType":"group.poll","uidFrom":"{from}","idTo":"5000101","ts":"1",
+                "content":{{"action":"{action}","title":"","description":"","params":"{{\"pollId\":5001001,\"question\":\"Họp lúc mấy giờ\",\"uid\":\"{from}\",\"dName\":\"Người A\",\"pollVer\":2}}"}}}}"#
         );
         let o = WireParseOptions {
             is_group_hint: Some(true),
@@ -1145,22 +1146,28 @@ fn group_poll_event_info_line() {
     };
     assert_eq!(
         ev("create", "peer"),
-        "Việt Linh tạo cuộc bình chọn mới: Khỏe không"
+        "Người A tạo cuộc bình chọn mới: Họp lúc mấy giờ"
     );
     assert_eq!(
         ev("vote", "peer"),
-        "Việt Linh tham gia cuộc bình chọn: Khỏe không"
+        "Người A tham gia cuộc bình chọn: Họp lúc mấy giờ"
     );
     assert_eq!(
         ev("update", "peer"),
-        "Việt Linh đổi lựa chọn trong cuộc bình chọn: Khỏe không"
+        "Người A đổi lựa chọn trong cuộc bình chọn: Họp lúc mấy giờ"
     );
     assert_eq!(
         ev("share", "peer"),
-        "Việt Linh chia sẻ cuộc bình chọn: Khỏe không"
+        "Người A chia sẻ cuộc bình chọn: Họp lúc mấy giờ"
     );
-    assert_eq!(ev("close", "peer"), "Việt Linh khóa bình chọn: Khỏe không");
-    assert_eq!(ev("vote", "0"), "Bạn tham gia cuộc bình chọn: Khỏe không");
+    assert_eq!(
+        ev("close", "peer"),
+        "Người A khóa bình chọn: Họp lúc mấy giờ"
+    );
+    assert_eq!(
+        ev("vote", "0"),
+        "Bạn tham gia cuộc bình chọn: Họp lúc mấy giờ"
+    );
 }
 
 /// Rich text (official `action: rtf`, sent with `textProperties`): the text is `title`, the styles come from
@@ -1242,13 +1249,13 @@ fn urgency_parse_and_round_trip() {
 fn quote_keeps_the_quoted_message_ids() {
     let (m, stored) = msg_of(parse(
         r#"{"msgId":"9","uidFrom":"peer","idTo":"100","msgType":"webchat","content":"ok","ts":1760000000000,
-        "quote":{"ownerId":"peer","msg":"hello","fromD":"P","globalMsgId":8521991431452,"cliMsgId":"1795441030216"}}"#,
+        "quote":{"ownerId":"peer","msg":"hello","fromD":"P","globalMsgId":9000000003001,"cliMsgId":"1700000003001"}}"#,
         "100",
     ));
     let q = m.quote.unwrap();
     assert_eq!(
         (q.msg_id.as_str(), q.cli_msg_id.as_str()),
-        ("8521991431452", "1795441030216")
+        ("9000000003001", "1700000003001")
     );
     let back = crate::model::ChatMessage::from_json(
         serde_json::from_slice::<serde_json::Value>(&stored.raw_json_data)
@@ -1258,7 +1265,7 @@ fn quote_keeps_the_quoted_message_ids() {
         "",
     )
     .unwrap();
-    assert_eq!(back.quote.unwrap().msg_id, "8521991431452");
+    assert_eq!(back.quote.unwrap().msg_id, "9000000003001");
 }
 
 #[test]

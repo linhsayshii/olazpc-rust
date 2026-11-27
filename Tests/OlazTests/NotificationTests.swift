@@ -89,10 +89,10 @@ import UserNotifications
     @Test func parsesElectronNotificationArguments() throws {
         let png = Data([0x89, 0x50, 0x4E, 0x47, 1, 2, 3]).base64EncodedString()
         let request = try #require(NativeNotificationRequest.parse([
-            "Nhóm Gia đình", ["body": "Mẹ: ăn cơm chưa", "tag": "g12345", "silent": true, "icon": "data:image/png;base64,\(png)"],
+            "Nhóm A", ["body": "Người A: họp lúc mấy giờ", "tag": "g12345", "silent": true, "icon": "data:image/png;base64,\(png)"],
         ]))
-        #expect(request.title == "Nhóm Gia đình")
-        #expect(request.body == "Mẹ: ăn cơm chưa")
+        #expect(request.title == "Nhóm A")
+        #expect(request.body == "Người A: họp lúc mấy giờ")
         #expect(request.tag == "g12345")
         #expect(request.silent)
         #expect(request.icon == .inline(Data([0x89, 0x50, 0x4E, 0x47, 1, 2, 3])))
@@ -118,8 +118,8 @@ import UserNotifications
     // MARK: policy
 
     @Test func previewToggle() {
-        #expect(NotificationPolicy.body("Mẹ: xin chào", showsPreview: true) == "Mẹ: xin chào")
-        #expect(NotificationPolicy.body("Mẹ: xin chào", showsPreview: false) == "Bạn có tin nhắn mới")
+        #expect(NotificationPolicy.body("Người A: xin chào", showsPreview: true) == "Người A: xin chào")
+        #expect(NotificationPolicy.body("Người A: xin chào", showsPreview: false) == "Bạn có tin nhắn mới")
     }
 
     @Test func suppressesOnlyWhenWatchingThatConversation() {
@@ -215,18 +215,18 @@ import UserNotifications
         #expect(updatedDM.title == "")
 
         let groupReq = NativeNotificationRequest(
-            title: "Gia Đình",
-            body: "Ăn cơm chưa",
+            title: "Nhóm A",
+            body: "Xin chào",
             tag: "g999",
             silent: false,
             icon: nil,
             senderId: "201",
-            senderName: "Mẹ",
+            senderName: "Người A",
             isGroup: true
         )
-        let groupIntent = NotificationPolicy.buildCommunicationIntent(for: groupReq, body: "Ăn cơm chưa", avatarPNGData: png)
-        #expect(groupIntent.speakableGroupName?.spokenPhrase == "Gia Đình")
-        #expect(groupIntent.sender?.displayName == "Mẹ")
+        let groupIntent = NotificationPolicy.buildCommunicationIntent(for: groupReq, body: "Xin chào", avatarPNGData: png)
+        #expect(groupIntent.speakableGroupName?.spokenPhrase == "Nhóm A")
+        #expect(groupIntent.sender?.displayName == "Người A")
         #expect(groupIntent.conversationIdentifier == "g999")
         #expect(groupIntent.recipients?.count == 1)
         #expect(groupIntent.__image(forParameterNamed: "sender") != nil)

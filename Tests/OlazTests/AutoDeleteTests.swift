@@ -7,10 +7,10 @@ struct AutoDeleteTests {
     @Test func settingsFromConvers() {
         let map = AutoDelete.settings(from: ["convers": [
             ["destId": "200", "isGroup": 0, "ttl": 86_400_000],
-            ["destId": "3993665107146848278", "isGroup": 1, "ttl": 3_600_000],
+            ["destId": "5000101", "isGroup": 1, "ttl": 3_600_000],
             ["destId": "300", "isGroup": 0, "ttl": 0],
         ]])
-        #expect(map == ["200": 86_400_000, "g3993665107146848278": 3_600_000])
+        #expect(map == ["200": 86_400_000, "g5000101": 3_600_000])
     }
 
     @Test func updatePayloadMatchesOfficial() {
