@@ -372,14 +372,15 @@ impl fmt::Debug for GroupsState {
 
 impl GroupsState {
     /// Applies a seeded [`GroupsState`] (from `Command::SeedGroups`), preserving existing
-    /// `member_cache` and `cached_groups` when the seed leaves them empty.
+    /// `cached_groups` when the seed leaves it empty.
     pub fn apply_seeded_groups(&mut self, seed: Self) {
         self.details_json = seed.details_json;
-        if !seed.member_cache.is_empty() {
-            self.member_cache = seed.member_cache;
-        }
+        self.member_cache = seed.member_cache;
         if !seed.cached_groups.is_empty() {
             self.cached_groups = seed.cached_groups;
+        }
+        if seed.navigation_request.is_some() {
+            self.navigation_request = seed.navigation_request;
         }
     }
 

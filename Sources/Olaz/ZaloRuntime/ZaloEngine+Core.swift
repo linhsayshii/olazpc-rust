@@ -1513,6 +1513,7 @@ extension ZaloEngine {
                 core.seedSeenReactionKeys(keys: self.seenReactionEventOrder)
             }
             self.pushCoreContactsIfRunning()
+            self.pushCoreGroupsIfRunning()
             self.pushCoreHistoryFreshnessIfRunning()
             self.pushCorePinsIfRunning()
             if let openId = self.openConversationId {
@@ -1747,8 +1748,8 @@ extension ZaloEngine {
     }
 
     internal func hostHandleGroupNotice(act: String, dataBox: ZaloJSONBox, ts: Int64) async {
-        guard traceHost("group_notice", args: ["act": act, "data": dataBox.dict, "ts": ts]) else { return }
-        await handleGroupEventNotice(act: act, data: dataBox.dict, ts: ts)
+        // Trace-only hook once `olaz-core` owns group notices (ADR-030 constraint (c)).
+        _ = traceHost("group_notice", args: ["act": act, "data": dataBox.dict, "ts": ts])
     }
 
     internal func hostApplyMute(
@@ -2045,6 +2046,10 @@ extension ZaloEngine {
             applyContactsMirror(cRec)
         }
 
+        if let gRec = batch.groups {
+            applyGroupsMirror(gRec)
+        }
+
         if let pRec = batch.polls {
             applyPollsMirror(pRec, fromLocalPlan: false)
         }
@@ -2168,7 +2173,7 @@ extension ZaloEngine {
             }
         }
 
-        if (batch.contacts != nil || batch.cachedProfiles != nil || batch.cachedGroups != nil),
+        if (batch.contacts != nil || batch.cachedProfiles != nil || batch.cachedGroups != nil || batch.groups != nil),
            let core = coreLifecycle.core {
             lastPushedIdentityKey = currentIdentityPushKey(for: core)
         }
@@ -3239,6 +3244,41 @@ extension ZaloEngine {
         core.seedContacts(contacts: currentContactsStateRecord())
     }
 
+    internal func currentGroupsStateRecord() -> GroupsStateRecord {
+        GroupsStateRecord(
+            detailsJson: cachedGroupDetails.map {
+                StringPairEntry(key: $0.key, value: Self.jsonString(for: $0.value))
+            },
+            memberCache: groupMemberCache.map { gid, members in
+                GroupMemberCacheEntry(
+                    groupId: gid,
+                    members: members.map {
+                        MentionCandidateRecord(
+                            id: $0.id,
+                            name: $0.name,
+                            avatar: $0.avatar?.absoluteString,
+                            isAll: $0.isAll
+                        )
+                    }
+                )
+            },
+            cachedGroups: cachedGroups.map { gid, cg in
+                CachedGroupEntry(
+                    gid: gid,
+                    name: cg.name,
+                    avatar: cg.avatar,
+                    members: Int64(cg.members)
+                )
+            },
+            navigationRequest: lastMirroredGroupNavigationRequest
+        )
+    }
+
+    internal func pushCoreGroupsIfRunning() {
+        guard !isApplyingCoreMirror, let core = coreLifecycle.core else { return }
+        core.seedGroups(groups: currentGroupsStateRecord())
+    }
+
     internal func pushCoreBlockedUsersIfRunning() {
         guard !isApplyingCoreMirror, let core = coreLifecycle.core else { return }
         core.seedBlockedUsers(users: blockedUsers?.map {
@@ -3378,14 +3418,6 @@ extension ZaloEngine {
             cachedAliases = nextAliases
         }
 
-        var details: [String: [String: Any]] = [:]
-        details.reserveCapacity(cRec.groupDetailsJson.count)
-        for pair in cRec.groupDetailsJson {
-            if let parsed = JSONLossless.parseObject(string: pair.value) {
-                details[pair.key] = parsed
-            }
-        }
-        cachedGroupDetails = details
         if let recRaw = cRec.receivedRawJson,
            let data = recRaw.data(using: .utf8),
            let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
@@ -3408,6 +3440,53 @@ extension ZaloEngine {
         if !gidToUid.isEmpty {
             let client = sessionClient
             Task { await client.seedGlobalIdMappings(gidToUid) }
+        }
+    }
+
+    internal func applyGroupsMirror(_ gRec: GroupsStateRecord) {
+        var details: [String: [String: Any]] = [:]
+        details.reserveCapacity(gRec.detailsJson.count)
+        for pair in gRec.detailsJson {
+            if let parsed = JSONLossless.parseObject(string: pair.value) {
+                details[pair.key] = parsed
+            }
+        }
+        cachedGroupDetails = details
+
+        var nextMemberCache: [String: [MentionCandidate]] = [:]
+        nextMemberCache.reserveCapacity(gRec.memberCache.count)
+        for entry in gRec.memberCache {
+            nextMemberCache[entry.groupId] = entry.members.map {
+                MentionCandidate(
+                    id: $0.id,
+                    name: $0.name,
+                    avatar: $0.avatar.flatMap(URL.init(string:)),
+                    isAll: $0.isAll
+                )
+            }
+        }
+        if nextMemberCache != groupMemberCache {
+            groupMemberCache = nextMemberCache
+        }
+
+        var nextCachedGroups: [String: ZaloWebKitMigrator.CachedGroup] = [:]
+        nextCachedGroups.reserveCapacity(gRec.cachedGroups.count)
+        for entry in gRec.cachedGroups {
+            nextCachedGroups[entry.gid] = ZaloWebKitMigrator.CachedGroup(
+                name: entry.name,
+                avatar: entry.avatar,
+                members: Int(entry.members)
+            )
+        }
+        if nextCachedGroups != cachedGroups {
+            cachedGroups = nextCachedGroups
+        }
+
+        if gRec.navigationRequest != lastMirroredGroupNavigationRequest {
+            lastMirroredGroupNavigationRequest = gRec.navigationRequest
+            if let req = gRec.navigationRequest {
+                navigationRequest = req
+            }
         }
     }
 

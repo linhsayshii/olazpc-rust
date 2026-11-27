@@ -362,47 +362,13 @@ extension ZaloEngine {
     }
 
     func mentionCandidates(in id: String, query: String, excluding: [String] = []) async -> [MentionCandidate] {
-        guard ZaloWireParser.isGroupId(id) else { return [] }
-        let cleanGroup = ZaloWireParser.cleanGroupId(id)
-        let excludedSet = Set(excluding)
-
-        if groupMemberCache[id] == nil {
-            var candidates: [MentionCandidate] = [
-                MentionCandidate(id: "-1", name: "All", avatar: nil, isAll: true)
-            ]
-            if let groupInfo = cachedGroupDetails[cleanGroup] {
-                var memberIds: [String] = []
-                if let verList = groupInfo["memVerList"] as? [String] {
-                    memberIds.append(contentsOf: verList.compactMap { $0.split(separator: "_").first.map(String.init) })
-                }
-                if memberIds.isEmpty, let mems = groupInfo["memIds"] as? [Any] {
-                    memberIds.append(contentsOf: mems.map(JSONLossless.string))
-                }
-                if memberIds.isEmpty, let cur = groupInfo["currentMems"] as? [[String: Any]] {
-                    memberIds.append(contentsOf: cur.map { JSONLossless.string($0["id"] ?? $0["uid"]) })
-                }
-                let myUid = profile?.userId ?? ""
-                let cleanIds = Array(Set(memberIds.map(ZaloWireParser.stripUserPrefix))).filter { !$0.isEmpty && $0 != myUid }
-                if let profBox = try? await sessionClient.fetchProfiles(uids: Array(cleanIds.prefix(50))) {
-                    let profilesMap = ZaloWireParser.extractProfilesMap(profBox.dict)
-                    for uid in cleanIds {
-                        guard let row = profilesMap[uid] else { continue }
-                        let name = ZaloWireParser.preferredName(row)
-                        let avt = JSONLossless.string(row["avatar"] ?? row["avt"])
-                        if !name.isEmpty {
-                            candidates.append(MentionCandidate(id: uid, name: name, avatar: avt.isEmpty ? nil : URL(string: avt), isAll: false))
-                        }
-                    }
-                }
-            }
-            groupMemberCache[id] = candidates
+        guard let core = await ensureCoreEngine(),
+              let res = try? await core.mentionCandidates(groupId: id, query: query, excluding: excluding) else {
+            return []
         }
-
-        let needle = Self.contactFold(query).trimmingCharacters(in: .whitespacesAndNewlines)
-        return (groupMemberCache[id] ?? []).filter { candidate in
-            guard !excludedSet.contains(candidate.id) else { return false }
-            if needle.isEmpty { return true }
-            return Self.contactFold(candidate.name).contains(needle)
+        await waitForMirrorVersion(res.version)
+        return res.members.map {
+            MentionCandidate(id: $0.id, name: $0.name, avatar: $0.avatar.flatMap(URL.init(string:)), isAll: $0.isAll)
         }
     }
 

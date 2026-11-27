@@ -119,7 +119,15 @@ final class ZaloEngine {
     var transferStartBlockedReason: String?
 
     var selfConversationId: String?
-    var navigationRequest: String?
+    @ObservationIgnored internal var lastMirroredGroupNavigationRequest: String?
+    var navigationRequest: String? {
+        didSet {
+            if !isApplyingCoreMirror, navigationRequest == nil, lastMirroredGroupNavigationRequest != nil {
+                lastMirroredGroupNavigationRequest = nil
+                coreLifecycle.core?.clearGroupNavigationRequest()
+            }
+        }
+    }
     var conversationExtras = ConversationExtras()
     var conversationActions = ConversationActionsState()
     let conversationUI = ConversationActionUI()
@@ -282,10 +290,10 @@ final class ZaloEngine {
     @ObservationIgnored internal var seenReactionEventIds: Set<String> = []
     @ObservationIgnored internal var seenReactionEventOrder: [String] = []
     @ObservationIgnored internal var reactionBusyKeys: Set<String> = []
-    @ObservationIgnored internal var groupMemberCache: [String: [MentionCandidate]] = [:]
+    @ObservationIgnored internal var groupMemberCache: [String: [MentionCandidate]] = [:] { didSet { pushCoreGroupsIfRunning() } }
     @ObservationIgnored internal var cachedSentRequestsRaw: [[String: Any]] = []
     @ObservationIgnored internal var cachedReceivedRequestsRaw: [[String: Any]] = []
-    @ObservationIgnored internal var cachedGroupDetails: [String: [String: Any]] = [:] { didSet { pushCoreContactsIfRunning() } }
+    @ObservationIgnored internal var cachedGroupDetails: [String: [String: Any]] = [:] { didSet { pushCoreGroupsIfRunning() } }
     @ObservationIgnored internal var cachedFriendGlobalIds: [String: String] = [:] {
         didSet {
             friendUidByGlobalId = nil
@@ -497,6 +505,7 @@ final class ZaloEngine {
         syncAttemptedProfileUids = []
         syncStage2Progress = SyncStage2ProgressState()
         syncInitialEmptyDB = false
+        lastMirroredGroupNavigationRequest = nil
         navigationRequest = nil
         conversationExtras = ConversationExtras()
         conversationActions = ConversationActionsState()

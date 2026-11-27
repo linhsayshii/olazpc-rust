@@ -48,6 +48,10 @@ use crate::conversations::{
     SeenTargetRecord,
 };
 use crate::error::{CoreError, NetworkKind};
+use crate::groups::{
+    GroupAvatarUploadRecord, GroupBoolResultRecord, GroupCreateResultRecord, GroupLinkResultRecord,
+    GroupMembersResultRecord, GroupPendingResultRecord, GroupsStateRecord,
+};
 use crate::messages::{
     BlockedUserRecord, ContactsStateRecord, FreshnessMapEntry, MessageMetaRecord, MuteEntryRecord,
     PersonLookupRecord, SaveAliasResultRecord, WindowDeltaRecord, records_to_chat_messages,
@@ -1770,6 +1774,8 @@ pub struct CoreChangesRecord {
     pub messages_reset_all: bool,
     pub message_meta: Option<MessageMetaRecord>,
     pub contacts: Option<ContactsStateRecord>,
+    #[uniffi(default = None)]
+    pub groups: Option<GroupsStateRecord>,
     pub typing: Option<Vec<TypingEntryRecord>>,
     pub forward_request: Option<ForwardRequestUpdateRecord>,
     pub clear_selection: bool,
@@ -1810,6 +1816,7 @@ impl fmt::Debug for CoreChangesRecord {
             .field("typing_count", &self.typing.as_ref().map(Vec::len))
             .field("has_forward_request", &self.forward_request.is_some())
             .field("clear_selection", &self.clear_selection)
+            .field("groups", &self.groups)
             .field("polls", &self.polls)
             .field("cloud", &self.cloud)
             .finish()
@@ -1833,20 +1840,8 @@ impl From<CoreChanges> for CoreChangesRecord {
             window_deltas: c.window_deltas.into_iter().map(Into::into).collect(),
             messages_reset_all: c.messages_reset_all,
             message_meta: c.message_meta.map(Into::into),
-            contacts: c.contacts.map(|contacts| {
-                let mut rec: ContactsStateRecord = contacts.into();
-                if let Some(ref g) = c.groups {
-                    rec.group_details_json = g
-                        .details_json
-                        .iter()
-                        .map(|(key, value)| crate::StringPairEntry {
-                            key: key.clone(),
-                            value: value.clone(),
-                        })
-                        .collect();
-                }
-                rec
-            }),
+            contacts: c.contacts.map(Into::into),
+            groups: c.groups.map(Into::into),
             typing: c.typing.map(|map| {
                 map.into_iter()
                     .map(|(conv_id, status)| TypingEntryRecord {
@@ -2257,6 +2252,7 @@ impl CoreOfflineConversations {
             messages_reset_all: false,
             message_meta: None,
             contacts: None,
+            groups: None,
             typing: None,
             forward_request: None,
             clear_selection: false,
@@ -2308,18 +2304,11 @@ impl CoreOfflineConversations {
                 DirtyKey::MessagesResetAll => {
                     rec.messages_reset_all = true;
                 }
-                DirtyKey::Contacts | DirtyKey::Groups => {
-                    let mut c_rec: ContactsStateRecord = state.contacts.clone().into();
-                    c_rec.group_details_json = state
-                        .groups
-                        .details_json
-                        .iter()
-                        .map(|(key, value)| crate::StringPairEntry {
-                            key: key.clone(),
-                            value: value.clone(),
-                        })
-                        .collect();
-                    rec.contacts = Some(c_rec);
+                DirtyKey::Contacts => {
+                    rec.contacts = Some(state.contacts.clone().into());
+                }
+                DirtyKey::Groups => {
+                    rec.groups = Some(state.groups.clone().into());
                 }
                 DirtyKey::Typing => {
                     rec.typing = Some(
@@ -3883,18 +3872,13 @@ impl CoreEngine {
     }
 
     pub fn seed_contacts(&self, contacts: ContactsStateRecord) {
-        let details_json: std::collections::BTreeMap<String, String> = contacts
-            .group_details_json
-            .iter()
-            .map(|p| (p.key.clone(), p.value.clone()))
-            .collect();
         self.handle
             .send(Command::SeedContacts(Box::new(contacts.into())));
+    }
+
+    pub fn seed_groups(&self, groups: GroupsStateRecord) {
         self.handle
-            .send(Command::SeedGroups(Box::new(olaz_core::GroupsState {
-                details_json,
-                ..olaz_core::GroupsState::default()
-            })));
+            .send(Command::SeedGroups(Box::new(groups.into())));
     }
 
     pub async fn flush_all(&self) -> Result<u64, CoreError> {
@@ -5558,6 +5542,450 @@ impl CoreEngine {
         self.handle.send(Command::SeedBlockedUsers(
             users.map(|v| v.into_iter().map(Into::into).collect()),
         ));
+    }
+
+    // --- Groups domain (U10) ---
+
+    pub async fn create_group(
+        &self,
+        name: String,
+        members: Vec<String>,
+        avatar: Option<GroupAvatarUploadRecord>,
+        now_ms: i64,
+    ) -> Result<GroupCreateResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let outcome = handle
+                .request_group_create(Command::CreateGroup {
+                    name,
+                    members,
+                    avatar: avatar.map(Into::into),
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            let _ = handle.settle().await;
+            runner.flush_store().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            GroupCreateResultRecord {
+                outcome: outcome.into(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn rename_group(
+        &self,
+        group_id: String,
+        name: String,
+        now_ms: i64,
+    ) -> Result<GroupBoolResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let ok = handle
+                .request_bool(Command::RenameGroup {
+                    group_id,
+                    name,
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            runner.flush_store().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            GroupBoolResultRecord { ok, version }
+        })
+        .await
+    }
+
+    pub async fn invite_group_members(
+        &self,
+        group_id: String,
+        member_ids: Vec<String>,
+        now_ms: i64,
+    ) -> Result<GroupBoolResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let ok = handle
+                .request_bool(Command::InviteGroupMembers {
+                    group_id,
+                    member_ids,
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            runner.flush_store().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            GroupBoolResultRecord { ok, version }
+        })
+        .await
+    }
+
+    pub async fn kick_group_member(
+        &self,
+        group_id: String,
+        member_id: String,
+        now_ms: i64,
+    ) -> Result<GroupBoolResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let ok = handle
+                .request_bool(Command::KickGroupMember {
+                    group_id,
+                    member_id,
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            runner.flush_store().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            GroupBoolResultRecord { ok, version }
+        })
+        .await
+    }
+
+    pub async fn leave_group(
+        &self,
+        group_id: String,
+        silent: bool,
+    ) -> Result<GroupBoolResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let ok = handle
+                .request_bool(Command::LeaveGroup { group_id, silent })
+                .await;
+            runner.flush_host().await;
+            runner.flush_store().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            GroupBoolResultRecord { ok, version }
+        })
+        .await
+    }
+
+    pub async fn refresh_group_metadata(
+        &self,
+        group_id: String,
+        now_ms: i64,
+    ) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let _ = handle
+                .request(Command::RefreshGroupMetadata { group_id, now_ms })
+                .await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub async fn mention_candidates(
+        &self,
+        group_id: String,
+        query: String,
+        excluding: Vec<String>,
+    ) -> Result<GroupMembersResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            let members = handle
+                .request_mention_candidates(Command::MentionCandidates {
+                    group_id,
+                    query,
+                    excluding,
+                })
+                .await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            GroupMembersResultRecord {
+                members: members.into_iter().map(Into::into).collect(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn load_group_members(
+        &self,
+        group_id: String,
+        now_ms: i64,
+    ) -> Result<GroupMembersResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let members = handle
+                .request_mention_candidates(Command::LoadGroupMembers { group_id, now_ms })
+                .await;
+            runner.flush_store().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            GroupMembersResultRecord {
+                members: members.into_iter().map(Into::into).collect(),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn set_group_admin(
+        &self,
+        group_id: String,
+        uid: String,
+        admin: bool,
+        now_ms: i64,
+    ) -> Result<GroupBoolResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let ok = handle
+                .request_bool(Command::SetGroupAdmin {
+                    group_id,
+                    uid,
+                    admin,
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            runner.flush_store().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            GroupBoolResultRecord { ok, version }
+        })
+        .await
+    }
+
+    pub async fn change_group_owner(
+        &self,
+        group_id: String,
+        uid: String,
+        now_ms: i64,
+    ) -> Result<GroupBoolResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let ok = handle
+                .request_bool(Command::ChangeGroupOwner {
+                    group_id,
+                    uid,
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            runner.flush_store().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            GroupBoolResultRecord { ok, version }
+        })
+        .await
+    }
+
+    pub async fn block_group_member(
+        &self,
+        group_id: String,
+        uid: String,
+        now_ms: i64,
+    ) -> Result<GroupBoolResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let ok = handle
+                .request_bool(Command::BlockGroupMember {
+                    group_id,
+                    uid,
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            runner.flush_store().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            GroupBoolResultRecord { ok, version }
+        })
+        .await
+    }
+
+    pub async fn fetch_group_pending(
+        &self,
+        group_id: String,
+    ) -> Result<GroupPendingResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            let members = handle.request_group_pending(group_id).await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            GroupPendingResultRecord {
+                members: members.map(|list| list.into_iter().map(Into::into).collect()),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn review_group_pending(
+        &self,
+        group_id: String,
+        uids: Vec<String>,
+        approve: bool,
+        now_ms: i64,
+    ) -> Result<GroupBoolResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let ok = handle
+                .request_bool(Command::ReviewGroupPending {
+                    group_id,
+                    uids,
+                    approve,
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            runner.flush_store().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            GroupBoolResultRecord { ok, version }
+        })
+        .await
+    }
+
+    pub async fn set_group_join_approval(
+        &self,
+        group_id: String,
+        on: bool,
+        now_ms: i64,
+    ) -> Result<GroupBoolResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let ok = handle
+                .request_bool(Command::SetGroupJoinApproval {
+                    group_id,
+                    on,
+                    now_ms,
+                })
+                .await;
+            runner.flush_host().await;
+            runner.flush_store().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            GroupBoolResultRecord { ok, version }
+        })
+        .await
+    }
+
+    pub async fn fetch_group_link(
+        &self,
+        group_id: String,
+    ) -> Result<GroupLinkResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            let link = handle
+                .request_group_link(Command::FetchGroupLink { group_id })
+                .await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            GroupLinkResultRecord {
+                link: link.map(Into::into),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn set_group_link(
+        &self,
+        group_id: String,
+        renew: bool,
+    ) -> Result<GroupLinkResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let link = handle
+                .request_group_link(Command::SetGroupLink { group_id, renew })
+                .await;
+            runner.flush_host().await;
+            let version = handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version());
+            GroupLinkResultRecord {
+                link: link.map(Into::into),
+                version,
+            }
+        })
+        .await
+    }
+
+    pub async fn handle_group_event_notice(
+        &self,
+        act: String,
+        data_json: String,
+        ts: i64,
+        now_ms: i64,
+    ) -> Result<u64, CoreError> {
+        let data = olaz_json::parse_object_str(&data_json).unwrap_or_default();
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let _ = handle
+                .request(Command::HandleGroupEventNotice {
+                    act,
+                    data,
+                    ts,
+                    now_ms,
+                })
+                .await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn clear_group_navigation_request(&self) {
+        self.handle.send(Command::ClearGroupNavigationRequest);
     }
 
     /// Stops the actor, aborts in-flight session & transport tasks, and closes `next_changes()`.

@@ -1350,11 +1350,15 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func attachStore(store: CoreStore) 
     
+    func blockGroupMember(groupId: String, uid: String, nowMs: Int64) async throws  -> GroupBoolResultRecord
+    
     func bootstrap(nowMs: Int64) async throws  -> UInt64
     
     func cancelFriendRequest(uid: String) 
     
     func cancelFriendRequestAndWait(uid: String) async throws  -> UInt64
+    
+    func changeGroupOwner(groupId: String, uid: String, nowMs: Int64) async throws  -> GroupBoolResultRecord
     
     /**
      * Checks whether `pin` matches the stored hidden-chat PIN digest (MD5 or offline SHA-256).
@@ -1365,6 +1369,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Dismisses the active forward picker request (e.g. sheet closed by user).
      */
     func clearForwardRequest() 
+    
+    func clearGroupNavigationRequest() 
     
     func closeConversation() 
     
@@ -1407,6 +1413,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Creates a new conversation label using caller-supplied `now_ms` and `rand4` for deterministic IDs.
      */
     func createConversationLabel(name: String, colorHex: String, conversationIds: [String], nowMs: Int64, rand4: String) 
+    
+    func createGroup(name: String, members: [String], avatar: GroupAvatarUploadRecord?, nowMs: Int64) async throws  -> GroupCreateResultRecord
     
     func createPoll(convId: String, draft: PollCreateDraftRecord, config: PollConfigRecord, canPin: Bool) async throws  -> PollActionOutcomeRecord
     
@@ -1481,6 +1489,10 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func ensureMessageLoaded(convId: String, message: ChatMessageRecord) async throws  -> EnsureMessageLoadedResultRecord
     
+    func fetchGroupLink(groupId: String) async throws  -> GroupLinkResultRecord
+    
+    func fetchGroupPending(groupId: String) async throws  -> GroupPendingResultRecord
+    
     func findFriendByPhone(phone: String) 
     
     func findFriendByPhoneAndWait(phone: String) async throws  -> UInt64
@@ -1516,6 +1528,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Applies a `conversationExtras` JSON state payload.
      */
     func handleConversationExtras(stateJson: String) 
+    
+    func handleGroupEventNotice(act: String, dataJson: String, ts: Int64, nowMs: Int64) async throws  -> UInt64
     
     /**
      * Handles a board pin topic WS push event for `conv_id` (refreshes if open, invalidates if closed).
@@ -1554,12 +1568,20 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func hideConversationNewPin(id: String, pin: String) async throws  -> ConversationActionResultRecord
     
+    func inviteGroupMembers(groupId: String, memberIds: [String], nowMs: Int64) async throws  -> GroupBoolResultRecord
+    
+    func kickGroupMember(groupId: String, memberId: String, nowMs: Int64) async throws  -> GroupBoolResultRecord
+    
+    func leaveGroup(groupId: String, silent: Bool) async throws  -> GroupBoolResultRecord
+    
     /**
      * Fetches per-conversation auto-delete TTLs from Zalo and awaits the mirror update.
      */
     func loadAutoDelete() async throws  -> UInt64
     
     func loadBlockedUsers() async throws  -> UInt64
+    
+    func loadGroupMembers(groupId: String, nowMs: Int64) async throws  -> GroupMembersResultRecord
     
     func loadOlderMessages(id: String) 
     
@@ -1601,6 +1623,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Marks a conversation read using core's own message window for the `send_seen` target.
      */
     func markRead(id: String) 
+    
+    func mentionCandidates(groupId: String, query: String, excluding: [String]) async throws  -> GroupMembersResultRecord
     
     /**
      * Synchronously resolves `@mention` display name from the lock-free `IdentitySnapshot`.
@@ -1727,6 +1751,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     
     func refreshContacts() 
     
+    func refreshGroupMetadata(groupId: String, nowMs: Int64) async throws  -> UInt64
+    
     /**
      * Refreshes group `@mention` previews from the attached SQLite store.
      */
@@ -1757,6 +1783,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Removes a conversation locally (e.g. after leaving a group) and persists the removal.
      */
     func removeLocalConversation(id: String) async throws  -> UInt64
+    
+    func renameGroup(groupId: String, name: String, nowMs: Int64) async throws  -> GroupBoolResultRecord
     
     /**
      * Reorders conversation labels to match `ids` (preserving any omitted labels after).
@@ -1839,6 +1867,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     
     func retryPoll(id: String, convId: String, nowMs: Int64) 
     
+    func reviewGroupPending(groupId: String, uids: [String], approve: Bool, nowMs: Int64) async throws  -> GroupBoolResultRecord
+    
     /**
      * Re-fetches the board pins of the currently open conversation (if any).
      */
@@ -1866,6 +1896,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func seedComposerConfirms(active: ComposerConfirmRecord?, queued: [ComposerConfirmRecord]) 
     
     func seedContacts(contacts: ContactsStateRecord) 
+    
+    func seedGroups(groups: GroupsStateRecord) 
     
     func seedHistoryFreshness(entries: [FreshnessMapEntry]) 
     
@@ -1937,6 +1969,12 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Replaces the set of 1-1 peer UIDs with active E2EE sessions in core.
      */
     func setE2eeThreads(threads: [String]) 
+    
+    func setGroupAdmin(groupId: String, uid: String, admin: Bool, nowMs: Int64) async throws  -> GroupBoolResultRecord
+    
+    func setGroupJoinApproval(groupId: String, on: Bool, nowMs: Int64) async throws  -> GroupBoolResultRecord
+    
+    func setGroupLink(groupId: String, renew: Bool) async throws  -> GroupLinkResultRecord
     
     /**
      * Sets or changes the hidden-chat PIN.
@@ -2406,6 +2444,22 @@ open func attachStore(store: CoreStore)  {try! rustCall() {
 }
 }
     
+open func blockGroupMember(groupId: String, uid: String, nowMs: Int64)async throws  -> GroupBoolResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_block_group_member(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(groupId),FfiConverterString.lower(uid),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGroupBoolResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
 open func bootstrap(nowMs: Int64)async throws  -> UInt64  {
     return
         try  await uniffiRustCallAsync(
@@ -2447,6 +2501,22 @@ open func cancelFriendRequestAndWait(uid: String)async throws  -> UInt64  {
         )
 }
     
+open func changeGroupOwner(groupId: String, uid: String, nowMs: Int64)async throws  -> GroupBoolResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_change_group_owner(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(groupId),FfiConverterString.lower(uid),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGroupBoolResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
     /**
      * Checks whether `pin` matches the stored hidden-chat PIN digest (MD5 or offline SHA-256).
      */
@@ -2472,6 +2542,14 @@ open func checkHiddenPin(pin: String)async throws  -> Bool  {
 open func clearForwardRequest()  {try! rustCall() {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_method_coreengine_clear_forward_request(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
+open func clearGroupNavigationRequest()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_clear_group_navigation_request(
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
@@ -2620,6 +2698,22 @@ open func createConversationLabel(name: String, colorHex: String, conversationId
         FfiConverterString.lower(rand4),uniffiCallStatus
     )
 }
+}
+    
+open func createGroup(name: String, members: [String], avatar: GroupAvatarUploadRecord?, nowMs: Int64)async throws  -> GroupCreateResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_create_group(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(name),FfiConverterSequenceString.lower(members),FfiConverterOptionTypeGroupAvatarUploadRecord.lower(avatar),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGroupCreateResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
 open func createPoll(convId: String, draft: PollCreateDraftRecord, config: PollConfigRecord, canPin: Bool)async throws  -> PollActionOutcomeRecord  {
@@ -2842,6 +2936,38 @@ open func ensureMessageLoaded(convId: String, message: ChatMessageRecord)async t
         )
 }
     
+open func fetchGroupLink(groupId: String)async throws  -> GroupLinkResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_fetch_group_link(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(groupId)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGroupLinkResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func fetchGroupPending(groupId: String)async throws  -> GroupPendingResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_fetch_group_pending(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(groupId)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGroupPendingResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
 open func findFriendByPhone(phone: String)  {try! rustCall() {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_method_coreengine_find_friend_by_phone(
@@ -2978,6 +3104,22 @@ open func handleConversationExtras(stateJson: String)  {try! rustCall() {
 }
 }
     
+open func handleGroupEventNotice(act: String, dataJson: String, ts: Int64, nowMs: Int64)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_handle_group_event_notice(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(act),FfiConverterString.lower(dataJson),FfiConverterInt64.lower(ts),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
     /**
      * Handles a board pin topic WS push event for `conv_id` (refreshes if open, invalidates if closed).
      */
@@ -3099,6 +3241,54 @@ open func hideConversationNewPin(id: String, pin: String)async throws  -> Conver
         )
 }
     
+open func inviteGroupMembers(groupId: String, memberIds: [String], nowMs: Int64)async throws  -> GroupBoolResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_invite_group_members(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(groupId),FfiConverterSequenceString.lower(memberIds),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGroupBoolResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func kickGroupMember(groupId: String, memberId: String, nowMs: Int64)async throws  -> GroupBoolResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_kick_group_member(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(groupId),FfiConverterString.lower(memberId),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGroupBoolResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func leaveGroup(groupId: String, silent: Bool)async throws  -> GroupBoolResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_leave_group(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(groupId),FfiConverterBool.lower(silent)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGroupBoolResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
     /**
      * Fetches per-conversation auto-delete TTLs from Zalo and awaits the mirror update.
      */
@@ -3130,6 +3320,22 @@ open func loadBlockedUsers()async throws  -> UInt64  {
             completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
             freeFunc: ffi_olaz_ffi_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func loadGroupMembers(groupId: String, nowMs: Int64)async throws  -> GroupMembersResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_load_group_members(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(groupId),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGroupMembersResultRecord_lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
 }
@@ -3272,6 +3478,22 @@ open func markRead(id: String)  {try! rustCall() {
         FfiConverterString.lower(id),uniffiCallStatus
     )
 }
+}
+    
+open func mentionCandidates(groupId: String, query: String, excluding: [String])async throws  -> GroupMembersResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_mention_candidates(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(groupId),FfiConverterString.lower(query),FfiConverterSequenceString.lower(excluding)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGroupMembersResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -3730,6 +3952,22 @@ open func refreshContacts()  {try! rustCall() {
 }
 }
     
+open func refreshGroupMetadata(groupId: String, nowMs: Int64)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_refresh_group_metadata(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(groupId),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
     /**
      * Refreshes group `@mention` previews from the attached SQLite store.
      */
@@ -3840,6 +4078,22 @@ open func removeLocalConversation(id: String)async throws  -> UInt64  {
             completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
             freeFunc: ffi_olaz_ffi_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func renameGroup(groupId: String, name: String, nowMs: Int64)async throws  -> GroupBoolResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_rename_group(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(groupId),FfiConverterString.lower(name),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGroupBoolResultRecord_lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
 }
@@ -4070,6 +4324,22 @@ open func retryPoll(id: String, convId: String, nowMs: Int64)  {try! rustCall() 
 }
 }
     
+open func reviewGroupPending(groupId: String, uids: [String], approve: Bool, nowMs: Int64)async throws  -> GroupBoolResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_review_group_pending(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(groupId),FfiConverterSequenceString.lower(uids),FfiConverterBool.lower(approve),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGroupBoolResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
     /**
      * Re-fetches the board pins of the currently open conversation (if any).
      */
@@ -4179,6 +4449,15 @@ open func seedContacts(contacts: ContactsStateRecord)  {try! rustCall() {
     uniffi_olaz_ffi_fn_method_coreengine_seed_contacts(
             self.uniffiCloneHandle(),
         FfiConverterTypeContactsStateRecord_lower(contacts),uniffiCallStatus
+    )
+}
+}
+    
+open func seedGroups(groups: GroupsStateRecord)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_seed_groups(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeGroupsStateRecord_lower(groups),uniffiCallStatus
     )
 }
 }
@@ -4418,6 +4697,54 @@ open func setE2eeThreads(threads: [String])  {try! rustCall() {
         FfiConverterSequenceString.lower(threads),uniffiCallStatus
     )
 }
+}
+    
+open func setGroupAdmin(groupId: String, uid: String, admin: Bool, nowMs: Int64)async throws  -> GroupBoolResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_set_group_admin(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(groupId),FfiConverterString.lower(uid),FfiConverterBool.lower(admin),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGroupBoolResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func setGroupJoinApproval(groupId: String, on: Bool, nowMs: Int64)async throws  -> GroupBoolResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_set_group_join_approval(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(groupId),FfiConverterBool.lower(on),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGroupBoolResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func setGroupLink(groupId: String, renew: Bool)async throws  -> GroupLinkResultRecord  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_set_group_link(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(groupId),FfiConverterBool.lower(renew)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeGroupLinkResultRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -15835,6 +16162,7 @@ public struct CoreChangesRecord: Equatable, Hashable {
     public var messagesResetAll: Bool
     public var messageMeta: MessageMetaRecord?
     public var contacts: ContactsStateRecord?
+    public var groups: GroupsStateRecord?
     public var typing: [TypingEntryRecord]?
     public var forwardRequest: ForwardRequestUpdateRecord?
     public var clearSelection: Bool
@@ -15853,7 +16181,7 @@ public struct CoreChangesRecord: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, typing: [TypingEntryRecord]?, forwardRequest: ForwardRequestUpdateRecord?, clearSelection: Bool, deleteUndo: DeleteUndoUpdateRecord?, messageConfirm: MessageConfirmUpdateRecord?, autoDelete: AutoDeleteUpdateRecord?, starredIds: [String]?, cachedProfiles: [CachedProfileEntry]?, pins: PinsSnapshotRecord? = nil, cachedGroups: [CachedGroupEntry]? = nil, polls: PollsMirrorRecord? = nil, cloud: CloudStateRecord? = nil, stickerSuggest: StickerSuggestUpdateRecord?, composerConfirm: ComposerConfirmUpdateRecord?, queuedComposerConfirms: [ComposerConfirmRecord]?) {
+    public init(version: UInt64, session: SessionStateRecord?, conversations: [ConversationSummaryRecord]?, conversationFlags: ConversationActionsRecord?, conversationExtras: ConversationExtrasRecord?, conversationUi: ConversationActionUiRecord?, conversationPrompt: PromptUpdateRecord?, windowDeltas: [WindowDeltaRecord], messagesResetAll: Bool, messageMeta: MessageMetaRecord?, contacts: ContactsStateRecord?, groups: GroupsStateRecord? = nil, typing: [TypingEntryRecord]?, forwardRequest: ForwardRequestUpdateRecord?, clearSelection: Bool, deleteUndo: DeleteUndoUpdateRecord?, messageConfirm: MessageConfirmUpdateRecord?, autoDelete: AutoDeleteUpdateRecord?, starredIds: [String]?, cachedProfiles: [CachedProfileEntry]?, pins: PinsSnapshotRecord? = nil, cachedGroups: [CachedGroupEntry]? = nil, polls: PollsMirrorRecord? = nil, cloud: CloudStateRecord? = nil, stickerSuggest: StickerSuggestUpdateRecord?, composerConfirm: ComposerConfirmUpdateRecord?, queuedComposerConfirms: [ComposerConfirmRecord]?) {
         self.version = version
         self.session = session
         self.conversations = conversations
@@ -15865,6 +16193,7 @@ public struct CoreChangesRecord: Equatable, Hashable {
         self.messagesResetAll = messagesResetAll
         self.messageMeta = messageMeta
         self.contacts = contacts
+        self.groups = groups
         self.typing = typing
         self.forwardRequest = forwardRequest
         self.clearSelection = clearSelection
@@ -15909,6 +16238,7 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
                 messagesResetAll: FfiConverterBool.read(from: &buf), 
                 messageMeta: FfiConverterOptionTypeMessageMetaRecord.read(from: &buf), 
                 contacts: FfiConverterOptionTypeContactsStateRecord.read(from: &buf), 
+                groups: FfiConverterOptionTypeGroupsStateRecord.read(from: &buf), 
                 typing: FfiConverterOptionSequenceTypeTypingEntryRecord.read(from: &buf), 
                 forwardRequest: FfiConverterOptionTypeForwardRequestUpdateRecord.read(from: &buf), 
                 clearSelection: FfiConverterBool.read(from: &buf), 
@@ -15939,6 +16269,7 @@ public struct FfiConverterTypeCoreChangesRecord: FfiConverterRustBuffer {
         FfiConverterBool.write(value.messagesResetAll, into: &buf)
         FfiConverterOptionTypeMessageMetaRecord.write(value.messageMeta, into: &buf)
         FfiConverterOptionTypeContactsStateRecord.write(value.contacts, into: &buf)
+        FfiConverterOptionTypeGroupsStateRecord.write(value.groups, into: &buf)
         FfiConverterOptionSequenceTypeTypingEntryRecord.write(value.typing, into: &buf)
         FfiConverterOptionTypeForwardRequestUpdateRecord.write(value.forwardRequest, into: &buf)
         FfiConverterBool.write(value.clearSelection, into: &buf)
@@ -16939,6 +17270,177 @@ public func FfiConverterTypeFriendRequestEntryRecord_lower(_ value: FriendReques
 }
 
 
+/**
+ * Prepared JPEG group avatar bytes passed into `CoreEngine::create_group`.
+ */
+public struct GroupAvatarUploadRecord: Equatable, Hashable {
+    public var jpeg: Data
+    public var side: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(jpeg: Data, side: UInt32) {
+        self.jpeg = jpeg
+        self.side = side
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension GroupAvatarUploadRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGroupAvatarUploadRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupAvatarUploadRecord {
+        return
+            try GroupAvatarUploadRecord(
+                jpeg: FfiConverterData.read(from: &buf), 
+                side: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GroupAvatarUploadRecord, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.jpeg, into: &buf)
+        FfiConverterUInt32.write(value.side, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupAvatarUploadRecord_lift(_ buf: RustBuffer) throws -> GroupAvatarUploadRecord {
+    return try FfiConverterTypeGroupAvatarUploadRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupAvatarUploadRecord_lower(_ value: GroupAvatarUploadRecord) -> RustBuffer {
+    return FfiConverterTypeGroupAvatarUploadRecord.lower(value)
+}
+
+
+/**
+ * Settled boolean result of a group mutation (`rename`, `invite`, `kick`, `leave`, admin calls).
+ */
+public struct GroupBoolResultRecord: Equatable, Hashable {
+    public var ok: Bool
+    public var version: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(ok: Bool, version: UInt64) {
+        self.ok = ok
+        self.version = version
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension GroupBoolResultRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGroupBoolResultRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupBoolResultRecord {
+        return
+            try GroupBoolResultRecord(
+                ok: FfiConverterBool.read(from: &buf), 
+                version: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GroupBoolResultRecord, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.ok, into: &buf)
+        FfiConverterUInt64.write(value.version, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupBoolResultRecord_lift(_ buf: RustBuffer) throws -> GroupBoolResultRecord {
+    return try FfiConverterTypeGroupBoolResultRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupBoolResultRecord_lower(_ value: GroupBoolResultRecord) -> RustBuffer {
+    return FfiConverterTypeGroupBoolResultRecord.lower(value)
+}
+
+
+/**
+ * Settled result of `CoreEngine::create_group`.
+ */
+public struct GroupCreateResultRecord: Equatable, Hashable {
+    public var outcome: GroupCreateOutcomeRecord
+    public var version: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(outcome: GroupCreateOutcomeRecord, version: UInt64) {
+        self.outcome = outcome
+        self.version = version
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension GroupCreateResultRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGroupCreateResultRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupCreateResultRecord {
+        return
+            try GroupCreateResultRecord(
+                outcome: FfiConverterTypeGroupCreateOutcomeRecord.read(from: &buf), 
+                version: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GroupCreateResultRecord, into buf: inout [UInt8]) {
+        FfiConverterTypeGroupCreateOutcomeRecord.write(value.outcome, into: &buf)
+        FfiConverterUInt64.write(value.version, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupCreateResultRecord_lift(_ buf: RustBuffer) throws -> GroupCreateResultRecord {
+    return try FfiConverterTypeGroupCreateResultRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupCreateResultRecord_lower(_ value: GroupCreateResultRecord) -> RustBuffer {
+    return FfiConverterTypeGroupCreateResultRecord.lower(value)
+}
+
+
 public struct GroupEntryRecord: Equatable, Hashable {
     public var id: String
     public var name: String
@@ -17064,6 +17566,478 @@ public func FfiConverterTypeGroupIdentityRecord_lift(_ buf: RustBuffer) throws -
 #endif
 public func FfiConverterTypeGroupIdentityRecord_lower(_ value: GroupIdentityRecord) -> RustBuffer {
     return FfiConverterTypeGroupIdentityRecord.lower(value)
+}
+
+
+/**
+ * Group join link (`GroupLink`).
+ */
+public struct GroupLinkRecord: Equatable, Hashable {
+    public var link: String
+    public var enabled: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(link: String, enabled: Bool) {
+        self.link = link
+        self.enabled = enabled
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension GroupLinkRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGroupLinkRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupLinkRecord {
+        return
+            try GroupLinkRecord(
+                link: FfiConverterString.read(from: &buf), 
+                enabled: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GroupLinkRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.link, into: &buf)
+        FfiConverterBool.write(value.enabled, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupLinkRecord_lift(_ buf: RustBuffer) throws -> GroupLinkRecord {
+    return try FfiConverterTypeGroupLinkRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupLinkRecord_lower(_ value: GroupLinkRecord) -> RustBuffer {
+    return FfiConverterTypeGroupLinkRecord.lower(value)
+}
+
+
+/**
+ * Settled result of `CoreEngine::fetch_group_link` / `CoreEngine::set_group_link`.
+ */
+public struct GroupLinkResultRecord: Equatable, Hashable {
+    public var link: GroupLinkRecord?
+    public var version: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(link: GroupLinkRecord?, version: UInt64) {
+        self.link = link
+        self.version = version
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension GroupLinkResultRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGroupLinkResultRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupLinkResultRecord {
+        return
+            try GroupLinkResultRecord(
+                link: FfiConverterOptionTypeGroupLinkRecord.read(from: &buf), 
+                version: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GroupLinkResultRecord, into buf: inout [UInt8]) {
+        FfiConverterOptionTypeGroupLinkRecord.write(value.link, into: &buf)
+        FfiConverterUInt64.write(value.version, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupLinkResultRecord_lift(_ buf: RustBuffer) throws -> GroupLinkResultRecord {
+    return try FfiConverterTypeGroupLinkResultRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupLinkResultRecord_lower(_ value: GroupLinkResultRecord) -> RustBuffer {
+    return FfiConverterTypeGroupLinkResultRecord.lower(value)
+}
+
+
+/**
+ * One group's cached mention candidates (`groupMemberCache[gid]`).
+ */
+public struct GroupMemberCacheEntry: Equatable, Hashable {
+    public var groupId: String
+    public var members: [MentionCandidateRecord]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(groupId: String, members: [MentionCandidateRecord]) {
+        self.groupId = groupId
+        self.members = members
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension GroupMemberCacheEntry: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGroupMemberCacheEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupMemberCacheEntry {
+        return
+            try GroupMemberCacheEntry(
+                groupId: FfiConverterString.read(from: &buf), 
+                members: FfiConverterSequenceTypeMentionCandidateRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GroupMemberCacheEntry, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.groupId, into: &buf)
+        FfiConverterSequenceTypeMentionCandidateRecord.write(value.members, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupMemberCacheEntry_lift(_ buf: RustBuffer) throws -> GroupMemberCacheEntry {
+    return try FfiConverterTypeGroupMemberCacheEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupMemberCacheEntry_lower(_ value: GroupMemberCacheEntry) -> RustBuffer {
+    return FfiConverterTypeGroupMemberCacheEntry.lower(value)
+}
+
+
+/**
+ * Settled member list result (`mention_candidates`, `load_group_members`).
+ */
+public struct GroupMembersResultRecord: Equatable, Hashable {
+    public var members: [MentionCandidateRecord]
+    public var version: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(members: [MentionCandidateRecord], version: UInt64) {
+        self.members = members
+        self.version = version
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension GroupMembersResultRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGroupMembersResultRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupMembersResultRecord {
+        return
+            try GroupMembersResultRecord(
+                members: FfiConverterSequenceTypeMentionCandidateRecord.read(from: &buf), 
+                version: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GroupMembersResultRecord, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeMentionCandidateRecord.write(value.members, into: &buf)
+        FfiConverterUInt64.write(value.version, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupMembersResultRecord_lift(_ buf: RustBuffer) throws -> GroupMembersResultRecord {
+    return try FfiConverterTypeGroupMembersResultRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupMembersResultRecord_lower(_ value: GroupMembersResultRecord) -> RustBuffer {
+    return FfiConverterTypeGroupMembersResultRecord.lower(value)
+}
+
+
+/**
+ * One pending join request (`GroupPendingMember`).
+ */
+public struct GroupPendingMemberRecord: Equatable, Hashable {
+    public var id: String
+    public var name: String
+    public var avatar: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, name: String, avatar: String?) {
+        self.id = id
+        self.name = name
+        self.avatar = avatar
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension GroupPendingMemberRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGroupPendingMemberRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupPendingMemberRecord {
+        return
+            try GroupPendingMemberRecord(
+                id: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                avatar: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GroupPendingMemberRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterOptionString.write(value.avatar, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupPendingMemberRecord_lift(_ buf: RustBuffer) throws -> GroupPendingMemberRecord {
+    return try FfiConverterTypeGroupPendingMemberRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupPendingMemberRecord_lower(_ value: GroupPendingMemberRecord) -> RustBuffer {
+    return FfiConverterTypeGroupPendingMemberRecord.lower(value)
+}
+
+
+/**
+ * Settled result of `CoreEngine::fetch_group_pending`.
+ */
+public struct GroupPendingResultRecord: Equatable, Hashable {
+    public var members: [GroupPendingMemberRecord]?
+    public var version: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(members: [GroupPendingMemberRecord]?, version: UInt64) {
+        self.members = members
+        self.version = version
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension GroupPendingResultRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGroupPendingResultRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupPendingResultRecord {
+        return
+            try GroupPendingResultRecord(
+                members: FfiConverterOptionSequenceTypeGroupPendingMemberRecord.read(from: &buf), 
+                version: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GroupPendingResultRecord, into buf: inout [UInt8]) {
+        FfiConverterOptionSequenceTypeGroupPendingMemberRecord.write(value.members, into: &buf)
+        FfiConverterUInt64.write(value.version, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupPendingResultRecord_lift(_ buf: RustBuffer) throws -> GroupPendingResultRecord {
+    return try FfiConverterTypeGroupPendingResultRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupPendingResultRecord_lower(_ value: GroupPendingResultRecord) -> RustBuffer {
+    return FfiConverterTypeGroupPendingResultRecord.lower(value)
+}
+
+
+/**
+ * Group roles derived from a cached group detail (`GroupRoles`).
+ */
+public struct GroupRolesRecord: Equatable, Hashable {
+    public var owner: String
+    public var admins: [String]
+    public var joinApproval: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(owner: String, admins: [String], joinApproval: Bool) {
+        self.owner = owner
+        self.admins = admins
+        self.joinApproval = joinApproval
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension GroupRolesRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGroupRolesRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupRolesRecord {
+        return
+            try GroupRolesRecord(
+                owner: FfiConverterString.read(from: &buf), 
+                admins: FfiConverterSequenceString.read(from: &buf), 
+                joinApproval: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GroupRolesRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.owner, into: &buf)
+        FfiConverterSequenceString.write(value.admins, into: &buf)
+        FfiConverterBool.write(value.joinApproval, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupRolesRecord_lift(_ buf: RustBuffer) throws -> GroupRolesRecord {
+    return try FfiConverterTypeGroupRolesRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupRolesRecord_lower(_ value: GroupRolesRecord) -> RustBuffer {
+    return FfiConverterTypeGroupRolesRecord.lower(value)
+}
+
+
+/**
+ * Full U10 groups state snapshot delivered via `CoreChangesRecord.groups`.
+ */
+public struct GroupsStateRecord: Equatable, Hashable {
+    public var detailsJson: [StringPairEntry]
+    public var memberCache: [GroupMemberCacheEntry]
+    public var cachedGroups: [CachedGroupEntry]
+    public var navigationRequest: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(detailsJson: [StringPairEntry], memberCache: [GroupMemberCacheEntry], cachedGroups: [CachedGroupEntry], navigationRequest: String?) {
+        self.detailsJson = detailsJson
+        self.memberCache = memberCache
+        self.cachedGroups = cachedGroups
+        self.navigationRequest = navigationRequest
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension GroupsStateRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGroupsStateRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupsStateRecord {
+        return
+            try GroupsStateRecord(
+                detailsJson: FfiConverterSequenceTypeStringPairEntry.read(from: &buf), 
+                memberCache: FfiConverterSequenceTypeGroupMemberCacheEntry.read(from: &buf), 
+                cachedGroups: FfiConverterSequenceTypeCachedGroupEntry.read(from: &buf), 
+                navigationRequest: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GroupsStateRecord, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeStringPairEntry.write(value.detailsJson, into: &buf)
+        FfiConverterSequenceTypeGroupMemberCacheEntry.write(value.memberCache, into: &buf)
+        FfiConverterSequenceTypeCachedGroupEntry.write(value.cachedGroups, into: &buf)
+        FfiConverterOptionString.write(value.navigationRequest, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupsStateRecord_lift(_ buf: RustBuffer) throws -> GroupsStateRecord {
+    return try FfiConverterTypeGroupsStateRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupsStateRecord_lower(_ value: GroupsStateRecord) -> RustBuffer {
+    return FfiConverterTypeGroupsStateRecord.lower(value)
 }
 
 
@@ -18408,6 +19382,71 @@ public func FfiConverterTypeMediaSecureRecord_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeMediaSecureRecord_lower(_ value: MediaSecureRecord) -> RustBuffer {
     return FfiConverterTypeMediaSecureRecord.lower(value)
+}
+
+
+/**
+ * Mentionable group member entry (`ChatModels.swift: MentionCandidate`).
+ */
+public struct MentionCandidateRecord: Equatable, Hashable {
+    public var id: String
+    public var name: String
+    public var avatar: String?
+    public var isAll: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, name: String, avatar: String?, isAll: Bool) {
+        self.id = id
+        self.name = name
+        self.avatar = avatar
+        self.isAll = isAll
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MentionCandidateRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMentionCandidateRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MentionCandidateRecord {
+        return
+            try MentionCandidateRecord(
+                id: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                avatar: FfiConverterOptionString.read(from: &buf), 
+                isAll: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MentionCandidateRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterOptionString.write(value.avatar, into: &buf)
+        FfiConverterBool.write(value.isAll, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMentionCandidateRecord_lift(_ buf: RustBuffer) throws -> MentionCandidateRecord {
+    return try FfiConverterTypeMentionCandidateRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMentionCandidateRecord_lower(_ value: MentionCandidateRecord) -> RustBuffer {
+    return FfiConverterTypeMentionCandidateRecord.lower(value)
 }
 
 
@@ -26363,6 +27402,116 @@ public func FfiConverterTypeForwardOutcomeRecord_lower(_ value: ForwardOutcomeRe
 
 
 
+/**
+ * Outcome of `CoreEngine::create_group` (`GroupCreateOutcome`).
+ */
+
+public enum GroupCreateOutcomeRecord: Equatable, Hashable {
+    
+    case created(id: String, failed: [String]
+    )
+    case exists(id: String, text: String
+    )
+    case invalid(text: String, dropped: [String]
+    )
+    case failed(title: String?, message: String, closes: Bool
+    )
+    case pending(text: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension GroupCreateOutcomeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGroupCreateOutcomeRecord: FfiConverterRustBuffer {
+    typealias SwiftType = GroupCreateOutcomeRecord
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupCreateOutcomeRecord {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .created(id: try FfiConverterString.read(from: &buf), failed: try FfiConverterSequenceString.read(from: &buf)
+        )
+        
+        case 2: return .exists(id: try FfiConverterString.read(from: &buf), text: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .invalid(text: try FfiConverterString.read(from: &buf), dropped: try FfiConverterSequenceString.read(from: &buf)
+        )
+        
+        case 4: return .failed(title: try FfiConverterOptionString.read(from: &buf), message: try FfiConverterString.read(from: &buf), closes: try FfiConverterBool.read(from: &buf)
+        )
+        
+        case 5: return .pending(text: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: GroupCreateOutcomeRecord, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .created(id,failed):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(id, into: &buf)
+            FfiConverterSequenceString.write(failed, into: &buf)
+            
+        
+        case let .exists(id,text):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(id, into: &buf)
+            FfiConverterString.write(text, into: &buf)
+            
+        
+        case let .invalid(text,dropped):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(text, into: &buf)
+            FfiConverterSequenceString.write(dropped, into: &buf)
+            
+        
+        case let .failed(title,message,closes):
+            writeInt(&buf, Int32(4))
+            FfiConverterOptionString.write(title, into: &buf)
+            FfiConverterString.write(message, into: &buf)
+            FfiConverterBool.write(closes, into: &buf)
+            
+        
+        case let .pending(text):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(text, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupCreateOutcomeRecord_lift(_ buf: RustBuffer) throws -> GroupCreateOutcomeRecord {
+    return try FfiConverterTypeGroupCreateOutcomeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupCreateOutcomeRecord_lower(_ value: GroupCreateOutcomeRecord) -> RustBuffer {
+    return FfiConverterTypeGroupCreateOutcomeRecord.lower(value)
+}
+
+
+
 
 public enum HistoryFreshnessRecord: Equatable, Hashable {
     
@@ -29363,6 +30512,78 @@ fileprivate struct FfiConverterOptionTypeFoundUserRecord: FfiConverterRustBuffer
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeGroupAvatarUploadRecord: FfiConverterRustBuffer {
+    typealias SwiftType = GroupAvatarUploadRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeGroupAvatarUploadRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeGroupAvatarUploadRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeGroupLinkRecord: FfiConverterRustBuffer {
+    typealias SwiftType = GroupLinkRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeGroupLinkRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeGroupLinkRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeGroupsStateRecord: FfiConverterRustBuffer {
+    typealias SwiftType = GroupsStateRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeGroupsStateRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeGroupsStateRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeLegacyCookieRecord: FfiConverterRustBuffer {
     typealias SwiftType = LegacyCookieRecord?
 
@@ -30347,6 +31568,30 @@ fileprivate struct FfiConverterOptionSequenceTypeConversationSummaryRecord: FfiC
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionSequenceTypeGroupPendingMemberRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [GroupPendingMemberRecord]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceTypeGroupPendingMemberRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceTypeGroupPendingMemberRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionSequenceTypeStickerEntryRecord: FfiConverterRustBuffer {
     typealias SwiftType = [StickerEntryRecord]?
 
@@ -31067,6 +32312,56 @@ fileprivate struct FfiConverterSequenceTypeGroupIdentityRecord: FfiConverterRust
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeGroupMemberCacheEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [GroupMemberCacheEntry]
+
+    public static func write(_ value: [GroupMemberCacheEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeGroupMemberCacheEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [GroupMemberCacheEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [GroupMemberCacheEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeGroupMemberCacheEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeGroupPendingMemberRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [GroupPendingMemberRecord]
+
+    public static func write(_ value: [GroupPendingMemberRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeGroupPendingMemberRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [GroupPendingMemberRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [GroupPendingMemberRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeGroupPendingMemberRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeLabelAssignmentEntry: FfiConverterRustBuffer {
     typealias SwiftType = [LabelAssignmentEntry]
 
@@ -31109,6 +32404,31 @@ fileprivate struct FfiConverterSequenceTypeLeaveEntry: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeLeaveEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeMentionCandidateRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [MentionCandidateRecord]
+
+    public static func write(_ value: [MentionCandidateRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeMentionCandidateRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [MentionCandidateRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [MentionCandidateRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeMentionCandidateRecord.read(from: &buf))
         }
         return seq
     }
@@ -32300,6 +33620,55 @@ public func inflate(data: Data)throws  -> Data  {
 })
 }
 /**
+ * Pure helper: formats a group control event into its official Vietnamese system line.
+ */
+public func groupEventNoticeFfi(act: String, dataJson: String, myUid: String, resolvedNames: [StringPairEntry]) -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_group_event_notice_ffi(
+        FfiConverterString.lower(act),
+        FfiConverterString.lower(dataJson),
+        FfiConverterString.lower(myUid),
+        FfiConverterSequenceTypeStringPairEntry.lower(resolvedNames),uniffiCallStatus
+    )
+})
+}
+/**
+ * Pure helper: extracts cleaned member IDs from a serialized group detail JSON + cached member IDs.
+ */
+public func groupMemberIdsFromDetailFfi(groupId: String, detailJson: String?, cachedMemberIds: [String]) -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_group_member_ids_from_detail_ffi(
+        FfiConverterString.lower(groupId),
+        FfiConverterOptionString.lower(detailJson),
+        FfiConverterSequenceString.lower(cachedMemberIds),uniffiCallStatus
+    )
+})
+}
+/**
+ * Pure helper: formats `"Chưa thêm được A, B và N người khác vào nhóm."`.
+ */
+public func groupNotAddedTextFfi(names: [String]) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_group_not_added_text_ffi(
+        FfiConverterSequenceString.lower(names),uniffiCallStatus
+    )
+})
+}
+/**
+ * Pure helper: parses `GroupRoles` from a serialized group detail JSON object.
+ */
+public func groupRolesFromJsonFfi(infoJson: String) -> GroupRolesRecord  {
+    return try!  FfiConverterTypeGroupRolesRecord_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_group_roles_from_json_ffi(
+        FfiConverterString.lower(infoJson),uniffiCallStatus
+    )
+})
+}
+/**
  * `<hash(seed)>.<ext>` cache file name (`MediaLoader.cachedFileLocation`).
  */
 public func mediaCachedFileName(seed: String, ext: String) -> String  {
@@ -32848,6 +34217,18 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_func_inflate() != 10643) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_func_group_event_notice_ffi() != 50999) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_group_member_ids_from_detail_ffi() != 40826) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_group_not_added_text_ffi() != 44298) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_group_roles_from_json_ffi() != 49190) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_func_media_cached_file_name() != 50847) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -33109,6 +34490,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_attach_store() != 20107) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_block_group_member() != 55058) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_bootstrap() != 40555) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -33118,10 +34502,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_cancel_friend_request_and_wait() != 13386) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_change_group_owner() != 61924) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_check_hidden_pin() != 2625) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_clear_forward_request() != 21403) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_clear_group_navigation_request() != 18444) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_close_conversation() != 59647) {
@@ -33149,6 +34539,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_create_conversation_label() != 13560) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_create_group() != 29573) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_create_poll() != 685) {
@@ -33199,6 +34592,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_ensure_message_loaded() != 11408) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_fetch_group_link() != 10052) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_fetch_group_pending() != 16706) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_find_friend_by_phone() != 43863) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -33229,6 +34628,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_handle_conversation_extras() != 26322) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_handle_group_event_notice() != 46729) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_handle_pin_topic_event() != 10307) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -33253,10 +34655,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_hide_conversation_new_pin() != 2897) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_invite_group_members() != 11005) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_kick_group_member() != 64412) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_leave_group() != 41556) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_load_auto_delete() != 38688) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_load_blocked_users() != 25069) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_load_group_members() != 20573) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_load_older_messages() != 41347) {
@@ -33287,6 +34701,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_mark_read() != 5051) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_mention_candidates() != 28352) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_mention_display_name() != 45321) {
@@ -33376,6 +34793,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_refresh_contacts() != 37332) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_refresh_group_metadata() != 59221) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_refresh_mention_previews() != 8415) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -33398,6 +34818,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_remove_local_conversation() != 52682) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_rename_group() != 19390) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_reorder_conversation_labels() != 2384) {
@@ -33454,6 +34877,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_retry_poll() != 26921) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_review_group_pending() != 2107) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_rewatch_pins() != 27384) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -33476,6 +34902,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_seed_contacts() != 13201) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_seed_groups() != 34038) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_seed_history_freshness() != 1024) {
@@ -33527,6 +34956,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_set_e2ee_threads() != 49248) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_set_group_admin() != 20902) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_set_group_join_approval() != 19968) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_set_group_link() != 39805) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_set_hidden_pin() != 49719) {

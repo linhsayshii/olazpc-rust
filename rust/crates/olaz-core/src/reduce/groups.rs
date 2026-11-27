@@ -1331,7 +1331,6 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
             state.groups.apply_seeded_groups(*groups);
             out.dirty.insert(DirtyKey::Groups);
             out.dirty.insert(DirtyKey::CachedGroups);
-            out.dirty.insert(DirtyKey::Contacts);
             out.refresh_identity_snapshot = true;
             complete_op(out, op_id, OpResult::Unit, false);
         }

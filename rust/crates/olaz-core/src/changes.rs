@@ -357,7 +357,6 @@ impl ChangeHub {
                 }
                 DirtyKey::Contacts => {
                     buf.contacts = Some(state.contacts.clone());
-                    buf.groups = Some(state.groups.clone());
                 }
                 DirtyKey::Groups => {
                     buf.groups = Some(state.groups.clone());

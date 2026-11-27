@@ -44,6 +44,7 @@ mod conversations;
 mod core;
 mod crypto;
 mod error;
+mod groups;
 mod http;
 mod media;
 mod messages;
@@ -77,6 +78,7 @@ pub use core::{
 };
 pub use crypto::{decrypt_ws_frame, inflate};
 pub use error::{CoreError, NetworkKind};
+pub use groups::*;
 pub use http::{CoreHttp, HttpMethod, HttpRequestRecord, UploadPartRecord};
 pub use media::*;
 pub use messages::*;

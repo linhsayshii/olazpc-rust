@@ -334,6 +334,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, out: &mut ReduceOutput) {
             bootstrap::cancel_bootstrap_state(state, out);
             state.messages.reset();
             state.contacts.reset();
+            state.groups = crate::groups::GroupsState::default();
             // U5
             if state.typing.reset_session() {
                 out.dirty.insert(DirtyKey::Typing);
@@ -385,6 +386,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, out: &mut ReduceOutput) {
             out.dirty.insert(DirtyKey::ConversationPrompt);
             out.dirty.insert(DirtyKey::MessagesResetAll);
             out.dirty.insert(DirtyKey::Contacts);
+            out.dirty.insert(DirtyKey::Groups);
             // U12
             out.dirty.insert(DirtyKey::Polls);
 
@@ -452,6 +454,7 @@ pub(crate) fn enter_session_expired(state: &mut CoreState, reason: String, out: 
     bootstrap::cancel_bootstrap_state(state, out);
     state.messages.reset();
     state.contacts.reset();
+    state.groups = crate::groups::GroupsState::default();
     // U5
     if state.typing.reset_session() {
         out.dirty.insert(DirtyKey::Typing);
@@ -499,6 +502,7 @@ pub(crate) fn enter_session_expired(state: &mut CoreState, reason: String, out: 
     out.dirty.insert(DirtyKey::ConversationPrompt);
     out.dirty.insert(DirtyKey::MessagesResetAll);
     out.dirty.insert(DirtyKey::Contacts);
+    out.dirty.insert(DirtyKey::Groups);
     // U12
     out.dirty.insert(DirtyKey::Polls);
 

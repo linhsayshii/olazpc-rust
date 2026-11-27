@@ -12,9 +12,8 @@ use crate::groups::merge_fetched_group_metadata;
 use crate::input::{Command, Input};
 use crate::polls::{
     POLL_DEBOUNCE_DELAY_MS, PollActionResult, PollCapabilities, PollPinOutcome,
-    build_pin_limit_confirm, build_poll_voters,
-    normalize_poll_detail, poll_detail_shape_anomaly_log_line, refresh_poll_pin_state,
-    resolve_poll_group_id,
+    build_pin_limit_confirm, build_poll_voters, normalize_poll_detail,
+    poll_detail_shape_anomaly_log_line, refresh_poll_pin_state, resolve_poll_group_id,
 };
 use crate::reduce::ReduceOutput;
 use crate::state::CoreState;
