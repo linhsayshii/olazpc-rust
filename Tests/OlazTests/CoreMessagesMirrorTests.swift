@@ -56,7 +56,16 @@ import Testing
             messageConfirm: nil,
             autoDelete: nil,
             starredIds: nil,
-            cachedProfiles: nil
+            cachedProfiles: nil,
+            notificationSettings: nil,
+            aliases: nil,
+            pins: nil,
+            cachedGroups: nil,
+            polls: nil,
+            cloud: nil,
+            stickerSuggest: nil,
+            composerConfirm: nil,
+            queuedComposerConfirms: nil
         )
     }
 

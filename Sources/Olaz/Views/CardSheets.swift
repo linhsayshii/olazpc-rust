@@ -184,7 +184,7 @@ struct GroupInviteSheet: View {
         joining = true
         error = nil
         Task {
-            let result = await engine.joinGroup(request.url)
+            let result = await engine.joinGroup(request.url, previewGroupId: preview?.groupId)
             joining = false
             switch result.state {
             case .joined, .already:

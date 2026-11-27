@@ -230,6 +230,8 @@ internal struct OptimisticMessageOverlay {
         case delete(msgIds: Set<String>, undo: DeleteUndo)
         case undoDelete(restored: [ChatMessage])
         case star(msgId: String, on: Bool)
+        case pin(item: PinnedItem, replacingRef: String?)
+        case unpin(ref: String)
     }
 
     let token: UUID
@@ -249,6 +251,9 @@ internal struct OptimisticMessageOverlay {
     var suppressedStarMsg: (starred: Bool, menuStar: MessageMenu.Star?)?
     var suppressedStarSetVersion: UInt64 = 0
     var suppressedStarInSet: Bool?
+    var suppressedPinsVersion: UInt64 = 0
+    var suppressedHasPinList: Bool = false
+    var suppressedPinList: PinnedList?
 }
 
 /// Commands queued on the MainActor while `CoreEngine` completes its one-time async creation.
@@ -406,9 +411,11 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         }
     }
 
-    func refreshBoardPins(convId: String) async {
-        guard let engine else { return }
-        await engine.refreshBoardPins(for: convId)
+    func refreshBoardPins(convId: String) async -> Bool {
+        guard let engine else { return false }
+        return await MainActor.run {
+            engine.traceU4Host("refresh_board_pins", args: ["conv_id": convId])
+        }
     }
 
     func markReadBoundary(convId: String, seenTarget: SeenTargetRecord?) async {
@@ -515,7 +522,11 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
     func notifyIncomingMessages(messages: [ChatMessageRecord]) async {
         guard let engine, !messages.isEmpty else { return }
         let mapped = messages.map(ChatMessage.init(record:))
-        await engine.notifyIncomingBatchMessages(mapped)
+        await MainActor.run {
+            engine.trackNotificationTask { [weak engine] in
+                await engine?.notifyIncomingBatchMessages(mapped)
+            }
+        }
     }
 
     func showBatchTyping(convId: String, senderId: String) async {
@@ -676,12 +687,10 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         }
     }
 
-    func pinTopic(convId: String) async {
-        guard let engine else { return }
-        await MainActor.run {
-            if engine.traceHost("pin_topic", args: ["conv_id": convId]) {
-                engine.handlePinTopicEvent(conversationId: convId)
-            }
+    func pinTopic(convId: String) async -> Bool {
+        guard let engine else { return false }
+        return await MainActor.run {
+            engine.traceHost("pin_topic", args: ["conv_id": convId])
         }
     }
 
@@ -747,6 +756,47 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         }
     }
 
+    func sendE2eeSticker(
+        convId: String,
+        cateId: Int64,
+        stickerId: Int64,
+        clientId: String
+    ) async -> E2eeStickerSendOutcomeRecord {
+        guard let engine else { return .e2eeFailed }
+        return await engine.hostSendE2EESticker(
+            convId: convId,
+            cateId: cateId,
+            stickerId: stickerId,
+            clientId: clientId
+        )
+    }
+
+    func sendE2eeContactCard(
+        convId: String,
+        clientId: String,
+        contactUid: String,
+        title: String,
+        phone: String,
+        avatar: String,
+        qrCodeUrl: String
+    ) async -> E2eeSendOutcomeRecord {
+        guard let engine else { return .aborted }
+        return await engine.hostSendE2EEContactCard(
+            convId: convId,
+            clientId: clientId,
+            contactUid: contactUid,
+            title: title,
+            phone: phone,
+            avatar: avatar,
+            qrCodeUrl: qrCodeUrl
+        )
+    }
+
+    func sleepConfirmPromote(delayMs: UInt64) async {
+        guard let engine else { return }
+        await engine.hostSleepConfirmPromote(delayMs: delayMs)
+    }
+
     func resolveMedia(convId: String, msgId: String, kind: String) async -> MediaResolutionRecord {
         guard let engine else { return .unavailable }
         return await engine.hostResolveMedia(convId: convId, msgId: msgId, kind: kind)
@@ -771,6 +821,75 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         guard let engine else { return .cancelled }
         return await engine.hostSendFiles(convId: convId, paths: paths)
     }
+
+    // MARK: - Notification & Card-Action Host Effects (U16)
+
+    func notifyBanners(banners: [NotifyBannerPayloadRecord]) async {
+        guard let engine, !banners.isEmpty else { return }
+        await MainActor.run {
+            for banner in banners {
+                engine.hostNotifyBanner(banner)
+            }
+        }
+    }
+
+    func requestNotifAuth() async -> NotifAuthorizationRecord {
+        guard let engine else { return .unavailable }
+        let auth = await engine.requestNotificationAuthorization()
+        return auth.coreRecord
+    }
+
+    func startCall(uid: String, video: Bool) async {
+        guard let engine else { return }
+        await MainActor.run {
+            engine.startCall(to: uid, video: video)
+        }
+    }
+
+    func sendCategorySticker(
+        convId: String,
+        cateId: Int32,
+        stickerId: Int32
+    ) async -> CardActionOutcomeRecord {
+        guard let engine else {
+            return .unsupported(text: CardActionOutcome.defaultUnsupported)
+        }
+        let outcome = await engine.sendCategorySticker(
+            in: convId,
+            category: Int(cateId),
+            sticker: Int(stickerId)
+        )
+        return ZaloEngine.mapCardActionOutcomeToRecord(outcome)
+    }
+
+    func refreshContacts() async {
+        guard let engine else { return }
+        await MainActor.run {
+            engine.refreshContacts()
+        }
+    }
+
+    func armReminderWatchTimer(waiterId: UInt64, delaySecs: Double) async -> Bool {
+        guard let engine else { return false }
+        return await MainActor.run {
+            engine.armLocalReminderWatchTimer(waiterId: waiterId, delaySecs: delaySecs)
+        }
+    }
+
+    func cancelReminderWatchTimer(waiterId: UInt64) async {
+        guard let engine else { return }
+        await MainActor.run {
+            engine.reminderWatchTimerTasks[waiterId]?.cancel()
+            engine.reminderWatchTimerTasks.removeValue(forKey: waiterId)
+        }
+    }
+
+    // U14: temporary host boundary until U14's core `ensure_message_loaded` lands on main.
+    func ensureMessageLoaded(convId: String, message: ChatMessageRecord) async -> Bool {
+        guard let engine else { return false }
+        await engine.waitForCoreMirrorDrain()
+        return await engine.ensureMessageLoaded(ChatMessage(record: message), in: convId)
+    }
 }
 
 extension ForwardRequest {
@@ -794,6 +913,239 @@ extension ForwardRequest {
     }
 }
 
+// MARK: - U11 Cloud FFI Record Conversions
+
+extension CloudState.PlanKind {
+    init(coreRecord record: CloudPlanKindRecord) {
+        switch record {
+        case .paid: self = .paid
+        case .free: self = .free
+        case .grace: self = .grace
+        case .afterGrace: self = .afterGrace
+        }
+    }
+}
+
+extension CloudItemKind {
+    init(coreRecord record: CloudItemKindRecord) {
+        switch record {
+        case .photo: self = .photo
+        case .video: self = .video
+        case .file: self = .file
+        case .voice: self = .voice
+        case .other: self = .other
+        }
+    }
+
+    var coreRecord: CloudItemKindRecord {
+        switch self {
+        case .photo: .photo
+        case .video: .video
+        case .file: .file
+        case .voice: .voice
+        case .other: .other
+        }
+    }
+}
+
+extension CloudBreakdown {
+    init(coreRecord record: CloudBreakdownRecord) {
+        self.init(
+            photo: record.photo,
+            video: record.video,
+            file: record.file,
+            voice: record.voice
+        )
+    }
+}
+
+extension CloudState.Plan {
+    init(coreRecord record: CloudPlanRecord) {
+        self.init(
+            kind: CloudState.PlanKind(coreRecord: record.kind),
+            name: record.name,
+            quota: record.quota,
+            usage: record.usage,
+            family: record.family,
+            cloudMedia: record.cloudMedia,
+            messageBackup: record.messageBackup,
+            myCloud: record.myCloud,
+            expireAt: record.expireAtMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) },
+            autoRenew: record.autoRenew,
+            months: Int(record.months),
+            hasKey: record.hasKey,
+            backupMedia: record.backupMedia,
+            backupMyCloud: record.backupMyCloud,
+            backupMessages: record.backupMessages,
+            fileLimit: record.fileLimit
+        )
+    }
+}
+
+extension CloudState.Conversation {
+    init(coreRecord record: CloudConversationRecord) {
+        self.init(
+            id: record.id,
+            name: record.name,
+            avatar: record.avatar.flatMap { $0.isEmpty ? nil : URL(string: $0) },
+            isGroup: record.isGroup,
+            total: record.total,
+            lastActivity: record.lastActivityMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) }
+        )
+    }
+}
+
+extension CloudState.Settings {
+    init(coreRecord record: CloudSettingsRecord) {
+        self.init(
+            offloadEnabled: record.offloadEnabled,
+            offloadAvailable: record.offloadAvailable,
+            lastOffloadAt: record.lastOffloadAtMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) },
+            lastOffloadSize: record.lastOffloadSize,
+            ttlDays: Int(record.ttlDays)
+        )
+    }
+}
+
+extension CloudState {
+    init(coreRecord record: CloudStateRecord) {
+        self.init(
+            plan: record.plan.map(CloudState.Plan.init(coreRecord:)),
+            media: CloudBreakdown(coreRecord: record.media),
+            myCloudTypes: CloudBreakdown(coreRecord: record.myCloudTypes),
+            conversations: record.conversations.map(CloudState.Conversation.init(coreRecord:)),
+            settings: CloudState.Settings(coreRecord: record.settings),
+            changed: Int(record.changed),
+            loaded: record.loaded,
+            hiddenLookup: record.hiddenLookup,
+            selfId: record.selfId
+        )
+    }
+}
+
+extension CloudItem {
+    init(coreRecord record: CloudItemRecord) {
+        self.init(
+            id: record.id,
+            kind: CloudItemKind(coreRecord: record.kind),
+            conversationId: record.conversationId,
+            conversationName: record.conversationName,
+            size: record.size,
+            date: record.dateMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) },
+            title: record.title,
+            ext: record.ext,
+            duration: record.duration,
+            width: Int(record.width),
+            height: Int(record.height)
+        )
+    }
+}
+
+extension CloudPage {
+    init(coreRecord record: CloudPageRecord) {
+        self.init(
+            items: record.items.map(CloudItem.init(coreRecord:)),
+            hasMore: record.hasMore,
+            error: record.error
+        )
+    }
+}
+
+extension CloudFile {
+    init(coreRecord record: CloudFileRecord) {
+        self.init(
+            url: URL(fileURLWithPath: record.path),
+            kind: CloudItemKind(coreRecord: record.kind),
+            title: record.title,
+            ext: record.ext,
+            size: record.size,
+            date: record.dateMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) }
+        )
+    }
+}
+
+extension CloudFetch {
+    init(coreRecord record: CloudFetchRecord) {
+        switch record {
+        case .ready(let file):
+            self = .ready(CloudFile(coreRecord: file))
+        case .expired:
+            self = .expired
+        case .failed(let message):
+            self = .failed(message)
+        }
+    }
+}
+
+extension CloudActionResult {
+    init(coreRecord record: CloudActionResultRecord) {
+        self.init(
+            ok: record.ok,
+            deleted: record.deleted,
+            failed: record.failed,
+            error: record.error
+        )
+    }
+}
+
+extension MediaResolution {
+    init(coreRecord record: MediaResolutionRecord) {
+        switch record {
+        case .file(let path):
+            self = .file(URL(fileURLWithPath: path))
+        case .expired:
+            self = .expired
+        case .unsupported:
+            self = .unsupported
+        case .unavailable:
+            self = .unavailable
+        }
+    }
+}
+
+extension StickerAnimation {
+    init?(coreRecord record: StickerAnimationRecord) {
+        switch record {
+        case .sprite(let url, let frames, let frameMs):
+            guard let parsed = URL(string: url) else { return nil }
+            self = .sprite(url: parsed, frames: Int(frames), frameMs: Int(frameMs))
+        case .animated(let url):
+            guard let parsed = URL(string: url) else { return nil }
+            self = .animated(url: parsed)
+        }
+    }
+
+    var coreRecord: StickerAnimationRecord {
+        switch self {
+        case .sprite(let url, let frames, let frameMs):
+            return .sprite(url: url.absoluteString, frames: Int64(frames), frameMs: Int64(frameMs))
+        case .animated(let url):
+            return .animated(url: url.absoluteString)
+        }
+    }
+}
+
+extension StickerEntry {
+    init?(coreRecord record: StickerEntryRecord) {
+        guard let url = URL(string: record.url) else { return nil }
+        self.init(
+            cateId: Int(record.cateId),
+            stickerId: Int(record.stickerId),
+            url: url,
+            animation: record.animation.flatMap(StickerAnimation.init(coreRecord:))
+        )
+    }
+
+    var coreRecord: StickerEntryRecord {
+        StickerEntryRecord(
+            cateId: Int64(cateId),
+            stickerId: Int64(stickerId),
+            url: url.absoluteString,
+            animation: animation?.coreRecord
+        )
+    }
+}
+
 extension MessageActionOutcome {
     init(forwardRecord record: ForwardOutcomeRecord) {
         switch record {
@@ -804,6 +1156,111 @@ extension MessageActionOutcome {
         case .failed(let text):
             self = .failed(text)
         }
+    }
+}
+
+extension StickerTab {
+    init(coreRecord record: StickerTabRecord) {
+        self.init(
+            id: Int(record.id),
+            name: record.name,
+            icon: record.icon.flatMap(URL.init(string:)),
+            count: Int(record.count)
+        )
+    }
+}
+
+extension StickerSuggestSetting {
+    init(coreRecord record: StickerSuggestSettingRecord) {
+        self.enabled = record.enabled
+        self.debounce = Int(record.debounce)
+    }
+}
+
+extension StickerSource {
+    var coreRecord: StickerSourceRecord {
+        switch self {
+        case .category: return .category
+        case .recent: return .recent
+        case .search: return .search
+        case .suggestion: return .suggestion
+        }
+    }
+}
+
+extension CardActionOutcome {
+    init(coreRecord record: CardActionOutcomeRecord) {
+        switch record {
+        case .done: self = .done
+        case .openChat(let id): self = .openChat(id)
+        case .openProfile(let uid): self = .openProfile(uid)
+        case .openUrl(let url):
+            self = URL(string: url).map(Self.openURL) ?? .failed("Không thực hiện được thao tác.")
+        case .copy(let text): self = .copy(text)
+        case .present: self = .unsupported(Self.defaultUnsupported)
+        case .unsupported(let text): self = .unsupported(text)
+        case .locked(let text): self = .locked(text)
+        case .failed(let text): self = .failed(text)
+        case .pending(let text): self = .pending(text)
+        }
+    }
+}
+
+extension ComposerOutcome {
+    init(coreRecord record: ComposerOutcomeRecord) {
+        switch record {
+        case .done: self = .done
+        case .cancelled: self = .cancelled
+        case .failed(let text): self = .failed(text)
+        case .pending(let text): self = .pending(text)
+        }
+    }
+}
+
+extension MyCardInfo {
+    init(coreRecord record: MyCardInfoRecord) {
+        self.uid = record.uid
+        self.name = record.name
+        self.avatar = record.avatar.flatMap { $0.isEmpty ? nil : URL(string: $0) }
+        self.phone = record.phone
+        self.withPhone = record.withPhone
+    }
+}
+
+extension ReminderComposeInfo {
+    init(coreRecord record: ReminderComposeInfoRecord) {
+        self.allowed = record.allowed
+        self.hidden = record.hidden
+        self.text = record.text
+        self.isGroup = record.isGroup
+        self.canPin = record.canPin
+        self.pinToggle = record.pinToggle
+        self.titleMaxChars = Int(record.titleMaxChars)
+        self.titleMaxBytes = Int(record.titleMaxBytes)
+    }
+}
+
+extension ComposerConfirm {
+    init(coreRecord record: ComposerConfirmRecord) {
+        self.init(
+            id: record.id,
+            conversationId: record.convId,
+            title: record.title,
+            message: record.message,
+            ok: record.ok,
+            cancel: record.cancel
+        )
+    }
+
+    var coreRecord: ComposerConfirmRecord {
+        ComposerConfirmRecord(
+            id: id,
+            convId: conversationId,
+            title: title,
+            message: message,
+            ok: ok,
+            cancel: cancel
+        )
     }
 }
 
@@ -1117,12 +1574,13 @@ extension ZaloEngine {
             if let store = self.sqliteStore {
                 core.attachStore(store: store.coreStoreHandle)
             }
-            core.updateIdentities(table: self.currentIdentityTableRecord())
+            self.sendIdentitiesToCore(core, force: true)
             if !self.seenReactionEventOrder.isEmpty {
                 core.seedSeenReactionKeys(keys: self.seenReactionEventOrder)
             }
             self.pushCoreContactsIfRunning()
             self.pushCoreHistoryFreshnessIfRunning()
+            self.pushCorePinsIfRunning()
             if let openId = self.openConversationId {
                 core.setOpenConversation(id: openId)
             }
@@ -1141,10 +1599,34 @@ extension ZaloEngine {
             }
             let sendTypingEnabled = self.userDefaults.object(forKey: OlazPrefs.sendTyping) as? Bool ?? true
             core.setSendTypingEnabled(enabled: sendTypingEnabled)
+            core.setMessagePreview(shown: self.notificationSettings.showsPreview)
+            if self.notificationSettings.authorization != .unknown {
+                core.setInitialNotificationAuth(auth: self.notificationSettings.authorization.coreRecord)
+            }
+            if self.notificationSettings.isLoaded {
+                let mutesPayload: [[String: Any]] = self.notificationSettings.mutes.map { id, info in
+                    ["id": id, "startTime": info.startTime, "duration": info.duration]
+                }
+                let settingsPayload: [String: Any] = [
+                    "kind": "settings",
+                    "enabled": self.notificationSettings.enabled,
+                    "sound": self.notificationSettings.sound,
+                    "hasSoundSetting": self.notificationSettings.hasSoundSetting,
+                    "mutes": mutesPayload,
+                ]
+                core.handleNotificationSettingsPayload(payloadJson: Self.jsonString(for: settingsPayload))
+            }
+            self.pushAllCorePinsIfRunning()
             if let autoDel = self.autoDelete {
                 for (convId, ttl) in autoDel where ttl > 0 {
                     core.setAutoDeleteTtl(convId: convId, ttlMs: ttl)
                 }
+            }
+            if self.composerConfirm != nil || !self.queuedComposerConfirms.isEmpty {
+                core.seedComposerConfirms(
+                    active: self.composerConfirm?.coreRecord,
+                    queued: self.queuedComposerConfirms.map(\.coreRecord)
+                )
             }
             let initialPolls = self.currentPollsMirrorRecord()
             if !initialPolls.details.isEmpty
@@ -1158,17 +1640,6 @@ extension ZaloEngine {
                 || initialPolls.syncEpoch > 0
             {
                 core.seedPolls(polls: initialPolls)
-            }
-            // U7: seed temporary read-only board caches into core until U7 owns board pins.
-            for (convId, list) in self.pins {
-                core.syncBoardPins(convId: convId, list: list.boardPinListRecord)
-            }
-            for (convId, entry) in self.cachedBoardRawTopics {
-                core.syncBoardRawTopics(
-                    convId: convId,
-                    version: entry.version,
-                    topicsJson: Self.jsonString(for: entry.topics)
-                )
             }
 
             let queued = self.pendingCoreCommands
@@ -1258,6 +1729,7 @@ extension ZaloEngine {
     /// Stops `CoreEngine` and its change-mirror loop (used in tests and teardown).
     internal func stopCoreEngine() {
         pendingCoreCommands.removeAll()
+        lastPushedIdentityKey = nil
         coreLifecycle.shutdown()
         let ws = webSocket
         Task { await ws.detachCore() }
@@ -1760,7 +2232,115 @@ extension ZaloEngine {
             for entry in profiles {
                 next[entry.uid] = ZaloWebKitMigrator.CachedProfile(name: entry.name, avatar: entry.avatar)
             }
-            cachedProfiles = next
+            if next != cachedProfiles {
+                cachedProfiles = next
+            }
+        }
+
+        if let groups = batch.cachedGroups {
+            var next: [String: ZaloWebKitMigrator.CachedGroup] = [:]
+            next.reserveCapacity(groups.count)
+            for entry in groups {
+                next[entry.gid] = ZaloWebKitMigrator.CachedGroup(
+                    name: entry.name,
+                    avatar: entry.avatar,
+                    members: Int(entry.members)
+                )
+            }
+            if next != cachedGroups {
+                cachedGroups = next
+            }
+        }
+
+        if (batch.contacts != nil || batch.cachedProfiles != nil || batch.cachedGroups != nil),
+           let core = coreLifecycle.core {
+            lastPushedIdentityKey = currentIdentityPushKey(for: core)
+        }
+
+        if let cloudRecord = batch.cloud {
+            let nextCloud = CloudState(coreRecord: cloudRecord)
+            if cloud != nextCloud {
+                cloud = nextCloud
+            }
+        }
+
+        if let suggestUpdate = batch.stickerSuggest {
+            StickerSuggestState.shared.apply(
+                suggestUpdate.setting.map(StickerSuggestSetting.init(coreRecord:))
+            )
+        }
+
+        if let confirmUpdate = batch.composerConfirm {
+            let next = confirmUpdate.confirm.map(ComposerConfirm.init(coreRecord:))
+            if composerConfirm != next {
+                composerConfirm = next
+            }
+        }
+
+        if let queuedRecords = batch.queuedComposerConfirms {
+            let next = queuedRecords.map(ComposerConfirm.init(coreRecord:))
+            if queuedComposerConfirms != next {
+                queuedComposerConfirms = next
+            }
+        }
+
+        if let notifRec = batch.notificationSettings {
+            var next = notificationSettings
+            next.applyCoreRecord(notifRec)
+            if next != notificationSettings {
+                notificationSettings = next
+            }
+        }
+
+        if let aliasEntries = batch.aliases {
+            var next: [String: String] = [:]
+            next.reserveCapacity(aliasEntries.count)
+            for entry in aliasEntries {
+                next[entry.uid] = entry.alias
+            }
+            if cachedAliases != next {
+                cachedAliases = next
+            }
+        }
+
+        if let pinsSnap = batch.pins {
+            var nextLists: [String: PinnedList] = [:]
+            nextLists.reserveCapacity(pinsSnap.lists.count)
+            for entry in pinsSnap.lists {
+                let items = entry.items.map { it in
+                    PinnedItem(
+                        ref: it.refId,
+                        kind: PinnedItem.Kind(rawValue: it.kind) ?? .note,
+                        title: it.title,
+                        sender: it.sender,
+                        thumbnail: it.thumbnail.flatMap(URL.init(string:)),
+                        msgId: it.msgId,
+                        cliMsgId: it.cliMsgId
+                    )
+                }
+                nextLists[entry.convId] = PinnedList(
+                    ready: entry.ready,
+                    canPin: entry.canPin,
+                    items: items,
+                    limit: Int(entry.limit)
+                )
+            }
+            if pins != nextLists {
+                pins = nextLists
+            }
+            var nextRaw: [String: (version: Int64, topics: [String: [String: Any]])] = [:]
+            nextRaw.reserveCapacity(pinsSnap.rawTopics.count)
+            for entry in pinsSnap.rawTopics {
+                let rawObj = JSONLossless.parseObject(string: entry.topicsJson) ?? [:]
+                var topics: [String: [String: Any]] = [:]
+                for (tid, val) in rawObj {
+                    if let row = val as? [String: Any] {
+                        topics[tid] = row
+                    }
+                }
+                nextRaw[entry.convId] = (version: entry.version, topics: topics)
+            }
+            cachedBoardRawTopics = nextRaw
         }
 
         if !optimisticMessageOverlays.isEmpty {
@@ -1852,6 +2432,35 @@ extension ZaloEngine {
         return token
     }
 
+    @discardableResult
+    internal func beginOptimisticPinOverlay(
+        convId: String,
+        item: PinnedItem,
+        replacingRef: String?
+    ) -> UUID {
+        let token = UUID()
+        optimisticMessageOverlays.append(OptimisticMessageOverlay(
+            token: token,
+            convId: convId,
+            kind: .pin(item: item, replacingRef: replacingRef)
+        ))
+        return token
+    }
+
+    @discardableResult
+    internal func beginOptimisticUnpinOverlay(
+        convId: String,
+        ref: String
+    ) -> UUID {
+        let token = UUID()
+        optimisticMessageOverlays.append(OptimisticMessageOverlay(
+            token: token,
+            convId: convId,
+            kind: .unpin(ref: ref)
+        ))
+        return token
+    }
+
     internal func scheduleOptimisticOverlayFence(token: UUID, core: CoreEngine) {
         let task = Task { @MainActor [weak self, core] in
             defer { self?.optimisticOverlayFenceTasks.removeValue(forKey: token) }
@@ -1939,6 +2548,12 @@ extension ZaloEngine {
                 } else {
                     cachedStarredIds.remove(msgId)
                 }
+            }
+        case .pin, .unpin:
+            if overlay.suppressedPinsVersion >= targetVersion,
+               overlay.suppressedHasPinList,
+               pins[overlay.convId] != overlay.suppressedPinList {
+                pins[overlay.convId] = overlay.suppressedPinList
             }
         }
     }
@@ -2119,6 +2734,53 @@ extension ZaloEngine {
                         cachedStarredIds.insert(msgId)
                     } else {
                         cachedStarredIds.remove(msgId)
+                    }
+                }
+            case .pin(let item, let replacingRef):
+                if batch.pins != nil {
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedPinsVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedPinsVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedHasPinList = true
+                        optimisticMessageOverlays[i].suppressedPinList = pins[overlay.convId]
+                    }
+                    if var list = pins[overlay.convId] {
+                        var changed = false
+                        if let replacingRef {
+                            let prev = list.items.count
+                            list.items.removeAll { $0.ref == replacingRef }
+                            if list.items.count != prev { changed = true }
+                        }
+                        let alreadyPresent = list.items.contains {
+                            $0.ref == item.ref || (!item.msgId.isEmpty && $0.msgId == item.msgId)
+                        }
+                        if !alreadyPresent {
+                            list.items.insert(item, at: 0)
+                            changed = true
+                        }
+                        if changed {
+                            pins[overlay.convId] = list
+                        }
+                    }
+                }
+            case .unpin(let ref):
+                if batch.pins != nil {
+                    if Self.shouldRecordSuppressed(
+                        batchVersion: batch.version,
+                        previousVersion: optimisticMessageOverlays[i].suppressedPinsVersion
+                    ) {
+                        optimisticMessageOverlays[i].suppressedPinsVersion = batch.version
+                        optimisticMessageOverlays[i].suppressedHasPinList = true
+                        optimisticMessageOverlays[i].suppressedPinList = pins[overlay.convId]
+                    }
+                    if var list = pins[overlay.convId] {
+                        let prev = list.items.count
+                        list.items.removeAll { $0.ref == ref }
+                        if list.items.count != prev {
+                            pins[overlay.convId] = list
+                        }
                     }
                 }
             }
@@ -2331,6 +2993,217 @@ extension ZaloEngine {
         }
     }
 
+    internal func hostSendE2EESticker(
+        convId: String,
+        cateId: Int64,
+        stickerId: Int64,
+        clientId cliId: String
+    ) async -> E2eeStickerSendOutcomeRecord {
+        do {
+            let res: SendMessageResult
+            if let sendE2EEStickerHostHandler {
+                let args: [String: Any] = [
+                    "conv_id": convId,
+                    "cate_id": Int(cateId),
+                    "sticker_id": Int(stickerId),
+                    "client_id": cliId,
+                ]
+                _ = traceHost("send_e2ee_sticker", args: args)
+                guard let hostRes = try await sendE2EEStickerHostHandler(args) else {
+                    return .e2eeFailed
+                }
+                res = hostRes
+            } else {
+                let myUid = profile?.userId ?? ""
+                guard !myUid.isEmpty,
+                      await e2eeManager.ensureSessions(
+                          forPeer: convId,
+                          myUid: myUid,
+                          webSocket: webSocket,
+                          store: sqliteStore
+                      ) else {
+                    EngineLog.shared.write("sendSticker e2ee failed: no open Signal session for peer=\(convId)")
+                    return .e2eeFailed
+                }
+                let encryptedDevices = await e2eeManager.encryptStickerMessage(
+                    peerUid: convId,
+                    myUid: myUid,
+                    stickerId: Int(stickerId),
+                    cateId: Int(cateId),
+                    stickerType: 7,
+                    store: sqliteStore
+                )
+                guard !encryptedDevices.isEmpty else {
+                    EngineLog.shared.write("sendSticker e2ee failed: encryption produced no peer payloads for peer=\(convId)")
+                    return .e2eeFailed
+                }
+                let senderIid = await e2eeManager.localRegistrationId()
+                let imei = await sessionClient.imei
+                let cliInt: Int64
+                if let parsed = Int64(cliId) {
+                    cliInt = parsed
+                } else {
+                    cliInt = await sessionClient.nextClientId()
+                }
+                let listParams: [[String: Any]] = encryptedDevices.compactMap { dev in
+                    guard dev.ciphers.count >= 3 else { return nil }
+                    let extra: [String: Any] = [
+                        "stickerId": dev.ciphers[0],
+                        "cateId": dev.ciphers[1],
+                        "type": dev.ciphers[2],
+                        "zsource": 101,
+                    ]
+                    return ZaloSessionClient.buildE2EEListParamEntry(
+                        toId: dev.toId,
+                        platform: dev.platform,
+                        clientId: cliInt,
+                        imei: imei,
+                        registrationId: dev.registrationId,
+                        senderIid: senderIid,
+                        extraFields: extra
+                    )
+                }
+                guard !listParams.isEmpty else {
+                    EngineLog.shared.write("sendSticker e2ee failed: empty listParams for peer=\(convId)")
+                    return .e2eeFailed
+                }
+                res = try await sessionClient.sendE2EEMessageAPI(
+                    endpoint: "sticker",
+                    threadId: convId,
+                    isGroup: false,
+                    clientId: cliInt,
+                    listParams: ZaloJSONArrayBox(listParams)
+                )
+            }
+            return .sent(msgId: res.msgId, cliMsgId: res.cliMsgId, tsMs: res.tsMs)
+        } catch {
+            EngineLog.shared.write("sendSticker failed: \(error.localizedDescription)")
+            return .apiFailed(message: error.localizedDescription)
+        }
+    }
+
+    internal func hostSendE2EEContactCard(
+        convId: String,
+        clientId cliId: String,
+        contactUid: String,
+        title: String,
+        phone: String,
+        avatar: String,
+        qrCodeUrl: String
+    ) async -> E2eeSendOutcomeRecord {
+        do {
+            let res: SendMessageResult
+            if let sendE2EEContactCardHostHandler {
+                let args: [String: Any] = [
+                    "conv_id": convId,
+                    "client_id": cliId,
+                    "contact_uid": contactUid,
+                    "title": title,
+                    "phone": phone,
+                    "avatar": avatar,
+                    "qr_code_url": qrCodeUrl,
+                ]
+                _ = traceHost("send_e2ee_contact_card", args: args)
+                res = try await sendE2EEContactCardHostHandler(args)
+            } else {
+                let myUid = profile?.userId ?? ""
+                guard !myUid.isEmpty else {
+                    EngineLog.shared.write("sendContactCard e2ee failed: missing local uid")
+                    return .aborted
+                }
+                let ready = await e2eeManager.ensureSessions(
+                    forPeer: convId,
+                    myUid: myUid,
+                    webSocket: webSocket,
+                    store: sqliteStore
+                )
+                guard ready else {
+                    EngineLog.shared.write("sendContactCard e2ee failed: no open Signal session for peer=\(convId)")
+                    return .aborted
+                }
+                let cliInt: Int64
+                if let parsed = Int64(cliId) {
+                    cliInt = parsed
+                } else {
+                    cliInt = await sessionClient.nextClientId()
+                }
+                let cleanContact = ZaloWireParser.stripUserPrefix(contactUid)
+                let gUid: String
+                if let cached = cachedFriendGlobalIds[cleanContact], !cached.isEmpty {
+                    gUid = cached
+                } else {
+                    let resolved = await sessionClient.encryptGlobalIds([cleanContact])[cleanContact] ?? ""
+                    gUid = resolved.isEmpty ? cleanContact : resolved
+                }
+                var descObj: [String: Any] = ["gUid": gUid]
+                if !phone.isEmpty { descObj["phone"] = phone }
+                if !qrCodeUrl.isEmpty { descObj["qrCodeUrl"] = qrCodeUrl }
+                let descJSON = Self.jsonString(for: descObj)
+
+                let encryptedDevices = await e2eeManager.encryptContactCardMessage(
+                    peerUid: convId,
+                    myUid: myUid,
+                    title: title,
+                    avatar: avatar,
+                    descJSON: descJSON,
+                    store: sqliteStore
+                )
+                guard !encryptedDevices.isEmpty else {
+                    EngineLog.shared.write("sendContactCard e2ee failed: encryption produced no peer payloads for peer=\(convId)")
+                    return .aborted
+                }
+                let senderIid = await e2eeManager.localRegistrationId()
+                let imei = await sessionClient.imei
+                let listParams: [[String: Any]] = encryptedDevices.compactMap { dev in
+                    guard dev.ciphers.count >= 4 else { return nil }
+                    let msgInfo: [String: Any] = [
+                        "title": dev.ciphers[0],
+                        "thumb": dev.ciphers[1],
+                        "desc": dev.ciphers[2],
+                        "href": dev.ciphers[3],
+                        "action": "recommened.user",
+                    ]
+                    let msgInfoJSON = Self.jsonString(for: msgInfo)
+                    return ZaloSessionClient.buildE2EEListParamEntry(
+                        toId: dev.toId,
+                        platform: dev.platform,
+                        clientId: cliInt,
+                        imei: imei,
+                        registrationId: dev.registrationId,
+                        senderIid: senderIid,
+                        version: 1,
+                        compatVersion: 0,
+                        extraFields: ["msgInfo": msgInfoJSON]
+                    )
+                }
+                guard !listParams.isEmpty else {
+                    EngineLog.shared.write("sendContactCard e2ee failed: empty listParams for peer=\(convId)")
+                    return .aborted
+                }
+                res = try await sessionClient.sendE2EEMessageAPI(
+                    endpoint: "forward",
+                    threadId: convId,
+                    isGroup: false,
+                    clientId: cliInt,
+                    listParams: ZaloJSONArrayBox(listParams),
+                    destType: 3,
+                    msgType: 6
+                )
+            }
+            return .sent(msgId: res.msgId, cliMsgId: res.cliMsgId, tsMs: res.tsMs)
+        } catch {
+            return .failed(message: error.localizedDescription)
+        }
+    }
+
+    internal func hostSleepConfirmPromote(delayMs: UInt64) async {
+        if let sleepSeam = composerConfirmSleep {
+            _ = await sleepSeam(Int(delayMs))
+        } else {
+            try? await Task.sleep(for: .milliseconds(Int64(delayMs)))
+        }
+    }
+
     internal func syncDirectMessageChangesToCore(from oldValue: [String: [ChatMessage]], to newValue: [String: [ChatMessage]]) {
         guard !isApplyingCoreMirror, !isSuppressingDirectMessageSync, let core = coreLifecycle.core else { return }
         for convId in oldValue.keys where newValue[convId] == nil {
@@ -2341,9 +3214,47 @@ extension ZaloEngine {
         }
     }
 
+    internal struct IdentityPushKey: Equatable {
+        let coreId: ObjectIdentifier
+        let friends: [ContactsState.Friend]
+        let groups: [ContactsState.Group]
+        let friendsLoaded: Bool
+        let groupsLoaded: Bool
+        let aliases: [String: String]
+        let cachedProfiles: [String: ZaloWebKitMigrator.CachedProfile]
+        let cachedGroups: [String: ZaloWebKitMigrator.CachedGroup]
+        let activityRanks: [String: Int64]
+        let friendGlobalIds: [String: String]
+    }
+
+    internal func currentIdentityPushKey(for core: CoreEngine) -> IdentityPushKey {
+        IdentityPushKey(
+            coreId: ObjectIdentifier(core),
+            friends: contacts.friends,
+            groups: contacts.groups,
+            friendsLoaded: contacts.friendsLoaded,
+            groupsLoaded: contacts.groupsLoaded,
+            aliases: cachedAliases,
+            cachedProfiles: cachedProfiles,
+            cachedGroups: cachedGroups,
+            activityRanks: cachedActivityRanks,
+            friendGlobalIds: cachedFriendGlobalIds
+        )
+    }
+
+    internal func sendIdentitiesToCore(_ core: CoreEngine, force: Bool = false) {
+        let key = currentIdentityPushKey(for: core)
+        if !force, lastPushedIdentityKey == key {
+            return
+        }
+        lastPushedIdentityKey = key
+        onCoreUpdateIdentities?()
+        core.updateIdentities(table: currentIdentityTableRecord())
+    }
+
     internal func pushCoreIdentitiesIfRunning() {
         guard !isApplyingCoreMirror, let core = coreLifecycle.core else { return }
-        core.updateIdentities(table: currentIdentityTableRecord())
+        sendIdentitiesToCore(core, force: false)
     }
 
     internal func currentContactsStateRecord() -> ContactsStateRecord {
@@ -2412,6 +3323,42 @@ extension ZaloEngine {
             return FreshnessMapEntry(convId: key, freshness: rec)
         }
         core.seedHistoryFreshness(entries: entries)
+    }
+
+    internal func pushCorePinsIfRunning() {
+        guard !isApplyingCoreMirror, let core = coreLifecycle.core else { return }
+        guard !pins.isEmpty || !cachedBoardRawTopics.isEmpty else { return }
+        var listsDict: [String: Any] = [:]
+        for (convId, list) in pins {
+            listsDict[convId] = [
+                "convId": convId,
+                "ready": list.ready,
+                "canPin": list.canPin,
+                "limit": list.limit,
+                "items": list.items.map { item -> [String: Any] in
+                    [
+                        "ref": item.ref,
+                        "kind": item.kind.rawValue,
+                        "title": item.title,
+                        "sender": item.sender,
+                        "thumb": item.thumbnail?.absoluteString ?? "",
+                        "msgId": item.msgId,
+                        "cliMsgId": item.cliMsgId,
+                    ]
+                },
+            ]
+        }
+        var rawDict: [String: Any] = [:]
+        for (convId, raw) in cachedBoardRawTopics {
+            rawDict[convId] = [
+                "version": raw.version,
+                "topics": raw.topics,
+            ]
+        }
+        core.seedPins(
+            listsJson: Self.jsonString(for: listsDict),
+            rawTopicsJson: Self.jsonString(for: rawDict)
+        )
     }
 
     internal func applyContactsMirror(_ cRec: ContactsStateRecord) {
@@ -2498,6 +3445,76 @@ extension ZaloEngine {
         }
     }
 
+    internal func armLocalReminderWatchTimer(waiterId: UInt64, delaySecs: Double) -> Bool {
+        guard let sleepHook = reminderWatchSleep else {
+            return false
+        }
+        reminderWatchTimerTasks[waiterId]?.cancel()
+        reminderWatchTimerTasks[waiterId] = Task { @MainActor [weak self] in
+            let completed = await sleepHook(delaySecs)
+            guard let self, completed, !Task.isCancelled else { return }
+            self.reminderWatchTimerTasks.removeValue(forKey: waiterId)
+            self.coreLifecycle.core?.fireReminderWatchTimer(waiterId: waiterId)
+        }
+        return true
+    }
+
+    internal func hostNotifyBanner(_ banner: NotifyBannerPayloadRecord) {
+        let resolvedAvatarURL = banner.avatarUrl.flatMap { $0.isEmpty ? nil : URL(string: $0) }
+        let record = NotifyBannerRecord(
+            title: banner.title,
+            body: banner.body,
+            convId: banner.convId,
+            senderId: banner.senderId,
+            senderName: banner.senderName,
+            isGroup: banner.isGroup,
+            avatarURL: resolvedAvatarURL?.absoluteString,
+            silent: banner.silent
+        )
+        notifyBannerHook?(record)
+        if traceNotifyHost("notify_banner", args: [
+            "conv_id": banner.convId,
+            "sender_id": banner.senderId,
+            "is_group": banner.isGroup,
+            "has_avatar": resolvedAvatarURL != nil,
+            "silent": banner.silent,
+            "title_len": banner.title.count,
+            "sender_name_len": banner.senderName.count,
+            "body_len": banner.body.count,
+        ]) {
+            NativeNotifier.shared.notifyIncomingMessage(
+                title: banner.title,
+                body: banner.body,
+                conversationId: banner.convId,
+                senderId: banner.senderId,
+                senderName: banner.senderName,
+                isGroup: banner.isGroup,
+                avatarURL: resolvedAvatarURL,
+                silent: banner.silent
+            )
+        }
+    }
+
+    internal func pushCorePinsIfRunning(for convId: String) {
+        guard !isApplyingCoreMirror, let core = coreLifecycle.core else { return }
+        let items = (pins[convId]?.items ?? []).compactMap { item -> PinReminderRefRecord? in
+            guard item.kind == .reminder, !item.ref.isEmpty else { return nil }
+            return PinReminderRefRecord(
+                msgId: item.msgId,
+                cliMsgId: item.cliMsgId,
+                reminderRef: item.ref
+            )
+        }
+        core.syncPinReminderRefs(convId: convId, items: items)
+    }
+
+    internal func pushAllCorePinsIfRunning() {
+        guard !isApplyingCoreMirror, coreLifecycle.core != nil else { return }
+        for convId in pins.keys {
+            pushCorePinsIfRunning(for: convId)
+        }
+    }
+
     internal func hostApplyBootstrapMutes(_ mutes: [MuteEntryRecord]) async {
         let serializedMutes: [[String: Any]] = mutes.map {
             [
@@ -2555,35 +3572,58 @@ extension ZaloEngine {
         let ranksData = try? await store.getPreferenceData(key: "activityRanks")
         let gidData = try? await store.getPreferenceData(key: "gidToUidMap")
 
-        isApplyingCoreMirror = true
-        defer { isApplyingCoreMirror = false }
-
-        if let aliasesData,
-           let dict = (try? JSONSerialization.jsonObject(with: aliasesData)) as? [String: String] {
-            cachedAliases = dict
+        let decodedAliases = aliasesData.flatMap {
+            (try? JSONSerialization.jsonObject(with: $0)) as? [String: String]
         }
-        if let profData,
-           let decoded = try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedProfile].self, from: profData) {
-            cachedProfiles = decoded
+        let decodedProfiles = profData.flatMap {
+            try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedProfile].self, from: $0)
         }
-        if let grpData,
-           let decoded = try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedGroup].self, from: grpData) {
-            cachedGroups = decoded
+        let decodedGroups = grpData.flatMap {
+            try? JSONDecoder().decode([String: ZaloWebKitMigrator.CachedGroup].self, from: $0)
         }
-        if let ranksData,
-           let rawRanks = (try? JSONSerialization.jsonObject(with: ranksData)) as? [String: Any] {
+        let decodedRanks: [String: Int64]? = ranksData.flatMap { data in
+            guard let rawRanks = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
             var parsed: [String: Int64] = [:]
             for (k, v) in rawRanks {
                 if let val = JSONLossless.int64(v), val > 0 { parsed[k] = val }
             }
-            cachedActivityRanks = parsed
+            return parsed
         }
-        if let gidData,
-           let gidToUid = (try? JSONSerialization.jsonObject(with: gidData)) as? [String: String] {
-            await sessionClient.seedGlobalIdMappings(gidToUid)
-            for (gid, uid) in gidToUid where !gid.isEmpty && !uid.isEmpty {
-                cachedFriendGlobalIds[uid] = gid
+        let decodedGidToUid = gidData.flatMap {
+            (try? JSONSerialization.jsonObject(with: $0)) as? [String: String]
+        }
+        if let decodedGidToUid {
+            await sessionClient.seedGlobalIdMappings(decodedGidToUid)
+        }
+
+        // Keep all awaits outside the non-reentrant `isApplyingCoreMirror` guard.
+        isApplyingCoreMirror = true
+        defer { isApplyingCoreMirror = false }
+
+        if let decodedAliases, decodedAliases != cachedAliases {
+            cachedAliases = decodedAliases
+        }
+        if let decodedProfiles, decodedProfiles != cachedProfiles {
+            cachedProfiles = decodedProfiles
+        }
+        if let decodedGroups, decodedGroups != cachedGroups {
+            cachedGroups = decodedGroups
+        }
+        if let decodedRanks, decodedRanks != cachedActivityRanks {
+            cachedActivityRanks = decodedRanks
+        }
+        if let decodedGidToUid {
+            var nextGlobalIds = cachedFriendGlobalIds
+            nextGlobalIds.reserveCapacity(nextGlobalIds.count + decodedGidToUid.count)
+            for (gid, uid) in decodedGidToUid where !gid.isEmpty && !uid.isEmpty {
+                nextGlobalIds[uid] = gid
             }
+            if nextGlobalIds != cachedFriendGlobalIds {
+                cachedFriendGlobalIds = nextGlobalIds
+            }
+        }
+        if let core = coreLifecycle.core {
+            lastPushedIdentityKey = currentIdentityPushKey(for: core)
         }
     }
 
@@ -2865,46 +3905,4 @@ extension ZaloEngine {
         }
     }
 
-    // U7: push Swift's board pins for one conversation into core's read-only board mirror.
-    internal func pushCoreBoardPinsIfRunning(for convId: String) {
-        guard let core = coreLifecycle.core else { return }
-        core.syncBoardPins(convId: convId, list: pins[convId]?.boardPinListRecord)
-    }
-
-    // U7: push Swift's board pins & raw topics for one conversation into core's read-only board mirror.
-    internal func pushCoreBoardStateIfRunning(for convId: String) {
-        guard let core = coreLifecycle.core else { return }
-        core.syncBoardPins(convId: convId, list: pins[convId]?.boardPinListRecord)
-        if let raw = cachedBoardRawTopics[convId] {
-            core.syncBoardRawTopics(
-                convId: convId,
-                version: raw.version,
-                topicsJson: Self.jsonString(for: raw.topics)
-            )
-        } else {
-            core.syncBoardRawTopics(convId: convId, version: 0, topicsJson: nil)
-        }
-    }
-}
-
-// U7: temporary conversion into `BoardPinListRecord` until U7 owns board pins.
-extension PinnedList {
-    var boardPinListRecord: BoardPinListRecord {
-        BoardPinListRecord(
-            ready: ready,
-            canPin: canPin,
-            limit: Int64(limit),
-            items: items.map { item in
-                BoardPinItemRecord(
-                    refId: item.ref,
-                    kind: item.kind.rawValue,
-                    title: item.title,
-                    sender: item.sender,
-                    thumbnail: item.thumbnail?.absoluteString,
-                    msgId: item.msgId,
-                    cliMsgId: item.cliMsgId
-                )
-            }
-        )
-    }
 }

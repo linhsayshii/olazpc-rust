@@ -15,7 +15,7 @@
 //! No I/O and no wall clock live here (D9): timestamps (`now_ms`) enter as command fields and
 //! timers / network calls execute as [`Effect`]s in [`crate::runner::SessionEffectRunner`].
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fmt;
 use std::time::Duration;
 
@@ -686,6 +686,38 @@ impl DeleteUndoState {
         true
     }
 
+    /// Non-empty message IDs and client IDs currently pending deletion in `conv_id`.
+    ///
+    /// Used by search, ensure-loaded, and quoted-message lookup so messages hidden by an active
+    /// delete-for-me undo window do not reappear from SQLite before the batch commits.
+    #[must_use]
+    pub fn pending_deleted_keys(&self, conv_id: &str) -> HashSet<String> {
+        let Some(active) = &self.active else {
+            return HashSet::new();
+        };
+        let mut keys = HashSet::new();
+        for item in &active.items {
+            if item.conv_id != conv_id {
+                continue;
+            }
+            if !item.msg_id.is_empty() {
+                keys.insert(item.msg_id.clone());
+            }
+            if !item.cli_msg_id.is_empty() {
+                keys.insert(item.cli_msg_id.clone());
+            }
+            if let Some(msg) = &item.message {
+                if !msg.id.is_empty() {
+                    keys.insert(msg.id.clone());
+                }
+                if !msg.client_id.is_empty() {
+                    keys.insert(msg.client_id.clone());
+                }
+            }
+        }
+        keys
+    }
+
     /// Resets per-session undo state without touching `next_undo_gen`.
     /// Returns `true` if an active undo bar was cleared.
     pub(crate) fn reset_session(&mut self) -> bool {
@@ -1146,6 +1178,12 @@ pub fn mutate_reactions<F>(
 pub(crate) enum PendingIdResolution {
     React(ReactDispatchArgs),
     Recall(RecallDispatchArgs),
+    // U7
+    Pin {
+        conv_id: String,
+        initial_msg_id: String,
+        pin_op_id: u64,
+    },
 }
 
 #[derive(Clone)]
@@ -1248,7 +1286,7 @@ impl fmt::Debug for ActionsState {
 }
 
 impl ActionsState {
-    fn next_id(&mut self) -> u64 {
+    pub(crate) fn next_id(&mut self) -> u64 {
         self.next_seq = self.next_seq.wrapping_add(1);
         if self.next_seq == 0 {
             self.next_seq = 1;
@@ -1372,6 +1410,7 @@ struct RemoteDeleteStoreInput {
     store_latest: Option<ConversationPreview>,
     update_conversation_preview: bool,
     persist_conversations: bool,
+    cloud_delete_op_id: Option<u64>,
 }
 
 /// Pure reducer for U6 message-actions commands and async completions.
@@ -1486,14 +1525,18 @@ pub(crate) fn reduce_actions(state: &mut CoreState, input: Input, out: &mut Redu
             cli_msg_id,
             update_conversation_preview,
             persist_conversations,
+            cloud_delete_op_id,
         } => {
             handle_remote_delete_approved(
                 state,
-                conv_id,
-                msg_id,
-                cli_msg_id,
-                update_conversation_preview,
-                persist_conversations,
+                RemoteDeleteApprovedInput {
+                    conv_id,
+                    msg_id,
+                    cli_msg_id,
+                    update_conversation_preview,
+                    persist_conversations,
+                    cloud_delete_op_id,
+                },
                 out,
             );
         }
@@ -1504,6 +1547,7 @@ pub(crate) fn reduce_actions(state: &mut CoreState, input: Input, out: &mut Redu
             store_latest,
             update_conversation_preview,
             persist_conversations,
+            cloud_delete_op_id,
         } => {
             handle_remote_delete_store_done(
                 state,
@@ -1514,6 +1558,7 @@ pub(crate) fn reduce_actions(state: &mut CoreState, input: Input, out: &mut Redu
                     store_latest,
                     update_conversation_preview,
                     persist_conversations,
+                    cloud_delete_op_id,
                 },
                 out,
             );
@@ -1696,8 +1741,28 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                 MessageConfirmAction::RecallMany { msg_ids } => {
                     start_recall_many(state, confirm.conv_id, msg_ids, now_ms, op_id, out);
                 }
-                MessageConfirmAction::Pin { .. } | MessageConfirmAction::Unpin { .. } => {
-                    complete_unit(op_id, out);
+                // U7
+                MessageConfirmAction::Pin {
+                    msg_id,
+                    replacing_ref,
+                } => {
+                    crate::reduce::pins::start_pin(
+                        state,
+                        &confirm.conv_id,
+                        &msg_id,
+                        replacing_ref,
+                        op_id,
+                        out,
+                    );
+                }
+                MessageConfirmAction::Unpin { topic_ref } => {
+                    crate::reduce::pins::start_unpin(
+                        state,
+                        &confirm.conv_id,
+                        &topic_ref,
+                        op_id,
+                        out,
+                    );
                 }
             }
         }
@@ -2361,6 +2426,11 @@ fn handle_ids_resolved(
     let (conv_id, initial_msg_id) = match &pending {
         PendingIdResolution::React(a) => (a.conv_id.clone(), a.initial_msg_id.clone()),
         PendingIdResolution::Recall(a) => (a.conv_id.clone(), a.initial_msg_id.clone()),
+        PendingIdResolution::Pin {
+            conv_id,
+            initial_msg_id,
+            ..
+        } => (conv_id.clone(), initial_msg_id.clone()),
     };
 
     if !effective_msg_id.is_empty()
@@ -2401,6 +2471,15 @@ fn handle_ids_resolved(
             dispatch_recall_after_id_resolution(
                 state,
                 args,
+                effective_msg_id,
+                resolved_cli_id,
+                out,
+            );
+        }
+        PendingIdResolution::Pin { pin_op_id, .. } => {
+            crate::reduce::pins::on_pin_ids_resolved(
+                state,
+                pin_op_id,
                 effective_msg_id,
                 resolved_cli_id,
                 out,
@@ -2751,21 +2830,37 @@ fn handle_remote_recall_store_done(
     finish_recall_step(state, req.op_id, req.recall_many_id, persisted_conv, out);
 }
 
-fn handle_remote_delete_approved(
-    state: &mut CoreState,
+struct RemoteDeleteApprovedInput {
     conv_id: String,
     msg_id: String,
     cli_msg_id: String,
     update_conversation_preview: bool,
     persist_conversations: bool,
+    cloud_delete_op_id: Option<u64>,
+}
+
+fn handle_remote_delete_approved(
+    state: &mut CoreState,
+    req: RemoteDeleteApprovedInput,
     out: &mut ReduceOutput,
 ) {
+    let RemoteDeleteApprovedInput {
+        conv_id,
+        msg_id,
+        cli_msg_id,
+        update_conversation_preview,
+        persist_conversations,
+        cloud_delete_op_id,
+    } = req;
     let target_id = if !msg_id.is_empty() {
         msg_id.as_str()
     } else {
         cli_msg_id.as_str()
     };
     if conv_id.is_empty() || target_id.is_empty() {
+        if let Some(op_id) = cloud_delete_op_id {
+            crate::reduce::cloud::on_cloud_remote_delete_done(state, op_id, out);
+        }
         return;
     }
 
@@ -2785,6 +2880,7 @@ fn handle_remote_delete_approved(
             mem_latest: outcome.mem_latest,
             update_conversation_preview,
             persist_conversations,
+            cloud_delete_op_id,
         }));
 }
 
@@ -2793,44 +2889,44 @@ fn handle_remote_delete_store_done(
     req: RemoteDeleteStoreInput,
     out: &mut ReduceOutput,
 ) {
-    let Some(target_ms) = req.deleted_ts_ms else {
-        return;
-    };
-    let best_remaining = match (req.mem_latest, req.store_latest) {
-        (Some(a), Some(b)) => {
-            if a.date_ms.unwrap_or(0) >= b.date_ms.unwrap_or(0) {
-                Some(a)
-            } else {
-                Some(b)
+    let cloud_delete_op_id = req.cloud_delete_op_id;
+    if let Some(target_ms) = req.deleted_ts_ms {
+        let best_remaining = match (req.mem_latest, req.store_latest) {
+            (Some(a), Some(b)) => {
+                if a.date_ms.unwrap_or(0) >= b.date_ms.unwrap_or(0) {
+                    Some(a)
+                } else {
+                    Some(b)
+                }
             }
-        }
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
-    if best_remaining
-        .as_ref()
-        .and_then(|p| p.date_ms)
-        .is_some_and(|d| d > target_ms)
-    {
-        return;
-    }
-    if req.update_conversation_preview {
-        let ov = ConvPreviewOverride {
-            conv_id: req.conv_id,
-            target_date_ms: target_ms,
-            preview: best_remaining,
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
         };
-        apply_batch_delta(
-            state,
-            BatchApplyDelta {
-                applied_count: 0,
-                updates: Vec::new(),
-                preview_overrides: vec![ov],
-                persist_conversations: req.persist_conversations,
-            },
-            out,
-        );
+        let has_newer = best_remaining
+            .as_ref()
+            .and_then(|p| p.date_ms)
+            .is_some_and(|d| d > target_ms);
+        if !has_newer && req.update_conversation_preview {
+            let ov = ConvPreviewOverride {
+                conv_id: req.conv_id,
+                target_date_ms: target_ms,
+                preview: best_remaining,
+            };
+            apply_batch_delta(
+                state,
+                BatchApplyDelta {
+                    applied_count: 0,
+                    updates: Vec::new(),
+                    preview_overrides: vec![ov],
+                    persist_conversations: req.persist_conversations,
+                },
+                out,
+            );
+        }
+    }
+    if let Some(op_id) = cloud_delete_op_id {
+        crate::reduce::cloud::on_cloud_remote_delete_done(state, op_id, out);
     }
 }
 

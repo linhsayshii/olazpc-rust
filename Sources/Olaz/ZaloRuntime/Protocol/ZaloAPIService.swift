@@ -439,7 +439,7 @@ extension ZaloSessionClient {
         } catch { throw RustCore.mapError(error) }
     }
 
-    func setMuteAPI(convId: String, isGroup: Bool, durationSeconds: Int, unmute: Bool) async throws {
+    func setMuteAPI(convId: String, isGroup: Bool, durationSeconds: Int, unmute: Bool, startTimeSec: Int64? = nil) async throws {
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(convId) : ZaloWireParser.stripUserPrefix(convId)
         _ = try await post(
             service: "profile",
@@ -448,7 +448,7 @@ extension ZaloSessionClient {
                 "toid": cleanId,
                 "duration": unmute ? 0 : durationSeconds,
                 "action": unmute ? 3 : 1,
-                "startTime": Int64(Date().timeIntervalSince1970),
+                "startTime": startTimeSec ?? Int64(Date().timeIntervalSince1970),
                 "muteType": isGroup ? 2 : 1,
                 "imei": imei
             ]
@@ -677,7 +677,8 @@ extension ZaloSessionClient {
         isGroup: Bool,
         clientId: Int64,
         listParams: [[String: Any]],
-        destType: Int = 3
+        destType: Int = 3,
+        msgType: Int? = nil
     ) -> (service: String, path: String, payload: [String: Any]) {
         let cleanId = isGroup ? ZaloWireParser.cleanGroupId(threadId) : ZaloWireParser.stripUserPrefix(threadId)
         if isGroup {
@@ -687,12 +688,15 @@ extension ZaloSessionClient {
         }
         let listStr = (try? JSONSerialization.data(withJSONObject: listParams, options: [.sortedKeys]))
             .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "listParams": listStr,
             "destType": destType,
             "threadId": cleanId,
             "clientId": clientId,
         ]
+        if let msgType {
+            payload["msgType"] = msgType
+        }
         return ("chat_e2e", "/api/e2ee/pc/message/\(endpoint)", payload)
     }
 
@@ -734,7 +738,8 @@ extension ZaloSessionClient {
         isGroup: Bool,
         clientId: Int64,
         listParams: ZaloJSONArrayBox,
-        destType: Int = 3
+        destType: Int = 3,
+        msgType: Int? = nil
     ) async throws -> SendMessageResult {
         let spec = Self.buildE2EEMessageRequestPayload(
             endpoint: endpoint,
@@ -742,7 +747,8 @@ extension ZaloSessionClient {
             isGroup: isGroup,
             clientId: clientId,
             listParams: listParams.array,
-            destType: destType
+            destType: destType,
+            msgType: msgType
         )
         let resp = try await post(
             service: spec.service,
@@ -1644,7 +1650,7 @@ extension ZaloSessionClient {
                 "needPin": false,
                 "repeat": repeatMode
             ]
-            let objStr = (try? JSONSerialization.data(withJSONObject: objDict)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+            let objStr = (try? JSONSerialization.data(withJSONObject: objDict, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
             let resp = try await post(
                 service: "group_board",
                 path: "/api/board/oneone/create",
@@ -1652,7 +1658,7 @@ extension ZaloSessionClient {
             )
             return ZaloJSONBox(resp)
         }
-        let paramsStr = (try? JSONSerialization.data(withJSONObject: ["title": title, "setTitle": true])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        let paramsStr = (try? JSONSerialization.data(withJSONObject: ["title": title, "setTitle": true], options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
         let resp = try await post(
             service: "group_board",
             path: "/api/board/topic/createv2",

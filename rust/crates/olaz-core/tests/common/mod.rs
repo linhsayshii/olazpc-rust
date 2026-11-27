@@ -19,23 +19,40 @@ use std::time::Duration;
 use async_trait::async_trait;
 use olaz_api::{PollState, SendMessageResult, ZaloApi};
 use olaz_core::actor::{ActorSink, CoreHandle};
+use olaz_core::cloud::{
+    CloudActionResult, CloudBreakdown, CloudConversation, CloudFetch, CloudItem, CloudItemKind,
+    CloudPage, CloudPlan, CloudSettings, CloudSnapshotState,
+};
+use olaz_core::composer::{ComposerConfirm, ComposerOutcome, MyCardInfo, ReminderComposeInfo};
 use olaz_core::conversations::{
     BatchApplyDelta, CachedGroup, CachedProfile, ConvMessageDelta, ConvPreviewOverride,
     ConversationPreview, FriendIdentity, GroupIdentity, IdentityTable, MessagePreviewInput,
     message_preview_label, to_wire_stored,
 };
-use olaz_core::effect::Effect;
+use olaz_core::effect::{Effect, OpResult};
 use olaz_core::forward::{
     ComposerSendOutcome, FileResolutionOutcome, ForwardOutcome, MediaResolutionOutcome,
 };
-use olaz_core::input::{Command, E2eeQuoteArg, Input, LegacyCookie, SeenTarget};
-use olaz_core::messages::{HistoryFreshness, MuteEntry};
-use olaz_core::reduce::classify::MobileSyncEvent;
+use olaz_core::input::{Command, E2eeQuoteArg, Input, LegacyCookie, SeenTarget, StickerSendError};
+use olaz_core::messages::{
+    ContactsState, FriendEntry, FriendRequestEntry, GroupEntry, HistoryFreshness, MuteEntry,
+    decode_db_stored, to_db_stored,
+};
+use olaz_core::notify::{
+    CardActionOutcomeData, FriendRequestOriginKind, MuteInfo, NotifAuthorization,
+    NotifyBannerPayload, PinReminderRef, policy as notification_policy,
+};
+use olaz_core::pins::{BoardRawTopics, PinnedList, can_pin_message, is_pinned};
+use olaz_core::reduce::classify::{MobileSyncEvent, pin_topic_event_conversations};
 use olaz_core::runner::{
     EffectRunner, Host, SessionEffectRunner, SharedStoreSlot, WsDriver, WsStartParams,
 };
 use olaz_core::state::{
     CoreFailKind, CoreState, LoginStep, PersistedTransportState, Phase, SessionSnapshot,
+};
+use olaz_core::stickers::{
+    CardActionOutcome, StickerAnimation, StickerEntry, StickerSource, StickerSuggestSetting,
+    StickerTab,
 };
 use olaz_core::typed_chat::{
     PlainChatParse, TypedChatEnvelope, new_shared_parse, try_parse_plain_chat,
@@ -47,8 +64,9 @@ use olaz_net::{
 };
 use olaz_store::{Store, StoredConversation, StoredMessage};
 use olaz_wire::{
-    Availability, ChatMessage, DeleteMode, Kind, Mention, NameLookup, ParsedWireEvent, StarMode,
-    Status, TextStyle, WireParseOptions, decode_stored_message, extract_batch_events,
+    Availability, ChatMessage, DeleteMode, Kind, Mention, MessageMenu, NameLookup, ParsedWireEvent,
+    StarMode, Status, TextStyle, WireParseOptions, decode_stored_message, encode_chat_message,
+    extract_batch_events, sticker_cdn_url,
 };
 use olaz_ws::consts::{CMD_AUTHEN, CMD_PING, CMD_PING_ACTIVE, DEFAULT_WS_ENDPOINTS, FRAME_VERSION};
 use olaz_ws::frame::encode_frame_json;
@@ -188,7 +206,12 @@ pub struct Seed {
     pub starred_ids: Option<Vec<String>>,
     #[serde(default)]
     pub seen_reaction_event_ids: Option<Vec<String>>,
-    // U12
+    // U16
+    #[serde(default)]
+    pub now_ms: Option<i64>,
+    #[serde(default)]
+    pub notif_prefs: Option<Value>,
+    // U7 + U12 (+ U16 pins)
     #[serde(default)]
     pub cached_group_details: Option<Value>,
     #[serde(default)]
@@ -203,6 +226,15 @@ pub struct Seed {
     pub poll_clock: Option<Value>,
     #[serde(default)]
     pub watched_check_ids: Option<Vec<String>>,
+    // U13
+    #[serde(default)]
+    pub recent_stickers: Option<Value>,
+    #[serde(default)]
+    pub sticker_suggest: Option<bool>,
+    #[serde(default)]
+    pub composer_confirm: Option<Value>,
+    #[serde(default)]
+    pub queued_composer_confirms: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -570,24 +602,25 @@ fn derive_param_cipher_key(zcid: &str, zcid_ext: &str) -> Vec<u8> {
     key.into_bytes()
 }
 
+const VOLATILE_PARAM_KEYS: &[&str] = &["imei", "computer_name", "client_time", "ts"];
+
 fn is_volatile_key(key: &str) -> bool {
     VOLATILE_KEYS.contains(&key)
 }
 
-fn scrub_volatile_value(val: Value) -> Value {
+fn scrub_volatile_params(val: Value) -> Value {
     match val {
         Value::Object(map) => {
             let mut out = Map::new();
             for (k, v) in map {
-                if is_volatile_key(&k) {
+                if VOLATILE_PARAM_KEYS.contains(&k.as_str()) {
                     out.insert(k, Value::String("<volatile>".to_owned()));
                 } else {
-                    out.insert(k, scrub_volatile_value(v));
+                    out.insert(k, v);
                 }
             }
             Value::Object(out)
         }
-        Value::Array(arr) => Value::Array(arr.into_iter().map(scrub_volatile_value).collect()),
         other => other,
     }
 }
@@ -617,8 +650,8 @@ fn decrypt_request_params(
     let decrypted = decrypt_key
         .and_then(|k| decode_aes(k, &enc_params).ok())
         .and_then(|plain| parse_any(plain.as_bytes()))
-        .map(scrub_volatile_value)
-        .unwrap_or_else(|| Value::String("<volatile>".to_owned()));
+        .map(scrub_volatile_params)
+        .unwrap_or_else(|| Value::String("<undecryptable>".to_owned()));
 
     (decrypted, param_cipher_key)
 }
@@ -1309,6 +1342,54 @@ struct HostSelfProfile {
     self_conv_id: Option<String>,
 }
 
+#[derive(Default)]
+struct VirtualConfirmClockInner {
+    now_ms: u64,
+    waiters: Vec<(u64, oneshot::Sender<()>)>,
+}
+
+#[derive(Default)]
+struct VirtualConfirmClock {
+    inner: Mutex<VirtualConfirmClockInner>,
+}
+
+impl VirtualConfirmClock {
+    async fn sleep(&self, delay: Duration) {
+        let delta = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        if delta == 0 {
+            return;
+        }
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let deadline = inner.now_ms.saturating_add(delta);
+            inner.waiters.push((deadline, tx));
+        }
+        let _ = rx.await;
+    }
+
+    fn advance(&self, delta_ms: u64) {
+        let mut to_wake = Vec::new();
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            inner.now_ms = inner.now_ms.saturating_add(delta_ms);
+            let now = inner.now_ms;
+            let mut remaining = Vec::new();
+            for (deadline, tx) in inner.waiters.drain(..) {
+                if deadline <= now {
+                    to_wake.push(tx);
+                } else {
+                    remaining.push((deadline, tx));
+                }
+            }
+            inner.waiters = remaining;
+        }
+        for tx in to_wake {
+            let _ = tx.send(());
+        }
+    }
+}
+
 pub struct RecordingHost {
     saved_session: Option<String>,
     legacy_cookie: Option<LegacyCookie>,
@@ -1319,19 +1400,31 @@ pub struct RecordingHost {
     is_u3: bool,
     is_u4: bool,
     is_u6: bool,
+    is_u16: bool,
+    is_u7: bool,
     is_u12: bool,
+    is_u13: bool,
     data_dir: Option<PathBuf>,
     virtual_now_ms: Mutex<i64>,
     virtual_poll_timers: Mutex<Vec<(String, u64, i64)>>,
     shared_store_slot: Mutex<Option<SharedStoreSlot>>,
     store: Mutex<Option<Arc<Mutex<Store>>>>,
+    core_handle: Mutex<Option<Arc<CoreHandle>>>,
     e2ee_send_results: Mutex<VecDeque<Result<SendMessageResult, String>>>,
+    notif_auth_results: Mutex<VecDeque<NotifAuthorization>>,
+    banners: Mutex<Vec<NotifyBannerPayload>>,
+    current_now_ms: Mutex<i64>,
+    client_slot: Mutex<Option<Arc<SessionClient<ArcTransport>>>>,
+    core_slot: Mutex<Option<Arc<CoreHandle>>>,
     resolve_media_results: Mutex<VecDeque<MediaResolutionOutcome>>,
     resolve_file_results: Mutex<VecDeque<FileResolutionOutcome>>,
     fetch_media_data_results: Mutex<VecDeque<bool>>,
     send_media_results: Mutex<VecDeque<ComposerSendOutcome>>,
     send_files_results: Mutex<VecDeque<ComposerSendOutcome>>,
     fwd_photo_counter: Mutex<usize>,
+    e2ee_sticker_results: Mutex<VecDeque<Result<SendMessageResult, StickerSendError>>>,
+    e2ee_contact_card_results: Mutex<VecDeque<Result<SendMessageResult, String>>>,
+    confirm_clock: VirtualConfirmClock,
     messages: Mutex<HashMap<String, Vec<ChatMessage>>>,
     open_conversation_id: Mutex<Option<String>>,
     identities: Mutex<IdentityTable>,
@@ -1352,7 +1445,7 @@ impl RecordingHost {
         is_u4: bool,
         data_dir: Option<PathBuf>,
     ) -> Self {
-        Self::from_seed_with_all_modes(seed, is_u3, is_u4, false, data_dir)
+        Self::from_seed_with_all_modes(seed, is_u3, is_u4, false, false, false, data_dir)
     }
 
     pub fn from_seed_with_all_modes(
@@ -1360,6 +1453,22 @@ impl RecordingHost {
         is_u3: bool,
         is_u4: bool,
         is_u6: bool,
+        is_u7: bool,
+        is_u16: bool,
+        data_dir: Option<PathBuf>,
+    ) -> Self {
+        Self::from_seed_with_u13_modes(seed, is_u3, is_u4, is_u6, is_u7, false, is_u16, data_dir)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_seed_with_u13_modes(
+        seed: &Seed,
+        is_u3: bool,
+        is_u4: bool,
+        is_u6: bool,
+        is_u7: bool,
+        is_u13: bool,
+        is_u16: bool,
         data_dir: Option<PathBuf>,
     ) -> Self {
         let saved_session = seed
@@ -1448,6 +1557,122 @@ impl RecordingHost {
                         .to_owned();
                     let ts_ms = item.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
                     e2ee_send_results.push_back(Ok(SendMessageResult {
+                        msg_id,
+                        cli_msg_id,
+                        ts_ms,
+                    }));
+                }
+            }
+        }
+        let mut notif_auth_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("request_notif_auth"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                let raw = item.as_str().unwrap_or("authorized");
+                notif_auth_results.push_back(
+                    NotifAuthorization::from_raw(raw).unwrap_or(NotifAuthorization::Authorized),
+                );
+            }
+        }
+        let mut e2ee_sticker_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("send_e2ee_sticker"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                if item.as_str() == Some("e2ee_failed")
+                    || item.get("status").and_then(Value::as_str) == Some("e2ee_failed")
+                {
+                    e2ee_sticker_results.push_back(Err(StickerSendError::E2eeFailed));
+                } else if let Some(err_obj) = item.get("error").and_then(Value::as_object) {
+                    let code = err_obj.get("code").and_then(Value::as_i64).unwrap_or(500);
+                    let msg = err_obj
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("E2EE error");
+                    let url = err_obj
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .unwrap_or("/api/e2ee/pc/message/sticker");
+                    let formatted = if url.is_empty() {
+                        format!("Zalo error {code}: {msg}")
+                    } else {
+                        format!("Zalo error {code}: {msg} ({url})")
+                    };
+                    e2ee_sticker_results.push_back(Err(StickerSendError::Api(formatted)));
+                } else if let Some(err_str) = item.get("error").and_then(Value::as_str) {
+                    e2ee_sticker_results.push_back(Err(StickerSendError::Api(format!(
+                        "Zalo error 500: {err_str} (/api/e2ee/pc/message/sticker)"
+                    ))));
+                } else {
+                    let msg_id = item
+                        .get("msg_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let cli_msg_id = item
+                        .get("cli_msg_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let ts_ms = item.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
+                    e2ee_sticker_results.push_back(Ok(SendMessageResult {
+                        msg_id,
+                        cli_msg_id,
+                        ts_ms,
+                    }));
+                }
+            }
+        }
+        let mut e2ee_contact_card_results = VecDeque::new();
+        if let Some(arr) = seed
+            .host_results
+            .as_ref()
+            .and_then(|hr| hr.get("send_e2ee_contact_card"))
+            .and_then(Value::as_array)
+        {
+            for item in arr {
+                if item.as_str() == Some("e2ee_failed")
+                    || item.get("status").and_then(Value::as_str) == Some("e2ee_failed")
+                {
+                    e2ee_contact_card_results.push_back(Err("e2ee_failed".to_owned()));
+                } else if let Some(err_obj) = item.get("error").and_then(Value::as_object) {
+                    let code = err_obj.get("code").and_then(Value::as_i64).unwrap_or(500);
+                    let msg = err_obj
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("E2EE error");
+                    let url = err_obj
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .unwrap_or("/api/e2ee/pc/message/forward");
+                    let formatted = if url.is_empty() {
+                        format!("Zalo error {code}: {msg}")
+                    } else {
+                        format!("Zalo error {code}: {msg} ({url})")
+                    };
+                    e2ee_contact_card_results.push_back(Err(formatted));
+                } else if let Some(err_str) = item.get("error").and_then(Value::as_str) {
+                    e2ee_contact_card_results.push_back(Err(err_str.to_owned()));
+                } else {
+                    let msg_id = item
+                        .get("msg_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let cli_msg_id = item
+                        .get("cli_msg_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let ts_ms = item.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
+                    e2ee_contact_card_results.push_back(Ok(SendMessageResult {
                         msg_id,
                         cli_msg_id,
                         ts_ms,
@@ -1581,23 +1806,71 @@ impl RecordingHost {
             is_u3,
             is_u4,
             is_u6,
+            is_u16,
+            is_u7,
             is_u12: false,
+            is_u13,
             data_dir,
             virtual_now_ms: Mutex::new(1_700_000_000_000),
             virtual_poll_timers: Mutex::new(Vec::new()),
             shared_store_slot: Mutex::new(None),
             store: Mutex::new(None),
+            core_handle: Mutex::new(None),
             e2ee_send_results: Mutex::new(e2ee_send_results),
+            notif_auth_results: Mutex::new(notif_auth_results),
+            banners: Mutex::new(Vec::new()),
+            current_now_ms: Mutex::new(seed.now_ms.unwrap_or(1_700_000_000_000)),
+            client_slot: Mutex::new(None),
+            core_slot: Mutex::new(None),
             resolve_media_results: Mutex::new(resolve_media_results),
             resolve_file_results: Mutex::new(resolve_file_results),
             fetch_media_data_results: Mutex::new(fetch_media_data_results),
             send_media_results: Mutex::new(send_media_results),
             send_files_results: Mutex::new(send_files_results),
             fwd_photo_counter: Mutex::new(0),
+            e2ee_sticker_results: Mutex::new(e2ee_sticker_results),
+            e2ee_contact_card_results: Mutex::new(e2ee_contact_card_results),
+            confirm_clock: VirtualConfirmClock::default(),
             messages: Mutex::new(HashMap::new()),
             open_conversation_id: Mutex::new(open_conv),
             identities: Mutex::new(identities),
         }
+    }
+
+    fn bind_u16_handles(&self, client: Arc<SessionClient<ArcTransport>>, core: Arc<CoreHandle>) {
+        *self
+            .client_slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(client);
+        *self
+            .core_slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(core);
+    }
+
+    pub fn set_current_now_ms(&self, ms: i64) {
+        *self
+            .current_now_ms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = ms;
+    }
+
+    pub fn current_now_ms(&self) -> i64 {
+        *self
+            .current_now_ms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn banners(&self) -> Vec<NotifyBannerPayload> {
+        self.banners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn advance_confirm_ms(&self, delta_ms: u64) {
+        self.confirm_clock.advance(delta_ms);
     }
 
     pub fn bind_store_slot(&self, slot: SharedStoreSlot) {
@@ -1605,6 +1878,13 @@ impl RecordingHost {
             .shared_store_slot
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(slot);
+    }
+
+    pub fn attach_core_handle(&self, core: Arc<CoreHandle>) {
+        *self
+            .core_handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(core);
     }
 
     pub fn attached_store(&self) -> Option<Arc<Mutex<Store>>> {
@@ -2391,10 +2671,11 @@ impl Host for RecordingHost {
         }
     }
 
-    async fn refresh_board_pins(&self, conv_id: String) {
+    async fn refresh_board_pins(&self, conv_id: String) -> bool {
         if self.is_u4 {
             self.record("refresh_board_pins", json!({ "conv_id": conv_id }));
         }
+        self.is_u7
     }
 
     async fn mark_read_boundary(&self, conv_id: String, _seen_target: Option<SeenTarget>) {
@@ -2554,6 +2835,80 @@ impl Host for RecordingHost {
             .unwrap_or_else(|| ComposerSendOutcome::Failed("Có lỗi khi gửi tệp".to_owned()))
     }
 
+    async fn send_e2ee_sticker(
+        &self,
+        conv_id: String,
+        cate_id: i64,
+        sticker_id: i64,
+        client_id: String,
+    ) -> Result<SendMessageResult, StickerSendError> {
+        self.record(
+            "send_e2ee_sticker",
+            json!({
+                "conv_id": conv_id,
+                "cate_id": cate_id,
+                "sticker_id": sticker_id,
+                "client_id": client_id,
+            }),
+        );
+        self.e2ee_sticker_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or_else(|| {
+                Err(StickerSendError::Api(
+                    "Zalo error 500: No scripted send_e2ee_sticker result (/api/e2ee/pc/message/sticker)"
+                        .to_owned(),
+                ))
+            })
+    }
+
+    async fn send_e2ee_contact_card(
+        &self,
+        conv_id: String,
+        client_id: String,
+        contact_uid: String,
+        title: String,
+        phone: String,
+        avatar: String,
+        qr_code_url: String,
+    ) -> Result<SendMessageResult, String> {
+        self.record(
+            "send_e2ee_contact_card",
+            json!({
+                "conv_id": conv_id,
+                "client_id": client_id,
+                "contact_uid": contact_uid,
+                "title": title,
+                "phone": phone,
+                "avatar": avatar,
+                "qr_code_url": qr_code_url,
+            }),
+        );
+        if let Some(scripted) = self
+            .e2ee_contact_card_results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+        {
+            return scripted;
+        }
+        // Deterministic fallback ONLY for unscripted send_e2ee_contact_card (approved for U13).
+        Ok(SendMessageResult {
+            msg_id: client_id.clone(),
+            cli_msg_id: client_id,
+            ts_ms: 0,
+        })
+    }
+
+    async fn sleep_confirm_promote(&self, delay: Duration) {
+        if self.is_u13 {
+            self.confirm_clock.sleep(delay).await;
+        } else {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     async fn apply_remote_reaction(
         &self,
         conv_id: String,
@@ -2627,6 +2982,244 @@ impl Host for RecordingHost {
         self.is_u6
     }
 
+    async fn notify_banner(&self, banner: NotifyBannerPayload) {
+        if self.is_u16 {
+            let mut norm = banner;
+            if let Some(ref av) = norm.avatar_url
+                && av.starts_with("http://127.0.0.1")
+                && let Some(pos) = av[7..].find('/')
+            {
+                norm.avatar_url = Some(format!("http://fake{}", &av[7 + pos..]));
+            }
+            self.record(
+                "notify_banner",
+                json!({
+                    "conv_id": norm.conv_id,
+                    "sender_id": norm.sender_id,
+                    "is_group": norm.is_group,
+                    "silent": norm.silent,
+                    "has_avatar": norm.avatar_url.is_some(),
+                    "title_len": norm.title.chars().count(),
+                    "body_len": norm.body.chars().count(),
+                    "sender_name_len": norm.sender_name.chars().count(),
+                }),
+            );
+            self.banners
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(norm);
+        }
+    }
+
+    async fn request_notif_auth(&self) -> NotifAuthorization {
+        if self.is_u16 {
+            self.record("request_notif_auth", json!({}));
+            self.notif_auth_results
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front()
+                .unwrap_or(NotifAuthorization::Authorized)
+        } else {
+            NotifAuthorization::Unavailable
+        }
+    }
+
+    async fn start_call(&self, uid: String, video: bool) {
+        if self.is_u16 {
+            self.record("start_call", json!({ "uid": uid, "video": video }));
+        }
+    }
+
+    async fn send_category_sticker(
+        &self,
+        conv_id: String,
+        cate_id: i32,
+        sticker_id: i32,
+    ) -> CardActionOutcomeData {
+        let Some(client) = self
+            .client_slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
+            return CardActionOutcomeData::Failed(
+                "Không gửi được sticker. Hãy thử lại.".to_owned(),
+            );
+        };
+        let Some(core) = self
+            .core_slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
+            return CardActionOutcomeData::Failed(
+                "Không gửi được sticker. Hãy thử lại.".to_owned(),
+            );
+        };
+        let api = ZaloApi::from_shared(client);
+        let Ok(res) = api
+            .send_sticker(&olaz_api::SendStickerParams {
+                conv_id: conv_id.clone(),
+                cate_id: i64::from(cate_id),
+                sticker_id: i64::from(sticker_id),
+                sticker_type: 7,
+                client_id: None,
+            })
+            .await
+        else {
+            return CardActionOutcomeData::Failed(
+                "Không gửi được sticker. Hãy thử lại.".to_owned(),
+            );
+        };
+        let full = core.full_snapshot().await;
+        let (my_uid, my_name, my_avt, self_conv) = match full.as_ref() {
+            Some(s) => (
+                s.session
+                    .profile
+                    .as_ref()
+                    .map(|p| p.user_id.clone())
+                    .unwrap_or_default(),
+                s.session
+                    .profile
+                    .as_ref()
+                    .map(|p| p.display_name.clone())
+                    .unwrap_or_else(|| "Bạn".to_owned()),
+                s.session.profile.as_ref().and_then(|p| p.avatar.clone()),
+                s.session.self_conversation_id.clone(),
+            ),
+            None => (String::new(), "Bạn".to_owned(), None, None),
+        };
+        let now_ms = self.current_now_ms();
+        let url = sticker_cdn_url(i64::from(cate_id), &sticker_id.to_string());
+        let is_self_conv = self_conv.as_deref() == Some(conv_id.as_str());
+        let msg = ChatMessage {
+            id: res.msg_id.clone(),
+            conversation_id: conv_id.clone(),
+            sender_id: my_uid,
+            sender_name: my_name,
+            sender_avatar: my_avt,
+            is_mine: true,
+            kind: Kind::Sticker {
+                url: Some(url.clone()),
+            },
+            fallback_urls: Vec::new(),
+            text: "[Sticker]".to_owned(),
+            date_ms: now_ms,
+            status: Status::Sent,
+            quote: None,
+            reactions: Vec::new(),
+            is_e2ee: false,
+            mentions: Vec::new(),
+            text_styles: Vec::new(),
+            ttl_ms: 0,
+            urgency: 0,
+            card_buttons: Vec::new(),
+            suggests_stickers: false,
+            menu: MessageMenu {
+                forward: Availability::Available,
+                recall: !is_self_conv,
+                delete: Some(if is_self_conv {
+                    DeleteMode::Plain
+                } else {
+                    DeleteMode::ForMe
+                }),
+                pin: false,
+                star: Some(StarMode::Star),
+                starred: false,
+                pinned: false,
+                is_protected: false,
+            },
+            client_id: res.cli_msg_id.clone(),
+        };
+        core.request_unit(Command::WriteThroughUpsertMessage {
+            msg: Box::new(msg.clone()),
+            replacing_client_id: Some(res.cli_msg_id.clone()),
+        })
+        .await;
+        if let Some(store_arc) = self.attached_store()
+            && let Some(wire_stored) = encode_chat_message(&msg, &res.cli_msg_id)
+        {
+            let mut store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = store.save_messages(&[to_db_stored(&wire_stored)]);
+            // Also persist recentStickers preference like Swift `saveRecentSticker`.
+            let mut rows: Vec<Value> = store
+                .get_preference_data("recentStickers")
+                .ok()
+                .flatten()
+                .and_then(|d| parse_any(&d))
+                .and_then(|v| match v {
+                    Value::Array(a) => Some(a),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            rows.retain(|r| r.get("id").and_then(Value::as_i64) != Some(i64::from(sticker_id)));
+            rows.insert(
+                0,
+                json!({
+                    "id": sticker_id,
+                    "cateId": cate_id,
+                    "type": 7,
+                    "url": url,
+                }),
+            );
+            if rows.len() > 30 {
+                rows.truncate(30);
+            }
+            if let Ok(bytes) = serde_json::to_vec(&rows) {
+                let _ = store.set_preference_data("recentStickers", &bytes);
+            }
+        }
+        core.request_unit(Command::UpdateConversationOnMessage {
+            msg: MessagePreviewInput::from_chat_message(&msg),
+            increment_unread: false,
+        })
+        .await;
+        CardActionOutcomeData::Done
+    }
+
+    async fn refresh_contacts(&self) {
+        let Some(client) = self
+            .client_slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
+            return;
+        };
+        let Some(core) = self
+            .core_slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
+            return;
+        };
+        let api = ZaloApi::from_shared(client);
+        let (f_res, g_res, s_res, r_res) = tokio::join!(
+            api.fetch_friends(1, 20_000),
+            api.fetch_groups_list(),
+            api.fetch_sent_friend_requests(),
+            api.fetch_received_friend_requests(),
+        );
+        if let Some(mut full) = core.full_snapshot().await {
+            olaz_core::messages::apply_fetched_contacts(
+                &mut full.contacts,
+                &mut full.conversations.identities,
+                f_res.ok(),
+                g_res.ok(),
+                s_res.ok(),
+                r_res.ok(),
+            );
+            core.request_unit(Command::SeedContacts(Box::new(full.contacts)))
+                .await;
+            core.request_unit(Command::UpdateIdentities(full.conversations.identities))
+                .await;
+            core.request_unit(Command::EnsureKnownContacts).await;
+            core.request_unit(Command::RebuildConversationExtras).await;
+            core.request_unit(Command::RefreshReactionNames { conv_id: None })
+                .await;
+        }
+    }
     async fn apply_batch(
         &self,
         cmd: Option<u16>,
@@ -2765,8 +3358,77 @@ impl Host for RecordingHost {
         );
     }
 
-    async fn pin_topic(&self, conv_id: String) {
+    async fn pin_topic(&self, conv_id: String) -> bool {
         self.record("pin_topic", json!({ "conv_id": conv_id }));
+        self.is_u7
+    }
+
+    // U14: test-only host shim matching Swift `ZaloEngine.ensureMessageLoaded` until U14 lands on main.
+    async fn ensure_message_loaded(&self, conv_id: String, message: ChatMessage) -> bool {
+        if conv_id.is_empty() {
+            return false;
+        }
+        let core = self
+            .core_handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(core) = core else {
+            return false;
+        };
+        let current = core
+            .full_snapshot()
+            .await
+            .and_then(|snap| snap.messages.windows.get(&conv_id).cloned())
+            .unwrap_or_default();
+        if current.iter().any(|m| m.id == message.id) {
+            return true;
+        }
+        let oldest_ts_ms = current.first().map(|m| m.date_ms);
+        let mut loaded_rows: Vec<ChatMessage> = Vec::new();
+        let mut has_more_older = false;
+        if let Some(store_arc) = self.attached_store() {
+            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Ok(window) =
+                store.messages_around(&conv_id, message.date_ms, oldest_ts_ms, 20, 200)
+            {
+                has_more_older = window.has_more_older;
+                for row in &window.messages {
+                    if let Some(decoded) = decode_db_stored(row) {
+                        loaded_rows.push(decoded);
+                    }
+                }
+            }
+        }
+        let mut found_target = false;
+        for row_msg in loaded_rows {
+            if row_msg.id == message.id {
+                found_target = true;
+            }
+            core.send(Command::WriteThroughUpsertMessage {
+                msg: Box::new(row_msg),
+                replacing_client_id: None,
+            });
+        }
+        if has_more_older {
+            core.send(Command::WriteThroughSetHasMore {
+                conv_id: conv_id.clone(),
+                has_more: true,
+            });
+        }
+        if !found_target
+            && (message.conversation_id == conv_id || message.conversation_id.is_empty())
+        {
+            core.send(Command::WriteThroughUpsertMessage {
+                msg: Box::new(message.clone()),
+                replacing_client_id: None,
+            });
+        }
+        let _ = core.settle().await;
+        core.full_snapshot()
+            .await
+            .and_then(|snap| snap.messages.windows.get(&conv_id).cloned())
+            .is_some_and(|list| list.iter().any(|m| m.id == message.id))
     }
 
     async fn group_notice(&self, act: String, data: Map<String, Value>, ts: i64) {
@@ -3128,6 +3790,43 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
             .set_preference_strings("hiddenIds", ids)
             .map_err(|e| format!("seed hiddenIds: {e}"))?;
     }
+    if let Some(np) = &seed.notif_prefs
+        && !np.is_null()
+    {
+        if let Some(enabled) = np.get("enabled").and_then(Value::as_bool) {
+            store
+                .set_preference_bool("notifEnabled", enabled)
+                .map_err(|e| format!("seed notifEnabled: {e}"))?;
+        }
+        if let Some(sound) = np.get("sound").and_then(Value::as_bool) {
+            store
+                .set_preference_bool("notifSound", sound)
+                .map_err(|e| format!("seed notifSound: {e}"))?;
+        }
+        if let Some(arr) = np.get("muted_threads").and_then(Value::as_array) {
+            let rows: Vec<Value> = arr
+                .iter()
+                .filter_map(|row| {
+                    let id = row.get("id").and_then(Value::as_str)?;
+                    if id.is_empty() {
+                        return None;
+                    }
+                    let st = row.get("start_time").and_then(Value::as_f64).unwrap_or(0.0);
+                    let dur = row.get("duration").and_then(Value::as_f64).unwrap_or(-1.0);
+                    Some(json!({
+                        "id": id,
+                        "startTime": st,
+                        "duration": dur,
+                    }))
+                })
+                .collect();
+            if let Ok(bytes) = serde_json::to_vec(&rows) {
+                store
+                    .set_preference_data("mutedThreads", &bytes)
+                    .map_err(|e| format!("seed mutedThreads: {e}"))?;
+            }
+        }
+    }
     if let Some(ids) = &seed.starred_ids {
         store
             .set_preference_strings("starredIds", ids)
@@ -3172,6 +3871,20 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
         store
             .set_preference_data("activityRanks", &bytes)
             .map_err(|e| format!("seed activityRanks: {e}"))?;
+    }
+    // U13
+    if let Some(recents) = &seed.recent_stickers
+        && !recents.is_null()
+    {
+        let bytes = canonical_json_string(recents).into_bytes();
+        store
+            .set_preference_data("recentStickers", &bytes)
+            .map_err(|e| format!("seed recentStickers: {e}"))?;
+    }
+    if let Some(suggest) = seed.sticker_suggest {
+        store
+            .set_preference_bool("stickerSuggest", suggest)
+            .map_err(|e| format!("seed stickerSuggest: {e}"))?;
     }
     // U4-bootstrap
     if let Some(ts) = &seed.history_full_refresh_at
@@ -3317,7 +4030,7 @@ fn seed_sqlite_store(user_id: &str, data_dir: &std::path::Path, seed: &Seed) -> 
                         "date": ts_ms,
                         "status": status,
                         "isE2EE": is_e2ee,
-                        "kind": { "type": kind_tag },
+                        "kind": row.get("kind").cloned().unwrap_or_else(|| json!({ "type": kind_tag })),
                     });
                     if let Some(reactions) = row.get("reactions")
                         && !reactions.is_null()
@@ -3354,6 +4067,7 @@ struct LogCapturingRunner<R> {
     inner: Arc<R>,
     send_logs: Arc<Mutex<Vec<String>>>,
     action_logs: Arc<Mutex<Vec<String>>>,
+    pin_logs: Arc<Mutex<Vec<String>>>,
 }
 
 impl<R: EffectRunner> EffectRunner for LogCapturingRunner<R> {
@@ -3367,6 +4081,7 @@ impl<R: EffectRunner> EffectRunner for LogCapturingRunner<R> {
                 .action_logs
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            let mut p_logs = self.pin_logs.lock().unwrap_or_else(PoisonError::into_inner);
             for eff in &effects {
                 if let Effect::EngineLog(line) = eff {
                     if line.starts_with("sendText ") {
@@ -3377,6 +4092,9 @@ impl<R: EffectRunner> EffectRunner for LogCapturingRunner<R> {
                         || line.starts_with("autodelete: ")
                     {
                         a_logs.push(line.clone());
+                    }
+                    if line.starts_with("pins: ") {
+                        p_logs.push(line.clone());
                     }
                 }
             }
@@ -3460,6 +4178,164 @@ fn enrich_send_message_json(m: &ChatMessage, base: &mut Map<String, Value>) {
             "protected": m.menu.is_protected,
         }),
     );
+}
+
+fn encode_cloud_breakdown(b: &CloudBreakdown) -> Value {
+    json!({
+        "photo": b.photo,
+        "video": b.video,
+        "file": b.file,
+        "voice": b.voice,
+        "total": b.total(),
+    })
+}
+
+fn encode_cloud_plan(p: &CloudPlan) -> Value {
+    json!({
+        "kind": p.kind.as_str(),
+        "name": p.name,
+        "quota": p.quota,
+        "usage": p.usage,
+        "family": p.family,
+        "cloud_media": p.cloud_media,
+        "message_backup": p.message_backup,
+        "my_cloud": p.my_cloud,
+        "expire_at_ms": p.expire_at_ms,
+        "auto_renew": p.auto_renew,
+        "months": p.months,
+        "has_key": p.has_key,
+        "backup_media": p.backup_media,
+        "backup_my_cloud": p.backup_my_cloud,
+        "backup_messages": p.backup_messages,
+        "file_limit": p.file_limit,
+    })
+}
+
+fn encode_cloud_conversation(c: &CloudConversation) -> Value {
+    json!({
+        "id": c.id,
+        "name": c.name,
+        "avatar": c.avatar,
+        "is_group": c.is_group,
+        "total": c.total,
+        "last_activity_ms": c.last_activity_ms,
+    })
+}
+
+fn encode_cloud_settings(s: &CloudSettings) -> Value {
+    json!({
+        "offload_enabled": s.offload_enabled,
+        "offload_available": s.offload_available,
+        "last_offload_at_ms": s.last_offload_at_ms,
+        "last_offload_size": s.last_offload_size,
+        "ttl_days": s.ttl_days,
+    })
+}
+
+fn encode_cloud_state(s: &CloudSnapshotState) -> Value {
+    json!({
+        "plan": s.plan.as_ref().map(encode_cloud_plan),
+        "media": encode_cloud_breakdown(&s.media),
+        "my_cloud_types": encode_cloud_breakdown(&s.my_cloud_types),
+        "conversations": s.conversations.iter().map(encode_cloud_conversation).collect::<Vec<_>>(),
+        "settings": encode_cloud_settings(&s.settings),
+        "changed": s.changed,
+        "loaded": s.loaded,
+        "hidden_lookup": s.hidden_lookup,
+        "self_id": s.self_id,
+    })
+}
+
+fn encode_cloud_item(item: &CloudItem) -> Value {
+    json!({
+        "id": item.id,
+        "kind": item.kind.as_str(),
+        "conv_id": item.conversation_id,
+        "conv_name": item.conversation_name,
+        "size": item.size,
+        "date_ms": item.date_ms,
+        "title": item.title,
+        "ext": item.ext,
+        "duration": item.duration.round() as i64,
+        "width": item.width,
+        "height": item.height,
+    })
+}
+
+fn encode_cloud_page(page: &CloudPage) -> Value {
+    json!({
+        "items": page.items.iter().map(encode_cloud_item).collect::<Vec<_>>(),
+        "has_more": page.has_more,
+        "error": page.error,
+    })
+}
+
+fn encode_cloud_fetch(fetch: &CloudFetch) -> Value {
+    match fetch {
+        CloudFetch::Ready(file) => {
+            let url = if file.path.starts_with('/') {
+                format!("file://{}", file.path)
+            } else {
+                format!("file:///{}", file.path)
+            };
+            json!({
+                "status": "ready",
+                "file": {
+                    "url": url,
+                    "kind": file.kind.as_str(),
+                    "title": file.title,
+                    "ext": file.ext,
+                    "size": file.size,
+                    "date_ms": file.date_ms,
+                },
+            })
+        }
+        CloudFetch::Expired => json!({ "status": "expired" }),
+        CloudFetch::Failed(err) => json!({ "status": "failed", "error": err }),
+    }
+}
+
+fn encode_media_resolution(res: &MediaResolutionOutcome) -> Value {
+    match res {
+        MediaResolutionOutcome::File(path) => json!({ "state": "file", "path": path }),
+        MediaResolutionOutcome::Expired => json!({ "state": "expired" }),
+        MediaResolutionOutcome::Unavailable => json!({ "state": "unavailable" }),
+        MediaResolutionOutcome::Unsupported => json!({ "state": "unsupported" }),
+    }
+}
+
+fn encode_cloud_action_result(res: &CloudActionResult) -> Value {
+    json!({
+        "ok": res.ok,
+        "deleted": res.deleted,
+        "failed": res.failed,
+        "error": res.error,
+    })
+}
+
+fn decode_step_message(msg_json: &Value, fallback_conv_id: &str) -> Option<ChatMessage> {
+    let mut obj = msg_json.as_object()?.clone();
+    let pairs = [
+        ("conversationId", "conv_id"),
+        ("clientId", "client_id"),
+        ("senderId", "sender_id"),
+        ("senderName", "sender_name"),
+        ("senderAvatar", "sender_avatar"),
+        ("isMine", "is_mine"),
+        ("isE2EE", "is_e2ee"),
+        ("date", "date_ms"),
+    ];
+    for (camel, snake) in pairs {
+        if !obj.contains_key(camel)
+            && let Some(v) = obj.get(snake).cloned()
+        {
+            obj.insert(camel.to_owned(), v);
+        }
+    }
+    if let Some(kind_str) = obj.get("kind").and_then(Value::as_str).map(str::to_owned) {
+        obj.insert("kind".to_owned(), json!({ "type": kind_str }));
+    }
+    ChatMessage::from_json(&obj, fallback_conv_id)
 }
 
 #[derive(Clone, Default)]
@@ -3920,7 +4796,7 @@ fn enrich_u12_snapshot(
     );
 
     let mut pins_obj = Map::new();
-    for (conv_id, list) in &full.board_pins {
+    for (conv_id, list) in &full.pins.lists {
         pins_obj.insert(conv_id.clone(), encode_u12_board_pin_list(list));
     }
     obj.insert("pins".to_owned(), Value::Object(pins_obj));
@@ -4263,17 +5139,201 @@ struct SnapshotOpts<'a> {
     is_u4: bool,
     is_u5: bool,
     is_u6: bool,
+    is_u16: bool,
+    current_now_ms: i64,
+    is_u7: bool,
     is_u8: bool,
     is_u12: bool,
+    is_u11: bool,
+    is_u13: bool,
+    is_u14: bool,
     last_send_result: Option<bool>,
     send_logs: &'a Mutex<Vec<String>>,
     prune_next_expiry_ms: Option<i64>,
     action_logs: &'a Mutex<Vec<String>>,
+    u16_results: &'a Map<String, Value>,
+    pin_logs: &'a Mutex<Vec<String>>,
     selection: Option<&'a TestSelection>,
     forward_results: &'a Map<String, Value>,
     u12_results: &'a BTreeMap<String, Value>,
     watched_check_ids: Option<&'a [String]>,
     seeded_member_cache: Option<&'a Value>,
+    search_results: &'a Map<String, Value>,
+    results: &'a Map<String, Value>,
+}
+
+fn encode_sticker_tabs(tabs: Option<Vec<StickerTab>>) -> Value {
+    match tabs {
+        None => Value::Null,
+        Some(list) => Value::Array(
+            list.into_iter()
+                .map(|t| {
+                    json!({
+                        "id": t.id,
+                        "name": t.name,
+                        "icon": t.icon,
+                        "count": t.count,
+                    })
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn encode_stickers(stickers: Option<Vec<StickerEntry>>) -> Value {
+    match stickers {
+        None => Value::Null,
+        Some(list) => Value::Array(
+            list.into_iter()
+                .map(|s| {
+                    let anim = match s.animation {
+                        None => Value::Null,
+                        Some(StickerAnimation::Sprite {
+                            url,
+                            frames,
+                            frame_ms,
+                        }) => json!({
+                            "kind": "sprite",
+                            "url": url,
+                            "frames": frames,
+                            "ms": frame_ms,
+                        }),
+                        Some(StickerAnimation::Animated { url }) => json!({
+                            "kind": "animated",
+                            "url": url,
+                        }),
+                    };
+                    json!({
+                        "cate_id": s.cate_id,
+                        "id": s.sticker_id,
+                        "url": s.url,
+                        "anim": anim,
+                    })
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn encode_suggest_setting(s: Option<StickerSuggestSetting>) -> Value {
+    match s {
+        None => Value::Null,
+        Some(v) => json!({
+            "enabled": v.enabled,
+            "debounce": v.debounce,
+        }),
+    }
+}
+
+fn encode_card_action_outcome(outcome: &CardActionOutcome) -> Value {
+    match outcome {
+        CardActionOutcome::Done => json!({"status": "done", "text": Value::Null}),
+        CardActionOutcome::OpenChat(s) => json!({"status": "open_chat", "text": s}),
+        CardActionOutcome::OpenProfile(s) => json!({"status": "open_profile", "text": s}),
+        CardActionOutcome::OpenUrl(s) => json!({"status": "open_url", "text": s}),
+        CardActionOutcome::Copy(s) => json!({"status": "copy", "text": s}),
+        CardActionOutcome::Present => json!({"status": "present", "text": Value::Null}),
+        CardActionOutcome::Unsupported(s) => json!({"status": "unsupported", "text": s}),
+        CardActionOutcome::Locked(s) => json!({"status": "locked", "text": s}),
+        CardActionOutcome::Failed(s) => json!({"status": "failed", "text": s}),
+        CardActionOutcome::Pending(s) => json!({"status": "pending", "text": s}),
+    }
+}
+
+fn encode_composer_outcome(outcome: &ComposerOutcome) -> Value {
+    match outcome {
+        ComposerOutcome::Done => json!({"status": "done", "text": Value::Null}),
+        ComposerOutcome::Cancelled => json!({"status": "cancelled", "text": Value::Null}),
+        ComposerOutcome::Failed(s) => json!({"status": "failed", "text": s}),
+        ComposerOutcome::Pending(s) => json!({"status": "pending", "text": s}),
+    }
+}
+
+fn decode_composer_outcome(v: &Value) -> ComposerOutcome {
+    let status = v.get("status").and_then(Value::as_str).unwrap_or("done");
+    let text = v
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    match status {
+        "cancelled" => ComposerOutcome::Cancelled,
+        "failed" => ComposerOutcome::Failed(text),
+        "pending" => ComposerOutcome::Pending(text),
+        _ => ComposerOutcome::Done,
+    }
+}
+
+fn encode_my_card(info: Option<MyCardInfo>) -> Value {
+    match info {
+        None => Value::Null,
+        Some(c) => json!({
+            "uid": c.uid,
+            "name": c.name,
+            "avatar": c.avatar,
+            "phone": c.phone,
+            "with_phone": c.with_phone,
+        }),
+    }
+}
+
+fn encode_reminder_info(info: Option<ReminderComposeInfo>) -> Value {
+    match info {
+        None => Value::Null,
+        Some(r) => json!({
+            "allowed": r.allowed,
+            "hidden": r.hidden,
+            "text": r.text,
+            "is_group": r.is_group,
+            "can_pin": r.can_pin,
+            "pin_toggle": r.pin_toggle,
+            "title_max_chars": r.title_max_chars,
+            "title_max_bytes": r.title_max_bytes,
+        }),
+    }
+}
+
+fn encode_composer_confirm(c: &ComposerConfirm) -> Value {
+    json!({
+        "id": c.id,
+        "conv_id": c.conv_id,
+        "title": c.title,
+        "message": c.message,
+        "ok": c.ok,
+        "cancel": c.cancel,
+    })
+}
+
+fn decode_composer_confirm(v: &Value) -> Option<ComposerConfirm> {
+    let id = v.get("id").and_then(Value::as_str)?.to_owned();
+    Some(ComposerConfirm {
+        id,
+        conv_id: v
+            .get("conv_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        title: v
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        message: v
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        ok: v
+            .get("ok")
+            .and_then(Value::as_str)
+            .unwrap_or("OK")
+            .to_owned(),
+        cancel: v
+            .get("cancel")
+            .and_then(Value::as_str)
+            .unwrap_or("Cancel")
+            .to_owned(),
+    })
 }
 
 async fn capture_case_snapshot(
@@ -4286,17 +5346,27 @@ async fn capture_case_snapshot(
         is_u4,
         is_u5,
         is_u6,
+        is_u16,
+        current_now_ms,
+        is_u7,
         is_u8,
         is_u12,
+        is_u11,
+        is_u13,
+        is_u14,
         last_send_result,
         send_logs,
         prune_next_expiry_ms,
         action_logs,
+        u16_results,
+        pin_logs,
         selection,
         forward_results,
         u12_results,
         watched_check_ids,
         seeded_member_cache,
+        results,
+        search_results,
     } = *opts;
     if !is_u3 {
         return core
@@ -4561,6 +5631,29 @@ async fn capture_case_snapshot(
                     "seen_reaction_event_ids".to_owned(),
                     Value::Array(seen_pref.into_iter().map(Value::String).collect()),
                 );
+                if is_u7 {
+                    let aliases_val = store
+                        .get_preference_data("aliases")
+                        .ok()
+                        .flatten()
+                        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                        .unwrap_or_else(|| json!({}));
+                    prefs_obj.insert("aliases".to_owned(), aliases_val);
+                    let cached_groups_val = store
+                        .get_preference_data("cachedGroups")
+                        .ok()
+                        .flatten()
+                        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                        .unwrap_or_else(|| json!({}));
+                    prefs_obj.insert("cached_groups".to_owned(), cached_groups_val);
+                    let cached_profiles_val = store
+                        .get_preference_data("cachedProfiles")
+                        .ok()
+                        .flatten()
+                        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                        .unwrap_or_else(|| json!({}));
+                    prefs_obj.insert("cached_profiles".to_owned(), cached_profiles_val);
+                }
             }
         }
         if is_u8 {
@@ -4589,7 +5682,671 @@ async fn capture_case_snapshot(
             obj.insert("results".to_owned(), Value::Object(forward_results.clone()));
         }
     }
+    if is_u16 {
+        if let Some(store_arc) = host.attached_store()
+            && let Some(Value::Object(store_obj)) = obj.get_mut("store")
+            && let Some(Value::Object(prefs_obj)) = store_obj.get_mut("prefs")
+        {
+            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+            let notif_enabled_val = store
+                .get_preference_data("notifEnabled")
+                .ok()
+                .flatten()
+                .and_then(|d| serde_json::from_slice::<bool>(&d).ok())
+                .map_or(Value::Null, Value::Bool);
+            prefs_obj.insert("notif_enabled".to_owned(), notif_enabled_val);
+
+            let notif_sound_val = store
+                .get_preference_data("notifSound")
+                .ok()
+                .flatten()
+                .and_then(|d| serde_json::from_slice::<bool>(&d).ok())
+                .map_or(Value::Null, Value::Bool);
+            prefs_obj.insert("notif_sound".to_owned(), notif_sound_val);
+
+            let mut muted_rows: Vec<Value> = store
+                .get_preference_data("mutedThreads")
+                .ok()
+                .flatten()
+                .and_then(|d| parse_any(&d))
+                .and_then(|v| match v {
+                    Value::Array(arr) => Some(arr),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            muted_rows.sort_by(|a, b| {
+                let sa = a.get("id").and_then(Value::as_str).unwrap_or("");
+                let sb = b.get("id").and_then(Value::as_str).unwrap_or("");
+                sa.as_bytes().cmp(sb.as_bytes())
+            });
+            prefs_obj.insert("muted_threads".to_owned(), Value::Array(muted_rows));
+
+            let aliases_val = store
+                .get_preference_data("aliases")
+                .ok()
+                .flatten()
+                .and_then(|d| parse_any(&d))
+                .unwrap_or_else(|| Value::Object(Map::new()));
+            prefs_obj.insert("aliases".to_owned(), aliases_val);
+        }
+
+        let ns = &full.notification_settings;
+        let mut mutes_obj = Map::new();
+        for (id, info) in &ns.mutes {
+            mutes_obj.insert(
+                id.clone(),
+                json!({
+                    "start_time": encode_seconds_json(info.start_time),
+                    "duration": encode_seconds_json(info.duration),
+                }),
+            );
+        }
+        obj.insert(
+            "notification_settings".to_owned(),
+            json!({
+                "is_loaded": ns.is_loaded,
+                "enabled": ns.enabled,
+                "sound": ns.sound,
+                "has_sound_setting": ns.has_sound_setting,
+                "shows_preview": ns.shows_preview,
+                "authorization": ns.authorization.as_str(),
+                "mutes": Value::Object(mutes_obj),
+            }),
+        );
+
+        let active_mutes: Vec<Value> = ns
+            .active_mutes(current_now_ms)
+            .into_iter()
+            .map(|entry| {
+                json!({
+                    "id": entry.id,
+                    "start_time": encode_seconds_json(entry.info.start_time),
+                    "duration": encode_seconds_json(entry.info.duration),
+                    "until_ms": entry.info.until_ms(),
+                    "status_text": mute_status_text_utc(entry.info, current_now_ms),
+                })
+            })
+            .collect();
+        obj.insert("active_mutes".to_owned(), Value::Array(active_mutes));
+
+        let banners_arr: Vec<Value> = host
+            .banners()
+            .into_iter()
+            .map(|b| {
+                json!({
+                    "title": b.title,
+                    "body": b.body,
+                    "conv_id": b.conv_id,
+                    "sender_id": b.sender_id,
+                    "sender_name": b.sender_name,
+                    "is_group": b.is_group,
+                    "avatar_url": b.avatar_url,
+                    "silent": b.silent,
+                })
+            })
+            .collect();
+        obj.insert("banners".to_owned(), Value::Array(banners_arr));
+
+        let aliases_map: Map<String, Value> = full
+            .aliases
+            .iter()
+            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .collect();
+        obj.insert("cached_aliases".to_owned(), Value::Object(aliases_map));
+        obj.insert("results".to_owned(), Value::Object(u16_results.clone()));
+    }
+    if is_u7 {
+        obj.insert("pins".to_owned(), full.pins.lists_to_case_json());
+        obj.insert(
+            "cached_board_raw_topics".to_owned(),
+            full.pins.raw_topics_to_case_json(),
+        );
+        let p_logs: Vec<Value> = pin_logs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .map(Value::String)
+            .collect();
+        obj.insert("pin_logs".to_owned(), Value::Array(p_logs));
+        let mut results_obj = Map::new();
+        for (k, v) in results {
+            results_obj.insert(k.clone(), v.clone());
+        }
+        obj.insert("results".to_owned(), Value::Object(results_obj));
+        let mut aliases_obj = Map::new();
+        for (k, v) in &full.conversations.identities.aliases {
+            aliases_obj.insert(k.clone(), Value::String(v.clone()));
+        }
+        obj.insert("aliases".to_owned(), Value::Object(aliases_obj));
+        let mut cached_groups_obj = Map::new();
+        for (k, g) in &full.conversations.identities.cached_groups {
+            cached_groups_obj.insert(
+                k.clone(),
+                json!({
+                    "name": g.name,
+                    "avatar": g.avatar,
+                    "members": g.members,
+                }),
+            );
+        }
+        obj.insert("cached_groups".to_owned(), Value::Object(cached_groups_obj));
+        let mut fgids_obj = Map::new();
+        for (k, v) in &full.conversations.identities.friend_global_ids {
+            fgids_obj.insert(k.clone(), Value::String(v.clone()));
+        }
+        obj.insert("friend_global_ids".to_owned(), Value::Object(fgids_obj));
+        let friends_arr: Vec<Value> = full
+            .contacts
+            .friends
+            .iter()
+            .map(|f| {
+                json!({
+                    "id": f.id,
+                    "name": f.name,
+                    "zalo_name": f.zalo_name,
+                    "avatar": f.avatar,
+                    "online": f.online,
+                    "last_active_ms": f.last_active_ms,
+                    "sort_key": f.sort_key,
+                    "section": f.section,
+                })
+            })
+            .collect();
+        let groups_arr: Vec<Value> = full
+            .contacts
+            .groups
+            .iter()
+            .map(|g| {
+                json!({
+                    "id": g.id,
+                    "name": g.name,
+                    "avatar": g.avatar,
+                    "members": g.members,
+                    "sort_key": g.sort_key,
+                })
+            })
+            .collect();
+        obj.insert(
+            "contacts".to_owned(),
+            json!({
+                "friends": friends_arr,
+                "friends_loaded": false,
+                "groups": groups_arr,
+                "groups_loaded": false,
+                "loading_requests": false,
+                "notice": Value::Null,
+                "pending_request_count": 0,
+                "received": [],
+                "search": {"error": Value::Null, "status": "idle", "user": Value::Null},
+                "sent": [],
+            }),
+        );
+        obj.insert("blocked_users".to_owned(), Value::Null);
+        obj.insert("cached_group_details".to_owned(), json!({}));
+        obj.insert("group_logs".to_owned(), json!([]));
+        obj.insert("group_member_cache".to_owned(), json!({}));
+        let mut gr_obj = Map::new();
+        for c in &full.conversations.conversations {
+            if c.is_group {
+                gr_obj.insert(
+                    c.id.clone(),
+                    json!({"admins": [], "join_approval": false, "owner": ""}),
+                );
+            }
+        }
+        obj.insert("group_roles".to_owned(), Value::Object(gr_obj));
+        obj.insert("last_alias_result".to_owned(), Value::Null);
+        obj.insert("lookups".to_owned(), json!({}));
+        obj.insert("navigation_request".to_owned(), Value::Null);
+    }
+    if is_u11 {
+        obj.insert("cloud".to_owned(), encode_cloud_state(&full.cloud));
+        obj.insert("results".to_owned(), Value::Object(results.clone()));
+    }
+    if is_u14 {
+        obj.insert("results".to_owned(), Value::Object(search_results.clone()));
+    }
+    if is_u13 {
+        if let Some(Value::Object(msgs_obj)) = obj.get_mut("messages") {
+            for (conv_id, list) in &full.messages.windows {
+                if let Some(Value::Array(arr)) = msgs_obj.get_mut(conv_id)
+                    && arr.len() == list.len()
+                {
+                    for (m, item) in list.iter().zip(arr.iter_mut()) {
+                        if let Value::Object(map) = item {
+                            match &m.kind {
+                                Kind::Sticker { url } => {
+                                    map.insert(
+                                        "sticker_url".to_owned(),
+                                        url.clone().map_or(Value::Null, Value::String),
+                                    );
+                                    map.insert("contact_card".to_owned(), Value::Null);
+                                }
+                                Kind::ContactCard(card) => {
+                                    map.insert("sticker_url".to_owned(), Value::Null);
+                                    map.insert(
+                                        "contact_card".to_owned(),
+                                        json!({
+                                            "name": card.name,
+                                            "uid": card.uid,
+                                            "avatar": card.avatar,
+                                            "phone": card.phone,
+                                        }),
+                                    );
+                                }
+                                _ => {
+                                    map.insert("sticker_url".to_owned(), Value::Null);
+                                    map.insert("contact_card".to_owned(), Value::Null);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(store_arc) = host.attached_store()
+            && let Some(Value::Object(store_obj)) = obj.get_mut("store")
+            && let Some(Value::Object(prefs_obj)) = store_obj.get_mut("prefs")
+        {
+            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+            let recent_val = store
+                .get_preference_data("recentStickers")
+                .ok()
+                .flatten()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .unwrap_or_else(|| Value::Array(Vec::new()));
+            prefs_obj.insert("recent_stickers".to_owned(), recent_val);
+            let suggest_val = store
+                .get_preference_data("stickerSuggest")
+                .ok()
+                .flatten()
+                .and_then(|bytes| serde_json::from_slice::<bool>(&bytes).ok())
+                .map_or(Value::Null, Value::Bool);
+            prefs_obj.insert("sticker_suggest".to_owned(), suggest_val);
+        }
+        obj.insert(
+            "sticker_suggest_state".to_owned(),
+            encode_suggest_setting(full.sticker_suggest_setting),
+        );
+        obj.insert(
+            "composer_confirm".to_owned(),
+            full.composer_confirm
+                .as_ref()
+                .map_or(Value::Null, encode_composer_confirm),
+        );
+        obj.insert(
+            "queued_composer_confirms".to_owned(),
+            Value::Array(
+                full.queued_composer_confirms
+                    .iter()
+                    .map(encode_composer_confirm)
+                    .collect(),
+            ),
+        );
+        obj.insert("results".to_owned(), Value::Object(results.clone()));
+    }
     Some(Value::Object(obj))
+}
+
+fn encode_seconds_json(val: f64) -> Value {
+    if val.is_finite() && val.round() == val && (-9e15..=9e15).contains(&val) {
+        Value::from(val as i64)
+    } else {
+        Value::from(val)
+    }
+}
+
+fn normalize_fake_url(url: &str) -> String {
+    if url.starts_with("http://127.0.0.1")
+        && let Some(pos) = url[7..].find('/')
+    {
+        return format!("http://fake{}", &url[7 + pos..]);
+    }
+    url.to_owned()
+}
+
+fn op_result_to_u16_json(res: OpResult) -> Value {
+    match res {
+        OpResult::Bool(b) => Value::Bool(b),
+        OpResult::CardAction(o) => {
+            let (status, text) = o.as_status_and_text();
+            json!({
+                "status": status,
+                "text": text.map(normalize_fake_url),
+            })
+        }
+        OpResult::SuggestedStickers(list) => Value::Array(
+            list.into_iter()
+                .map(|item| {
+                    json!({
+                        "ref": item.sticker_ref,
+                        "url": normalize_fake_url(&item.url),
+                    })
+                })
+                .collect(),
+        ),
+        OpResult::ContactCardState(st) => json!({
+            "is_self": st.is_self,
+            "is_friend": st.is_friend,
+        }),
+        OpResult::ContactProfile(None) => Value::Null,
+        OpResult::ContactProfile(Some(p)) => json!({
+            "uid": p.uid,
+            "name": p.name,
+            "zalo_name": p.zalo_name,
+            "avatar": p.avatar.map(|u| normalize_fake_url(&u)),
+            "bio": p.bio,
+            "is_self": p.is_self,
+            "is_friend": p.is_friend,
+            "is_oa": p.is_oa,
+        }),
+        OpResult::FriendRequestPrep(prep) => json!({
+            "state": prep.state,
+            "default_message": prep.default_message,
+            "max_message": prep.max_message,
+        }),
+        OpResult::SubmitFriend(r) => json!({
+            "ok": r.ok,
+            "text": r.text,
+            "pending": r.pending,
+        }),
+        OpResult::SaveAlias(r) => json!({
+            "ok": r.ok,
+            "text": r.text,
+        }),
+        OpResult::GroupInvitePreview(p) => json!({
+            "state": p.state,
+            "group_id": p.group_id,
+            "name": p.name,
+            "avatar": p.avatar.map(|u| normalize_fake_url(&u)),
+            "total_member": p.total_member,
+            "desc": p.desc,
+            "community": p.community,
+            "creator_name": p.creator_name,
+            "members": p.members.into_iter().map(|m| json!({
+                "id": m.id,
+                "name": m.name,
+                "avatar": m.avatar.map(|u| normalize_fake_url(&u)),
+                "admin": m.admin,
+            })).collect::<Vec<_>>(),
+            "text": p.text,
+        }),
+        OpResult::JoinGroup(r) => json!({
+            "state": r.state,
+            "group_id": r.group_id,
+            "text": r.text,
+        }),
+        OpResult::ReminderSnapshot(None) => Value::Null,
+        OpResult::ReminderSnapshot(Some(s)) => json!({
+            "variant": s.variant,
+            "id": s.id,
+            "title": s.title,
+            "start_ms": s.start_ms,
+            "repeat_label": s.repeat_label,
+            "creator_name": s.creator_name,
+            "only_me": s.only_me,
+            "is_group": s.is_group,
+            "mine": s.mine,
+            "accepted_count": s.accepted_count,
+            "rejected_count": s.rejected_count,
+            "can_rsvp": s.can_rsvp,
+            "can_view": s.can_view,
+            "deleted": s.deleted,
+            "sig": s.sig,
+        }),
+        OpResult::RespondReminder(r) => json!({
+            "ok": r.ok,
+            "text": r.text,
+            "snapshot": op_result_to_u16_json(OpResult::ReminderSnapshot(r.snapshot)),
+        }),
+        OpResult::ReminderResponders(None) => Value::Null,
+        OpResult::ReminderResponders(Some(resp)) => {
+            let enc_people = |list: Vec<olaz_core::ReminderResponderPerson>| -> Vec<Value> {
+                list.into_iter()
+                    .map(|p| {
+                        json!({
+                            "uid": p.uid,
+                            "name": p.name,
+                            "avatar": p.avatar.map(|u| normalize_fake_url(&u)),
+                            "is_me": p.is_me,
+                        })
+                    })
+                    .collect()
+            };
+            json!({
+                "accept": enc_people(resp.accept),
+                "reject": enc_people(resp.reject),
+                "accept_total": resp.accept_total,
+                "reject_total": resp.reject_total,
+                "accept_more": resp.accept_more,
+                "reject_more": resp.reject_more,
+            })
+        }
+        _ => Value::Null,
+    }
+}
+
+fn parse_incoming_message(raw: &Value) -> Option<ChatMessage> {
+    let obj = raw.as_object()?;
+    let conv_id = obj
+        .get("conversationId")
+        .or_else(|| obj.get("conv_id"))
+        .and_then(Value::as_str)?
+        .to_owned();
+    if conv_id.is_empty() {
+        return None;
+    }
+    let id = obj
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let sender_id = obj
+        .get("senderId")
+        .or_else(|| obj.get("sender_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let sender_name = obj
+        .get("senderName")
+        .or_else(|| obj.get("sender_name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let sender_avatar = obj
+        .get("senderAvatar")
+        .or_else(|| obj.get("sender_avatar"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let is_mine = obj
+        .get("isMine")
+        .or_else(|| obj.get("is_mine"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let is_e2ee = obj
+        .get("isE2EE")
+        .or_else(|| obj.get("is_e2ee"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let date_ms = obj
+        .get("date")
+        .or_else(|| obj.get("ts_ms"))
+        .or_else(|| obj.get("date_ms"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let text = obj
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let kind_obj = match obj.get("kind") {
+        Some(Value::String(s)) => json!({ "type": s }),
+        Some(v @ Value::Object(_)) => v.clone(),
+        _ => json!({ "type": "text" }),
+    };
+    let wire_json = json!({
+        "id": id,
+        "conversationId": conv_id,
+        "clientId": id,
+        "senderId": sender_id,
+        "senderName": sender_name,
+        "senderAvatar": sender_avatar.clone().unwrap_or_default(),
+        "isMine": is_mine,
+        "isE2EE": is_e2ee,
+        "text": text,
+        "date": date_ms,
+        "status": "sent",
+        "kind": kind_obj,
+    });
+    let raw_bytes = serde_json::to_vec(&wire_json).ok()?;
+    let stored = olaz_wire::StoredMessage {
+        id,
+        conv_id,
+        client_id: String::new(),
+        sender_id,
+        sender_name,
+        sender_avatar: sender_avatar.unwrap_or_default(),
+        is_mine,
+        text,
+        kind_tag: "text".to_owned(),
+        ts_ms: date_ms,
+        status: "sent".to_owned(),
+        raw_json_data: raw_bytes,
+    };
+    decode_stored_message(&stored)
+}
+
+fn apply_u16_contacts_seed(contacts: &Value, state: &mut ContactsState) {
+    if let Some(b) = contacts.get("friends_loaded").and_then(Value::as_bool) {
+        state.friends_loaded = b;
+    }
+    if let Some(b) = contacts.get("groups_loaded").and_then(Value::as_bool) {
+        state.groups_loaded = b;
+    }
+    if let Some(arr) = contacts.get("friends").and_then(Value::as_array) {
+        state.friends = arr
+            .iter()
+            .filter_map(|row| {
+                let id = row.get("id").and_then(Value::as_str)?.to_owned();
+                let name = row
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&id)
+                    .to_owned();
+                let zalo_name = row
+                    .get("zalo_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&name)
+                    .to_owned();
+                let avatar = row
+                    .get("avatar")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                let last_active_ms = row.get("last_active_ms").and_then(Value::as_i64);
+                let online = row.get("online").and_then(Value::as_bool).unwrap_or(false);
+                let section = row
+                    .get("section")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        name.chars()
+                            .next()
+                            .map(|c| c.to_uppercase().collect::<String>())
+                            .unwrap_or_else(|| "#".to_owned())
+                    });
+                let sort_key = row
+                    .get("sort_key")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| name.to_lowercase());
+                Some(FriendEntry {
+                    id,
+                    name,
+                    zalo_name,
+                    avatar,
+                    last_active_ms,
+                    online,
+                    section: if section.is_empty() {
+                        "#".to_owned()
+                    } else {
+                        section
+                    },
+                    sort_key,
+                })
+            })
+            .collect();
+    }
+    if let Some(arr) = contacts.get("groups").and_then(Value::as_array) {
+        state.groups = arr
+            .iter()
+            .filter_map(|row| {
+                let id = row.get("id").and_then(Value::as_str)?.to_owned();
+                let name = row
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&id)
+                    .to_owned();
+                let avatar = row
+                    .get("avatar")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                let members = row.get("members").and_then(Value::as_i64).unwrap_or(0);
+                let sort_key = row
+                    .get("sort_key")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| name.to_lowercase());
+                Some(GroupEntry {
+                    id,
+                    name,
+                    avatar,
+                    members,
+                    sort_key,
+                })
+            })
+            .collect();
+    }
+    let decode_reqs = |arr: &[Value]| -> Vec<FriendRequestEntry> {
+        arr.iter()
+            .filter_map(|row| {
+                let id = row.get("id").and_then(Value::as_str)?.to_owned();
+                let name = row
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&id)
+                    .to_owned();
+                let avatar = row
+                    .get("avatar")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                let message = row
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let time_ms = row.get("date_ms").and_then(Value::as_i64);
+                Some(FriendRequestEntry {
+                    id,
+                    name,
+                    avatar,
+                    message,
+                    time_ms,
+                })
+            })
+            .collect()
+    };
+    if let Some(arr) = contacts.get("received").and_then(Value::as_array) {
+        state.received = decode_reqs(arr);
+        state.pending_request_count = state.received.len();
+    }
+    if let Some(arr) = contacts.get("sent").and_then(Value::as_array) {
+        state.sent = decode_reqs(arr);
+    }
 }
 
 fn str_arg(args: &Value, key: &str) -> String {
@@ -4614,9 +6371,15 @@ fn str_vec_arg(args: &Value, key: &str) -> Vec<String> {
 /// Runs a single Case format v1 [`Case`] under paused tokio time and returns the observed
 /// snapshots, final state, sorted canonical requests, and ordered host calls.
 pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
+    let is_u16 = case.domain == "notify";
+    let is_u7 = case.domain == "pins";
     let is_u8 = case.domain == "forward";
     let is_u12 = case.domain == "polls";
-    let is_u6 = case.domain == "message_actions" || is_u8;
+    let is_u11 = case.domain == "cloud";
+    let is_u13 = case.domain == "stickers";
+    let is_u14 = case.domain == "search";
+    let is_u6 =
+        case.domain == "message_actions" || is_u7 || is_u8 || is_u11 || is_u13 || is_u14 || is_u16;
     let is_u5 = case.domain == "send" || is_u6 || is_u12;
     let is_u4 = case.domain == "bootstrap" || case.domain == "messages" || is_u5;
     let is_u3 = case.domain == "conversations" || case.domain == "conversation_actions" || is_u4;
@@ -4675,11 +6438,14 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         client.seed_next_client_id(next_cid);
     }
 
-    let base_host = RecordingHost::from_seed_with_all_modes(
+    let base_host = RecordingHost::from_seed_with_u13_modes(
         &case.seed,
         is_u3,
         is_u4,
         is_u6,
+        is_u7,
+        is_u13,
+        is_u16,
         temp_dir.as_ref().map(|d| d.path().to_path_buf()),
     );
     let host = Arc::new(if is_u12 {
@@ -4698,10 +6464,12 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
     host.bind_store_slot(inner_runner.shared_store_slot());
     let send_logs = Arc::new(Mutex::new(Vec::<String>::new()));
     let action_logs = Arc::new(Mutex::new(Vec::<String>::new()));
+    let pin_logs = Arc::new(Mutex::new(Vec::<String>::new()));
     let runner: Arc<dyn EffectRunner> = Arc::new(LogCapturingRunner {
         inner: Arc::clone(&inner_runner),
         send_logs: Arc::clone(&send_logs),
         action_logs: Arc::clone(&action_logs),
+        pin_logs: Arc::clone(&pin_logs),
     });
 
     let mut initial_state = CoreState::default();
@@ -4741,6 +6509,163 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             }
         }
         initial_state.actions.auto_delete = Some(map);
+    }
+    if is_u16 {
+        if let Some(contacts) = &case.seed.contacts
+            && !contacts.is_null()
+        {
+            apply_u16_contacts_seed(contacts, &mut initial_state.contacts);
+        }
+        if let Some(pins_obj) = case.seed.pins.as_ref().and_then(Value::as_object) {
+            for (conv_id, list_val) in pins_obj {
+                if let Some(items) = list_val.get("items").and_then(Value::as_array) {
+                    let refs: Vec<PinReminderRef> = items
+                        .iter()
+                        .filter_map(|item| {
+                            let is_reminder = match item.get("kind") {
+                                Some(Value::String(s)) => s == "reminder",
+                                _ => false,
+                            };
+                            if !is_reminder {
+                                return None;
+                            }
+                            let msg_id = item
+                                .get("msgId")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned();
+                            let cli_msg_id = item
+                                .get("cliMsgId")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned();
+                            let reminder_ref = item
+                                .get("ref")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned();
+                            if reminder_ref.is_empty() {
+                                return None;
+                            }
+                            Some(PinReminderRef {
+                                msg_id,
+                                cli_msg_id,
+                                reminder_ref,
+                            })
+                        })
+                        .collect();
+                    if !refs.is_empty() {
+                        initial_state
+                            .notify
+                            .pin_reminder_refs
+                            .insert(conv_id.clone(), refs);
+                    }
+                }
+            }
+        }
+    }
+    if is_u7 {
+        if let Some(contacts_val) = &case.seed.contacts
+            && let Some(friends_arr) = contacts_val.get("friends").and_then(Value::as_array)
+        {
+            for item in friends_arr {
+                let Some(obj) = item.as_object() else {
+                    continue;
+                };
+                let id = obj
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                if id.is_empty() {
+                    continue;
+                }
+                let name = obj
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let zalo_name = obj
+                    .get("zalo_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&name)
+                    .to_owned();
+                let avatar = obj
+                    .get("avatar")
+                    .and_then(Value::as_str)
+                    .filter(|a| !a.is_empty())
+                    .map(str::to_owned);
+                let online = obj.get("online").and_then(Value::as_bool).unwrap_or(false);
+                let last_active_ms = obj.get("last_active_ms").and_then(Value::as_i64);
+                let sort_key = obj
+                    .get("sort_key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let section = obj
+                    .get("section")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                initial_state.contacts.friends.push(olaz_core::FriendEntry {
+                    id,
+                    name,
+                    zalo_name,
+                    avatar,
+                    online,
+                    last_active_ms,
+                    sort_key,
+                    section,
+                });
+            }
+        }
+        if let Some(pins_obj) = case.seed.pins.as_ref().and_then(Value::as_object) {
+            for (conv_id, val) in pins_obj {
+                if let Some(obj) = val.as_object() {
+                    initial_state
+                        .pins
+                        .lists
+                        .insert(conv_id.clone(), PinnedList::from_json(obj));
+                }
+            }
+        }
+        if let Some(raw_obj) = case
+            .seed
+            .board_raw_topics
+            .as_ref()
+            .and_then(Value::as_object)
+        {
+            for (conv_id, val) in raw_obj {
+                if let Some(obj) = val.as_object() {
+                    let version = obj.get("version").and_then(Value::as_i64).unwrap_or(0);
+                    let mut topics = BTreeMap::new();
+                    if let Some(tmap) = obj.get("topics").and_then(Value::as_object) {
+                        for (tid, trow) in tmap {
+                            if let Some(row_obj) = trow.as_object() {
+                                topics.insert(tid.clone(), row_obj.clone());
+                            }
+                        }
+                    }
+                    initial_state
+                        .pins
+                        .raw_topics
+                        .insert(conv_id.clone(), BoardRawTopics { version, topics });
+                }
+            }
+        }
+    }
+    if is_u13 {
+        if let Some(active_val) = &case.seed.composer_confirm
+            && !active_val.is_null()
+        {
+            initial_state.composer.active_confirm = decode_composer_confirm(active_val);
+        }
+        if let Some(queued_arr) = &case.seed.queued_composer_confirms {
+            initial_state.composer.queued_confirms = queued_arr
+                .iter()
+                .filter_map(decode_composer_confirm)
+                .collect();
+        }
     }
     if is_u12 {
         if let Some(contacts) = &case.seed.contacts {
@@ -4883,10 +6808,10 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         if let Some(pins_obj) = case.seed.pins.as_ref().and_then(Value::as_object) {
             for (conv_id, list_val) in pins_obj {
                 if let Some(list_map) = list_val.as_object() {
-                    initial_state.board_pins.insert(
-                        conv_id.clone(),
-                        olaz_core::BoardPinList::from_json(list_map),
-                    );
+                    initial_state
+                        .pins
+                        .lists
+                        .insert(conv_id.clone(), PinnedList::from_json(list_map));
                 }
             }
         }
@@ -4906,10 +6831,10 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         }
                     }
                 }
-                initial_state.board_raw_topics.insert(
-                    conv_id.clone(),
-                    olaz_core::BoardRawTopics { version, topics },
-                );
+                initial_state
+                    .pins
+                    .raw_topics
+                    .insert(conv_id.clone(), BoardRawTopics { version, topics });
             }
         }
         if let Some(clock_obj) = case.seed.poll_clock.as_ref().and_then(Value::as_object) {
@@ -4948,17 +6873,26 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
         runner,
         Handle::current(),
     ));
+    host.bind_u16_handles(Arc::clone(&client), Arc::clone(&core));
+    host.attach_core_handle(Arc::clone(&core));
 
     let mut snapshots = BTreeMap::new();
+    let mut results = Map::<String, Value>::new();
     let mut host_cursor = 0usize;
     let mut last_send_result: Option<bool> = None;
     let mut prune_next_expiry_ms: Option<i64> = None;
     let mut pending_send_task: Option<tokio::task::JoinHandle<bool>> = None;
     let mut pending_action_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut baseline_now_ms: i64 = case.seed.now_ms.unwrap_or(1_700_000_000_000);
+    let mut u16_results: Map<String, Value> = Map::new();
+    let mut pending_watch_task: Option<(usize, tokio::task::JoinHandle<Value>)> = None;
+    let mut pending_extra_action_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut u12_results: BTreeMap<String, Value> = BTreeMap::new();
 
+    let mut search_results: Map<String, Value> = Map::new();
     let mut selection: Option<TestSelection> = None;
     let mut forward_results: Map<String, Value> = Map::new();
+
     for (step_index, step) in case.steps.iter().enumerate() {
         let step_idx = step_index;
         if is_u12
@@ -5160,8 +7094,43 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                     }
                 }
                 "pin" => {
-                    let id = str_arg(args, "id");
-                    core.request_unit(Command::PinConversation { id }).await;
+                    if is_u7 {
+                        let conv_id = str_arg(args, "conv_id");
+                        let msg_id = str_arg(args, "msg_id");
+                        let replacing = args
+                            .get("replacing")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
+                        let pin_cmd = Command::Pin {
+                            conv_id,
+                            msg_id,
+                            replacing,
+                        };
+                        if is_async {
+                            let core_c = Arc::clone(&core);
+                            let task = tokio::spawn(async move {
+                                core_c.request_unit(pin_cmd).await;
+                            });
+                            if pending_action_task.is_none() {
+                                pending_action_task = Some(task);
+                            } else {
+                                pending_extra_action_tasks.push(task);
+                            }
+                            tokio::task::yield_now().await;
+                            let _ = core.settle().await;
+                        } else {
+                            core.request_unit(pin_cmd).await;
+                            if pending_send_task.is_none() && pending_action_task.is_none() {
+                                let _ =
+                                    tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
+                                        .await;
+                            }
+                        }
+                    } else {
+                        let id = str_arg(args, "id");
+                        core.request_unit(Command::PinConversation { id }).await;
+                    }
                 }
                 "unpin" => {
                     let id = str_arg(args, "id");
@@ -5515,6 +7484,86 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         .await
                         .map_err(|_| format!("timed out awaiting typing expiry for `{id}`"))?;
                 }
+                "search" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let query = str_arg(args, "query");
+                    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(50);
+                    let (hits, _ver) = core.search_messages(conv_id, query, limit).await;
+                    search_results.insert(
+                        step_index.to_string(),
+                        Value::Array(hits.into_iter().map(|m| Value::String(m.id)).collect()),
+                    );
+                }
+                "ensure_loaded" => {
+                    if is_u11 {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                    let conv_id = str_arg(args, "conv_id");
+                    let target = if let Some(msg_json) = args.get("message") {
+                        decode_step_message(msg_json, &conv_id)
+                    } else if let Some(msg_id) = args.get("msg_id").and_then(Value::as_str) {
+                        let mem_hit = core.full_snapshot().await.and_then(|snap| {
+                            snap.messages.windows.get(&conv_id).and_then(|list| {
+                                list.iter()
+                                    .find(|m| m.id == msg_id || m.client_id == msg_id)
+                                    .cloned()
+                            })
+                        });
+                        if mem_hit.is_some() {
+                            mem_hit
+                        } else if let Some(store_arc) = host.attached_store() {
+                            let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                            store
+                                .message(&conv_id, msg_id)
+                                .ok()
+                                .flatten()
+                                .and_then(|row| olaz_core::decode_db_stored(&row))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let msg = target.ok_or_else(|| {
+                        "ensure_loaded could not resolve target message".to_owned()
+                    })?;
+                    let (loaded, _ver) = core.ensure_message_loaded(conv_id, msg).await;
+                    if is_u11 {
+                        let _ = core.settle().await;
+                        results.insert(step_index.to_string(), Value::Bool(loaded));
+                    }
+                    search_results.insert(step_index.to_string(), Value::Bool(loaded));
+                }
+                "load_quoted" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let mem_hit = core.full_snapshot().await.and_then(|snap| {
+                        snap.messages
+                            .windows
+                            .get(&conv_id)
+                            .and_then(|list| list.iter().find(|m| m.id == msg_id).cloned())
+                    });
+                    let target = if mem_hit.is_some() {
+                        mem_hit
+                    } else if let Some(store_arc) = host.attached_store() {
+                        let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
+                        store
+                            .message(&conv_id, &msg_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|row| olaz_core::decode_db_stored(&row))
+                    } else {
+                        None
+                    };
+                    let msg = target
+                        .ok_or_else(|| format!("load_quoted could not find msg_id `{msg_id}`"))?;
+                    let (quoted_id, _ver) = core.load_quoted_message(conv_id, msg).await;
+                    search_results.insert(
+                        step_index.to_string(),
+                        quoted_id.map_or(Value::Null, Value::String),
+                    );
+                }
                 "request_forward" => {
                     let conv_id = str_arg(args, "conv_id");
                     let msg_id = str_arg(args, "msg_id");
@@ -5694,6 +7743,11 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                             .await
                             .map_err(|e| format!("await_action join error: {e}"))?;
                     }
+                    for handle in std::mem::take(&mut pending_extra_action_tasks) {
+                        handle
+                            .await
+                            .map_err(|e| format!("await_action extra join error: {e}"))?;
+                    }
                     if pending_send_task.is_none() {
                         let _ =
                             tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
@@ -5823,12 +7877,48 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                 }
                 "answer_confirm" => {
                     let ok = args.get("ok").and_then(Value::as_bool).unwrap_or(false);
-                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
-                    core.request_unit(Command::AnswerMessageConfirm { ok, now_ms: ts_ms })
-                        .await;
-                    if pending_send_task.is_none() && pending_action_task.is_none() {
-                        let _ =
-                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    if is_u13 {
+                        let confirm_id = if let Some(explicit) = args
+                            .get("confirm")
+                            .and_then(|c| c.get("id"))
+                            .and_then(Value::as_str)
+                        {
+                            explicit.to_owned()
+                        } else {
+                            core.full_snapshot()
+                                .await
+                                .and_then(|s| s.composer_confirm)
+                                .map(|c| c.id)
+                                .unwrap_or_default()
+                        };
+                        core.request_unit(Command::AnswerComposerConfirm { confirm_id, ok })
+                            .await;
+                        tokio::task::yield_now().await;
+                        tokio::task::yield_now().await;
+                    } else {
+                        let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
+                        let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                        let confirm_cmd = Command::AnswerMessageConfirm { ok, now_ms: ts_ms };
+                        if is_async {
+                            let core_c = Arc::clone(&core);
+                            let task = tokio::spawn(async move {
+                                core_c.request_unit(confirm_cmd).await;
+                            });
+                            if pending_action_task.is_none() {
+                                pending_action_task = Some(task);
+                            } else {
+                                pending_extra_action_tasks.push(task);
+                            }
+                            tokio::task::yield_now().await;
+                            let _ = core.settle().await;
+                        } else {
+                            core.request_unit(confirm_cmd).await;
+                            if pending_send_task.is_none() && pending_action_task.is_none() {
+                                let _ =
+                                    tokio::time::timeout(Duration::from_secs(5), core.wait_idle())
+                                        .await;
+                            }
+                        }
                     }
                 }
                 "star" => {
@@ -5877,6 +7967,476 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                             now_ms: ts_ms,
                         })
                         .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                // U16 notify domain commands
+                "set_now_ms" => {
+                    if let Some(ms) = args.get("ms").and_then(Value::as_i64) {
+                        baseline_now_ms = ms;
+                        host.set_current_now_ms(ms);
+                    }
+                }
+                "set_enabled" => {
+                    let enabled = args.get("on").and_then(Value::as_bool).unwrap_or(false);
+                    core.request_unit(Command::SetNotificationsEnabled { enabled })
+                        .await;
+                    if pending_watch_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "set_sound" => {
+                    let enabled = args.get("on").and_then(Value::as_bool).unwrap_or(false);
+                    core.request_unit(Command::SetNotificationSound { enabled })
+                        .await;
+                    if pending_watch_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "set_preview" => {
+                    let shown = args.get("on").and_then(Value::as_bool).unwrap_or(false);
+                    core.request_unit(Command::SetMessagePreview { shown })
+                        .await;
+                }
+                "mute" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let raw_dur = args.get("duration").and_then(Value::as_i64).unwrap_or(1) as i32;
+                    let eff_now_ms = now_ms.unwrap_or(baseline_now_ms);
+                    let duration_secs = mute_duration_secs_utc(raw_dur, eff_now_ms);
+                    core.request_unit(Command::MuteConversation {
+                        conv_id,
+                        duration_secs,
+                        now_ms: eff_now_ms,
+                    })
+                    .await;
+                    if pending_watch_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "unmute" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let eff_now_ms = now_ms.unwrap_or(baseline_now_ms);
+                    core.request_unit(Command::UnmuteConversation {
+                        conv_id,
+                        now_ms: eff_now_ms,
+                    })
+                    .await;
+                    if pending_watch_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "is_muted" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let eff_now_ms = now_ms.unwrap_or(baseline_now_ms);
+                    if let Some(res) = core
+                        .request(Command::IsConversationMuted {
+                            conv_id,
+                            now_ms: eff_now_ms,
+                        })
+                        .await
+                    {
+                        u16_results.insert(step_index.to_string(), op_result_to_u16_json(res));
+                    }
+                }
+                "settings_payload" => {
+                    let payload = args
+                        .get("json")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    core.request_unit(Command::HandleNotificationSettingsPayload { payload })
+                        .await;
+                }
+                "load_prefs" => {
+                    core.request_unit(Command::LoadNotificationPreferences)
+                        .await;
+                    if pending_watch_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "incoming" => {
+                    let eff_now_ms = now_ms.unwrap_or(baseline_now_ms);
+                    let msgs: Vec<ChatMessage> = args
+                        .get("messages")
+                        .and_then(Value::as_array)
+                        .map(|arr| arr.iter().filter_map(parse_incoming_message).collect())
+                        .unwrap_or_default();
+                    core.request_unit(Command::NotifyIncomingBatch {
+                        messages: msgs,
+                        now_ms: eff_now_ms,
+                    })
+                    .await;
+                    if pending_watch_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "card_action" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let action_ref = str_arg(args, "ref");
+                    let eff_now_ms = now_ms.unwrap_or(baseline_now_ms);
+                    host.set_current_now_ms(eff_now_ms);
+                    if let Some(res) = core
+                        .request(Command::PerformCardAction {
+                            conv_id,
+                            msg_id,
+                            action_ref,
+                        })
+                        .await
+                    {
+                        u16_results.insert(step_index.to_string(), op_result_to_u16_json(res));
+                    }
+                    host.set_current_now_ms(baseline_now_ms);
+                    if pending_watch_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "suggested_stickers" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    if let Some(res) = core
+                        .request(Command::SuggestedStickers { conv_id, msg_id })
+                        .await
+                    {
+                        u16_results.insert(step_index.to_string(), op_result_to_u16_json(res));
+                    }
+                }
+                "contact_card" => {
+                    let uid = str_arg(args, "uid");
+                    if let Some(res) = core.request(Command::ContactCardState { uid }).await {
+                        u16_results.insert(step_index.to_string(), op_result_to_u16_json(res));
+                    }
+                }
+                "contact_profile" => {
+                    let uid = str_arg(args, "uid");
+                    if let Some(res) = core.request(Command::ContactProfile { uid }).await {
+                        u16_results.insert(step_index.to_string(), op_result_to_u16_json(res));
+                    }
+                }
+                "prep_friend" => {
+                    let uid = str_arg(args, "uid");
+                    let conv_id = str_arg(args, "conv_id");
+                    let via_raw = args.get("via").and_then(Value::as_str).unwrap_or("add");
+                    let via = FriendRequestOriginKind::from_raw(via_raw);
+                    if let Some(res) = core
+                        .request(Command::PrepareFriendRequest { uid, conv_id, via })
+                        .await
+                    {
+                        u16_results.insert(step_index.to_string(), op_result_to_u16_json(res));
+                    }
+                }
+                "submit_friend" => {
+                    let uid = str_arg(args, "uid");
+                    let message = str_arg(args, "message");
+                    if let Some(res) = core
+                        .request(Command::SubmitFriendRequest { uid, message })
+                        .await
+                    {
+                        u16_results.insert(step_index.to_string(), op_result_to_u16_json(res));
+                    }
+                    if pending_watch_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "save_alias" => {
+                    let uid = str_arg(args, "uid");
+                    let name = str_arg(args, "name");
+                    if let Some(res) = core.request(Command::SaveAlias { uid, name }).await {
+                        u16_results.insert(step_index.to_string(), op_result_to_u16_json(res));
+                    }
+                    if pending_watch_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "invite_preview" => {
+                    let url = str_arg(args, "url");
+                    if let Some(res) = core.request(Command::GroupInvitePreview { url }).await {
+                        u16_results.insert(step_index.to_string(), op_result_to_u16_json(res));
+                    }
+                }
+                "join_group" => {
+                    let url = str_arg(args, "url");
+                    let preview_group_id = args
+                        .get("preview_group_id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    if let Some(res) = core
+                        .request(Command::JoinGroup {
+                            url,
+                            preview_group_id,
+                        })
+                        .await
+                    {
+                        u16_results.insert(step_index.to_string(), op_result_to_u16_json(res));
+                    }
+                    if pending_watch_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "reminder_watch" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let signature = str_arg(args, "signature");
+                    let is_async = args.get("async").and_then(Value::as_bool).unwrap_or(false);
+                    let watch_cmd = Command::ReminderWatch {
+                        conv_id,
+                        msg_id,
+                        signature,
+                    };
+                    if is_async {
+                        let core_bg = Arc::clone(&core);
+                        let handle = tokio::spawn(async move {
+                            core_bg
+                                .request(watch_cmd)
+                                .await
+                                .map_or(Value::Null, op_result_to_u16_json)
+                        });
+                        pending_watch_task = Some((step_index, handle));
+                        let _ = core.settle().await;
+                        tokio::task::yield_now().await;
+                    } else if let Some(res) = core.request(watch_cmd).await {
+                        u16_results.insert(step_index.to_string(), op_result_to_u16_json(res));
+                    }
+                }
+                "advance_reminder_ms" => {
+                    let ms = args.get("ms").and_then(Value::as_u64).unwrap_or(0);
+                    tokio::time::advance(Duration::from_millis(ms)).await;
+                    tokio::task::yield_now().await;
+                    let _ = core.settle().await;
+                }
+                "await_reminder_watch" => {
+                    if let Some((watch_idx, handle)) = pending_watch_task.take() {
+                        let val = handle
+                            .await
+                            .map_err(|e| format!("await_reminder_watch join error: {e}"))?;
+                        u16_results.insert(watch_idx.to_string(), val);
+                    }
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "respond_reminder" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let accept = args.get("accept").and_then(Value::as_bool).unwrap_or(false);
+                    if let Some(res) = core
+                        .request(Command::RespondReminder {
+                            conv_id,
+                            msg_id,
+                            accept,
+                        })
+                        .await
+                    {
+                        u16_results.insert(step_index.to_string(), op_result_to_u16_json(res));
+                    }
+                }
+                "reminder_responders" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    if let Some(res) = core
+                        .request(Command::ReminderResponders { conv_id, msg_id })
+                        .await
+                    {
+                        u16_results.insert(step_index.to_string(), op_result_to_u16_json(res));
+                    }
+                }
+                "reset_card_state" => {
+                    core.request_unit(Command::ResetCardState).await;
+                    tokio::task::yield_now().await;
+                }
+                "policy" => {
+                    let eff_now_ms = now_ms.unwrap_or(baseline_now_ms);
+                    let ref_now_sec = (eff_now_ms as f64) / 1000.0;
+                    let m_indef = MuteInfo {
+                        start_time: ref_now_sec,
+                        duration: -1.0,
+                    };
+                    let m_same_day = MuteInfo {
+                        start_time: ref_now_sec,
+                        duration: 3600.0,
+                    };
+                    let m_next_day = MuteInfo {
+                        start_time: ref_now_sec,
+                        duration: 35200.0,
+                    };
+                    let newly_added = notification_policy::newly_hidden(
+                        &["1".to_owned(), "2".to_owned()],
+                        &["2".to_owned(), "3".to_owned(), "4".to_owned()],
+                    );
+                    let newly_same =
+                        notification_policy::newly_hidden(&["1".to_owned()], &["1".to_owned()]);
+                    u16_results.insert(
+                        step_index.to_string(),
+                        json!({
+                            "should_suppress": {
+                                "baseline": notification_policy::should_suppress(true, true, Some("5"), "5", 4.0, 180.0),
+                                "inactive_app": notification_policy::should_suppress(false, true, Some("5"), "5", 4.0, 180.0),
+                                "hidden_window": notification_policy::should_suppress(true, false, Some("5"), "5", 4.0, 180.0),
+                                "other_conv": notification_policy::should_suppress(true, true, Some("6"), "5", 4.0, 180.0),
+                                "empty_tag": notification_policy::should_suppress(true, true, Some("5"), "", 4.0, 180.0),
+                                "nil_open": notification_policy::should_suppress(true, true, None, "5", 4.0, 180.0),
+                                "idle_179": notification_policy::should_suppress(true, true, Some("5"), "5", 179.0, 180.0),
+                                "idle_180": notification_policy::should_suppress(true, true, Some("5"), "5", 180.0, 180.0),
+                            },
+                            "refuses_reply": {
+                                "known_unlocked": notification_policy::refuses_reply(true, false),
+                                "known_locked": notification_policy::refuses_reply(true, true),
+                                "unknown_unlocked": notification_policy::refuses_reply(false, false),
+                                "unknown_locked": notification_policy::refuses_reply(false, true),
+                            },
+                            "newly_hidden_added": newly_added,
+                            "newly_hidden_unchanged": newly_same,
+                            "body": {
+                                "preview_on": notification_policy::body("Mẹ: xin chào", true),
+                                "preview_off": notification_policy::body("Mẹ: xin chào", false),
+                            },
+                            "mute_texts": {
+                                "indefinite_desc": mute_description_utc(m_indef, eff_now_ms),
+                                "indefinite_status": mute_status_text_utc(m_indef, eff_now_ms),
+                                "same_day_desc": mute_description_utc(m_same_day, eff_now_ms),
+                                "same_day_status": mute_status_text_utc(m_same_day, eff_now_ms),
+                                "next_day_desc": mute_description_utc(m_next_day, eff_now_ms),
+                                "next_day_status": mute_status_text_utc(m_next_day, eff_now_ms),
+                            },
+                        }),
+                    );
+                }
+                // U7 board pins domain commands
+                "refresh_board" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let _ = core.refresh_board_pins(conv_id).await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "pin_message" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    core.request_unit(Command::PinMessage { conv_id, msg_id })
+                        .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+
+                "request_unpin" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let topic_ref = str_arg(args, "ref");
+                    core.request_unit(Command::RequestUnpin { conv_id, topic_ref })
+                        .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "request_unpin_message" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    core.request_unit(Command::RequestUnpinMessage { conv_id, msg_id })
+                        .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "pins_state" => {
+                    if is_u12 {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                    let state_json = args
+                        .get("json")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    core.request_unit(Command::HandlePinsState { state_json })
+                        .await;
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "pin_event" => {
+                    let act_type = str_arg(args, "act_type");
+                    let act = str_arg(args, "act");
+                    let data = args
+                        .get("data")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    let convs = pin_topic_event_conversations(&act_type, &act, &data);
+                    results.insert(
+                        step_index.to_string(),
+                        Value::Array(convs.iter().cloned().map(Value::String).collect()),
+                    );
+                    for cid in convs {
+                        core.request_unit(Command::HandlePinTopicEvent { conv_id: cid })
+                            .await;
+                    }
+                    if pending_send_task.is_none() && pending_action_task.is_none() {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
+                }
+                "can_pin" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let val = core
+                        .full_snapshot()
+                        .await
+                        .and_then(|snap| {
+                            snap.messages
+                                .windows
+                                .get(&conv_id)
+                                .and_then(|list| {
+                                    list.iter()
+                                        .find(|m| m.id == msg_id || m.client_id == msg_id)
+                                })
+                                .map(|msg| can_pin_message(&snap.pins.lists, msg))
+                        })
+                        .unwrap_or(false);
+                    results.insert(step_index.to_string(), Value::Bool(val));
+                }
+                "is_pinned" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let msg_id = str_arg(args, "msg_id");
+                    let val = core
+                        .full_snapshot()
+                        .await
+                        .and_then(|snap| {
+                            snap.messages
+                                .windows
+                                .get(&conv_id)
+                                .and_then(|list| {
+                                    list.iter()
+                                        .find(|m| m.id == msg_id || m.client_id == msg_id)
+                                })
+                                .map(|msg| is_pinned(&snap.pins.lists, msg))
+                        })
+                        .unwrap_or(false);
+                    results.insert(step_index.to_string(), Value::Bool(val));
+                }
+                "load_pinned" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let topic_ref = str_arg(args, "ref");
+                    let loaded = core.load_pinned_message(conv_id, topic_ref).await;
+                    results.insert(
+                        step_index.to_string(),
+                        loaded.map_or(Value::Null, Value::String),
+                    );
                     if pending_send_task.is_none() && pending_action_task.is_none() {
                         let _ =
                             tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
@@ -6264,13 +8824,6 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                             .await;
                     }
                 }
-                "pins_state" => {
-                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
-                    if let Some(j_map) = args.get("json").and_then(Value::as_object).cloned() {
-                        core.request_unit(Command::HandlePinsState { state: j_map })
-                            .await;
-                    }
-                }
                 "reset_polls" => {
                     let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
                     host.clear_virtual_poll_timers();
@@ -6288,6 +8841,229 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                     let check_results = run_u12_poll_model_checks(checks, &core).await;
                     u12_results.insert(step_index.to_string(), check_results);
                 }
+                // U11 cloud domain commands
+                "refresh_cloud" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    host.record("refresh_cloud", json!({}));
+                    core.request_unit(Command::RefreshCloud).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                "cloud_list" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let conv_id = args
+                        .get("conv_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let kind = args
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .and_then(CloudItemKind::from_raw);
+                    let sort_by_size = args
+                        .get("sort_by_size")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let ascending = args
+                        .get("ascending")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let offset = args.get("offset").and_then(Value::as_i64).unwrap_or(0);
+                    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(60);
+                    let page = core
+                        .request_cloud_page(Command::CloudList {
+                            conv_id,
+                            kind,
+                            sort_by_size,
+                            ascending,
+                            offset,
+                            limit,
+                        })
+                        .await;
+                    results.insert(step_idx.to_string(), encode_cloud_page(&page));
+                }
+                "cloud_fetch" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let key = str_arg(args, "key");
+                    let fetch = core.request_cloud_fetch(Command::CloudFetch { key }).await;
+                    results.insert(step_idx.to_string(), encode_cloud_fetch(&fetch));
+                }
+                "cloud_thumbnail" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let key = str_arg(args, "key");
+                    let thumb = core
+                        .request_media_resolution(Command::CloudThumbnail { key })
+                        .await;
+                    results.insert(step_idx.to_string(), encode_media_resolution(&thumb));
+                }
+                "cloud_delete" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let keys = str_vec_arg(args, "keys");
+                    let res = core
+                        .request_cloud_action(Command::CloudDelete { keys })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    results.insert(step_idx.to_string(), encode_cloud_action_result(&res));
+                }
+                "cloud_set_offload" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let enabled = args
+                        .get("enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let res = core
+                        .request_cloud_action(Command::CloudSetOffload { enabled })
+                        .await;
+                    results.insert(step_idx.to_string(), encode_cloud_action_result(&res));
+                }
+                "reset_cloud" => {
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    core.request_unit(Command::ResetCloud).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
+                // U13 stickers + composer side-actions commands
+                "sticker_tabs" => {
+                    let tabs = core.request_sticker_tabs().await;
+                    results.insert(step_index.to_string(), encode_sticker_tabs(tabs));
+                }
+                "stickers_in_tab" => {
+                    let id = args.get("id").and_then(Value::as_i64).unwrap_or(0);
+                    let list = core
+                        .request_sticker_entries(Command::StickersInTab { id })
+                        .await;
+                    results.insert(step_index.to_string(), encode_stickers(list));
+                }
+                "search_stickers" => {
+                    let text = str_arg(args, "text");
+                    let list = core
+                        .request_sticker_entries(Command::SearchStickers { text })
+                        .await;
+                    results.insert(step_index.to_string(), encode_stickers(list));
+                }
+                "typing_suggestions" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let text = str_arg(args, "text");
+                    let list = core
+                        .request_sticker_entries(Command::TypingStickerSuggestions {
+                            conv_id,
+                            text,
+                            is_e2ee: None,
+                        })
+                        .await;
+                    results.insert(step_index.to_string(), encode_stickers(list));
+                }
+                "send_sticker" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let st = args.get("sticker").unwrap_or(&Value::Null);
+                    let sticker = StickerEntry {
+                        cate_id: st.get("cate_id").and_then(Value::as_i64).unwrap_or(0),
+                        sticker_id: st.get("id").and_then(Value::as_i64).unwrap_or(0),
+                        url: st
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        animation: None,
+                    };
+                    let source = match args.get("source").and_then(Value::as_str) {
+                        Some("recent") => StickerSource::Recent,
+                        Some("search") => StickerSource::Search,
+                        Some("suggestion") => StickerSource::Suggestion,
+                        _ => StickerSource::Category,
+                    };
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    let client_id = client.next_client_id();
+                    let outcome = core
+                        .request_card_action(Command::SendSticker {
+                            conv_id,
+                            sticker,
+                            source,
+                            client_id,
+                            now_ms: ts_ms,
+                            is_e2ee: None,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    results.insert(step_index.to_string(), encode_card_action_outcome(&outcome));
+                }
+                "sticker_setting" => {
+                    let setting = core
+                        .request_sticker_suggest_setting(Command::StickerSetting)
+                        .await;
+                    results.insert(step_index.to_string(), encode_suggest_setting(setting));
+                }
+                "set_sticker_suggest" => {
+                    let enabled = args.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                    let setting = core
+                        .request_sticker_suggest_setting(Command::SetStickerSuggest { enabled })
+                        .await;
+                    results.insert(step_index.to_string(), encode_suggest_setting(setting));
+                }
+                "my_card" => {
+                    let info = core.request_my_card().await;
+                    results.insert(step_index.to_string(), encode_my_card(info));
+                }
+                "send_my_card" => {
+                    // Drain any in-flight boot HTTP/host work so `send_e2ee_contact_card`
+                    // lands deterministically after `start_bootstrap` in both Rust and Swift.
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    let conv_id = str_arg(args, "conv_id");
+                    let with_phone = args
+                        .get("with_phone")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let ts_ms = now_ms.unwrap_or(1_700_000_000_000);
+                    let outcome = core
+                        .request_composer_outcome(Command::SendMyCard {
+                            conv_id,
+                            with_phone,
+                            client_id: None,
+                            now_ms: ts_ms,
+                            is_e2ee: None,
+                        })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    results.insert(step_index.to_string(), encode_composer_outcome(&outcome));
+                }
+                "reminder_info" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let info = core.request_reminder_info(conv_id).await;
+                    results.insert(step_index.to_string(), encode_reminder_info(info));
+                }
+                "create_reminder" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let title = str_arg(args, "title");
+                    let start_ms = args.get("start_ms").and_then(Value::as_i64).unwrap_or(0);
+                    let repeat_mode = args.get("repeat").and_then(Value::as_i64).unwrap_or(0);
+                    let pin = args.get("pin").and_then(Value::as_bool).unwrap_or(false);
+                    let outcome = core
+                        .request_composer_outcome(Command::CreateReminder {
+                            conv_id,
+                            title,
+                            start_ms,
+                            repeat_mode,
+                            pin,
+                        })
+                        .await;
+                    results.insert(step_index.to_string(), encode_composer_outcome(&outcome));
+                }
+                "advance_confirm_ms" => {
+                    let ms = args.get("ms").and_then(Value::as_u64).unwrap_or(0);
+                    host.advance_confirm_ms(ms);
+                    tokio::task::yield_now().await;
+                    tokio::task::yield_now().await;
+                    let _ = core.settle().await;
+                }
+                "drop_confirms" => {
+                    core.request_unit(Command::DropComposerConfirms).await;
+                }
+                "composer_report" => {
+                    let conv_id = str_arg(args, "conv_id");
+                    let outcome = args
+                        .get("outcome")
+                        .map_or(ComposerOutcome::Done, decode_composer_outcome);
+                    core.request_unit(Command::ComposerReport { conv_id, outcome })
+                        .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                }
                 other => return Err(format!("unknown step cmd: {other}")),
             },
             Step::Await {
@@ -6301,6 +9077,10 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                     let dur = Duration::from_millis(timeout_ms.unwrap_or(10_000));
                     let wait_fut = core.wait_for_predicate(|snap| predicate.matches(snap));
                     let _ = tokio::time::timeout(dur, wait_fut).await;
+                    if is_u7 {
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(5), core.wait_idle()).await;
+                    }
                 }
             }
             Step::AwaitHost {
@@ -6331,7 +9111,10 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             }
             Step::Snapshot { snapshot } => {
                 if is_u3 {
-                    if pending_send_task.is_some() || pending_action_task.is_some() {
+                    if pending_send_task.is_some()
+                        || pending_action_task.is_some()
+                        || pending_watch_task.is_some()
+                    {
                         inner_runner.flush_host().await;
                         let _ = core.settle().await;
                         inner_runner.flush_store().await;
@@ -6349,17 +9132,27 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
                         is_u4,
                         is_u5,
                         is_u6,
+                        is_u16,
+                        current_now_ms: baseline_now_ms,
+                        is_u7,
                         is_u8,
                         is_u12,
+                        is_u11,
+                        is_u13,
+                        is_u14,
                         last_send_result,
                         send_logs: &send_logs,
                         prune_next_expiry_ms,
                         action_logs: &action_logs,
+                        u16_results: &u16_results,
+                        pin_logs: &pin_logs,
                         selection: selection.as_ref(),
                         forward_results: &forward_results,
                         u12_results: &u12_results,
                         watched_check_ids: case.seed.watched_check_ids.as_deref(),
                         seeded_member_cache: case.seed.group_member_cache.as_ref(),
+                        results: &results,
+                        search_results: &search_results,
                     },
                 )
                 .await
@@ -6400,6 +9193,12 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             .await
             .map_err(|e| format!("trailing action task join error: {e}"))?;
     }
+    if let Some((watch_idx, handle)) = pending_watch_task.take() {
+        let val = handle
+            .await
+            .map_err(|e| format!("trailing watch task join error: {e}"))?;
+        u16_results.insert(watch_idx.to_string(), val);
+    }
     let final_state = capture_case_snapshot(
         &core,
         &host,
@@ -6408,17 +9207,27 @@ pub async fn run_case(case: &Case) -> Result<CaseRunResult, String> {
             is_u4,
             is_u5,
             is_u6,
+            is_u16,
+            current_now_ms: baseline_now_ms,
+            is_u7,
             is_u8,
             is_u12,
+            is_u11,
+            is_u13,
+            is_u14,
             last_send_result,
             send_logs: &send_logs,
             prune_next_expiry_ms,
             action_logs: &action_logs,
+            u16_results: &u16_results,
+            pin_logs: &pin_logs,
             selection: selection.as_ref(),
             forward_results: &forward_results,
             u12_results: &u12_results,
             watched_check_ids: case.seed.watched_check_ids.as_deref(),
             seeded_member_cache: case.seed.group_member_cache.as_ref(),
+            results: &results,
+            search_results: &search_results,
         },
     )
     .await
@@ -6608,5 +9417,73 @@ pub fn failed_message_en(snap: &SessionSnapshot) -> Option<String> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+// UTC-only test formatting helpers (Swift owns Calendar formatting and until-8am duration).
+fn civil_from_days_utc(days_since_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    (year as i32, m as u32, d as u32)
+}
+
+fn hh_mm_and_dd_mm_utc(until_ms: i64, now_ms: i64) -> (String, Option<String>) {
+    let until_sec = until_ms.div_euclid(1000);
+    let now_sec = now_ms.div_euclid(1000);
+    let until_days = until_sec.div_euclid(86_400);
+    let now_days = now_sec.div_euclid(86_400);
+    let sec_of_day = until_sec.rem_euclid(86_400);
+    let hh = sec_of_day / 3600;
+    let mm = (sec_of_day % 3600) / 60;
+    let hm = format!("{hh:02}:{mm:02}");
+    let until_ymd = civil_from_days_utc(until_days);
+    let now_ymd = civil_from_days_utc(now_days);
+    let dm = if until_ymd == now_ymd {
+        None
+    } else {
+        Some(format!("{:02}/{:02}", until_ymd.2, until_ymd.1))
+    };
+    (hm, dm)
+}
+
+fn mute_description_utc(info: MuteInfo, now_ms: i64) -> String {
+    let Some(until_ms) = info.until_ms() else {
+        return info.format_description(None, None);
+    };
+    let (hm, dm) = hh_mm_and_dd_mm_utc(until_ms, now_ms);
+    info.format_description(Some(&hm), dm.as_deref())
+}
+
+fn mute_status_text_utc(info: MuteInfo, now_ms: i64) -> String {
+    let Some(until_ms) = info.until_ms() else {
+        return info.format_status_text(None, None);
+    };
+    let (hm, dm) = hh_mm_and_dd_mm_utc(until_ms, now_ms);
+    info.format_status_text(Some(&hm), dm.as_deref())
+}
+
+fn mute_duration_secs_utc(raw: i32, now_ms: i64) -> i64 {
+    match raw {
+        1 => 3600,
+        2 => 4 * 3600,
+        3 => {
+            let now_sec = now_ms.div_euclid(1000);
+            let sec_of_day = now_sec.rem_euclid(86_400);
+            let target_sec_of_day = 8 * 3600;
+            if sec_of_day < target_sec_of_day {
+                target_sec_of_day - sec_of_day
+            } else {
+                86_400 - sec_of_day + target_sec_of_day
+            }
+        }
+        _ => -1,
     }
 }

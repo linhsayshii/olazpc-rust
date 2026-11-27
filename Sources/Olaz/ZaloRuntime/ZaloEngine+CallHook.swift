@@ -110,6 +110,7 @@ extension ZaloEngine {
     /// Starts a 1-1 voice / video call to `uid`, or opens the participant picker for a group video call (`g...`).
     func startCall(to uid: String, video: Bool) {
         guard !uid.isEmpty else { return }
+        guard traceHost("start_call", args: ["uid": uid, "video": video]) else { return }
         if uid.hasPrefix("g"), !video {
             showCallNotice("Chỉ gọi video cho nhóm", "Zalo chỉ hỗ trợ gọi video trong nhóm. Hãy chọn nút gọi video.")
             return
@@ -536,13 +537,17 @@ extension ZaloEngine {
         let profileUids = candidates.compactMap { ZaloWireParser.sanitizeProfileUid($0) }
         if !profileUids.isEmpty,
            let profBox = try? await sessionClient.fetchProfiles(uids: profileUids) {
+            var nextProfiles = cachedProfiles
             for (uid, row) in ZaloWireParser.extractProfilesMap(profBox.dict) {
                 let c = ZaloWireParser.stripUserPrefix(uid)
                 let n = ZaloWireParser.preferredName(row)
                 let a = JSONLossless.string(row["avatar"] ?? row["avt"])
                 if !c.isEmpty, (!n.isEmpty || !a.isEmpty) {
-                    cachedProfiles[c] = ZaloWebKitMigrator.CachedProfile(name: n, avatar: a)
+                    nextProfiles[c] = ZaloWebKitMigrator.CachedProfile(name: n, avatar: a)
                 }
+            }
+            if nextProfiles != cachedProfiles {
+                cachedProfiles = nextProfiles
             }
             if let resolved = resolvePersonFromCandidates(candidates) {
                 return cachedAliases[resolved.uid] ?? resolved.name
@@ -650,13 +655,17 @@ extension ZaloEngine {
                 }
                 if !profileFetchUids.isEmpty,
                    let profBox = try? await sessionClient.fetchProfiles(uids: profileFetchUids) {
+                    var nextProfiles = cachedProfiles
                     for (uid, row) in ZaloWireParser.extractProfilesMap(profBox.dict) {
                         let c = ZaloWireParser.stripUserPrefix(uid)
                         let n = ZaloWireParser.preferredName(row)
                         let a = JSONLossless.string(row["avatar"] ?? row["avt"])
                         if !c.isEmpty, (!n.isEmpty || !a.isEmpty) {
-                            cachedProfiles[c] = ZaloWebKitMigrator.CachedProfile(name: n, avatar: a)
+                            nextProfiles[c] = ZaloWebKitMigrator.CachedProfile(name: n, avatar: a)
                         }
+                    }
+                    if nextProfiles != cachedProfiles {
+                        cachedProfiles = nextProfiles
                     }
                     resolvedCaller = resolvePersonFromCandidates(allCandidates)
                 }

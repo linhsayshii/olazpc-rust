@@ -52,7 +52,7 @@ else
 fi
 
 # Tests that assert a wall-clock budget or poll real time.
-TIMING_SWIFT='sqliteClientIdIndexExistsBulkSaveIsFastAndE2EETwinProtectionIntact|fastPhoneSyncPlanFiltersAndSortsNewestFirstAndBulkIngestsFast|startsHelperQueuesUntilReadyThenSendsInitFirst|queueIsLIFOAndDropsCancelledWork|scrubEndsAtOnceAndPlaybackResumesEvenIfALaterSeekSupersedesTheExactOne|phaseGateTasksCompleteAcrossStartLogOutRefreshExpiryAndTeardown|uncachedDecodesStayOutOfTheSharedMemoryCache'
+TIMING_SWIFT='sqliteClientIdIndexExistsBulkSaveIsFastAndE2EETwinProtectionIntact|fastPhoneSyncPlanFiltersAndSortsNewestFirstAndBulkIngestsFast|startsHelperQueuesUntilReadyThenSendsInitFirst|queueIsLIFOAndDropsCancelledWork|scrubEndsAtOnceAndPlaybackResumesEvenIfALaterSeekSupersedesTheExactOne|phaseGateTasksCompleteAcrossStartLogOutRefreshExpiryAndTeardown|uncachedDecodesStayOutOfTheSharedMemoryCache|serverConfirmedMuteAndJoinErrorCodesAndBannerLatency'
 TIMING_RUST=(ping_cadence_uses_interval_after_auth)
 # The crate holding TIMING_RUST; the olaz-core `cases` harness reads any free argument as a domain, so test
 # filters go to this crate only.
@@ -260,6 +260,9 @@ for DOMAIN in "${DOMAINS[@]}"; do
         message_actions)
             RECORDER_FILTER="MessageActionRecorderTests"
             ;;
+        pins)
+            RECORDER_FILTER="PinRecorderTests"
+            ;;
         contacts)
             RECORDER_FILTER="ContactRecorderTests"
             ;;
@@ -268,6 +271,9 @@ for DOMAIN in "${DOMAINS[@]}"; do
             ;;
         polls)
             RECORDER_FILTER="PollRecorderTests"
+            ;;
+        stickers)
+            RECORDER_FILTER="StickerRecorderTests"
             ;;
         *)
             RECORDER_FILTER="${DOMAIN_CAP}RecorderTests"

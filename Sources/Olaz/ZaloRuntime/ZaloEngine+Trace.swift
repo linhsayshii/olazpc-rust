@@ -13,6 +13,13 @@ extension ZaloEngine {
         return traceHost(name, args: args())
     }
 
+    internal func traceNotifyHost(_ name: String, args: @autoclosure () -> [String: Any] = [:]) -> Bool {
+        guard traceNotifyHostEnabled else {
+            return hostTrace == nil
+        }
+        return traceHost(name, args: args())
+    }
+
     internal func showActionCard(_ text: String, in conversationId: String?) {
         if traceHost("show_card", args: ["conv_id": conversationId ?? NSNull(), "text": text]) {
             CardActionCenter.shared.show(text, in: conversationId)
@@ -46,6 +53,15 @@ extension ZaloEngine {
         pollRefreshTasks[key] = task
     }
 
+    internal func trackNotificationTask(_ body: @escaping @MainActor () async -> Void) {
+        let key = UUID()
+        let task = Task { @MainActor [weak self] in
+            defer { self?.notificationTasks.removeValue(forKey: key) }
+            await body()
+        }
+        notificationTasks[key] = task
+    }
+
     internal func syncSessionClientTrace() async {
         guard hostTrace != nil else {
             await sessionClient.setSessionTrace(nil)
@@ -64,6 +80,8 @@ extension ZaloEngine {
     internal func cancelTasksForRecording() {
         hostTrace = nil
         sendE2EETextHostHandler = nil
+        sendE2EEStickerHostHandler = nil
+        sendE2EEContactCardHostHandler = nil
         resolveMediaHostHandler = nil
         resolveFileHostHandler = nil
         fetchMediaDataHostHandler = nil
@@ -71,6 +89,7 @@ extension ZaloEngine {
         sendFilesHostHandler = nil
         forwardTempPhotoURL = nil
         traceU4HostEnabled = false
+        traceNotifyHostEnabled = false
         stateTrace = nil
         transportSettleTrace = nil
         EngineLog.shared.onAppend = nil
@@ -98,14 +117,23 @@ extension ZaloEngine {
         pollDebounceSleep = nil
         resetPolls()
         pollRefreshTasks.values.forEach { $0.cancel() }
+        pollRefreshTasks.removeAll()
+        cloudRefreshTask?.cancel()
+        cloudRefreshTask = nil
         optimisticOverlayFenceTasks.values.forEach { $0.cancel() }
         optimisticOverlayFenceTasks.removeAll()
-        contactsTasks.values.forEach { $0.cancel() }
-        contactsTasks.removeAll()
-        pollDebounceSleep = nil
-        resetPolls()
-        pollRefreshTasks.values.forEach { $0.cancel() }
-        pollRefreshTasks.removeAll()
+        composerConfirmSleep = nil
+        composerConfirmTask?.cancel()
+        composerConfirmTask = nil
+        notifyBannerHook = nil
+        requestNotifAuthHostHandler = nil
+        notificationCalendar = .current
+        reminderWatchSleep = nil
+        reminderWatchTimerTasks.values.forEach { $0.cancel() }
+        reminderWatchTimerTasks.removeAll()
+        notificationTasks.values.forEach { $0.cancel() }
+        notificationTasks.removeAll()
+        resetCardState()
         typingResetTasks.values.forEach { $0.cancel() }
         typingResetTasks = [:]
         callBridge?.shutdown()
@@ -181,6 +209,11 @@ extension ZaloEngine {
             messageActionTasks.removeAll()
             for task in tasks { _ = await task.value }
         }
+        while !optimisticOverlayFenceTasks.isEmpty {
+            let tasks = Array(optimisticOverlayFenceTasks.values)
+            optimisticOverlayFenceTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
         if let core = coreLifecycle.core {
             if phase == .ready, activeSendTask == nil {
                 if let v = try? await core.waitIdle() {
@@ -210,6 +243,23 @@ extension ZaloEngine {
         }
         if let core = coreLifecycle.core {
             await drainCorePollWork(core)
+        }
+        _ = await persistConversationsTask?.value
+    }
+
+    internal func awaitCloudTasksForRecording() async {
+        while let task = cloudRefreshTask {
+            cloudRefreshTask = nil
+            _ = await task.value
+        }
+        _ = await persistConversationsTask?.value
+    }
+
+    internal func awaitNotificationTasksForRecording() async {
+        while !notificationTasks.isEmpty {
+            let tasks = Array(notificationTasks.values)
+            notificationTasks.removeAll()
+            for task in tasks { _ = await task.value }
         }
         _ = await persistConversationsTask?.value
     }
@@ -272,6 +322,12 @@ extension ZaloEngine {
         while !pollRefreshTasks.isEmpty {
             let tasks = Array(pollRefreshTasks.values)
             pollRefreshTasks.removeAll()
+            for task in tasks { _ = await task.value }
+        }
+        _ = await cloudRefreshTask?.value
+        while !notificationTasks.isEmpty {
+            let tasks = Array(notificationTasks.values)
+            notificationTasks.removeAll()
             for task in tasks { _ = await task.value }
         }
         _ = await persistConversationsTask?.value

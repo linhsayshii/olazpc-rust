@@ -21,6 +21,8 @@ use olaz_wire::{
     strip_user_prefix,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::pins::PinnedList;
 use serde_json::{Map, Value, json};
 
 use crate::conversations::{
@@ -85,6 +87,89 @@ fn nsnumber_bool(val: Option<&Value>) -> Option<bool> {
         Value::Bool(b) => Some(*b),
         Value::Number(n) => n.as_f64().map(|x| x != 0.0),
         _ => None,
+    }
+}
+
+/// Swift `value as? Bool` bridging parity for raw JSON values decoded via Foundation:
+/// JSON `true`/`false` and numeric `1`/`0` (including `1.0`/`0.0`) bridge to `true`/`false`;
+/// all other numbers (e.g. `2`, `-1`, `0.5`) and non-numeric types (e.g. `"1"`, `"true"`) return `None`.
+fn swift_json_bool(val: Option<&Value>) -> Option<bool> {
+    match val? {
+        Value::Bool(b) => Some(*b),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                match i {
+                    1 => Some(true),
+                    0 => Some(false),
+                    _ => None,
+                }
+            } else if let Some(u) = n.as_u64() {
+                match u {
+                    1 => Some(true),
+                    0 => Some(false),
+                    _ => None,
+                }
+            } else if let Some(f) = n.as_f64() {
+                if f == 1.0 {
+                    Some(true)
+                } else if f == 0.0 && !n.to_string().chars().any(|c| ('1'..='9').contains(&c)) {
+                    Some(false)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn json_value_type(val: &Value) -> &'static str {
+    match val {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Formats a shape-only diagnostic line for `/api/poll/detail` `data` objects:
+/// sorted top-level keys plus the JSON value type of each `allow_*` / `is_*` flag.
+/// Never logs poll question/option text, IDs, or tokens.
+#[must_use]
+pub fn poll_detail_shape_log_line(d: &Map<String, Value>) -> String {
+    let mut keys: Vec<&str> = d.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    let flags: Vec<String> = keys
+        .iter()
+        .filter(|k| k.starts_with("allow_") || k.starts_with("is_"))
+        .filter_map(|k| d.get(*k).map(|v| format!("{k}:{}", json_value_type(v))))
+        .collect();
+    format!(
+        "poll detail shape: keys=[{}] flags=[{}]",
+        keys.join(","),
+        flags.join(",")
+    )
+}
+
+/// Returns a shape-only diagnostic log line only when one of the expected poll detail
+/// boolean flags (`allow_add_new_option`/`is_add_new_option`,
+/// `allow_multi_choices`/`is_multi_choice`, `is_anonymous`, `is_hide_vote_preview`)
+/// is missing or not a JSON boolean.
+#[must_use]
+pub fn poll_detail_shape_anomaly_log_line(d: &Map<String, Value>) -> Option<String> {
+    let is_bool = |key: &str| matches!(d.get(key), Some(Value::Bool(_)));
+    let has_add = is_bool("allow_add_new_option") || is_bool("is_add_new_option");
+    let has_multi = is_bool("allow_multi_choices") || is_bool("is_multi_choice");
+    let has_anon = is_bool("is_anonymous");
+    let has_hide = is_bool("is_hide_vote_preview");
+    if has_add && has_multi && has_anon && has_hide {
+        None
+    } else {
+        Some(poll_detail_shape_log_line(d))
     }
 }
 
@@ -990,63 +1075,6 @@ pub enum PollPinOutcome {
 // Temporary U7 read-only board mirror types
 // ---------------------------------------------------------------------------
 
-/// One item in a conversation's pinned board list (`PinnedItem` read-only mirror until U7).
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BoardPinItem {
-    pub ref_id: String,
-    pub kind: String,
-    pub title: String,
-    pub sender: String,
-    pub thumbnail: Option<String>,
-    pub msg_id: String,
-    pub cli_msg_id: String,
-}
-
-impl fmt::Debug for BoardPinItem {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BoardPinItem")
-            .field("kind", &self.kind)
-            .finish()
-    }
-}
-
-/// Conversation board pin list (`PinnedList` read-only mirror until U7).
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BoardPinList {
-    pub ready: bool,
-    pub can_pin: bool,
-    pub limit: i64,
-    pub items: Vec<BoardPinItem>,
-}
-
-impl fmt::Debug for BoardPinList {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BoardPinList")
-            .field("ready", &self.ready)
-            .field("can_pin", &self.can_pin)
-            .field("limit", &self.limit)
-            .field("items", &self.items.len())
-            .finish()
-    }
-}
-
-/// Raw board topic cache for a conversation (`cachedBoardRawTopics[convId]` until U7).
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BoardRawTopics {
-    pub version: i64,
-    /// `topic_id -> raw JSON object` (used to extract `type` for `unpinv2` / `multi_unpin`).
-    pub topics: BTreeMap<String, JsonObject>,
-}
-
-impl fmt::Debug for BoardRawTopics {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BoardRawTopics")
-            .field("version", &self.version)
-            .field("topics", &self.topics.len())
-            .finish()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // PollsState + PollClock
 // ---------------------------------------------------------------------------
@@ -1473,10 +1501,18 @@ pub fn normalize_poll_detail(
         "question": lossless::string(d.get("question")),
         "creator": creator_id,
         "creatorName": creator_name,
-        "multi": d.get("is_multi_choice").and_then(Value::as_bool).unwrap_or(false),
-        "allowAdd": d.get("is_add_new_option").and_then(Value::as_bool).unwrap_or(false),
-        "anonymous": d.get("is_anonymous").and_then(Value::as_bool).unwrap_or(false),
-        "hidePreview": d.get("is_hide_vote_preview").and_then(Value::as_bool).unwrap_or(false),
+        "multi": swift_json_bool(
+            d.get("allow_multi_choices")
+                .or_else(|| d.get("is_multi_choice")),
+        )
+        .unwrap_or(false),
+        "allowAdd": swift_json_bool(
+            d.get("allow_add_new_option")
+                .or_else(|| d.get("is_add_new_option")),
+        )
+        .unwrap_or(false),
+        "anonymous": swift_json_bool(d.get("is_anonymous")).unwrap_or(false),
+        "hidePreview": swift_json_bool(d.get("is_hide_vote_preview")).unwrap_or(false),
         "closed": lossless::int64(d.get("status")) == Some(0),
         "expired": expired_ms,
         "voters": total_voters.len(),
@@ -1496,10 +1532,7 @@ pub fn build_poll_voters(
     my_avatar: Option<&str>,
     convs: &ConversationsState,
 ) -> PollVoters {
-    let anonymous = d
-        .get("is_anonymous")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let anonymous = swift_json_bool(d.get("is_anonymous")).unwrap_or(false);
     let my_uid = normalize_poll_uid(my_raw_uid);
     let snap = IdentitySnapshot::from_core(my_raw_uid, my_avatar, convs);
 
@@ -1566,7 +1599,7 @@ pub fn build_poll_voters(
 /// Returns `(returned_state, mutated)`.
 pub fn refresh_poll_pin_state(
     polls: &mut PollsState,
-    board_pins: &BTreeMap<String, BoardPinList>,
+    board_pins: &BTreeMap<String, PinnedList>,
     id: &str,
     conv_id: &str,
 ) -> (PollPinState, bool) {
@@ -1602,7 +1635,7 @@ pub fn refresh_poll_pin_state(
 #[must_use]
 pub fn build_pin_limit_confirm(
     poll_id: &str,
-    board: Option<&BoardPinList>,
+    board: Option<&PinnedList>,
 ) -> Option<PollPinConfirm> {
     let board = board?;
     let oldest = board.items.last()?;
@@ -2039,11 +2072,11 @@ mod tests {
 
         boards.insert(
             "g500701".to_owned(),
-            BoardPinList {
+            crate::pins::PinnedList {
                 ready: true,
                 can_pin: true,
                 limit: 3,
-                items: vec![BoardPinItem {
+                items: vec![crate::pins::PinnedItem {
                     ref_id: "9701".to_owned(),
                     kind: "poll".to_owned(),
                     title: "Poll".to_owned(),
@@ -2174,5 +2207,254 @@ mod tests {
         assert_eq!(convs.conversations[0].name, "Nhóm Mới");
         assert!(persisted.cached_groups_json.is_some());
         assert!(persisted.stored_conversation.is_some());
+    }
+
+    #[test]
+    fn poll_detail_and_voters_parse_swift_bool_parity_for_numeric_and_invalid_flags() {
+        let polls = PollsState::default();
+        let contacts = ContactsState::default();
+        let mut convs = ConversationsState::default();
+        convs.identities.friends.push(FriendIdentity {
+            id: "3001001".to_owned(),
+            name: "An Nguyễn".to_owned(),
+            avatar: None,
+        });
+        let messages = MessagesState::default();
+
+        // Numeric 1/0 flags (and 1.0/0.0) bridge identically to Swift `as? Bool`.
+        let numeric_on = json!({
+            "group_id": "500101",
+            "question": "Ăn trưa?",
+            "creator": "2001001",
+            "is_multi_choice": 1,
+            "is_add_new_option": 1,
+            "is_anonymous": 1,
+            "is_hide_vote_preview": 1.0,
+            "status": 1,
+            "expired_time": 1_700_086_400,
+            "options": [
+                {"option_id": 1, "content": "Phở", "voters": ["3001001"]},
+            ],
+        });
+        let detail_on = normalize_poll_detail(
+            numeric_on.as_object().unwrap(),
+            "9201",
+            None,
+            "2001001",
+            None,
+            &polls,
+            &contacts,
+            &convs,
+            &messages,
+        )
+        .unwrap();
+        assert!(detail_on.multi);
+        assert!(detail_on.allow_add);
+        assert!(detail_on.anonymous);
+        assert!(detail_on.hide_preview);
+
+        let voters_anon =
+            build_poll_voters(numeric_on.as_object().unwrap(), "2001001", None, &convs);
+        assert!(voters_anon.restricted);
+        assert!(voters_anon.groups[0].users.is_empty());
+
+        let numeric_off = json!({
+            "group_id": "500101",
+            "question": "Ăn tối?",
+            "creator": "2001001",
+            "is_multi_choice": 0,
+            "is_add_new_option": 0.0,
+            "is_anonymous": 0,
+            "is_hide_vote_preview": false,
+            "status": 1,
+            "expired_time": 0,
+            "options": [
+                {"option_id": 1, "content": "Bún", "voters": ["3001001"]},
+            ],
+        });
+        let detail_off = normalize_poll_detail(
+            numeric_off.as_object().unwrap(),
+            "9202",
+            None,
+            "2001001",
+            None,
+            &polls,
+            &contacts,
+            &convs,
+            &messages,
+        )
+        .unwrap();
+        assert!(!detail_off.multi);
+        assert!(!detail_off.allow_add);
+        assert!(!detail_off.anonymous);
+        assert!(!detail_off.hide_preview);
+
+        let voters_public =
+            build_poll_voters(numeric_off.as_object().unwrap(), "2001001", None, &convs);
+        assert!(!voters_public.restricted);
+        assert_eq!(voters_public.groups[0].users.len(), 1);
+
+        // Non-0/1 numbers (2, -1, 1.5) and strings ("1", "true") yield nil in Swift `as? Bool` -> false.
+        let non_bridging = json!({
+            "group_id": "500101",
+            "question": "Kiểm tra?",
+            "creator": "2001001",
+            "is_multi_choice": 2,
+            "is_add_new_option": "1",
+            "is_anonymous": "true",
+            "is_hide_vote_preview": -1,
+            "status": 1,
+            "expired_time": 0,
+            "options": [
+                {"option_id": 1, "content": "Cơm", "voters": ["3001001"]},
+            ],
+        });
+        let detail_nb = normalize_poll_detail(
+            non_bridging.as_object().unwrap(),
+            "9203",
+            None,
+            "2001001",
+            None,
+            &polls,
+            &contacts,
+            &convs,
+            &messages,
+        )
+        .unwrap();
+        assert!(!detail_nb.multi);
+        assert!(!detail_nb.allow_add);
+        assert!(!detail_nb.anonymous);
+        assert!(!detail_nb.hide_preview);
+
+        let voters_nb =
+            build_poll_voters(non_bridging.as_object().unwrap(), "2001001", None, &convs);
+        assert!(!voters_nb.restricted);
+        assert_eq!(voters_nb.groups[0].users.len(), 1);
+
+        // Extra check for float non-0/1 (0.5, 1.5) and null.
+        assert_eq!(swift_json_bool(Some(&json!(1))), Some(true));
+        assert_eq!(swift_json_bool(Some(&json!(0))), Some(false));
+        assert_eq!(swift_json_bool(Some(&json!(1.0))), Some(true));
+        assert_eq!(swift_json_bool(Some(&json!(0.0))), Some(false));
+        assert_eq!(swift_json_bool(Some(&json!(true))), Some(true));
+        assert_eq!(swift_json_bool(Some(&json!(false))), Some(false));
+        assert_eq!(swift_json_bool(Some(&json!(2))), None);
+        assert_eq!(swift_json_bool(Some(&json!(1.5))), None);
+        assert_eq!(swift_json_bool(Some(&json!("1"))), None);
+        assert_eq!(swift_json_bool(Some(&json!("true"))), None);
+        assert_eq!(swift_json_bool(Some(&Value::Null)), None);
+    }
+
+    #[test]
+    fn poll_detail_shape_log_line_records_only_keys_and_flag_types() {
+        let payload = json!({
+            "question": "SECRET_QUESTION_TEXT",
+            "creator": "SECRET_CREATOR_999",
+            "is_add_new_option": 1,
+            "is_multi_choice": true,
+            "is_anonymous": 0,
+            "is_hide_vote_preview": null,
+            "options": [{"content": "SECRET_OPTION"}],
+        });
+        let line = poll_detail_shape_log_line(payload.as_object().unwrap());
+        assert_eq!(
+            line,
+            "poll detail shape: keys=[creator,is_add_new_option,is_anonymous,is_hide_vote_preview,is_multi_choice,options,question] flags=[is_add_new_option:number,is_anonymous:number,is_hide_vote_preview:null,is_multi_choice:bool]"
+        );
+        assert!(!line.contains("SECRET_QUESTION_TEXT"));
+        assert!(!line.contains("SECRET_CREATOR_999"));
+        assert!(!line.contains("SECRET_OPTION"));
+    }
+
+    #[test]
+    fn normalize_poll_detail_reads_live_allow_flags_and_silences_shape_log() {
+        // Exact top-level key set observed on live `/api/poll/detail` responses (synthetic values).
+        let payload = json!({
+            "allow_add_new_option": true,
+            "allow_multi_choices": true,
+            "closed": false,
+            "created_time": 1_700_000_000_i64,
+            "creator": "2001001",
+            "expired_time": 0,
+            "is_anonymous": false,
+            "is_hide_vote_preview": false,
+            "joined": true,
+            "num_vote": 1,
+            "options": [
+                {"option_id": 1, "content": "Opt A", "voters": ["2001001"]},
+                {"option_id": 2, "content": "Opt B", "voters": []},
+            ],
+            "poll_id": 9901,
+            "poll_type": 0,
+            "question": "Live shape question",
+            "updated_time": 1_700_000_100_i64,
+        });
+        let obj = payload.as_object().unwrap();
+        let polls = PollsState::default();
+        let contacts = ContactsState::default();
+        let convs = ConversationsState::default();
+        let messages = MessagesState::default();
+        let detail = normalize_poll_detail(
+            obj,
+            "9901",
+            Some("g500100"),
+            "2001001",
+            None,
+            &polls,
+            &contacts,
+            &convs,
+            &messages,
+        )
+        .unwrap();
+        assert!(detail.allow_add);
+        assert!(detail.multi);
+        assert!(!detail.anonymous);
+        assert!(!detail.hide_preview);
+        assert!(
+            poll_detail_shape_anomaly_log_line(obj).is_none(),
+            "all-bool live payload must not emit shape anomaly log"
+        );
+
+        // `allow_*` takes precedence over legacy `is_*` keys when both are present.
+        let precedence = json!({
+            "poll_id": 9902,
+            "question": "Precedence",
+            "creator": "2001001",
+            "allow_add_new_option": true,
+            "is_add_new_option": false,
+            "allow_multi_choices": false,
+            "is_multi_choice": true,
+            "is_anonymous": true,
+            "is_hide_vote_preview": true,
+            "options": [],
+        });
+        let prec_detail = normalize_poll_detail(
+            precedence.as_object().unwrap(),
+            "9902",
+            Some("g500100"),
+            "2001001",
+            None,
+            &polls,
+            &contacts,
+            &convs,
+            &messages,
+        )
+        .unwrap();
+        assert!(prec_detail.allow_add);
+        assert!(!prec_detail.multi);
+        assert!(prec_detail.anonymous);
+        assert!(prec_detail.hide_preview);
+
+        // Missing or non-bool expected flag triggers shape anomaly log.
+        let mut missing_flag = obj.clone();
+        missing_flag.remove("allow_add_new_option");
+        let missing_line = poll_detail_shape_anomaly_log_line(&missing_flag).unwrap();
+        assert!(missing_line.starts_with("poll detail shape: "));
+        assert!(missing_line.contains("allow_multi_choices:bool"));
+
+        let mut non_bool_flag = obj.clone();
+        non_bool_flag.insert("allow_add_new_option".to_owned(), json!(1));
+        let non_bool_line = poll_detail_shape_anomaly_log_line(&non_bool_flag).unwrap();
+        assert!(non_bool_line.contains("allow_add_new_option:number"));
     }
 }

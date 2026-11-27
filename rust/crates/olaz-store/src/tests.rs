@@ -352,15 +352,15 @@ fn client_id_index_exists_bulk_save_is_fast_and_e2ee_twin_protection_intact() {
 #[test]
 fn locked_echo_with_server_id_upgrades_local_plain_row() {
     let mut store = Store::open_in_memory().unwrap();
-    let cli = "1795343225001";
-    let srv = "8502116332999";
+    let cli = "1700000100001";
+    let srv = "9000000001001";
     store
         .save_messages(&[msg(
             cli,
-            "3161",
+            "3000101",
             cli,
             "Tin nhắn E2EE vừa gửi",
-            1_795_343_225_000,
+            1_700_000_100_000,
             "text",
             "sent",
         )])
@@ -368,15 +368,15 @@ fn locked_echo_with_server_id_upgrades_local_plain_row() {
     store
         .save_messages(&[msg(
             srv,
-            "3161",
+            "3000101",
             cli,
             "Tin nhắn mã hóa đầu cuối",
-            1_795_343_225_000,
+            1_700_000_100_000,
             "placeholder",
             "e2ee_locked",
         )])
         .unwrap();
-    let rows = store.messages("3161", None, 10).unwrap();
+    let rows = store.messages("3000101", None, 10).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, srv);
     assert_eq!(rows[0].client_id, cli);
@@ -388,15 +388,16 @@ fn locked_echo_with_server_id_upgrades_local_plain_row() {
 }
 
 // NativeProtocolTests.e2eeSignalDecryptionPlaceholderProtectionAndSQLiteSelfHealing (store part)
-const PREKEY_CIPHER: &str = "AzMovwMIpFUwoVUSIQVNUKcMqQKEDdK1jcEt8He7V15D1iWl9ngJgOPtsXiUIRohBZSX4D1qiBhXbdSPciObevx/DTnpfki5s5eI0wzTTQp/InIzCiEFCFnb614YZfaOg7R9/7/DIagW4nsLw5V5jK1ELLEbY1IQCBgAIkDL6XqJXgMKkj5gMtM5+CCkjt5p+Xm4q0wQjhLXMOgyl8M137oQAjyDi9fCjALZOCaCQpyjgm5/eW2crnxEu3JybU+y/enV2FQ=";
+const PREKEY_CIPHER: &str =
+    "AzMIAQgPFh0kKzI5QEdOVVxjanF4f4aNlJuiqbC3vsXM09rh6O/2/QQLEhkgJy41PENKUVhfZm10e4KJ";
 const WHISPER_CIPHER: &str =
-    "AjMKIQXfGtZEt75pr2/KWoTA8W8Bu0oNpGDv9ITalIBSb69UaxAOGAAiENtYix7GNUB1eR/LgY4IuK2Blmqxld2njA==";
+    "AjMKAw4ZJC86RVBbZnF8h5KdqLO+ydTf6vUACxYhLDdCTVhjbnmEj5qlsLvG0dzn8v0IEx4pND9KVWBr";
 
 #[test]
 fn signal_ciphertext_detection() {
     assert!(is_signal_ciphertext(PREKEY_CIPHER));
     assert!(is_signal_ciphertext(WHISPER_CIPHER));
-    assert!(!is_signal_ciphertext("miế ngan trộn"));
+    assert!(!is_signal_ciphertext("xin chào bạn"));
     assert!(!is_signal_ciphertext(
         "https://api.zaloapp.com/api/emoticon/sticker/webpc?eid=34840&size=130"
     ));
@@ -412,24 +413,24 @@ fn signal_ciphertext_detection() {
 fn e2ee_locked_never_overwrites_plain_and_legacy_poison_is_repaired() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path().join("history.sqlite3")).unwrap();
-    let conv_id = "31612076530602762";
+    let conv_id = "3000101";
     let locked = msg(
-        "8502116332010",
+        "9000000002001",
         conv_id,
-        "1794982452921",
+        "1700000002001",
         "Tin nhắn mã hóa đầu cuối",
-        1_794_982_453_589,
+        1_700_000_002_000,
         "placeholder",
         "e2ee_locked",
     );
     store.save_messages(std::slice::from_ref(&locked)).unwrap();
 
     let plain = msg(
-        "8502116332010",
+        "9000000002001",
         conv_id,
-        "1794982452921",
-        "Con về ăn cơm nhé",
-        1_794_982_453_589,
+        "1700000002001",
+        "Hẹn gặp lúc 10 giờ nhé",
+        1_700_000_002_000,
         "text",
         "sent",
     );
@@ -437,7 +438,7 @@ fn e2ee_locked_never_overwrites_plain_and_legacy_poison_is_repaired() {
     store.save_messages(&[locked]).unwrap();
     let loaded = store.messages(conv_id, None, 10).unwrap();
     assert_eq!(loaded.len(), 1);
-    assert_eq!(loaded[0].text, "Con về ăn cơm nhé");
+    assert_eq!(loaded[0].text, "Hẹn gặp lúc 10 giờ nhé");
     assert_eq!(loaded[0].status, "sent");
 
     let broken_url =
@@ -448,18 +449,18 @@ fn e2ee_locked_never_overwrites_plain_and_legacy_poison_is_repaired() {
             conv_id,
             "999111",
             "[Sticker]",
-            1_794_982_472_463,
+            1_700_000_003_000,
             "sticker",
             "sent",
         ),
         json!({"id": "legacy_poison_1", "clientId": "999111", "conversationId": conv_id,
-            "senderId": conv_id, "senderName": "Mẹ", "senderAvatar": "", "isMine": false,
+            "senderId": conv_id, "senderName": "Người A", "senderAvatar": "", "isMine": false,
             "kind": {"type": "sticker", "url": broken_url}, "text": "[Sticker]",
-            "date": 1_794_982_472_463_i64, "status": "sent", "isE2EE": false}),
+            "date": 1_700_000_003_000_i64, "status": "sent", "isE2EE": false}),
     );
     store.save_messages(&[poisoned]).unwrap();
     // Poisoned conversation preview is sanitized too.
-    let mut c = conv(conv_id, false, "Mẹ", false, 5);
+    let mut c = conv(conv_id, false, "Người A", false, 5);
     c.preview_text = PREKEY_CIPHER.into();
     store.save_conversations(&[c]).unwrap();
 
@@ -946,10 +947,10 @@ fn large_64bit_ids_round_trip_as_text() {
     let raw = format!("{{\"id\":\"{id}\",\"big\":{id}}}");
     let m = StoredMessage {
         raw_json_data: raw.clone().into_bytes(),
-        ..msg(id, "31612076530602762", "", "x", 1, "text", "sent")
+        ..msg(id, "3000101", "", "x", 1, "text", "sent")
     };
     store.save_messages(&[m]).unwrap();
-    let got = store.message("31612076530602762", id).unwrap().unwrap();
+    let got = store.message("3000101", id).unwrap().unwrap();
     assert_eq!(got.id, id);
     assert_eq!(String::from_utf8(got.raw_json_data).unwrap(), raw);
 }
@@ -1203,5 +1204,288 @@ fn set_conversation_preview_allows_rollback_and_empty_clear() {
     assert_eq!(row.preview_text, "");
     assert_eq!(row.preview_ts_ms, 0);
     assert!(!row.preview_from_me);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cloud_media_aggregation_null_is_group_falls_back_to_is_group_id() {
+    let mut store = Store::open_in_memory().unwrap();
+    // Explicit 1-1 conversation row (is_group = 0) and explicit group row (is_group = 1).
+    let dm = conv("3001001", false, "Alice", false, 100);
+    let grp = conv("g5001002", true, "Team", false, 100);
+    store.save_conversations(&[dm, grp]).unwrap();
+
+    // Media rows:
+    // - 3001001 (explicit is_group = 0)
+    // - g5001002 (explicit is_group = 1)
+    // - 3001003 (NO conversations row -> c.is_group IS NULL -> 1-1 via is_group_id)
+    // - g5001004 (NO conversations row -> c.is_group IS NULL -> group via is_group_id)
+    let mut m_dm = msg("m1", "3001001", "c1", "", 10, "photo", "sent");
+    m_dm.raw_json_data = br#"{"kind":{"type":"photo","size":1000}}"#.to_vec();
+    let mut m_grp = msg("m2", "g5001002", "c2", "", 20, "photo", "sent");
+    m_grp.raw_json_data = br#"{"kind":{"type":"photo","size":2000}}"#.to_vec();
+    let mut m_dm_null = msg("m3", "3001003", "c3", "", 30, "file", "sent");
+    m_dm_null.raw_json_data = br#"{"kind":{"type":"file","name":"a.pdf","size":3000}}"#.to_vec();
+    let mut m_grp_null = msg("m4", "g5001004", "c4", "", 40, "file", "sent");
+    m_grp_null.raw_json_data = br#"{"kind":{"type":"file","name":"b.pdf","size":4000}}"#.to_vec();
+    store
+        .save_messages(&[m_dm, m_grp, m_dm_null, m_grp_null])
+        .unwrap();
+
+    let agg = store.cloud_media_aggregation().unwrap();
+    let by_id: std::collections::HashMap<_, _> =
+        agg.iter().map(|s| (s.conv_id.as_str(), s)).collect();
+    assert!(
+        !by_id["3001001"].is_group,
+        "explicit 1-1 conv must stay is_group=false"
+    );
+    assert!(
+        by_id["g5001002"].is_group,
+        "explicit group conv must stay is_group=true"
+    );
+    assert!(
+        !by_id["3001003"].is_group,
+        "1-1 conv with NULL c.is_group must resolve is_group=false via is_group_id"
+    );
+    assert!(
+        by_id["g5001004"].is_group,
+        "group conv with NULL c.is_group must resolve is_group=true via is_group_id"
+    );
+}
+
+#[test]
+fn search_text_unicode_parity_with_swift_lowercased_contains() {
+    use crate::search_text::{fold_search_text, search_text_contains_folded, trim_search_query};
+
+    let matches = |hay: &str, query: &str| {
+        let trimmed = trim_search_query(query);
+        let needle = fold_search_text(trimmed);
+        search_text_contains_folded(hay, &needle)
+    };
+
+    // 1. NFC vs NFD (precomposed ấ vs a + combining marks)
+    assert!(matches("\u{1EA5}", "a\u{0302}\u{0301}"));
+    assert!(matches("a\u{0302}\u{0301}", "\u{1EA5}"));
+    assert!(matches("\u{1EA4}", "a\u{0302}\u{0301}"));
+    assert!(matches("A\u{0302}\u{0301}", "\u{1EA5}"));
+    assert!(!matches("\u{1EA5}", "a"));
+    assert!(!matches("a\u{0302}\u{0301}", "a"));
+
+    // 2. Đ / đ
+    assert!(matches("Đà Nẵng", "đà"));
+    assert!(matches("đà nẵng", "ĐÀ"));
+
+    // 3. Turkish İ (U+0130 -> i + U+0307): matches i+dot and İ, does NOT match bare i or dotless ı
+    assert!(!matches("\u{0130}stanbul", "i"));
+    assert!(matches("\u{0130}stanbul", "i\u{0307}"));
+    assert!(matches("\u{0130}stanbul", "\u{0130}"));
+    assert!(!matches("\u{0130}stanbul", "\u{0131}"));
+    assert!(!matches("istanbul", "\u{0130}"));
+    assert!(!matches("i\u{0307}", "\u{0307}"));
+
+    // 4. Kelvin sign K (U+212A -> k)
+    assert!(matches("300\u{212A}", "k"));
+    assert!(matches("300k", "\u{212A}"));
+    assert!(matches("300\u{212A}", "K"));
+
+    // 5. ß and capital sharp S ẞ (U+1E9E)
+    assert!(!matches("Straße", "ss"));
+    assert!(!matches("Strasse", "ß"));
+    assert!(matches("STRA\u{1E9E}E", "ß"));
+    assert!(matches("straße", "\u{1E9E}"));
+
+    // 6. Whitespace trim (Swift CharacterSet.whitespacesAndNewlines = 26 chars incl. U+200B, excl. U+FEFF)
+    for ws in [
+        "\u{0009}", "\u{000A}", "\u{000B}", "\u{000C}", "\u{000D}", "\u{0020}", "\u{0085}",
+        "\u{00A0}", "\u{1680}", "\u{2000}", "\u{2003}", "\u{200B}", "\u{2028}", "\u{2029}",
+        "\u{202F}", "\u{205F}", "\u{3000}",
+    ] {
+        let padded = format!("{ws}hello{ws}");
+        assert_eq!(trim_search_query(&padded), "hello", "failed for {ws:?}");
+    }
+    assert_eq!(
+        trim_search_query("\u{FEFF}hello\u{FEFF}"),
+        "\u{FEFF}hello\u{FEFF}"
+    );
+}
+
+#[test]
+fn store_search_matches_unicode_fix2_fields_and_cursor_pages() {
+    let dir = std::env::temp_dir().join(format!("olaz-search-u14-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("store.sqlite");
+    let mut store = Store::open(&path).unwrap();
+
+    let mut call_row = msg("m_call", "c", "cli_call", "[Cuộc gọi]", 100, "call", "sent");
+    call_row.raw_json_data =
+        r#"{"kind":{"type":"call","title":"Cuộc gọi","detail":"2 phút 5 giây"}}"#
+            .as_bytes()
+            .to_vec();
+
+    let mut ecard_row = msg("m_ecard", "c", "cli_ecard", "[Thiệp]", 101, "ecard", "sent");
+    ecard_row.raw_json_data =
+        r#"{"kind":{"type":"ecard","title":"Nhắc hẹn","description":"","reminderTitle":"Họp giao ban"}}"#.as_bytes().to_vec();
+
+    let mut ph_row = msg("m_ph", "c", "cli_ph", "", 102, "placeholder", "sent");
+    ph_row.raw_json_data =
+        r#"{"kind":{"type":"placeholder","symbol":"lock","text":"2 phút hidden"}}"#
+            .as_bytes()
+            .to_vec();
+
+    let nfd_row = msg(
+        "m_nfd",
+        "c",
+        "cli_nfd",
+        "Đa\u{0302}\u{0301}u a\u{0302}\u{0301}m",
+        103,
+        "text",
+        "sent",
+    );
+    let kelvin_row = msg(
+        "m_kelvin",
+        "c",
+        "cli_kelvin",
+        "300\u{212A} temp",
+        104,
+        "text",
+        "sent",
+    );
+    let turkish_row = msg(
+        "m_turk",
+        "c",
+        "cli_turk",
+        "\u{0130}stanbul",
+        105,
+        "text",
+        "sent",
+    );
+    let sharp_row = msg(
+        "m_sharp",
+        "c",
+        "cli_sharp",
+        "STRA\u{1E9E}E",
+        106,
+        "text",
+        "sent",
+    );
+
+    // Equal timestamps for cursor paging tie-breaker test.
+    let p1 = msg("p_1", "c", "cp_1", "needle row", 200, "text", "sent");
+    let p2 = msg("p_2", "c", "cp_2", "needle row", 200, "text", "sent");
+    let p3 = msg("p_3", "c", "cp_3", "needle row", 200, "text", "sent");
+
+    store
+        .save_messages(&[
+            call_row,
+            ecard_row,
+            ph_row,
+            nfd_row,
+            kelvin_row,
+            turkish_row,
+            sharp_row,
+            p1,
+            p2,
+            p3,
+        ])
+        .unwrap();
+
+    // Fix 2: call detail & ecard reminderTitle match; placeholder kind.text does NOT match.
+    let call_hits: Vec<_> = store
+        .search_messages("c", "2 phút", 10)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(call_hits, vec!["m_call"]);
+
+    let ecard_hits: Vec<_> = store
+        .search_messages("c", "giao ban", 10)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(ecard_hits, vec!["m_ecard"]);
+
+    // Shared fold parity in SQLite: NFC query matches NFD row, Kelvin matches k, Turkish İ does not match bare i, ẞ matches ß.
+    assert_eq!(
+        store
+            .search_messages("c", "đấu ấm", 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        vec!["m_nfd"]
+    );
+    assert_eq!(
+        store
+            .search_messages("c", "300k", 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        vec!["m_kelvin"]
+    );
+    assert!(
+        store
+            .search_messages("c", "i", 10)
+            .unwrap()
+            .into_iter()
+            .all(|r| r.id != "m_turk")
+    );
+    assert_eq!(
+        store
+            .search_messages("c", "\u{0130}stan", 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        vec!["m_turk"]
+    );
+    assert_eq!(
+        store
+            .search_messages("c", "ß", 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        vec!["m_sharp"]
+    );
+
+    // Cursor paging across equal timestamps: p_3, p_2, then p_1.
+    let page1 = store.search_messages_page("c", "needle", None, 2).unwrap();
+    let ids1: Vec<_> = page1.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids1, vec!["p_3", "p_2"]);
+    let last = page1.last().unwrap();
+    let page2 = store
+        .search_messages_page("c", "needle", Some((last.ts_ms, last.id.as_str())), 2)
+        .unwrap();
+    let ids2: Vec<_> = page2.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids2, vec!["p_1"]);
+
+    // Legacy quote fallback query (Fix 4).
+    let mut q_old = msg("q1", "c", "cq1", "  Legacy shared  ", 50, "text", "sent");
+    q_old.is_mine = true;
+    q_old.raw_json_data = br#"{"text":"  Legacy shared  "}"#.to_vec();
+    let q_new = msg("q2", "c", "cq2", "Legacy shared", 60, "text", "sent");
+    let mut q_recalled = msg("q3", "c", "cq3", "Legacy shared", 70, "recalled", "sent");
+    q_recalled.is_mine = true;
+    store.save_messages(&[q_old, q_new, q_recalled]).unwrap();
+
+    let any_hits: Vec<_> = store
+        .find_legacy_quoted_candidates("c", "q_src", 80, "Legacy shared", false, 10)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(any_hits, vec!["q2", "q1"]);
+
+    let mine_hits: Vec<_> = store
+        .find_legacy_quoted_candidates("c", "q_src", 80, "Legacy shared", true, 10)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(mine_hits, vec!["q1"]);
+
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -9,7 +9,7 @@ pub(crate) use olaz_wire::{
 
 /// Swift `trimmingCharacters(in: .whitespacesAndNewlines)`.
 pub(crate) fn trim_ws(s: &str) -> &str {
-    s.trim()
+    crate::search_text::trim_search_query(s)
 }
 
 /// `JSONLossless.parseObject`.

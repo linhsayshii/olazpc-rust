@@ -48,6 +48,7 @@ mod http;
 mod identity;
 mod media;
 mod messages;
+mod notify;
 mod polls;
 mod raw_http;
 mod runtime;
@@ -65,12 +66,16 @@ pub use api::{
 pub use chat::*;
 pub use conversations::*;
 pub use core::{
-    AutoDeleteEntryRecord, AutoDeleteUpdateRecord, ControlRouteRecord, CoreChangesRecord,
+    AutoDeleteEntryRecord, AutoDeleteUpdateRecord, CardActionOutcomeRecord, ComposerConfirmRecord,
+    ComposerConfirmUpdateRecord, ComposerOutcomeRecord, ControlRouteRecord, CoreChangesRecord,
     CoreEngine, CoreFailKindRecord, CoreHost, CoreWirePayload, DeleteUndoSnapshotRecord,
-    DeleteUndoUpdateRecord, FailReasonRecord, LegacyCookieRecord, LoginAccountRecord,
-    LoginStateRecord, LoginStepRecord, MessageConfirmActionRecord, MessageConfirmRecord,
-    MessageConfirmUpdateRecord, MobileSyncEventRecord, PersistedTransportStateRecord, PhaseRecord,
-    ProfileRecord, SessionStateRecord, classify_control_envelope,
+    DeleteUndoUpdateRecord, E2eeStickerSendOutcomeRecord, FailReasonRecord, LegacyCookieRecord,
+    LoginAccountRecord, LoginStateRecord, LoginStepRecord, MessageConfirmActionRecord,
+    MessageConfirmRecord, MessageConfirmUpdateRecord, MobileSyncEventRecord, MyCardInfoRecord,
+    PersistedTransportStateRecord, PhaseRecord, ProfileRecord, ReminderComposeInfoRecord,
+    SessionStateRecord, StickerAnimationRecord, StickerEntryRecord, StickerSourceRecord,
+    StickerSuggestSettingRecord, StickerSuggestUpdateRecord, StickerTabRecord,
+    classify_control_envelope,
 };
 pub use crypto::{decrypt_ws_frame, inflate};
 pub use error::{CoreError, NetworkKind};
@@ -78,6 +83,7 @@ pub use http::{CoreHttp, HttpMethod, HttpRequestRecord, UploadPartRecord};
 pub use identity::{ClientIdentityRecord, client_identity};
 pub use media::*;
 pub use messages::*;
+pub use notify::*;
 pub use polls::*;
 pub use raw_http::{CoreRawHttp, RawRequestRecord, RawResponseRecord};
 pub use session::{CoreSession, CoreSessionStatus, QrListener, QrScanRecord, QrTicketRecord};

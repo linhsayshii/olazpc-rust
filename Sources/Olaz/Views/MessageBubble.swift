@@ -548,17 +548,7 @@ struct MessageRow: View {
                 caption
             }
         case .gif(let url):
-            RemoteImage(url: url, contentMode: .fit, maxPixelSize: 560, animated: true) { mediaPlaceholder }
-                .onFailure { reason, retry in
-                    MediaFailureView(failure: reason, subject: .photo, retry: retry).frame(width: 200, height: 150)
-                }
-                .frame(maxWidth: 260, maxHeight: 260)
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .overlay(alignment: .bottomLeading) {
-                    Text("GIF").font(.system(size: 10, weight: .bold)).foregroundStyle(.white)
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(.black.opacity(0.5), in: Capsule()).padding(8)
-                }
+            GifView(url: url)
         case .video(let thumbnail, let duration, let url):
             VideoThumb(thumbnail: thumbnail, duration: duration, url: url, conversationId: message.conversationId, messageId: message.id,
                        senderName: mine ? "Bạn" : message.senderName, date: message.date,
@@ -710,12 +700,6 @@ struct MessageRow: View {
 
     private var stickerPlaceholder: some View {
         ProgressView().controlSize(.small).frame(width: 130, height: 130)
-    }
-
-    private var mediaPlaceholder: some View {
-        RoundedRectangle(cornerRadius: 16, style: .continuous).fill(.quaternary)
-            .frame(width: 200, height: 150)
-            .overlay { ProgressView().controlSize(.small) }
     }
 
     // MARK: Bubble chrome
@@ -949,6 +933,63 @@ struct PhotoView: View {
             MediaViewerItem(media: .photo(url: url, width: width, height: height, encrypted: encrypted),
                             conversationId: conversationId, messageId: messageId, senderName: senderName, date: date),
             engine: engine, shell: shell)
+    }
+}
+
+struct GifView: View {
+    let url: URL?
+    var width: Int = 0
+    var height: Int = 0
+
+    nonisolated static let maxSize = CGSize(width: 260, height: 260)
+    nonisolated static let fallbackSize = CGSize(width: 240, height: 180)
+    nonisolated static let minSize = CGSize(width: 80, height: 60)
+
+    /// Deterministic display box for a GIF message: fits metadata dimensions inside `maxSize`
+    /// (clamped to `minSize` where room allows), or reserves `fallbackSize` when dimensions are absent
+    /// so the transcript row keeps a stable height before and after the animated image loads.
+    nonisolated static func displaySize(
+        width: Int,
+        height: Int,
+        maxSize: CGSize = Self.maxSize,
+        fallbackSize: CGSize = Self.fallbackSize,
+        minSize: CGSize = Self.minSize
+    ) -> CGSize {
+        let maxW = max(1, maxSize.width)
+        let maxH = max(1, maxSize.height)
+        guard width > 0, height > 0 else {
+            let scale = min(maxW / fallbackSize.width, maxH / fallbackSize.height, 1)
+            return CGSize(width: fallbackSize.width * scale, height: fallbackSize.height * scale)
+        }
+        let w = CGFloat(width), h = CGFloat(height)
+        let scale = min(maxW / w, maxH / h, 1.5)
+        return CGSize(
+            width: min(maxW, max(minSize.width, w * scale)),
+            height: min(maxH, max(minSize.height, h * scale))
+        )
+    }
+
+    private var box: CGSize { Self.displaySize(width: width, height: height) }
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+        RemoteImage(url: url, contentMode: .fit, maxPixelSize: 560, animated: true) {
+            Color.clear.overlay { ProgressView().controlSize(.small) }
+        }
+        .onFailure { reason, retry in
+            MediaFailureView(failure: reason, subject: .photo, retry: retry)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.quaternary)
+        .chatMediaBox(box, fixed: false)
+        .overlay(alignment: .bottomLeading) {
+            Text("GIF").font(.system(size: 10, weight: .bold)).foregroundStyle(.white)
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .background(.black.opacity(0.5), in: Capsule()).padding(8)
+        }
+        .clipped()
+        .clipShape(shape)
+        .contentShape(shape)
     }
 }
 

@@ -504,6 +504,9 @@ fn emit_routes(
                 start_explicit,
                 duration,
             } => {
+                crate::reduce::notify::apply_remote_mute_control(
+                    state, &conv_id, set, start, duration, out,
+                );
                 out.effects.push(Effect::Host(HostCall::Mute {
                     conv_id,
                     set,

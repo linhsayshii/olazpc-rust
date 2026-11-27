@@ -82,13 +82,18 @@ final class ShellModel {
     var columns: NavigationSplitViewVisibility = .all
     /// Conversation info inspector (⌥⌘I).
     var showInspector = false
-    /// The window holds the inspector's room: its minimum width includes the inspector, from the end of the widening until the
-    /// inspector is hidden. Raising it while the window is still widening would snap the window wide at once.
+    /// The window holds the inspector's room: its minimum width includes the inspector, raised only AFTER the inspector
+    /// has presented inside the already-widened window. Raising it in the same SwiftUI update as `showInspector = true`
+    /// causes AppKit's `.inspector` to expand the window a second time (+600 pt total, hitting full screen width).
     var holdsInspectorRoom = false
+    /// Minimum window width held while `holdsInspectorRoom` is true (capped to the screen's visible width).
+    var inspectorMinWidth: CGFloat = InspectorRoom.windowMinWidth
     /// The signed-in window (set by `MainShellView`), widened for the inspector.
     @ObservationIgnored weak var window: NSWindow?
     /// What opening the inspector added to the window, given back when it closes.
     @ObservationIgnored private var inspectorGrowth: InspectorRoom.Growth?
+    /// Cancels a deferred `holdsInspectorRoom` update if the inspector closes or re-toggles before the next runloop turn.
+    @ObservationIgnored private var inspectorGeneration: UInt64 = 0
     /// ⌘K palette.
     var showQuickSwitcher = false
     /// Search text of the conversation list column.
@@ -152,18 +157,43 @@ final class ShellModel {
     func toggleInspector() {
         guard destination.isConversationList, selection != nil, !showInspector else { hideInspector(); return }
         // The window widens first (synchronously), so the inspector takes its width from the window, never from the chat.
-        inspectorGrowth = InspectorRoom.make(in: window)
-        holdsInspectorRoom = true
+        let plan = InspectorRoom.make(in: window)
+        inspectorGrowth = plan?.growth
+        inspectorGeneration &+= 1
+        let gen = inspectorGeneration
         Self.withoutAnimation { showInspector = true }
+
+        // Defer raising `ShellMinimumSize` until after SwiftUI finishes presenting `.inspector` on the current runloop turn;
+        // changing the outer `.frame(minWidth:)` in the same update as `showInspector = true` makes AppKit add a second
+        // inspector width to the window frame. Also clamp back to `plan.targetFrame` if AppKit nudged the frame during layout.
+        let targetFrame = plan?.targetFrame
+        let screenWidth = window?.screen?.visibleFrame.width ?? NSScreen.main?.visibleFrame.width
+        let minWidth = plan?.minimumWidth ?? InspectorRoom.minimumWidth(holdingInspectorRoom: true, screenWidth: screenWidth)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.inspectorGeneration == gen, self.showInspector else { return }
+            if let targetFrame, let window = self.window, !window.styleMask.contains(.fullScreen),
+               window.frame != targetFrame {
+                window.setFrame(targetFrame, display: true, animate: false)
+            }
+            self.inspectorMinWidth = minWidth
+            self.holdsInspectorRoom = true
+        }
     }
 
     func hideInspector() {
-        guard showInspector || holdsInspectorRoom else { return }
-        holdsInspectorRoom = false
-        Self.withoutAnimation { showInspector = false }
-        // The window gives the inspector's width back, so it ends where it was before the inspector opened.
-        InspectorRoom.release(inspectorGrowth, in: window)
+        guard showInspector || holdsInspectorRoom || inspectorGrowth != nil else { return }
+        inspectorGeneration &+= 1
+        // Consume `inspectorGrowth` before toggling `showInspector` so a synchronous `.onChange(of: showInspector)`
+        // re-entry cannot release the growth a second time.
+        let growth = inspectorGrowth
         inspectorGrowth = nil
+        holdsInspectorRoom = false
+        inspectorMinWidth = InspectorRoom.windowMinWidth
+        if showInspector {
+            Self.withoutAnimation { showInspector = false }
+        }
+        // The window gives the inspector's width back, so it ends where it was before the inspector opened.
+        InspectorRoom.release(growth, in: window)
     }
 
     private static func withoutAnimation(_ body: () -> Void) {
@@ -207,6 +237,22 @@ enum InspectorRoom {
         var shifted: CGFloat
     }
 
+    /// Complete pure-math plan for opening the inspector on a screen: target window frame, growth to undo on close,
+    /// and the minimum width to hold while open (never wider than the screen).
+    struct OpenPlan: Equatable {
+        var targetFrame: CGRect
+        var growth: Growth?
+        var minimumWidth: CGFloat
+    }
+
+    /// Minimum window width to enforce for the current inspector state, capped to `screenWidth` so a compact display
+    /// is never forced wider than its visible frame.
+    static func minimumWidth(holdingInspectorRoom: Bool, screenWidth: CGFloat?) -> CGFloat {
+        guard holdingInspectorRoom else { return windowMinWidth }
+        guard let screenWidth, screenWidth > 0 else { return windowMinWidthWithInspector }
+        return max(windowMinWidth, min(windowMinWidthWithInspector, screenWidth))
+    }
+
     /// The window frame with the inspector's width added: growing to the right, moving left only as far as the screen needs, never
     /// wider than the screen. A window that cannot grow is returned unchanged.
     static func frame(for window: CGRect, in screen: CGRect) -> CGRect {
@@ -217,31 +263,49 @@ enum InspectorRoom {
         return CGRect(x: max(screen.minX, x), y: window.minY, width: width, height: window.height)
     }
 
+    /// Pure-function plan for opening the inspector on `window` within `screen`.
+    static func planOpen(window: CGRect, in screen: CGRect) -> OpenPlan {
+        let target = frame(for: window, in: screen)
+        let growth: Growth? = target == window
+            ? nil
+            : Growth(added: target.width - window.width, shifted: window.minX - target.minX)
+        let minWidth = minimumWidth(holdingInspectorRoom: true, screenWidth: screen.width)
+        return OpenPlan(targetFrame: target, growth: growth, minimumWidth: minWidth)
+    }
+
     /// The frame after closing: the added width given back and the window moved back to where it was (the user may have moved or
     /// resized it meanwhile, so this works from the current frame), never narrower than `windowMinWidth`.
     static func restored(_ window: CGRect, undoing growth: Growth) -> CGRect {
         let width = max(windowMinWidth, window.width - growth.added)
-        let given = window.width - width
+        let given = max(0, window.width - width)
         // Moves back in proportion to the width given back: all of it when the whole width is returned.
         let x = window.minX + (growth.added > 0 ? growth.shifted * given / growth.added : 0)
         return CGRect(x: x, y: window.minY, width: width, height: window.height)
     }
 
-    /// Widens the shell window for the inspector and returns what it did; nil when nothing changed (no room on screen, or full screen).
-    static func make(in window: NSWindow?) -> Growth? {
+    /// Widens the shell window for the inspector and returns the open plan; nil when in full screen or no window/screen exists.
+    static func make(in window: NSWindow?) -> OpenPlan? {
         guard let window, !window.styleMask.contains(.fullScreen), let screen = window.screen ?? NSScreen.main else { return nil }
-        let target = frame(for: window.frame, in: screen.visibleFrame)
-        guard target != window.frame else { return nil }
-        let growth = Growth(added: target.width - window.frame.width, shifted: window.frame.minX - target.minX)
-        // Synchronous, so AppKit never leaves `NSTableView` stuck in `inLiveResize`; not displayed yet, so the wider window and the
-        // inspector reach the screen in the same frame (no frame of a stretched chat first).
-        window.setFrame(target, display: false, animate: false)
-        return growth
+        let plan = planOpen(window: window.frame, in: screen.visibleFrame)
+        if plan.growth != nil {
+            // Synchronous, so AppKit never leaves `NSTableView` stuck in `inLiveResize`; not displayed yet, so the wider window and the
+            // inspector reach the screen in the same frame (no frame of a stretched chat first).
+            window.setFrame(plan.targetFrame, display: false, animate: false)
+        }
+        return plan
     }
 
     /// Gives back the width `growth` added.
     static func release(_ growth: Growth?, in window: NSWindow?) {
         guard let growth, let window, !window.styleMask.contains(.fullScreen) else { return }
+        // Lower min widths before shrinking so AppKit never clamps `setFrame` to `windowMinWidthWithInspector`
+        // before SwiftUI commits the updated `ShellMinimumSize`.
+        if window.minSize.width > windowMinWidth {
+            window.minSize.width = windowMinWidth
+        }
+        if window.contentMinSize.width > windowMinWidth {
+            window.contentMinSize.width = windowMinWidth
+        }
         let target = restored(window.frame, undoing: growth)
         guard target != window.frame else { return }
         window.setFrame(target, display: false, animate: false)

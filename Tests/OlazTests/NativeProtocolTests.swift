@@ -243,13 +243,13 @@ import Testing
             Issue.record("Expected reaction")
         }
 
-        // Self-cloud push arriving over `cmdPushMsgGroup` must route to `selfConvId` (`217477...`), never `"g217477..."`.
+        // Self-cloud push arriving over `cmdPushMsgGroup` must route to `selfConvId` (`9200101`), never `"g9200101"`.
         let selfCloudPush = ZaloWireParser.parseWireMessage([
-            "msgId": "888", "cliMsgId": "c888", "uidFrom": "me", "idTo": "2174771368031376212",
+            "msgId": "888", "cliMsgId": "c888", "uidFrom": "me", "idTo": "9200101",
             "msgType": "share.file", "content": ["title": "probe.txt", "href": "https://cdn.example/probe.txt"], "ts": 4000
-        ], myUid: "me", cmd: ZaloWebSocket.cmdPushMsgGroup, selfConvId: "2174771368031376212")
+        ], myUid: "me", cmd: ZaloWebSocket.cmdPushMsgGroup, selfConvId: "9200101")
         if case .message(let msg, _) = selfCloudPush {
-            #expect(msg.conversationId == "2174771368031376212")
+            #expect(msg.conversationId == "9200101")
             #expect(msg.isMine)
         } else {
             Issue.record("Expected self-cloud message")
@@ -688,13 +688,13 @@ import Testing
             "data": [
                 "msgs": [
                     [
-                        "msgId": "8500861956467",
-                        "cliMsgId": "1795000000001",
-                        "uidFrom": "31612076530602762",
+                        "msgId": "9000000001001",
+                        "cliMsgId": "1700000000001",
+                        "uidFrom": "3000101",
                         "idTo": "0",
-                        "dName": "Ha",
+                        "dName": "Người B",
                         "msgType": "chat.recommended",
-                        "ts": 1795000000000 as Int64,
+                        "ts": 1700000000000 as Int64,
                         "content": [
                             "action": "recommened.calltime",
                             "params": "{\"duration\":42,\"callType\":1}",
@@ -707,18 +707,18 @@ import Testing
 
         let events = ZaloWireParser.extractBatchEvents(
             pollingEnvelope,
-            myUid: "2072032406797762235",
-            selfConvId: "2174771368031376212",
+            myUid: "2000101",
+            selfConvId: "9200101",
             nameLookup: { uid in
-                uid == "31612076530602762" ? ("Mẹ", "https://ava.example/me.jpg") : nil
+                uid == "3000101" ? ("Người A", "https://ava.example/peer.jpg") : nil
             }
         )
         #expect(events.count == 1)
         if case .message(let chatMsg, let stored) = events[0] {
-            #expect(chatMsg.conversationId == "31612076530602762")
-            #expect(stored.convId == "31612076530602762")
-            #expect(chatMsg.senderName == "Mẹ")
-            #expect(chatMsg.senderAvatar?.absoluteString == "https://ava.example/me.jpg")
+            #expect(chatMsg.conversationId == "3000101")
+            #expect(stored.convId == "3000101")
+            #expect(chatMsg.senderName == "Người A")
+            #expect(chatMsg.senderAvatar?.absoluteString == "https://ava.example/peer.jpg")
             #expect(chatMsg.text == "Cuộc gọi thoại")
         } else {
             Issue.record("Expected parsed 1-1 call message")
@@ -730,19 +730,19 @@ import Testing
         // Explicit 1-1 uidFrom must never be overridden by an unrelated fallbackConvId
         let crossPeerCheck = ZaloWireParser.parseWireMessage(
             [
-                "msgId": "8500861956467",
-                "uidFrom": "31612076530602762",
+                "msgId": "9000000001001",
+                "uidFrom": "3000101",
                 "idTo": "0",
                 "msgType": "webchat",
-                "ts": 1795000000000 as Int64,
-                "content": "Alo con",
+                "ts": 1700000000000 as Int64,
+                "content": "Xin chào",
             ],
-            myUid: "2072032406797762235",
-            fallbackConvId: "8964177950559533085",
+            myUid: "2000101",
+            fallbackConvId: "3000102",
             isGroupHint: false
         )
         if case .message(let m, _) = crossPeerCheck {
-            #expect(m.conversationId == "31612076530602762")
+            #expect(m.conversationId == "3000101")
         } else {
             Issue.record("Expected 1-1 message routed to uidFrom")
         }
@@ -778,7 +778,7 @@ import Testing
         putU32(16) // version 16
         bytes.append(0x02) // ObjectTag
         putAscii("userId") // pool[0]
-        bytes.append(0x10); putAscii("31612076530602762") // pool[1]
+        bytes.append(0x10); putAscii("3000101") // pool[1]
         putAscii("toUid") // pool[2]
         bytes.append(0x10); putU32(0xFFFF_FFFE); bytes.append(0x01) // StringPoolTag -> pool[1]
         putAscii("message") // pool[3]
@@ -790,8 +790,8 @@ import Testing
             xorDecryptFields: ["message"],
             xorKeyUnits: keyUnits
         )
-        #expect(decoded?["userId"] as? String == "31612076530602762")
-        #expect(decoded?["toUid"] as? String == "31612076530602762")
+        #expect(decoded?["userId"] as? String == "3000101")
+        #expect(decoded?["toUid"] as? String == "3000101")
         #expect(decoded?["message"] as? String == plainJSON)
     }
 }
@@ -1213,26 +1213,26 @@ import Testing
     }
 
     @Test func e2eeSignalDecryptionPlaceholderProtectionAndSQLiteSelfHealing() async throws {
-        let samplePreKeyCipher = "AzMovwMIpFUwoVUSIQVNUKcMqQKEDdK1jcEt8He7V15D1iWl9ngJgOPtsXiUIRohBZSX4D1qiBhXbdSPciObevx/DTnpfki5s5eI0wzTTQp/InIzCiEFCFnb614YZfaOg7R9/7/DIagW4nsLw5V5jK1ELLEbY1IQCBgAIkDL6XqJXgMKkj5gMtM5+CCkjt5p+Xm4q0wQjhLXMOgyl8M137oQAjyDi9fCjALZOCaCQpyjgm5/eW2crnxEu3JybU+y/enV2FQ="
-        let sampleWhisperCipher = "AjMKIQXfGtZEt75pr2/KWoTA8W8Bu0oNpGDv9ITalIBSb69UaxAOGAAiENtYix7GNUB1eR/LgY4IuK2Blmqxld2njA=="
+        let samplePreKeyCipher = "AzMIAQgPFh0kKzI5QEdOVVxjanF4f4aNlJuiqbC3vsXM09rh6O/2/QQLEhkgJy41PENKUVhfZm10e4KJ"
+        let sampleWhisperCipher = "AjMKAw4ZJC86RVBbZnF8h5KdqLO+ydTf6vUACxYhLDdCTVhjbnmEj5qlsLvG0dzn8v0IEx4pND9KVWBr"
         let brokenStickerURL = "https://api.zaloapp.com/api/emoticon/sticker/webpc?eid=\(samplePreKeyCipher)&size=130"
 
         #expect(ZaloWireParser.isSignalCiphertext(samplePreKeyCipher))
         #expect(ZaloWireParser.isSignalCiphertext(sampleWhisperCipher))
-        #expect(!ZaloWireParser.isSignalCiphertext("miế ngan trộn"))
+        #expect(!ZaloWireParser.isSignalCiphertext("xin chào bạn"))
         #expect(!ZaloWireParser.isSignalCiphertext("https://api.zaloapp.com/api/emoticon/sticker/webpc?eid=34840&size=130"))
         #expect(ZaloWireParser.urlHasUndecryptedSignalCipher(brokenStickerURL))
 
         // 1. Undecryptable Signal ciphertext becomes a clean `.placeholder(symbol: "lock.fill", ...)` with `e2ee_locked`, NEVER raw Base64 or broken sticker URL!
         let lockedTextEvent = ZaloWireParser.parseWireMessage([
-            "msgId": "8502116332010",
-            "cliMsgId": "1794982452921",
-            "uidFrom": "31612076530602762",
-            "idTo": "2072032406797762235",
+            "msgId": "9000000002001",
+            "cliMsgId": "1700000002001",
+            "uidFrom": "3000101",
+            "idTo": "2000101",
             "msgType": "webchat",
-            "ts": 1_794_982_453_589,
+            "ts": 1_700_000_002_000,
             "content": samplePreKeyCipher,
-        ], myUid: "2072032406797762235")
+        ], myUid: "2000101")
         guard case .message(let lockedChatMsg, let lockedStored) = lockedTextEvent else {
             Issue.record("Expected locked placeholder message"); return
         }
@@ -1246,14 +1246,14 @@ import Testing
         }
 
         let lockedStickerEvent = ZaloWireParser.parseWireMessage([
-            "msgId": "8502117270115",
-            "cliMsgId": "1794982471828",
-            "uidFrom": "31612076530602762",
-            "idTo": "2072032406797762235",
+            "msgId": "9000000002002",
+            "cliMsgId": "1700000002002",
+            "uidFrom": "3000101",
+            "idTo": "2000101",
             "msgType": "chat.sticker",
-            "ts": 1_794_982_472_463,
+            "ts": 1_700_000_003_000,
             "content": ["id": samplePreKeyCipher, "catId": samplePreKeyCipher, "type": samplePreKeyCipher],
-        ], myUid: "2072032406797762235")
+        ], myUid: "2000101")
         if case .message(let sMsg, let sStored) = lockedStickerEvent {
             #expect(sStored.status == "e2ee_locked")
             if case .placeholder(_, let label) = sMsg.kind {
@@ -1275,56 +1275,56 @@ import Testing
 
         // Sync2 arrives with real plaintext for the exact same message -> replaces `e2ee_locked`!
         let plainEvent = ZaloWireParser.parseWireMessage([
-            "msgId": "8502116332010",
-            "cliMsgId": "1794982452921",
-            "uidFrom": "31612076530602762",
-            "idTo": "2072032406797762235",
+            "msgId": "9000000002001",
+            "cliMsgId": "1700000002001",
+            "uidFrom": "3000101",
+            "idTo": "2000101",
             "msgType": "webchat",
-            "ts": 1_794_982_453_589,
-            "content": "Con về ăn cơm nhé",
-        ], myUid: "2072032406797762235")
+            "ts": 1_700_000_002_000,
+            "content": "Hẹn gặp lúc 10 giờ nhé",
+        ], myUid: "2000101")
         guard case .message(_, let plainStored) = plainEvent else { Issue.record("Expected plain"); return }
         try await store.saveMessages([plainStored])
 
-        // Now server preload/polling re-sends `lockedStored` -> MUST NOT overwrite `"Con về ăn cơm nhé"`!
+        // Now server preload/polling re-sends `lockedStored` -> MUST NOT overwrite `"Hẹn gặp lúc 10 giờ nhé"`!
         try await store.saveMessages([lockedStored])
-        let loadedAfter = try await store.messages(convId: "31612076530602762", limit: 10)
+        let loadedAfter = try await store.messages(convId: "3000101", limit: 10)
         #expect(loadedAfter.count == 1)
-        #expect(loadedAfter.first?.text == "Con về ăn cơm nhé")
+        #expect(loadedAfter.first?.text == "Hẹn gặp lúc 10 giờ nhé")
         #expect(loadedAfter.first?.status == "sent")
 
         // Legacy poisoned row in SQLite (stored before this fix with status='sent' and raw Base64) is repaired on boot!
         let poisonedRaw = try JSONSerialization.data(withJSONObject: [
             "id": "legacy_poison_1",
             "clientId": "999111",
-            "conversationId": "31612076530602762",
-            "senderId": "31612076530602762",
-            "senderName": "Mẹ",
+            "conversationId": "3000101",
+            "senderId": "3000101",
+            "senderName": "Người A",
             "senderAvatar": "",
             "isMine": false,
             "kind": ["type": "sticker", "url": brokenStickerURL],
             "text": "[Sticker]",
-            "date": 1_794_982_472_463,
+            "date": 1_700_000_003_000,
             "status": "sent",
             "isE2EE": false,
         ] as [String: Any])
         try await store.saveMessages([StoredMessage(
             id: "legacy_poison_1",
-            convId: "31612076530602762",
+            convId: "3000101",
             clientId: "999111",
-            senderId: "31612076530602762",
-            senderName: "Mẹ",
+            senderId: "3000101",
+            senderName: "Người A",
             senderAvatar: "",
             isMine: false,
             text: "[Sticker]",
             kindTag: "sticker",
-            tsMs: 1_794_982_472_463,
+            tsMs: 1_700_000_003_000,
             status: "sent",
             rawJSONData: poisonedRaw
         )])
         let repaired = try await store.repairUndecryptedE2EEMessages()
         #expect(repaired >= 1)
-        let afterRepair = try await store.messages(convId: "31612076530602762", limit: 10)
+        let afterRepair = try await store.messages(convId: "3000101", limit: 10)
         let repairedSticker = try #require(afterRepair.first(where: { $0.id == "legacy_poison_1" }))
         #expect(repairedSticker.kindTag == "placeholder")
         #expect(repairedSticker.status == "e2ee_locked")
@@ -1334,8 +1334,8 @@ import Testing
         await e2eeMgr.prepare(uid: "me_uid", store: store)
         let savedStoreJSON = try #require(try await store.getPreferenceString(key: ZaloE2EEManager.storePrefKey))
 
-        // Simulate sender ("mom_uid", deviceId = 0) encrypting a text message + a 4-byte LE sticker ID (34840) to our PC bundle!
-        let senderRT = try JSRuntime(name: "test-mom-sender")
+        // Simulate sender ("peer_uid", deviceId = 0) encrypting a text message + a 4-byte LE sticker ID (34840) to our PC bundle!
+        let senderRT = try JSRuntime(name: "test-peer-sender")
         try await senderRT.loadModule("vendor/libsignal-protocol.js")
         try await senderRT.loadModule("zalo-e2ee.js")
         _ = try await senderRT.evaluate("""
@@ -1381,7 +1381,7 @@ import Testing
             preKey: { keyId: 1, publicKey: b64ToBuf(pkEntry.pubKey) }
           });
           const cipher = new libsignal.SessionCipher(sStore, toAddr, { logger: console });
-          const textMsg = await cipher.encrypt(new TextEncoder().encode('Mẹ nấu canh chua rồi!').buffer);
+          const textMsg = await cipher.encrypt(new TextEncoder().encode('Hôm nay trời đẹp quá!').buffer);
           const idBytes = new Uint8Array([34840 & 0xff, (34840 >> 8) & 0xff, 0, 0]);
           const catBytes = new Uint8Array([420 & 0xff, (420 >> 8) & 0xff, 0, 0]);
           const typeBytes = new Uint8Array([7, 0, 0, 0]);
@@ -1409,20 +1409,20 @@ import Testing
                     [
                         "msgId": "9001",
                         "cliMsgId": "9001",
-                        "uidFrom": "mom_uid",
+                        "uidFrom": "peer_uid",
                         "idTo": "me_uid",
                         "msgType": "webchat",
-                        "ts": 1_795_000_001_000,
+                        "ts": 1_700_000_004_000,
                         "paramsExt": ["platformType": 0],
                         "content": encText,
                     ],
                     [
                         "msgId": "9002",
                         "cliMsgId": "9002",
-                        "uidFrom": "mom_uid",
+                        "uidFrom": "peer_uid",
                         "idTo": "me_uid",
                         "msgType": "chat.sticker",
-                        "ts": 1_795_000_002_000,
+                        "ts": 1_700_000_005_000,
                         "paramsExt": ["platformType": 0],
                         "content": ["id": encStickerId, "catId": encStickerCat, "type": encStickerType],
                     ],
@@ -1435,7 +1435,7 @@ import Testing
         #expect(parsedEvents.count == 2)
 
         if case .message(let m1, _) = parsedEvents[0] {
-            #expect(m1.text == "Mẹ nấu canh chua rồi!")
+            #expect(m1.text == "Hôm nay trời đẹp quá!")
             #expect(m1.isE2EE == true)
         } else {
             Issue.record("Expected decrypted E2EE text message")
