@@ -47,7 +47,8 @@ final class MediaRecorderTests: XCTestCase {
         fallbackURLs: [String] = [],
         tsMs: Int64,
         status: String = "sent",
-        isE2EE: Bool = false
+        isE2EE: Bool = false,
+        menu: CaseJSON? = nil
     ) -> CaseJSON {
         let effectiveClientId = clientId ?? "cli_\(id)"
         var rawObj: [String: CaseJSON] = [
@@ -66,6 +67,9 @@ final class MediaRecorderTests: XCTestCase {
         ]
         if !fallbackURLs.isEmpty {
             rawObj["fallbacks"] = .array(fallbackURLs.map(CaseJSON.string))
+        }
+        if let menu {
+            rawObj["menu"] = menu
         }
 
         return .object([
@@ -979,6 +983,303 @@ final class MediaRecorderTests: XCTestCase {
                     ]),
                 ]
             ),
+
+            // 10. send_media_photo_e2ee_1to1: current Swift bug (U15 / user-decisions #19):
+            // sendMedia uploads and sends photo into an E2EE 1-1 chat unencrypted (isE2EE: 0, plain photo_original endpoints).
+            MediaRecorderHarness.ScenarioDef(
+                name: "send_media_photo_e2ee_1to1",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2001001",
+                    displayName: "Media User 10",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "next_client_id": .int(5001000000001),
+                        "e2ee_threads": .array([.string("3001001")]),
+                        "history_freshness": .object(["3001001": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3001001", name: "E2EE Photo Peer", previewText: "Init", previewTsMs: baseTs),
+                        ]),
+                        "host_results": .object([
+                            "image_dimensions": .array([
+                                .object(["width": .int(1280), "height": .int(720)]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2001001", displayName: "Media User 10"),
+                    MessageRecorderHarness.profileMeScript(uid: "2001001", displayName: "Media User 10"),
+                    MessageRecorderHarness.httpScript(
+                        path: "/api/message/photo_original/upload",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "normalUrl": .string("https://cdn.example.invalid/e2ee_photo_normal.jpg"),
+                                "hdUrl": .string("https://cdn.example.invalid/e2ee_photo_hd.jpg"),
+                                "thumbUrl": .string("https://cdn.example.invalid/e2ee_photo_thumb.jpg"),
+                                "photoId": .string("9010001"),
+                            ]),
+                        ])
+                    ),
+                    MessageRecorderHarness.httpScript(
+                        path: "/api/message/photo_original/send",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "msgId": .string("9010002"),
+                            ]),
+                        ])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3001001")])]),
+                    .object([
+                        "cmd": .string("send_media"),
+                        "now_ms": .int(baseTs + 10_000),
+                        "args": .object([
+                            "conv_id": .string("3001001"),
+                            "files": .array([
+                                fileSpec(name: "secret_photo.jpg", type: "image", size: 9, readable: true),
+                            ]),
+                        ]),
+                    ]),
+                ]
+            ),
+
+            // 11. send_media_video_e2ee_1to1: current Swift bug (U15 / user-decisions #19):
+            // sendMedia uploads and sends video + thumb into an E2EE 1-1 chat unencrypted (isE2EE: 0, plain video + forward endpoints).
+            MediaRecorderHarness.ScenarioDef(
+                name: "send_media_video_e2ee_1to1",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2001101",
+                    displayName: "Media User 11",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "next_client_id": .int(5001100000001),
+                        "e2ee_threads": .array([.string("3001002")]),
+                        "history_freshness": .object(["3001002": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3001002", name: "E2EE Video Peer", previewText: "Init", previewTsMs: baseTs),
+                        ]),
+                        "host_results": .object([
+                            "video_metadata": .array([
+                                .object([
+                                    "duration_ms": .int(4200),
+                                    "width": .int(1280),
+                                    "height": .int(720),
+                                    "has_thumb": .bool(true),
+                                ]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2001101", displayName: "Media User 11"),
+                    MessageRecorderHarness.profileMeScript(uid: "2001101", displayName: "Media User 11"),
+                    MessageRecorderHarness.httpScript(
+                        path: "/api/message/video/file/upload",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "fileId": .string("8011001"),
+                                "fileUrl": .string("https://cdn.example.invalid/e2ee_video.mp4"),
+                            ]),
+                        ])
+                    ),
+                    MessageRecorderHarness.httpScript(
+                        path: "/api/message/video/thumb/upload",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "thumbUrl": .string("https://cdn.example.invalid/e2ee_video_thumb.jpg"),
+                            ]),
+                        ])
+                    ),
+                    MessageRecorderHarness.httpScript(
+                        path: "/api/message/forward",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "msgId": .string("9011002"),
+                            ]),
+                        ])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3001002")])]),
+                    .object([
+                        "cmd": .string("send_media"),
+                        "now_ms": .int(baseTs + 10_000),
+                        "args": .object([
+                            "conv_id": .string("3001002"),
+                            "files": .array([
+                                fileSpec(name: "secret_clip.mp4", type: "video", size: 9, readable: true),
+                            ]),
+                        ]),
+                    ]),
+                ]
+            ),
+
+            // 12. send_files_e2ee_detection: sendFiles into an E2EE 1-1 before start() (cold start,
+            // e2eeThreadsV1 not loaded yet -> is_e2ee: false) vs after start() (loaded -> is_e2ee: true).
+            MediaRecorderHarness.ScenarioDef(
+                name: "send_files_e2ee_detection",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2001201",
+                    displayName: "Media User 12",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "next_client_id": .int(5001200000001),
+                        "e2ee_threads": .array([.string("3001003")]),
+                        "history_freshness": .object(["3001003": .string("up_to_date")]),
+                        "local_conversations": .array([
+                            localConv(id: "3001003", name: "E2EE Cold Peer", previewText: "Init", previewTsMs: baseTs),
+                        ]),
+                        "host_results": .object([
+                            "upload_file": .array([
+                                .object([
+                                    "url": .string("https://cdn.example.invalid/cold_plain.pdf"),
+                                    "msg_id": .string("9012001"),
+                                    "cli_msg_id": .string("5001200000001"),
+                                ]),
+                                .object([
+                                    "url": .string("https://cdn.example.invalid/warm_e2ee.pdf?e2esession=xyz"),
+                                    "msg_id": .string("9012002"),
+                                    "cli_msg_id": .string("5001200000002"),
+                                ]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2001201", displayName: "Media User 12"),
+                    MessageRecorderHarness.profileMeScript(uid: "2001201", displayName: "Media User 12"),
+                ],
+                steps: [
+                    .object([
+                        "cmd": .string("send_files"),
+                        "now_ms": .int(baseTs + 1_000),
+                        "args": .object([
+                            "conv_id": .string("3001003"),
+                            "files": .array([fileSpec(name: "cold.pdf", size: 128)]),
+                        ]),
+                    ]),
+                    .object(["snapshot": .string("after_cold_start_send")]),
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3001003")])]),
+                    .object([
+                        "cmd": .string("send_files"),
+                        "now_ms": .int(baseTs + 10_000),
+                        "args": .object([
+                            "conv_id": .string("3001003"),
+                            "files": .array([fileSpec(name: "warm.pdf", size: 256)]),
+                        ]),
+                    ]),
+                ]
+            ),
+
+            // 13. forward_photo_into_e2ee: forward an existing photo message into an E2EE 1-1;
+            // records current Swift behavior where sendMedia sends it unencrypted (isE2EE: 0).
+            MediaRecorderHarness.ScenarioDef(
+                name: "forward_photo_into_e2ee",
+                seed: MessageRecorderHarness.readySessionSeed(
+                    userId: "2001301",
+                    displayName: "Media User 13",
+                    suppress: ["ws", "long_poll"],
+                    extras: [
+                        "next_client_id": .int(5001300000001),
+                        "e2ee_threads": .array([.string("3001004b")]),
+                        "history_freshness": .object([
+                            "3001004a": .string("up_to_date"),
+                            "3001004b": .string("up_to_date"),
+                        ]),
+                        "local_conversations": .array([
+                            localConv(id: "3001004a", name: "Source Peer", previewText: "Photo", previewTsMs: baseTs),
+                            localConv(id: "3001004b", name: "E2EE Target Peer", previewText: "Init", previewTsMs: baseTs),
+                        ]),
+                        "preseeded_media_cache": .array([
+                            .object([
+                                "key": .string("3001004a|m_fwd_photo|photo"),
+                                "ext": .string("png"),
+                                "data_b64": .string(onePixelPNGB64),
+                            ]),
+                        ]),
+                        "local_messages": .array([
+                            storedMsg(
+                                id: "m_fwd_photo",
+                                convId: "3001004a",
+                                senderId: "3001004a",
+                                text: "",
+                                kind: .object([
+                                    "type": .string("photo"),
+                                    "url": .string("https://cdn.example.invalid/fwd_src.png"),
+                                    "width": .int(640),
+                                    "height": .int(480),
+                                ]),
+                                kindTag: "photo",
+                                tsMs: baseTs + 1_000,
+                                menu: .object(["forward": .string("ok")])
+                            ),
+                        ]),
+                        "host_results": .object([
+                            "image_dimensions": .array([
+                                .object(["width": .int(640), "height": .int(480)]),
+                            ]),
+                        ]),
+                    ]
+                ),
+                server: [
+                    MessageRecorderHarness.loginInfoScript(uid: "2001301", displayName: "Media User 13"),
+                    MessageRecorderHarness.profileMeScript(uid: "2001301", displayName: "Media User 13"),
+                    MessageRecorderHarness.httpScript(
+                        path: "/api/message/photo_original/upload",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "normalUrl": .string("https://cdn.example.invalid/fwd_e2ee_normal.jpg"),
+                                "hdUrl": .string("https://cdn.example.invalid/fwd_e2ee_hd.jpg"),
+                                "thumbUrl": .string("https://cdn.example.invalid/fwd_e2ee_thumb.jpg"),
+                                "photoId": .string("9013001"),
+                            ]),
+                        ])
+                    ),
+                    MessageRecorderHarness.httpScript(
+                        path: "/api/message/photo_original/send",
+                        method: "POST",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "msgId": .string("9013002"),
+                            ]),
+                        ])
+                    ),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                    .object(["cmd": .string("open"), "args": .object(["id": .string("3001004a")])]),
+                    .object([
+                        "cmd": .string("forward"),
+                        "now_ms": .int(baseTs + 10_000),
+                        "args": .object([
+                            "conv_id": .string("3001004a"),
+                            "msg_id": .string("m_fwd_photo"),
+                            "targets": .array([.string("3001004b")]),
+                        ]),
+                    ]),
+                ]
+            ),
         ]
     }
 }
@@ -1375,6 +1676,18 @@ enum MediaRecorderHarness {
                     data: Data("synthetic".utf8)
                 )
             }
+            if path.hasPrefix(cacheDir.path),
+               FileManager.default.fileExists(atPath: path),
+               let cachedData = try? Data(contentsOf: URL(fileURLWithPath: path)) {
+                return OutgoingFileProbeResult(
+                    exists: true,
+                    isDirectory: false,
+                    readable: true,
+                    size: Int64(cachedData.count),
+                    mediaType: nil,
+                    data: cachedData
+                )
+            }
             return OutgoingFileProbeResult(exists: false, isDirectory: false, readable: false, size: 0)
         }
 
@@ -1421,66 +1734,72 @@ enum MediaRecorderHarness {
             return nil
         }
 
-        let uploadPhotoQueue = scenario.seed["host_results"]?["upload_photo"]?.arrayValue ?? []
-        var uploadPhotoIndex = 0
-        engine.uploadPhotoHostHandler = { _ in
-            guard uploadPhotoIndex < uploadPhotoQueue.count else {
-                throw ZaloSessionError(code: 500, message: "No scripted upload_photo", url: "/api/message/photo_original/send")
+        if scenario.seed["host_results"]?["upload_photo"] != nil {
+            let uploadPhotoQueue = scenario.seed["host_results"]?["upload_photo"]?.arrayValue ?? []
+            var uploadPhotoIndex = 0
+            engine.uploadPhotoHostHandler = { _ in
+                guard uploadPhotoIndex < uploadPhotoQueue.count else {
+                    throw ZaloSessionError(code: 500, message: "No scripted upload_photo", url: "/api/message/photo_original/send")
+                }
+                let item = uploadPhotoQueue[uploadPhotoIndex]
+                uploadPhotoIndex += 1
+                if let err = parseErrorItem(item) { throw err }
+                return UploadedMediaResult(
+                    url: item["url"]?.stringValue ?? "",
+                    msgId: item["msg_id"]?.stringValue ?? "",
+                    cliMsgId: item["cli_msg_id"]?.stringValue ?? "",
+                    width: Int(item["width"]?.int64Value ?? 0),
+                    height: Int(item["height"]?.int64Value ?? 0)
+                )
             }
-            let item = uploadPhotoQueue[uploadPhotoIndex]
-            uploadPhotoIndex += 1
-            if let err = parseErrorItem(item) { throw err }
-            return UploadedMediaResult(
-                url: item["url"]?.stringValue ?? "",
-                msgId: item["msg_id"]?.stringValue ?? "",
-                cliMsgId: item["cli_msg_id"]?.stringValue ?? "",
-                width: Int(item["width"]?.int64Value ?? 0),
-                height: Int(item["height"]?.int64Value ?? 0)
-            )
         }
 
-        let uploadVideoQueue = scenario.seed["host_results"]?["upload_video"]?.arrayValue ?? []
-        var uploadVideoIndex = 0
-        engine.uploadVideoHostHandler = { _ in
-            guard uploadVideoIndex < uploadVideoQueue.count else {
-                throw ZaloSessionError(code: 500, message: "No scripted upload_video", url: "/api/message/asyncfile/msg")
+        if scenario.seed["host_results"]?["upload_video"] != nil {
+            let uploadVideoQueue = scenario.seed["host_results"]?["upload_video"]?.arrayValue ?? []
+            var uploadVideoIndex = 0
+            engine.uploadVideoHostHandler = { _ in
+                guard uploadVideoIndex < uploadVideoQueue.count else {
+                    throw ZaloSessionError(code: 500, message: "No scripted upload_video", url: "/api/message/asyncfile/msg")
+                }
+                let item = uploadVideoQueue[uploadVideoIndex]
+                uploadVideoIndex += 1
+                if let err = parseErrorItem(item) { throw err }
+                return UploadedVideoResult(
+                    url: item["url"]?.stringValue ?? "",
+                    thumbUrl: item["thumb_url"]?.stringValue ?? "",
+                    msgId: item["msg_id"]?.stringValue ?? "",
+                    cliMsgId: item["cli_msg_id"]?.stringValue ?? "",
+                    width: Int(item["width"]?.int64Value ?? 0),
+                    height: Int(item["height"]?.int64Value ?? 0),
+                    durationMs: Int(item["duration_ms"]?.int64Value ?? 0)
+                )
             }
-            let item = uploadVideoQueue[uploadVideoIndex]
-            uploadVideoIndex += 1
-            if let err = parseErrorItem(item) { throw err }
-            return UploadedVideoResult(
-                url: item["url"]?.stringValue ?? "",
-                thumbUrl: item["thumb_url"]?.stringValue ?? "",
-                msgId: item["msg_id"]?.stringValue ?? "",
-                cliMsgId: item["cli_msg_id"]?.stringValue ?? "",
-                width: Int(item["width"]?.int64Value ?? 0),
-                height: Int(item["height"]?.int64Value ?? 0),
-                durationMs: Int(item["duration_ms"]?.int64Value ?? 0)
-            )
         }
 
         var heldUploadWaiters: [CheckedContinuation<Void, Never>] = []
-        let uploadFileQueue = scenario.seed["host_results"]?["upload_file"]?.arrayValue ?? []
-        var uploadFileIndex = 0
-        engine.uploadFileHostHandler = { args in
-            guard uploadFileIndex < uploadFileQueue.count else {
-                throw ZaloSessionError(code: 500, message: "No scripted upload_file", url: "/api/message/asyncfile/msg")
-            }
-            let item = uploadFileQueue[uploadFileIndex]
-            uploadFileIndex += 1
-            if item["hold"]?.boolValue == true {
-                await withCheckedContinuation { cont in
-                    heldUploadWaiters.append(cont)
+        if scenario.seed["host_results"]?["upload_file"] != nil {
+            let uploadFileQueue = scenario.seed["host_results"]?["upload_file"]?.arrayValue ?? []
+            var uploadFileIndex = 0
+            engine.uploadFileHostHandler = { args in
+                guard uploadFileIndex < uploadFileQueue.count else {
+                    throw ZaloSessionError(code: 500, message: "No scripted upload_file", url: "/api/message/asyncfile/msg")
                 }
+                let item = uploadFileQueue[uploadFileIndex]
+                uploadFileIndex += 1
+                if item["hold"]?.boolValue == true {
+                    await withCheckedContinuation { cont in
+                        heldUploadWaiters.append(cont)
+                    }
+                }
+                if let err = parseErrorItem(item) { throw err }
+                return UploadedMediaResult(
+                    url: item["url"]?.stringValue ?? "",
+                    msgId: item["msg_id"]?.stringValue ?? "",
+                    cliMsgId: item["cli_msg_id"]?.stringValue ?? (args["client_id"] as? String ?? ""),
+                    width: 0,
+                    height: 0
+                )
             }
-            if let err = parseErrorItem(item) { throw err }
-            return UploadedMediaResult(
-                url: item["url"]?.stringValue ?? "",
-                msgId: item["msg_id"]?.stringValue ?? "",
-                cliMsgId: item["cli_msg_id"]?.stringValue ?? (args["client_id"] as? String ?? ""),
-                width: 0,
-                height: 0
-            )
         }
 
         engine.mediaCacheLookupHostHandler = { args in
@@ -1786,6 +2105,18 @@ enum MediaRecorderHarness {
                             "key": .string(key),
                             "path": remembered.map { .string($0.path) } ?? .null,
                         ]))
+                    case "forward":
+                        _ = await engine.bootTask?.value
+                        let convId = args?["conv_id"]?.stringValue ?? ""
+                        let msgId = args?["msg_id"]?.stringValue ?? ""
+                        let targets = args?["targets"]?.arrayValue?.compactMap(\.stringValue) ?? []
+                        guard let msg = engine.messages[convId]?.first(where: { $0.id == msgId || $0.clientId == msgId }) else {
+                            throw RecorderError.invalidStep(scenario: scenario.name, detail: "forward missing msg \(msgId) in \(convId)")
+                        }
+                        let outcome = await engine.forward(msg, to: targets)
+                        await engine.settleForRecording()
+                        _ = await engine.persistConversationsTask?.value
+                        results["\(stepIndex)"] = normalizeRecordedURLs(ForwardSnapshot.encodeOutcome(outcome))
                     default:
                         throw RecorderError.invalidStep(scenario: scenario.name, detail: "Unknown cmd: \(cmd)")
                     }
