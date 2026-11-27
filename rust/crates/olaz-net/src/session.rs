@@ -17,6 +17,13 @@ pub enum SessionStatus {
     Unreachable,
 }
 
+/// Origin of a raw server payload that may carry `setttings` / `settings` (parsed in `olaz-core`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerSettingsSource {
+    ServerInfo,
+    LoginInfo,
+}
+
 /// Logged-in account (Swift `ZaloLoginAccount`; same JSON keys).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -90,6 +97,8 @@ pub struct SessionState {
     pub seeded_next_client_id: Option<i64>,
     pub cloud_viewer_key: Option<String>,
     pub cloud_enk: Option<String>,
+    /// Raw server-settings payloads observed on the wire, drained by `olaz-core`.
+    pub pending_server_settings: Vec<(ServerSettingsSource, Map<String, Value>)>,
 }
 
 impl std::fmt::Debug for SessionState {
@@ -122,7 +131,25 @@ impl SessionState {
             seeded_next_client_id: None,
             cloud_viewer_key: None,
             cloud_enk: None,
+            pending_server_settings: Vec::new(),
         }
+    }
+
+    pub fn record_server_settings(
+        &mut self,
+        source: ServerSettingsSource,
+        payload: Map<String, Value>,
+    ) {
+        if self.pending_server_settings.len() >= 8 {
+            self.pending_server_settings.remove(0);
+        }
+        self.pending_server_settings.push((source, payload));
+    }
+
+    pub fn take_pending_server_settings(
+        &mut self,
+    ) -> Vec<(ServerSettingsSource, Map<String, Value>)> {
+        std::mem::take(&mut self.pending_server_settings)
     }
 
     /// Swift `isAuthenticated`.
@@ -185,6 +212,7 @@ impl SessionState {
         self.expired_at = None;
         self.cloud_viewer_key = None;
         self.cloud_enk = None;
+        self.pending_server_settings.clear();
         self.domains = ZaloDomains::default();
     }
 

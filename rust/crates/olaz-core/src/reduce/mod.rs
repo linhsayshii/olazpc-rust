@@ -149,7 +149,8 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         | Input::QrRotated { .. }
         | Input::QrScanned { .. }
         | Input::QrConfirmed { .. }
-        | Input::LoginCompleted { .. } => session::reduce_session(state, input, &mut out),
+        | Input::LoginCompleted { .. }
+        | Input::ServerSettingsReceived { .. } => session::reduce_session(state, input, &mut out),
 
         Input::Command(Command::DrainChatPolling { .. })
         | Input::DrainRequested { .. }

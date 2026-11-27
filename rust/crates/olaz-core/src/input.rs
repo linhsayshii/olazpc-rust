@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use olaz_api::{AutoDeleteFetchOutcome, HiddenConversationsSnapshot, PollState, SendMessageResult};
-use olaz_net::{LoginAccount, NetError, QrScanResult, QrTicket, SessionStatus};
+use olaz_net::{
+    LoginAccount, NetError, QrScanResult, QrTicket, ServerSettingsSource, SessionStatus,
+};
 use olaz_store::{
     MessagesAround, StoredCloudConversationSummary, StoredCloudMediaItem, StoredMessage,
 };
@@ -1500,6 +1502,10 @@ pub enum Input {
         qr_gen: u64,
         result: Result<CompletedLogin, SessionFailure>,
     },
+    ServerSettingsReceived {
+        source: ServerSettingsSource,
+        payload: Map<String, Value>,
+    },
 
     // --- Transport domain (U2) ---
     WsEvent {
@@ -2202,6 +2208,11 @@ impl fmt::Debug for Input {
                 .debug_struct("LoginCompleted")
                 .field("qr_gen", qr_gen)
                 .field("ok", &result.is_ok())
+                .finish(),
+            Self::ServerSettingsReceived { source, payload } => f
+                .debug_struct("ServerSettingsReceived")
+                .field("source", source)
+                .field("payload_keys", &payload.len())
                 .finish(),
             Self::WsEvent {
                 ws_gen,

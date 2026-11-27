@@ -24381,14 +24381,16 @@ public struct SessionStateRecord: Equatable, Hashable {
     public var profile: ProfileRecord?
     public var signOutNotice: String?
     public var selfConversationId: String?
+    public var attestEnforced: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(phase: PhaseRecord, profile: ProfileRecord?, signOutNotice: String?, selfConversationId: String?) {
+    public init(phase: PhaseRecord, profile: ProfileRecord?, signOutNotice: String?, selfConversationId: String?, attestEnforced: Bool) {
         self.phase = phase
         self.profile = profile
         self.signOutNotice = signOutNotice
         self.selfConversationId = selfConversationId
+        self.attestEnforced = attestEnforced
     }
 
     
@@ -24410,7 +24412,8 @@ public struct FfiConverterTypeSessionStateRecord: FfiConverterRustBuffer {
                 phase: FfiConverterTypePhaseRecord.read(from: &buf), 
                 profile: FfiConverterOptionTypeProfileRecord.read(from: &buf), 
                 signOutNotice: FfiConverterOptionString.read(from: &buf), 
-                selfConversationId: FfiConverterOptionString.read(from: &buf)
+                selfConversationId: FfiConverterOptionString.read(from: &buf), 
+                attestEnforced: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -24419,6 +24422,7 @@ public struct FfiConverterTypeSessionStateRecord: FfiConverterRustBuffer {
         FfiConverterOptionTypeProfileRecord.write(value.profile, into: &buf)
         FfiConverterOptionString.write(value.signOutNotice, into: &buf)
         FfiConverterOptionString.write(value.selfConversationId, into: &buf)
+        FfiConverterBool.write(value.attestEnforced, into: &buf)
     }
 }
 

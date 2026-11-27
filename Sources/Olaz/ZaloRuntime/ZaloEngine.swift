@@ -70,8 +70,12 @@ final class ZaloEngine {
         }
     }
     private(set) var profile: Profile?
+    static var nativeClientVersion: String { "\(ZaloDomains.zpwVer) (Native)" }
+    static let attestWarningText = "Zalo đã bật xác thực ứng dụng cho tài khoản hoặc phiên bản này. Olaz có thể không đăng nhập được nữa."
+
     private(set) var signOutNotice: String?
-    private(set) var clientVersion: String? = "694 (Native)"
+    private(set) var attestEnforced = false
+    private(set) var clientVersion: String? = ZaloEngine.nativeClientVersion
     private(set) var recentLog: [String] = []
 
     var openConversationId: String? {
@@ -354,6 +358,7 @@ final class ZaloEngine {
         signOutNotice: String?,
         selfConversationId: String?,
         clientVersion: String?,
+        attestEnforced: Bool = false,
         qrPayload: String? = nil
     ) {
         var traceChanged = false
@@ -375,6 +380,10 @@ final class ZaloEngine {
         }
         if self.selfConversationId != selfConversationId {
             self.selfConversationId = selfConversationId
+            traceChanged = true
+        }
+        if self.attestEnforced != attestEnforced {
+            self.attestEnforced = attestEnforced
             traceChanged = true
         }
         if self.clientVersion != clientVersion { self.clientVersion = clientVersion }
@@ -403,6 +412,31 @@ final class ZaloEngine {
         call.videoSupported = call.helperInstalled
 
         dispatchCoreCommand(.start)
+    }
+
+    /// Checks if the local `ZaloRuntime` needs a fresh install or a staged upgrade from an older pinned release
+    /// (e.g. 26.10.20 → 26.11.10) into `ZaloRuntime.pending`, without blocking app startup.
+    func scheduleRuntimeUpgradeCheck() {
+        let env = ProcessInfo.processInfo.environment
+        guard env["OLAZ_UI_SMOKE"] == nil, env["OLAZ_PERF_PROBE"] == nil else { return }
+        guard ZaloRuntime.plannedAction() != .upToDate else { return }
+        Task.detached(priority: .utility) { [weak self] in
+            do {
+                if let version = try await ZaloRuntimeInstaller().ensureUpToDate() {
+                    await MainActor.run {
+                        guard let self else { return }
+                        EngineLog.shared.write("runtime: prepared Zalo \(version)")
+                        self.call.helperInstalled = CallBridge.isHelperInstalled()
+                        self.call.supported = self.call.helperInstalled
+                        self.call.videoSupported = self.call.helperInstalled
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    EngineLog.shared.write("runtime: upgrade check failed: \(error.localizedDescription)")
+                }
+            }
+        }
     }
 
     func retryRuntimeSetup() {

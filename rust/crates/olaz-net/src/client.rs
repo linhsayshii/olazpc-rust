@@ -117,6 +117,12 @@ impl<T: Transport> SessionClient<T> {
         self.lock().domains = domains;
     }
 
+    pub fn take_pending_server_settings(
+        &self,
+    ) -> Vec<(crate::ServerSettingsSource, Map<String, Value>)> {
+        self.lock().take_pending_server_settings()
+    }
+
     pub fn account(&self) -> Option<crate::LoginAccount> {
         self.lock().account.clone()
     }

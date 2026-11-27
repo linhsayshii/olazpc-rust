@@ -379,6 +379,7 @@ pub struct SessionStateRecord {
     pub profile: Option<ProfileRecord>,
     pub sign_out_notice: Option<String>,
     pub self_conversation_id: Option<String>,
+    pub attest_enforced: bool,
 }
 
 impl fmt::Debug for SessionStateRecord {
@@ -388,6 +389,7 @@ impl fmt::Debug for SessionStateRecord {
             .field("has_profile", &self.profile.is_some())
             .field("has_sign_out_notice", &self.sign_out_notice.is_some())
             .field("has_self_conv", &self.self_conversation_id.is_some())
+            .field("attest_enforced", &self.attest_enforced)
             .finish()
     }
 }
@@ -399,6 +401,7 @@ impl From<SessionSnapshot> for SessionStateRecord {
             profile: s.profile.map(Into::into),
             sign_out_notice: s.sign_out_notice,
             self_conversation_id: s.self_conversation_id,
+            attest_enforced: s.attest_enforced,
         }
     }
 }

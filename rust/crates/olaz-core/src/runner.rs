@@ -1060,6 +1060,12 @@ pub struct SessionEffectRunner<T: Transport + 'static> {
     runtime: Handle,
 }
 
+fn forward_pending_server_settings<T: Transport>(client: &SessionClient<T>, sink: &ActorSink) {
+    for (source, payload) in client.take_pending_server_settings() {
+        sink.send(Input::ServerSettingsReceived { source, payload });
+    }
+}
+
 impl<T: Transport + 'static> SessionEffectRunner<T> {
     /// Starts the runner's serial host worker on `runtime` with [`LiveWsDriver`].
     #[must_use]
@@ -1444,6 +1450,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     self.spawn_cancellable(async move {
                         let (status, updated_from_login_info) =
                             client.session_status_detailed().await;
+                        forward_pending_server_settings(&client, &sink);
                         let ws_endpoints = client.domains().ws;
                         sink.send(Input::SessionStatusResult {
                             boot_gen,
@@ -1483,6 +1490,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             .request_qr(&language)
                             .await
                             .map_err(SessionFailure::from);
+                        forward_pending_server_settings(&client, &sink);
                         sink.send(Input::QrRequested { qr_gen, result });
                         drop(guard);
                     });
@@ -1519,6 +1527,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             .await
                             .map(|_| ())
                             .map_err(SessionFailure::from);
+                        forward_pending_server_settings(&client, &sink);
                         sink.send(Input::QrConfirmed { qr_gen, result });
                         drop(guard);
                     });
@@ -1538,6 +1547,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                                 profile_synced,
                             })
                             .map_err(SessionFailure::from);
+                        forward_pending_server_settings(&client, &sink);
                         sink.send(Input::LoginCompleted { qr_gen, result });
                         drop(guard);
                     });
@@ -5150,6 +5160,7 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                         });
                         match client.complete_login_detailed().await {
                             Ok((account, profile_synced)) if client.is_authenticated() => {
+                                forward_pending_server_settings(&client, &sink);
                                 let ws_endpoints = client.domains().ws;
                                 sink.send(Input::LegacyCookieResult {
                                     boot_gen,

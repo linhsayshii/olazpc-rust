@@ -1957,7 +1957,8 @@ extension ZaloEngine {
                 profile: mappedProfile,
                 signOutNotice: session.signOutNotice,
                 selfConversationId: session.selfConversationId,
-                clientVersion: "694 (Native)",
+                clientVersion: Self.nativeClientVersion,
+                attestEnforced: session.attestEnforced,
                 qrPayload: qrPayload
             )
 

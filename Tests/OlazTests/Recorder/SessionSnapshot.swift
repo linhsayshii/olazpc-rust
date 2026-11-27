@@ -59,6 +59,7 @@ enum SessionSnapshot {
             "sign_out_notice": engine.signOutNotice.map(CaseJSON.string) ?? .null,
             "self_conversation_id": engine.selfConversationId.map(CaseJSON.string) ?? .null,
             "prefs": .object(prefsObj),
+            "attest_enforced": .bool(engine.attestEnforced),
         ])
     }
 
