@@ -8,7 +8,9 @@ use olaz_api::{
     AutoDeleteFetchOutcome, BlockedUserEntry, HiddenConversationsSnapshot, PollState,
     SendMessageResult,
 };
-use olaz_net::{LoginAccount, NetError, QrScanResult, QrTicket, SessionStatus};
+use olaz_net::{
+    LoginAccount, NetError, QrScanResult, QrTicket, ServerSettingsSource, SessionStatus,
+};
 use olaz_store::{
     MessagesAround, StoredCloudConversationSummary, StoredCloudMediaItem, StoredMessage,
 };
@@ -1558,6 +1560,10 @@ pub enum Input {
         qr_gen: u64,
         result: Result<CompletedLogin, SessionFailure>,
     },
+    ServerSettingsReceived {
+        source: ServerSettingsSource,
+        payload: Map<String, Value>,
+    },
 
     // --- Transport domain (U2) ---
     WsEvent {
@@ -2209,7 +2215,14 @@ pub enum Input {
         conv_id: String,
         pin: bool,
         ok: bool,
+        topic_id: Option<String>,
         create_keys: Vec<String>,
+    },
+    ReminderPinDone {
+        op_id: Option<u64>,
+        conv_id: String,
+        ok: bool,
+        status: String,
     },
     ConfirmPromoteExpired {
         confirm_gen: u64,
@@ -2305,6 +2318,11 @@ impl fmt::Debug for Input {
                 .debug_struct("LoginCompleted")
                 .field("qr_gen", qr_gen)
                 .field("ok", &result.is_ok())
+                .finish(),
+            Self::ServerSettingsReceived { source, payload } => f
+                .debug_struct("ServerSettingsReceived")
+                .field("source", source)
+                .field("payload_keys", &payload.len())
                 .finish(),
             Self::WsEvent {
                 ws_gen,
@@ -3160,11 +3178,26 @@ impl fmt::Debug for Input {
                 .field("card_send_id", card_send_id)
                 .field("ok", &result.is_ok())
                 .finish(),
-            Self::CreateReminderDone { op_id, pin, ok, .. } => f
+            Self::CreateReminderDone {
+                op_id,
+                pin,
+                ok,
+                topic_id,
+                ..
+            } => f
                 .debug_struct("CreateReminderDone")
                 .field("op_id", op_id)
                 .field("pin", pin)
                 .field("ok", ok)
+                .field("has_topic_id", &topic_id.is_some())
+                .finish(),
+            Self::ReminderPinDone {
+                op_id, ok, status, ..
+            } => f
+                .debug_struct("ReminderPinDone")
+                .field("op_id", op_id)
+                .field("ok", ok)
+                .field("status", status)
                 .finish(),
             Self::ConfirmPromoteExpired { confirm_gen } => f
                 .debug_struct("ConfirmPromoteExpired")

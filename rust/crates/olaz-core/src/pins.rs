@@ -536,6 +536,8 @@ pub enum RefreshBoardFollowup {
         conv_id: String,
         continuation: crate::effect::PollBoardContinuation,
     },
+    /// After pinning a newly created group reminder (`pinv2`): complete `CreateReminder` as Done.
+    ReminderPinned { op_id: Option<u64> },
 }
 
 impl fmt::Debug for RefreshBoardFollowup {
@@ -571,6 +573,10 @@ impl fmt::Debug for RefreshBoardFollowup {
             Self::Poll { continuation, .. } => f
                 .debug_struct("Poll")
                 .field("continuation", continuation)
+                .finish(),
+            Self::ReminderPinned { op_id } => f
+                .debug_struct("ReminderPinned")
+                .field("op_id", op_id)
                 .finish(),
         }
     }
@@ -750,7 +756,7 @@ mod tests {
         let se = ApiError::Net(NetError::Session(ZaloSessionError {
             code: 500,
             message: "fail".to_owned(),
-            url: "https://groupboard-wpa.api.zaloapp.com/api/board/pin/list?zpw_ver=694".to_owned(),
+            url: "https://groupboard-wpa.api.zaloapp.com/api/board/pin/list?zpw_ver=695".to_owned(),
         }));
         assert_eq!(pin_error_shape(&se), "code=500 path=/api/board/pin/list");
 

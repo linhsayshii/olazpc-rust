@@ -1569,6 +1569,12 @@ pub enum Effect {
         op_id: Option<u64>,
         params: CreateReminderParams,
     },
+    /// Calls `GET group_board /api/board/pinv2` (type 0) after creating a pinned group reminder.
+    PinReminderTopicApi {
+        op_id: Option<u64>,
+        conv_id: String,
+        topic_id: String,
+    },
     StartConfirmPromoteDelay {
         confirm_gen: u64,
         delay: Duration,
@@ -2272,6 +2278,13 @@ impl fmt::Debug for Effect {
                 .debug_struct("CreateReminderApi")
                 .field("op_id", op_id)
                 .field("params", params)
+                .finish(),
+            Self::PinReminderTopicApi {
+                op_id, topic_id, ..
+            } => f
+                .debug_struct("PinReminderTopicApi")
+                .field("op_id", op_id)
+                .field("has_topic_id", &!topic_id.is_empty())
                 .finish(),
             Self::StartConfirmPromoteDelay { confirm_gen, delay } => f
                 .debug_struct("StartConfirmPromoteDelay")

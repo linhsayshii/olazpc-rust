@@ -43,6 +43,11 @@ struct RootView: View {
                     .transition(.opacity)
             }
         }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if engine.attestEnforced {
+                AttestEnforcedBanner()
+            }
+        }
         .animation(.smooth(duration: 0.4), value: route)
         // Incoming calls also ring during the first-run setup, so the banner / alerts sit around every route.
         .callOverlay()
@@ -73,6 +78,29 @@ struct RootView: View {
             try? await Task.sleep(for: .milliseconds(900))
             if case .ready = engine.phase, !setupPending { shell.startTour() }
         }
+    }
+}
+
+/// Persistent in-app warning shown when server settings enforce ZaloAttest (`attest_enforced`).
+struct AttestEnforcedBanner: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text(ZaloEngine.attestWarningText)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.orange.opacity(0.14))
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(.orange.opacity(0.28)).frame(height: 1)
+        }
+        .accessibilityElement(children: .combine)
     }
 }
 

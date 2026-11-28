@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::actions::{MessageConfirmAction, MessageConfirmState, PendingIdResolution};
 use crate::changes::DirtyKey;
+use crate::composer::ComposerOutcome;
 use crate::conversations::message_preview_label;
 use crate::effect::{Effect, HostCall, OpResult, StoreOp};
 use crate::input::{Command, Input};
@@ -681,6 +682,15 @@ fn finish_refresh_followup(
             continuation,
         } => {
             crate::reduce::polls::handle_poll_board_refreshed(state, conv_id, continuation, out);
+        }
+        RefreshBoardFollowup::ReminderPinned { op_id } => {
+            if let Some(id) = op_id {
+                out.effects.push(Effect::CompleteOp {
+                    op_id: id,
+                    result: OpResult::ComposerOutcome(ComposerOutcome::Done),
+                    after_store: false,
+                });
+            }
         }
     }
 }

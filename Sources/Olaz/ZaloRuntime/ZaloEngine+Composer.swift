@@ -546,6 +546,7 @@ extension ZaloEngine {
                 repeatMode: Int64(rule.rawValue),
                 pin: pin
             )
+            await waitForCoreMirrorDrain()
             return ComposerOutcome(coreRecord: outcome)
         } catch {
             return .failed("Không tạo được nhắc hẹn. Hãy thử lại.")

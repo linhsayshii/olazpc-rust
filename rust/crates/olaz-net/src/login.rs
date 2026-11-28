@@ -178,6 +178,7 @@ impl<T: Transport> SessionClient<T> {
         };
         let mut s = self.lock();
         s.domains.apply_server_info(&json);
+        s.record_server_settings(crate::ServerSettingsSource::ServerInfo, json.clone());
         let settings = json
             .get("setttings")
             .and_then(Value::as_object)
@@ -408,6 +409,15 @@ impl<T: Transport> SessionClient<T> {
                 if let Some(d) = json.get("data").and_then(Value::as_object) {
                     s.apply_login_config(d);
                 }
+                let has_settings = json.contains_key("setttings")
+                    || json.contains_key("settings")
+                    || json
+                        .get("data")
+                        .and_then(Value::as_object)
+                        .is_some_and(|d| d.contains_key("setttings") || d.contains_key("settings"));
+                if has_settings {
+                    s.record_server_settings(crate::ServerSettingsSource::LoginInfo, json.clone());
+                }
                 drop(s);
                 return Ok(sek);
             } else if matches!(code, 18012 | -13 | 13 | 8) {
@@ -476,12 +486,14 @@ impl<T: Transport> SessionClient<T> {
             let decrypted = unwrap_decrypted_response(&raw, Some(cipher.key_data()));
             let code = int64(decrypted.get("error_code")).unwrap_or(0);
             if code == 0 {
-                if let Some(cookie) = outcome.zpw_sek_cookie.filter(|c| is_valid_zpw_sek(Some(c))) {
-                    let mut s = self.lock();
-                    if !is_valid_zpw_sek(s.zpw_sek.as_deref()) {
-                        s.zpw_sek = Some(cookie);
-                    }
+                let mut s = self.lock();
+                if let Some(cookie) = outcome.zpw_sek_cookie.filter(|c| is_valid_zpw_sek(Some(c)))
+                    && !is_valid_zpw_sek(s.zpw_sek.as_deref())
+                {
+                    s.zpw_sek = Some(cookie);
                 }
+                s.record_server_settings(crate::ServerSettingsSource::LoginInfo, decrypted.clone());
+                drop(s);
                 return Ok(decrypted);
             }
             last_error = ZaloSessionError {

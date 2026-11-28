@@ -22,7 +22,14 @@ import Foundation
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helper.path)
     }
 
+    @Test func pinnedReleaseMatches26_11_10() {
+        #expect(ZaloRuntime.pinned.version == "26.11.10")
+        #expect(ZaloRuntime.pinned.url.absoluteString == "https://res-download-pc.zadn.vn/mac/ZaloSetup-universal-26.11.10.dmg")
+        #expect(ZaloRuntime.pinned.sha256 == "eff7e9c887a1164ae078e919f950b5552ffc3d846f8a63bd12ce88171ba79092")
+    }
+
     @Test func readsVersionFromInstallerName() {
+        #expect(ZaloRuntime.version(fromInstallerName: "ZaloSetup-universal-26.11.10.dmg") == "26.11.10")
         #expect(ZaloRuntime.version(fromInstallerName: "ZaloSetup-universal-26.10.20.dmg") == "26.10.20")
         #expect(ZaloRuntime.version(fromInstallerName: "ZaloSetup-universal-26.10.20-RC4.zip") == nil)
         #expect(ZaloRuntime.version(fromInstallerName: "Zalo-3.2.64.dmg") == nil)
@@ -30,23 +37,41 @@ import Foundation
     }
 
     @Test func comparesVersionsNumerically() {
+        #expect(ZaloRuntime.isNewer("26.11.10", than: "26.10.20"))
         #expect(ZaloRuntime.isNewer("26.10.20", than: "26.9.10"))
         #expect(ZaloRuntime.isNewer("27.1.5", than: "26.12.31"))
-        #expect(!ZaloRuntime.isNewer("26.10.20", than: "26.10.20"))
+        #expect(!ZaloRuntime.isNewer("26.11.10", than: "26.11.10"))
         #expect(!ZaloRuntime.isNewer("26.10", than: "26.10.0"))
-        #expect(!ZaloRuntime.isNewer("26.9.10", than: "26.10.20"))
+        #expect(!ZaloRuntime.isNewer("26.10.20", than: "26.11.10"))
+    }
+
+    @Test func plannedActionUpgrades26_10_20ToPinned() throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        #expect(ZaloRuntime.plannedAction(root: root) == .installCurrent)
+
+        try makeRuntime(at: root.appendingPathComponent("current"), version: "26.10.20")
+        #expect(ZaloRuntime.plannedAction(root: root) == .stageUpgrade(installed: "26.10.20"))
+
+        try makeRuntime(at: root.appendingPathComponent("pending"), version: ZaloRuntime.pinned.version)
+        #expect(ZaloRuntime.plannedAction(root: root) == .upToDate)
+
+        ZaloRuntime.prepareForLaunch(root: root)
+        #expect(ZaloRuntime.version(of: root.appendingPathComponent("current")) == ZaloRuntime.pinned.version)
+        #expect(ZaloRuntime.plannedAction(root: root) == .upToDate)
     }
 
     @Test func launchSwapsInPreparedUpgrade() throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        try makeRuntime(at: root.appendingPathComponent("current"), version: "26.9.10")
-        try makeRuntime(at: root.appendingPathComponent("pending"), version: "26.10.20")
+        try makeRuntime(at: root.appendingPathComponent("current"), version: "26.10.20")
+        try makeRuntime(at: root.appendingPathComponent("pending"), version: "26.11.10")
         try FileManager.default.createDirectory(at: root.appendingPathComponent("work/staging-x"), withIntermediateDirectories: true)
 
         ZaloRuntime.prepareForLaunch(root: root)
 
-        #expect(ZaloRuntime.version(of: root.appendingPathComponent("current")) == "26.10.20")
+        #expect(ZaloRuntime.version(of: root.appendingPathComponent("current")) == "26.11.10")
         #expect(ZaloRuntime.isComplete(root.appendingPathComponent("current")))
         #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("pending").path))
         #expect((try? FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("work").path)) ?? [] == [])
@@ -55,12 +80,12 @@ import Foundation
     @Test func launchDropsIncompleteUpgrade() throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        try makeRuntime(at: root.appendingPathComponent("current"), version: "26.9.10")
+        try makeRuntime(at: root.appendingPathComponent("current"), version: "26.10.20")
         try FileManager.default.createDirectory(at: root.appendingPathComponent("pending/Contents"), withIntermediateDirectories: true)
 
         ZaloRuntime.prepareForLaunch(root: root)
 
-        #expect(ZaloRuntime.version(of: root.appendingPathComponent("current")) == "26.9.10")
+        #expect(ZaloRuntime.version(of: root.appendingPathComponent("current")) == "26.10.20")
         #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("pending").path))
     }
 
@@ -74,6 +99,28 @@ import Foundation
         let app = URL(fileURLWithPath: "/Applications/Zalo.app")
         guard FileManager.default.fileExists(atPath: app.path) else { return }
         try ZaloRuntimeInstaller.verifySignature(of: app)
+    }
+
+    @Test func upgrades26_10_20FromInstalledPinnedZaloWhenPresent() async throws {
+        guard ZaloRuntimeInstaller.installedZalo(version: ZaloRuntime.pinned.version) != nil else { return }
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeRuntime(at: root.appendingPathComponent("current"), version: "26.10.20")
+
+        let installer = ZaloRuntimeInstaller(
+            release: ZaloRuntime.pinned,
+            allowsLatest: false,
+            work: root.appendingPathComponent("work", isDirectory: true)
+        )
+        let staged = try await installer.ensureUpToDate(root: root)
+        #expect(staged == ZaloRuntime.pinned.version)
+        #expect(ZaloRuntime.version(of: root.appendingPathComponent("pending")) == ZaloRuntime.pinned.version)
+        #expect(ZaloRuntime.version(of: root.appendingPathComponent("current")) == "26.10.20")
+
+        ZaloRuntime.prepareForLaunch(root: root)
+        #expect(ZaloRuntime.version(of: root.appendingPathComponent("current")) == ZaloRuntime.pinned.version)
+        #expect(ZaloRuntime.isComplete(root.appendingPathComponent("current")))
+        try CallHelperSignature.verify(executable: ZaloRuntime.helper("ZaloCall", in: root.appendingPathComponent("current")))
     }
 
     /// The whole DMG path (download, checksum, mount, signature, copy) against the official DMG, a downloaded copy or the

@@ -111,7 +111,7 @@ import Testing
 @Suite struct NativeDomainsAndWSTests {
     @Test func serviceCandidateFailoverAndWinnerPromotion() {
         #expect(ZaloDomains.zpwType == "23")
-        #expect(ZaloDomains.userAgent == "ZaloPC-darwin-23v694")
+        #expect(ZaloDomains.userAgent == "ZaloPC-darwin-23v695")
         #expect(ZaloDomains.wsOrigin == "file://")
 
         var domains = ZaloDomains()
@@ -262,7 +262,7 @@ import Testing
         let engine = ZaloEngine(dataDirectory: dir, useKeychain: false)
         #expect(engine.phase == .starting)
         #expect(engine.conversations.isEmpty)
-        #expect(engine.clientVersion == "694 (Native)")
+        #expect(engine.clientVersion == "695 (Native)")
         #expect(!engine.isInCall)
 
         let a = ZaloEngine.ConversationSummary(id: "u1", isGroup: false, name: "A", avatar: nil, pinned: false, members: 0, unread: 0,

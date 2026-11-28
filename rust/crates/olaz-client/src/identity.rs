@@ -8,6 +8,6 @@ macro_rules! client_identity {
     };
 }
 
-client_identity!("694", "23");
+client_identity!("695", "23");
 pub const WEB_CLIENT_TYPE: &str = "30";
 pub const WS_ORIGIN: &str = "file://";

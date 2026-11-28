@@ -1,12 +1,14 @@
 //! Pure reducer for the session domain: boot, QR login, log out, session expiry, and profile.
 
-use olaz_net::{LoginAccount, QrTicket, SessionStatus};
+use olaz_net::{LoginAccount, QrTicket, ServerSettingsSource, SessionStatus};
 
 use crate::changes::DirtyKey;
 use crate::effect::{Effect, HostCall};
 use crate::input::{Command, Input, SessionFailure, StoreToken};
 use crate::reduce::{ReduceOutput, bootstrap, transport};
-use crate::state::{CoreState, LoginState, LoginStep, PendingStore, Phase, Profile, SessionState};
+use crate::state::{
+    AttestFlags, CoreState, LoginState, LoginStep, PendingStore, Phase, Profile, SessionState,
+};
 
 /// Default Vietnamese display name when the server returns an empty string (Swift `applyAccountProfile`).
 pub const DEFAULT_DISPLAY_NAME: &str = "Người dùng Zalo";
@@ -320,6 +322,10 @@ pub fn reduce_session(state: &mut CoreState, input: Input, out: &mut ReduceOutpu
             }
         }
 
+        Input::ServerSettingsReceived { source, payload } => {
+            apply_server_settings(&mut state.session, source, &payload, out);
+        }
+
         _ => {}
     }
 }
@@ -536,6 +542,32 @@ pub(crate) fn enter_session_expired(state: &mut CoreState, reason: String, out: 
     });
 }
 
+fn apply_server_settings(
+    state: &mut SessionState,
+    source: ServerSettingsSource,
+    payload: &serde_json::Map<String, serde_json::Value>,
+    out: &mut ReduceOutput,
+) {
+    let attest_obj = AttestFlags::find_in_payload(payload);
+    // A post-login payload without `features.attest` must not clear flags already learned from
+    // `getServerInfo`.
+    if source == ServerSettingsSource::LoginInfo
+        && attest_obj.is_none()
+        && state.last_attest_flags.is_some()
+    {
+        return;
+    }
+    let flags = AttestFlags::from_attest_map(attest_obj);
+    if state.last_attest_flags != Some(flags) {
+        state.last_attest_flags = Some(flags);
+        out.effects.push(Effect::EngineLog(flags.engine_log_line()));
+        if state.attest_enforced != flags.enforce {
+            state.attest_enforced = flags.enforce;
+            out.dirty.insert(DirtyKey::Session);
+        }
+    }
+}
+
 fn reset_session_fields(state: &mut SessionState) {
     state.boot_gen = state.boot_gen.saturating_add(1);
     state.pending_store = None;
@@ -543,6 +575,8 @@ fn reset_session_fields(state: &mut SessionState) {
     state.profile = None;
     state.self_conversation_id = None;
     state.prefs.clear();
+    state.attest_enforced = false;
+    state.last_attest_flags = None;
 }
 
 fn apply_qr_failure(state: &mut SessionState, failure: SessionFailure, out: &mut ReduceOutput) {
@@ -919,5 +953,116 @@ mod tests {
                 Effect::RequestQr { qr_gen: 3, .. }
             ]
         ));
+    }
+
+    #[test]
+    fn attest_flags_absent_all_false_and_enforced_log_only_on_change() {
+        let mut state = CoreState::default();
+        let obj = |v: serde_json::Value| v.as_object().cloned().unwrap_or_default();
+
+        // 1. Flags absent in getServerInfo -> all false, logged once, attest_enforced = false.
+        let out = reduce(
+            &mut state,
+            Input::ServerSettingsReceived {
+                source: ServerSettingsSource::ServerInfo,
+                payload: obj(serde_json::json!({"setttings": {"trusted_device": {"self_g": 0}}})),
+            },
+        );
+        assert!(!state.session.attest_enforced);
+        assert!(out.dirty.is_empty());
+        assert!(matches!(
+            out.effects.as_slice(),
+            [Effect::EngineLog(msg)]
+                if msg == "attest: enable=false enable_on_login=false enforce=false enable_qos=false deactivated=false"
+        ));
+
+        // 2. Repeated all-false payload (explicit 0/false) -> no duplicate log.
+        let out = reduce(
+            &mut state,
+            Input::ServerSettingsReceived {
+                source: ServerSettingsSource::LoginInfo,
+                payload: obj(serde_json::json!({
+                    "data": {
+                        "settings": {
+                            "features": {
+                                "attest": {
+                                    "enable": false,
+                                    "enable_on_login": 0,
+                                    "enforce": false,
+                                    "enable_qos": 0,
+                                    "deactivated": false
+                                }
+                            }
+                        }
+                    }
+                })),
+            },
+        );
+        assert!(!state.session.attest_enforced);
+        assert!(out.effects.is_empty());
+        assert!(out.dirty.is_empty());
+
+        // 3. Post-login settings enables enforce -> logs 5 booleans and sets attest_enforced = true.
+        let out = reduce(
+            &mut state,
+            Input::ServerSettingsReceived {
+                source: ServerSettingsSource::LoginInfo,
+                payload: obj(serde_json::json!({
+                    "data": {
+                        "setttings": {
+                            "features": {
+                                "attest": {
+                                    "enable": 1,
+                                    "enable_on_login": true,
+                                    "enforce": 1
+                                }
+                            }
+                        }
+                    }
+                })),
+            },
+        );
+        assert!(state.session.attest_enforced);
+        assert!(out.dirty.contains(&DirtyKey::Session));
+        assert!(matches!(
+            out.effects.as_slice(),
+            [Effect::EngineLog(msg)]
+                if msg == "attest: enable=true enable_on_login=true enforce=true enable_qos=false deactivated=false"
+        ));
+
+        // 4. Subsequent post-login payload without features.attest preserves enforce=true without logging.
+        let out = reduce(
+            &mut state,
+            Input::ServerSettingsReceived {
+                source: ServerSettingsSource::LoginInfo,
+                payload: obj(serde_json::json!({"data": {"uid": "100"}})),
+            },
+        );
+        assert!(state.session.attest_enforced);
+        assert!(out.effects.is_empty());
+        assert!(out.dirty.is_empty());
+
+        // 5. Same enforced flags repeated -> no duplicate log.
+        let out = reduce(
+            &mut state,
+            Input::ServerSettingsReceived {
+                source: ServerSettingsSource::ServerInfo,
+                payload: obj(serde_json::json!({
+                    "setttings": {
+                        "features": {
+                            "attest": {
+                                "enable": true,
+                                "enable_on_login": true,
+                                "enforce": true,
+                                "enable_qos": false,
+                                "deactivated": false
+                            }
+                        }
+                    }
+                })),
+            },
+        );
+        assert!(state.session.attest_enforced);
+        assert!(out.effects.is_empty());
     }
 }

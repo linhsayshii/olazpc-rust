@@ -35,7 +35,7 @@ line("qrpayload", payloadJSON)
 let encrypted = try! cipher.encryptPayload(payloadJSON)
 var map: [String: String] = [
     "zcid": cipher.zcid, "zcid_ext": cipher.zcidExt, "enc_ver": "v2", "params": encrypted,
-    "type": "23", "client_version": "694",
+    "type": "23", "client_version": "695",
 ]
 map["signkey"] = ZaloCrypto.signKey(tag: "reqqr", params: map)
 line("reqqr", "https://wpa.zaloapp.com/api/login/reqqr?\(SC.sortedQueryString(map))")
@@ -43,7 +43,7 @@ let lp: [String: Any] = ["imei": imei, "computer_name": "Linh MacBook Pro", "lan
 let lpEnc = try! cipher.encryptPayload(sorted(lp))
 var lmap: [String: String] = [
     "zcid": cipher.zcid, "zcid_ext": cipher.zcidExt, "enc_ver": "v2", "params": lpEnc,
-    "type": "23", "client_version": "694",
+    "type": "23", "client_version": "695",
 ]
 lmap["signkey"] = ZaloCrypto.signKey(tag: "getlogininfo", params: lmap)
 line("logininfo", "https://wpa.zaloapp.com/api/login/getLoginInfo?\(SC.sortedQueryString(lmap))&nretry=0")
@@ -51,7 +51,7 @@ line("logininfo", "https://wpa.zaloapp.com/api/login/getLoginInfo?\(SC.sortedQue
 // C/D/E. authenticated suffixes (zpw_enk 16 bytes)
 let key = Data("0123456789abcdef".utf8)
 func enc(_ s: String) -> String { SC.urlEncode(try! ZaloCrypto.encodeAES(key: key, plaintext: s)) }
-let common = "zpw_ver=694&zpw_type=23"
+let common = "zpw_ver=695&zpw_type=23"
 let mePayload = sorted(["avatar_size": 160, "imei": imei] as [String: Any])
 line("meJSON", mePayload)
 line("get", "/api/social/profile/me-v2?\(common)&params=\(enc(mePayload))&os=8")

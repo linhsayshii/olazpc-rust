@@ -17,6 +17,13 @@ pub enum SessionStatus {
     Unreachable,
 }
 
+/// Origin of a raw server payload that may carry `setttings` / `settings` (parsed in `olaz-core`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerSettingsSource {
+    ServerInfo,
+    LoginInfo,
+}
+
 /// Logged-in account (Swift `ZaloLoginAccount`; same JSON keys).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -67,9 +74,22 @@ pub fn generate_imei() -> String {
     format!("{uuid}-{}", md5_hex(USER_AGENT))
 }
 
-/// True for an IMEI Swift would keep: 69 characters ending in `md5(userAgent)`.
-pub fn is_current_imei(imei: &str) -> bool {
-    imei.chars().count() == 69 && imei.ends_with(&md5_hex(USER_AGENT))
+/// True for a well-formed PC IMEI: `<lowercase uuid>-<32 lowercase hex>`, 69 ASCII characters.
+///
+/// Matches the official Zalo PC client's `z_uuid` retention rule: a valid stored PC IMEI is kept
+/// across `zpw_ver` bumps without comparing its suffix against `md5(USER_AGENT)`.
+pub fn is_valid_pc_imei(imei: &str) -> bool {
+    let bytes = imei.as_bytes();
+    if bytes.len() != 69 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(i, &b)| {
+        if matches!(i, 8 | 13 | 18 | 23 | 36) {
+            b == b'-'
+        } else {
+            matches!(b, b'0'..=b'9' | b'a'..=b'f')
+        }
+    })
 }
 
 /// Mutable session fields (Swift actor properties that belong to the transport layer).
@@ -90,6 +110,8 @@ pub struct SessionState {
     pub seeded_next_client_id: Option<i64>,
     pub cloud_viewer_key: Option<String>,
     pub cloud_enk: Option<String>,
+    /// Raw server-settings payloads observed on the wire, drained by `olaz-core`.
+    pub pending_server_settings: Vec<(ServerSettingsSource, Map<String, Value>)>,
 }
 
 impl std::fmt::Debug for SessionState {
@@ -122,7 +144,25 @@ impl SessionState {
             seeded_next_client_id: None,
             cloud_viewer_key: None,
             cloud_enk: None,
+            pending_server_settings: Vec::new(),
         }
+    }
+
+    pub fn record_server_settings(
+        &mut self,
+        source: ServerSettingsSource,
+        payload: Map<String, Value>,
+    ) {
+        if self.pending_server_settings.len() >= 8 {
+            self.pending_server_settings.remove(0);
+        }
+        self.pending_server_settings.push((source, payload));
+    }
+
+    pub fn take_pending_server_settings(
+        &mut self,
+    ) -> Vec<(ServerSettingsSource, Map<String, Value>)> {
+        std::mem::take(&mut self.pending_server_settings)
     }
 
     /// Swift `isAuthenticated`.
@@ -185,6 +225,7 @@ impl SessionState {
         self.expired_at = None;
         self.cloud_viewer_key = None;
         self.cloud_enk = None;
+        self.pending_server_settings.clear();
         self.domains = ZaloDomains::default();
     }
 
@@ -214,7 +255,7 @@ impl SessionState {
             if stored.imei.chars().count() == 69 {
                 self.imei = stored.imei.clone();
             }
-        } else if is_current_imei(&stored.imei) {
+        } else if is_valid_pc_imei(&stored.imei) {
             self.imei = stored.imei.clone();
         }
         if !stored.computer_name.is_empty() {

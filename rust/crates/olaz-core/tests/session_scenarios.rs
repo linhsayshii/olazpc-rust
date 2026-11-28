@@ -954,3 +954,128 @@ async fn compare_case_detects_mismatches_and_applies_known_diffs() -> Result<(),
     assert_eq!(used_stale, vec![false]);
     Ok(())
 }
+
+#[tokio::test(start_paused = true)]
+async fn attest_flags_from_get_server_info_and_post_login_settings() -> Result<(), String> {
+    // 1. Flags absent in getServerInfo -> attest_enforced = false.
+    let absent = base_case(
+        "attest_absent",
+        Seed {
+            domains: Some(fake_domains()),
+            ..Seed::default()
+        },
+        vec![
+            server_info_ok(),
+            reqqr_ok("zalo://qr/attest-absent"),
+            http_repeat_ok("/api/login/waitScan", json!({ "error_code": 8 })),
+        ],
+        vec![cmd("start"), await_phase("login", Some("waiting_scan"))],
+    );
+    let res = run_case(&absent).await?;
+    assert_eq!(res.final_state["attest_enforced"], json!(false));
+    assert!(
+        res.requests
+            .iter()
+            .all(|r| !r.to_string().contains("app_attest")),
+        "must never send app_attest or app_attest_err"
+    );
+
+    // 2. getServerInfo sets enforce: true -> attest_enforced stays true after getLoginInfo without attest.
+    let enforced = base_case(
+        "attest_enforced_server_info",
+        Seed {
+            domains: Some(fake_domains()),
+            ..Seed::default()
+        },
+        vec![
+            http_ok(
+                "/api/login/getServerInfo",
+                json!({
+                    "error_code": 0,
+                    "setttings": {
+                        "features": {
+                            "attest": {
+                                "enable": true,
+                                "enable_on_login": true,
+                                "enforce": true,
+                                "enable_qos": false,
+                                "deactivated": false
+                            }
+                        }
+                    }
+                }),
+            ),
+            reqqr_ok("zalo://qr/attest-enforced"),
+            http_ok(
+                "/api/login/waitScan",
+                json!({ "error_code": 0, "data": { "display_name": "An", "avatar": "" } }),
+            ),
+            http_ok(
+                "/api/login/waitConfirm",
+                json!({ "error_code": 0, "data": { "zpw_sek": TEST_SEK } }),
+            ),
+            login_info_ok("200", false),
+            profile_me_ok("200", "An"),
+        ],
+        vec![cmd("start"), await_phase("ready", None)],
+    );
+    let res = run_case(&enforced).await?;
+    assert_eq!(res.final_state["phase"]["kind"], json!("ready"));
+    assert_eq!(res.final_state["attest_enforced"], json!(true));
+    assert!(
+        res.requests
+            .iter()
+            .all(|r| !r.to_string().contains("app_attest")),
+        "must never send app_attest or app_attest_err"
+    );
+
+    // 3. Restored session boot where post-login getLoginInfo enforces attest.
+    let post_login = base_case(
+        "attest_enforced_post_login",
+        Seed {
+            saved_session: Some(saved_session_json("100", "Minh", "100")),
+            ..Seed::default()
+        },
+        vec![
+            http_ok(
+                "/api/login/getLoginInfo",
+                json!({
+                    "error_code": 0,
+                    "data": {
+                        "uid": "100",
+                        "display_name": "Minh",
+                        "dkey": "dk-new",
+                        "send2me_id": "100",
+                        "zpw_enk": TEST_ENK,
+                        "zpw_sek": TEST_SEK,
+                        "need_sync_msg": false,
+                        "zpw_ws": ["ws://fake/ws"],
+                        "settings": {
+                            "features": {
+                                "attest": {
+                                    "enable": true,
+                                    "enable_on_login": false,
+                                    "enforce": true,
+                                    "enable_qos": true,
+                                    "deactivated": false
+                                }
+                            }
+                        }
+                    }
+                }),
+            ),
+            profile_me_ok("100", "Minh"),
+        ],
+        vec![cmd("start"), await_phase("ready", None)],
+    );
+    let res = run_case(&post_login).await?;
+    assert_eq!(res.final_state["phase"]["kind"], json!("ready"));
+    assert_eq!(res.final_state["attest_enforced"], json!(true));
+    assert!(
+        res.requests
+            .iter()
+            .all(|r| !r.to_string().contains("app_attest")),
+        "must never send app_attest or app_attest_err"
+    );
+    Ok(())
+}

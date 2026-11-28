@@ -1060,6 +1060,12 @@ pub struct SessionEffectRunner<T: Transport + 'static> {
     runtime: Handle,
 }
 
+fn forward_pending_server_settings<T: Transport>(client: &SessionClient<T>, sink: &ActorSink) {
+    for (source, payload) in client.take_pending_server_settings() {
+        sink.send(Input::ServerSettingsReceived { source, payload });
+    }
+}
+
 impl<T: Transport + 'static> SessionEffectRunner<T> {
     /// Starts the runner's serial host worker on `runtime` with [`LiveWsDriver`].
     #[must_use]
@@ -1444,6 +1450,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     self.spawn_cancellable(async move {
                         let (status, updated_from_login_info) =
                             client.session_status_detailed().await;
+                        forward_pending_server_settings(&client, &sink);
                         let ws_endpoints = client.domains().ws;
                         sink.send(Input::SessionStatusResult {
                             boot_gen,
@@ -1483,6 +1490,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             .request_qr(&language)
                             .await
                             .map_err(SessionFailure::from);
+                        forward_pending_server_settings(&client, &sink);
                         sink.send(Input::QrRequested { qr_gen, result });
                         drop(guard);
                     });
@@ -1519,6 +1527,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             .await
                             .map(|_| ())
                             .map_err(SessionFailure::from);
+                        forward_pending_server_settings(&client, &sink);
                         sink.send(Input::QrConfirmed { qr_gen, result });
                         drop(guard);
                     });
@@ -1538,6 +1547,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                                 profile_synced,
                             })
                             .map_err(SessionFailure::from);
+                        forward_pending_server_settings(&client, &sink);
                         sink.send(Input::LoginCompleted { qr_gen, result });
                         drop(guard);
                     });
@@ -2816,6 +2826,8 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         let pin = params.pin;
                         match api.create_reminder(&params).await {
                             Ok(resp) => {
+                                let raw_id = olaz_api::extract_created_reminder_id(&resp);
+                                let topic_id = (!raw_id.is_empty()).then_some(raw_id);
                                 let data_node = resp
                                     .get("data")
                                     .and_then(serde_json::Value::as_object)
@@ -2828,6 +2840,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                                     conv_id,
                                     pin,
                                     ok: true,
+                                    topic_id,
                                     create_keys,
                                 });
                             }
@@ -2837,10 +2850,39 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                                     conv_id,
                                     pin,
                                     ok: false,
+                                    topic_id: None,
                                     create_keys: Vec::new(),
                                 });
                             }
                         }
+                        drop(guard);
+                    });
+                }
+                Effect::PinReminderTopicApi {
+                    op_id,
+                    conv_id,
+                    topic_id,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.runtime.spawn(async move {
+                        let (ok, status) = match api.pin_board_item(&conv_id, &topic_id, 0).await {
+                            Ok(_) => (true, "ok".to_owned()),
+                            Err(err) => (
+                                false,
+                                err.session_error().map_or_else(
+                                    || "err(net)".to_owned(),
+                                    |s| format!("err(code={})", s.code),
+                                ),
+                            ),
+                        };
+                        sink.send(Input::ReminderPinDone {
+                            op_id,
+                            conv_id,
+                            ok,
+                            status,
+                        });
                         drop(guard);
                     });
                 }
@@ -5270,6 +5312,7 @@ async fn run_host_worker<T: Transport + 'static>(deps: HostWorkerDeps<T>) {
                         });
                         match client.complete_login_detailed().await {
                             Ok((account, profile_synced)) if client.is_authenticated() => {
+                                forward_pending_server_settings(&client, &sink);
                                 let ws_endpoints = client.domains().ws;
                                 sink.send(Input::LegacyCookieResult {
                                     boot_gen,

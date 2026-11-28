@@ -24,7 +24,7 @@ fn chromium_api_headers_keep_caller_values_and_session_cookie() {
         ("ACCEPT".into(), "custom".into()),
     ];
     let spec = build_request(&options, Some("sek.1.2")).unwrap();
-    assert_eq!(spec.header("user-agent"), Some("ZaloPC-darwin-23v694"));
+    assert_eq!(spec.header("user-agent"), Some("ZaloPC-darwin-23v695"));
     assert_eq!(spec.header("Cookie"), Some("zpw_sek=sek.1.2"));
     assert_eq!(spec.header("zpw_sek"), None);
     assert_eq!(spec.header("accept"), Some("custom"));
@@ -466,12 +466,25 @@ fn restore_rules_for_legacy_type_and_bad_accounts() {
     );
     assert!(!s.domains.preferred_hosts.contains_key("chat"));
 
-    // Current type: an IMEI that does not end in md5(userAgent) is not adopted.
+    // Current type: a malformed IMEI is not adopted; freshly minted IMEI is kept.
     snap.zpw_type = Some("23".to_owned());
     let mut s = SessionState::new(IMEI.to_owned(), "n".to_owned());
     assert!(s.restore(snap.clone()));
     assert!(!s.needs_pc_type_upgrade);
     assert_eq!(s.imei, IMEI);
+
+    // Current type: a well-formed 694 IMEI survives restore under 695 without suffix rotation.
+    let imei_694 = format!(
+        "00000000-0000-4000-8000-000000000001-{}",
+        olaz_crypto::md5_hex("ZaloPC-darwin-23v694")
+    );
+    assert_ne!(imei_694, IMEI);
+    let mut snap_694 = snap.clone();
+    snap_694.imei = imei_694.clone();
+    let mut s_694 = SessionState::new(IMEI.to_owned(), "n".to_owned());
+    assert!(s_694.restore(snap_694));
+    assert!(!s_694.needs_pc_type_upgrade);
+    assert_eq!(s_694.imei, imei_694);
 
     // Accounts without usable key / sek do not restore.
     for (enk, sek) in [("", "a.b"), ("0123456789abcdef", ""), ("short", "a.b")] {

@@ -56,6 +56,7 @@ struct OlazApp: App {
                 .modifier(ShellMinimumSize(shell: shell))
                 .task {
                     engine.start()
+                    engine.scheduleRuntimeUpgradeCheck()
                     await EngineProbe.runUISmokeIfRequested(engine: engine, shell: shell)
                     await PerfProbe.runIfRequested(engine: engine, shell: shell)
                 }
@@ -129,7 +130,7 @@ private struct ShellMinimumSize: ViewModifier {
     let shell: ShellModel
 
     func body(content: Content) -> some View {
-        content.frame(minWidth: shell.holdsInspectorRoom ? shell.inspectorMinWidth : InspectorRoom.windowMinWidth,
+        content.frame(minWidth: shell.holdsInspectorRoom ? InspectorRoom.windowMinWidthWithInspector : InspectorRoom.windowMinWidth,
                       minHeight: 620)
     }
 }

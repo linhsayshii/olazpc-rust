@@ -130,7 +130,7 @@ pub use runner::{
 };
 pub use search::{SearchState, message_matches_folded_needle, message_matches_search_query};
 pub use state::{
-    CoreFailKind, CoreSnapshot, CoreState, FailReason, LoginState, LoginStep,
+    AttestFlags, CoreFailKind, CoreSnapshot, CoreState, FailReason, LoginState, LoginStep,
     PersistedTransportState, Phase, Profile, SessionSnapshot, SessionState, TransportState,
     WsPhase,
 };
