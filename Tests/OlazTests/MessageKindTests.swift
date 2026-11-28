@@ -118,4 +118,84 @@ import Foundation
         guard case .ecard(let card) = try kind(#"{"type":"ecard","reminderStart":1e300}"#) else { return }
         #expect(card.reminderStart == nil)
     }
+
+    @Test func videoAndVoiceWireDurationsAreAlwaysMilliseconds() throws {
+        // Video floors ms -> seconds (official IzMZ + pYkA) and switches to h:mm:ss at >= 3_600_000 ms.
+        let videoCases: [(Int64, Int, String)] = [
+            (0, 0, "0:00"),
+            (8_000, 8, "0:08"),
+            (10_000, 10, "0:10"),
+            (59_999, 59, "0:59"),
+            (3_600_000, 3_600, "1:00:00"),
+        ]
+        for (rawMs, wantSec, wantClock) in videoCases {
+            let raw: [String: Any] = [
+                "msgId": "v\(rawMs)",
+                "uidFrom": "u_peer",
+                "idTo": "u_me",
+                "msgType": "chat.video.msg",
+                "ts": 1_760_000_000_000 as Int64,
+                "content": ["href": "https://cdn.example.invalid/v.mp4", "params": #"{"duration":\#(rawMs)}"#]
+            ]
+            guard case .message(let msg, let stored) = ZaloWireParser.parseWireMessage(raw, myUid: "u_me") else {
+                Issue.record("expected video message for \(rawMs)")
+                continue
+            }
+            guard case .video(_, let dur, _) = msg.kind else {
+                Issue.record("expected .video kind for \(rawMs)")
+                continue
+            }
+            #expect(dur == wantSec, "video rawMs=\(rawMs)")
+            #expect(ChatFormat.clock(dur) == wantClock, "video clock rawMs=\(rawMs)")
+            // Cached SQLite rows store seconds and must not be divided again on read.
+            let restored = try #require(ZaloWireParser.decodeStoredMessage(stored))
+            #expect(restored.kind == msg.kind, "video stored roundtrip rawMs=\(rawMs)")
+        }
+
+        // Voice rounds ms -> nearest second (official zV/HV/XV: Math.round(ms / 1e3)).
+        let voiceCases: [(Int64, Int, String)] = [
+            (0, 0, "0:00"),
+            (8_000, 8, "0:08"),
+            (10_000, 10, "0:10"),
+            (12_500, 13, "0:13"),
+            (59_999, 60, "1:00"),
+            (3_600_000, 3_600, "1:00:00"),
+        ]
+        for (rawMs, wantSec, wantClock) in voiceCases {
+            let raw: [String: Any] = [
+                "msgId": "a\(rawMs)",
+                "uidFrom": "u_peer",
+                "idTo": "u_me",
+                "msgType": "chat.voice",
+                "ts": 1_760_000_000_000 as Int64,
+                "content": ["href": "https://cdn.example.invalid/a.m4a", "params": #"{"duration":\#(rawMs)}"#]
+            ]
+            guard case .message(let msg, let stored) = ZaloWireParser.parseWireMessage(raw, myUid: "u_me") else {
+                Issue.record("expected voice message for \(rawMs)")
+                continue
+            }
+            guard case .voice(_, let dur) = msg.kind else {
+                Issue.record("expected .voice kind for \(rawMs)")
+                continue
+            }
+            #expect(dur == wantSec, "voice rawMs=\(rawMs)")
+            #expect(ChatFormat.clock(dur) == wantClock, "voice clock rawMs=\(rawMs)")
+            let restored = try #require(ZaloWireParser.decodeStoredMessage(stored))
+            #expect(restored.kind == msg.kind, "voice stored roundtrip rawMs=\(rawMs)")
+        }
+    }
+
+    @MainActor @Test func storedSecondsAreNotDividedAgain() throws {
+        #expect(try kind(#"{"type":"video","thumbnail":"","duration":10,"url":"https://v/a.mp4"}"#)
+                == .video(thumbnail: nil, duration: 10, url: URL(string: "https://v/a.mp4")))
+        #expect(try kind(#"{"type":"video","thumbnail":"","duration":3600,"url":"https://v/b.mp4"}"#)
+                == .video(thumbnail: nil, duration: 3600, url: URL(string: "https://v/b.mp4")))
+        #expect(try kind(#"{"type":"voice","url":"https://v/a.m4a","duration":8}"#)
+                == .voice(url: URL(string: "https://v/a.m4a"), duration: 8))
+        #expect(ChatFormat.clock(10) == "0:10")
+        #expect(ChatFormat.clock(8) == "0:08")
+        #expect(ChatFormat.clock(59) == "0:59")
+        #expect(ChatFormat.clock(3600) == "1:00:00")
+        #expect(CloudFormat.duration(3600) == "1:00:00")
+    }
 }

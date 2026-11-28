@@ -257,7 +257,7 @@ extension ZaloEngine {
                     )
                     let thumbURL = res.thumbUrl.isEmpty ? nil : URL(string: res.thumbUrl)
                     let videoURL = res.url.isEmpty ? nil : URL(string: res.url)
-                    let durSec = res.durationMs > 0 ? max(1, Int((Double(res.durationMs) / 1000.0).rounded())) : 0
+                    let durSec = ZaloWireParser.videoDurationSeconds(Int64(res.durationMs))
                     await recordUploadedMessage(
                         convId: id, msgId: res.msgId, cliId: res.cliMsgId,
                         kind: .video(thumbnail: thumbURL, duration: durSec, url: videoURL),

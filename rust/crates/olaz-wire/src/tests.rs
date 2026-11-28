@@ -1049,7 +1049,7 @@ fn location_poll_ecard_voice_video_kinds() {
         voice.kind,
         Kind::Voice {
             url: Some("https://v/a.m4a".into()),
-            duration: 12
+            duration: 13
         }
     );
     let (poll, _) = msg_of(parse(
@@ -1319,4 +1319,65 @@ fn text_properties_json_matches_swift_send_jsonl_shapes() {
     let parsed: Value = serde_json::from_str(&serialized).unwrap();
     assert_eq!(parsed["ver"], 0);
     assert_eq!(TextStyle::list(parsed.get("styles")), multi);
+}
+
+#[test]
+fn video_and_voice_wire_durations_always_milliseconds() {
+    // Video uses floor(ms / 1000) per official IzMZ + pYkA.
+    let video_cases: &[(i64, i64)] = &[
+        (-500, 0),
+        (0, 0),
+        (999, 0),
+        (8_000, 8),
+        (10_000, 10),
+        (59_999, 59),
+        (3_600_000, 3_600),
+    ];
+    for &(raw_ms, want_sec) in video_cases {
+        let raw = format!(
+            r#"{{"msgId":"v{raw_ms}","uidFrom":"p","idTo":"me","msgType":"chat.video.msg","ts":1760000000000,"content":{{"href":"https://v/clip.mp4","params":"{{\"duration\":{raw_ms}}}"}}}}"#
+        );
+        let (msg, stored) = msg_of(parse(&raw, "me"));
+        assert_eq!(
+            msg.kind,
+            Kind::Video {
+                thumbnail: None,
+                duration: want_sec,
+                url: Some("https://v/clip.mp4".into()),
+            },
+            "video raw_ms={raw_ms}"
+        );
+        // Stored SQLite rows already hold seconds and must NOT be divided again on read.
+        let roundtrip = decode_stored_message(&stored).unwrap();
+        assert_eq!(roundtrip.kind, msg.kind, "video stored roundtrip raw_ms={raw_ms}");
+    }
+
+    // Voice uses Math.round(ms / 1000) per official zV/HV/XV.
+    let voice_cases: &[(i64, i64)] = &[
+        (-500, 0),
+        (0, 0),
+        (499, 0),
+        (500, 1),
+        (8_000, 8),
+        (10_000, 10),
+        (12_500, 13),
+        (59_999, 60),
+        (3_600_000, 3_600),
+    ];
+    for &(raw_ms, want_sec) in voice_cases {
+        let raw = format!(
+            r#"{{"msgId":"a{raw_ms}","uidFrom":"p","idTo":"me","msgType":"chat.voice","ts":1760000000000,"content":{{"href":"https://v/a.m4a","params":"{{\"duration\":{raw_ms}}}"}}}}"#
+        );
+        let (msg, stored) = msg_of(parse(&raw, "me"));
+        assert_eq!(
+            msg.kind,
+            Kind::Voice {
+                url: Some("https://v/a.m4a".into()),
+                duration: want_sec,
+            },
+            "voice raw_ms={raw_ms}"
+        );
+        let roundtrip = decode_stored_message(&stored).unwrap();
+        assert_eq!(roundtrip.kind, msg.kind, "voice stored roundtrip raw_ms={raw_ms}");
+    }
 }

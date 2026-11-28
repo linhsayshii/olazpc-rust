@@ -34,6 +34,24 @@ enum ParsedWireEvent: Sendable {
 }
 
 enum ZaloWireParser {
+    /// Official Zalo PC 26.11.10 (`app.asar`, zpw_ver 695) always carries wire `params.duration`
+    /// (and video fallback `message.duration`) in milliseconds:
+    /// - Video (`pc-dist/lazy/main-startup.89bb530b91927fd5dd28.js` @ 1322193 `dP`,
+    ///   `pc-dist/compact-app-pc.cfeba43a9a8e4e40dda3.js` @ 6503091 `IzMZ` -> @ 17988477 `pYkA`)
+    ///   floors milliseconds to whole seconds (`Math.floor(ms / 1000)`).
+    /// - Voice (`main-startup` @ 1322586 `hP`, `zV`/`HV`/`XV` @ 1486777, 1493721, 1498282)
+    ///   rounds milliseconds to the nearest second (`Math.round(ms / 1e3)`).
+    static func videoDurationSeconds(_ rawMs: Int64) -> Int {
+        guard rawMs > 0 else { return 0 }
+        return Int(rawMs / 1000)
+    }
+
+    static func voiceDurationSeconds(_ rawMs: Int64) -> Int {
+        guard rawMs > 0 else { return 0 }
+        let (sum, overflow) = rawMs.addingReportingOverflow(500)
+        return Int((overflow ? Int64.max : sum) / 1000)
+    }
+
     // MARK: - Conversation ID Normalization
 
     static func cleanGroupId(_ raw: String) -> String {
@@ -568,8 +586,8 @@ enum ZaloWireParser {
                 JSONLossless.string(contentDict?["thumbUrl"]),
                 JSONLossless.string(contentParams?["thumb"])
             )
-            let durRaw = (JSONLossless.int64(contentParams?["duration"] ?? contentDict?["duration"]) ?? 0)
-            let durSec = durRaw > 10_000 ? Int(durRaw / 1000) : Int(durRaw)
+            let durRaw = JSONLossless.int64(contentParams?["duration"] ?? contentDict?["duration"]) ?? 0
+            let durSec = videoDurationSeconds(durRaw)
             textBody = JSONLossless.string(contentDict?["title"])
             var vDict: [String: Any] = ["type": "video", "thumbnail": thumbStr, "duration": durSec, "url": urlStr]
             if !fallbackStrs.isEmpty { vDict["fallbacks"] = fallbackStrs }
@@ -585,7 +603,7 @@ enum ZaloWireParser {
                 JSONLossless.string(contentParams?["m4a"])
             )
             let durRaw = JSONLossless.int64(contentParams?["duration"] ?? contentDict?["duration"]) ?? 0
-            let durSec = durRaw > 10_000 ? Int(durRaw / 1000) : Int(durRaw)
+            let durSec = voiceDurationSeconds(durRaw)
             kindDict = ["type": "voice", "url": urlStr, "duration": durSec]
             kindTag = "voice"
             textBody = "[Tin nhắn thoại]"
