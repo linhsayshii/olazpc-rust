@@ -733,6 +733,8 @@ struct ComposerTextView: NSViewRepresentable {
     @MainActor final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: ComposerTextView
         var lastFocusTick = 0
+        /// Set while a whole-token replacement asks `shouldChangeText` (see `textView(_:shouldChangeTextIn:replacementString:)`).
+        private var replacingToken = false
         init(_ parent: ComposerTextView) { self.parent = parent }
 
         /// Text set from outside (restored draft) while composing: `base` is what the field held then.
@@ -794,7 +796,9 @@ struct ComposerTextView: NSViewRepresentable {
 
         /// A mention is atomic: any edit touching it replaces/deletes the whole token.
         func textView(_ tv: NSTextView, shouldChangeTextIn range: NSRange, replacementString: String?) -> Bool {
-            guard let storage = tv.textStorage, storage.length > 0, !tv.hasMarkedText() else { return true }
+            // `shouldChangeText(in: expanded)` below asks this delegate again; that inner call is the whole-token edit itself, so it
+            // goes through instead of recursing until the stack overflows.
+            guard !replacingToken, let storage = tv.textStorage, storage.length > 0, !tv.hasMarkedText() else { return true }
             var expanded = range
             var touched = false
             storage.enumerateAttribute(.zaloMention, in: NSRange(location: 0, length: storage.length)) { value, tokenRange, _ in
@@ -806,7 +810,10 @@ struct ComposerTextView: NSViewRepresentable {
             }
             guard touched, expanded.location != NSNotFound else { return true }
             let replacement = NSAttributedString(string: replacementString ?? "", attributes: ComposerTextView.baseAttributes)
-            guard tv.shouldChangeText(in: expanded, replacementString: replacement.string) else { return false }
+            replacingToken = true
+            let allowed = tv.shouldChangeText(in: expanded, replacementString: replacement.string)
+            replacingToken = false
+            guard allowed else { return false }
             storage.replaceCharacters(in: expanded, with: replacement)
             tv.didChangeText()
             tv.setSelectedRange(NSRange(location: expanded.location + replacement.length, length: 0))
