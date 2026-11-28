@@ -49,16 +49,16 @@ use crate::conversations::{
 };
 use crate::error::{CoreError, NetworkKind};
 use crate::messages::{
-    ContactsStateRecord, FreshnessMapEntry, MessageMetaRecord, MuteEntryRecord, WindowDeltaRecord,
-    records_to_chat_messages,
+    BlockedUserRecord, ContactsStateRecord, FreshnessMapEntry, MessageMetaRecord, MuteEntryRecord,
+    PersonLookupRecord, SaveAliasResultRecord, WindowDeltaRecord, records_to_chat_messages,
 };
 use crate::notify::{
     AliasEntryRecord, ContactCardStateRecord, ContactProfileRecord, FriendRequestOriginRecord,
     FriendRequestPrepRecord, GroupInvitePreviewRecord, GroupJoinRecord, NotifAuthorizationRecord,
     NotificationSettingsRecord, NotifyBannerPayloadRecord, PinReminderRefRecord,
-    ReminderRespondersRecord, ReminderSnapshotRecord, RespondReminderRecord, SaveAliasRecord,
-    SubmitFriendRecord, SuggestedStickerRecord, alias_map_to_records,
-    default_failed_respond_reminder_record, default_unsupported_card_record,
+    ReminderRespondersRecord, ReminderSnapshotRecord, RespondReminderRecord, SubmitFriendRecord,
+    SuggestedStickerRecord, alias_map_to_records, default_failed_respond_reminder_record,
+    default_unsupported_card_record,
 };
 use crate::polls::{
     PollActionOutcomeRecord, PollCapabilitiesOutcomeRecord, PollConfigRecord,
@@ -379,6 +379,7 @@ pub struct SessionStateRecord {
     pub profile: Option<ProfileRecord>,
     pub sign_out_notice: Option<String>,
     pub self_conversation_id: Option<String>,
+    pub attest_enforced: bool,
 }
 
 impl fmt::Debug for SessionStateRecord {
@@ -388,6 +389,7 @@ impl fmt::Debug for SessionStateRecord {
             .field("has_profile", &self.profile.is_some())
             .field("has_sign_out_notice", &self.sign_out_notice.is_some())
             .field("has_self_conv", &self.self_conversation_id.is_some())
+            .field("attest_enforced", &self.attest_enforced)
             .finish()
     }
 }
@@ -399,6 +401,7 @@ impl From<SessionSnapshot> for SessionStateRecord {
             profile: s.profile.map(Into::into),
             sign_out_notice: s.sign_out_notice,
             self_conversation_id: s.self_conversation_id,
+            attest_enforced: s.attest_enforced,
         }
     }
 }
@@ -2380,7 +2383,7 @@ impl CoreOfflineConversations {
     ) {
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let (state, _) = &mut *guard;
-        state.conversations.identities = identities.into();
+        state.contacts.apply_identity_table(identities.into());
         state.conversations.open_conversation_id = open_conv_id;
         state.session.self_conversation_id = self_conv_id;
         if !my_uid.is_empty() {
@@ -4944,28 +4947,6 @@ impl CoreEngine {
         .await
     }
 
-    pub async fn save_alias(
-        &self,
-        uid: String,
-        name: String,
-    ) -> Result<SaveAliasRecord, CoreError> {
-        let handle = Arc::clone(&self.handle);
-        let runner = Arc::clone(&self.runner);
-        run(async move {
-            let out = match handle.request(Command::SaveAlias { uid, name }).await {
-                Some(olaz_core::OpResult::SaveAlias(r)) => r.into(),
-                _ => SaveAliasRecord {
-                    ok: false,
-                    text: "Không lưu được tên gợi nhớ.".to_owned(),
-                },
-            };
-            runner.flush_store().await;
-            let _ = handle.settle().await;
-            out
-        })
-        .await
-    }
-
     pub async fn group_invite_preview(
         &self,
         url: String,
@@ -5843,6 +5824,199 @@ impl CoreEngine {
         });
     }
 
+    // --- Contacts, friend requests, phone lookup, block, alias (U9) ---
+
+    /// Synchronously resolves `(name, avatar)` from the lock-free `IdentitySnapshot`.
+    #[must_use]
+    pub fn lookup_person_info(&self, uid: String) -> Option<PersonLookupRecord> {
+        self.handle
+            .identity_snapshot()
+            .lookup_person(&uid)
+            .map(|h| PersonLookupRecord {
+                name: h.name,
+                avatar: h.avatar,
+            })
+    }
+
+    /// Synchronously resolves `@mention` display name from the lock-free `IdentitySnapshot`.
+    #[must_use]
+    pub fn mention_display_name(&self, uid: String) -> Option<String> {
+        self.handle.identity_snapshot().mention_display_name(&uid)
+    }
+
+    pub fn refresh_contacts(&self) {
+        self.handle.send(Command::RefreshContacts);
+    }
+
+    pub async fn perform_contacts_sync(&self) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let _ = handle.request(Command::PerformContactsSync).await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn accept_friend_request(&self, uid: String) {
+        self.handle.send(Command::AcceptFriendRequest { uid });
+    }
+
+    pub async fn accept_friend_request_and_wait(&self, uid: String) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let _ = handle.request(Command::AcceptFriendRequest { uid }).await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn decline_friend_request(&self, uid: String) {
+        self.handle.send(Command::DeclineFriendRequest { uid });
+    }
+
+    pub async fn decline_friend_request_and_wait(&self, uid: String) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            let _ = handle.request(Command::DeclineFriendRequest { uid }).await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn cancel_friend_request(&self, uid: String) {
+        self.handle.send(Command::CancelFriendRequest { uid });
+    }
+
+    pub async fn cancel_friend_request_and_wait(&self, uid: String) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            let _ = handle.request(Command::CancelFriendRequest { uid }).await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn send_friend_request(&self, uid: String, message: String) {
+        self.handle
+            .send(Command::SendFriendRequest { uid, message });
+    }
+
+    pub async fn send_friend_request_and_wait(
+        &self,
+        uid: String,
+        message: String,
+    ) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let _ = handle
+                .request(Command::SendFriendRequest { uid, message })
+                .await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn find_friend_by_phone(&self, phone: String) {
+        self.handle.send(Command::FindFriendByPhone { phone });
+    }
+
+    pub async fn find_friend_by_phone_and_wait(&self, phone: String) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            let _ = handle.request(Command::FindFriendByPhone { phone }).await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn reset_friend_search(&self) {
+        self.handle.send(Command::ResetFriendSearch);
+    }
+
+    pub fn handle_contacts_state(&self, state_json: String) {
+        self.handle
+            .send(Command::HandleContactsState { state_json });
+    }
+
+    pub async fn load_blocked_users(&self) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            let _ = handle.request(Command::LoadBlockedUsers).await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub async fn set_blocked(
+        &self,
+        uid: String,
+        blocked: bool,
+        name: String,
+    ) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let _ = handle
+                .request(Command::SetBlocked { uid, blocked, name })
+                .await;
+            runner.flush_host().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub async fn save_alias(
+        &self,
+        uid: String,
+        name: String,
+    ) -> Result<SaveAliasResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let res = handle.request_save_alias(uid, name).await;
+            runner.flush_store().await;
+            let _ = handle.settle().await;
+            res.into()
+        })
+        .await
+    }
+
+    pub fn seed_blocked_users(&self, users: Option<Vec<BlockedUserRecord>>) {
+        self.handle.send(Command::SeedBlockedUsers(
+            users.map(|v| v.into_iter().map(Into::into).collect()),
+        ));
+    }
+
     /// Stops the actor, aborts in-flight session & transport tasks, and closes `next_changes()`.
     pub fn stop(&self) {
         self.handle.stop();
@@ -5854,12 +6028,16 @@ mod tests {
     use super::*;
     use crate::conversations::ConversationPreviewRecord;
 
-    struct NoopCoreHost;
+    #[derive(Default)]
+    struct NoopCoreHost {
+        saved_session: Option<String>,
+        allow_ws: bool,
+    }
 
     #[async_trait::async_trait]
     impl CoreHost for NoopCoreHost {
         async fn load_saved_session(&self) -> Option<String> {
-            None
+            self.saved_session.clone()
         }
         async fn load_legacy_cookie(&self) -> Option<LegacyCookieRecord> {
             None
@@ -5870,7 +6048,7 @@ mod tests {
         async fn set_pref(&self, _key: String, _value: String) {}
         async fn prepare_store(&self, _user_id: String, _account: LoginAccountRecord) {}
         async fn on_ws_started(&self, _endpoints: Vec<String>) -> bool {
-            false
+            self.allow_ws
         }
         async fn on_long_poll_started(&self) -> bool {
             false
@@ -6144,7 +6322,7 @@ mod tests {
     async fn core_engine_apply_account_profile_delivers_changes_and_stops() -> Result<(), CoreError>
     {
         let session = CoreSession::with_config("imei-1".to_owned(), "Mac".to_owned(), None)?;
-        let engine = CoreEngine::new(session, Arc::new(NoopCoreHost))?;
+        let engine = CoreEngine::new(session, Arc::new(NoopCoreHost::default()))?;
         let acc = LoginAccountRecord {
             user_id: "42".to_owned(),
             display_name: "Linh".to_owned(),
@@ -6182,7 +6360,7 @@ mod tests {
     #[tokio::test]
     async fn core_engine_u3_message_and_hidden_pin_flow() -> Result<(), CoreError> {
         let session = CoreSession::with_config("imei-2".to_owned(), "Mac".to_owned(), None)?;
-        let engine = CoreEngine::new(session, Arc::new(NoopCoreHost))?;
+        let engine = CoreEngine::new(session, Arc::new(NoopCoreHost::default()))?;
 
         engine.update_conversation_on_message(
             MessagePreviewInputRecord {
@@ -6220,6 +6398,103 @@ mod tests {
         assert!(!engine.check_hidden_pin("9999".to_owned()).await?);
 
         engine.stop();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "Tungstenite fixes the server callback error type to an HTTP response"
+    )]
+    async fn core_engine_session_languages_reach_real_ws_upgrade()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use olaz_net::ZaloDomains;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+
+        let http = TcpListener::bind("127.0.0.1:0").await?;
+        let http_base = format!("http://{}", http.local_addr()?);
+        let http_server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = http.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0u8; 8192];
+                    let _ = socket.read(&mut request).await;
+                    let body = br#"{"error_code":0,"data":{}}"#;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                });
+            }
+        });
+        let ws = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", ws.local_addr()?);
+        let (tx, rx) = oneshot::channel();
+        let ws_server = tokio::spawn(async move {
+            let (socket, _) = ws.accept().await?;
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                socket,
+                move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                      response| {
+                    let _ = tx.send(request.headers().clone());
+                    Ok(response)
+                },
+            )
+            .await?;
+            socket.close(None).await
+        });
+        let domains = ZaloDomains {
+            auth: http_base.clone(),
+            wpa_chat: http_base.clone(),
+            ws: vec![endpoint],
+            isolated: true,
+            service_candidates: std::collections::BTreeMap::from([(
+                "profile".into(),
+                vec![http_base],
+            )]),
+            ..ZaloDomains::default()
+        };
+        let snapshot = serde_json::json!({
+            "zpwType":"23", "imei":"imei-language-test", "computerName":"Mac",
+            "domains":domains,
+            "plainAccount":{"userId":"100","displayName":"Test","avatar":"","phone":"",
+                "send2MeId":"100","dkey":"","zpwEnk":"0123456789abcdef","zpwSek":"sek.1.2"},
+            "expiredAt":null,"sealedSecretsBase64":null,
+        })
+        .to_string();
+        let session = CoreSession::with_client_config(
+            "imei-language-test".into(),
+            "Mac".into(),
+            Some(serde_json::to_string(&domains)?),
+            vec!["vi_VN".into(), "en-US".into()],
+        )?;
+        let engine = CoreEngine::new(
+            session,
+            Arc::new(NoopCoreHost {
+                saved_session: Some(snapshot),
+                allow_ws: true,
+            }),
+        )?;
+        engine.start();
+        let result = tokio::time::timeout(Duration::from_secs(10), rx).await;
+        engine.stop();
+        http_server.abort();
+        ws_server.abort();
+        let headers = result??;
+        assert_eq!(
+            headers.get("accept-language").and_then(|v| v.to_str().ok()),
+            Some("vi-VN,en-US;q=0.9")
+        );
+        assert_eq!(
+            headers.get("origin").and_then(|v| v.to_str().ok()),
+            Some("file://")
+        );
+        assert!(!headers.contains_key("zpw_sek"));
+        assert!(!headers.contains_key("cookie")); // local host must not receive the session secret
         Ok(())
     }
 

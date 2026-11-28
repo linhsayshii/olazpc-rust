@@ -75,7 +75,7 @@ struct PinTests {
     /// pin_force_sync carries `conversationIds` (official `_processFriendCtrlEvents` → OneOnOne controller).
     @Test func friendPinEventConversations() throws {
         for act in ["pin_create", "pin_unpin", "pin_reorder"] {
-            #expect(ZaloWireParser.pinTopicEventConversations(actType: "fr", act: act, data: ["conversationId": "8268371147601882821"]) == ["8268371147601882821"])
+            #expect(ZaloWireParser.pinTopicEventConversations(actType: "fr", act: act, data: ["conversationId": "3000103"]) == ["3000103"])
         }
         #expect(ZaloWireParser.pinTopicEventConversations(actType: "fr", act: "pin_force_sync", data: ["conversationIds": [111, "222"]]) == ["111", "222"])
         #expect(ZaloWireParser.pinTopicEventConversations(actType: "fr", act: "add", data: ["conversationId": "1"]).isEmpty)
@@ -100,14 +100,14 @@ struct PinTests {
     @Test func friendBoardListBoxing() throws {
         let topic: [String: Any] = [
             "id": 9_100_000_000_123 as Int64, "type": 2,
-            "params": #"{"senderUid":"0","client_msg_id":"1700000000123","global_msg_id":"7401234567890123456","msg_type":1,"title":"a đi dạy về ah"}"#
+            "params": #"{"senderUid":"0","client_msg_id":"1700000000123","global_msg_id":"7401234567890123456","msg_type":1,"title":"Hẹn gặp lúc 10 giờ nhé"}"#
         ]
         let asObject = ZaloWireParser.friendBoardListBox(["data": ["data": [topic], "version": 4]])
         let parsed = ZaloWireParser.parseBoardTopics(asObject, convId: "12345")
         #expect(parsed.version == 4)
         #expect(parsed.list.items.map(\.ref) == ["9100000000123"])
         #expect(parsed.list.items.first?.msgId == "7401234567890123456")
-        #expect(parsed.list.items.first?.title == "a đi dạy về ah")
+        #expect(parsed.list.items.first?.title == "Hẹn gặp lúc 10 giờ nhé")
 
         let json = #"{"data":[{"id":9100000000124,"type":2,"params":{"global_msg_id":"7401234567890000001","client_msg_id":"1699999999000","title":"x"}}],"version":5}"#
         let asString = ZaloWireParser.friendBoardListBox(["data": json])

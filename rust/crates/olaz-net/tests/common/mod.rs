@@ -8,7 +8,7 @@ use olaz_net::{
 use serde_json::{Map, Value};
 
 pub const KEY: &[u8] = b"0123456789abcdef";
-pub const IMEI: &str = "123e4567-e89b-42d3-a456-426614174000-f39f277f3586bbc6c6ab67a11a27cc0a";
+pub const IMEI: &str = "123e4567-e89b-42d3-a456-426614174000-4de6480f07c0153bac11c76cab0f7e34";
 pub const NOW_MS: i64 = 1_700_000_000_123;
 pub const H1: &str = "https://h1.zaloapp.com";
 pub const H2: &str = "https://h2.zaloapp.com";

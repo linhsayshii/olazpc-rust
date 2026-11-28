@@ -61,8 +61,9 @@ impl Default for WsTimings {
 pub struct WsConfig {
     /// `wss://host` bases (rotated on reconnect). Empty means [`DEFAULT_WS_ENDPOINTS`].
     pub endpoints: Vec<String>,
-    /// Session key (`zpw_sek`): sent as cookie/header only, never logged.
+    /// Session key (`zpw_sek`): sent as cookies only, never logged.
     pub zpw_sek: String,
+    pub preferred_languages: Vec<String>,
     /// Cursors to resume from (`seedQueueCursors`).
     pub seed_cursors: CursorMap,
     /// Persist-cursors hook (`setQueueCursorObserver`).
@@ -77,6 +78,7 @@ impl WsConfig {
         Self {
             endpoints,
             zpw_sek: zpw_sek.into(),
+            preferred_languages: Vec::new(),
             seed_cursors: CursorMap::new(),
             on_cursors_changed: None,
             timings: WsTimings::default(),
@@ -121,6 +123,7 @@ impl WsClient {
             ),
             endpoints,
             zpw_sek: config.zpw_sek,
+            preferred_languages: config.preferred_languages,
             timings: t,
             cmds: cmd_rx,
             events: event_tx,

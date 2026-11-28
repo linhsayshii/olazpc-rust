@@ -283,13 +283,13 @@ fn swift_golden_sign_key() {
         ("zcid", "ABC"),
         ("params", "Xin chào"),
         ("type", "30"),
-        ("client_version", "694"),
+        ("client_version", "695"),
         ("enc_ver", "v2"),
         ("zcid_ext", "ff00"),
     ]);
     assert_eq!(
         sign_key("getlogininfo", &login),
-        "c1fe11b19f793f57028ca66f582dfab7"
+        "a6881acaf5de29d9a871f160146c893d"
     );
     // Mixed-case / digit / underscore / non-ASCII keys (byte order equals Swift order here).
     let mixed = map(&[
@@ -333,12 +333,12 @@ fn swift_golden_param_cipher() {
     );
     let payload: Value = serde_json::from_str(r#"{"k":"v"}"#).unwrap();
     let signed = pc
-        .build_signed_params("30", "694", &payload, "getlogininfo")
+        .build_signed_params("30", "695", &payload, "getlogininfo")
         .unwrap();
     let joined: Vec<String> = signed.iter().map(|(k, v)| format!("{k}={v}")).collect();
     assert_eq!(
         joined.join("&"),
-        "client_version=694&enc_ver=v2&params=dEbpBYDYRUXcDVTnfO4ZUw==&signkey=7557455d912e489a38480fba9109d34d&type=30&zcid=ED3558BE77FD013C5C15B8029C037490A60ECB3D4783AB73252D7B11AC4C2E22&zcid_ext=5be85c628d"
+        "client_version=695&enc_ver=v2&params=dEbpBYDYRUXcDVTnfO4ZUw==&signkey=52ad2cc1450e2b1719b08a415ceb67ee&type=30&zcid=ED3558BE77FD013C5C15B8029C037490A60ECB3D4783AB73252D7B11AC4C2E22&zcid_ext=5be85c628d"
     );
     let c0 = ParamCipher::with_zcid_ext("30", "imei", 0, "x".into()).unwrap();
     assert_eq!(c0.zcid(), "B81147BF86B5ABF87B612C22ED212ED0");

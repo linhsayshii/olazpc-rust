@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use olaz_core::conversations::{CachedProfile, FriendIdentity};
+use olaz_core::conversations::{CachedProfile, FriendIdentity, IdentityTable};
 use olaz_core::effect::{Effect, HistoryFetchPurpose, HostCall, StoreOp};
 use olaz_core::input::{Command, Input};
 use olaz_core::messages::{HistoryFreshness, WindowDelta};
@@ -130,10 +130,13 @@ fn m02_open_up_to_date_skips_history_fetch_and_emits_pins_and_mark_read() {
         .messages
         .history_freshness
         .insert("friend_1".to_owned(), HistoryFreshness::UpToDate);
-    state.conversations.identities.friends.push(FriendIdentity {
-        id: "friend_1".to_owned(),
-        name: "Alice".to_owned(),
-        avatar: Some("https://cdn.example.invalid/alice.jpg".to_owned()),
+    state.contacts.apply_identity_table(IdentityTable {
+        friends: vec![FriendIdentity {
+            id: "friend_1".to_owned(),
+            name: "Alice".to_owned(),
+            avatar: Some("https://cdn.example.invalid/alice.jpg".to_owned()),
+        }],
+        ..IdentityTable::default()
     });
 
     let preloaded = vec![make_msg(
@@ -295,7 +298,7 @@ fn m04_refresh_reaction_names_updates_in_memory_and_emits_save_messages() {
     );
 
     // Add peer_b to cached_profiles and refresh reaction names
-    state.conversations.identities.cached_profiles.insert(
+    state.contacts.cached_profiles.insert(
         "peer_b".to_owned(),
         CachedProfile {
             name: "Bob Reactor".to_owned(),

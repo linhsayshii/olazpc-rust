@@ -16,20 +16,25 @@ use olaz_net::{
 use serde_json::{Value, json};
 
 #[test]
-fn headers_have_user_agent_cookie_and_sek_in_swift_order() {
+fn chromium_api_headers_keep_caller_values_and_session_cookie() {
     let mut options = RequestOptions::get("https://tt-chat3-wpa.api.zaloapp.com/api/x?a=1");
-    options.method = Method::Post;
-    options.content_type = Some("application/x-www-form-urlencoded".to_owned());
-    options.extra_headers = vec![("X-Extra".to_owned(), "1".to_owned())];
+    options.content_type = Some("multipart/form-data; boundary=x".to_owned());
+    options.extra_headers = vec![
+        ("X-Extra".into(), "1".into()),
+        ("ACCEPT".into(), "custom".into()),
+    ];
     let spec = build_request(&options, Some("sek.1.2")).unwrap();
-    let names: Vec<&str> = spec.headers.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(spec.header("user-agent"), Some("ZaloPC-darwin-23v695"));
+    assert_eq!(spec.header("Cookie"), Some("zpw_sek=sek.1.2"));
+    assert_eq!(spec.header("zpw_sek"), None);
+    assert_eq!(spec.header("accept"), Some("custom"));
     assert_eq!(
-        names,
-        ["User-Agent", "Cookie", "zpw_sek", "Content-Type", "X-Extra"]
+        spec.header("content-type"),
+        Some("multipart/form-data; boundary=x")
     );
-    assert_eq!(spec.header("user-agent"), Some("ZaloPC-darwin-23v694"));
-    assert_eq!(spec.header("Cookie"), Some("zpw_sek=sek.1.2; _zlang=vi"));
-    assert_eq!(spec.header("zpw_sek"), Some("sek.1.2"));
+    assert_eq!(spec.header("sec-fetch-dest"), Some("empty"));
+    assert_eq!(spec.header("origin"), None);
+    assert_eq!(spec.header("referer"), None);
     assert_eq!(spec.query, [("a".to_owned(), "1".to_owned())]);
 }
 
@@ -46,13 +51,15 @@ fn cookie_is_only_sent_to_zalo_hosts_and_when_a_session_exists() {
     }
     for (host, sek) in [
         ("https://example.com/x", Some("a.b")),
+        ("https://zalo.me.attacker.test/x", Some("a.b")),
+        ("http://wpa.zaloapp.com/x", Some("a.b")),
         ("https://wpa.zaloapp.com/x", None),
         ("https://wpa.zaloapp.com/x", Some("")),
     ] {
         let spec = build_request(&RequestOptions::get(host), sek).unwrap();
         assert!(spec.header("Cookie").is_none(), "{host} {sek:?}");
         assert!(spec.header("zpw_sek").is_none());
-        assert_eq!(spec.headers.len(), 1, "only the User-Agent");
+        assert_eq!(spec.headers.len(), 11, "Chromium API defaults, no cookie");
     }
 }
 
@@ -67,7 +74,7 @@ fn extra_headers_replace_defaults_like_set_value() {
     let spec = build_request(&options, None).unwrap();
     assert_eq!(spec.header("Content-Type"), Some("c/d"));
     assert_eq!(spec.header("User-Agent"), Some("custom"));
-    assert_eq!(spec.headers.len(), 2);
+    assert_eq!(spec.headers.len(), 11);
 }
 
 #[test]
@@ -92,7 +99,10 @@ async fn get_and_post_shapes_through_the_client() {
     let get = &reqs[0];
     assert_eq!(get.method, Method::Get);
     assert!(get.body.is_none());
-    assert!(get.header("Content-Type").is_none());
+    assert_eq!(
+        get.header("Content-Type"),
+        Some("application/x-www-form-urlencoded")
+    );
     let names: Vec<&str> = get.query.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(
         names,
@@ -318,7 +328,9 @@ async fn raw_get_json_download_and_sync_batch() {
     );
     let reqs = c.transport().requests();
     let dl = reqs.iter().find(|r| r.url.ends_with("/blob")).unwrap();
-    assert_eq!(dl.headers.len(), 1);
+    assert_eq!(dl.headers.len(), 10);
+    assert_eq!(dl.header("accept"), Some("*/*"));
+    assert_eq!(dl.header("content-type"), None);
     let batch: Vec<_> = reqs.iter().filter(|r| r.url.ends_with("/batch")).collect();
     assert_eq!(batch.len(), 2);
     assert_eq!(
@@ -454,12 +466,25 @@ fn restore_rules_for_legacy_type_and_bad_accounts() {
     );
     assert!(!s.domains.preferred_hosts.contains_key("chat"));
 
-    // Current type: an IMEI that does not end in md5(userAgent) is not adopted.
+    // Current type: a malformed IMEI is not adopted; freshly minted IMEI is kept.
     snap.zpw_type = Some("23".to_owned());
     let mut s = SessionState::new(IMEI.to_owned(), "n".to_owned());
     assert!(s.restore(snap.clone()));
     assert!(!s.needs_pc_type_upgrade);
     assert_eq!(s.imei, IMEI);
+
+    // Current type: a well-formed 694 IMEI survives restore under 695 without suffix rotation.
+    let imei_694 = format!(
+        "00000000-0000-4000-8000-000000000001-{}",
+        olaz_crypto::md5_hex("ZaloPC-darwin-23v694")
+    );
+    assert_ne!(imei_694, IMEI);
+    let mut snap_694 = snap.clone();
+    snap_694.imei = imei_694.clone();
+    let mut s_694 = SessionState::new(IMEI.to_owned(), "n".to_owned());
+    assert!(s_694.restore(snap_694));
+    assert!(!s_694.needs_pc_type_upgrade);
+    assert_eq!(s_694.imei, imei_694);
 
     // Accounts without usable key / sek do not restore.
     for (enk, sek) in [("", "a.b"), ("0123456789abcdef", ""), ("short", "a.b")] {
@@ -542,4 +567,55 @@ fn account_json_matches_swift_codable() {
     }
     let parsed: LoginAccount = serde_json::from_str(r#"{"userId":"5"}"#).unwrap();
     assert_eq!(parsed.user_id, "5");
+}
+
+#[test]
+fn api_chat_subdomains_receive_both_domain_cookies() {
+    for host in ["chat.zalo.me", "zcld.chat.zalo.me"] {
+        let request = build_request(
+            &RequestOptions::get(format!("https://{host}/api/x")),
+            Some("sek"),
+        )
+        .unwrap();
+        assert_eq!(request.header("cookie"), Some("zpw_sek=sek; zpw_sek=sek"));
+    }
+}
+
+#[tokio::test]
+async fn sync_batch_keeps_legacy_cookie_retry_for_server_supplied_destinations() {
+    // dlfl.vn also occurs in Swift's upload_batch fixtures; these are routing-policy tests,
+    // not assertions about a live server's current download hostname.
+    for target in [
+        "http://127.0.0.1/batch",
+        "https://dlfl.vn/batch",
+        "https://chat.zalo.me/batch",
+    ] {
+        for status in [401, 403] {
+            let transport = MockTransport::scripted(vec![
+                Ok(RawResponse::new(status, Vec::new())),
+                Ok(RawResponse::new(200, b"batch".to_vec())),
+            ]);
+            let body = olaz_net::download_sync_batch_with(
+                &transport,
+                target,
+                Duration::from_secs(5),
+                Some("sek.1.2"),
+                Some("100"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(body, b"batch");
+            let requests = transport.requests();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].header("Cookie"), None);
+            assert_eq!(
+                requests[1].header("Cookie"),
+                Some("zpw_sek=sek.1.2; zpw_uin=100")
+            );
+            assert_eq!(requests[1].url, target);
+            assert_eq!(requests[1].header("accept"), Some("*/*"));
+            assert_eq!(requests[1].header("content-type"), None);
+            assert_eq!(requests[1].header("zpw_sek"), None);
+        }
+    }
 }

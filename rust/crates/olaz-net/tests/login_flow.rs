@@ -10,8 +10,8 @@ use common::*;
 use olaz_crypto::{ParamCipher, encode_aes, parse_object_str};
 use olaz_net::mock::MockTransport;
 use olaz_net::{
-    LoginAccount, NetError, NetworkErrorKind, QrTicket, RawResponse, SessionClient, SessionStatus,
-    ZaloSessionError, parse_qr_ticket,
+    LoginAccount, NetError, NetworkErrorKind, QrTicket, RawResponse, SessionClient,
+    SessionSnapshot, SessionStatus, ZaloDomains, ZaloSessionError, parse_qr_ticket,
 };
 use serde_json::{Value, json};
 
@@ -652,5 +652,75 @@ async fn session_status_paths() {
     // ...and one rejected with any session error is expired.
     let c = authed(MockTransport::from_fn(|_| ok(r#"{"error_code":5}"#)));
     c.with_session(|s| s.needs_pc_type_upgrade = true);
+    assert_eq!(c.session_status().await, SessionStatus::Expired);
+}
+
+#[tokio::test]
+async fn restored_694_imei_is_sent_unchanged_on_get_login_info() {
+    let imei_694 = format!(
+        "123e4567-e89b-42d3-a456-426614174000-{}",
+        olaz_crypto::md5_hex("ZaloPC-darwin-23v694")
+    );
+    let c = logged_out(MockTransport::scripted(vec![ok(&login_ok_body())]));
+    let snap = SessionSnapshot {
+        zpw_type: Some("23".to_owned()),
+        imei: imei_694.clone(),
+        computer_name: "Linh MacBook Pro".to_owned(),
+        domains: ZaloDomains::default(),
+        plain_account: Some(LoginAccount {
+            user_id: "100".into(),
+            zpw_enk: "0123456789abcdef".into(),
+            zpw_sek: "sek.1.2".into(),
+            ..Default::default()
+        }),
+        expired_at: None,
+    };
+    assert!(c.restore(snap));
+    assert_eq!(c.imei(), imei_694);
+    assert_eq!(c.session_status().await, SessionStatus::Valid);
+
+    let req = c
+        .transport()
+        .requests()
+        .into_iter()
+        .find(|r| r.path() == "/api/login/getLoginInfo")
+        .expect("getLoginInfo request");
+    let expected_cipher =
+        ParamCipher::with_zcid_ext("23", &imei_694, NOW_MS, "abcdef0123".to_owned()).unwrap();
+    assert_eq!(req.query_value("zcid"), Some(expected_cipher.zcid()));
+    assert_eq!(req.query_value("client_version"), Some("695"));
+    let plain = olaz_crypto::decode_aes(
+        expected_cipher.key_data(),
+        req.query_value("params").unwrap(),
+    )
+    .unwrap();
+    let payload = obj(&plain);
+    assert_eq!(payload["imei"], json!(imei_694));
+}
+
+#[tokio::test]
+async fn restored_type_30_session_still_migrates_via_needs_pc_type_upgrade() {
+    let web_imei = format!(
+        "123e4567-e89b-42d3-a456-426614174000-{}",
+        olaz_crypto::md5_hex("Mozilla/5.0 WebLegacy")
+    );
+    let c = logged_out(MockTransport::from_fn(|_| ok(r#"{"error_code":5}"#)));
+    let snap = SessionSnapshot {
+        zpw_type: Some("30".to_owned()),
+        imei: web_imei.clone(),
+        computer_name: "Linh MacBook Pro".to_owned(),
+        domains: ZaloDomains::default(),
+        plain_account: Some(LoginAccount {
+            user_id: "100".into(),
+            zpw_enk: "0123456789abcdef".into(),
+            zpw_sek: "sek.1.2".into(),
+            ..Default::default()
+        }),
+        expired_at: None,
+    };
+    assert!(c.restore(snap));
+    assert!(c.with_session(|s| s.needs_pc_type_upgrade));
+    assert_eq!(c.imei(), web_imei);
+    // Any session error on getLoginInfo(type=23) expires a legacy type-30 session for fresh QR login.
     assert_eq!(c.session_status().await, SessionStatus::Expired);
 }

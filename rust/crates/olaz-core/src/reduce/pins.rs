@@ -828,7 +828,7 @@ fn lookup_person_name(state: &CoreState, uid: &str) -> Option<String> {
     }
     for cand in &candidates {
         if let Some(friend) = state.contacts.friends.iter().find(|f| f.id == *cand) {
-            if let Some(alias) = state.conversations.identities.aliases.get(cand)
+            if let Some(alias) = state.contacts.aliases.get(cand)
                 && !alias.is_empty()
             {
                 return Some(alias.clone());

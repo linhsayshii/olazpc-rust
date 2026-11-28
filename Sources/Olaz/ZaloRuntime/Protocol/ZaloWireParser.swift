@@ -63,6 +63,21 @@ enum ZaloWireParser {
         id.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Strips a leading `"u"` prefix from numeric user IDs (1...24 ASCII digits, not all `"0"`),
+    /// without touching `"_<digits>"` suffixes (`user-decisions` item 6.1).
+    static func normalizeContactUid(_ raw: String) -> String {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("u") {
+            let rest = s.dropFirst()
+            if (1...24).contains(rest.count),
+               rest.allSatisfy({ $0.isASCII && $0.isNumber }),
+               !rest.allSatisfy({ $0 == "0" }) {
+                return String(rest)
+            }
+        }
+        return s
+    }
+
     /// A person's name from a friend / profile row, as the official `getDName` falls back after the alias: `zaloName`
     /// first. `displayName` on friend rows can carry the name from the phone's contacts, which the official PC does not show.
     static func preferredName(_ row: [String: Any]) -> String {

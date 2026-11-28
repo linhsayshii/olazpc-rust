@@ -26,7 +26,7 @@ use crate::pins::PinnedList;
 use serde_json::{Map, Value, json};
 
 use crate::conversations::{
-    CachedGroup, ConversationSummary, ConversationsState, GroupIdentity, sort_conversations,
+    CachedGroup, ConversationSummary, ConversationsState, sort_conversations,
 };
 use crate::messages::{
     ContactsState, GroupEntry, IdentitySnapshot, MessagesState, fold_contact_str, is_valid_url_str,
@@ -1424,8 +1424,9 @@ fn lookup_person_name_and_avatar(
     my_uid: &str,
     my_avatar: Option<&str>,
     convs: &ConversationsState,
+    contacts: &ContactsState,
 ) -> Option<(String, String)> {
-    let snap = IdentitySnapshot::from_core(my_uid, my_avatar, convs);
+    let snap = IdentitySnapshot::from_core(my_uid, my_avatar, convs, contacts);
     snap.lookup_person(uid).map(|hit| (hit.name, hit.avatar))
 }
 
@@ -1487,10 +1488,11 @@ pub fn normalize_poll_detail(
         }
     }
 
-    let creator_name = lookup_person_name_and_avatar(&creator_id, my_raw_uid, my_avatar, convs)
-        .map(|(name, _)| name)
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| UNKNOWN_POLL_USER_NAME.to_owned());
+    let creator_name =
+        lookup_person_name_and_avatar(&creator_id, my_raw_uid, my_avatar, convs, contacts)
+            .map(|(name, _)| name)
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| UNKNOWN_POLL_USER_NAME.to_owned());
 
     let expired_ms = lossless::int64(d.get("expired_time"))
         .unwrap_or(0)
@@ -1531,10 +1533,11 @@ pub fn build_poll_voters(
     my_raw_uid: &str,
     my_avatar: Option<&str>,
     convs: &ConversationsState,
+    contacts: &ContactsState,
 ) -> PollVoters {
     let anonymous = swift_json_bool(d.get("is_anonymous")).unwrap_or(false);
     let my_uid = normalize_poll_uid(my_raw_uid);
-    let snap = IdentitySnapshot::from_core(my_raw_uid, my_avatar, convs);
+    let snap = IdentitySnapshot::from_core(my_raw_uid, my_avatar, convs, contacts);
 
     let mut groups_json = Vec::new();
     if let Some(Value::Array(options_raw)) = d.get("options") {
@@ -1854,16 +1857,6 @@ pub fn merge_fetched_group_metadata(
     contacts
         .groups
         .sort_by(|a, b| localized_standard_cmp(&a.sort_key, &b.sort_key));
-    convs.identities.groups = contacts
-        .groups
-        .iter()
-        .map(|g| GroupIdentity {
-            id: g.id.clone(),
-            name: g.name.clone(),
-            avatar: g.avatar.clone(),
-            members: g.members,
-        })
-        .collect();
 
     if let Some(conv) = convs.conversations.iter_mut().find(|c| c.id == gid) {
         if let Some(n) = opt_name {
@@ -1887,10 +1880,10 @@ pub fn merge_fetched_group_metadata(
             preview: None,
         });
     }
-    sort_conversations(&mut convs.conversations, &convs.identities.activity_ranks);
+    sort_conversations(&mut convs.conversations, &contacts.activity_ranks);
 
-    let existing_cached = convs.identities.cached_groups.get(&gid).cloned();
-    convs.identities.cached_groups.insert(
+    let existing_cached = contacts.cached_groups.get(&gid).cloned();
+    contacts.cached_groups.insert(
         gid.clone(),
         CachedGroup {
             name: match opt_name {
@@ -1910,9 +1903,9 @@ pub fn merge_fetched_group_metadata(
     );
 
     convs.rebuild_conversation_flags(self_conv_id);
-    convs.rebuild_conversation_extras(self_conv_id);
+    convs.rebuild_conversation_extras(contacts, self_conv_id);
 
-    let cached_groups_json = serialize_cached_groups_json(&convs.identities.cached_groups);
+    let cached_groups_json = serialize_cached_groups_json(&contacts.cached_groups);
     let stored_conversation = convs
         .conversations
         .iter()
@@ -2096,12 +2089,15 @@ mod tests {
         assert_eq!(dm_pin.limit, 0);
 
         // Fix #3: normalized u-prefixed UIDs + unified "Người dùng Zalo" unknown default.
-        let contacts = ContactsState::default();
-        let mut convs = ConversationsState::default();
-        convs.identities.friends.push(FriendIdentity {
-            id: "3001001".to_owned(),
-            name: "An Nguyễn".to_owned(),
-            avatar: Some("https://cdn.example.invalid/an.jpg".to_owned()),
+        let mut contacts = ContactsState::default();
+        let convs = ConversationsState::default();
+        contacts.apply_identity_table(crate::conversations::IdentityTable {
+            friends: vec![FriendIdentity {
+                id: "3001001".to_owned(),
+                name: "An Nguyễn".to_owned(),
+                avatar: Some("https://cdn.example.invalid/an.jpg".to_owned()),
+            }],
+            ..crate::conversations::IdentityTable::default()
         });
         let messages = MessagesState::default();
         let raw_payload = json!({
@@ -2134,7 +2130,13 @@ mod tests {
         assert!(detail.options[0].voted);
         assert_eq!(detail.voter_count, 2);
 
-        let voters = build_poll_voters(raw_payload.as_object().unwrap(), "2001001", None, &convs);
+        let voters = build_poll_voters(
+            raw_payload.as_object().unwrap(),
+            "2001001",
+            None,
+            &convs,
+            &contacts,
+        );
         assert_eq!(voters.groups[0].users[0].uid, "2001001");
         assert!(voters.groups[0].users[0].is_me);
         assert_eq!(voters.groups[0].users[1].uid, "3001001");
@@ -2212,13 +2214,18 @@ mod tests {
     #[test]
     fn poll_detail_and_voters_parse_swift_bool_parity_for_numeric_and_invalid_flags() {
         let polls = PollsState::default();
-        let contacts = ContactsState::default();
-        let mut convs = ConversationsState::default();
-        convs.identities.friends.push(FriendIdentity {
+        let mut contacts = ContactsState::default();
+        contacts.friends.push(crate::messages::FriendEntry {
             id: "3001001".to_owned(),
             name: "An Nguyễn".to_owned(),
+            zalo_name: "An Nguyễn".to_owned(),
             avatar: None,
+            last_active_ms: None,
+            online: false,
+            section: "A".to_owned(),
+            sort_key: "an nguyen".to_owned(),
         });
+        let convs = ConversationsState::default();
         let messages = MessagesState::default();
 
         // Numeric 1/0 flags (and 1.0/0.0) bridge identically to Swift `as? Bool`.
@@ -2253,8 +2260,13 @@ mod tests {
         assert!(detail_on.anonymous);
         assert!(detail_on.hide_preview);
 
-        let voters_anon =
-            build_poll_voters(numeric_on.as_object().unwrap(), "2001001", None, &convs);
+        let voters_anon = build_poll_voters(
+            numeric_on.as_object().unwrap(),
+            "2001001",
+            None,
+            &convs,
+            &contacts,
+        );
         assert!(voters_anon.restricted);
         assert!(voters_anon.groups[0].users.is_empty());
 
@@ -2289,8 +2301,13 @@ mod tests {
         assert!(!detail_off.anonymous);
         assert!(!detail_off.hide_preview);
 
-        let voters_public =
-            build_poll_voters(numeric_off.as_object().unwrap(), "2001001", None, &convs);
+        let voters_public = build_poll_voters(
+            numeric_off.as_object().unwrap(),
+            "2001001",
+            None,
+            &convs,
+            &contacts,
+        );
         assert!(!voters_public.restricted);
         assert_eq!(voters_public.groups[0].users.len(), 1);
 
@@ -2326,8 +2343,13 @@ mod tests {
         assert!(!detail_nb.anonymous);
         assert!(!detail_nb.hide_preview);
 
-        let voters_nb =
-            build_poll_voters(non_bridging.as_object().unwrap(), "2001001", None, &convs);
+        let voters_nb = build_poll_voters(
+            non_bridging.as_object().unwrap(),
+            "2001001",
+            None,
+            &convs,
+            &contacts,
+        );
         assert!(!voters_nb.restricted);
         assert_eq!(voters_nb.groups[0].users.len(), 1);
 

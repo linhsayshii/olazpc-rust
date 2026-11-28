@@ -34,7 +34,7 @@ fn param_cipher_and_aes_cbc_round_trip() {
     assert_eq!(cipher.encrypt_key().len(), 32);
     let payload = json!({"imei": imei, "computer_name": "Mac", "language": "vi"});
     let signed = cipher
-        .build_signed_params("30", "694", &payload, "getlogininfo")
+        .build_signed_params("30", "695", &payload, "getlogininfo")
         .unwrap();
     for k in [
         "zcid",

@@ -1,14 +1,14 @@
 import Foundation
 
-/// Authoritative Zalo macOS PC service endpoints (`zpw_ver=694`, `zpw_type=23`)
+/// Authoritative Zalo macOS PC service endpoints (`zpw_ver=695`, `zpw_type=23`)
 /// plus live `getServerInfo` / `getLoginInfo` service map discovery and failover.
 struct ZaloDomains: Codable, Sendable {
-    static let zpwVer = "694"
-    static let zpwType = "23"
-    static let zpwPCType = "23"
-    static let zpwWebType = "30"
-    static let userAgent = "ZaloPC-darwin-23v694"
-    static let wsOrigin = "file://"
+    static let zpwVer = RustCore.clientIdentity.clientVersion
+    static let zpwType = RustCore.clientIdentity.clientType
+    static let zpwPCType = RustCore.clientIdentity.clientType
+    static let zpwWebType = RustCore.clientIdentity.webClientType
+    static let userAgent = RustCore.clientIdentity.userAgent
+    static let wsOrigin = RustCore.clientIdentity.wsOrigin
 
     /// Authoritative `zpw_service_map_v3` defaults returned by `wpa.zaloapp.com` for `type=23`.
     static let defaultServiceMapV3: [String: [String]] = [

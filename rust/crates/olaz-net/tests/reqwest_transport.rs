@@ -29,8 +29,8 @@ fn spec(url: String, method: Method, body: Option<Vec<u8>>) -> RequestSpec {
         url,
         query: Vec::new(),
         headers: vec![
-            ("User-Agent".to_owned(), "ZaloPC-darwin-23v694".to_owned()),
-            ("Cookie".to_owned(), "zpw_sek=a.b; _zlang=vi".to_owned()),
+            ("User-Agent".to_owned(), "ZaloPC-darwin-23v695".to_owned()),
+            ("Cookie".to_owned(), "zpw_sek=a.b".to_owned()),
             (
                 "Content-Type".to_owned(),
                 "application/x-www-form-urlencoded".to_owned(),
@@ -49,7 +49,7 @@ async fn sends_headers_and_body_and_keeps_duplicate_set_cookie() {
     let t = ReqwestTransport::new().unwrap();
     let resp = t
         .send(spec(
-            format!("{base}/api/x?zpw_ver=694"),
+            format!("{base}/api/x?zpw_ver=695"),
             Method::Post,
             Some(b"params=abc".to_vec()),
         ))
@@ -69,9 +69,9 @@ async fn sends_headers_and_body_and_keeps_duplicate_set_cookie() {
         .recv_timeout(Duration::from_secs(5))
         .unwrap()
         .to_lowercase();
-    assert!(raw.starts_with("post /api/x?zpw_ver=694 http/1.1"), "{raw}");
-    assert!(raw.contains("user-agent: zalopc-darwin-23v694"));
-    assert!(raw.contains("cookie: zpw_sek=a.b; _zlang=vi"));
+    assert!(raw.starts_with("post /api/x?zpw_ver=695 http/1.1"), "{raw}");
+    assert!(raw.contains("user-agent: zalopc-darwin-23v695"));
+    assert!(raw.contains("cookie: zpw_sek=a.b"));
     assert!(raw.contains("content-type: application/x-www-form-urlencoded"));
     assert!(raw.ends_with("params=abc"));
 }

@@ -74,11 +74,11 @@ impl CoreState {
             message_confirm: self.actions.message_confirm.clone(),
             auto_delete: self.actions.auto_delete.clone(),
             starred_ids: self.actions.starred_ids.clone(),
-            cached_profiles: self.conversations.identities.cached_profiles.clone(),
+            cached_profiles: self.contacts.cached_profiles.clone(),
             last_prune_next_expiry_ms: self.actions.last_prune_next_expiry_ms,
             // U16
             notification_settings: self.notify.settings.clone(),
-            aliases: self.conversations.identities.aliases.clone(),
+            aliases: self.contacts.aliases.clone(),
             // U7
             pins: self.pins.snapshot(),
             // U12
@@ -105,7 +105,7 @@ impl CoreState {
             .profile
             .as_ref()
             .and_then(|p| p.avatar.as_deref());
-        IdentitySnapshot::from_core(my_uid, my_avatar, &self.conversations)
+        IdentitySnapshot::from_core(my_uid, my_avatar, &self.conversations, &self.contacts)
     }
 }
 
@@ -504,6 +504,73 @@ pub(crate) enum PendingStore {
     },
 }
 
+/// Server-controlled ZaloAttest feature flags (`setttings.features.attest` / `settings.features.attest`).
+/// A missing key reads as `false`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AttestFlags {
+    pub enable: bool,
+    pub enable_on_login: bool,
+    pub enforce: bool,
+    pub enable_qos: bool,
+    pub deactivated: bool,
+}
+
+impl AttestFlags {
+    /// Extracts `setttings.features.attest` (or `settings.features.attest`) from a top-level or
+    /// `data`-wrapped server payload.
+    #[must_use]
+    pub fn find_in_payload(payload: &Map<String, Value>) -> Option<&Map<String, Value>> {
+        fn from_root(root: &Map<String, Value>) -> Option<&Map<String, Value>> {
+            root.get("setttings")
+                .and_then(Value::as_object)
+                .or_else(|| root.get("settings").and_then(Value::as_object))
+                .and_then(|s| s.get("features"))
+                .and_then(Value::as_object)
+                .and_then(|f| f.get("attest"))
+                .and_then(Value::as_object)
+        }
+        from_root(payload).or_else(|| {
+            payload
+                .get("data")
+                .and_then(Value::as_object)
+                .and_then(from_root)
+        })
+    }
+
+    /// Parses the five booleans from an optional `attest` object; missing keys default to `false`.
+    #[must_use]
+    pub fn from_attest_map(attest: Option<&Map<String, Value>>) -> Self {
+        let flag = |key: &str| {
+            attest
+                .and_then(|m| m.get(key))
+                .and_then(|v| olaz_crypto::bool_value(Some(v)))
+                .unwrap_or(false)
+        };
+        Self {
+            enable: flag("enable"),
+            enable_on_login: flag("enable_on_login"),
+            enforce: flag("enforce"),
+            enable_qos: flag("enable_qos"),
+            deactivated: flag("deactivated"),
+        }
+    }
+
+    /// Parses directly from a raw `getServerInfo` or post-login settings payload.
+    #[must_use]
+    pub fn parse_from_payload(payload: &Map<String, Value>) -> Self {
+        Self::from_attest_map(Self::find_in_payload(payload))
+    }
+
+    /// Engine log line carrying only the five booleans (no account or server metadata).
+    #[must_use]
+    pub fn engine_log_line(self) -> String {
+        format!(
+            "attest: enable={} enable_on_login={} enforce={} enable_qos={} deactivated={}",
+            self.enable, self.enable_on_login, self.enforce, self.enable_qos, self.deactivated,
+        )
+    }
+}
+
 /// Full session-domain state inside [`CoreState`].
 #[derive(Clone, Default)]
 pub struct SessionState {
@@ -512,6 +579,7 @@ pub struct SessionState {
     pub sign_out_notice: Option<String>,
     pub self_conversation_id: Option<String>,
     pub prefs: BTreeMap<String, String>,
+    pub attest_enforced: bool,
 
     // Internal reducer bookkeeping (never serialized in case snapshots).
     pub(crate) started: bool,
@@ -519,6 +587,7 @@ pub struct SessionState {
     pub(crate) boot_gen: u64,
     pub(crate) pending_store: Option<PendingStore>,
     pub(crate) boot_ws_endpoints: Vec<String>,
+    pub(crate) last_attest_flags: Option<AttestFlags>,
 }
 
 impl SessionState {
@@ -531,6 +600,7 @@ impl SessionState {
             sign_out_notice: self.sign_out_notice.clone(),
             self_conversation_id: self.self_conversation_id.clone(),
             prefs: self.prefs.clone(),
+            attest_enforced: self.attest_enforced,
         }
     }
 }
@@ -543,6 +613,7 @@ impl fmt::Debug for SessionState {
             .field("has_sign_out_notice", &self.sign_out_notice.is_some())
             .field("has_self_conv", &self.self_conversation_id.is_some())
             .field("prefs_count", &self.prefs.len())
+            .field("attest_enforced", &self.attest_enforced)
             .field("started", &self.started)
             .field("qr_gen", &self.qr_gen)
             .field("boot_gen", &self.boot_gen)
@@ -558,6 +629,7 @@ pub struct SessionSnapshot {
     pub sign_out_notice: Option<String>,
     pub self_conversation_id: Option<String>,
     pub prefs: BTreeMap<String, String>,
+    pub attest_enforced: bool,
 }
 
 impl SessionSnapshot {
@@ -625,6 +697,7 @@ impl SessionSnapshot {
             "sign_out_notice": self.sign_out_notice,
             "self_conversation_id": self.self_conversation_id,
             "prefs": Value::Object(prefs_map),
+            "attest_enforced": self.attest_enforced,
         })
     }
 }
@@ -637,6 +710,7 @@ impl fmt::Debug for SessionSnapshot {
             .field("has_sign_out_notice", &self.sign_out_notice.is_some())
             .field("has_self_conv", &self.self_conversation_id.is_some())
             .field("prefs_count", &self.prefs.len())
+            .field("attest_enforced", &self.attest_enforced)
             .finish()
     }
 }
@@ -687,6 +761,7 @@ mod tests {
             sign_out_notice: None,
             self_conversation_id: None,
             prefs: BTreeMap::new(),
+            attest_enforced: false,
         };
         let v = snap.to_case_json(&|_| String::new());
         assert_eq!(v["phase"]["kind"], "login");

@@ -9,6 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+olaz-client = { path = "../olaz-client" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 olaz-json = { path = "../olaz-json" }

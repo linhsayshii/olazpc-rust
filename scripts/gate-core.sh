@@ -52,7 +52,7 @@ else
 fi
 
 # Tests that assert a wall-clock budget or poll real time.
-TIMING_SWIFT='sqliteClientIdIndexExistsBulkSaveIsFastAndE2EETwinProtectionIntact|fastPhoneSyncPlanFiltersAndSortsNewestFirstAndBulkIngestsFast|startsHelperQueuesUntilReadyThenSendsInitFirst|queueIsLIFOAndDropsCancelledWork|scrubEndsAtOnceAndPlaybackResumesEvenIfALaterSeekSupersedesTheExactOne|phaseGateTasksCompleteAcrossStartLogOutRefreshExpiryAndTeardown|uncachedDecodesStayOutOfTheSharedMemoryCache|serverConfirmedMuteAndJoinErrorCodesAndBannerLatency'
+TIMING_SWIFT='sqliteClientIdIndexExistsBulkSaveIsFastAndE2EETwinProtectionIntact|fastPhoneSyncPlanFiltersAndSortsNewestFirstAndBulkIngestsFast|startsHelperQueuesUntilReadyThenSendsInitFirst|queueIsLIFOAndDropsCancelledWork|scrubEndsAtOnceAndPlaybackResumesEvenIfALaterSeekSupersedesTheExactOne|phaseGateTasksCompleteAcrossStartLogOutRefreshExpiryAndTeardown|uncachedDecodesStayOutOfTheSharedMemoryCache|serverConfirmedMuteAndJoinErrorCodesAndBannerLatency|contactsSyncAndLookupLatency'
 TIMING_RUST=(ping_cadence_uses_interval_after_auth)
 # The crate holding TIMING_RUST; the olaz-core `cases` harness reads any free argument as a domain, so test
 # filters go to this crate only.
@@ -86,6 +86,10 @@ run_quiet() {
         return "$rc"
     fi
 }
+
+# Local-only runtime drift check: runtime assets are deliberately absent from CI.
+run_quiet runtime_version "installed runtime client version" python3 "$ROOT/scripts/check-client-version.py"
+cat "$TMPDIR_GATE/check_runtime_version.log"
 
 # 1. Rust workspace fmt, clippy, tests
 run_quiet 1 "rust fmt / clippy / test" zsh -c '

@@ -453,13 +453,21 @@ final class SessionRecorderTests: XCTestCase {
         return .object(entry)
     }
 
-    private static func serverInfoScript(error: String? = nil) -> CaseJSON {
+    private static func serverInfoScript(error: String? = nil, attest: CaseJSON? = nil) -> CaseJSON {
         if let error {
             return httpScript(path: "/api/login/getServerInfo", error: error)
         }
+        var body: [String: CaseJSON] = ["error_code": .int(0), "data": .object([:])]
+        if let attest {
+            body["setttings"] = .object([
+                "features": .object([
+                    "attest": attest,
+                ]),
+            ])
+        }
         return httpScript(
             path: "/api/login/getServerInfo",
-            json: .object(["error_code": .int(0), "data": .object([:])])
+            json: .object(body)
         )
     }
 
@@ -492,25 +500,34 @@ final class SessionRecorderTests: XCTestCase {
         zpwSek: String,
         needSyncMsg: Bool = false,
         displayName: String = "Logged In User",
-        send2MeId: String? = nil
+        send2MeId: String? = nil,
+        attest: CaseJSON? = nil
     ) -> CaseJSON {
-        httpScript(
+        var data: [String: CaseJSON] = [
+            "uid": .string(uid),
+            "dkey": .string("dkey_\(uid)"),
+            "zpw_enk": .string("0123456789abcdef"),
+            "zpw_sek": .string(zpwSek),
+            "display_name": .string(displayName),
+            "send2me_id": .string(send2MeId ?? uid),
+            "need_sync_msg": .bool(needSyncMsg),
+            "zpw_service_map_v3": .object([
+                "profile": .array([.string("http://fake")]),
+            ]),
+            "zpw_ws": .array([.string("ws://fake")]),
+        ]
+        if let attest {
+            data["settings"] = .object([
+                "features": .object([
+                    "attest": attest,
+                ]),
+            ])
+        }
+        return httpScript(
             path: "/api/login/getLoginInfo",
             json: .object([
                 "error_code": .int(0),
-                "data": .object([
-                    "uid": .string(uid),
-                    "dkey": .string("dkey_\(uid)"),
-                    "zpw_enk": .string("0123456789abcdef"),
-                    "zpw_sek": .string(zpwSek),
-                    "display_name": .string(displayName),
-                    "send2me_id": .string(send2MeId ?? uid),
-                    "need_sync_msg": .bool(needSyncMsg),
-                    "zpw_service_map_v3": .object([
-                        "profile": .array([.string("http://fake")]),
-                    ]),
-                    "zpw_ws": .array([.string("ws://fake")]),
-                ]),
+                "data": .object(data),
             ])
         )
     }
@@ -1090,6 +1107,182 @@ final class SessionRecorderTests: XCTestCase {
                     .object(["cmd": .string("start")]),
                     .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
                     .object(["cmd": .string("start")]),
+                ]
+            ),
+
+            // 21. attest_flags_absent
+            ScenarioDef(
+                name: "attest_flags_absent",
+                seed: emptySeed(),
+                server: [
+                    serverInfoScript(),
+                    reqqrScript(tokenId: "tok_qr_21", qrCnt: "https://zalo.me/qr/test-21"),
+                    httpScript(
+                        path: "/api/login/waitScan",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "display_name": .string("Attest Absent"),
+                                "avatar": .string(""),
+                            ]),
+                        ])
+                    ),
+                    httpScript(
+                        path: "/api/login/waitCfirm",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "zpw_sek": .string("qr.200.a0.sek21"),
+                                "uid": .string("1000021"),
+                                "dkey": .string("dkey_1000021"),
+                                "zpw_enk": .string("0123456789abcdef"),
+                            ]),
+                        ])
+                    ),
+                    loginInfoScript(uid: "1000021", zpwSek: "qr.200.a0.sek21", displayName: "Attest Absent"),
+                    profileMeScript(uid: "1000021", displayName: "Attest Absent"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("login"), "step": .string("waiting_scan")]), "timeout_ms": .int(5000)]),
+                    .object(["snapshot": .string("waiting_scan")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                ]
+            ),
+
+            // 22. attest_flags_all_false
+            ScenarioDef(
+                name: "attest_flags_all_false",
+                seed: emptySeed(),
+                server: [
+                    serverInfoScript(
+                        attest: .object([
+                            "enable": .bool(false),
+                            "enable_on_login": .bool(false),
+                            "enforce": .bool(false),
+                            "enable_qos": .bool(false),
+                            "deactivated": .bool(false),
+                        ])
+                    ),
+                    reqqrScript(tokenId: "tok_qr_22", qrCnt: "https://zalo.me/qr/test-22"),
+                    httpScript(
+                        path: "/api/login/waitScan",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "display_name": .string("Attest False"),
+                                "avatar": .string(""),
+                            ]),
+                        ])
+                    ),
+                    httpScript(
+                        path: "/api/login/waitCfirm",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "zpw_sek": .string("qr.200.a0.sek22"),
+                                "uid": .string("1000022"),
+                                "dkey": .string("dkey_1000022"),
+                                "zpw_enk": .string("0123456789abcdef"),
+                            ]),
+                        ])
+                    ),
+                    loginInfoScript(
+                        uid: "1000022",
+                        zpwSek: "qr.200.a0.sek22",
+                        displayName: "Attest False",
+                        attest: .object([
+                            "enable": .bool(false),
+                            "enable_on_login": .bool(false),
+                            "enforce": .bool(false),
+                            "enable_qos": .bool(false),
+                            "deactivated": .bool(false),
+                        ])
+                    ),
+                    profileMeScript(uid: "1000022", displayName: "Attest False"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("login"), "step": .string("waiting_scan")]), "timeout_ms": .int(5000)]),
+                    .object(["snapshot": .string("waiting_scan")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                ]
+            ),
+
+            // 23. attest_enforce_true (pre-login getServerInfo enforces attest; login still proceeds)
+            ScenarioDef(
+                name: "attest_enforce_true",
+                seed: emptySeed(),
+                server: [
+                    serverInfoScript(
+                        attest: .object([
+                            "enable": .bool(true),
+                            "enable_on_login": .bool(true),
+                            "enforce": .bool(true),
+                            "enable_qos": .bool(false),
+                            "deactivated": .bool(false),
+                        ])
+                    ),
+                    reqqrScript(tokenId: "tok_qr_23", qrCnt: "https://zalo.me/qr/test-23"),
+                    httpScript(
+                        path: "/api/login/waitScan",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "display_name": .string("Attest Enforced"),
+                                "avatar": .string(""),
+                            ]),
+                        ])
+                    ),
+                    httpScript(
+                        path: "/api/login/waitCfirm",
+                        json: .object([
+                            "error_code": .int(0),
+                            "data": .object([
+                                "zpw_sek": .string("qr.200.a0.sek23"),
+                                "uid": .string("1000023"),
+                                "dkey": .string("dkey_1000023"),
+                                "zpw_enk": .string("0123456789abcdef"),
+                            ]),
+                        ])
+                    ),
+                    loginInfoScript(uid: "1000023", zpwSek: "qr.200.a0.sek23", displayName: "Attest Enforced"),
+                    profileMeScript(uid: "1000023", displayName: "Attest Enforced"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("login"), "step": .string("waiting_scan")]), "timeout_ms": .int(5000)]),
+                    .object(["snapshot": .string("waiting_scan")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
+                ]
+            ),
+
+            // 24. attest_enforce_post_login (restored session receives enforce=true in post-login getLoginInfo)
+            ScenarioDef(
+                name: "attest_enforce_post_login",
+                seed: savedSessionSeed(
+                    userId: "1000024",
+                    displayName: "Attest Post Login",
+                    zpwSek: "saved.200.a0.sek24"
+                ),
+                server: [
+                    loginInfoScript(
+                        uid: "1000024",
+                        zpwSek: "saved.200.a0.sek24",
+                        displayName: "Attest Post Login",
+                        attest: .object([
+                            "enable": .bool(true),
+                            "enable_on_login": .bool(false),
+                            "enforce": .bool(true),
+                            "enable_qos": .bool(true),
+                            "deactivated": .bool(false),
+                        ])
+                    ),
+                    profileMeScript(uid: "1000024", displayName: "Attest Post Login"),
+                ],
+                steps: [
+                    .object(["cmd": .string("start")]),
+                    .object(["await": .object(["phase": .string("ready")]), "timeout_ms": .int(5000)]),
                 ]
             ),
         ]

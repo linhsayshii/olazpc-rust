@@ -52,7 +52,7 @@ fn ws_url_has_slash_before_query() {
     assert!(url.starts_with("wss://ws1-msg.chat.zalo.me/?"));
     assert_eq!(
         url,
-        "wss://ws1-msg.chat.zalo.me/?zpw_ver=694&zpw_type=23&t=123456"
+        "wss://ws1-msg.chat.zalo.me/?zpw_ver=695&zpw_type=23&t=123456"
     );
 }
 
@@ -61,22 +61,22 @@ fn ws_url_variants() {
     // path already present: no extra slash
     assert_eq!(
         build_socket_url("wss://h.example/ws", 1),
-        "wss://h.example/ws?zpw_ver=694&zpw_type=23&t=1"
+        "wss://h.example/ws?zpw_ver=695&zpw_type=23&t=1"
     );
     // existing query preserved
     assert_eq!(
         build_socket_url("wss://h.example?a=b", 1),
-        "wss://h.example/?a=b&zpw_ver=694&zpw_type=23&t=1"
+        "wss://h.example/?a=b&zpw_ver=695&zpw_type=23&t=1"
     );
     // empty query dropped
     assert_eq!(
         build_socket_url("wss://h.example?", 1),
-        "wss://h.example/?zpw_ver=694&zpw_type=23&t=1"
+        "wss://h.example/?zpw_ver=695&zpw_type=23&t=1"
     );
     // no scheme: hostPart itself is inspected
     assert_eq!(
         build_socket_url("h.example", 1),
-        "h.example/?zpw_ver=694&zpw_type=23&t=1"
+        "h.example/?zpw_ver=695&zpw_type=23&t=1"
     );
 }
 
@@ -472,11 +472,12 @@ fn reconnect_policy_backoff_and_rotation() {
 
 #[test]
 fn handshake_headers() {
-    let h = connect_headers("SEK");
-    assert_eq!(h[0], ("Cookie", "zpw_sek=SEK; _zlang=vi".to_string()));
-    assert_eq!(h[1], ("zpw_sek", "SEK".to_string()));
-    assert_eq!(h[2], ("Origin", "file://".to_string()));
-    assert_eq!(h[3], ("User-Agent", "ZaloPC-darwin-23v694".to_string()));
+    let h = connect_headers("ws1-msg.chat.zalo.me", "SEK", &["vi".into()]);
+    assert_eq!(h.len(), 7);
+    assert!(h.contains(&("Cookie", "zpw_sek=SEK; zpw_sek=SEK".to_string())));
+    assert!(h.contains(&("Origin", "file://".to_string())));
+    assert!(h.contains(&("Accept-Language", "vi".to_string())));
+    assert!(!h.iter().any(|(k, _)| k.eq_ignore_ascii_case("zpw_sek")));
 }
 
 // ---- Waiters --------------------------------------------------------------------------------------

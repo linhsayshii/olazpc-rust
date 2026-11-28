@@ -487,6 +487,22 @@ fileprivate struct FfiConverterUInt8: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterInt8: FfiConverterPrimitive {
+    typealias FfiType = Int8
+    typealias SwiftType = Int8
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int8 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int8, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt16: FfiConverterPrimitive {
     typealias FfiType = UInt16
     typealias SwiftType = UInt16
@@ -1278,6 +1294,10 @@ public func FfiConverterTypeCoreApi_lower(_ value: CoreApi) -> UInt64 {
  */
 public protocol CoreEngineProtocol: AnyObject, Sendable {
     
+    func acceptFriendRequest(uid: String) 
+    
+    func acceptFriendRequestAndWait(uid: String) async throws  -> UInt64
+    
     /**
      * Answers the active composer confirm dialog (schedules 300 ms promotion if queued).
      */
@@ -1331,6 +1351,10 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func attachStore(store: CoreStore) 
     
     func bootstrap(nowMs: Int64) async throws  -> UInt64
+    
+    func cancelFriendRequest(uid: String) 
+    
+    func cancelFriendRequestAndWait(uid: String) async throws  -> UInt64
     
     /**
      * Checks whether `pin` matches the stored hidden-chat PIN digest (MD5 or offline SHA-256).
@@ -1400,6 +1424,10 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func currentVersion()  -> UInt64
     
+    func declineFriendRequest(uid: String) 
+    
+    func declineFriendRequestAndWait(uid: String) async throws  -> UInt64
+    
     /**
      * Deletes a conversation label.
      */
@@ -1457,6 +1485,10 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func ensureMessageLoaded(convId: String, message: ChatMessageRecord) async throws  -> EnsureMessageLoadedResultRecord
     
+    func findFriendByPhone(phone: String) 
+    
+    func findFriendByPhoneAndWait(phone: String) async throws  -> UInt64
+    
     func firePollDebounce(pollId: String, seq: UInt64, nowMs: Int64) 
     
     func fireReminderWatchTimer(waiterId: UInt64) 
@@ -1480,6 +1512,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func forwardSelection(messages: [ChatMessageRecord]) 
     
     func groupInvitePreview(url: String) async throws  -> GroupInvitePreviewRecord
+    
+    func handleContactsState(stateJson: String) 
     
     /**
      * Applies a `convActions` JSON state payload.
@@ -1537,6 +1571,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func loadAutoDelete() async throws  -> UInt64
     
+    func loadBlockedUsers() async throws  -> UInt64
+    
     func loadNotificationPreferences() async throws  -> UInt64
     
     func loadOlderMessages(id: String) 
@@ -1561,6 +1597,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func logOut() 
     
     /**
+     * Synchronously resolves `(name, avatar)` from the lock-free `IdentitySnapshot`.
+     */
+    func lookupPersonInfo(uid: String)  -> PersonLookupRecord?
+    
+    /**
      * Marks a conversation read (clears unread count & manual unread mark, optional read receipt).
      */
     func markConversationRead(id: String, seenTarget: SeenTargetRecord?) 
@@ -1574,6 +1615,11 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Marks a conversation read using core's own message window for the `send_seen` target.
      */
     func markRead(id: String) 
+    
+    /**
+     * Synchronously resolves `@mention` display name from the lock-free `IdentitySnapshot`.
+     */
+    func mentionDisplayName(uid: String)  -> String?
     
     /**
      * Moves a conversation between Focus (`to_other = false`) and Other (`to_other = true`).
@@ -1614,6 +1660,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     func openConversationAndWait(id: String, preloaded: [ChatMessageRecord]) async throws  -> UInt64
     
     func performCardAction(convId: String, msgId: String, actionRef: String) async throws  -> CardActionOutcomeRecord
+    
+    func performContactsSync() async throws  -> UInt64
     
     /**
      * Persists the current conversation list to SQLite and awaits completion.
@@ -1700,6 +1748,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * and returns the published version once reduced.
      */
     func refreshCloudAsync() async throws  -> UInt64
+    
+    func refreshContacts() 
     
     /**
      * Refreshes group `@mention` previews from the attached SQLite store.
@@ -1793,6 +1843,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func resetConversationActions() 
     
+    func resetFriendSearch() 
+    
     /**
      * Resets the hidden-chat PIN and unhides all hidden conversations.
      */
@@ -1826,7 +1878,7 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
     
     func rewatchPolls(nowMs: Int64) 
     
-    func saveAlias(uid: String, name: String) async throws  -> SaveAliasRecord
+    func saveAlias(uid: String, name: String) async throws  -> SaveAliasResultRecord
     
     /**
      * Searches in-memory messages and SQLite history for `conv_id`, newest-first.
@@ -1837,6 +1889,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Searches stickers by keyword (max 40).
      */
     func searchStickers(text: String) async throws  -> [StickerEntryRecord]?
+    
+    func seedBlockedUsers(users: [BlockedUserRecord]?) 
     
     /**
      * Seeds active + queued composer confirms in core state.
@@ -1864,6 +1918,10 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      */
     func seedStickerSuggestSetting(setting: StickerSuggestSettingRecord?) 
     
+    func sendFriendRequest(uid: String, message: String) 
+    
+    func sendFriendRequestAndWait(uid: String, message: String) async throws  -> UInt64
+    
     /**
      * Sends own contact card (plain or 1-1 E2EE via `send_e2ee_contact_card`).
      */
@@ -1889,6 +1947,8 @@ public protocol CoreEngineProtocol: AnyObject, Sendable {
      * Updates a single conversation's auto-delete TTL in milliseconds (`0` disables).
      */
     func setAutoDeleteTtl(convId: String, ttlMs: Int64) 
+    
+    func setBlocked(uid: String, blocked: Bool, name: String) async throws  -> UInt64
     
     /**
      * Updates the sidebar type/label filter and recomputes `list_ids`.
@@ -2195,6 +2255,31 @@ public convenience init(session: CoreSession, host: CoreHost)throws  {
     
 
     
+open func acceptFriendRequest(uid: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_accept_friend_request(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(uid),uniffiCallStatus
+    )
+}
+}
+    
+open func acceptFriendRequestAndWait(uid: String)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_accept_friend_request_and_wait(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(uid)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
     /**
      * Answers the active composer confirm dialog (schedules 300 ms promotion if queued).
      */
@@ -2381,6 +2466,31 @@ open func bootstrap(nowMs: Int64)async throws  -> UInt64  {
             rustFutureFunc: {
                 uniffi_olaz_ffi_fn_method_coreengine_bootstrap(
                         self.uniffiCloneHandle(),FfiConverterInt64.lower(nowMs)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func cancelFriendRequest(uid: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_cancel_friend_request(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(uid),uniffiCallStatus
+    )
+}
+}
+    
+open func cancelFriendRequestAndWait(uid: String)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_cancel_friend_request_and_wait(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(uid)
                 )
             },
             pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
@@ -2645,6 +2755,31 @@ open func currentVersion() -> UInt64  {
 })
 }
     
+open func declineFriendRequest(uid: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_decline_friend_request(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(uid),uniffiCallStatus
+    )
+}
+}
+    
+open func declineFriendRequestAndWait(uid: String)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_decline_friend_request_and_wait(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(uid)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
     /**
      * Deletes a conversation label.
      */
@@ -2793,6 +2928,31 @@ open func ensureMessageLoaded(convId: String, message: ChatMessageRecord)async t
         )
 }
     
+open func findFriendByPhone(phone: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_find_friend_by_phone(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(phone),uniffiCallStatus
+    )
+}
+}
+    
+open func findFriendByPhoneAndWait(phone: String)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_find_friend_by_phone_and_wait(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(phone)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
 open func firePollDebounce(pollId: String, seq: UInt64, nowMs: Int64)  {try! rustCall() {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_method_coreengine_fire_poll_debounce(
@@ -2894,6 +3054,15 @@ open func groupInvitePreview(url: String)async throws  -> GroupInvitePreviewReco
             liftFunc: FfiConverterTypeGroupInvitePreviewRecord_lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
+}
+    
+open func handleContactsState(stateJson: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_handle_contacts_state(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(stateJson),uniffiCallStatus
+    )
+}
 }
     
     /**
@@ -3085,6 +3254,22 @@ open func loadAutoDelete()async throws  -> UInt64  {
         )
 }
     
+open func loadBlockedUsers()async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_load_blocked_users(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
 open func loadNotificationPreferences()async throws  -> UInt64  {
     return
         try  await uniffiRustCallAsync(
@@ -3192,6 +3377,19 @@ open func logOut()  {try! rustCall() {
 }
     
     /**
+     * Synchronously resolves `(name, avatar)` from the lock-free `IdentitySnapshot`.
+     */
+open func lookupPersonInfo(uid: String) -> PersonLookupRecord?  {
+    return try!  FfiConverterOptionTypePersonLookupRecord.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_lookup_person_info(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(uid),uniffiCallStatus
+    )
+})
+}
+    
+    /**
      * Marks a conversation read (clears unread count & manual unread mark, optional read receipt).
      */
 open func markConversationRead(id: String, seenTarget: SeenTargetRecord?)  {try! rustCall() {
@@ -3226,6 +3424,19 @@ open func markRead(id: String)  {try! rustCall() {
         FfiConverterString.lower(id),uniffiCallStatus
     )
 }
+}
+    
+    /**
+     * Synchronously resolves `@mention` display name from the lock-free `IdentitySnapshot`.
+     */
+open func mentionDisplayName(uid: String) -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_mention_display_name(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(uid),uniffiCallStatus
+    )
+})
 }
     
     /**
@@ -3397,6 +3608,22 @@ open func performCardAction(convId: String, msgId: String, actionRef: String)asy
             completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeCardActionOutcomeRecord_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+open func performContactsSync()async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_perform_contacts_sync(
+                        self.uniffiCloneHandle()
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
 }
@@ -3722,6 +3949,14 @@ open func refreshCloudAsync()async throws  -> UInt64  {
         )
 }
     
+open func refreshContacts()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_refresh_contacts(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
     /**
      * Refreshes group `@mention` previews from the attached SQLite store.
      */
@@ -4013,6 +4248,14 @@ open func resetConversationActions()  {try! rustCall() {
 }
 }
     
+open func resetFriendSearch()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_reset_friend_search(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
     /**
      * Resets the hidden-chat PIN and unhides all hidden conversations.
      */
@@ -4138,7 +4381,7 @@ open func rewatchPolls(nowMs: Int64)  {try! rustCall() {
 }
 }
     
-open func saveAlias(uid: String, name: String)async throws  -> SaveAliasRecord  {
+open func saveAlias(uid: String, name: String)async throws  -> SaveAliasResultRecord  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
@@ -4149,7 +4392,7 @@ open func saveAlias(uid: String, name: String)async throws  -> SaveAliasRecord  
             pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
             completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeSaveAliasRecord_lift,
+            liftFunc: FfiConverterTypeSaveAliasResultRecord_lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
 }
@@ -4190,6 +4433,15 @@ open func searchStickers(text: String)async throws  -> [StickerEntryRecord]?  {
             liftFunc: FfiConverterOptionSequenceTypeStickerEntryRecord.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
+}
+    
+open func seedBlockedUsers(users: [BlockedUserRecord]?)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_seed_blocked_users(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionSequenceTypeBlockedUserRecord.lower(users),uniffiCallStatus
+    )
+}
 }
     
     /**
@@ -4267,6 +4519,32 @@ open func seedStickerSuggestSetting(setting: StickerSuggestSettingRecord?)  {try
         FfiConverterOptionTypeStickerSuggestSettingRecord.lower(setting),uniffiCallStatus
     )
 }
+}
+    
+open func sendFriendRequest(uid: String, message: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_method_coreengine_send_friend_request(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(uid),
+        FfiConverterString.lower(message),uniffiCallStatus
+    )
+}
+}
+    
+open func sendFriendRequestAndWait(uid: String, message: String)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_send_friend_request_and_wait(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(uid),FfiConverterString.lower(message)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -4357,6 +4635,22 @@ open func setAutoDeleteTtl(convId: String, ttlMs: Int64)  {try! rustCall() {
         FfiConverterInt64.lower(ttlMs),uniffiCallStatus
     )
 }
+}
+    
+open func setBlocked(uid: String, blocked: Bool, name: String)async throws  -> UInt64  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreengine_set_blocked(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(uid),FfiConverterBool.lower(blocked),FfiConverterString.lower(name)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_u64,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_u64,
+            freeFunc: ffi_olaz_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -10056,7 +10350,7 @@ public func FfiConverterTypeCoreOfflineConversations_lower(_ value: CoreOfflineC
 public protocol CoreRawHttpProtocol: AnyObject, Sendable {
     
     /**
-     * Swift `rawDownloadData`: GET with only the `User-Agent` header; non-2xx is `CoreError.http`.
+     * Swift `rawDownloadData`: GET with Chromium media-other headers; non-2xx is `CoreError.http`.
      */
     func download(url: String, timeoutSecs: Double) async throws  -> Data
     
@@ -10136,10 +10430,19 @@ public convenience init()throws  {
     }
 
     
+public static func withPreferredLanguages(preferredLanguages: [String])throws  -> CoreRawHttp  {
+    return try  FfiConverterTypeCoreRawHttp_lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_constructor_corerawhttp_with_preferred_languages(
+        FfiConverterSequenceString.lower(preferredLanguages),uniffiCallStatus
+    )
+})
+}
+    
 
     
     /**
-     * Swift `rawDownloadData`: GET with only the `User-Agent` header; non-2xx is `CoreError.http`.
+     * Swift `rawDownloadData`: GET with Chromium media-other headers; non-2xx is `CoreError.http`.
      */
 open func download(url: String, timeoutSecs: Double)async throws  -> Data  {
     return
@@ -10385,6 +10688,21 @@ public convenience init(computerName: String)throws  {
         try! rustCall { uniffi_olaz_ffi_fn_free_coresession(handle, $0) }
     }
 
+    
+    /**
+     * Host language preferences apply to all HTTP calls through this session, including login.
+     */
+public static func withClientConfig(imei: String, computerName: String, domainsJson: String?, preferredLanguages: [String])throws  -> CoreSession  {
+    return try  FfiConverterTypeCoreSession_lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_constructor_coresession_with_client_config(
+        FfiConverterString.lower(imei),
+        FfiConverterString.lower(computerName),
+        FfiConverterOptionString.lower(domainsJson),
+        FfiConverterSequenceString.lower(preferredLanguages),uniffiCallStatus
+    )
+})
+}
     
     /**
      * A fresh session configured with an explicit IMEI and optional `ZaloDomains` JSON override.
@@ -14102,6 +14420,64 @@ public func FfiConverterTypeAutoDeleteUpdateRecord_lower(_ value: AutoDeleteUpda
 }
 
 
+public struct BlockedUserRecord: Equatable, Hashable {
+    public var id: String
+    public var name: String
+    public var avatar: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, name: String, avatar: String?) {
+        self.id = id
+        self.name = name
+        self.avatar = avatar
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension BlockedUserRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBlockedUserRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BlockedUserRecord {
+        return
+            try BlockedUserRecord(
+                id: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                avatar: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BlockedUserRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterOptionString.write(value.avatar, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBlockedUserRecord_lift(_ buf: RustBuffer) throws -> BlockedUserRecord {
+    return try FfiConverterTypeBlockedUserRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBlockedUserRecord_lower(_ value: BlockedUserRecord) -> RustBuffer {
+    return FfiConverterTypeBlockedUserRecord.lower(value)
+}
+
+
 public struct BoardRawTopicsEntryRecord: Equatable, Hashable {
     public var convId: String
     public var version: Int64
@@ -14534,6 +14910,72 @@ public func FfiConverterTypeChatMessageRecord_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeChatMessageRecord_lower(_ value: ChatMessageRecord) -> RustBuffer {
     return FfiConverterTypeChatMessageRecord.lower(value)
+}
+
+
+public struct ClientIdentityRecord: Equatable, Hashable {
+    public var clientVersion: String
+    public var clientType: String
+    public var webClientType: String
+    public var userAgent: String
+    public var wsOrigin: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(clientVersion: String, clientType: String, webClientType: String, userAgent: String, wsOrigin: String) {
+        self.clientVersion = clientVersion
+        self.clientType = clientType
+        self.webClientType = webClientType
+        self.userAgent = userAgent
+        self.wsOrigin = wsOrigin
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ClientIdentityRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeClientIdentityRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ClientIdentityRecord {
+        return
+            try ClientIdentityRecord(
+                clientVersion: FfiConverterString.read(from: &buf), 
+                clientType: FfiConverterString.read(from: &buf), 
+                webClientType: FfiConverterString.read(from: &buf), 
+                userAgent: FfiConverterString.read(from: &buf), 
+                wsOrigin: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ClientIdentityRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.clientVersion, into: &buf)
+        FfiConverterString.write(value.clientType, into: &buf)
+        FfiConverterString.write(value.webClientType, into: &buf)
+        FfiConverterString.write(value.userAgent, into: &buf)
+        FfiConverterString.write(value.wsOrigin, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeClientIdentityRecord_lift(_ buf: RustBuffer) throws -> ClientIdentityRecord {
+    return try FfiConverterTypeClientIdentityRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeClientIdentityRecord_lower(_ value: ClientIdentityRecord) -> RustBuffer {
+    return FfiConverterTypeClientIdentityRecord.lower(value)
 }
 
 
@@ -15482,6 +15924,64 @@ public func FfiConverterTypeContactCardStateRecord_lower(_ value: ContactCardSta
 }
 
 
+public struct ContactNoticeRecord: Equatable, Hashable {
+    public var seq: Int64
+    public var ok: Bool
+    public var text: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(seq: Int64, ok: Bool, text: String) {
+        self.seq = seq
+        self.ok = ok
+        self.text = text
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ContactNoticeRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeContactNoticeRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactNoticeRecord {
+        return
+            try ContactNoticeRecord(
+                seq: FfiConverterInt64.read(from: &buf), 
+                ok: FfiConverterBool.read(from: &buf), 
+                text: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ContactNoticeRecord, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.seq, into: &buf)
+        FfiConverterBool.write(value.ok, into: &buf)
+        FfiConverterString.write(value.text, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactNoticeRecord_lift(_ buf: RustBuffer) throws -> ContactNoticeRecord {
+    return try FfiConverterTypeContactNoticeRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactNoticeRecord_lower(_ value: ContactNoticeRecord) -> RustBuffer {
+    return FfiConverterTypeContactNoticeRecord.lower(value)
+}
+
+
 public struct ContactProfileRecord: Equatable, Hashable {
     public var uid: String
     public var name: String
@@ -15560,8 +16060,66 @@ public func FfiConverterTypeContactProfileRecord_lower(_ value: ContactProfileRe
 }
 
 
+public struct ContactSearchRecord: Equatable, Hashable {
+    public var status: String
+    public var error: String?
+    public var user: FoundUserRecord?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(status: String, error: String?, user: FoundUserRecord?) {
+        self.status = status
+        self.error = error
+        self.user = user
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ContactSearchRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeContactSearchRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactSearchRecord {
+        return
+            try ContactSearchRecord(
+                status: FfiConverterString.read(from: &buf), 
+                error: FfiConverterOptionString.read(from: &buf), 
+                user: FfiConverterOptionTypeFoundUserRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ContactSearchRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.status, into: &buf)
+        FfiConverterOptionString.write(value.error, into: &buf)
+        FfiConverterOptionTypeFoundUserRecord.write(value.user, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactSearchRecord_lift(_ buf: RustBuffer) throws -> ContactSearchRecord {
+    return try FfiConverterTypeContactSearchRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactSearchRecord_lower(_ value: ContactSearchRecord) -> RustBuffer {
+    return FfiConverterTypeContactSearchRecord.lower(value)
+}
+
+
 /**
- * Partial-U9 contacts state snapshot delivered via `CoreChangesRecord.contacts`.
+ * Full U9 contacts state snapshot delivered via `CoreChangesRecord.contacts`.
  */
 public struct ContactsStateRecord: Equatable, Hashable {
     public var friends: [FriendEntryRecord]
@@ -15572,6 +16130,10 @@ public struct ContactsStateRecord: Equatable, Hashable {
     public var friendsLoaded: Bool
     public var groupsLoaded: Bool
     public var loadingRequests: Bool
+    public var search: ContactSearchRecord
+    public var notice: ContactNoticeRecord?
+    public var blockedUsers: [BlockedUserRecord]?
+    public var aliases: [StringPairEntry]
     public var groupDetailsJson: [StringPairEntry]
     public var receivedRawJson: String?
     public var sentRawJson: String?
@@ -15579,7 +16141,7 @@ public struct ContactsStateRecord: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(friends: [FriendEntryRecord], groups: [GroupEntryRecord], received: [FriendRequestEntryRecord], sent: [FriendRequestEntryRecord], pendingRequestCount: Int64, friendsLoaded: Bool, groupsLoaded: Bool, loadingRequests: Bool, groupDetailsJson: [StringPairEntry], receivedRawJson: String?, sentRawJson: String?, friendGlobalIds: [StringPairEntry]) {
+    public init(friends: [FriendEntryRecord], groups: [GroupEntryRecord], received: [FriendRequestEntryRecord], sent: [FriendRequestEntryRecord], pendingRequestCount: Int64, friendsLoaded: Bool, groupsLoaded: Bool, loadingRequests: Bool, search: ContactSearchRecord, notice: ContactNoticeRecord?, blockedUsers: [BlockedUserRecord]?, aliases: [StringPairEntry], groupDetailsJson: [StringPairEntry], receivedRawJson: String?, sentRawJson: String?, friendGlobalIds: [StringPairEntry]) {
         self.friends = friends
         self.groups = groups
         self.received = received
@@ -15588,6 +16150,10 @@ public struct ContactsStateRecord: Equatable, Hashable {
         self.friendsLoaded = friendsLoaded
         self.groupsLoaded = groupsLoaded
         self.loadingRequests = loadingRequests
+        self.search = search
+        self.notice = notice
+        self.blockedUsers = blockedUsers
+        self.aliases = aliases
         self.groupDetailsJson = groupDetailsJson
         self.receivedRawJson = receivedRawJson
         self.sentRawJson = sentRawJson
@@ -15618,6 +16184,10 @@ public struct FfiConverterTypeContactsStateRecord: FfiConverterRustBuffer {
                 friendsLoaded: FfiConverterBool.read(from: &buf), 
                 groupsLoaded: FfiConverterBool.read(from: &buf), 
                 loadingRequests: FfiConverterBool.read(from: &buf), 
+                search: FfiConverterTypeContactSearchRecord.read(from: &buf), 
+                notice: FfiConverterOptionTypeContactNoticeRecord.read(from: &buf), 
+                blockedUsers: FfiConverterOptionSequenceTypeBlockedUserRecord.read(from: &buf), 
+                aliases: FfiConverterSequenceTypeStringPairEntry.read(from: &buf), 
                 groupDetailsJson: FfiConverterSequenceTypeStringPairEntry.read(from: &buf), 
                 receivedRawJson: FfiConverterOptionString.read(from: &buf), 
                 sentRawJson: FfiConverterOptionString.read(from: &buf), 
@@ -15634,6 +16204,10 @@ public struct FfiConverterTypeContactsStateRecord: FfiConverterRustBuffer {
         FfiConverterBool.write(value.friendsLoaded, into: &buf)
         FfiConverterBool.write(value.groupsLoaded, into: &buf)
         FfiConverterBool.write(value.loadingRequests, into: &buf)
+        FfiConverterTypeContactSearchRecord.write(value.search, into: &buf)
+        FfiConverterOptionTypeContactNoticeRecord.write(value.notice, into: &buf)
+        FfiConverterOptionSequenceTypeBlockedUserRecord.write(value.blockedUsers, into: &buf)
+        FfiConverterSequenceTypeStringPairEntry.write(value.aliases, into: &buf)
         FfiConverterSequenceTypeStringPairEntry.write(value.groupDetailsJson, into: &buf)
         FfiConverterOptionString.write(value.receivedRawJson, into: &buf)
         FfiConverterOptionString.write(value.sentRawJson, into: &buf)
@@ -17145,6 +17719,96 @@ public func FfiConverterTypeForwardRequestUpdateRecord_lower(_ value: ForwardReq
 }
 
 
+public struct FoundUserRecord: Equatable, Hashable {
+    public var id: String
+    public var name: String
+    public var zaloName: String
+    public var avatar: String?
+    public var bio: String
+    public var isFriend: Bool
+    public var isSelf: Bool
+    public var requested: Bool
+    public var requesting: Bool
+    public var defaultMessage: String
+    public var maxMessage: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, name: String, zaloName: String, avatar: String?, bio: String, isFriend: Bool, isSelf: Bool, requested: Bool, requesting: Bool, defaultMessage: String, maxMessage: Int64) {
+        self.id = id
+        self.name = name
+        self.zaloName = zaloName
+        self.avatar = avatar
+        self.bio = bio
+        self.isFriend = isFriend
+        self.isSelf = isSelf
+        self.requested = requested
+        self.requesting = requesting
+        self.defaultMessage = defaultMessage
+        self.maxMessage = maxMessage
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FoundUserRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFoundUserRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FoundUserRecord {
+        return
+            try FoundUserRecord(
+                id: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                zaloName: FfiConverterString.read(from: &buf), 
+                avatar: FfiConverterOptionString.read(from: &buf), 
+                bio: FfiConverterString.read(from: &buf), 
+                isFriend: FfiConverterBool.read(from: &buf), 
+                isSelf: FfiConverterBool.read(from: &buf), 
+                requested: FfiConverterBool.read(from: &buf), 
+                requesting: FfiConverterBool.read(from: &buf), 
+                defaultMessage: FfiConverterString.read(from: &buf), 
+                maxMessage: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FoundUserRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.zaloName, into: &buf)
+        FfiConverterOptionString.write(value.avatar, into: &buf)
+        FfiConverterString.write(value.bio, into: &buf)
+        FfiConverterBool.write(value.isFriend, into: &buf)
+        FfiConverterBool.write(value.isSelf, into: &buf)
+        FfiConverterBool.write(value.requested, into: &buf)
+        FfiConverterBool.write(value.requesting, into: &buf)
+        FfiConverterString.write(value.defaultMessage, into: &buf)
+        FfiConverterInt64.write(value.maxMessage, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFoundUserRecord_lift(_ buf: RustBuffer) throws -> FoundUserRecord {
+    return try FfiConverterTypeFoundUserRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFoundUserRecord_lower(_ value: FoundUserRecord) -> RustBuffer {
+    return FfiConverterTypeFoundUserRecord.lower(value)
+}
+
+
 public struct FreshnessMapEntry: Equatable, Hashable {
     public var convId: String
     public var freshness: HistoryFreshnessRecord
@@ -18512,6 +19176,7 @@ public func FfiConverterTypeLoginStateRecord_lower(_ value: LoginStateRecord) ->
  * DoH override); tests point it at local servers.
  */
 public struct MediaCoreOptions: Equatable, Hashable {
+    public var preferredLanguages: [String]
     public var filesDir: String
     public var filesCacheLimit: UInt64
     public var maxConcurrent: UInt32
@@ -18528,13 +19193,14 @@ public struct MediaCoreOptions: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(filesDir: String, filesCacheLimit: UInt64, maxConcurrent: UInt32, allowPlainHttp: Bool, dohEndpoints: [String]?, 
+    public init(preferredLanguages: [String] = [], filesDir: String, filesCacheLimit: UInt64, maxConcurrent: UInt32, allowPlainHttp: Bool, dohEndpoints: [String]?, 
         /**
          * Allowed gap between file bytes (production: 30 s).
          */fileIdleSecs: Double, 
         /**
          * Allowed gap between image bytes (production: 10 s).
          */imageIdleSecs: Double) {
+        self.preferredLanguages = preferredLanguages
         self.filesDir = filesDir
         self.filesCacheLimit = filesCacheLimit
         self.maxConcurrent = maxConcurrent
@@ -18560,6 +19226,7 @@ public struct FfiConverterTypeMediaCoreOptions: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MediaCoreOptions {
         return
             try MediaCoreOptions(
+                preferredLanguages: FfiConverterSequenceString.read(from: &buf), 
                 filesDir: FfiConverterString.read(from: &buf), 
                 filesCacheLimit: FfiConverterUInt64.read(from: &buf), 
                 maxConcurrent: FfiConverterUInt32.read(from: &buf), 
@@ -18571,6 +19238,7 @@ public struct FfiConverterTypeMediaCoreOptions: FfiConverterRustBuffer {
     }
 
     public static func write(_ value: MediaCoreOptions, into buf: inout [UInt8]) {
+        FfiConverterSequenceString.write(value.preferredLanguages, into: &buf)
         FfiConverterString.write(value.filesDir, into: &buf)
         FfiConverterUInt64.write(value.filesCacheLimit, into: &buf)
         FfiConverterUInt32.write(value.maxConcurrent, into: &buf)
@@ -20403,6 +21071,60 @@ public func FfiConverterTypePersistedTransportStateRecord_lift(_ buf: RustBuffer
 #endif
 public func FfiConverterTypePersistedTransportStateRecord_lower(_ value: PersistedTransportStateRecord) -> RustBuffer {
     return FfiConverterTypePersistedTransportStateRecord.lower(value)
+}
+
+
+public struct PersonLookupRecord: Equatable, Hashable {
+    public var name: String
+    public var avatar: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, avatar: String) {
+        self.name = name
+        self.avatar = avatar
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PersonLookupRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePersonLookupRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PersonLookupRecord {
+        return
+            try PersonLookupRecord(
+                name: FfiConverterString.read(from: &buf), 
+                avatar: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PersonLookupRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.avatar, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePersonLookupRecord_lift(_ buf: RustBuffer) throws -> PersonLookupRecord {
+    return try FfiConverterTypePersonLookupRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePersonLookupRecord_lower(_ value: PersonLookupRecord) -> RustBuffer {
+    return FfiConverterTypePersonLookupRecord.lower(value)
 }
 
 
@@ -23185,7 +23907,7 @@ public struct RawRequestRecord: Equatable, Hashable {
     public var timeoutSecs: Double?
     public var headers: [String: String]
     /**
-     * Sent as `Cookie: zpw_sek=..; _zlang=vi` + `zpw_sek:` header on Zalo hosts only.
+     * Sent only as host-shaped session cookies on HTTPS Zalo hosts.
      */
     public var zpwSek: String?
 
@@ -23199,7 +23921,7 @@ public struct RawRequestRecord: Equatable, Hashable {
          * Inactivity timeout in seconds; `None` = the 35 s default.
          */timeoutSecs: Double?, headers: [String: String], 
         /**
-         * Sent as `Cookie: zpw_sek=..; _zlang=vi` + `zpw_sek:` header on Zalo hosts only.
+         * Sent only as host-shaped session cookies on HTTPS Zalo hosts.
          */zpwSek: String?) {
         self.method = method
         self.url = url
@@ -23944,6 +24666,60 @@ public func FfiConverterTypeSaveAliasRecord_lower(_ value: SaveAliasRecord) -> R
 }
 
 
+public struct SaveAliasResultRecord: Equatable, Hashable {
+    public var ok: Bool
+    public var text: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(ok: Bool, text: String) {
+        self.ok = ok
+        self.text = text
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SaveAliasResultRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSaveAliasResultRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SaveAliasResultRecord {
+        return
+            try SaveAliasResultRecord(
+                ok: FfiConverterBool.read(from: &buf), 
+                text: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SaveAliasResultRecord, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.ok, into: &buf)
+        FfiConverterString.write(value.text, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSaveAliasResultRecord_lift(_ buf: RustBuffer) throws -> SaveAliasResultRecord {
+    return try FfiConverterTypeSaveAliasResultRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSaveAliasResultRecord_lower(_ value: SaveAliasResultRecord) -> RustBuffer {
+    return FfiConverterTypeSaveAliasResultRecord.lower(value)
+}
+
+
 /**
  * Result of `CoreEngine.search_messages`, paired with the actor's settled change revision.
  */
@@ -24287,14 +25063,16 @@ public struct SessionStateRecord: Equatable, Hashable {
     public var profile: ProfileRecord?
     public var signOutNotice: String?
     public var selfConversationId: String?
+    public var attestEnforced: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(phase: PhaseRecord, profile: ProfileRecord?, signOutNotice: String?, selfConversationId: String?) {
+    public init(phase: PhaseRecord, profile: ProfileRecord?, signOutNotice: String?, selfConversationId: String?, attestEnforced: Bool) {
         self.phase = phase
         self.profile = profile
         self.signOutNotice = signOutNotice
         self.selfConversationId = selfConversationId
+        self.attestEnforced = attestEnforced
     }
 
     
@@ -24316,7 +25094,8 @@ public struct FfiConverterTypeSessionStateRecord: FfiConverterRustBuffer {
                 phase: FfiConverterTypePhaseRecord.read(from: &buf), 
                 profile: FfiConverterOptionTypeProfileRecord.read(from: &buf), 
                 signOutNotice: FfiConverterOptionString.read(from: &buf), 
-                selfConversationId: FfiConverterOptionString.read(from: &buf)
+                selfConversationId: FfiConverterOptionString.read(from: &buf), 
+                attestEnforced: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -24325,6 +25104,7 @@ public struct FfiConverterTypeSessionStateRecord: FfiConverterRustBuffer {
         FfiConverterOptionTypeProfileRecord.write(value.profile, into: &buf)
         FfiConverterOptionString.write(value.signOutNotice, into: &buf)
         FfiConverterOptionString.write(value.selfConversationId, into: &buf)
+        FfiConverterBool.write(value.attestEnforced, into: &buf)
     }
 }
 
@@ -25690,12 +26470,13 @@ public func FfiConverterTypeWireStored_lower(_ value: WireStored) -> RustBuffer 
  * Input of [`ws_start`].
  */
 public struct WsConfigRecord: Equatable, Hashable {
+    public var preferredLanguages: [String]
     /**
      * `wss://host` bases, rotated on reconnect. Empty means the built-in defaults.
      */
     public var endpoints: [String]
     /**
-     * Session key (`zpw_sek`). Sent as cookie/header only, never logged.
+     * Session key (`zpw_sek`). Sent as cookies only, never logged.
      */
     public var zpwSek: String
     /**
@@ -25715,12 +26496,12 @@ public struct WsConfigRecord: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(
+    public init(preferredLanguages: [String] = [], 
         /**
          * `wss://host` bases, rotated on reconnect. Empty means the built-in defaults.
          */endpoints: [String] = [], 
         /**
-         * Session key (`zpw_sek`). Sent as cookie/header only, never logged.
+         * Session key (`zpw_sek`). Sent as cookies only, never logged.
          */zpwSek: String, 
         /**
          * Cursors to resume from.
@@ -25732,6 +26513,7 @@ public struct WsConfigRecord: Equatable, Hashable {
          * Signed-in uid and "My Cloud" conversation id, used to parse chat envelopes in the socket task. Swift verifies
          * them on every delivery (`WirePayload::resolve`), so a wrong or late value only costs a re-parse.
          */myUid: String? = nil, selfConvId: String? = nil) {
+        self.preferredLanguages = preferredLanguages
         self.endpoints = endpoints
         self.zpwSek = zpwSek
         self.seedCursors = seedCursors
@@ -25756,6 +26538,7 @@ public struct FfiConverterTypeWsConfigRecord: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WsConfigRecord {
         return
             try WsConfigRecord(
+                preferredLanguages: FfiConverterSequenceString.read(from: &buf), 
                 endpoints: FfiConverterSequenceString.read(from: &buf), 
                 zpwSek: FfiConverterString.read(from: &buf), 
                 seedCursors: FfiConverterSequenceTypeCursorEntry.read(from: &buf), 
@@ -25766,6 +26549,7 @@ public struct FfiConverterTypeWsConfigRecord: FfiConverterRustBuffer {
     }
 
     public static func write(_ value: WsConfigRecord, into buf: inout [UInt8]) {
+        FfiConverterSequenceString.write(value.preferredLanguages, into: &buf)
         FfiConverterSequenceString.write(value.endpoints, into: &buf)
         FfiConverterString.write(value.zpwSek, into: &buf)
         FfiConverterSequenceTypeCursorEntry.write(value.seedCursors, into: &buf)
@@ -30535,6 +31319,30 @@ fileprivate struct FfiConverterOptionTypeComposerConfirmUpdateRecord: FfiConvert
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeContactNoticeRecord: FfiConverterRustBuffer {
+    typealias SwiftType = ContactNoticeRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeContactNoticeRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeContactNoticeRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeContactProfileRecord: FfiConverterRustBuffer {
     typealias SwiftType = ContactProfileRecord?
 
@@ -30847,6 +31655,30 @@ fileprivate struct FfiConverterOptionTypeForwardRequestUpdateRecord: FfiConverte
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFoundUserRecord: FfiConverterRustBuffer {
+    typealias SwiftType = FoundUserRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFoundUserRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFoundUserRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeLegacyCookieRecord: FfiConverterRustBuffer {
     typealias SwiftType = LegacyCookieRecord?
 
@@ -31055,6 +31887,30 @@ fileprivate struct FfiConverterOptionTypeNotificationSettingsRecord: FfiConverte
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeNotificationSettingsRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypePersonLookupRecord: FfiConverterRustBuffer {
+    typealias SwiftType = PersonLookupRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePersonLookupRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePersonLookupRecord.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -31783,6 +32639,30 @@ fileprivate struct FfiConverterOptionSequenceTypeAutoDeleteEntryRecord: FfiConve
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionSequenceTypeBlockedUserRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [BlockedUserRecord]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceTypeBlockedUserRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceTypeBlockedUserRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionSequenceTypeCachedGroupEntry: FfiConverterRustBuffer {
     typealias SwiftType = [CachedGroupEntry]?
 
@@ -32091,6 +32971,31 @@ fileprivate struct FfiConverterSequenceTypeAutoDeleteEntryRecord: FfiConverterRu
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeAutoDeleteEntryRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeBlockedUserRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [BlockedUserRecord]
+
+    public static func write(_ value: [BlockedUserRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeBlockedUserRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [BlockedUserRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [BlockedUserRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeBlockedUserRecord.read(from: &buf))
         }
         return seq
     }
@@ -33981,6 +34886,13 @@ public func inflate(data: Data)throws  -> Data  {
     )
 })
 }
+public func clientIdentity() -> ClientIdentityRecord  {
+    return try!  FfiConverterTypeClientIdentityRecord_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_client_identity(uniffiCallStatus
+    )
+})
+}
 /**
  * `<hash(seed)>.<ext>` cache file name (`MediaLoader.cachedFileLocation`).
  */
@@ -34044,6 +34956,23 @@ public func mediaStableHash(text: String) -> String  {
         uniffiCallStatus in
     uniffi_olaz_ffi_fn_func_media_stable_hash(
         FfiConverterString.lower(text),uniffiCallStatus
+    )
+})
+}
+public func contactFoldFfi(text: String) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_contact_fold_ffi(
+        FfiConverterString.lower(text),uniffiCallStatus
+    )
+})
+}
+public func localizedStandardCmpFfi(a: String, b: String) -> Int8  {
+    return try!  FfiConverterInt8.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_localized_standard_cmp_ffi(
+        FfiConverterString.lower(a),
+        FfiConverterString.lower(b),uniffiCallStatus
     )
 })
 }
@@ -34575,6 +35504,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_func_inflate() != 10643) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_func_client_identity() != 2944) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_func_media_cached_file_name() != 50847) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -34588,6 +35520,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_func_media_stable_hash() != 42448) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_contact_fold_ffi() != 9027) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_localized_standard_cmp_ffi() != 33296) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_func_mute_info_format_description() != 47161) {
@@ -34809,6 +35747,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_historybatch_raw_json() != 50277) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_accept_friend_request() != 36286) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_accept_friend_request_and_wait() != 4960) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_answer_composer_confirm() != 53689) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -34843,6 +35787,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_bootstrap() != 40555) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_cancel_friend_request() != 42472) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_cancel_friend_request_and_wait() != 13386) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_check_hidden_pin() != 2625) {
@@ -34893,6 +35843,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_current_version() != 33807) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_decline_friend_request() != 21267) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_decline_friend_request_and_wait() != 6903) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_delete_conversation_label() != 22782) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -34926,6 +35882,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_ensure_message_loaded() != 11408) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_find_friend_by_phone() != 43863) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_find_friend_by_phone_and_wait() != 45433) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_fire_poll_debounce() != 19532) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -34945,6 +35907,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_group_invite_preview() != 51794) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_handle_contacts_state() != 30398) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_handle_conversation_actions() != 55696) {
@@ -34986,6 +35951,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_load_auto_delete() != 38688) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_load_blocked_users() != 25069) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_load_notification_preferences() != 22960) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -35007,6 +35975,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_log_out() != 29389) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_lookup_person_info() != 50530) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_mark_conversation_read() != 4135) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -35014,6 +35985,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_mark_read() != 5051) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_mention_display_name() != 45321) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_move_conversation() != 1144) {
@@ -35050,6 +36024,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_perform_card_action() != 28720) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_perform_contacts_sync() != 45358) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_persist_conversations() != 32011) {
@@ -35107,6 +36084,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_refresh_cloud_async() != 58373) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_refresh_contacts() != 37332) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_refresh_mention_previews() != 8415) {
@@ -35175,6 +36155,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_reset_conversation_actions() != 31584) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_reset_friend_search() != 38225) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_reset_hidden_pin() != 13854) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -35202,13 +36185,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_rewatch_polls() != 35928) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_coreengine_save_alias() != 22314) {
+    if (uniffi_olaz_ffi_checksum_method_coreengine_save_alias() != 23037) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_search_messages() != 44896) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_search_stickers() != 59277) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_seed_blocked_users() != 43011) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_seed_composer_confirms() != 43201) {
@@ -35232,6 +36218,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreengine_seed_sticker_suggest_setting() != 40980) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_send_friend_request() != 35661) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_send_friend_request_and_wait() != 44356) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreengine_send_my_card() != 33199) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -35245,6 +36237,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_set_auto_delete_ttl() != 15133) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreengine_set_blocked() != 41461) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreengine_set_conversation_filter() != 10430) {
@@ -35691,7 +36686,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_mediapublishhook_before_publish() != 3838) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corerawhttp_download() != 44253) {
+    if (uniffi_olaz_ffi_checksum_method_corerawhttp_download() != 28805) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_corerawhttp_download_sync_batch() != 17218) {
@@ -35943,7 +36938,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_constructor_corerawhttp_new() != 28295) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_constructor_corerawhttp_with_preferred_languages() != 52705) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_constructor_coresession_new() != 51392) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_constructor_coresession_with_client_config() != 63740) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_constructor_coresession_with_config() != 16329) {

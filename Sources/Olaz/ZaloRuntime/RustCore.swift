@@ -3,6 +3,9 @@ import OlazCore
 
 /// Shared helpers for the `OlazCore` UniFFI boundary (ADR-017: Rust is the sole implementation).
 enum RustCore {
+    /// Protocol identity pinned in Rust, independent of the installed official runtime.
+    static let clientIdentity = OlazCore.clientIdentity()
+
     // MARK: Errors
 
     /// Maps a Rust-core error to the Swift error the engine already reacts to (`ZaloSessionError.isAuthError` re-login,

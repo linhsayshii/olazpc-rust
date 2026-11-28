@@ -22,6 +22,7 @@
 mod api;
 mod autodelete;
 mod cloud;
+mod contacts;
 mod conversations;
 mod e2ee;
 mod error;
@@ -46,6 +47,11 @@ pub use autodelete::{
     build_update_auto_delete_payload, parse_auto_delete_settings,
 };
 pub use cloud::{CloudPlanKind, CloudServerSnapshot, parse_cloud_usage_snapshot};
+pub use contacts::{
+    BlockedUserEntry, build_accept_friend_request_payload, build_fid_imei_payload,
+    build_search_friend_by_phone_payload, build_send_friend_request_payload,
+    build_set_alias_request, normalize_phone_for_lookup, parse_blocked_users_page,
+};
 pub use conversations::{
     HiddenConversationsSnapshot, PollOutcome, parse_hidden_conversations_response,
     received_friend_request_rows,

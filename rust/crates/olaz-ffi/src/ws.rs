@@ -54,10 +54,12 @@ pub(crate) fn to_map(entries: Vec<CursorEntry>) -> CursorMap {
 /// Input of [`ws_start`].
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct WsConfigRecord {
+    #[uniffi(default = [])]
+    pub preferred_languages: Vec<String>,
     /// `wss://host` bases, rotated on reconnect. Empty means the built-in defaults.
     #[uniffi(default = [])]
     pub endpoints: Vec<String>,
-    /// Session key (`zpw_sek`). Sent as cookie/header only, never logged.
+    /// Session key (`zpw_sek`). Sent as cookies only, never logged.
     pub zpw_sek: String,
     /// Cursors to resume from.
     #[uniffi(default = [])]
@@ -261,6 +263,7 @@ pub fn ws_start(
     let _guard = rt.enter();
     let mut cfg = WsConfig::new(config.endpoints, config.zpw_sek);
     cfg.seed_cursors = to_map(config.seed_cursors);
+    cfg.preferred_languages = config.preferred_languages;
     if let Some(cap) = config.event_capacity {
         cfg.event_capacity = usize::try_from(cap).unwrap_or(1024).max(1);
     }

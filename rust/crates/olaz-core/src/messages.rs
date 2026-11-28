@@ -7,7 +7,8 @@ use olaz_store::StoredMessage as DbStoredMessage;
 use olaz_wire::{
     ChatMessage, Kind, NameLookup, ParsedWireEvent, StoredMessage as WireStoredMessage,
     UNKNOWN_NAME, WireParseOptions, clean_group_id, decode_stored_message, encode_chat_message,
-    extract_batch_events, group_conv_id, is_group_id, sanitize_profile_uid, strip_user_prefix,
+    extract_batch_events, group_conv_id, is_group_id, normalize_contact_uid, sanitize_profile_uid,
+    strip_user_prefix,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -262,7 +263,127 @@ impl fmt::Debug for FriendRequestEntry {
     }
 }
 
-/// Partial U9 contacts state owned by `olaz-core` and mirrored via `DirtyKey::Contacts`.
+/// Unified contacts & identity state owned by `olaz-core` and mirrored via `DirtyKey::Contacts`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FoundUserEntry {
+    pub id: String,
+    pub name: String,
+    pub zalo_name: String,
+    pub avatar: Option<String>,
+    pub bio: String,
+    pub is_friend: bool,
+    pub is_self: bool,
+    pub requested: bool,
+    pub requesting: bool,
+    pub default_message: String,
+    pub max_message: i64,
+}
+
+impl fmt::Debug for FoundUserEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FoundUserEntry")
+            .field("is_friend", &self.is_friend)
+            .field("is_self", &self.is_self)
+            .field("requested", &self.requested)
+            .field("requesting", &self.requesting)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactSearchStatus {
+    #[default]
+    Idle,
+    Searching,
+    Found,
+    Error,
+}
+
+impl ContactSearchStatus {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Searching => "searching",
+            Self::Found => "found",
+            Self::Error => "error",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "searching" => Self::Searching,
+            "found" => Self::Found,
+            "error" => Self::Error,
+            _ => Self::Idle,
+        }
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactSearchState {
+    pub status: ContactSearchStatus,
+    pub error: Option<String>,
+    pub user: Option<FoundUserEntry>,
+}
+
+impl fmt::Debug for ContactSearchState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContactSearchState")
+            .field("status", &self.status)
+            .field("has_error", &self.error.is_some())
+            .field("has_user", &self.user.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactNotice {
+    pub seq: i64,
+    pub ok: bool,
+    pub text: String,
+}
+
+impl fmt::Debug for ContactNotice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContactNotice")
+            .field("seq", &self.seq)
+            .field("ok", &self.ok)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedUserState {
+    pub id: String,
+    pub name: String,
+    pub avatar: Option<String>,
+}
+
+impl fmt::Debug for BlockedUserState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BlockedUserState")
+            .field("has_avatar", &self.avatar.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveAliasOutcome {
+    pub ok: bool,
+    pub text: String,
+}
+
+impl fmt::Debug for SaveAliasOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SaveAliasOutcome")
+            .field("ok", &self.ok)
+            .finish()
+    }
+}
+
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactsState {
     pub friends: Vec<FriendEntry>,
@@ -273,6 +394,10 @@ pub struct ContactsState {
     pub groups_loaded: bool,
     pub pending_request_count: usize,
     pub loading_requests: bool,
+    pub search: ContactSearchState,
+    pub notice: Option<ContactNotice>,
+    /// `None` before `loadBlockedUsers` / `setBlocked` runs; `Some(...)` once loaded or mutated.
+    pub blocked_users: Option<Vec<BlockedUserState>>,
     /// Clean group id -> serialized JSON object string for `cachedGroupDetails`.
     pub group_details_json: BTreeMap<String, String>,
     /// Serialized JSON array string of raw received friend requests (`cachedReceivedRequestsRaw`).
@@ -281,6 +406,14 @@ pub struct ContactsState {
     pub sent_raw_json: Option<String>,
     /// UID -> globalId map discovered from friends list (`cachedFriendGlobalIds`).
     pub friend_global_ids: BTreeMap<String, String>,
+    pub aliases: BTreeMap<String, String>,
+    pub cached_profiles: BTreeMap<String, CachedProfile>,
+    pub cached_groups: BTreeMap<String, CachedGroup>,
+    pub activity_ranks: BTreeMap<String, i64>,
+    #[serde(skip)]
+    pub search_gen: u64,
+    #[serde(skip)]
+    pub sync_in_flight: usize,
 }
 
 impl fmt::Debug for ContactsState {
@@ -292,6 +425,10 @@ impl fmt::Debug for ContactsState {
             .field("sent", &self.sent.len())
             .field("friends_loaded", &self.friends_loaded)
             .field("groups_loaded", &self.groups_loaded)
+            .field("aliases", &self.aliases.len())
+            .field("cached_profiles", &self.cached_profiles.len())
+            .field("cached_groups", &self.cached_groups.len())
+            .field("activity_ranks", &self.activity_ranks.len())
             .finish()
     }
 }
@@ -299,6 +436,150 @@ impl fmt::Debug for ContactsState {
 impl ContactsState {
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// Projects the [`IdentityTable`] view of this contacts state.
+    #[must_use]
+    pub fn to_identity_table(&self) -> IdentityTable {
+        IdentityTable {
+            friends: self
+                .friends
+                .iter()
+                .map(|f| FriendIdentity {
+                    id: f.id.clone(),
+                    name: f.name.clone(),
+                    avatar: f.avatar.clone(),
+                })
+                .collect(),
+            groups: self
+                .groups
+                .iter()
+                .map(|g| GroupIdentity {
+                    id: g.id.clone(),
+                    name: g.name.clone(),
+                    avatar: g.avatar.clone(),
+                    members: g.members,
+                })
+                .collect(),
+            friends_loaded: self.friends_loaded,
+            groups_loaded: self.groups_loaded,
+            aliases: self.aliases.clone(),
+            cached_profiles: self.cached_profiles.clone(),
+            cached_groups: self.cached_groups.clone(),
+            friend_global_ids: self.friend_global_ids.clone(),
+            activity_ranks: self.activity_ranks.clone(),
+        }
+    }
+
+    /// Applies an [`IdentityTable`] pushed by Swift / tests onto this state while preserving
+    /// contacts-specific fields (`received`, `sent`, `zalo_name`, `online`, `sort_key`, etc.)
+    /// for matching friend/group ids.
+    pub fn apply_identity_table(&mut self, table: IdentityTable) {
+        let existing_friends: HashMap<String, FriendEntry> =
+            self.friends.drain(..).map(|f| (f.id.clone(), f)).collect();
+        self.friends = table
+            .friends
+            .into_iter()
+            .map(|f| {
+                if let Some(prev) = existing_friends.get(&f.id) {
+                    let sort_key = if prev.name == f.name {
+                        prev.sort_key.clone()
+                    } else {
+                        fold_contact_str(&f.name).trim().to_owned()
+                    };
+                    let section = if prev.name == f.name {
+                        prev.section.clone()
+                    } else {
+                        sort_key
+                            .chars()
+                            .next()
+                            .map(|c| c.to_ascii_uppercase())
+                            .filter(char::is_ascii_uppercase)
+                            .map_or_else(|| "#".to_owned(), |c| c.to_string())
+                    };
+                    FriendEntry {
+                        id: f.id,
+                        name: f.name,
+                        zalo_name: prev.zalo_name.clone(),
+                        avatar: f.avatar,
+                        last_active_ms: prev.last_active_ms,
+                        online: prev.online,
+                        section,
+                        sort_key,
+                    }
+                } else {
+                    let sort_key = fold_contact_str(&f.name).trim().to_owned();
+                    let section = sort_key
+                        .chars()
+                        .next()
+                        .map(|c| c.to_ascii_uppercase())
+                        .filter(char::is_ascii_uppercase)
+                        .map_or_else(|| "#".to_owned(), |c| c.to_string());
+                    FriendEntry {
+                        id: f.id,
+                        name: f.name.clone(),
+                        zalo_name: f.name,
+                        avatar: f.avatar,
+                        last_active_ms: None,
+                        online: false,
+                        section,
+                        sort_key,
+                    }
+                }
+            })
+            .collect();
+
+        let existing_groups: HashMap<String, GroupEntry> =
+            self.groups.drain(..).map(|g| (g.id.clone(), g)).collect();
+        self.groups = table
+            .groups
+            .into_iter()
+            .map(|g| {
+                let sort_key = match existing_groups.get(&g.id) {
+                    Some(prev) if prev.name == g.name => prev.sort_key.clone(),
+                    _ => fold_contact_str(&g.name),
+                };
+                GroupEntry {
+                    id: g.id,
+                    name: g.name,
+                    avatar: g.avatar,
+                    members: g.members,
+                    sort_key,
+                }
+            })
+            .collect();
+
+        self.friends_loaded = table.friends_loaded;
+        self.groups_loaded = table.groups_loaded;
+        self.aliases = table.aliases;
+        self.cached_profiles = table.cached_profiles;
+        self.cached_groups = table.cached_groups;
+        self.friend_global_ids = table.friend_global_ids;
+        self.activity_ranks = table.activity_ranks;
+    }
+
+    /// Applies a seeded [`ContactsState`] (from `Command::SeedContacts`), preserving existing
+    /// identity caches (`aliases`, `cached_profiles`, `cached_groups`, `activity_ranks`) when the
+    /// incoming snapshot leaves them empty.
+    pub fn apply_seeded_contacts(&mut self, mut next: ContactsState) {
+        if next.aliases.is_empty() && !self.aliases.is_empty() {
+            next.aliases = std::mem::take(&mut self.aliases);
+        }
+        if next.cached_profiles.is_empty() && !self.cached_profiles.is_empty() {
+            next.cached_profiles = std::mem::take(&mut self.cached_profiles);
+        }
+        if next.cached_groups.is_empty() && !self.cached_groups.is_empty() {
+            next.cached_groups = std::mem::take(&mut self.cached_groups);
+        }
+        if next.activity_ranks.is_empty() && !self.activity_ranks.is_empty() {
+            next.activity_ranks = std::mem::take(&mut self.activity_ranks);
+        }
+        if next.blocked_users.is_none() && self.blocked_users.is_some() {
+            next.blocked_users = self.blocked_users.take();
+        }
+        next.search_gen = self.search_gen;
+        next.sync_in_flight = self.sync_in_flight;
+        *self = next;
     }
 }
 
@@ -311,6 +592,8 @@ pub struct IdentitySnapshot {
     pub identities: IdentityTable,
     /// Conversation fallback names/avatars (`conv.id -> (name, avatar)`).
     pub conversation_fallbacks: HashMap<String, (String, String)>,
+    friends_by_id: HashMap<String, usize>,
+    uid_by_global_id: HashMap<String, String>,
 }
 
 impl fmt::Debug for IdentitySnapshot {
@@ -324,9 +607,11 @@ impl fmt::Debug for IdentitySnapshot {
 
 impl IdentitySnapshot {
     #[must_use]
-    pub fn from_core(my_uid: &str, my_avatar: Option<&str>, convs: &ConversationsState) -> Self {
-        let mut conversation_fallbacks = HashMap::with_capacity(convs.conversations.len());
-        for c in &convs.conversations {
+    pub fn build_conversation_fallbacks(
+        conversations: &[crate::conversations::ConversationSummary],
+    ) -> HashMap<String, (String, String)> {
+        let mut conversation_fallbacks = HashMap::with_capacity(conversations.len());
+        for c in conversations {
             let trimmed = c.name.trim();
             let valid_name = if !trimmed.is_empty() && trimmed != c.id && trimmed != UNKNOWN_NAME {
                 trimmed.to_owned()
@@ -338,15 +623,44 @@ impl IdentitySnapshot {
                 conversation_fallbacks.insert(c.id.clone(), (valid_name, avt));
             }
         }
-        Self {
-            my_uid: my_uid.to_owned(),
-            my_avatar: my_avatar.map(str::to_owned),
-            identities: convs.identities.clone(),
-            conversation_fallbacks,
-        }
+        conversation_fallbacks
     }
 
-    /// Exact port of `ZaloEngine.lookupPersonInfo(_:)` (`conversations.rs:835`).
+    pub fn rebuild_identity_indexes(&mut self) {
+        let mut friends_by_id = HashMap::with_capacity(self.identities.friends.len());
+        for (idx, f) in self.identities.friends.iter().enumerate() {
+            friends_by_id.entry(f.id.clone()).or_insert(idx);
+        }
+        let mut uid_by_global_id = HashMap::with_capacity(self.identities.friend_global_ids.len());
+        for (u, g) in &self.identities.friend_global_ids {
+            uid_by_global_id
+                .entry(g.clone())
+                .or_insert_with(|| u.clone());
+        }
+        self.friends_by_id = friends_by_id;
+        self.uid_by_global_id = uid_by_global_id;
+    }
+
+    #[must_use]
+    pub fn from_core(
+        my_uid: &str,
+        my_avatar: Option<&str>,
+        convs: &ConversationsState,
+        contacts: &ContactsState,
+    ) -> Self {
+        let mut snap = Self {
+            my_uid: my_uid.to_owned(),
+            my_avatar: my_avatar.map(str::to_owned),
+            identities: contacts.to_identity_table(),
+            conversation_fallbacks: Self::build_conversation_fallbacks(&convs.conversations),
+            friends_by_id: HashMap::new(),
+            uid_by_global_id: HashMap::new(),
+        };
+        snap.rebuild_identity_indexes();
+        snap
+    }
+
+    /// Exact port of `ZaloEngine.lookupPersonInfo(_:)` (`conversations.rs:835`), using O(1) indexes.
     #[must_use]
     pub fn lookup_person(&self, raw_uid: &str) -> Option<NameLookup> {
         let clean = strip_user_prefix(raw_uid);
@@ -354,22 +668,24 @@ impl IdentitySnapshot {
             return None;
         }
         let mut candidates = vec![clean.clone()];
+        let norm = normalize_contact_uid(&clean);
+        if !norm.is_empty() && norm != clean {
+            candidates.push(norm);
+        }
         if let Some(sanitized) = sanitize_profile_uid(&clean)
-            && sanitized != clean
+            && !candidates.contains(&sanitized)
         {
             candidates.push(sanitized);
         }
-        if let Some(mapped_uid) = candidates.iter().find_map(|cand| {
-            self.identities
-                .friend_global_ids
-                .iter()
-                .find_map(|(u, g)| (g == cand).then(|| u.clone()))
-        }) && !candidates.contains(&mapped_uid)
+        if let Some(mapped_uid) = candidates
+            .iter()
+            .find_map(|cand| self.uid_by_global_id.get(cand).cloned())
+            && !candidates.contains(&mapped_uid)
         {
             candidates.push(mapped_uid);
         }
 
-        let clean_my_uid = strip_user_prefix(&self.my_uid);
+        let clean_my_uid = normalize_contact_uid(&self.my_uid);
         let sanitized_my_uid =
             sanitize_profile_uid(&clean_my_uid).unwrap_or_else(|| clean_my_uid.clone());
         if !clean_my_uid.is_empty()
@@ -385,7 +701,9 @@ impl IdentitySnapshot {
 
         for candidate in &candidates {
             let alias = self.identities.aliases.get(candidate).map(String::as_str);
-            if let Some(f) = self.identities.friends.iter().find(|f| f.id == *candidate) {
+            if let Some(&idx) = self.friends_by_id.get(candidate)
+                && let Some(f) = self.identities.friends.get(idx)
+            {
                 let avt = f
                     .avatar
                     .as_deref()
@@ -436,6 +754,27 @@ impl IdentitySnapshot {
             }
         }
         None
+    }
+
+    /// Exact port of `ZaloEngine.mentionDisplayName(_:)` (`ZaloEngine+Contacts.swift:424`).
+    #[must_use]
+    pub fn mention_display_name(&self, raw_uid: &str) -> Option<String> {
+        let clean = normalize_contact_uid(raw_uid);
+        if clean.is_empty() || clean == "-1" {
+            return None;
+        }
+        let clean_my = normalize_contact_uid(&self.my_uid);
+        let sanitized_my = sanitize_profile_uid(&clean_my).unwrap_or_else(|| clean_my.clone());
+        let sanitized_clean = sanitize_profile_uid(&clean).unwrap_or_else(|| clean.clone());
+        if !clean_my.is_empty() && (clean == clean_my || sanitized_clean == sanitized_my) {
+            return None;
+        }
+        let hit = self.lookup_person(&clean)?;
+        let trimmed = hit.name.trim();
+        if trimmed.is_empty() || trimmed == clean || trimmed == "Bạn" || trimmed == UNKNOWN_NAME {
+            return None;
+        }
+        Some(trimmed.to_owned())
     }
 
     #[must_use]
@@ -1526,6 +1865,7 @@ pub fn parse_batch_events(
 pub fn apply_batch_pass1(
     messages: &mut MessagesState,
     conversations: &mut ConversationsState,
+    contacts: &ContactsState,
     events: &[ParsedWireEvent],
     increment_unread: bool,
     self_conv_id: Option<&str>,
@@ -1616,7 +1956,7 @@ pub fn apply_batch_pass1(
     for (conv_id, latest) in latest_by_conv {
         poll_messages.push(latest.clone());
         let is_grp = is_group_id(&conv_id);
-        let info = conversations.lookup_conversation_identity(&conv_id, self_conv_id);
+        let info = conversations.lookup_conversation_identity(contacts, &conv_id, self_conv_id);
         let prev = ConversationPreview {
             text: message_preview_label(&latest),
             date_ms: Some(latest.date_ms),
@@ -1669,7 +2009,7 @@ pub fn apply_batch_pass1(
     }
 
     let mut list: Vec<ConversationSummary> = by_id.into_values().collect();
-    sort_conversations(&mut list, &conversations.identities.activity_ranks);
+    sort_conversations(&mut list, &contacts.activity_ranks);
     let conversations_changed = if list != conversations.conversations {
         conversations.conversations = list;
         true
@@ -1677,7 +2017,7 @@ pub fn apply_batch_pass1(
         false
     };
     let flags_changed = conversations.rebuild_conversation_flags(self_conv_id);
-    let extras_changed = conversations.rebuild_conversation_extras(self_conv_id);
+    let extras_changed = conversations.rebuild_conversation_extras(contacts, self_conv_id);
 
     BatchPass1Outcome {
         stored_rows,
@@ -1824,68 +2164,187 @@ pub fn collect_missing_sender_uids(
 // Contacts folding, sorting, and parsing (`ZaloEngine+Contacts.swift`)
 // ---------------------------------------------------------------------------
 
-/// Lower-cased, diacritic-folded text (Vietnamese `đ`/`Đ` included) for contact searching & sorting.
+static CONTACT_COLLATOR: std::sync::LazyLock<icu_collator::CollatorBorrowed<'static>> =
+    std::sync::LazyLock::new(|| {
+        let mut prefs = icu_collator::CollatorPreferences::default();
+        prefs.numeric_ordering = Some(icu_collator::preferences::CollationNumericOrdering::True);
+        let mut opts = icu_collator::options::CollatorOptions::default();
+        opts.strength = Some(icu_collator::options::Strength::Tertiary);
+        let res = icu_collator::Collator::try_new(prefs, opts);
+        #[expect(
+            clippy::expect_used,
+            reason = "compiled-in ICU root collation data is infallible"
+        )]
+        // INFALLIBLE: compiled-in ICU root collation data (`icu_collator` `compiled_data` feature).
+        res.expect("ICU root collator")
+    });
+
+fn is_latin_diacritic_mark(u: u32) -> bool {
+    matches!(
+        u,
+        0x0300..=0x036F
+            | 0x0483..=0x0489
+            | 0x1AB0..=0x1AFF
+            | 0x1DC0..=0x1DFF
+            | 0x20D0..=0x20FF
+            | 0xFE20..=0xFE2F
+    )
+}
+
+fn fold_special_pre_nfd(ch: char) -> Option<&'static str> {
+    match ch {
+        'đ' | 'Đ' => Some("d"),
+        'ß' | 'ẞ' => Some("ss"),
+        '\u{017F}' | '\u{1E9B}' => Some("s"),
+        '\u{0149}' => Some("\u{02BC}n"),
+        '\u{1E9A}' => Some("a\u{02BE}"),
+        '\u{00B5}' => Some("\u{03BC}"),
+        '\u{0345}' => Some("\u{03B9}"),
+        '\u{03C2}' => Some("\u{03C3}"),
+        '\u{03D0}' => Some("\u{03B2}"),
+        '\u{03D1}' => Some("\u{03B8}"),
+        '\u{03D5}' => Some("\u{03C6}"),
+        '\u{03D6}' => Some("\u{03C0}"),
+        '\u{03F0}' => Some("\u{03BA}"),
+        '\u{03F1}' => Some("\u{03C1}"),
+        '\u{03F5}' => Some("\u{03B5}"),
+        '\u{0587}' => Some("\u{0565}\u{0582}"),
+        '\u{212B}' => Some("a"),
+        '\u{FB00}' => Some("ff"),
+        '\u{FB01}' => Some("fi"),
+        '\u{FB02}' => Some("fl"),
+        '\u{FB03}' => Some("ffi"),
+        '\u{FB04}' => Some("ffl"),
+        '\u{FB05}' | '\u{FB06}' => Some("st"),
+        '\u{FB13}' => Some("\u{0574}\u{0576}"),
+        '\u{FB14}' => Some("\u{0574}\u{0565}"),
+        '\u{FB15}' => Some("\u{0574}\u{056B}"),
+        '\u{FB16}' => Some("\u{057E}\u{0576}"),
+        '\u{FB17}' => Some("\u{0574}\u{056D}"),
+        // Turkish capital I with dot above -> plain ASCII 'i' (without combining dot).
+        '\u{0130}' => Some("i"),
+        _ => None,
+    }
+}
+
+fn preserves_precomposed_form(ch: char) -> bool {
+    let u = u32::from(ch);
+    // Hangul syllables, Greek prosgegrammeni/breathings, and negated math operators
+    // are not decomposed by CFStringFold(diacriticInsensitive).
+    (0xAC00..=0xD7A3).contains(&u)
+        || matches!(u, 0x1FCD..=0x1FCF | 0x1FDD..=0x1FDF)
+        || matches!(
+            u,
+            0x219A
+                | 0x219B
+                | 0x21AE
+                | 0x21CD..=0x21CF
+                | 0x2204
+                | 0x2209
+                | 0x220C
+                | 0x2224
+                | 0x2226
+                | 0x2241
+                | 0x2244
+                | 0x2247
+                | 0x2249
+                | 0x2262
+                | 0x226D
+                | 0x2270
+                | 0x2271
+                | 0x2274
+                | 0x2275
+                | 0x2278
+                | 0x2279
+                | 0x2280
+                | 0x2281
+                | 0x2284
+                | 0x2285
+                | 0x2288
+                | 0x2289
+                | 0x22AC..=0x22AF
+                | 0x22E0..=0x22E3
+                | 0x22EA..=0x22ED
+                | 0x2ADC
+        )
+}
+
+/// Lower-cased, diacritic- and width-folded text (Vietnamese `đ`/`Đ` included) matching Swift's
+/// `ZaloEngine.contactFold`:
+/// `replacingOccurrences("đ"->"d", "Đ"->"D").folding([.diacriticInsensitive, .caseInsensitive, .widthInsensitive], locale: "vi").lowercased()`.
 #[must_use]
 pub fn contact_fold(text: &str) -> String {
     fold_contact_str(text)
 }
 
-fn fold_vietnamese_and_latin_char(ch: char) -> &'static [char] {
-    match ch {
-        'đ' | 'Đ' => &['d'],
-        'à' | 'á' | 'ả' | 'ã' | 'ạ' | 'ă' | 'ằ' | 'ắ' | 'ẳ' | 'ẵ' | 'ặ' | 'â' | 'ầ' | 'ấ' | 'ẩ'
-        | 'ẫ' | 'ậ' | 'À' | 'Á' | 'Ả' | 'Ã' | 'Ạ' | 'Ă' | 'Ằ' | 'Ắ' | 'Ẳ' | 'Ẵ' | 'Ặ' | 'Â'
-        | 'Ầ' | 'Ấ' | 'Ẩ' | 'Ẫ' | 'Ậ' | 'ä' | 'å' | 'ā' | 'Ä' | 'Å' | 'Ā' => &['a'],
-        'è' | 'é' | 'ẻ' | 'ẽ' | 'ẹ' | 'ê' | 'ề' | 'ế' | 'ể' | 'ễ' | 'ệ' | 'È' | 'É' | 'Ẻ' | 'Ẽ'
-        | 'Ẹ' | 'Ê' | 'Ề' | 'Ế' | 'Ể' | 'Ễ' | 'Ệ' | 'ë' | 'ē' | 'Ë' | 'Ē' => {
-            &['e']
-        }
-        'ì' | 'í' | 'ỉ' | 'ĩ' | 'ị' | 'Ì' | 'Í' | 'Ỉ' | 'Ĩ' | 'Ị' | 'î' | 'ï' | 'ī' | 'Î' | 'Ï'
-        | 'Ī' => &['i'],
-        'ò' | 'ó' | 'ỏ' | 'õ' | 'ọ' | 'ô' | 'ồ' | 'ố' | 'ổ' | 'ỗ' | 'ộ' | 'ơ' | 'ờ' | 'ớ' | 'ở'
-        | 'ỡ' | 'ợ' | 'Ò' | 'Ó' | 'Ỏ' | 'Õ' | 'Ọ' | 'Ô' | 'Ồ' | 'Ố' | 'Ổ' | 'Ỗ' | 'Ộ' | 'Ơ'
-        | 'Ờ' | 'Ớ' | 'Ở' | 'Ỡ' | 'Ợ' | 'ö' | 'ø' | 'ō' | 'Ö' | 'Ø' | 'Ō' => &['o'],
-        'ù' | 'ú' | 'ủ' | 'ũ' | 'ụ' | 'ư' | 'ừ' | 'ứ' | 'ử' | 'ữ' | 'ự' | 'Ù' | 'Ú' | 'Ủ' | 'Ũ'
-        | 'Ụ' | 'Ư' | 'Ừ' | 'Ứ' | 'Ử' | 'Ữ' | 'Ự' | 'û' | 'ü' | 'ū' | 'Û' | 'Ü' | 'Ū' => {
-            &['u']
-        }
-        'ỳ' | 'ý' | 'ỷ' | 'ỹ' | 'ỵ' | 'Ỳ' | 'Ý' | 'Ỷ' | 'Ỹ' | 'Ỵ' | 'ÿ' | 'Ÿ' => {
-            &['y']
-        }
-        'ñ' | 'Ñ' => &['n'],
-        'ç' | 'Ç' => &['c'],
-        'ß' => &['s', 's'],
-        'æ' | 'Æ' => &['a', 'e'],
-        'œ' | 'Œ' => &['o', 'e'],
-        '\u{0300}'..='\u{036F}' | '\u{1DC0}'..='\u{1DFF}' | '\u{20D0}'..='\u{20FF}' => &[],
-        '\u{FF01}'..='\u{FF5E}' => &[],
-        _ => &[],
-    }
-}
-
-/// Fold helper handling arbitrary characters including fullwidth ASCII and passthrough scalars.
+/// Exact ICU-backed port of `ZaloEngine.contactFold` (NFD + width folding + diacritic stripping + case folding).
 #[must_use]
 pub fn fold_contact_str(text: &str) -> String {
+    let nfd = icu_normalizer::DecomposingNormalizerBorrowed::new_nfd();
+    let nfkd = icu_normalizer::DecomposingNormalizerBorrowed::new_nfkd();
+    let nfc = icu_normalizer::ComposingNormalizerBorrowed::new_nfc();
+
     let mut out = String::with_capacity(text.len());
+    let mut prev_was_base = false;
+    let mut scratch = String::new();
+
     for ch in text.chars() {
-        if ('\u{0300}'..='\u{036F}').contains(&ch)
-            || ('\u{1DC0}'..='\u{1DFF}').contains(&ch)
-            || ('\u{20D0}'..='\u{20FF}').contains(&ch)
-        {
-            continue;
-        }
-        if ('\u{FF01}'..='\u{FF5E}').contains(&ch) {
-            if let Some(ascii) = char::from_u32(u32::from(ch) - 0xFEE0) {
-                for lc in ascii.to_lowercase() {
-                    out.push(lc);
-                }
+        let u = u32::from(ch);
+        if is_latin_diacritic_mark(u) {
+            if !prev_was_base {
+                out.push(ch);
             }
             continue;
         }
-        let mapped = fold_vietnamese_and_latin_char(ch);
-        if !mapped.is_empty() {
-            for &m in mapped {
-                for lc in m.to_lowercase() {
+        if let Some(mapped) = fold_special_pre_nfd(ch) {
+            out.push_str(mapped);
+            prev_was_base = true;
+            continue;
+        }
+        // Halfwidth & Fullwidth Forms (U+FF01..=U+FFEE, excluding U+FFE3, U+FF9E, U+FF9F).
+        if (0xFF01..=0xFFEE).contains(&u) && !matches!(u, 0xFFE3 | 0xFF9E | 0xFF9F) {
+            scratch.clear();
+            scratch.push(ch);
+            let compat_decomposed = nfkd.normalize(&scratch);
+            let compat = nfc.normalize(&compat_decomposed);
+            for c in compat.chars() {
+                for lc in c.to_lowercase() {
+                    out.push(lc);
+                }
+            }
+            prev_was_base = true;
+            continue;
+        }
+        if preserves_precomposed_form(ch) {
+            for lc in ch.to_lowercase() {
+                out.push(lc);
+            }
+            prev_was_base = true;
+            continue;
+        }
+
+        scratch.clear();
+        scratch.push(ch);
+        let decomposed = nfd.normalize(&scratch);
+        let mut stripped_any = false;
+        let mut temp = String::new();
+        for (idx, dc) in decomposed.chars().enumerate() {
+            let du = u32::from(dc);
+            if idx > 0 && is_latin_diacritic_mark(du) {
+                stripped_any = true;
+                continue;
+            }
+            if let Some(mapped) = fold_special_pre_nfd(dc) {
+                stripped_any = true;
+                temp.push_str(mapped);
+            } else {
+                temp.push(dc);
+            }
+        }
+        if stripped_any {
+            let recomposed = nfc.normalize(&temp);
+            for c in recomposed.chars() {
+                for lc in c.to_lowercase() {
                     out.push(lc);
                 }
             }
@@ -1894,14 +2353,12 @@ pub fn fold_contact_str(text: &str) -> String {
                 out.push(lc);
             }
         }
+        prev_was_base = true;
     }
     out
 }
 
-/// Numeric-aware comparison matching Foundation's `localizedStandardCompare` on folded keys
-/// (e.g. `"group 2" < "group 10"`).
-#[must_use]
-pub fn localized_standard_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+fn leading_zero_numeric_tiebreak(a: &str, b: &str) -> std::cmp::Ordering {
     let mut ia = a.chars().peekable();
     let mut ib = b.chars().peekable();
     loop {
@@ -1910,45 +2367,54 @@ pub fn localized_standard_cmp(a: &str, b: &str) -> std::cmp::Ordering {
             (None, Some(_)) => return std::cmp::Ordering::Less,
             (Some(_), None) => return std::cmp::Ordering::Greater,
             (Some(&ca), Some(&cb)) if ca.is_ascii_digit() && cb.is_ascii_digit() => {
-                let mut sa = String::new();
+                let mut len_a = 0usize;
                 while let Some(&d) = ia.peek()
                     && d.is_ascii_digit()
                 {
-                    sa.push(d);
+                    len_a += 1;
                     let _ = ia.next();
                 }
-                let mut sb = String::new();
+                let mut len_b = 0usize;
                 while let Some(&d) = ib.peek()
                     && d.is_ascii_digit()
                 {
-                    sb.push(d);
+                    len_b += 1;
                     let _ = ib.next();
                 }
-                let ta = sa.trim_start_matches('0');
-                let tb = sb.trim_start_matches('0');
-                match ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb)) {
-                    std::cmp::Ordering::Equal => match sa.len().cmp(&sb.len()) {
-                        std::cmp::Ordering::Equal => {}
-                        ord => return ord,
-                    },
+                match len_a.cmp(&len_b) {
+                    std::cmp::Ordering::Equal => {}
                     ord => return ord,
                 }
             }
-            (Some(&ca), Some(&cb)) => {
+            (Some(_), Some(_)) => {
                 let _ = ia.next();
                 let _ = ib.next();
-                if ca != cb {
-                    return ca.cmp(&cb);
-                }
             }
         }
     }
 }
 
-/// Parses raw responses from the 4 contact endpoints into `ContactsState` and updates `IdentityTable`.
+/// ICU UCA collation with numeric ordering (`kn=true`), matching Foundation's
+/// `localizedStandardCompare` across Latin/Vietnamese, emoji/symbols, numbers, CJK, Kana, Hangul,
+/// Cyrillic, and Greek, with Foundation's `forcedOrdering` tie-breaker (`"2" < "02"` and deterministic
+/// UTF-8 tie-break).
+#[must_use]
+pub fn localized_standard_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    if a == b {
+        return std::cmp::Ordering::Equal;
+    }
+    match CONTACT_COLLATOR.compare(a, b) {
+        std::cmp::Ordering::Equal => match leading_zero_numeric_tiebreak(a, b) {
+            std::cmp::Ordering::Equal => a.cmp(b),
+            ord => ord,
+        },
+        ord => ord,
+    }
+}
+
+/// Parses raw responses from the 4 contact endpoints into unified `ContactsState`.
 pub fn apply_fetched_contacts(
     contacts: &mut ContactsState,
-    identities: &mut IdentityTable,
     friends_rows: Option<Vec<Map<String, Value>>>,
     groups_dict: Option<Map<String, Value>>,
     sent_rows: Option<Vec<Map<String, Value>>>,
@@ -1962,7 +2428,7 @@ pub fn apply_fetched_contacts(
                 .get("userId")
                 .or_else(|| row.get("uid"))
                 .or_else(|| row.get("id"));
-            let uid = strip_user_prefix(&olaz_wire::lossless::string(uid_raw));
+            let uid = normalize_contact_uid(&olaz_wire::lossless::string(uid_raw));
             if uid.is_empty() {
                 continue;
             }
@@ -2000,10 +2466,8 @@ pub fn apply_fetched_contacts(
                 sort_key,
             });
         }
-        for (uid, gid) in friend_global_map {
-            contacts.friend_global_ids.insert(uid.clone(), gid.clone());
-            identities.friend_global_ids.insert(uid, gid);
-        }
+        // Fix #1: replace friend_global_ids atomically so stale globalId mappings do not linger.
+        contacts.friend_global_ids = friend_global_map;
         mapped_friends.sort_by(|a, b| {
             if a.section != b.section {
                 if a.section == "#" {
@@ -2016,15 +2480,6 @@ pub fn apply_fetched_contacts(
             }
             localized_standard_cmp(&a.sort_key, &b.sort_key)
         });
-        identities.friends = mapped_friends
-            .iter()
-            .map(|f| FriendIdentity {
-                id: f.id.clone(),
-                name: f.name.clone(),
-                avatar: f.avatar.clone(),
-            })
-            .collect();
-        identities.friends_loaded = true;
         contacts.friends = mapped_friends;
         contacts.friends_loaded = true;
     }
@@ -2070,16 +2525,6 @@ pub fn apply_fetched_contacts(
             });
         }
         mapped_groups.sort_by(|a, b| localized_standard_cmp(&a.sort_key, &b.sort_key));
-        identities.groups = mapped_groups
-            .iter()
-            .map(|g| GroupIdentity {
-                id: g.id.clone(),
-                name: g.name.clone(),
-                avatar: g.avatar.clone(),
-                members: g.members,
-            })
-            .collect();
-        identities.groups_loaded = true;
         contacts.group_details_json = detail_cache;
         contacts.groups = mapped_groups;
         contacts.groups_loaded = true;
@@ -2114,7 +2559,7 @@ fn parse_friend_request_row(
     row: &Map<String, Value>,
     alt_uid_key: &str,
 ) -> Option<FriendRequestEntry> {
-    let uid = strip_user_prefix(&olaz_wire::lossless::string(
+    let uid = normalize_contact_uid(&olaz_wire::lossless::string(
         row.get("userId")
             .or_else(|| row.get("uid"))
             .or_else(|| row.get(alt_uid_key)),
@@ -2139,7 +2584,14 @@ fn parse_friend_request_row(
 /// Port of `ZaloWireParser.preferredName(_:)`.
 #[must_use]
 pub fn preferred_contact_name(row: &Map<String, Value>) -> String {
-    for key in ["displayName", "dName", "zaloName", "username", "name"] {
+    for key in [
+        "zaloName",
+        "zalo_name",
+        "displayName",
+        "display_name",
+        "dName",
+        "name",
+    ] {
         let s = olaz_wire::lossless::string(row.get(key));
         let trimmed = s.trim();
         if !trimmed.is_empty() {

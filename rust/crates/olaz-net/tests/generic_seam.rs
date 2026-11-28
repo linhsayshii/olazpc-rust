@@ -59,7 +59,10 @@ async fn generic_get_matches_swift_golden_url() {
         format!("{H1}{}", get_suffix(&profile_req(), Some(KEY)).unwrap())
     );
     assert!(reqs[0].body.is_none());
-    assert_eq!(reqs[0].header("Content-Type"), None);
+    assert_eq!(
+        reqs[0].header("Content-Type"),
+        Some("application/x-www-form-urlencoded")
+    );
 }
 
 #[tokio::test]

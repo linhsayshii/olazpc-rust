@@ -3,7 +3,7 @@ import SwiftUI
 /// Text emoticons (`:)`, `:z`, `&-(`, `/-heart`…) shown as emoji, like the official Zalo PC.
 ///
 /// The shortcut set and the tokenizer rules are the official client's (`emojiMapPos` keys + `xp5P` parser in `app.asar`,
-/// zpw_ver 694): case-insensitive, longest match wins, and a match counts only when it stands alone, that is, it is
+/// zpw_ver 695): case-insensitive, longest match wins, and a match counts only when it stands alone, that is, it is
 /// preceded by the start of the text, a space or a newline (or directly by another emoticon) and followed by the end of
 /// the text, a space or a newline (or directly by another emoticon). So `10:30`, `http://…` and `a:)` stay as typed.
 /// The official client draws its own sprite; here each shortcut maps to the closest Unicode emoji.

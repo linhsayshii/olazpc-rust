@@ -223,6 +223,8 @@ pub struct MediaDownloadOutcome {
 /// DoH override); tests point it at local servers.
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct MediaCoreOptions {
+    #[uniffi(default = [])]
+    pub preferred_languages: Vec<String>,
     pub files_dir: String,
     pub files_cache_limit: u64,
     pub max_concurrent: u32,
@@ -378,6 +380,7 @@ impl CoreMedia {
     pub fn new(options: MediaCoreOptions, hook: Option<Arc<dyn MediaPublishHook>>) -> Arc<Self> {
         let mut cfg = MediaConfig {
             allow_plain_http: options.allow_plain_http,
+            preferred_languages: options.preferred_languages,
             ..MediaConfig::default()
         };
         if let Some(endpoints) = options.doh_endpoints {

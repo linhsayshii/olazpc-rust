@@ -89,11 +89,10 @@ pub fn build_socket_url(base: &str, now_ms: i64) -> String {
 }
 
 /// Handshake headers set by `runSingleSession`.
-pub fn connect_headers(zpw_sek: &str) -> Vec<(&'static str, String)> {
-    vec![
-        ("Cookie", format!("zpw_sek={zpw_sek}; _zlang=vi")),
-        ("zpw_sek", zpw_sek.to_owned()),
-        ("Origin", WS_ORIGIN.to_owned()),
-        ("User-Agent", USER_AGENT.to_owned()),
-    ]
+pub fn connect_headers(
+    host: &str,
+    zpw_sek: &str,
+    preferred_languages: &[String],
+) -> Vec<(&'static str, String)> {
+    olaz_client::headers::websocket_headers(host, zpw_sek, preferred_languages)
 }

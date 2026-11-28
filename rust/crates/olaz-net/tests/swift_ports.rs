@@ -11,7 +11,8 @@ use olaz_crypto::{ParamCipher, decode_aes, encode_aes, md5_hex, sign_key};
 use olaz_net::mock::MockTransport;
 use olaz_net::{
     ApiRequest, USER_AGENT, WS_ORIGIN, ZPW_TYPE, ZPW_VER, ZaloDomains, extract_zpw_sek,
-    extract_zpw_sek_cookie, generate_imei, is_valid_zpw_sek, unwrap_decrypted_response,
+    extract_zpw_sek_cookie, generate_imei, is_valid_pc_imei, is_valid_zpw_sek,
+    unwrap_decrypted_response,
 };
 use serde_json::{Value, json};
 
@@ -19,7 +20,7 @@ use serde_json::{Value, json};
 #[test]
 fn service_candidate_failover_and_winner_promotion() {
     assert_eq!(ZPW_TYPE, "23");
-    assert_eq!(USER_AGENT, "ZaloPC-darwin-23v694");
+    assert_eq!(USER_AGENT, "ZaloPC-darwin-23v695");
     assert_eq!(WS_ORIGIN, "file://");
 
     let mut domains = ZaloDomains::default();
@@ -176,13 +177,31 @@ fn generated_imei_is_uuid_v4_plus_user_agent_md5() {
             uuid.chars()
                 .all(|c| c == '-' || c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         );
-        assert!(olaz_net::is_current_imei(&imei));
+        assert!(is_valid_pc_imei(&imei));
     }
     assert_ne!(generate_imei(), generate_imei());
-    assert!(!olaz_net::is_current_imei("short"));
-    assert!(!olaz_net::is_current_imei(&format!(
+
+    // Stored 694 PC IMEI (older UA MD5 suffix) stays valid across zpw_ver bumps.
+    let imei_694 = format!(
+        "123e4567-e89b-42d3-a456-426614174000-{}",
+        md5_hex("ZaloPC-darwin-23v694")
+    );
+    assert!(is_valid_pc_imei(&imei_694));
+
+    // Malformed shapes are rejected: wrong length, missing UUID dashes, uppercase hex, non-hex.
+    assert!(!is_valid_pc_imei("short"));
+    assert!(!is_valid_pc_imei(&format!(
         "{}-{}",
         "a".repeat(36),
+        "0".repeat(32)
+    )));
+    assert!(!is_valid_pc_imei(&imei_694.to_uppercase()));
+    assert!(!is_valid_pc_imei(&format!(
+        "123e4567-e89b-42d3-a456-426614174000-{}",
+        "g".repeat(32)
+    )));
+    assert!(!is_valid_pc_imei(&format!(
+        "123e4567_e89b-42d3-a456-426614174000-{}",
         "0".repeat(32)
     )));
 }
@@ -202,7 +221,7 @@ async fn mocked_service_captures_path_and_decrypts_request_payload() {
 
     let recorded = c.transport().requests().pop().unwrap();
     assert_eq!(recorded.path(), "/api/e2ee/pc/message/sms");
-    assert_eq!(recorded.query_value("zpw_ver"), Some("694"));
+    assert_eq!(recorded.query_value("zpw_ver"), Some("695"));
     assert_eq!(recorded.query_value("zpw_type"), Some("23"));
     let payload = decrypted_params(&recorded);
     assert_eq!(olaz_crypto::int64(payload.get("destType")), Some(3));

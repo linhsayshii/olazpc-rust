@@ -45,6 +45,7 @@ mod core;
 mod crypto;
 mod error;
 mod http;
+mod identity;
 mod media;
 mod messages;
 mod notify;
@@ -79,6 +80,7 @@ pub use core::{
 pub use crypto::{decrypt_ws_frame, inflate};
 pub use error::{CoreError, NetworkKind};
 pub use http::{CoreHttp, HttpMethod, HttpRequestRecord, UploadPartRecord};
+pub use identity::{ClientIdentityRecord, client_identity};
 pub use media::*;
 pub use messages::*;
 pub use notify::*;

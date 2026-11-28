@@ -21,7 +21,7 @@ struct SettingsView: View {
                 SettingsPane(height: 160) { StickerSettingsSection() }
             }
             Tab("Tài khoản", systemImage: "person.crop.circle") {
-                SettingsPane(height: 400) { AccountSettings() }
+                SettingsPane(height: 420) { AccountSettings() }
             }
         }
     }
@@ -232,6 +232,12 @@ private struct AccountSettings: View {
         Section("Engine") {
             LabeledContent("Giao thức") { Text("Zalo PC \(engine.clientVersion ?? "—") (mã chính thức)") }
             LabeledContent("Hội thoại") { Text(engine.conversationActions.hiddenKnown ? "\(engine.visibleConversations.count)" : "—") }
+            if engine.attestEnforced {
+                Label(ZaloEngine.attestWarningText, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         Section {
             Button("Đăng xuất", role: .destructive) { engine.logOut() }

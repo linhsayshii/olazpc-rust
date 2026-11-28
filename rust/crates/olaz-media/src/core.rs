@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
+use olaz_client::headers::RequestKind;
 use tokio::sync::Semaphore;
 use url::Url;
 
@@ -251,7 +252,10 @@ impl MediaCore {
             let step = self
                 .net
                 .with_dns_fallback(&host, false, |route| async move {
-                    let head = self.net.send(route, target, &[], idle).await?;
+                    let head = self
+                        .net
+                        .send(route, target, &[], RequestKind::MediaImage, idle)
+                        .await?;
                     if let Some(next) = self.net.redirect_target(&head, target, hops) {
                         return Ok(Step::Redirect(next));
                     }
@@ -390,7 +394,7 @@ impl MediaCore {
                     hub.reset();
                     let head = self
                         .net
-                        .send(route, target, &[], idle)
+                        .send(route, target, &[], RequestKind::MediaOther, idle)
                         .await
                         .map_err(|e| stall_for(route, e))?;
                     if let Some(next) = self.net.redirect_target(&head, target, hops) {
@@ -470,7 +474,7 @@ impl MediaCore {
         let cfg = Arc::clone(&self.net.cfg);
         let mut headers = sanitize_headers(&req.headers, &url, |h| cfg.is_cdn(h));
         let hub = ProgressHub::default();
-        let observer = progress.map(|p| hub.add(p));
+        let observer = progress.clone().map(|p| hub.add(p));
         let started = tokio::time::Instant::now();
         let first = req.ttfb;
         let idle = self.opts.file_idle;
@@ -481,7 +485,13 @@ impl MediaCore {
                 let head_wait = remaining.map_or(idle, |r| r.min(idle));
                 let head = self
                     .net
-                    .send(Route::System, &url, &headers, head_wait)
+                    .send(
+                        Route::System,
+                        &url,
+                        &headers,
+                        RequestKind::MediaOther,
+                        head_wait,
+                    )
                     .await
                     .map_err(|e| {
                         if e == MediaError::Net(crate::error::NetKind::TimedOut)
@@ -523,6 +533,13 @@ impl MediaCore {
         .await;
         if let Some(id) = observer {
             hub.remove(id);
+        }
+        // Automatic content decoding removes the wire Content-Length. An unknown total emits
+        // no intermediate fractions, but a successful download must still finish progress.
+        if result.is_ok()
+            && let Some(progress) = progress
+        {
+            progress(1.0);
         }
         result
     }

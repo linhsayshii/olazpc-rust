@@ -183,7 +183,7 @@ async fn fetch_chat_from_polling_builds_url_and_advances_state() {
     let req = last(&api);
     assert!(
         req.url
-            .starts_with("https://p4-msg-chat.zaloapp.com/?zpw_ver=694&zpw_type=23&params=")
+            .starts_with("https://p4-msg-chat.zaloapp.com/?zpw_ver=695&zpw_type=23&params=")
     );
     assert_eq!(req.query_value("ts"), Some("1700000000"));
     assert_eq!(
