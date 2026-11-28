@@ -2,6 +2,7 @@
 """Local gate: compare installed Zalo runtime with the protocol identity Rust implements."""
 import argparse
 import mmap
+import os
 from pathlib import Path
 import re
 import sys
@@ -35,8 +36,13 @@ def check(asar: Path, identity: Path) -> int:
 
 def main() -> int:
     root = Path(__file__).resolve().parent.parent
+    default_asar = (
+        Path(os.environ["OLAZ_RUNTIME_ASAR"])
+        if os.environ.get("OLAZ_RUNTIME_ASAR")
+        else Path.home() / "Library/Application Support/Olaz/ZaloRuntime/current/Contents/Resources/app.asar"
+    )
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--asar", type=Path, default=Path.home() / "Library/Application Support/Olaz/ZaloRuntime/current/Contents/Resources/app.asar")
+    parser.add_argument("--asar", type=Path, default=default_asar)
     parser.add_argument("--identity", type=Path, default=root / "rust/crates/olaz-client/src/identity.rs")
     args = parser.parse_args()
     try:
