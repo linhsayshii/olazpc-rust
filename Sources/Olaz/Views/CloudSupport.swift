@@ -36,8 +36,7 @@ enum CloudFormat {
     static func dateTime(_ value: Date) -> String { dayTime.string(from: value) }
 
     static func duration(_ seconds: TimeInterval) -> String {
-        let total = Int(seconds.rounded())
-        return String(format: "%d:%02d", total / 60, total % 60)
+        ChatFormat.clock(Int(seconds.rounded()))
     }
 }
 

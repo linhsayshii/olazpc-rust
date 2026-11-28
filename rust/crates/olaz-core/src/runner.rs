@@ -2214,8 +2214,26 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     let sink = sink.clone();
                     let guard = sink.track();
                     self.spawn_cancellable(async move {
+                        let mut resolved_global_ids = BTreeMap::new();
                         let profiles_map = if client.is_authenticated() {
-                            match api.fetch_profiles(&chunk).await {
+                            // Sync2 stores an opaque 32-byte global sender id when gid/decrypt
+                            // fails. Resolve it before profile sanitization discards it. Short
+                            // legacy placeholders are not global ids and must not hit this API.
+                            let global_ids: Vec<_> = chunk
+                                .iter()
+                                .filter(|id| {
+                                    id.len() == 32 && olaz_wire::sanitize_profile_uid(id).is_none()
+                                })
+                                .cloned()
+                                .collect();
+                            if let Ok(resolved) = api.decrypt_global_ids(&global_ids).await {
+                                resolved_global_ids.extend(resolved);
+                            }
+                            let uids: Vec<_> = chunk
+                                .iter()
+                                .map(|id| resolved_global_ids.get(id).unwrap_or(id).clone())
+                                .collect();
+                            match api.fetch_profiles(&uids).await {
                                 Ok(raw) => extract_profiles_map(&raw),
                                 Err(_) => Map::new(),
                             }
@@ -2227,6 +2245,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             conv_id,
                             remaining_chunks,
                             profiles_map,
+                            resolved_global_ids,
                             cache_updated,
                         });
                         drop(guard);

@@ -1549,6 +1549,7 @@ impl MessagesState {
         &mut self,
         conv_id: &str,
         snap: &IdentitySnapshot,
+        resolved_global_ids: &BTreeMap<String, String>,
     ) -> (Vec<DbStoredMessage>, bool) {
         let Some(list) = self.windows.get_mut(conv_id) else {
             return (Vec::new(), false);
@@ -1559,22 +1560,32 @@ impl MessagesState {
             if msg.is_mine {
                 continue;
             }
-            let clean = strip_user_prefix(&msg.sender_id);
-            let Some(info) = snap.lookup_person(&clean) else {
-                continue;
-            };
             let mut row_changed = false;
-            if !info.name.is_empty()
-                && info.name != clean
-                && info.name != UNKNOWN_NAME
-                && msg.sender_name != info.name
+            if let Some(uid) = resolved_global_ids
+                .get(&msg.sender_id)
+                .and_then(|uid| sanitize_profile_uid(uid))
+                && uid != msg.sender_id
             {
-                msg.sender_name = info.name;
+                // Persist the canonical uid, even when its profile is temporarily unavailable.
+                // Subsequent opens can fetch the profile without needing gid resolution again.
+                msg.sender_id = uid;
                 row_changed = true;
             }
-            if msg.sender_avatar.is_none() && is_valid_url_str(&info.avatar) {
-                msg.sender_avatar = Some(info.avatar);
-                row_changed = true;
+            let clean = strip_user_prefix(&msg.sender_id);
+            let info = snap.lookup_person(&clean);
+            if let Some(info) = info {
+                if !info.name.is_empty()
+                    && info.name != clean
+                    && info.name != UNKNOWN_NAME
+                    && msg.sender_name != info.name
+                {
+                    msg.sender_name = info.name;
+                    row_changed = true;
+                }
+                if msg.sender_avatar.is_none() && is_valid_url_str(&info.avatar) {
+                    msg.sender_avatar = Some(info.avatar);
+                    row_changed = true;
+                }
             }
             if row_changed {
                 upserts.push(msg.clone());

@@ -251,11 +251,17 @@ struct FriendsList: View {
 }
 
 private struct FriendRow: View {
+    @Environment(ZaloEngine.self) private var engine
     let friend: ContactsState.Friend
 
+    private var displayName: String {
+        engine.aliasDisplayName(for: friend.id, fallback: friend.name)
+    }
+
     var body: some View {
+        let name = displayName
         HStack(spacing: 10) {
-            RemoteAvatar(url: friend.avatar, name: friend.name, size: 36)
+            RemoteAvatar(url: friend.avatar, name: name, size: 36)
                 .overlay(alignment: .bottomTrailing) {
                     if friend.online {
                         Circle().fill(.green).frame(width: 11, height: 11)
@@ -263,24 +269,31 @@ private struct FriendRow: View {
                             .offset(x: 1, y: 1)
                     }
                 }
-            Text(friend.name).font(.system(size: 13.5, weight: .medium)).lineLimit(1)
+            Text(name).font(.system(size: 13.5, weight: .medium)).lineLimit(1)
             Spacer(minLength: 0)
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(friend.online ? "\(friend.name), đang hoạt động" : friend.name)
+        .accessibilityLabel(friend.online ? "\(name), đang hoạt động" : name)
     }
 }
 
 /// Row actions of a friend: open the chat, call.
 private struct FriendMenu: View {
     @Environment(ZaloEngine.self) private var engine
+    @Environment(ShellModel.self) private var shell
     let friend: ContactsState.Friend
 
     var body: some View {
-        let target = ZaloEngine.ConversationSummary(id: friend.id, isGroup: false, name: friend.name, avatar: friend.avatar,
+        let displayName = engine.aliasDisplayName(for: friend.id, fallback: friend.name)
+        let target = ZaloEngine.ConversationSummary(id: friend.id, isGroup: false, name: displayName, avatar: friend.avatar,
                                                     pinned: false, members: 0, unread: 0, preview: nil)
         Button("Nhắn tin", systemImage: "bubble.left") { engine.openContactConversation(friend.id) }
+        if engine.canEditAlias(for: friend.id, isGroup: false) {
+            Button(AliasDraft.menuTitle, systemImage: "pencil") {
+                shell.editAlias(draft: engine.aliasDraft(for: friend.id, fallbackName: friend.name, fallbackZaloName: friend.zaloName))
+            }
+        }
         if engine.callAvailability(for: target, video: false) != .hidden {
             Button("Gọi thoại", systemImage: "phone") { engine.startCall(to: friend.id, video: false) }
                 .disabled(engine.callAvailability(for: target, video: false) != .available)
@@ -295,8 +308,22 @@ private struct FriendMenu: View {
 /// Detail column: the selected friend as a Contacts.app-style card.
 struct FriendCard: View {
     @Environment(ZaloEngine.self) private var engine
+    @Environment(ShellModel.self) private var shell
     let friend: ContactsState.Friend
     @State private var profile: ContactProfile?
+
+    private var displayName: String {
+        engine.aliasDisplayName(for: friend.id, fallback: friend.name)
+    }
+
+    private var secondaryName: String? {
+        let base = friend.zaloName.isEmpty ? (profile?.zaloName ?? friend.name) : friend.zaloName
+        return base.isEmpty ? nil : base
+    }
+
+    private var canEditAlias: Bool {
+        engine.canEditAlias(for: friend.id, isGroup: false, isOfficialAccount: profile?.isOfficialAccount ?? false)
+    }
 
     private var status: String? {
         if friend.online { return "Đang hoạt động" }
@@ -304,17 +331,23 @@ struct FriendCard: View {
     }
 
     var body: some View {
+        let titleName = displayName
         Form {
             Section {
-                ContactCardHeader(avatar: friend.avatar, name: friend.name,
-                                  secondaryName: friend.zaloName.isEmpty ? profile?.zaloName : friend.zaloName,
+                ContactCardHeader(avatar: friend.avatar, name: titleName,
+                                  secondaryName: secondaryName,
                                   status: status, online: friend.online) {
                     GlassEffectContainer(spacing: 20) {
                         HStack(spacing: 20) {
                             ContactActionButton(title: "Nhắn tin", symbol: "bubble.left.fill", prominent: true) {
                                 engine.openContactConversation(friend.id)
                             }
-                            ContactCallActions(id: friend.id, name: friend.name, avatar: friend.avatar)
+                            ContactCallActions(id: friend.id, name: titleName, avatar: friend.avatar)
+                            if canEditAlias {
+                                ContactActionButton(title: "Tên gợi nhớ", symbol: "pencil", help: AliasDraft.menuTitle) {
+                                    shell.editAlias(draft: engine.aliasDraft(for: friend.id, fallbackName: friend.name, fallbackZaloName: friend.zaloName))
+                                }
+                            }
                         }
                     }
                 }
@@ -328,7 +361,7 @@ struct FriendCard: View {
             }
         }
         .formStyle(.grouped)
-        .navigationTitle(friend.name)
+        .navigationTitle(titleName)
         .task(id: friend.id) {
             profile = nil
             let loaded = await engine.contactProfile(friend.id)

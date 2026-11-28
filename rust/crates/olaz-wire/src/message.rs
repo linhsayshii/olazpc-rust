@@ -353,8 +353,25 @@ fn content_dict_of(raw_content: Option<&Value>) -> Option<Map<String, Value>> {
     }
 }
 
-fn duration_seconds(raw: i64) -> i64 {
-    if raw > 10_000 { raw / 1000 } else { raw }
+/// Official Zalo PC 26.11.10 (`app.asar`, zpw_ver 695) always carries wire `params.duration`
+/// (and video fallback `message.duration`) in milliseconds:
+/// - Video mapper `dP` (`pc-dist/lazy/main-startup.89bb530b91927fd5dd28.js` @ 1322193) and
+///   bubble formatter `IzMZ` (`pc-dist/compact-app-pc.cfeba43a9a8e4e40dda3.js` @ 6503091) ->
+///   `pYkA` (@ 17988477) floor milliseconds to whole seconds (`Math.floor(ms / 1000)`),
+///   switching from `mm:ss` to `hh:mm:ss` at `>= 3_600_000` ms.
+/// - Voice mapper `hP` (`main-startup` @ 1322586) and voice bubble `zV`/`HV`/`XV`
+///   (`main-startup` @ 1486777, 1493721, 1498282) round milliseconds to the nearest second
+///   (`Math.round(ms / 1e3)`).
+fn video_duration_seconds(raw_ms: i64) -> i64 {
+    if raw_ms <= 0 { 0 } else { raw_ms / 1000 }
+}
+
+fn voice_duration_seconds(raw_ms: i64) -> i64 {
+    if raw_ms <= 0 {
+        0
+    } else {
+        raw_ms.saturating_add(500) / 1000
+    }
 }
 
 // MARK: - parseWireMessage
@@ -724,7 +741,8 @@ pub fn parse_wire_message(
             let url = candidates.first().cloned().unwrap_or_default();
             let fallbacks: Vec<String> = candidates.iter().skip(1).cloned().collect();
             let thumb = first_non_empty(&[&dd.ds("thumb"), &dd.ds("thumbUrl"), &dd.ps("thumb")]);
-            let dur = duration_seconds(int64(dd.p("duration").or(dd.d("duration"))).unwrap_or(0));
+            let dur =
+                video_duration_seconds(int64(dd.p("duration").or(dd.d("duration"))).unwrap_or(0));
             text_body = dd.ds("title");
             let mut v =
                 obj(json!({"type": "video", "thumbnail": thumb, "duration": dur, "url": url}));
@@ -742,7 +760,8 @@ pub fn parse_wire_message(
                 &dd.ds("fileUrl"),
                 &dd.ps("m4a"),
             ]);
-            let dur = duration_seconds(int64(dd.p("duration").or(dd.d("duration"))).unwrap_or(0));
+            let dur =
+                voice_duration_seconds(int64(dd.p("duration").or(dd.d("duration"))).unwrap_or(0));
             kind_dict = obj(json!({"type": "voice", "url": url, "duration": dur}));
             kind_tag = "voice".into();
             text_body = "[Tin nhắn thoại]".into();

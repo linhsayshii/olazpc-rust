@@ -237,6 +237,19 @@ private func hasQuarantine(_ url: URL) -> Bool { getxattr(url.path, "com.apple.q
 }
 
 @Suite struct MediaResolutionTests {
+    @MainActor private final class ResolutionGate {
+        var finish: CheckedContinuation<MediaResolution, Never>?
+        var cancelled = false
+
+        func wait() async -> MediaResolution {
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { finish = $0 }
+            } onCancel: {
+                Task { @MainActor in self.cancelled = true }
+            }
+        }
+    }
+
     @Test func parsesEngineJSON() {
         #expect(MediaResolution(json: ["state": "ok", "path": "/a/b.jpg"]) == .file(URL(fileURLWithPath: "/a/b.jpg")))
         #expect(MediaResolution(json: ["state": "ok"]) == .unavailable)
@@ -293,6 +306,45 @@ private func hasQuarantine(_ url: URL) -> Bool { getxattr(url.path, "com.apple.q
         }
         for task in tasks { _ = await task.value }
         #expect(peak <= 2)
+    }
+
+    @MainActor @Test func cancelledResolutionDoesNotRequireManualRetry() async throws {
+        let resolver = MediaResolver()
+        let gate = ResolutionGate()
+        let first = Task { @MainActor in
+            await resolver.resolve(key: "new-photo") { await gate.wait() }
+        }
+        try #require(await pollUntil { gate.finish != nil })
+        first.cancel() // The row leaves the screen while its fallback lookup is running.
+        try #require(await pollUntil { gate.cancelled })
+        gate.finish?.resume(returning: .unavailable)
+        _ = await first.value
+
+        #expect(resolver.known("new-photo") == nil)
+        // The next visible row must resolve immediately, without force/forgetFailures or a 30 s wait.
+        let next = await resolver.resolve(key: "new-photo") { .unsupported }
+        #expect(next == .unsupported)
+    }
+
+    @MainActor @Test func cancelledResolutionCannotReplaceANewerFile() async throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("photo-\(UUID().uuidString).png")
+        try Data("local photo".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let resolver = MediaResolver()
+        let gate = ResolutionGate()
+        let first = Task { @MainActor in
+            await resolver.resolve(key: "photo") { await gate.wait() }
+        }
+        try #require(await pollUntil { gate.finish != nil })
+        first.cancel()
+        try #require(await pollUntil { gate.cancelled })
+        let ready = await resolver.resolve(key: "photo") { .file(file) }
+        #expect(ready == .file(file))
+        gate.finish?.resume(returning: .unavailable) // Old cancelled work completes after the replacement.
+        _ = await first.value
+        #expect(resolver.known("photo") == .file(file))
+        let later = await resolver.resolve(key: "photo") { .unavailable }
+        #expect(later == .file(file))
     }
 
     // 8: queued work whose views are gone is dropped, and the newest request is served first.

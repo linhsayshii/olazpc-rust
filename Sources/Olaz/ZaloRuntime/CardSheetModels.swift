@@ -34,6 +34,64 @@ struct AliasDraft: Equatable, Sendable {
     static func sanitized(_ text: String) -> String {
         String(String.UnicodeScalarView(text.unicodeScalars.filter { $0.value > 7 }))
     }
+
+    /// Official Vietnamese menu / dialog label (`pc-dist/lazy/lang-vi.bd6430df3fbb9dc6dc93.js` @ 324655 `STR_RENAME_ALIAS`).
+    static let menuTitle = "Đặt tên gợi nhớ"
+
+    /// Official visibility rule (`pc-dist/compact-app-pc.cfeba43a9a8e4e40dda3.js` @ 3062897, 20725899, 579492, 10632573):
+    /// shown only for a normal 1-1 friend — hidden for groups, self, Cloud của tôi (`sendToMeId`),
+    /// Official Accounts, and strangers (`enable_stranger_alias` defaults off; server rejects strangers with error 239).
+    static func canEditAlias(
+        uid: String,
+        isGroup: Bool,
+        myUid: String?,
+        selfConversationId: String?,
+        isFriend: Bool,
+        isOfficialAccount: Bool = false
+    ) -> Bool {
+        guard !isGroup, isFriend, !isOfficialAccount else { return false }
+        let trimmed = uid.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !ZaloWireParser.isGroupId(trimmed) else { return false }
+        let clean = ZaloWireParser.normalizeContactUid(trimmed)
+        guard !clean.isEmpty else { return false }
+        if let myUid {
+            let cleanMe = ZaloWireParser.normalizeContactUid(myUid)
+            if !cleanMe.isEmpty, clean == cleanMe { return false }
+        }
+        if let selfConversationId, !selfConversationId.isEmpty {
+            let cleanSelfConv = ZaloWireParser.normalizeContactUid(selfConversationId)
+            if trimmed == selfConversationId || (!cleanSelfConv.isEmpty && clean == cleanSelfConv) {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Builds a pre-filled `AliasDraft` for a 1-1 contact using the official fallback length limit unless overridden.
+    static func forContact(
+        uid: String,
+        displayName: String,
+        zaloName: String = "",
+        currentAlias: String? = nil,
+        max: Int = fallbackMax
+    ) -> AliasDraft {
+        let cleanUid = ZaloWireParser.normalizeContactUid(uid)
+        let trimmedAlias = (currentAlias ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasAlias = !trimmedAlias.isEmpty
+        let limit = max > 0 ? min(max, 200) : fallbackMax
+        let baseName = !zaloName.isEmpty ? zaloName : displayName
+        let effectiveName = baseName.isEmpty ? displayName : baseName
+        let suggest = hasAlias ? sanitized(trimmedAlias).prefixUTF16(limit) : ""
+        let placeholder = effectiveName.isEmpty ? "Nhập tên gợi nhớ" : effectiveName
+        return AliasDraft(
+            uid: cleanUid,
+            name: effectiveName,
+            suggest: suggest,
+            placeholder: placeholder,
+            max: limit,
+            hasAlias: hasAlias
+        )
+    }
 }
 
 /// What a card button asks the app to show.

@@ -1759,6 +1759,7 @@ pub enum Input {
         conv_id: String,
         remaining_chunks: Vec<Vec<String>>,
         profiles_map: Map<String, Value>,
+        resolved_global_ids: BTreeMap<String, String>,
         cache_updated: bool,
     },
     TypedEnvelopeReady {

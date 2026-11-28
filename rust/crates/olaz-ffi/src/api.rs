@@ -273,6 +273,24 @@ impl CoreApi {
         Ok(m.into_iter().collect())
     }
 
+    /// Global noised ID -> PC uid, with bounded GET batches and retry/split recovery.
+    pub async fn decrypt_global_ids(
+        &self,
+        ids: Vec<String>,
+    ) -> Result<HashMap<String, String>, CoreError> {
+        let api = Arc::clone(&self.api);
+        Ok(run(async move { api.decrypt_global_ids(&ids).await }).await??)
+    }
+
+    /// PC uid -> global noised ID.
+    pub async fn encrypt_global_ids(
+        &self,
+        ids: Vec<String>,
+    ) -> Result<HashMap<String, String>, CoreError> {
+        let api = Arc::clone(&self.api);
+        Ok(run(async move { api.encrypt_global_ids(&ids).await }).await??)
+    }
+
     /// `{"data": {"profiles": {uid: row}}}` as lossless JSON.
     pub async fn fetch_profiles(&self, uids: Vec<String>) -> Result<String, CoreError> {
         let api = Arc::clone(&self.api);

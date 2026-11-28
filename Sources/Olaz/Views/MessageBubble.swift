@@ -28,9 +28,12 @@ enum ChatFormat {
         return (sameYear ? dayThisYear : dayOtherYear).string(from: date)
     }
 
+    /// Formats whole seconds as `m:ss`, or `h:mm:ss` when `>= 3600` s (matching official
+    /// `IzMZ` at `compact-app-pc` @ 6503091 switching format at `>= 36e5` ms).
     static func clock(_ seconds: Int) -> String {
         let s = max(0, seconds)
-        return String(format: "%d:%02d", s / 60, s % 60)
+        let h = s / 3600, m = (s % 3600) / 60, sec = s % 60
+        return h > 0 ? String(format: "%d:%02d:%02d", h, m, sec) : String(format: "%d:%02d", m, sec)
     }
 
     static func bytes(_ size: Int64) -> String {

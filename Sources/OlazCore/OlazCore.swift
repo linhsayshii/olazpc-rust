@@ -698,7 +698,17 @@ public protocol CoreApiProtocol: AnyObject, Sendable {
      */
     func archivedVersion()  -> Int64
     
+    /**
+     * Global noised ID -> PC uid, with bounded GET batches and retry/split recovery.
+     */
+    func decryptGlobalIds(ids: [String]) async throws  -> [String: String]
+    
     func deleteMessageForMe(convId: String, msgId: String, cliMsgId: String, senderId: String) async throws 
+    
+    /**
+     * PC uid -> global noised ID.
+     */
+    func encryptGlobalIds(ids: [String]) async throws  -> [String: String]
     
     /**
      * `uid -> alias`.
@@ -862,6 +872,25 @@ open func archivedVersion() -> Int64  {
 })
 }
     
+    /**
+     * Global noised ID -> PC uid, with bounded GET batches and retry/split recovery.
+     */
+open func decryptGlobalIds(ids: [String])async throws  -> [String: String]  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreapi_decrypt_global_ids(
+                        self.uniffiCloneHandle(),FfiConverterSequenceString.lower(ids)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterDictionaryStringString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
 open func deleteMessageForMe(convId: String, msgId: String, cliMsgId: String, senderId: String)async throws   {
     return
         try  await uniffiRustCallAsync(
@@ -874,6 +903,25 @@ open func deleteMessageForMe(convId: String, msgId: String, cliMsgId: String, se
             completeFunc: ffi_olaz_ffi_rust_future_complete_void,
             freeFunc: ffi_olaz_ffi_rust_future_free_void,
             liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
+    /**
+     * PC uid -> global noised ID.
+     */
+open func encryptGlobalIds(ids: [String])async throws  -> [String: String]  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_olaz_ffi_fn_method_coreapi_encrypt_global_ids(
+                        self.uniffiCloneHandle(),FfiConverterSequenceString.lower(ids)
+                )
+            },
+            pollFunc: ffi_olaz_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_olaz_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_olaz_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterDictionaryStringString.lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
 }
@@ -35678,7 +35726,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_coreapi_archived_version() != 46719) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_method_coreapi_decrypt_global_ids() != 52677) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_method_coreapi_delete_message_for_me() != 49659) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_method_coreapi_encrypt_global_ids() != 9909) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_coreapi_fetch_aliases() != 45479) {
