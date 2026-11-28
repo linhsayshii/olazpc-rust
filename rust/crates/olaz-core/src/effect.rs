@@ -26,8 +26,8 @@ use crate::messages::{IdentitySnapshot, MuteEntry};
 use crate::notify::{
     CardActionOutcomeData, ContactCardStateResult, ContactProfileResult, FriendRequestPrepResult,
     GroupInvitePreviewResult, GroupJoinResultData, NotifyBannerPayload, RawResponderBuckets,
-    ReminderRespondersData, ReminderSnapshotData, RespondReminderResult, SaveAliasResult,
-    SubmitFriendRequestResult, SuggestedStickerItem,
+    ReminderRespondersData, ReminderSnapshotData, RespondReminderResult, SubmitFriendRequestResult,
+    SuggestedStickerItem,
 };
 use crate::reduce::classify::MobileSyncEvent;
 use crate::stickers::{CardActionOutcome, StickerEntry, StickerSuggestSetting, StickerTab};
@@ -475,7 +475,6 @@ pub enum OpResult {
     ContactProfile(Option<ContactProfileResult>),
     FriendRequestPrep(FriendRequestPrepResult),
     SubmitFriend(SubmitFriendRequestResult),
-    SaveAlias(SaveAliasResult),
     GroupInvitePreview(GroupInvitePreviewResult),
     JoinGroup(GroupJoinResultData),
     CardAction(CardActionOutcomeData),
@@ -489,6 +488,8 @@ pub enum OpResult {
     PollPinOutcome(crate::polls::PollPinOutcome),
     PollActionResult(crate::polls::PollActionResult),
     PollCapabilities(crate::polls::PollCapabilities),
+    // U9
+    SaveAlias(crate::messages::SaveAliasOutcome),
     // U11
     CloudPage(CloudPage),
     CloudFetch(CloudFetch),
@@ -534,7 +535,6 @@ impl fmt::Debug for OpResult {
             Self::ContactProfile(r) => f.debug_tuple("ContactProfile").field(r).finish(),
             Self::FriendRequestPrep(r) => f.debug_tuple("FriendRequestPrep").field(r).finish(),
             Self::SubmitFriend(r) => f.debug_tuple("SubmitFriend").field(r).finish(),
-            Self::SaveAlias(r) => f.debug_tuple("SaveAlias").field(r).finish(),
             Self::GroupInvitePreview(r) => f.debug_tuple("GroupInvitePreview").field(r).finish(),
             Self::JoinGroup(r) => f.debug_tuple("JoinGroup").field(r).finish(),
             Self::CardAction(r) => f.debug_tuple("CardAction").field(r).finish(),
@@ -554,6 +554,7 @@ impl fmt::Debug for OpResult {
             Self::PollPinOutcome(o) => f.debug_tuple("PollPinOutcome").field(o).finish(),
             Self::PollActionResult(r) => f.debug_tuple("PollActionResult").field(r).finish(),
             Self::PollCapabilities(c) => f.debug_tuple("PollCapabilities").field(c).finish(),
+            Self::SaveAlias(s) => f.debug_tuple("SaveAlias").field(s).finish(),
             // U11
             Self::CloudPage(p) => f.debug_tuple("CloudPage").field(p).finish(),
             Self::CloudFetch(r) => f.debug_tuple("CloudFetch").field(r).finish(),
@@ -1574,6 +1575,47 @@ pub enum Effect {
     },
     CancelConfirmPromoteDelay,
 
+    // U9
+    FetchContactsSyncApi {
+        op_id: Option<u64>,
+    },
+    AcceptFriendRequestApi {
+        uid: String,
+        op_id: Option<u64>,
+    },
+    DeclineFriendRequestApi {
+        uid: String,
+        op_id: Option<u64>,
+    },
+    CancelFriendRequestApi {
+        uid: String,
+        op_id: Option<u64>,
+    },
+    SendFriendRequestApi {
+        uid: String,
+        message: String,
+        op_id: Option<u64>,
+    },
+    FindFriendByPhoneApi {
+        phone: String,
+        search_gen: u64,
+        op_id: Option<u64>,
+    },
+    LoadBlockedUsersApi {
+        op_id: Option<u64>,
+    },
+    SetBlockedApi {
+        uid: String,
+        blocked: bool,
+        name: String,
+        open_conv_id: Option<String>,
+        op_id: Option<u64>,
+    },
+    SaveAliasApi {
+        uid: String,
+        trimmed_alias: String,
+        op_id: Option<u64>,
+    },
     // U16
     SetMuteApi {
         req_id: u64,
@@ -1595,15 +1637,10 @@ pub enum Effect {
         op_id: u64,
         uid: String,
     },
-    SendFriendRequestApi {
+    SubmitFriendRequestApi {
         op_id: u64,
         uid: String,
         message: String,
-    },
-    SetAliasApi {
-        op_id: u64,
-        uid: String,
-        trimmed_name: String,
     },
     FetchGroupInvitePreviewApi {
         op_id: u64,
@@ -1958,13 +1995,10 @@ impl fmt::Debug for Effect {
                 .debug_struct("FetchContactProfileApi")
                 .field("op_id", op_id)
                 .finish(),
-            Self::SendFriendRequestApi { op_id, .. } => f
-                .debug_struct("SendFriendRequestApi")
+            Self::SubmitFriendRequestApi { op_id, .. } => f
+                .debug_struct("SubmitFriendRequestApi")
                 .field("op_id", op_id)
                 .finish(),
-            Self::SetAliasApi { op_id, .. } => {
-                f.debug_struct("SetAliasApi").field("op_id", op_id).finish()
-            }
             Self::FetchGroupInvitePreviewApi { op_id, .. } => f
                 .debug_struct("FetchGroupInvitePreviewApi")
                 .field("op_id", op_id)
@@ -2108,6 +2142,53 @@ impl fmt::Debug for Effect {
                 .field("delay_ms", &delay.as_millis())
                 .finish(),
             Self::CancelAllPollDebounces => f.write_str("CancelAllPollDebounces"),
+            // U9
+            Self::FetchContactsSyncApi { op_id } => f
+                .debug_struct("FetchContactsSyncApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::AcceptFriendRequestApi { op_id, .. } => f
+                .debug_struct("AcceptFriendRequestApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::DeclineFriendRequestApi { op_id, .. } => f
+                .debug_struct("DeclineFriendRequestApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::CancelFriendRequestApi { op_id, .. } => f
+                .debug_struct("CancelFriendRequestApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::SendFriendRequestApi { message, op_id, .. } => f
+                .debug_struct("SendFriendRequestApi")
+                .field("msg_len", &message.len())
+                .field("op_id", op_id)
+                .finish(),
+            Self::FindFriendByPhoneApi {
+                search_gen, op_id, ..
+            } => f
+                .debug_struct("FindFriendByPhoneApi")
+                .field("search_gen", search_gen)
+                .field("op_id", op_id)
+                .finish(),
+            Self::LoadBlockedUsersApi { op_id } => f
+                .debug_struct("LoadBlockedUsersApi")
+                .field("op_id", op_id)
+                .finish(),
+            Self::SetBlockedApi { blocked, op_id, .. } => f
+                .debug_struct("SetBlockedApi")
+                .field("blocked", blocked)
+                .field("op_id", op_id)
+                .finish(),
+            Self::SaveAliasApi {
+                trimmed_alias,
+                op_id,
+                ..
+            } => f
+                .debug_struct("SaveAliasApi")
+                .field("has_alias", &!trimmed_alias.is_empty())
+                .field("op_id", op_id)
+                .finish(),
             // U11
             Self::RefreshCloudData {
                 op_id,

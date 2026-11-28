@@ -122,12 +122,10 @@ pub(crate) fn reduce_bootstrap(state: &mut CoreState, input: Input, out: &mut Re
                 Ok(aliases) => {
                     if !aliases.is_empty() {
                         for (k, v) in aliases {
-                            state.conversations.identities.aliases.insert(k, v);
+                            state.contacts.aliases.insert(k, v);
                         }
                         out.dirty.insert(DirtyKey::Aliases);
-                        if let Ok(bytes) =
-                            serde_json::to_vec(&state.conversations.identities.aliases)
-                        {
+                        if let Ok(bytes) = serde_json::to_vec(&state.contacts.aliases) {
                             out.effects.push(Effect::Store(StoreOp::SetPreferenceData {
                                 key: "aliases".to_owned(),
                                 data: bytes,
@@ -237,7 +235,7 @@ pub(crate) fn reduce_bootstrap(state: &mut CoreState, input: Input, out: &mut Re
                     let self_conv_id = state.session.self_conversation_id.clone();
                     state
                         .conversations
-                        .rebuild_conversation_extras(self_conv_id.as_deref());
+                        .rebuild_conversation_extras(&state.contacts, self_conv_id.as_deref());
                     out.dirty.insert(DirtyKey::ConversationExtras);
                     out.effects.push(Effect::Store(StoreOp::SetPreferenceData {
                         key: "labels".to_owned(),
@@ -280,7 +278,6 @@ pub(crate) fn reduce_bootstrap(state: &mut CoreState, input: Input, out: &mut Re
             }
             apply_fetched_contacts(
                 &mut state.contacts,
-                &mut state.conversations.identities,
                 friends_rows,
                 groups_dict,
                 sent_rows,
@@ -460,8 +457,9 @@ pub(crate) fn reduce_bootstrap(state: &mut CoreState, input: Input, out: &mut Re
             if !matches_stage(state, boot_gen, BootstrapStage::ResolveNames) {
                 return;
             }
-            let (cache_changed, convs_changed) =
-                state.conversations.apply_resolved_profiles(&profiles_map);
+            let (cache_changed, convs_changed) = state
+                .conversations
+                .apply_resolved_profiles(&mut state.contacts, &profiles_map);
             profiles_cache_changed |= cache_changed;
             if convs_changed {
                 out.dirty.insert(DirtyKey::Conversations);
@@ -476,8 +474,7 @@ pub(crate) fn reduce_bootstrap(state: &mut CoreState, input: Input, out: &mut Re
                 });
             } else {
                 if profiles_cache_changed
-                    && let Ok(bytes) =
-                        serde_json::to_vec(&state.conversations.identities.cached_profiles)
+                    && let Ok(bytes) = serde_json::to_vec(&state.contacts.cached_profiles)
                 {
                     out.effects.push(Effect::Store(StoreOp::SetPreferenceData {
                         key: "cachedProfiles".to_owned(),
@@ -564,7 +561,7 @@ pub fn parse_mute_entries(rows: &[Map<String, Value>], now_ms: i64) -> Vec<MuteE
 }
 
 /// Extracts `data.clearUnreads` activity ranks from the initial preload overview response,
-/// merges them into `state.conversations.identities.activity_ranks` (keeping `max`), records
+/// merges them into `state.contacts.activity_ranks` (keeping `max`), records
 /// group ranks in `group_activity_rank`, and persists `"activityRanks"` if non-empty.
 fn apply_preload_clear_unreads(
     root: &Map<String, Value>,
@@ -618,8 +615,7 @@ fn apply_preload_clear_unreads(
                 continue;
             }
             let rank_entry = state
-                .conversations
-                .identities
+                .contacts
                 .activity_ranks
                 .entry(g_candidate.clone())
                 .or_insert(0);
@@ -635,20 +631,15 @@ fn apply_preload_clear_unreads(
             if peer_id.is_empty() || peer_id == "0" || peer_id == my_uid {
                 continue;
             }
-            let rank_entry = state
-                .conversations
-                .identities
-                .activity_ranks
-                .entry(peer_id)
-                .or_insert(0);
+            let rank_entry = state.contacts.activity_ranks.entry(peer_id).or_insert(0);
             if last_mid > *rank_entry {
                 *rank_entry = last_mid;
             }
         }
     }
 
-    if !state.conversations.identities.activity_ranks.is_empty()
-        && let Ok(bytes) = serde_json::to_vec(&state.conversations.identities.activity_ranks)
+    if !state.contacts.activity_ranks.is_empty()
+        && let Ok(bytes) = serde_json::to_vec(&state.contacts.activity_ranks)
     {
         out.effects.push(Effect::Store(StoreOp::SetPreferenceData {
             key: "activityRanks".to_owned(),
@@ -680,8 +671,7 @@ pub fn compute_preload_order_and_chunks(
     });
 
     let mut peers: Vec<(&String, i64)> = state
-        .conversations
-        .identities
+        .contacts
         .activity_ranks
         .iter()
         .filter(|(k, _)| !is_group_id(k))
@@ -750,6 +740,7 @@ fn ingest_bootstrap_batch(
     let outcome = apply_batch_pass1(
         &mut state.messages,
         &mut state.conversations,
+        &state.contacts,
         &events,
         false,
         self_conv_id.as_deref(),
@@ -785,7 +776,7 @@ fn finish_preload_overview(state: &mut CoreState, out: &mut ReduceOutput) {
     let self_conv_id = state.session.self_conversation_id.clone();
     if state
         .conversations
-        .ensure_known_contacts(self_conv_id.as_deref())
+        .ensure_known_contacts(&state.contacts, self_conv_id.as_deref())
     {
         out.dirty.insert(DirtyKey::Conversations);
     }
@@ -978,7 +969,7 @@ fn ensure_known_contacts_and_rebuild(state: &mut CoreState, out: &mut ReduceOutp
     let self_conv_id = state.session.self_conversation_id.clone();
     if state
         .conversations
-        .ensure_known_contacts(self_conv_id.as_deref())
+        .ensure_known_contacts(&state.contacts, self_conv_id.as_deref())
     {
         out.dirty.insert(DirtyKey::Conversations);
     }
@@ -1075,8 +1066,7 @@ mod tests {
     fn aliases_success_merges_persists_and_loads_freshness_pref() {
         let mut state = ready_state("2000501", "9200501");
         state
-            .conversations
-            .identities
+            .contacts
             .aliases
             .insert("3000001".to_owned(), "Old".to_owned());
 
@@ -1098,21 +1088,11 @@ mod tests {
             },
         );
         assert_eq!(
-            state
-                .conversations
-                .identities
-                .aliases
-                .get("3000001")
-                .map(String::as_str),
+            state.contacts.aliases.get("3000001").map(String::as_str),
             Some("New")
         );
         assert_eq!(
-            state
-                .conversations
-                .identities
-                .aliases
-                .get("3000002")
-                .map(String::as_str),
+            state.contacts.aliases.get("3000002").map(String::as_str),
             Some("Two")
         );
         assert!(out.effects.iter().any(|e| matches!(
@@ -1291,8 +1271,7 @@ mod tests {
     fn clear_unreads_filters_invalid_ids_and_computes_preload_chunks() {
         let mut state = ready_state("2000501", "92000501");
         state
-            .conversations
-            .identities
+            .contacts
             .activity_ranks
             .insert("3000001".to_owned(), 50);
         state.contacts.groups.push(GroupEntry {
@@ -1332,7 +1311,7 @@ mod tests {
         apply_preload_clear_unreads(&payload, &mut state, &mut group_rank, &mut out);
 
         assert_eq!(
-            state.conversations.identities.activity_ranks,
+            state.contacts.activity_ranks,
             BTreeMap::from([
                 ("3000001".to_owned(), 50),
                 ("3000002".to_owned(), 90),

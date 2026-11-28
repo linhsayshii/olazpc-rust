@@ -3,13 +3,13 @@
 //! Mirrors the U16 subset of `ZaloAPIService.swift`:
 //! - `setMuteAPI` (`POST /api/social/profile/setmute`)
 //! - `suggestStickersAPI` (`GET /api/message/sticker/suggest/stickers`)
-//! - `sendFriendRequestAPI` (`POST /api/friend/sendreq`, `reqsrc: 30`)
-//! - `setAliasAPI` (`GET /api/alias/remove` | `GET /api/alias/update`)
 //! - `fetchGroupLinkDetail` (`GET /api/group/link/detail`)
 //! - `joinGroupByLink` (`GET /api/group/link/join`)
 //! - `fetchReminderDetail` (`GET /api/board/topic/getReminder`)
 //! - `respondReminderAPI` (`POST /api/board/topic/updateEventResponse`)
 //! - `fetchReminderRespondersAPI` (`GET /api/board/topic/listResponseEvent`)
+//!
+//! (`send_friend_request` and `set_alias` live in `contacts.rs`, U9.)
 
 use olaz_net::{ApiRequest, Transport};
 use olaz_wire::{clean_group_id, strip_user_prefix};
@@ -89,46 +89,6 @@ impl<T: Transport> ZaloApi<T> {
         self.post(ApiRequest::new("profile", "/api/social/profile/setmute").payload(payload))
             .await?;
         Ok(())
-    }
-
-    /// Swift `sendFriendRequestAPI`: `POST /api/friend/sendreq` (`reqsrc: 30` kept per user decision 16.5).
-    pub async fn send_friend_request(
-        &self,
-        to_uid: &str,
-        message: &str,
-    ) -> Result<JsonObject, ApiError> {
-        self.post(
-            ApiRequest::new("friend", "/api/friend/sendreq").payload(json!({
-                "toid": strip_user_prefix(to_uid),
-                "msg": message,
-                "reqsrc": 30,
-                "imei": self.imei(),
-                "language": "vi",
-            })),
-        )
-        .await
-    }
-
-    /// Swift `setAliasAPI`: `GET /api/alias/remove` when trimmed alias is empty, else `GET /api/alias/update`.
-    pub async fn set_alias(&self, uid: &str, alias: &str) -> Result<JsonObject, ApiError> {
-        let clean_uid = strip_user_prefix(uid);
-        let trimmed = alias.trim();
-        if trimmed.is_empty() {
-            self.get(
-                ApiRequest::new("alias", "/api/alias/remove")
-                    .payload(json!({ "friendId": clean_uid })),
-            )
-            .await
-        } else {
-            self.get(
-                ApiRequest::new("alias", "/api/alias/update").payload(json!({
-                    "friendId": clean_uid,
-                    "alias": trimmed,
-                    "imei": self.imei(),
-                })),
-            )
-            .await
-        }
     }
 
     /// Swift `fetchGroupLinkDetail`: `GET /api/group/link/detail`.

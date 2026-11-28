@@ -85,16 +85,16 @@ pub use input::{
     LegacyCookie, PollBatchError, PollBatchOutcome, SeenTarget, SessionFailure, StoreToken,
 };
 pub use messages::{
-    BatchPass1Outcome, BootstrapFlowState, ContactsState, DeleteWindowOutcome,
-    FULL_HISTORY_REFRESH_INTERVAL_SECS, FULL_HISTORY_REFRESH_PREF_KEY, FriendEntry,
-    FriendRequestEntry, GroupEntry, HistoryFreshness, HistoryPagePass1Outcome, IdentitySnapshot,
-    LoadOlderFlowState, MessagesState, MuteEntry, OpenFlowState, PendingWindowOp,
-    RecallWindowOutcome, SenderResolveFollowup, WindowChange, WindowDelta, apply_batch_pass1,
-    apply_fetched_contacts, coalesce_window_op, collect_missing_sender_uids, contact_fold,
-    decode_db_stored, fold_contact_str, format_swift_double, is_valid_url_str,
-    localized_standard_cmp, newest_message_ids, numeric_msg_cursor, parse_batch_events,
-    preferred_contact_name, serialize_cached_groups_json, serialize_cached_profiles_json,
-    to_db_stored,
+    BatchPass1Outcome, BlockedUserState, BootstrapFlowState, ContactNotice, ContactSearchState,
+    ContactSearchStatus, ContactsState, DeleteWindowOutcome, FULL_HISTORY_REFRESH_INTERVAL_SECS,
+    FULL_HISTORY_REFRESH_PREF_KEY, FoundUserEntry, FriendEntry, FriendRequestEntry, GroupEntry,
+    HistoryFreshness, HistoryPagePass1Outcome, IdentitySnapshot, LoadOlderFlowState, MessagesState,
+    MuteEntry, OpenFlowState, PendingWindowOp, RecallWindowOutcome, SaveAliasOutcome,
+    SenderResolveFollowup, WindowChange, WindowDelta, apply_batch_pass1, apply_fetched_contacts,
+    coalesce_window_op, collect_missing_sender_uids, contact_fold, decode_db_stored,
+    fold_contact_str, format_swift_double, is_valid_url_str, localized_standard_cmp,
+    newest_message_ids, numeric_msg_cursor, parse_batch_events, preferred_contact_name,
+    serialize_cached_groups_json, serialize_cached_profiles_json, to_db_stored,
 };
 // U12
 pub use polls::{
@@ -109,6 +109,7 @@ pub use polls::{
     normalize_poll_uid, refresh_poll_pin_state, resolve_poll_group_id,
 };
 pub use reduce::classify::{MobileSyncEvent, Route, classify, classify_poll};
+pub use reduce::contacts::apply_contacts_adapter_state;
 pub use reduce::polls::DEFAULT_BOARD_PIN_LIMIT;
 pub use reduce::send::SendState;
 // U16

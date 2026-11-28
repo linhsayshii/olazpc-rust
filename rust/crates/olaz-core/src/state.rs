@@ -74,11 +74,11 @@ impl CoreState {
             message_confirm: self.actions.message_confirm.clone(),
             auto_delete: self.actions.auto_delete.clone(),
             starred_ids: self.actions.starred_ids.clone(),
-            cached_profiles: self.conversations.identities.cached_profiles.clone(),
+            cached_profiles: self.contacts.cached_profiles.clone(),
             last_prune_next_expiry_ms: self.actions.last_prune_next_expiry_ms,
             // U16
             notification_settings: self.notify.settings.clone(),
-            aliases: self.conversations.identities.aliases.clone(),
+            aliases: self.contacts.aliases.clone(),
             // U7
             pins: self.pins.snapshot(),
             // U12
@@ -105,7 +105,7 @@ impl CoreState {
             .profile
             .as_ref()
             .and_then(|p| p.avatar.as_deref());
-        IdentitySnapshot::from_core(my_uid, my_avatar, &self.conversations)
+        IdentitySnapshot::from_core(my_uid, my_avatar, &self.conversations, &self.contacts)
     }
 }
 

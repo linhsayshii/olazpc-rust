@@ -1,6 +1,6 @@
 import Foundation
 
-/// A blocked account (official blocked-friends list).
+/// A blocked account (official blocked-friends list), mirrored from `olaz-core` (U9).
 struct BlockedUser: Identifiable, Equatable, Sendable {
     let id: String
     var name: String
@@ -25,32 +25,5 @@ extension ZaloSessionClient {
     /// Official `setBlockFriend`: {fid, imei}.
     nonisolated static func blockPayload(uid: String, imei: String) -> [String: Any] {
         ["fid": ZaloWireParser.stripUserPrefix(uid), "imei": imei]
-    }
-
-    /// Blocks (or unblocks) messages and calls from a user: `friend /api/friend/block` · `/api/friend/unblock`.
-    func setBlockedAPI(uid: String, blocked: Bool) async throws {
-        _ = try await post(
-            service: "friend",
-            path: blocked ? "/api/friend/block" : "/api/friend/unblock",
-            encryptedPayload: Self.blockPayload(uid: uid, imei: imei)
-        )
-    }
-
-    /// Every page of `friend /api/friend/blocklistv2` {page, count, avatar}.
-    func fetchBlockedUsersAPI() async throws -> [BlockedUser] {
-        var all: [BlockedUser] = []
-        var page = 1
-        while page <= 20 {
-            let resp = try await get(
-                service: "friend",
-                path: "/api/friend/blocklistv2",
-                encryptedPayload: ["page": page, "count": 50, "avatar": 75]
-            )
-            let parsed = BlockedUser.page(from: resp["data"] as? [String: Any] ?? [:])
-            all.append(contentsOf: parsed.users)
-            guard parsed.hasMore, !parsed.users.isEmpty else { break }
-            page += 1
-        }
-        return all
     }
 }

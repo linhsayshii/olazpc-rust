@@ -5,23 +5,23 @@ use std::time::Duration;
 
 use olaz_wire::lossless::string;
 use olaz_wire::{
-    ChatMessage, ECard, ECardStyle, Kind, UNKNOWN_NAME, is_group_id, sanitize_profile_uid,
-    strip_user_prefix, web_link_sanitized,
+    ChatMessage, ECard, ECardStyle, Kind, UNKNOWN_NAME, is_group_id, normalize_contact_uid,
+    sanitize_profile_uid, strip_user_prefix, web_link_sanitized,
 };
 use serde_json::{Map, Value};
 
 use crate::changes::DirtyKey;
 use crate::conversations::{
-    CachedProfile, ConversationSummary, FriendIdentity, message_preview_label,
-    preferred_profile_name,
+    CachedProfile, ConversationSummary, message_preview_label, preferred_profile_name,
 };
 use crate::effect::{Effect, HostCall, OpResult, StoreOp};
 use crate::input::{Command, Input};
+use crate::messages::FriendEntry;
 use crate::notify::{
     CARD_DEFAULT_FAILED, CARD_DEFAULT_UNSUPPORTED, CardActionOutcomeData, ContactCardStateResult,
     ContactProfileResult, FriendRequestPrepResult, IncomingBatchInFlight, MUTE_ERROR_TOAST_TEXT,
     MuteInFlight, MuteInfo, NotifAuthorization, NotifyBannerPayload, ReminderSnapshotData,
-    ReminderWatchWaiter, RespondReminderResult, SaveAliasResult, SubmitFriendRequestResult,
+    ReminderWatchWaiter, RespondReminderResult, SubmitFriendRequestResult,
     build_reminder_responders, extract_responder_buckets, map_join_group_outcome,
     map_suggested_stickers, normalize_reminder_snapshot, parse_group_invite_preview,
 };
@@ -50,7 +50,6 @@ pub(crate) fn is_notify_command(cmd: &Command) -> bool {
             | Command::ContactProfile { .. }
             | Command::PrepareFriendRequest { .. }
             | Command::SubmitFriendRequest { .. }
-            | Command::SaveAlias { .. }
             | Command::GroupInvitePreview { .. }
             | Command::JoinGroup { .. }
             | Command::ReminderWatch { .. }
@@ -75,15 +74,6 @@ pub(crate) fn persist_notification_preferences(state: &CoreState, out: &mut Redu
         key: "mutedThreads".to_owned(),
         data: state.notify.settings.serialize_muted_threads_json(),
     }));
-}
-
-fn persist_aliases(state: &CoreState, out: &mut ReduceOutput) {
-    if let Ok(bytes) = serde_json::to_vec(&state.conversations.identities.aliases) {
-        out.effects.push(Effect::Store(StoreOp::SetPreferenceData {
-            key: "aliases".to_owned(),
-            data: bytes,
-        }));
-    }
 }
 
 fn complete_unit(op_id: Option<u64>, out: &mut ReduceOutput) {
@@ -198,7 +188,7 @@ pub(crate) fn start_notify_incoming_batch(
 struct IncomingBurstIndex<'a> {
     state: &'a CoreState,
     conv_by_id: HashMap<&'a str, &'a ConversationSummary>,
-    friend_by_id: HashMap<&'a str, &'a FriendIdentity>,
+    friend_by_id: HashMap<&'a str, &'a FriendEntry>,
     gid_to_uid: HashMap<&'a str, &'a str>,
     clean_my_uid: String,
     sanitized_my_uid: String,
@@ -211,13 +201,12 @@ impl<'a> IncomingBurstIndex<'a> {
         for c in &state.conversations.conversations {
             conv_by_id.entry(c.id.as_str()).or_insert(c);
         }
-        let mut friend_by_id = HashMap::with_capacity(state.conversations.identities.friends.len());
-        for f in &state.conversations.identities.friends {
+        let mut friend_by_id = HashMap::with_capacity(state.contacts.friends.len());
+        for f in &state.contacts.friends {
             friend_by_id.entry(f.id.as_str()).or_insert(f);
         }
-        let mut gid_to_uid =
-            HashMap::with_capacity(state.conversations.identities.friend_global_ids.len());
-        for (uid, gid) in &state.conversations.identities.friend_global_ids {
+        let mut gid_to_uid = HashMap::with_capacity(state.contacts.friend_global_ids.len());
+        for (uid, gid) in &state.contacts.friend_global_ids {
             gid_to_uid.entry(gid.as_str()).or_insert(uid.as_str());
         }
         let my_uid = state
@@ -272,7 +261,7 @@ impl<'a> IncomingBurstIndex<'a> {
             return Some(("Bạn".to_owned(), self.my_avatar.to_owned()));
         }
 
-        let identities = &self.state.conversations.identities;
+        let identities = &self.state.contacts;
         for candidate in &candidates {
             let alias = identities.aliases.get(candidate).map(String::as_str);
             if let Some(f) = self.friend_by_id.get(candidate.as_str()) {
@@ -379,9 +368,12 @@ impl<'a> IncomingLookup<'a> {
                 state,
                 my_uid,
                 my_avatar,
-            } => state
-                .conversations
-                .lookup_person_info(clean_uid, my_uid, *my_avatar),
+            } => state.conversations.lookup_person_info(
+                &state.contacts,
+                clean_uid,
+                my_uid,
+                *my_avatar,
+            ),
             Self::Indexed(idx) => idx.lookup_person(clean_uid),
         }
     }
@@ -640,8 +632,7 @@ pub(crate) fn reduce_notify(state: &mut CoreState, input: Input, out: &mut Reduc
                 let avatar = string(row.get("avatar").or_else(|| row.get("avt")));
                 if !clean.is_empty() && (!name.is_empty() || !avatar.is_empty()) {
                     state
-                        .conversations
-                        .identities
+                        .contacts
                         .cached_profiles
                         .insert(clean, CachedProfile { name, avatar });
                     updated_any = true;
@@ -649,9 +640,8 @@ pub(crate) fn reduce_notify(state: &mut CoreState, input: Input, out: &mut Reduc
             }
             if updated_any {
                 out.dirty.insert(DirtyKey::CachedProfiles);
-                if let Ok(bytes) =
-                    serde_json::to_vec(&state.conversations.identities.cached_profiles)
-                {
+                out.refresh_identity_snapshot = true;
+                if let Ok(bytes) = serde_json::to_vec(&state.contacts.cached_profiles) {
                     out.effects.push(Effect::Store(StoreOp::SetPreferenceData {
                         key: "cachedProfiles".to_owned(),
                         data: bytes,
@@ -718,45 +708,6 @@ pub(crate) fn reduce_notify(state: &mut CoreState, input: Input, out: &mut Reduc
                     after_store: false,
                 });
             }
-        }
-
-        Input::SaveAliasDone {
-            op_id,
-            uid,
-            trimmed_name,
-            ok,
-        } => {
-            let res = if ok {
-                if trimmed_name.is_empty() {
-                    state.conversations.identities.aliases.remove(&uid);
-                } else {
-                    state
-                        .conversations
-                        .identities
-                        .aliases
-                        .insert(uid, trimmed_name.clone());
-                }
-                out.dirty.insert(DirtyKey::Aliases);
-                persist_aliases(state, out);
-                SaveAliasResult {
-                    ok: true,
-                    text: if trimmed_name.is_empty() {
-                        "Đã xóa tên gợi nhớ.".to_owned()
-                    } else {
-                        "Đã lưu tên gợi nhớ.".to_owned()
-                    },
-                }
-            } else {
-                SaveAliasResult {
-                    ok: false,
-                    text: "Không lưu được tên gợi nhớ.".to_owned(),
-                }
-            };
-            out.effects.push(Effect::CompleteOp {
-                op_id,
-                result: OpResult::SaveAlias(res),
-                after_store: true,
-            });
         }
 
         Input::GroupInvitePreviewDone { op_id, url, resp } => {
@@ -967,8 +918,7 @@ pub(crate) fn reduce_notify(state: &mut CoreState, input: Input, out: &mut Reduc
                 let avatar = string(row.get("avatar").or_else(|| row.get("avt")));
                 if !clean.is_empty() && (!name.is_empty() || !avatar.is_empty()) {
                     state
-                        .conversations
-                        .identities
+                        .contacts
                         .cached_profiles
                         .insert(clean, CachedProfile { name, avatar });
                     updated_any = true;
@@ -977,6 +927,7 @@ pub(crate) fn reduce_notify(state: &mut CoreState, input: Input, out: &mut Reduc
             if updated_any {
                 // Quirk preserved as recorded: updates in-memory `cachedProfiles` without persisting SQLite.
                 out.dirty.insert(DirtyKey::CachedProfiles);
+                out.refresh_identity_snapshot = true;
             }
             let snap = state.identity_snapshot();
             let my_uid = state
@@ -1220,21 +1171,14 @@ fn handle_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
             let Some(op_id) = op_id else {
                 return;
             };
-            let clean = strip_user_prefix(&uid);
+            let clean = normalize_contact_uid(&uid);
             let my_uid = state
                 .session
                 .profile
                 .as_ref()
-                .map(|p| p.user_id.as_str())
-                .unwrap_or("");
-            let is_self = !my_uid.is_empty() && clean == my_uid;
-            let is_friend = state.contacts.friends.iter().any(|f| f.id == clean)
-                || state
-                    .conversations
-                    .identities
-                    .friends
-                    .iter()
-                    .any(|f| f.id == clean);
+                .map_or_else(String::new, |p| normalize_contact_uid(&p.user_id));
+            let is_self = !clean.is_empty() && clean == my_uid;
+            let is_friend = state.contacts.friends.iter().any(|f| f.id == clean);
             out.effects.push(Effect::CompleteOp {
                 op_id,
                 result: OpResult::ContactCardState(ContactCardStateResult { is_self, is_friend }),
@@ -1246,7 +1190,7 @@ fn handle_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
             let Some(op_id) = op_id else {
                 return;
             };
-            let clean = strip_user_prefix(&uid);
+            let clean = normalize_contact_uid(&uid);
             if clean.is_empty() {
                 out.effects.push(Effect::CompleteOp {
                     op_id,
@@ -1256,7 +1200,7 @@ fn handle_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                 return;
             }
             if let Some(p) = state.session.profile.as_ref()
-                && clean == p.user_id
+                && clean == normalize_contact_uid(&p.user_id)
             {
                 out.effects.push(Effect::CompleteOp {
                     op_id,
@@ -1291,29 +1235,6 @@ fn handle_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                 });
                 return;
             }
-            if let Some(f) = state
-                .conversations
-                .identities
-                .friends
-                .iter()
-                .find(|f| f.id == clean)
-            {
-                out.effects.push(Effect::CompleteOp {
-                    op_id,
-                    result: OpResult::ContactProfile(Some(ContactProfileResult {
-                        uid: clean,
-                        name: f.name.clone(),
-                        zalo_name: String::new(),
-                        avatar: f.avatar.as_deref().and_then(non_empty_url),
-                        bio: String::new(),
-                        is_self: false,
-                        is_friend: true,
-                        is_oa: false,
-                    })),
-                    after_store: false,
-                });
-                return;
-            }
             out.effects
                 .push(Effect::FetchContactProfileApi { op_id, uid: clean });
         }
@@ -1326,27 +1247,19 @@ fn handle_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
             let Some(op_id) = op_id else {
                 return;
             };
-            let clean = strip_user_prefix(&uid);
+            let clean = normalize_contact_uid(&uid);
             let my_uid = state
                 .session
                 .profile
                 .as_ref()
-                .map(|p| p.user_id.as_str())
-                .unwrap_or("");
-            let prep = if !my_uid.is_empty() && clean == my_uid {
+                .map_or_else(String::new, |p| normalize_contact_uid(&p.user_id));
+            let prep = if !clean.is_empty() && clean == my_uid {
                 FriendRequestPrepResult {
                     state: "self".to_owned(),
                     default_message: String::new(),
                     max_message: 150,
                 }
-            } else if state.contacts.friends.iter().any(|f| f.id == clean)
-                || state
-                    .conversations
-                    .identities
-                    .friends
-                    .iter()
-                    .any(|f| f.id == clean)
-            {
+            } else if state.contacts.friends.iter().any(|f| f.id == clean) {
                 FriendRequestPrepResult {
                     state: "friend".to_owned(),
                     default_message: String::new(),
@@ -1388,23 +1301,10 @@ fn handle_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
             let Some(op_id) = op_id else {
                 return;
             };
-            out.effects.push(Effect::SendFriendRequestApi {
+            out.effects.push(Effect::SubmitFriendRequestApi {
                 op_id,
-                uid,
+                uid: normalize_contact_uid(&uid),
                 message,
-            });
-        }
-
-        Command::SaveAlias { uid, name } => {
-            let Some(op_id) = op_id else {
-                return;
-            };
-            let clean = strip_user_prefix(&uid);
-            let trimmed = name.trim().to_owned();
-            out.effects.push(Effect::SetAliasApi {
-                op_id,
-                uid: clean,
-                trimmed_name: trimmed,
             });
         }
 
@@ -1782,15 +1682,19 @@ mod tests {
                 unread: 0,
                 preview: None,
             });
-            state.conversations.identities.friends.push(FriendIdentity {
+            state.contacts.friends.push(FriendEntry {
                 id: format!("300{:03}", i),
                 name: format!("Friend {i}"),
+                zalo_name: format!("Friend {i}"),
                 avatar: Some(format!("https://cdn.example/f{i}.jpg")),
+                last_active_ms: None,
+                online: false,
+                section: "F".to_owned(),
+                sort_key: format!("friend {i}"),
             });
         }
         state
-            .conversations
-            .identities
+            .contacts
             .aliases
             .insert("300002".to_owned(), "Alias Two".to_owned());
         state.conversations.conversations.push(ConversationSummary {

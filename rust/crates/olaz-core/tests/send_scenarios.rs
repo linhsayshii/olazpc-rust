@@ -9,12 +9,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use olaz_api::{PollState, SendMessageResult};
 use olaz_core::actor::{ActorSink, CoreHandle};
-use olaz_core::conversations::{
-    BatchApplyDelta, ConversationPreview, ConversationSummary, IdentityTable,
-};
+use olaz_core::conversations::{BatchApplyDelta, ConversationPreview, ConversationSummary};
 use olaz_core::effect::Effect;
 use olaz_core::input::{Command, E2eeQuoteArg, LegacyCookie};
-use olaz_core::messages::WindowDelta;
+use olaz_core::messages::{ContactsState, WindowDelta};
 use olaz_core::reduce::classify::MobileSyncEvent;
 use olaz_core::runner::{EffectRunner, Host, SessionEffectRunner};
 use olaz_core::state::{CoreState, Phase, Profile};
@@ -291,7 +289,7 @@ fn make_ready_state() -> CoreState {
         avatar: Some("https://cdn.example.invalid/alice.jpg".to_owned()),
         phone: None,
     });
-    state.conversations.identities = IdentityTable::default();
+    state.contacts = ContactsState::default();
     state.conversations.conversations.push(ConversationSummary {
         id: "3000001".to_owned(),
         is_group: false,
@@ -956,7 +954,7 @@ async fn s06_typing_incoming_expiry_outgoing_throttle_send_reset_and_guards() {
         ),
         "c1",
     );
-    initial.conversations.identities.cached_profiles = BTreeMap::new();
+    initial.contacts.cached_profiles = BTreeMap::new();
 
     let core = CoreHandle::start_with_state(initial, inner_runner, Handle::current());
 

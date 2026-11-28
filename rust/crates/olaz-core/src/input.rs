@@ -4,7 +4,10 @@ use crate::pins::{BoardRawTopics, PinnedList, RefreshBoardFollowup, UnpinBoardPu
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use olaz_api::{AutoDeleteFetchOutcome, HiddenConversationsSnapshot, PollState, SendMessageResult};
+use olaz_api::{
+    AutoDeleteFetchOutcome, BlockedUserEntry, HiddenConversationsSnapshot, PollState,
+    SendMessageResult,
+};
 use olaz_net::{
     LoginAccount, NetError, QrScanResult, QrTicket, ServerSettingsSource, SessionStatus,
 };
@@ -24,7 +27,7 @@ use crate::conversations::{
 };
 use crate::effect::OpResult;
 use crate::forward::{ComposerSendOutcome, FileResolutionOutcome, MediaResolutionOutcome};
-use crate::messages::{ContactsState, HistoryFreshness};
+use crate::messages::{BlockedUserState, ContactsState, HistoryFreshness};
 use crate::notify::{
     CardActionOutcomeData, FriendRequestOriginKind, MuteInfo, NotifAuthorization, PinReminderRef,
     RawResponderBuckets,
@@ -496,10 +499,6 @@ pub enum Command {
         uid: String,
         message: String,
     },
-    SaveAlias {
-        uid: String,
-        name: String,
-    },
     GroupInvitePreview {
         url: String,
     },
@@ -648,6 +647,40 @@ pub enum Command {
     SeedPolls {
         polls: Box<crate::polls::PollsState>,
     },
+    // --- Contacts, friend requests, phone lookup, block, alias (U9) ---
+    RefreshContacts,
+    PerformContactsSync,
+    AcceptFriendRequest {
+        uid: String,
+    },
+    DeclineFriendRequest {
+        uid: String,
+    },
+    CancelFriendRequest {
+        uid: String,
+    },
+    SendFriendRequest {
+        uid: String,
+        message: String,
+    },
+    FindFriendByPhone {
+        phone: String,
+    },
+    ResetFriendSearch,
+    HandleContactsState {
+        state_json: String,
+    },
+    LoadBlockedUsers,
+    SetBlocked {
+        uid: String,
+        blocked: bool,
+        name: String,
+    },
+    SaveAlias {
+        uid: String,
+        name: String,
+    },
+    SeedBlockedUsers(Option<Vec<BlockedUserState>>),
     // U11: zCloud
     RefreshCloud,
     CloudList {
@@ -1124,10 +1157,6 @@ impl fmt::Debug for Command {
                 .debug_struct("SubmitFriendRequest")
                 .field("msg_len", &message.len())
                 .finish(),
-            Self::SaveAlias { name, .. } => f
-                .debug_struct("SaveAlias")
-                .field("name_len", &name.len())
-                .finish(),
             Self::GroupInvitePreview { .. } => f.write_str("GroupInvitePreview"),
             Self::JoinGroup {
                 preview_group_id, ..
@@ -1242,6 +1271,35 @@ impl fmt::Debug for Command {
                 .field("sync_epoch", sync_epoch)
                 .finish(),
             Self::SeedPolls { polls } => f.debug_tuple("SeedPolls").field(polls).finish(),
+            // U9
+            Self::RefreshContacts => f.write_str("RefreshContacts"),
+            Self::PerformContactsSync => f.write_str("PerformContactsSync"),
+            Self::AcceptFriendRequest { .. } => f.write_str("AcceptFriendRequest"),
+            Self::DeclineFriendRequest { .. } => f.write_str("DeclineFriendRequest"),
+            Self::CancelFriendRequest { .. } => f.write_str("CancelFriendRequest"),
+            Self::SendFriendRequest { message, .. } => f
+                .debug_struct("SendFriendRequest")
+                .field("msg_len", &message.len())
+                .finish(),
+            Self::FindFriendByPhone { .. } => f.write_str("FindFriendByPhone"),
+            Self::ResetFriendSearch => f.write_str("ResetFriendSearch"),
+            Self::HandleContactsState { state_json } => f
+                .debug_struct("HandleContactsState")
+                .field("bytes", &state_json.len())
+                .finish(),
+            Self::LoadBlockedUsers => f.write_str("LoadBlockedUsers"),
+            Self::SetBlocked { blocked, .. } => f
+                .debug_struct("SetBlocked")
+                .field("blocked", blocked)
+                .finish(),
+            Self::SaveAlias { name, .. } => f
+                .debug_struct("SaveAlias")
+                .field("has_name", &!name.trim().is_empty())
+                .finish(),
+            Self::SeedBlockedUsers(users) => f
+                .debug_struct("SeedBlockedUsers")
+                .field("count", &users.as_ref().map(Vec::len))
+                .finish(),
             Self::RefreshCloud => f.write_str("RefreshCloud"),
             Self::CloudList {
                 kind,
@@ -1948,12 +2006,6 @@ pub enum Input {
         op_id: u64,
         ok: bool,
     },
-    SaveAliasDone {
-        op_id: u64,
-        uid: String,
-        trimmed_name: String,
-        ok: bool,
-    },
     GroupInvitePreviewDone {
         op_id: u64,
         url: String,
@@ -1997,6 +2049,57 @@ pub enum Input {
         outcome: CardActionOutcomeData,
     },
 
+    // --- Contacts, friend requests, phone lookup, block, alias (U9) ---
+    ContactsSyncDone {
+        friends_rows: Option<Vec<Map<String, Value>>>,
+        groups_dict: Option<Map<String, Value>>,
+        sent_rows: Option<Vec<Map<String, Value>>>,
+        received_rows: Option<Vec<Map<String, Value>>>,
+        op_id: Option<u64>,
+    },
+    FriendRequestAccepted {
+        uid: String,
+        ok: bool,
+        op_id: Option<u64>,
+    },
+    FriendRequestDeclined {
+        uid: String,
+        ok: bool,
+        op_id: Option<u64>,
+    },
+    FriendRequestCancelled {
+        uid: String,
+        ok: bool,
+        op_id: Option<u64>,
+    },
+    FriendRequestSent {
+        uid: String,
+        ok: bool,
+        op_id: Option<u64>,
+    },
+    FriendFoundByPhone {
+        search_gen: u64,
+        result: Result<Map<String, Value>, SessionFailure>,
+        op_id: Option<u64>,
+    },
+    BlockedUsersLoaded {
+        users: Option<Vec<BlockedUserEntry>>,
+        op_id: Option<u64>,
+    },
+    BlockedUserUpdated {
+        uid: String,
+        blocked: bool,
+        name: String,
+        open_conv_id: Option<String>,
+        ok: bool,
+        op_id: Option<u64>,
+    },
+    AliasSaved {
+        uid: String,
+        trimmed_alias: String,
+        ok: bool,
+        op_id: Option<u64>,
+    },
     // --- Board pins domain (U7) ---
     BoardPinsFetched {
         conv_id: String,
@@ -2753,6 +2856,75 @@ impl fmt::Debug for Input {
                 .field("error_type", error_type)
                 .field("op_id", op_id)
                 .finish(),
+            // U9
+            Self::ContactsSyncDone {
+                friends_rows,
+                groups_dict,
+                sent_rows,
+                received_rows,
+                op_id,
+            } => f
+                .debug_struct("ContactsSyncDone")
+                .field("friends", &friends_rows.as_ref().map(Vec::len))
+                .field("groups_ok", &groups_dict.is_some())
+                .field("sent", &sent_rows.as_ref().map(Vec::len))
+                .field("received", &received_rows.as_ref().map(Vec::len))
+                .field("op_id", op_id)
+                .finish(),
+            Self::FriendRequestAccepted { ok, op_id, .. } => f
+                .debug_struct("FriendRequestAccepted")
+                .field("ok", ok)
+                .field("op_id", op_id)
+                .finish(),
+            Self::FriendRequestDeclined { ok, op_id, .. } => f
+                .debug_struct("FriendRequestDeclined")
+                .field("ok", ok)
+                .field("op_id", op_id)
+                .finish(),
+            Self::FriendRequestCancelled { ok, op_id, .. } => f
+                .debug_struct("FriendRequestCancelled")
+                .field("ok", ok)
+                .field("op_id", op_id)
+                .finish(),
+            Self::FriendRequestSent { ok, op_id, .. } => f
+                .debug_struct("FriendRequestSent")
+                .field("ok", ok)
+                .field("op_id", op_id)
+                .finish(),
+            Self::FriendFoundByPhone {
+                search_gen,
+                result,
+                op_id,
+            } => f
+                .debug_struct("FriendFoundByPhone")
+                .field("search_gen", search_gen)
+                .field("ok", &result.is_ok())
+                .field("op_id", op_id)
+                .finish(),
+            Self::BlockedUsersLoaded { users, op_id } => f
+                .debug_struct("BlockedUsersLoaded")
+                .field("count", &users.as_ref().map(Vec::len))
+                .field("op_id", op_id)
+                .finish(),
+            Self::BlockedUserUpdated {
+                blocked, ok, op_id, ..
+            } => f
+                .debug_struct("BlockedUserUpdated")
+                .field("blocked", blocked)
+                .field("ok", ok)
+                .field("op_id", op_id)
+                .finish(),
+            Self::AliasSaved {
+                trimmed_alias,
+                ok,
+                op_id,
+                ..
+            } => f
+                .debug_struct("AliasSaved")
+                .field("has_alias", &!trimmed_alias.is_empty())
+                .field("ok", ok)
+                .field("op_id", op_id)
+                .finish(),
             // U16
             Self::NotificationPrefsLoaded {
                 enabled,
@@ -2793,11 +2965,6 @@ impl fmt::Debug for Input {
                 .finish(),
             Self::SubmitFriendDone { op_id, ok } => f
                 .debug_struct("SubmitFriendDone")
-                .field("op_id", op_id)
-                .field("ok", ok)
-                .finish(),
-            Self::SaveAliasDone { op_id, ok, .. } => f
-                .debug_struct("SaveAliasDone")
                 .field("op_id", op_id)
                 .field("ok", ok)
                 .finish(),

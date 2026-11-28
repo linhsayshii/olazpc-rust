@@ -479,7 +479,7 @@ fn emit_routes(
                     .and_then(|p| p.avatar.as_deref());
                 let name = state
                     .conversations
-                    .lookup_person_info(&uid, my_uid, my_avatar)
+                    .lookup_person_info(&state.contacts, &uid, my_uid, my_avatar)
                     .map(|(n, _)| n)
                     .unwrap_or_else(|| crate::typing::DEFAULT_TYPING_NAME.to_owned());
                 crate::typing::set_typing(&mut state.typing, conv_id.clone(), name, on_pc, out);

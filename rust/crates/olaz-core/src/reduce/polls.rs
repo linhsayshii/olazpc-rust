@@ -238,7 +238,15 @@ pub fn reduce_polls(state: &mut CoreState, input: Input, out: &mut ReduceOutput)
                     .as_ref()
                     .and_then(|root| root.get("data"))
                     .and_then(Value::as_object)
-                    .map(|d| build_poll_voters(d, my_uid, my_avatar, &state.conversations));
+                    .map(|d| {
+                        build_poll_voters(
+                            d,
+                            my_uid,
+                            my_avatar,
+                            &state.conversations,
+                            &state.contacts,
+                        )
+                    });
                 complete_op(out, op_id, OpResult::PollVoters(voters), false);
             }
             PollDetailPurpose::Refresh { now_ms } => {
@@ -913,8 +921,7 @@ mod tests {
         assert!(out.dirty.contains(&DirtyKey::CachedGroups));
         assert!(out.dirty.contains(&DirtyKey::Polls));
         let cached = state
-            .conversations
-            .identities
+            .contacts
             .cached_groups
             .get("g500202")
             .expect("cached group updated");

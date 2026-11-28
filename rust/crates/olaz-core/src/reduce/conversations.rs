@@ -37,6 +37,7 @@ pub(crate) fn apply_message_preview_update(
         .and_then(|p| p.avatar.clone());
     let self_conv_id = state.session.self_conversation_id.clone();
     let changed = state.conversations.update_conversation_on_message(
+        &state.contacts,
         msg,
         increment_unread,
         &my_uid,
@@ -77,9 +78,10 @@ pub(crate) fn apply_batch_delta(
     };
 
     let self_conv_id = state.session.self_conversation_id.clone();
-    let (convs_changed, flags_changed, extras_changed) = state
-        .conversations
-        .apply_batch_delta(&delta, self_conv_id.as_deref());
+    let (convs_changed, flags_changed, extras_changed) =
+        state
+            .conversations
+            .apply_batch_delta(&state.contacts, &delta, self_conv_id.as_deref());
     if convs_changed {
         out.dirty.insert(DirtyKey::Conversations);
     }
@@ -134,9 +136,12 @@ pub(crate) fn reduce_conversations(state: &mut CoreState, input: Input, out: &mu
                     state.conversations.pinned_ids.remove(&id);
                 }
                 let self_conv_id = state.session.self_conversation_id.clone();
-                state
-                    .conversations
-                    .apply_pin_status(&id, pinned, self_conv_id.as_deref());
+                state.conversations.apply_pin_status(
+                    &state.contacts,
+                    &id,
+                    pinned,
+                    self_conv_id.as_deref(),
+                );
                 mark_list_flags_extras_dirty(out);
                 out.effects
                     .push(Effect::Store(StoreOp::SetPreferenceStrings {
@@ -181,9 +186,12 @@ pub(crate) fn reduce_conversations(state: &mut CoreState, input: Input, out: &mu
             let self_conv_id = state.session.self_conversation_id.clone();
             if !pinned {
                 state.conversations.pinned_ids.remove(&target_id);
-                state
-                    .conversations
-                    .apply_pin_status(&target_id, false, self_conv_id.as_deref());
+                state.conversations.apply_pin_status(
+                    &state.contacts,
+                    &target_id,
+                    false,
+                    self_conv_id.as_deref(),
+                );
                 mark_list_flags_extras_dirty(out);
                 out.effects
                     .push(Effect::Store(StoreOp::SetConversationPinned {
@@ -210,9 +218,12 @@ pub(crate) fn reduce_conversations(state: &mut CoreState, input: Input, out: &mu
                 }
             } else {
                 state.conversations.pinned_ids.insert(target_id.clone());
-                state
-                    .conversations
-                    .apply_pin_status(&target_id, true, self_conv_id.as_deref());
+                state.conversations.apply_pin_status(
+                    &state.contacts,
+                    &target_id,
+                    true,
+                    self_conv_id.as_deref(),
+                );
                 mark_list_flags_extras_dirty(out);
                 out.effects
                     .push(Effect::Store(StoreOp::SetPreferenceStrings {
@@ -444,8 +455,9 @@ pub(crate) fn reduce_conversations(state: &mut CoreState, input: Input, out: &mu
             profiles_map,
             mut profiles_cache_changed,
         } => {
-            let (cache_changed, convs_changed) =
-                state.conversations.apply_resolved_profiles(&profiles_map);
+            let (cache_changed, convs_changed) = state
+                .conversations
+                .apply_resolved_profiles(&mut state.contacts, &profiles_map);
             profiles_cache_changed |= cache_changed;
             if convs_changed {
                 out.dirty.insert(DirtyKey::Conversations);
@@ -460,8 +472,7 @@ pub(crate) fn reduce_conversations(state: &mut CoreState, input: Input, out: &mu
                 });
             } else {
                 if profiles_cache_changed
-                    && let Ok(bytes) =
-                        serde_json::to_vec(&state.conversations.identities.cached_profiles)
+                    && let Ok(bytes) = serde_json::to_vec(&state.contacts.cached_profiles)
                 {
                     out.effects.push(Effect::Store(StoreOp::SetPreferenceData {
                         key: "cachedProfiles".to_owned(),
@@ -485,6 +496,7 @@ pub(crate) fn reduce_conversations(state: &mut CoreState, input: Input, out: &mu
                 .as_ref()
                 .and_then(|p| p.avatar.clone());
             if state.conversations.apply_mention_preview_messages(
+                &state.contacts,
                 &messages,
                 &my_uid,
                 my_avatar.as_deref(),
@@ -509,7 +521,7 @@ pub(crate) fn reduce_conversations(state: &mut CoreState, input: Input, out: &mu
             let self_conv_id = state.session.self_conversation_id.clone();
             state
                 .conversations
-                .rebuild_conversation_extras(self_conv_id.as_deref());
+                .rebuild_conversation_extras(&state.contacts, self_conv_id.as_deref());
             out.dirty.insert(DirtyKey::ConversationExtras);
             out.effects.push(Effect::Store(StoreOp::SetPreferenceData {
                 key: "labels".to_owned(),
@@ -525,7 +537,8 @@ pub(crate) fn reduce_conversations(state: &mut CoreState, input: Input, out: &mu
 fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: &mut ReduceOutput) {
     match cmd {
         Command::UpdateIdentities(table) => {
-            state.conversations.identities = table;
+            state.contacts.apply_identity_table(table);
+            out.refresh_identity_snapshot = true;
             complete_op(op_id, OpResult::Unit, false, out);
         }
 
@@ -547,7 +560,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
             let self_conv_id = state.session.self_conversation_id.clone();
             if state
                 .conversations
-                .ensure_known_contacts(self_conv_id.as_deref())
+                .ensure_known_contacts(&state.contacts, self_conv_id.as_deref())
             {
                 out.dirty.insert(DirtyKey::Conversations);
             }
@@ -935,7 +948,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
             let self_conv_id = state.session.self_conversation_id.clone();
             let rebuilt = state
                 .conversations
-                .rebuild_conversation_extras(self_conv_id.as_deref());
+                .rebuild_conversation_extras(&state.contacts, self_conv_id.as_deref());
             if rebuilt
                 || before.0 != state.conversations.extras.type_filter
                 || before.1 != state.conversations.extras.label_filter_ids
@@ -979,7 +992,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
             let self_conv_id = state.session.self_conversation_id.clone();
             state
                 .conversations
-                .rebuild_conversation_extras(self_conv_id.as_deref());
+                .rebuild_conversation_extras(&state.contacts, self_conv_id.as_deref());
             out.dirty.insert(DirtyKey::ConversationExtras);
             emit_save_labels(state, op_id, out);
         }
@@ -1014,7 +1027,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
             let self_conv_id = state.session.self_conversation_id.clone();
             state
                 .conversations
-                .rebuild_conversation_extras(self_conv_id.as_deref());
+                .rebuild_conversation_extras(&state.contacts, self_conv_id.as_deref());
             out.dirty.insert(DirtyKey::ConversationExtras);
             emit_save_labels(state, op_id, out);
         }
@@ -1041,7 +1054,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                 let self_conv_id = state.session.self_conversation_id.clone();
                 state
                     .conversations
-                    .rebuild_conversation_extras(self_conv_id.as_deref());
+                    .rebuild_conversation_extras(&state.contacts, self_conv_id.as_deref());
                 out.dirty.insert(DirtyKey::ConversationExtras);
                 emit_save_labels(state, op_id, out);
             } else {
@@ -1066,7 +1079,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
             let self_conv_id = state.session.self_conversation_id.clone();
             state
                 .conversations
-                .rebuild_conversation_extras(self_conv_id.as_deref());
+                .rebuild_conversation_extras(&state.contacts, self_conv_id.as_deref());
             out.dirty.insert(DirtyKey::ConversationExtras);
             emit_save_labels(state, op_id, out);
         }
@@ -1114,6 +1127,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
 
         Command::SyncConversationsSnapshot(list) => {
             state.conversations.conversations = list;
+            out.refresh_identity_snapshot = true;
             complete_op(op_id, OpResult::Unit, false, out);
         }
 
@@ -1121,7 +1135,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
             let self_conv_id = state.session.self_conversation_id.clone();
             if state
                 .conversations
-                .rebuild_conversation_extras(self_conv_id.as_deref())
+                .rebuild_conversation_extras(&state.contacts, self_conv_id.as_deref())
             {
                 out.dirty.insert(DirtyKey::ConversationExtras);
             }
@@ -1331,7 +1345,7 @@ pub(crate) fn rebuild_flags_and_extras(state: &mut CoreState, out: &mut ReduceOu
     }
     if state
         .conversations
-        .rebuild_conversation_extras(self_conv_id.as_deref())
+        .rebuild_conversation_extras(&state.contacts, self_conv_id.as_deref())
     {
         out.dirty.insert(DirtyKey::ConversationExtras);
     }
@@ -1406,7 +1420,7 @@ pub(crate) fn mark_conversation_read(
     if extras_changed
         && state
             .conversations
-            .rebuild_conversation_extras(self_conv_id.as_deref())
+            .rebuild_conversation_extras(&state.contacts, self_conv_id.as_deref())
     {
         out.dirty.insert(DirtyKey::ConversationExtras);
     }
