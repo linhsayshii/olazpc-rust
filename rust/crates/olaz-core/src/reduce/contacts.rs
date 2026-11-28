@@ -490,7 +490,6 @@ pub(crate) fn reduce_contacts_command(
 
         Command::SeedBlockedUsers(users) => {
             state.contacts.blocked_users = users;
-            out.dirty.insert(DirtyKey::Contacts);
             complete_op(out, op_id, OpResult::Unit, false);
         }
 
