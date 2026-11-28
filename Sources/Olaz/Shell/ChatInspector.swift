@@ -196,6 +196,18 @@ struct ChatInspector: View {
                     .font(.system(size: 17, weight: .bold))
                     .lineLimit(2)
                     .multilineTextAlignment(.center)
+                if engine.canEditAlias(for: id, isGroup: conversation.isGroup) {
+                    Button {
+                        shell.editAlias(draft: engine.aliasDraft(for: id, fallbackName: conversation.displayName), conversationId: id)
+                    } label: {
+                        Image(systemName: "pencil")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help(AliasDraft.menuTitle)
+                    .accessibilityLabel(AliasDraft.menuTitle)
+                }
                 MutedBell(conversationId: id, size: 12)
             }
             if let subtitle {

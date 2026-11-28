@@ -110,6 +110,11 @@ struct MainShellView: View {
         .conversationPrompts(engine: engine) { id in if shell.selection == id { engine.openConversation(id) } }
         .conversationToast(engine: engine)
         .sheet(item: $shell.groupCompose) { request in CreateGroupSheet(request: request) }
+        .sheet(item: $shell.aliasEdit) { request in
+            AliasSheet(request: request) { text in
+                if !text.isEmpty { engine.conversationUI.show(.success, text) }
+            }
+        }
     }
 
     /// Opens the conversation in the official client; a hidden one stays closed until its PIN was entered (official OPEN_CONV screen).

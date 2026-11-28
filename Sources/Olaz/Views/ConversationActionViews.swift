@@ -7,21 +7,29 @@ import SwiftUI
 /// Menu items in the official order: pin · (Khác/Ưu tiên · Phân loại · đã đọc/chưa đọc) · (thông báo · ẩn) · xóa.
 struct ConversationActionsMenu: View {
     @Environment(ZaloEngine.self) private var engine
+    @Environment(ShellModel.self) private var shell
     let conversationId: String
     var preset: ConversationMenuPreset = .thread
     @Binding var showLabelManager: Bool
 
     var body: some View {
         let state = engine.conversationActions
+        let eligibleForAlias = engine.canEditAlias(for: conversationId)
         if state.loaded {
             let plan = ConversationMenuPlan.make(id: conversationId, preset: preset, state: state, unread: unread,
-                                                 muted: engine.isConversationMuted(conversationId))
+                                                 muted: engine.isConversationMuted(conversationId),
+                                                 canEditAlias: eligibleForAlias)
             pinItem(plan.pin)
-            if plan.pin != nil, plan.archive != nil || plan.showsLabel || plan.read != nil { Divider() }
+            if plan.pin != nil, plan.canEditAlias || plan.archive != nil || plan.showsLabel || plan.read != nil { Divider() }
+            if plan.canEditAlias {
+                Button(AliasDraft.menuTitle, systemImage: "pencil") {
+                    shell.editAlias(draft: engine.aliasDraft(for: conversationId), conversationId: conversationId)
+                }
+            }
             archiveItem(plan.archive)
             if plan.showsLabel { ConversationLabelMenu(conversationId: conversationId, showLabelManager: $showLabelManager) }
             readItem(plan.read)
-            if plan.mute != nil || plan.hide != nil, plan.pin != nil || plan.archive != nil || plan.showsLabel || plan.read != nil { Divider() }
+            if plan.mute != nil || plan.hide != nil, plan.pin != nil || plan.canEditAlias || plan.archive != nil || plan.showsLabel || plan.read != nil { Divider() }
             muteItems(plan.mute)
             hideItem(plan.hide)
             if plan.canDelete {
@@ -30,6 +38,11 @@ struct ConversationActionsMenu: View {
             }
         } else {
             // The adapter has not published yet: only what does not depend on it.
+            if eligibleForAlias {
+                Button(AliasDraft.menuTitle, systemImage: "pencil") {
+                    shell.editAlias(draft: engine.aliasDraft(for: conversationId), conversationId: conversationId)
+                }
+            }
             ConversationLabelMenu(conversationId: conversationId, showLabelManager: $showLabelManager)
             ConversationMuteMenu(conversationId: conversationId)
         }
@@ -96,7 +109,8 @@ struct ConversationHeaderMenu: View {
     var body: some View {
         let state = engine.conversationActions
         let plan = ConversationMenuPlan.make(id: conversationId, preset: .chatBox, state: state, unread: 0,
-                                             muted: engine.isConversationMuted(conversationId))
+                                             muted: engine.isConversationMuted(conversationId),
+                                             canEditAlias: engine.canEditAlias(for: conversationId))
         // Without the adapter's data the menu would only offer the label / mute items, which stay in the sidebar row menu.
         if state.loaded, !plan.isEmpty {
             Menu {

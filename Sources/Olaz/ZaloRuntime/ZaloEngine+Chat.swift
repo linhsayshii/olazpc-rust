@@ -399,11 +399,22 @@ extension ZaloEngine {
         }
 
         let needle = Self.contactFold(query).trimmingCharacters(in: .whitespacesAndNewlines)
-        return (groupMemberCache[id] ?? []).filter { candidate in
-            guard !excludedSet.contains(candidate.id) else { return false }
-            if needle.isEmpty { return true }
-            return Self.contactFold(candidate.name).contains(needle)
+        return (groupMemberCache[id] ?? [])
+            .map { resolvedMentionCandidate($0) }
+            .filter { candidate in
+                guard !excludedSet.contains(candidate.id) else { return false }
+                if needle.isEmpty { return true }
+                return Self.contactFold(candidate.name).contains(needle)
+            }
+    }
+
+    private func resolvedMentionCandidate(_ candidate: MentionCandidate) -> MentionCandidate {
+        guard !candidate.isAll else { return candidate }
+        let clean = ZaloWireParser.normalizeContactUid(candidate.id)
+        if let alias = cachedAliases[clean], !alias.isEmpty {
+            return MentionCandidate(id: candidate.id, name: alias, avatar: candidate.avatar, isAll: false)
         }
+        return candidate
     }
 
     // MARK: - Reactions & Read Receipts

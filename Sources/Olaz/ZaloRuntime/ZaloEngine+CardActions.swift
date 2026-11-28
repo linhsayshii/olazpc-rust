@@ -121,6 +121,49 @@ extension ZaloEngine {
 
     // MARK: Native sheets of card actions
 
+    /// Whether the "Đặt tên gợi nhớ" entry point should be shown for `id` (1-1 friend only).
+    func canEditAlias(for id: String, isGroup: Bool? = nil, isOfficialAccount: Bool = false) -> Bool {
+        _ = (contacts, profile)
+        let conv = conversations.first { $0.id == id }
+        let group = isGroup ?? conv?.isGroup ?? ZaloWireParser.isGroupId(id)
+        let clean = ZaloWireParser.normalizeContactUid(id)
+        let isFriend = contacts.friends.contains { ZaloWireParser.normalizeContactUid($0.id) == clean }
+        return AliasDraft.canEditAlias(
+            uid: id,
+            isGroup: group,
+            myUid: profile?.userId,
+            selfConversationId: selfConversationId,
+            isFriend: isFriend,
+            isOfficialAccount: isOfficialAccount
+        )
+    }
+
+    /// Builds an `AliasDraft` for a 1-1 contact from current contact & alias state.
+    func aliasDraft(for uid: String, fallbackName: String = "", fallbackZaloName: String = "", max: Int = AliasDraft.fallbackMax) -> AliasDraft {
+        let clean = ZaloWireParser.normalizeContactUid(uid)
+        let friend = contacts.friends.first { ZaloWireParser.normalizeContactUid($0.id) == clean }
+        let conv = conversations.first { $0.id == uid || ZaloWireParser.normalizeContactUid($0.id) == clean }
+        let currentAlias = cachedAliases[clean] ?? cachedAliases[uid]
+        let zaloName = !fallbackZaloName.isEmpty ? fallbackZaloName : (friend?.zaloName ?? "")
+        let displayName = friend?.name ?? (fallbackName.isEmpty ? (conv?.displayName ?? "") : fallbackName)
+        return AliasDraft.forContact(
+            uid: clean,
+            displayName: displayName,
+            zaloName: zaloName,
+            currentAlias: currentAlias,
+            max: max
+        )
+    }
+
+    /// Live display name for a contact, preferring any saved alias and tracking `identityCacheVersion`.
+    func aliasDisplayName(for uid: String, fallback: String) -> String {
+        _ = identityCacheVersion
+        let clean = ZaloWireParser.normalizeContactUid(uid)
+        if let alias = cachedAliases[clean], !alias.isEmpty { return alias }
+        if let alias = cachedAliases[uid], !alias.isEmpty { return alias }
+        return fallback
+    }
+
     func saveAlias(uid: String, name: String) async -> (ok: Bool, text: String) {
         guard let core = await ensureCoreEngine(),
               let rec = try? await core.saveAlias(uid: uid, name: name) else {

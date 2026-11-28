@@ -96,4 +96,67 @@ import Foundation
         #expect(StickerCategory(json: try json(#"{"id":0,"stickers":[{"ref":"0_1","url":"https://s/1.png"}]}"#)) == nil)
         #expect(StickerCategory(json: nil) == nil)
     }
+
+    @Test func aliasMenuVisibilityMatchesOfficialClientRules() {
+        #expect(AliasDraft.menuTitle == "Đặt tên gợi nhớ")
+
+        let myUid = "2000100"
+        let selfConv = "9200100"
+
+        // 1-1 friend: shown (raw or u-prefixed uid).
+        #expect(AliasDraft.canEditAlias(uid: "3000101", isGroup: false, myUid: myUid, selfConversationId: selfConv, isFriend: true))
+        #expect(AliasDraft.canEditAlias(uid: "u3000101", isGroup: false, myUid: myUid, selfConversationId: selfConv, isFriend: true))
+
+        // Group: never shown.
+        #expect(!AliasDraft.canEditAlias(uid: "g500101", isGroup: true, myUid: myUid, selfConversationId: selfConv, isFriend: true))
+        #expect(!AliasDraft.canEditAlias(uid: "g500101", isGroup: false, myUid: myUid, selfConversationId: selfConv, isFriend: true))
+
+        // Self profile: never shown (raw or u-prefixed).
+        #expect(!AliasDraft.canEditAlias(uid: myUid, isGroup: false, myUid: myUid, selfConversationId: selfConv, isFriend: true))
+        #expect(!AliasDraft.canEditAlias(uid: "u\(myUid)", isGroup: false, myUid: myUid, selfConversationId: selfConv, isFriend: true))
+
+        // Cloud của tôi (sendToMeId): never shown.
+        #expect(!AliasDraft.canEditAlias(uid: selfConv, isGroup: false, myUid: myUid, selfConversationId: selfConv, isFriend: true))
+
+        // Official Account: never shown.
+        #expect(!AliasDraft.canEditAlias(uid: "3000102", isGroup: false, myUid: myUid, selfConversationId: selfConv, isFriend: true, isOfficialAccount: true))
+
+        // Stranger without a contact/friend record: hidden (matches official enable_stranger_alias default off + server error 239).
+        #expect(!AliasDraft.canEditAlias(uid: "3000103", isGroup: false, myUid: myUid, selfConversationId: selfConv, isFriend: false))
+
+        // Empty uid: hidden.
+        #expect(!AliasDraft.canEditAlias(uid: "   ", isGroup: false, myUid: myUid, selfConversationId: selfConv, isFriend: true))
+    }
+
+    @Test func aliasDraftForContactBuildsExpectedDefaultsAndExistingAlias() {
+        let fresh = AliasDraft.forContact(uid: "u3000201", displayName: "Minh An", zaloName: "An Zalo")
+        #expect(fresh == AliasDraft(
+            uid: "3000201",
+            name: "An Zalo",
+            suggest: "",
+            placeholder: "An Zalo",
+            max: AliasDraft.fallbackMax,
+            hasAlias: false
+        ))
+
+        let existing = AliasDraft.forContact(
+            uid: "3000201",
+            displayName: "Sếp An",
+            zaloName: "An Zalo",
+            currentAlias: "Sếp\u{0001} An",
+            max: 40
+        )
+        #expect(existing == AliasDraft(
+            uid: "3000201",
+            name: "An Zalo",
+            suggest: "Sếp An",
+            placeholder: "An Zalo",
+            max: 40,
+            hasAlias: true
+        ))
+
+        // Invalid / oversized limits fall back or cap cleanly.
+        #expect(AliasDraft.forContact(uid: "3000201", displayName: "An", max: 0).max == AliasDraft.fallbackMax)
+        #expect(AliasDraft.forContact(uid: "3000201", displayName: "An", max: 999).max == 200)
+    }
 }

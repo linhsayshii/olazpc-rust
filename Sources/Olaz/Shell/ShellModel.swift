@@ -108,6 +108,8 @@ final class ShellModel {
     var tour: TourStep?
     /// The "Tạo nhóm" sheet, nil when it is not shown.
     var groupCompose: GroupComposeRequest?
+    /// The "Đặt tên gợi nhớ" sheet opened from menus or contact info, nil when not shown.
+    var aliasEdit: AliasRequest?
 
     // Ticks: a view observing one of these performs the action when it changes.
     /// Focus the list search field (⌘F in the list, ⌥⌘F).
@@ -121,6 +123,10 @@ final class ShellModel {
 
     /// Shows the "Tạo nhóm" sheet with `members` already picked.
     func composeGroup(with members: [String] = []) { groupCompose = GroupComposeRequest(members: members) }
+    /// Shows the "Đặt tên gợi nhớ" sheet for a 1-1 contact.
+    func editAlias(draft: AliasDraft, conversationId: String = "") {
+        aliasEdit = AliasRequest(conversationId: conversationId, draft: draft)
+    }
     func replyToLatest() { replyTick += 1 }
     func toggleChatSearch() { chatSearchTick += 1 }
 

@@ -44,13 +44,17 @@ struct ConversationMenuPlan: Equatable {
     var canDelete = false
     /// "Phân loại" (official `showLabel`).
     var showsLabel = false
+    /// "Đặt tên gợi nhớ" (official `STR_RENAME_ALIAS`, 1-1 friend only).
+    var canEditAlias = false
 
-    var isEmpty: Bool { pin == nil && archive == nil && read == nil && mute == nil && hide == nil && !canDelete && !showsLabel }
+    var isEmpty: Bool { pin == nil && archive == nil && read == nil && mute == nil && hide == nil && !canDelete && !showsLabel && !canEditAlias }
 
     /// - Parameters:
     ///   - unread: unread message count of the conversation (`smsUnreadCount`).
     ///   - muted: notifications are off for it.
-    static func make(id: String, preset: ConversationMenuPreset, state: ConversationActionsState, unread: Int, muted: Bool) -> ConversationMenuPlan {
+    ///   - canEditAlias: true when the conversation is a normal 1-1 friend eligible for "Đặt tên gợi nhớ".
+    static func make(id: String, preset: ConversationMenuPreset, state: ConversationActionsState, unread: Int, muted: Bool,
+                     canEditAlias: Bool = false) -> ConversationMenuPlan {
         let flags = state.flags(for: id)
         var plan = ConversationMenuPlan()
         let isSelf = flags.contains(.cannotDelete)   // My Cloud: the only conversation that can't be deleted
@@ -65,6 +69,7 @@ struct ConversationMenuPlan: Equatable {
         if !flags.contains(.noPinMenu) {
             if flags.contains(.pinned) { plan.pin = .unpin } else if !flags.contains(.cannotPin) { plan.pin = .pin }
         }
+        plan.canEditAlias = canEditAlias && !isSelf
         // `showArchiveChatAction` is only passed by the sidebar list; the item needs the "3" list layout and the feature on.
         if thread, !flags.contains(.cannotArchive) {
             plan.archive = flags.contains(.archived) ? .moveToFocus : .moveToOther
