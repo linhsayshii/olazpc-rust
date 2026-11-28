@@ -1943,3 +1943,113 @@ async fn send_contact_card_direct_group_phone_and_fallback() {
     assert!(dbg.contains("has_phone: true"));
     assert!(dbg.contains("has_client_id: true"));
 }
+
+// ---------------------------------------------------------------- Global IDs
+
+fn gid_input(req: &RequestSpec) -> Vec<String> {
+    let p = params_of(req);
+    if req.path() == "/api/gid/decrypt" {
+        serde_json::from_str(p["globalUids"].as_str().unwrap()).unwrap()
+    } else {
+        serde_json::from_value(p["noiseUids"].clone()).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn gid_decrypt_splits_414_and_431_and_caches_all_successes() {
+    for status in [414, 431] {
+        let ids: Vec<_> = (1..=200).map(|i| format!("{i:032x}")).collect();
+        let api = api_with(move |req| {
+            assert_eq!(req.method, olaz_net::http::Method::Get);
+            let ids = gid_input(req);
+            if ids.len() > 7 {
+                return Ok(RawResponse::new(status, Vec::new()));
+            }
+            let data: Map<String, Value> = ids
+                .into_iter()
+                .map(|id| {
+                    let uid = u64::from_str_radix(&id, 16).unwrap() + 1000;
+                    (id, json!(uid.to_string()))
+                })
+                .collect();
+            ok(Value::Object(data))
+        });
+        let resolved = api.decrypt_global_ids(&ids).await.unwrap();
+        assert_eq!(resolved.len(), 200);
+        let requests = sent(&api);
+        assert!(requests.iter().all(|r| gid_input(r).len() <= 50));
+        assert!(requests.iter().all(|r| r.url.len() < 4096));
+        assert_eq!(api.decrypt_global_ids(&ids).await.unwrap(), resolved);
+        assert_eq!(sent(&api).len(), requests.len());
+    }
+}
+
+#[tokio::test]
+async fn gid_encrypt_keeps_array_type_and_splits_transient_failures() {
+    let api = api_with(|req| {
+        assert_eq!(req.path(), "/api/gid/encrypt");
+        let ids = gid_input(req);
+        if ids.len() > 2 {
+            return Err(NetError::Network {
+                kind: olaz_net::NetworkErrorKind::Other,
+                message: "fixture".into(),
+            });
+        }
+        ok(Value::Object(
+            ids.into_iter()
+                .map(|id| (format!("u{id}"), json!(format!("gid-{id}"))))
+                .collect(),
+        ))
+    });
+    let ids: Vec<_> = (1..=8).map(|i| format!("u{i}")).collect();
+    assert_eq!(api.encrypt_global_ids(&ids).await.unwrap().len(), 8);
+    assert!(
+        sent(&api)
+            .iter()
+            .all(|r| params_of(r)["noiseUids"].is_array())
+    );
+    api.reset_state();
+    assert_eq!(api.encrypt_global_ids(&ids).await.unwrap().len(), 8);
+}
+
+#[tokio::test]
+async fn gid_failure_is_bounded_not_cached_and_auth_never_splits() {
+    let mut count = 0;
+    let api = api_with(move |_| {
+        count += 1;
+        if count <= 2 {
+            return err(112);
+        }
+        ok(json!({"global-fixture": "123"}))
+    });
+    let ids = strs(&["global-fixture"]);
+    assert!(api.decrypt_global_ids(&ids).await.unwrap().is_empty());
+    assert_eq!(sent(&api).len(), 2);
+    assert_eq!(
+        api.decrypt_global_ids(&ids).await.unwrap()["global-fixture"],
+        "123"
+    );
+    let api = api_with(|_| err(600));
+    assert!(
+        api.decrypt_global_ids(&strs(&["a", "b"]))
+            .await
+            .unwrap_err()
+            .is_auth_error()
+    );
+    assert_eq!(sent(&api).len(), 1);
+}
+
+#[tokio::test]
+async fn legacy_200_gid_get_exceeds_common_path_limit() {
+    let ids: Vec<_> = (1..=200).map(|i| format!("{i:032x}")).collect();
+    let api = api_ok();
+    api.client()
+        .get(
+            &olaz_net::ApiRequest::new("profile", "/api/gid/decrypt")
+                .payload(json!({"globalUids": json!(ids).to_string()})),
+        )
+        .await
+        .unwrap();
+    // Same encrypted query builder before/after #27: this is independent of HTTP version.
+    assert!(last(&api).url.len() > 8192);
+}

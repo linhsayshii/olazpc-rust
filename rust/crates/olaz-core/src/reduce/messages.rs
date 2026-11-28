@@ -295,6 +295,7 @@ pub(crate) fn reduce_messages(state: &mut CoreState, input: Input, out: &mut Red
             conv_id,
             remaining_chunks,
             profiles_map,
+            resolved_global_ids,
             mut cache_updated,
         } => {
             for (uid, raw_row) in profiles_map {
@@ -314,6 +315,26 @@ pub(crate) fn reduce_messages(state: &mut CoreState, input: Input, out: &mut Red
                         },
                     );
                     cache_updated = true;
+                }
+            }
+
+            // Repair already persisted Sync2 rows in each completed chunk. This also
+            // survives a profile lookup failure and does not wait for the final chunk.
+            if !resolved_global_ids.is_empty() {
+                let snap = state.identity_snapshot();
+                let (rows, changed) = state.messages.apply_resolved_sender_profiles(
+                    &conv_id,
+                    &snap,
+                    &resolved_global_ids,
+                );
+                if changed {
+                    out.dirty.insert(DirtyKey::Messages);
+                }
+                if !rows.is_empty() {
+                    out.effects.push(Effect::Store(StoreOp::SaveMessages {
+                        rows,
+                        preserve_existing_reactions: true,
+                    }));
                 }
             }
 
@@ -340,9 +361,11 @@ pub(crate) fn reduce_messages(state: &mut CoreState, input: Input, out: &mut Red
                     }));
                 }
                 let snap = state.identity_snapshot();
-                let (to_persist, win_changed) = state
-                    .messages
-                    .apply_resolved_sender_profiles(&conv_id, &snap);
+                let (to_persist, win_changed) = state.messages.apply_resolved_sender_profiles(
+                    &conv_id,
+                    &snap,
+                    &Default::default(),
+                );
                 if win_changed {
                     out.dirty.insert(DirtyKey::Messages);
                 }

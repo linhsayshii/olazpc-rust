@@ -14,8 +14,7 @@
 //! (reach them with [`ZaloApi::client`]).
 //!
 //! Not ported here (later waves): media upload and file send, polls and reminders, cloud, stickers,
-//! group management, contact cards, friend-request mutations, call signalling, global-id
-//! encrypt/decrypt, mute set.
+//! group management, contact cards, friend-request mutations, call signalling, mute set.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -26,6 +25,7 @@ mod contacts;
 mod conversations;
 mod e2ee;
 mod error;
+mod global_ids;
 mod group_polls;
 mod groups;
 mod history;

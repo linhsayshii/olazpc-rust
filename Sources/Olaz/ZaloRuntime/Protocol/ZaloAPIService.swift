@@ -77,25 +77,11 @@ extension ZaloSessionClient {
         }
         guard !missing.isEmpty else { return resolved }
 
-        for offset in stride(from: 0, to: missing.count, by: 200) {
-            let chunk = Array(missing[offset..<min(offset + 200, missing.count)])
-            guard let jsonBytes = try? JSONSerialization.data(withJSONObject: chunk),
-                  let jsonStr = String(data: jsonBytes, encoding: .utf8),
-                  let resp = try? await get(
-                      service: "profile",
-                      path: "/api/gid/decrypt",
-                      encryptedPayload: ["globalUids": jsonStr]
-                  ) else {
-                continue
-            }
-            let mapNode = (resp["data"] as? [String: Any]) ?? [:]
-            for (rawGid, rawUid) in mapNode {
-                let uid = ZaloWireParser.stripUserPrefix(JSONLossless.string(rawUid))
-                if !rawGid.isEmpty && !uid.isEmpty {
-                    globalIdToUidCache[rawGid] = uid
-                    uidToGlobalIdCache[uid] = rawGid
-                    resolved[rawGid] = uid
-                }
+        if let core = coreApi(), let result = try? await core.decryptGlobalIds(ids: missing) {
+            for (gid, uid) in result {
+                globalIdToUidCache[gid] = uid
+                uidToGlobalIdCache[uid] = gid
+                resolved[gid] = uid
             }
         }
         return resolved
@@ -117,24 +103,11 @@ extension ZaloSessionClient {
         }
         guard !missing.isEmpty else { return resolved }
 
-        for offset in stride(from: 0, to: missing.count, by: 200) {
-            let chunk = Array(missing[offset..<min(offset + 200, missing.count)])
-            guard let resp = try? await get(
-                service: "profile",
-                path: "/api/gid/encrypt",
-                encryptedPayload: ["noiseUids": chunk]
-            ) else {
-                continue
-            }
-            let mapNode = (resp["data"] as? [String: Any]) ?? [:]
-            for (rawUid, rawGid) in mapNode {
-                let uid = ZaloWireParser.stripUserPrefix(rawUid)
-                let gid = JSONLossless.string(rawGid)
-                if !uid.isEmpty && !gid.isEmpty {
-                    uidToGlobalIdCache[uid] = gid
-                    globalIdToUidCache[gid] = uid
-                    resolved[uid] = gid
-                }
+        if let core = coreApi(), let result = try? await core.encryptGlobalIds(ids: missing) {
+            for (uid, gid) in result {
+                uidToGlobalIdCache[uid] = gid
+                globalIdToUidCache[gid] = uid
+                resolved[uid] = gid
             }
         }
         return resolved
