@@ -13,7 +13,7 @@ import SwiftUI
 // translucent selection highlight over the SwiftUI glyphs. Once nothing is selected any more, the text view goes away.
 // - a right-click on the selection offers "Copy"; anywhere else the event goes on to the row's SwiftUI `.contextMenu`;
 // - a click anywhere outside the selected text clears it (one shared local event monitor);
-// - a click that selects nothing (a link, a tap on the bubble) hands keyboard focus back to where it was (the composer).
+// - a click that selects nothing (a link, a tap on the bubble) or clearing a selection hands keyboard focus back to where it was (the composer).
 
 /// The AppKit form of one bubble's text (same font, links and mentions as the SwiftUI `Text`), cached by the builder
 /// (`ChatFormat.messageText`).
@@ -129,7 +129,8 @@ final class MessageTextSelectionView: NSView, NSTextViewDelegate {
 
     // MARK: The text view, only while clicked / selected
 
-    private func activate() -> MessageTextView? {
+    @discardableResult
+    func activate() -> MessageTextView? {
         if let textView { return textView }
         guard let config else { return nil }
         // Own TextKit 1 stack: the layout manager paints every selection (focused or not) in the translucent color.
@@ -171,7 +172,8 @@ final class MessageTextSelectionView: NSView, NSTextViewDelegate {
         textView = nil
         view.onEmpty = nil
         view.delegate = nil
-        if window?.firstResponder === view { window?.makeFirstResponder(nil) }
+        SelectionOwner.release(view)
+        view.restorePreviousFirstResponderIfFocused()
         view.removeFromSuperview()
     }
 
@@ -255,7 +257,11 @@ final class MessageTextView: NSTextView {
     }
     /// Called once nothing is selected any more (outside a click's tracking): the overlay removes this view.
     var onEmpty: (() -> Void)?
+    /// The responder focused before this overlay took focus (typically the composer), restored when selection clears.
+    weak var previousFirstResponder: NSResponder?
     private var tracking = false
+
+    override var acceptsFirstResponder: Bool { allowsSelection && super.acceptsFirstResponder }
 
     func clearSelection() {
         guard selectedRange().length > 0 else { return }
@@ -263,6 +269,51 @@ final class MessageTextView: NSTextView {
     }
 
     private var hasSelection: Bool { selectedRange().length > 0 }
+
+    /// Resolves the non-overlay responder that held focus before `view`, unwrapping another bubble's overlay if needed.
+    static func previousResponder(from current: NSResponder?, excluding view: MessageTextView) -> NSResponder? {
+        if let other = current as? MessageTextView {
+            return other === view ? view.previousFirstResponder : other.previousFirstResponder
+        }
+        if current is NSWindow { return nil }
+        return current
+    }
+
+    func capturePreviousFirstResponder() {
+        if previousFirstResponder == nil {
+            previousFirstResponder = Self.previousResponder(from: window?.firstResponder, excluding: self)
+        }
+    }
+
+    func finishMouseTracking() {
+        if hasSelection {
+            // `MessageTextSelectionView` does not accept first responder, so `NSWindow.sendEvent` kept focus on the
+            // composer before activating this overlay; claim focus now so ⌘C and Edit ▸ Copy target the selected text.
+            if allowsSelection, window?.firstResponder !== self {
+                window?.makeFirstResponder(self)
+            }
+            return
+        }
+        // A plain click selects nothing: focus goes back where it was (e.g. the composer) and the overlay goes away.
+        restorePreviousFirstResponderIfFocused()
+        onEmpty?()
+    }
+
+    func restorePreviousFirstResponderIfFocused() {
+        guard let window, window.firstResponder === self else { return }
+        if let previous = previousFirstResponder, previous !== self {
+            if let view = previous as? NSView {
+                if view.window === window, view.acceptsFirstResponder {
+                    window.makeFirstResponder(view)
+                    return
+                }
+            } else if previous.acceptsFirstResponder {
+                window.makeFirstResponder(previous)
+                return
+            }
+        }
+        window.makeFirstResponder(nil)
+    }
 
     // MARK: Selection
 
@@ -292,14 +343,11 @@ final class MessageTextView: NSTextView {
 
     override func mouseDown(with event: NSEvent) {
         if event.modifierFlags.contains(.control) { rightMouseDown(with: event); return }
-        let previous = window?.firstResponder
+        capturePreviousFirstResponder()
         tracking = true
         super.mouseDown(with: event)  // tracks the click / drag until mouse up (link clicks included)
         tracking = false
-        guard !hasSelection else { return }
-        // A plain click selects nothing: focus goes back where it was (e.g. the composer) and the overlay goes away.
-        if let previous, previous !== self, window?.firstResponder === self { window?.makeFirstResponder(previous) }
-        onEmpty?()
+        finishMouseTracking()
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -336,11 +384,39 @@ final class MessageTextView: NSTextView {
 
     // MARK: Copy
 
-    /// Plain text only: pasting a bubble's text must not bring its fonts or colors along.
-    override var writablePasteboardTypes: [NSPasteboard.PasteboardType] { [.string] }
+    // `isRichText = false` already restricts `writablePasteboardTypes` to plain text (`NSStringPboardType`) so no
+    // fonts, colors, or RTF are written. Overriding `writablePasteboardTypes` to `[.string]` (`public.utf8-plain-text`)
+    // broke `NSTextView.copy(_:)` because AppKit's `writeSelection(to:type:)` only handles `NSStringPboardType` and
+    // returned `false`, leaving the pasteboard empty.
+    override func writeSelection(to pboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Bool {
+        guard allowsSelection, hasSelection else { return false }
+        if type == .string {
+            let ns = string as NSString
+            let text = selectedRanges
+                .map(\.rangeValue)
+                .filter { $0.length > 0 && NSMaxRange($0) <= ns.length }
+                .map { ns.substring(with: $0) }
+                .joined(separator: "\n")
+            guard !text.isEmpty else { return false }
+            return pboard.setString(text, forType: .string)
+        }
+        return super.writeSelection(to: pboard, type: type)
+    }
+
+    override func copy(_ sender: Any?) {
+        guard allowsSelection, hasSelection else { return }
+        super.copy(sender)
+    }
+
+    override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
+        if item.action == #selector(copy(_:)) { return allowsSelection && hasSelection }
+        if item.action == #selector(selectAll(_:)) { return allowsSelection }
+        return super.validateUserInterfaceItem(item)
+    }
 
     override func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if item.action == #selector(copy(_:)) { return allowsSelection && hasSelection }
+        if item.action == #selector(selectAll(_:)) { return allowsSelection }
         return super.validateMenuItem(item)
     }
 }
@@ -358,13 +434,19 @@ private enum SelectionOwner {
         guard monitor == nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { event in
             MainActor.assumeIsolated {
-                if let view = owner {
-                    let inside = event.window === view.window
-                        && view.bounds.contains(view.convert(event.locationInWindow, from: nil))
-                    if !inside { owner = nil; view.clearSelection() }
-                }
+                guard let view = owner else { return }
+                // Never clear selection on menu-bar or popup-menu clicks (e.g. Edit ▸ Copy or the selection context menu).
+                guard let eventWindow = event.window,
+                      eventWindow.level.rawValue < NSWindow.Level.popUpMenu.rawValue else { return }
+                let inside = eventWindow === view.window
+                    && view.bounds.contains(view.convert(event.locationInWindow, from: nil))
+                if !inside { owner = nil; view.clearSelection() }
             }
             return event
         }
+    }
+
+    static func release(_ view: MessageTextView) {
+        if owner === view { owner = nil }
     }
 }

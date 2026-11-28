@@ -310,6 +310,11 @@ struct ChatComposer: View {
             }
         }
         .padding(.leading, 14).padding(.trailing, 6)
+        .background {
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture { handle.focus() }
+        }
         .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: 19, style: .continuous))
     }
 
@@ -580,6 +585,13 @@ final class ComposerHandle {
     weak var textView: NSTextView?
     /// The format of the field changed without a text change (bar / shortcut on a selection).
     var onFormatChange: (() -> Void)?
+
+    func focus() {
+        guard let tv = textView else { return }
+        if tv.window?.firstResponder !== tv {
+            tv.window?.makeFirstResponder(tv)
+        }
+    }
 
     func insertMention(_ candidate: MentionCandidate, replacing range: NSRange) {
         guard let tv = textView, let storage = tv.textStorage,
@@ -933,11 +945,13 @@ struct ComposerTextView: NSViewRepresentable {
         var onWidthChange: (() -> Void)?
         var onPasteAttachment: ((PastedContent) -> Void)?
         var onFormatKey: ((ComposerFormatCommand) -> Void)?
+        /// Pasteboard used by menu validation and `paste(_:)`; overridable in tests to avoid touching `.general`.
+        var pasteboardProvider: () -> NSPasteboard = { .general }
 
         /// ⌘B ⌘I ⌘U, ⌘⇧X: the official format shortcuts.
         override func performKeyEquivalent(with event: NSEvent) -> Bool {
             guard window?.firstResponder === self, !hasMarkedText(), let onFormatKey else { return super.performKeyEquivalent(with: event) }
-            let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
             let key = event.charactersIgnoringModifiers?.lowercased() ?? ""
             let command: ComposerFormatCommand? = switch (mods, key) {
             case (.command, "b"): .bold
@@ -950,13 +964,36 @@ struct ComposerTextView: NSViewRepresentable {
             onFormatKey(command)
             return true
         }
+
+        private func canValidateAttachmentPaste() -> Bool {
+            isEditable && onPasteAttachment != nil && PastedContent.canRead(from: pasteboardProvider())
+        }
+
+        /// With `isRichText = false` and `importsGraphics = false`, `NSTextView` disables `Edit ▸ Paste` (and ⌘V)
+        /// whenever the pasteboard holds only an image (screenshots, Preview, "Copy hình ảnh") or a file URL without text.
+        override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
+            if item.action == #selector(paste(_:)), canValidateAttachmentPaste() { return true }
+            return super.validateUserInterfaceItem(item)
+        }
+
+        override func validateMenuItem(_ item: NSMenuItem) -> Bool {
+            if item.action == #selector(paste(_:)), canValidateAttachmentPaste() { return true }
+            return super.validateMenuItem(item)
+        }
+
         override func paste(_ sender: Any?) {
-            if let content = PastedContent.read(from: .general) {
-                onPasteAttachment?(content)
-            } else {
+            let pasteboard = pasteboardProvider()
+            if let onPasteAttachment, let content = PastedContent.read(from: pasteboard) {
+                onPasteAttachment(content)
+            } else if pasteboard === NSPasteboard.general {
                 super.paste(sender)
+            } else if let text = pasteboard.string(forType: .string),
+                      shouldChangeText(in: selectedRange(), replacementString: text) {
+                replaceCharacters(in: selectedRange(), with: text)
+                didChangeText()
             }
         }
+
         override func setFrameSize(_ newSize: NSSize) {
             let changed = abs(newSize.width - frame.width) > 0.5
             super.setFrameSize(newSize)
@@ -970,14 +1007,72 @@ enum PastedContent {
     case image(Data)
     case files([URL])
 
+    /// Fast type-only check used by menu validation (`Edit ▸ Paste` / ⌘V) so validating never decodes image bytes.
+    static func canRead(from pasteboard: NSPasteboard) -> Bool {
+        if pasteboard.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) {
+            return true
+        }
+        if hasImageType(in: pasteboard) { return true }
+        return !hasText(in: pasteboard) && NSImage.canInit(with: pasteboard)
+    }
+
     static func read(from pasteboard: NSPasteboard) -> PastedContent? {
         let urls = (pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
         if !urls.isEmpty { return .files(urls) }
-        if let text = pasteboard.string(forType: .string), !text.isEmpty { return nil }
-        if let png = pasteboard.data(forType: .png), NSImage(data: png) != nil { return .image(png) }
-        guard let image = NSImage(pasteboard: pasteboard), let tiff = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiff), let png = bitmap.representation(using: .png, properties: [:]) else { return nil }
+        // Official Zalo PC treats clipboard image data as an image attachment even when a browser or app also puts a
+        // URL/alt string on the pasteboard alongside it.
+        if let png = readImageData(from: pasteboard) { return .image(png) }
+        // Only fall back to `NSImage(pasteboard:)` (which also rasterizes PDF) when there is no text on the pasteboard.
+        guard !hasText(in: pasteboard),
+              let image = NSImage(pasteboard: pasteboard),
+              let png = pngData(from: image) else { return nil }
         return .image(png)
+    }
+
+    private static func hasText(in pasteboard: NSPasteboard) -> Bool {
+        if let text = pasteboard.string(forType: .string), !text.isEmpty { return true }
+        return false
+    }
+
+    private static func isImageType(_ type: NSPasteboard.PasteboardType) -> Bool {
+        if type == .png || type == .tiff { return true }
+        return UTType(type.rawValue)?.conforms(to: .image) == true
+    }
+
+    private static func hasImageType(in pasteboard: NSPasteboard) -> Bool {
+        (pasteboard.types ?? []).contains(where: isImageType)
+    }
+
+    private static func readImageData(from pasteboard: NSPasteboard) -> Data? {
+        if let png = pasteboard.data(forType: .png), NSImage(data: png) != nil {
+            return png
+        }
+        let types = pasteboard.types ?? []
+        var candidates: [NSPasteboard.PasteboardType] = []
+        if types.contains(.tiff) { candidates.append(.tiff) }
+        for type in types where type != .png && type != .tiff && isImageType(type) {
+            candidates.append(type)
+        }
+        for type in candidates {
+            guard let data = pasteboard.data(forType: type) else { continue }
+            if let png = pngData(from: data) { return png }
+        }
+        return nil
+    }
+
+    private static func pngData(from data: Data) -> Data? {
+        if let bitmap = NSBitmapImageRep(data: data),
+           let png = bitmap.representation(using: .png, properties: [:]) {
+            return png
+        }
+        guard let image = NSImage(data: data) else { return nil }
+        return pngData(from: image)
+    }
+
+    private static func pngData(from image: NSImage) -> Data? {
+        guard let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff) else { return nil }
+        return bitmap.representation(using: .png, properties: [:])
     }
 }
 
