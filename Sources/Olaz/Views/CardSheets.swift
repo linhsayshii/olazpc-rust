@@ -9,6 +9,7 @@ import SwiftUI
 
 struct AliasSheet: View {
     let request: AliasRequest
+    var onSaved: ((String) -> Void)? = nil
     @Environment(ZaloEngine.self) private var engine
     @Environment(\.dismiss) private var dismiss
     @State private var text = ""
@@ -77,7 +78,11 @@ struct AliasSheet: View {
             let result = await engine.saveAlias(uid: draft.uid, name: value)
             saving = false
             if result.ok {
-                CardActionCenter.shared.show(result.text, in: request.conversationId)
+                if let onSaved {
+                    onSaved(result.text)
+                } else {
+                    CardActionCenter.shared.show(result.text, in: request.conversationId)
+                }
                 dismiss()
             } else {
                 error = result.text.isEmpty ? "Có lỗi xảy ra, vui lòng thử lại sau" : result.text

@@ -413,20 +413,55 @@ struct ContactProfileSheet: View {
     /// The adapter has not answered yet: the request may still go out, so it cannot be sent again from here.
     @State private var requestPending = false
     @State private var result: (ok: Bool, text: String)?
+    @State private var aliasRequest: AliasRequest?
 
-    private var name: String {
+    private var baseName: String {
         let own = profile?.name ?? ""
         return own.isEmpty ? (request.name.isEmpty ? "Người dùng Zalo" : request.name) : own
     }
+    private var name: String {
+        engine.aliasDisplayName(for: request.uid, fallback: baseName)
+    }
     private var isOfficialAccount: Bool { profile?.isOfficialAccount ?? request.isOfficialAccount }
+    private var canEditAlias: Bool {
+        guard let profile else { return false }
+        return AliasDraft.canEditAlias(
+            uid: request.uid,
+            isGroup: false,
+            myUid: engine.profile?.userId,
+            selfConversationId: engine.selfConversationId,
+            isFriend: profile.isFriend,
+            isOfficialAccount: isOfficialAccount
+        )
+    }
 
     var body: some View {
         VStack(spacing: 14) {
             RemoteAvatar(url: profile?.avatar ?? request.avatar, name: name, size: 84)
             VStack(spacing: 4) {
-                Text(name).font(.system(size: 17, weight: .bold)).multilineTextAlignment(.center)
-                if let zaloName = profile?.zaloName, !zaloName.isEmpty, zaloName != name {
-                    Text(zaloName).font(.system(size: 12.5)).foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    Text(name).font(.system(size: 17, weight: .bold)).multilineTextAlignment(.center)
+                    if canEditAlias {
+                        Button {
+                            let draft = engine.aliasDraft(
+                                for: request.uid,
+                                fallbackName: profile?.name ?? request.name,
+                                fallbackZaloName: profile?.zaloName ?? ""
+                            )
+                            aliasRequest = AliasRequest(conversationId: request.conversationId, draft: draft)
+                        } label: {
+                            Image(systemName: "pencil")
+                                .font(.system(size: 12.5, weight: .medium))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help(AliasDraft.menuTitle)
+                        .accessibilityLabel(AliasDraft.menuTitle)
+                    }
+                }
+                let secondary = (profile?.zaloName.isEmpty == false ? profile?.zaloName : nil) ?? (baseName != name ? baseName : nil)
+                if let secondary, !secondary.isEmpty, secondary != name {
+                    Text(secondary).font(.system(size: 12.5)).foregroundStyle(.secondary)
                 }
                 if let bio = profile?.bio, !bio.isEmpty {
                     Text(bio).font(.system(size: 12.5)).foregroundStyle(.secondary).multilineTextAlignment(.center)
@@ -444,6 +479,12 @@ struct ContactProfileSheet: View {
         .task {
             profile = await engine.contactProfile(request.uid)
             if request.startWithFriendRequest { await beginRequest() }
+        }
+        .sheet(item: $aliasRequest) { req in
+            AliasSheet(request: req) { text in
+                if !text.isEmpty { CardActionCenter.shared.show(text, in: request.conversationId) }
+                Task { profile = await engine.contactProfile(request.uid) }
+            }
         }
     }
 

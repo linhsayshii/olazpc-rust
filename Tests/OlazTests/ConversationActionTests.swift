@@ -68,6 +68,31 @@ import Foundation
         #expect(p.canDelete && p.showsLabel)
     }
 
+    @Test func aliasEntryAppearsOnOneToOneThreadAndHeaderMenusOnly() {
+        let s = state(
+            ["cloud": [.cannotDelete], "g_left": []],
+            left: ["g_left": .kick]
+        )
+
+        let threadFriend = ConversationMenuPlan.make(id: "3000101", preset: .thread, state: s, unread: 0, muted: false, canEditAlias: true)
+        #expect(threadFriend.canEditAlias && !threadFriend.isEmpty)
+
+        let headerFriend = ConversationMenuPlan.make(id: "3000101", preset: .chatBox, state: s, unread: 0, muted: false, canEditAlias: true)
+        #expect(headerFriend.canEditAlias && !headerFriend.isEmpty)
+
+        // Groups / strangers / self pass canEditAlias: false.
+        let headerGroup = ConversationMenuPlan.make(id: "g500101", preset: .chatBox, state: s, unread: 0, muted: false, canEditAlias: false)
+        #expect(!headerGroup.canEditAlias)
+
+        // Defense in depth: My Cloud (cannotDelete) and left groups never offer alias editing even if requested.
+        let cloud = ConversationMenuPlan.make(id: "cloud", preset: .thread, state: s, unread: 0, muted: false, canEditAlias: true)
+        #expect(!cloud.canEditAlias)
+
+        let leftGroup = ConversationMenuPlan.make(id: "g_left", preset: .thread, state: s, unread: 0, muted: false, canEditAlias: true)
+        #expect(!leftGroup.canEditAlias && leftGroup.canDelete)
+    }
+
+
     @Test func pinStates() {
         #expect(plan(state: state(["c1": .pinned])).pin == .unpin)
         // Unpin stays offered when "cannot pin" is set (e.g. its last message is gone).
