@@ -51,5 +51,10 @@ jobs:
       - name: Swift build
         run: swift build
 
+      # Wall-clock budget tests need a quiet host: gate-core.sh runs them alone in check 7. A shared runner
+      # only adds noise, so CI skips the same list (user-decisions item 20.4).
       - name: Swift tests
-        run: swift test
+        run: |
+          timing=$(sed -n "s/^TIMING_SWIFT='\(.*\)'$/\1/p" scripts/gate-core.sh)
+          test -n "$timing"
+          swift test --skip "$timing"
