@@ -752,7 +752,7 @@ final class ZaloEngineCoreHost: CoreHost, @unchecked Sendable {
         guard let engine else { return }
         await engine.waitForCoreMirrorDrain()
         await MainActor.run {
-            engine.showActionCard(text, in: convId)
+            engine.showActionCard(text, in: (convId?.isEmpty == false) ? convId : nil)
         }
     }
 
@@ -3302,6 +3302,32 @@ extension ZaloEngine {
             friendsLoaded: contacts.friendsLoaded,
             groupsLoaded: contacts.groupsLoaded,
             loadingRequests: contacts.loadingRequests,
+            search: ContactSearchRecord(
+                status: contacts.search.status.rawValue,
+                error: contacts.search.error,
+                user: contacts.search.user.map {
+                    FoundUserRecord(
+                        id: $0.id,
+                        name: $0.name,
+                        zaloName: $0.zaloName,
+                        avatar: $0.avatar?.absoluteString,
+                        bio: $0.bio,
+                        isFriend: $0.isFriend,
+                        isSelf: $0.isSelf,
+                        requested: $0.requested,
+                        requesting: $0.requesting,
+                        defaultMessage: $0.defaultMessage,
+                        maxMessage: Int64($0.maxMessage)
+                    )
+                }
+            ),
+            notice: contacts.notice.map {
+                ContactNoticeRecord(seq: Int64($0.seq), ok: $0.ok, text: $0.text)
+            },
+            blockedUsers: blockedUsers?.map {
+                BlockedUserRecord(id: $0.id, name: $0.name, avatar: $0.avatar?.absoluteString)
+            },
+            aliases: cachedAliases.map { StringPairEntry(key: $0.key, value: $0.value) },
             groupDetailsJson: cachedGroupDetails.map {
                 StringPairEntry(key: $0.key, value: Self.jsonString(for: $0.value))
             },
@@ -3314,6 +3340,13 @@ extension ZaloEngine {
     internal func pushCoreContactsIfRunning() {
         guard !isApplyingCoreMirror, let core = coreLifecycle.core else { return }
         core.seedContacts(contacts: currentContactsStateRecord())
+    }
+
+    internal func pushCoreBlockedUsersIfRunning() {
+        guard !isApplyingCoreMirror, let core = coreLifecycle.core else { return }
+        core.seedBlockedUsers(users: blockedUsers?.map {
+            BlockedUserRecord(id: $0.id, name: $0.name, avatar: $0.avatar?.absoluteString)
+        })
     }
 
     internal func pushCoreHistoryFreshnessIfRunning() {
@@ -3406,8 +3439,46 @@ extension ZaloEngine {
         next.friendsLoaded = cRec.friendsLoaded
         next.groupsLoaded = cRec.groupsLoaded
         next.loadingRequests = cRec.loadingRequests
+        next.search = ContactsState.Search(
+            status: ContactsState.Search.Status(rawValue: cRec.search.status) ?? .idle,
+            error: cRec.search.error,
+            user: cRec.search.user.map { u in
+                ContactsState.FoundUser(
+                    id: u.id,
+                    name: u.name,
+                    zaloName: u.zaloName,
+                    avatar: u.avatar.flatMap(URL.init(string:)),
+                    bio: u.bio,
+                    isFriend: u.isFriend,
+                    isSelf: u.isSelf,
+                    requested: u.requested,
+                    requesting: u.requesting,
+                    defaultMessage: u.defaultMessage,
+                    maxMessage: Int(u.maxMessage)
+                )
+            }
+        )
+        next.notice = cRec.notice.map { n in
+            ContactsState.Notice(seq: Int(n.seq), ok: n.ok, text: n.text)
+        }
         if next != contacts {
             contacts = next
+        }
+
+        let mappedBlocked: [BlockedUser]? = cRec.blockedUsers.map { list in
+            list.map { BlockedUser(id: $0.id, name: $0.name, avatar: $0.avatar.flatMap(URL.init(string:))) }
+        }
+        if blockedUsers != mappedBlocked {
+            blockedUsers = mappedBlocked
+        }
+
+        var nextAliases: [String: String] = [:]
+        nextAliases.reserveCapacity(cRec.aliases.count)
+        for pair in cRec.aliases where !pair.key.isEmpty && !pair.value.isEmpty {
+            nextAliases[pair.key] = pair.value
+        }
+        if cachedAliases != nextAliases {
+            cachedAliases = nextAliases
         }
 
         var details: [String: [String: Any]] = [:]
@@ -3428,20 +3499,18 @@ extension ZaloEngine {
            let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
             cachedSentRequestsRaw = arr
         }
-        if !cRec.friendGlobalIds.isEmpty {
-            var nextUids = cachedFriendGlobalIds
-            var gidToUid: [String: String] = [:]
-            for pair in cRec.friendGlobalIds where !pair.key.isEmpty && !pair.value.isEmpty {
-                nextUids[pair.key] = pair.value
-                gidToUid[pair.value] = pair.key
-            }
-            if nextUids != cachedFriendGlobalIds {
-                cachedFriendGlobalIds = nextUids
-            }
-            if !gidToUid.isEmpty {
-                let client = sessionClient
-                Task { await client.seedGlobalIdMappings(gidToUid) }
-            }
+        var nextUids: [String: String] = [:]
+        var gidToUid: [String: String] = [:]
+        for pair in cRec.friendGlobalIds where !pair.key.isEmpty && !pair.value.isEmpty {
+            nextUids[pair.key] = pair.value
+            gidToUid[pair.value] = pair.key
+        }
+        if nextUids != cachedFriendGlobalIds {
+            cachedFriendGlobalIds = nextUids
+        }
+        if !gidToUid.isEmpty {
+            let client = sessionClient
+            Task { await client.seedGlobalIdMappings(gidToUid) }
         }
     }
 

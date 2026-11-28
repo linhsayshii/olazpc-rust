@@ -1472,11 +1472,9 @@ pub fn normalize_poll_detail_ffi(
 ) -> Option<PollDetailRecord> {
     let payload = olaz_json::parse_object_str(&payload_json)?;
     let polls = PollsState::default();
-    let c: ContactsState = contacts.into();
-    let convs = ConversationsState {
-        identities: identities.into(),
-        ..ConversationsState::default()
-    };
+    let mut c: ContactsState = contacts.into();
+    c.apply_identity_table(identities.into());
+    let convs = ConversationsState::default();
     let messages = MessagesState::default();
     let explicit = (!resolved_group_id.is_empty()).then_some(resolved_group_id.as_str());
     normalize_poll_detail(

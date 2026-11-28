@@ -391,22 +391,21 @@ impl ChangeHub {
                     buf.starred_ids = Some(state.actions.starred_ids.clone());
                 }
                 DirtyKey::CachedProfiles => {
-                    buf.cached_profiles =
-                        Some(state.conversations.identities.cached_profiles.clone());
+                    buf.cached_profiles = Some(state.contacts.cached_profiles.clone());
                 }
                 // U16
                 DirtyKey::NotificationSettings => {
                     buf.notification_settings = Some(state.notify.settings.clone());
                 }
                 DirtyKey::Aliases => {
-                    buf.aliases = Some(state.conversations.identities.aliases.clone());
+                    buf.aliases = Some(state.contacts.aliases.clone());
                 }
                 // U7
                 DirtyKey::Pins => {
                     buf.pins = Some(state.pins.snapshot());
                 }
                 DirtyKey::CachedGroups => {
-                    buf.cached_groups = Some(state.conversations.identities.cached_groups.clone());
+                    buf.cached_groups = Some(state.contacts.cached_groups.clone());
                 }
                 DirtyKey::Cloud => {
                     buf.cloud = Some(state.cloud.snapshot.clone());

@@ -49,16 +49,16 @@ use crate::conversations::{
 };
 use crate::error::{CoreError, NetworkKind};
 use crate::messages::{
-    ContactsStateRecord, FreshnessMapEntry, MessageMetaRecord, MuteEntryRecord, WindowDeltaRecord,
-    records_to_chat_messages,
+    BlockedUserRecord, ContactsStateRecord, FreshnessMapEntry, MessageMetaRecord, MuteEntryRecord,
+    PersonLookupRecord, SaveAliasResultRecord, WindowDeltaRecord, records_to_chat_messages,
 };
 use crate::notify::{
     AliasEntryRecord, ContactCardStateRecord, ContactProfileRecord, FriendRequestOriginRecord,
     FriendRequestPrepRecord, GroupInvitePreviewRecord, GroupJoinRecord, NotifAuthorizationRecord,
     NotificationSettingsRecord, NotifyBannerPayloadRecord, PinReminderRefRecord,
-    ReminderRespondersRecord, ReminderSnapshotRecord, RespondReminderRecord, SaveAliasRecord,
-    SubmitFriendRecord, SuggestedStickerRecord, alias_map_to_records,
-    default_failed_respond_reminder_record, default_unsupported_card_record,
+    ReminderRespondersRecord, ReminderSnapshotRecord, RespondReminderRecord, SubmitFriendRecord,
+    SuggestedStickerRecord, alias_map_to_records, default_failed_respond_reminder_record,
+    default_unsupported_card_record,
 };
 use crate::polls::{
     PollActionOutcomeRecord, PollCapabilitiesOutcomeRecord, PollConfigRecord,
@@ -2380,7 +2380,7 @@ impl CoreOfflineConversations {
     ) {
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let (state, _) = &mut *guard;
-        state.conversations.identities = identities.into();
+        state.contacts.apply_identity_table(identities.into());
         state.conversations.open_conversation_id = open_conv_id;
         state.session.self_conversation_id = self_conv_id;
         if !my_uid.is_empty() {
@@ -4944,28 +4944,6 @@ impl CoreEngine {
         .await
     }
 
-    pub async fn save_alias(
-        &self,
-        uid: String,
-        name: String,
-    ) -> Result<SaveAliasRecord, CoreError> {
-        let handle = Arc::clone(&self.handle);
-        let runner = Arc::clone(&self.runner);
-        run(async move {
-            let out = match handle.request(Command::SaveAlias { uid, name }).await {
-                Some(olaz_core::OpResult::SaveAlias(r)) => r.into(),
-                _ => SaveAliasRecord {
-                    ok: false,
-                    text: "Không lưu được tên gợi nhớ.".to_owned(),
-                },
-            };
-            runner.flush_store().await;
-            let _ = handle.settle().await;
-            out
-        })
-        .await
-    }
-
     pub async fn group_invite_preview(
         &self,
         url: String,
@@ -5841,6 +5819,199 @@ impl CoreEngine {
         self.handle.send(Command::SeedPolls {
             polls: Box::new(polls.into()),
         });
+    }
+
+    // --- Contacts, friend requests, phone lookup, block, alias (U9) ---
+
+    /// Synchronously resolves `(name, avatar)` from the lock-free `IdentitySnapshot`.
+    #[must_use]
+    pub fn lookup_person_info(&self, uid: String) -> Option<PersonLookupRecord> {
+        self.handle
+            .identity_snapshot()
+            .lookup_person(&uid)
+            .map(|h| PersonLookupRecord {
+                name: h.name,
+                avatar: h.avatar,
+            })
+    }
+
+    /// Synchronously resolves `@mention` display name from the lock-free `IdentitySnapshot`.
+    #[must_use]
+    pub fn mention_display_name(&self, uid: String) -> Option<String> {
+        self.handle.identity_snapshot().mention_display_name(&uid)
+    }
+
+    pub fn refresh_contacts(&self) {
+        self.handle.send(Command::RefreshContacts);
+    }
+
+    pub async fn perform_contacts_sync(&self) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let _ = handle.request(Command::PerformContactsSync).await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn accept_friend_request(&self, uid: String) {
+        self.handle.send(Command::AcceptFriendRequest { uid });
+    }
+
+    pub async fn accept_friend_request_and_wait(&self, uid: String) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let _ = handle.request(Command::AcceptFriendRequest { uid }).await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn decline_friend_request(&self, uid: String) {
+        self.handle.send(Command::DeclineFriendRequest { uid });
+    }
+
+    pub async fn decline_friend_request_and_wait(&self, uid: String) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            let _ = handle.request(Command::DeclineFriendRequest { uid }).await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn cancel_friend_request(&self, uid: String) {
+        self.handle.send(Command::CancelFriendRequest { uid });
+    }
+
+    pub async fn cancel_friend_request_and_wait(&self, uid: String) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            let _ = handle.request(Command::CancelFriendRequest { uid }).await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn send_friend_request(&self, uid: String, message: String) {
+        self.handle
+            .send(Command::SendFriendRequest { uid, message });
+    }
+
+    pub async fn send_friend_request_and_wait(
+        &self,
+        uid: String,
+        message: String,
+    ) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let _ = handle
+                .request(Command::SendFriendRequest { uid, message })
+                .await;
+            runner.flush_store().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn find_friend_by_phone(&self, phone: String) {
+        self.handle.send(Command::FindFriendByPhone { phone });
+    }
+
+    pub async fn find_friend_by_phone_and_wait(&self, phone: String) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            let _ = handle.request(Command::FindFriendByPhone { phone }).await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub fn reset_friend_search(&self) {
+        self.handle.send(Command::ResetFriendSearch);
+    }
+
+    pub fn handle_contacts_state(&self, state_json: String) {
+        self.handle
+            .send(Command::HandleContactsState { state_json });
+    }
+
+    pub async fn load_blocked_users(&self) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        run(async move {
+            let _ = handle.request(Command::LoadBlockedUsers).await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub async fn set_blocked(
+        &self,
+        uid: String,
+        blocked: bool,
+        name: String,
+    ) -> Result<u64, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let _ = handle
+                .request(Command::SetBlocked { uid, blocked, name })
+                .await;
+            runner.flush_host().await;
+            handle
+                .settle()
+                .await
+                .unwrap_or_else(|| handle.current_version())
+        })
+        .await
+    }
+
+    pub async fn save_alias(
+        &self,
+        uid: String,
+        name: String,
+    ) -> Result<SaveAliasResultRecord, CoreError> {
+        let handle = Arc::clone(&self.handle);
+        let runner = Arc::clone(&self.runner);
+        run(async move {
+            let res = handle.request_save_alias(uid, name).await;
+            runner.flush_store().await;
+            let _ = handle.settle().await;
+            res.into()
+        })
+        .await
+    }
+
+    pub fn seed_blocked_users(&self, users: Option<Vec<BlockedUserRecord>>) {
+        self.handle.send(Command::SeedBlockedUsers(
+            users.map(|v| v.into_iter().map(Into::into).collect()),
+        ));
     }
 
     /// Stops the actor, aborts in-flight session & transport tasks, and closes `next_changes()`.

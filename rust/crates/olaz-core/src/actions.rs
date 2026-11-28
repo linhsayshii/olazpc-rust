@@ -2636,14 +2636,13 @@ fn handle_remote_reaction(
                     .map(|e| e.avatar)
                     .or_else(|| {
                         state
-                            .conversations
-                            .identities
+                            .contacts
                             .cached_profiles
                             .get(canonical_actor)
                             .map(|p| p.avatar.clone())
                     })
                     .unwrap_or_default();
-                state.conversations.identities.cached_profiles.insert(
+                state.contacts.cached_profiles.insert(
                     canonical_actor.to_owned(),
                     CachedProfile {
                         name: trimmed_wire_sender_name.to_owned(),

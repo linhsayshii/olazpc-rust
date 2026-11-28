@@ -212,22 +212,6 @@ extension ZaloSessionClient {
         return digits
     }
 
-    func searchFriendByPhone(_ phone: String) async throws -> ZaloJSONBox {
-        let normalized = Self.normalizePhoneForLookup(phone)
-        let resp = try await get(
-            service: "friend",
-            path: "/api/friend/profile/get",
-            encryptedPayload: [
-                "phone": normalized.isEmpty ? phone : normalized,
-                "avatar_size": 240,
-                "language": "vi",
-                "imei": imei,
-                "reqSrc": 40
-            ]
-        )
-        return ZaloJSONBox(resp)
-    }
-
     func sendFriendRequestAPI(toUid: String, message: String) async throws -> ZaloJSONBox {
         let resp = try await post(
             service: "friend",
@@ -241,53 +225,6 @@ extension ZaloSessionClient {
             ]
         )
         return ZaloJSONBox(resp)
-    }
-
-    func acceptFriendRequestAPI(uid: String) async throws -> ZaloJSONBox {
-        let resp = try await post(
-            service: "friend",
-            path: "/api/friend/accept",
-            encryptedPayload: ["fid": ZaloWireParser.stripUserPrefix(uid), "language": "vi", "imei": imei]
-        )
-        return ZaloJSONBox(resp)
-    }
-
-    func rejectFriendRequestAPI(uid: String) async throws -> ZaloJSONBox {
-        let resp = try await post(
-            service: "friend",
-            path: "/api/friend/reject",
-            encryptedPayload: ["fid": ZaloWireParser.stripUserPrefix(uid), "imei": imei]
-        )
-        return ZaloJSONBox(resp)
-    }
-
-    func cancelFriendRequestAPI(uid: String) async throws -> ZaloJSONBox {
-        let resp = try await post(
-            service: "friend",
-            path: "/api/friend/undo",
-            encryptedPayload: ["fid": ZaloWireParser.stripUserPrefix(uid), "imei": imei]
-        )
-        return ZaloJSONBox(resp)
-    }
-
-    func setAliasAPI(uid: String, alias: String) async throws -> ZaloJSONBox {
-        let cleanUid = ZaloWireParser.stripUserPrefix(uid)
-        let trimmed = alias.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            let resp = try await get(
-                service: "alias",
-                path: "/api/alias/remove",
-                encryptedPayload: ["friendId": cleanUid]
-            )
-            return ZaloJSONBox(resp)
-        } else {
-            let resp = try await get(
-                service: "alias",
-                path: "/api/alias/update",
-                encryptedPayload: ["friendId": cleanUid, "alias": trimmed, "imei": imei]
-            )
-            return ZaloJSONBox(resp)
-        }
     }
 
     // MARK: - Conversations, Pins, Archive, Mute, Polling, History

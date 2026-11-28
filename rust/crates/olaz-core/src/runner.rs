@@ -3249,7 +3249,7 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                         drop(guard);
                     });
                 }
-                Effect::SendFriendRequestApi {
+                Effect::SubmitFriendRequestApi {
                     op_id,
                     uid,
                     message,
@@ -3260,25 +3260,6 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     self.runtime.spawn(async move {
                         let ok = api.send_friend_request(&uid, &message).await.is_ok();
                         sink.send(Input::SubmitFriendDone { op_id, ok });
-                        drop(guard);
-                    });
-                }
-                Effect::SetAliasApi {
-                    op_id,
-                    uid,
-                    trimmed_name,
-                } => {
-                    let api = Arc::clone(&self.api);
-                    let sink = sink.clone();
-                    let guard = sink.track();
-                    self.runtime.spawn(async move {
-                        let ok = api.set_alias(&uid, &trimmed_name).await.is_ok();
-                        sink.send(Input::SaveAliasDone {
-                            op_id,
-                            uid,
-                            trimmed_name,
-                            ok,
-                        });
                         drop(guard);
                     });
                 }
@@ -3465,6 +3446,72 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                             error_type,
                             op_id,
                         });
+                        drop(guard);
+                    });
+                }
+                // U9
+                Effect::FetchContactsSyncApi { op_id } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let (friends_res, groups_res, sent_res, received_res) = tokio::join!(
+                            api.fetch_friends(1, 20000),
+                            api.fetch_groups_list(),
+                            api.fetch_sent_friend_requests(),
+                            api.fetch_received_friend_requests(),
+                        );
+                        sink.send(Input::ContactsSyncDone {
+                            friends_rows: friends_res.ok(),
+                            groups_dict: groups_res.ok(),
+                            sent_rows: sent_res.ok(),
+                            received_rows: received_res.ok(),
+                            op_id,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::AcceptFriendRequestApi { uid, op_id } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let ok = api.accept_friend_request(&uid).await.is_ok();
+                        sink.send(Input::FriendRequestAccepted { uid, ok, op_id });
+                        drop(guard);
+                    });
+                }
+                Effect::DeclineFriendRequestApi { uid, op_id } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let ok = api.reject_friend_request(&uid).await.is_ok();
+                        sink.send(Input::FriendRequestDeclined { uid, ok, op_id });
+                        drop(guard);
+                    });
+                }
+                Effect::CancelFriendRequestApi { uid, op_id } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let ok = api.cancel_friend_request(&uid).await.is_ok();
+                        sink.send(Input::FriendRequestCancelled { uid, ok, op_id });
+                        drop(guard);
+                    });
+                }
+                Effect::SendFriendRequestApi {
+                    uid,
+                    message,
+                    op_id,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let ok = api.send_friend_request(&uid, &message).await.is_ok();
+                        sink.send(Input::FriendRequestSent { uid, ok, op_id });
                         drop(guard);
                     });
                 }
@@ -3656,6 +3703,79 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                 }
                 Effect::ClearCloudViewerKey => {
                     self.api.clear_cloud_viewer_key();
+                }
+                Effect::FindFriendByPhoneApi {
+                    phone,
+                    search_gen,
+                    op_id,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let result = api
+                            .search_friend_by_phone(&phone)
+                            .await
+                            .map_err(|olaz_api::ApiError::Net(n)| SessionFailure::from(n));
+                        sink.send(Input::FriendFoundByPhone {
+                            search_gen,
+                            result,
+                            op_id,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::LoadBlockedUsersApi { op_id } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let users = api.fetch_blocked_users().await.ok();
+                        sink.send(Input::BlockedUsersLoaded { users, op_id });
+                        drop(guard);
+                    });
+                }
+                Effect::SetBlockedApi {
+                    uid,
+                    blocked,
+                    name,
+                    open_conv_id,
+                    op_id,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let ok = api.set_blocked(&uid, blocked).await.is_ok();
+                        sink.send(Input::BlockedUserUpdated {
+                            uid,
+                            blocked,
+                            name,
+                            open_conv_id,
+                            ok,
+                            op_id,
+                        });
+                        drop(guard);
+                    });
+                }
+                Effect::SaveAliasApi {
+                    uid,
+                    trimmed_alias,
+                    op_id,
+                } => {
+                    let api = Arc::clone(&self.api);
+                    let sink = sink.clone();
+                    let guard = sink.track();
+                    self.spawn_cancellable(async move {
+                        let ok = api.set_alias(&uid, &trimmed_alias).await.is_ok();
+                        sink.send(Input::AliasSaved {
+                            uid,
+                            trimmed_alias,
+                            ok,
+                            op_id,
+                        });
+                        drop(guard);
+                    });
                 }
                 Effect::Host(call) => {
                     let guard = sink.track();
@@ -6537,18 +6657,21 @@ mod tests {
             avatar: None,
             phone: None,
         });
-        initial.conversations.identities.friends = vec![
-            FriendIdentity {
-                id: "3000515".to_owned(),
-                name: "Alice".to_owned(),
-                avatar: None,
-            },
-            FriendIdentity {
-                id: "3000516".to_owned(),
-                name: "Bob".to_owned(),
-                avatar: None,
-            },
-        ];
+        initial.contacts.apply_identity_table(IdentityTable {
+            friends: vec![
+                FriendIdentity {
+                    id: "3000515".to_owned(),
+                    name: "Alice".to_owned(),
+                    avatar: None,
+                },
+                FriendIdentity {
+                    id: "3000516".to_owned(),
+                    name: "Bob".to_owned(),
+                    avatar: None,
+                },
+            ],
+            ..IdentityTable::default()
+        });
         initial.transport.ws_phase = WsPhase::Running;
         initial.transport.ws_gen = 1;
 

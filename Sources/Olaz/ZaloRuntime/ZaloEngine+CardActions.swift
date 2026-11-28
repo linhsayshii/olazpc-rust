@@ -63,8 +63,9 @@ extension ZaloEngine {
 
     func contactCardState(_ uid: String) async -> (isSelf: Bool, isFriend: Bool) {
         guard let core = await ensureCoreEngine() else {
-            let clean = ZaloWireParser.stripUserPrefix(uid)
-            return (clean == profile?.userId, contacts.friends.contains { $0.id == clean })
+            let clean = ZaloWireParser.normalizeContactUid(uid)
+            let myUid = ZaloWireParser.normalizeContactUid(profile?.userId ?? "")
+            return (!clean.isEmpty && clean == myUid, contacts.friends.contains { $0.id == clean })
         }
         pushCoreContactsIfRunning()
         guard let res = try? await core.contactCardState(uid: uid) else {
@@ -121,13 +122,15 @@ extension ZaloEngine {
     // MARK: Native sheets of card actions
 
     func saveAlias(uid: String, name: String) async -> (ok: Bool, text: String) {
-        guard let core = await ensureCoreEngine() else {
+        guard let core = await ensureCoreEngine(),
+              let rec = try? await core.saveAlias(uid: uid, name: name) else {
             return (false, "Không lưu được tên gợi nhớ.")
         }
-        guard let rec = try? await core.saveAlias(uid: uid, name: name) else {
-            return (false, "Không lưu được tên gợi nhớ.")
+        if let v = try? await core.settle() {
+            await waitForMirrorVersion(v)
+        } else {
+            await waitForMirrorVersion(core.currentVersion())
         }
-        await waitForMirrorVersion(core.currentVersion())
         return (rec.ok, rec.text)
     }
 

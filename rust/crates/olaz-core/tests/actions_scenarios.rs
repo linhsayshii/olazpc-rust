@@ -11,9 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use olaz_api::PollState;
 use olaz_core::actor::CoreHandle;
-use olaz_core::conversations::{
-    BatchApplyDelta, ConversationPreview, ConversationSummary, IdentityTable,
-};
+use olaz_core::conversations::{BatchApplyDelta, ConversationPreview, ConversationSummary};
 use olaz_core::input::{Command, LegacyCookie};
 use olaz_core::reduce::classify::MobileSyncEvent;
 use olaz_core::runner::{Host, SessionEffectRunner};
@@ -392,7 +390,6 @@ fn build_harness(
     });
     initial.session.self_conversation_id = Some("9me100".to_owned());
     initial.conversations.open_conversation_id = Some(conv_id.to_owned());
-    initial.conversations.identities = IdentityTable::default();
     let last_msg = msgs.last();
     initial.conversations.conversations = vec![ConversationSummary {
         id: conv_id.to_owned(),

@@ -756,7 +756,7 @@ extension ZaloEngine {
             cliMsgId: resolvedCliId,
             rType: "\(effectiveType)",
             reactClientId: reactClientId,
-            createdAt: Date(timeIntervalSince1970: Double(nowMs()) / 1000.0)
+            createdAt: Date()
         ))
 
         func rollbackOnError() {
@@ -819,13 +819,13 @@ extension ZaloEngine {
             EngineLog.shared.write(
                 "react failed: code=\(err.code) msg=\(msgNote) msgId=\(effectiveMsgId) cliId=\(resolvedCliId) msgType=\(msgType)"
             )
-            showActionCard("Không thể thả biểu cảm. Vui lòng thử lại.", in: conversationId)
+            CardActionCenter.shared.show("Không thể thả biểu cảm. Vui lòng thử lại.", in: conversationId)
         } catch {
             rollbackOnError()
             EngineLog.shared.write(
                 "react failed: \(error.localizedDescription) msgId=\(effectiveMsgId) cliId=\(resolvedCliId) msgType=\(msgType)"
             )
-            showActionCard("Không thể thả biểu cảm. Vui lòng thử lại.", in: conversationId)
+            CardActionCenter.shared.show("Không thể thả biểu cảm. Vui lòng thử lại.", in: conversationId)
         }
     }
 
