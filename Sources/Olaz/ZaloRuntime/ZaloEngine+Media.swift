@@ -93,14 +93,19 @@ final class MediaResolver {
         } onCancel: {
             Task { @MainActor in self.leave(key, flight, waiter) }
         }
-        leave(key, flight, waiter)
-        guard let resolution = outcome else { return .unavailable }          // dropped before it started
-        if flights[key] === flight { flights[key] = nil }
-        switch resolution {
-        case .unavailable: settled[key] = (resolution, Date().addingTimeInterval(Self.unavailableTTL))
-        case .file, .expired, .unsupported: settled[key] = (resolution, .distantFuture)
+        defer { leave(key, flight, waiter) }
+        // Cancellation is not a verdict about the photo. An abandoned lookup may still return
+        // unavailable after a replacement has started (or even found a file); never remember it.
+        // Check before leave(), which cancels the flight when its last waiter finishes normally too.
+        guard let resolution = outcome, !Task.isCancelled, !flight.task.isCancelled else { return .unavailable }
+        if flights[key] === flight {
+            flights[key] = nil
+            switch resolution {
+            case .unavailable: settled[key] = (resolution, Date().addingTimeInterval(Self.unavailableTTL))
+            case .file, .expired, .unsupported: settled[key] = (resolution, .distantFuture)
+            }
+            if settled.count > 2000 { settled = settled.filter { $0.value.until > Date() } }
         }
-        if settled.count > 2000 { settled = settled.filter { $0.value.until > Date() } }
         return resolution
     }
 
