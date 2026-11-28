@@ -55,4 +55,17 @@ import AppKit
         #expect(tokens[0].0 == NSRange(location: 5, length: 8))
         #expect(tokens[0].1.uid == "7" && tokens[0].1.label == "@An Bình")
     }
+
+    /// Backspace at the end of a mention deletes the whole token. The coordinator's own `shouldChangeText` call used to re-enter
+    /// the delegate with the same range and recurse until the stack overflowed (beta.7 crash).
+    @MainActor @Test func backspaceAfterMentionDeletesWholeTokenWithoutRecursion() {
+        let view = ComposerTextView(text: .constant(""), mentions: .constant([]), height: .constant(0), focusTick: 0, onSend: {})
+        let coordinator = view.makeCoordinator()
+        let tv = NSTextView()
+        ComposerTextView.setContent(tv, text: "chào @An Bình", mentions: [Mention(uid: "7", pos: 5, len: 8)])
+        tv.delegate = coordinator
+        tv.setSelectedRange(NSRange(location: 13, length: 0))
+        tv.deleteBackward(nil)
+        #expect(tv.string == "chào ")
+    }
 }
