@@ -9,14 +9,12 @@ use crate::changes::DirtyKey;
 use crate::cloud::{
     CLOUD_FETCH_FAILED_ERROR, CLOUD_LOCAL_READ_ERROR, CLOUD_NOT_FOUND_ERROR,
     CLOUD_OFFLOAD_UNSUPPORTED_ERROR, CloudActionResult, CloudFetch, CloudFile, CloudItem,
-    CloudItemKind, CloudMediaStoreBatch, CloudMediaStoreCategoryFetch, CloudMediaStoreFetchSpec,
-    CloudPage, CloudServerSnapshot, ESTIMATED_PHOTO_BYTES, ESTIMATED_VIDEO_BYTES,
+    CloudItemKind, CloudPage, CloudServerSnapshot, ESTIMATED_PHOTO_BYTES, ESTIMATED_VIDEO_BYTES,
     ESTIMATED_VOICE_BYTES, FileResolutionOutcome, MediaResolutionOutcome, PendingCloudDelete,
-    PendingCloudFetchStage, PendingCloudList, PendingSharedMedia, SharedMediaPage,
-    apply_cloud_snapshot, cloud_item_from_message, cloud_item_from_stored,
-    cloud_media_store_categories_for_kind, collect_list_memory_media_ids, collect_memory_media_ids,
-    merge_shared_media_items, message_cloud_kind, path_extension, resolve_cloud_conversation_meta,
-    shared_media_page_from_memory, sort_cloud_items, split_cloud_key,
+    PendingCloudFetchStage, PendingCloudList, apply_cloud_snapshot, cloud_item_from_message,
+    cloud_item_from_stored, collect_list_memory_media_ids, collect_memory_media_ids,
+    message_cloud_kind, path_extension, resolve_cloud_conversation_meta, sort_cloud_items,
+    split_cloud_key,
 };
 use crate::effect::{Effect, HostCall, OpResult};
 use crate::input::{Command, Input};
@@ -50,7 +48,6 @@ pub fn reduce_cloud(state: &mut CoreState, input: Input, out: &mut ReduceOutput)
             sql_items,
             sql_has_more,
             sql_error,
-            server_batches,
         } => {
             handle_cloud_list_store_done(
                 state,
@@ -61,25 +58,7 @@ pub fn reduce_cloud(state: &mut CoreState, input: Input, out: &mut ReduceOutput)
                     sql_items: &sql_items,
                     sql_has_more,
                     sql_error,
-                    server_batches,
                 },
-                out,
-            );
-        }
-        Input::SharedMediaLoaded {
-            op_id,
-            store_present,
-            from_server,
-            server_items,
-            page,
-        } => {
-            handle_shared_media_loaded(
-                state,
-                op_id,
-                store_present,
-                from_server,
-                server_items,
-                page,
                 out,
             );
         }
@@ -113,7 +92,6 @@ pub fn reduce_cloud(state: &mut CoreState, input: Input, out: &mut ReduceOutput)
 fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: &mut ReduceOutput) {
     match cmd {
         Command::RefreshCloud => {
-            state.cloud.clear_media_store_cache();
             let media_ids_by_conv = collect_memory_media_ids(state);
             out.effects.push(Effect::RefreshCloudData {
                 op_id,
@@ -152,80 +130,6 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                 excluding_self.as_deref(),
                 kind,
             );
-            let is_self_cloud = conv_id.as_deref().is_some_and(|cid| {
-                !cid.is_empty() && state.session.self_conversation_id.as_deref() == Some(cid)
-            });
-            let needed_categories = if is_self_cloud {
-                cloud_media_store_categories_for_kind(kind)
-            } else {
-                &[]
-            };
-            let needed_total =
-                usize::try_from(safe_offset.saturating_add(safe_limit)).unwrap_or(usize::MAX);
-            let need_all_pages = sort_by_size || ascending;
-            let mut categories_to_fetch: Vec<CloudMediaStoreCategoryFetch> = Vec::new();
-            let mut has_cached_items = false;
-            for &category in needed_categories {
-                match state.cloud.my_cloud_media_cache.get(&category) {
-                    None => {
-                        categories_to_fetch.push(CloudMediaStoreCategoryFetch {
-                            category,
-                            start_last_id: None,
-                            target_additional: if need_all_pages {
-                                None
-                            } else {
-                                Some(needed_total)
-                            },
-                            kind_filter: kind,
-                        });
-                    }
-                    Some(entry) => {
-                        if !entry.items.is_empty() {
-                            has_cached_items = true;
-                        }
-                        if !entry.fetched {
-                            categories_to_fetch.push(CloudMediaStoreCategoryFetch {
-                                category,
-                                start_last_id: None,
-                                target_additional: if need_all_pages {
-                                    None
-                                } else {
-                                    Some(needed_total)
-                                },
-                                kind_filter: kind,
-                            });
-                        } else if entry.has_more {
-                            let matching_cached = entry
-                                .items
-                                .iter()
-                                .filter(|m| kind.is_none() || message_cloud_kind(m) == kind)
-                                .count();
-                            if need_all_pages || matching_cached < needed_total {
-                                categories_to_fetch.push(CloudMediaStoreCategoryFetch {
-                                    category,
-                                    start_last_id: entry.last_id.clone(),
-                                    target_additional: if need_all_pages {
-                                        None
-                                    } else {
-                                        Some(needed_total.saturating_sub(matching_cached))
-                                    },
-                                    kind_filter: kind,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            let server_media_store = if !categories_to_fetch.is_empty() {
-                conv_id.clone().map(|self_conv_id| CloudMediaStoreFetchSpec {
-                    self_conv_id,
-                    categories: categories_to_fetch,
-                })
-            } else {
-                None
-            };
-            let force_full_window = has_cached_items || server_media_store.is_some();
-
             state.cloud.pending_lists.insert(
                 op_id,
                 PendingCloudList {
@@ -236,8 +140,6 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                     ascending,
                     safe_offset,
                     safe_limit,
-                    is_self_cloud,
-                    force_full_window,
                 },
             );
             out.effects.push(Effect::CloudListStore {
@@ -250,53 +152,6 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                 offset: safe_offset,
                 limit: safe_limit,
                 memory_media,
-                force_full_window,
-                server_media_store,
-            });
-        }
-        Command::SharedMedia {
-            conv_id,
-            kind,
-            after_cursor,
-            limit,
-        } => {
-            let Some(op_id) = op_id else {
-                return;
-            };
-            let safe_limit = limit.clamp(1, 200);
-            let is_self_cloud = !conv_id.is_empty()
-                && state.session.self_conversation_id.as_deref() == Some(conv_id.as_str());
-            state.cloud.pending_shared_media.insert(
-                op_id,
-                PendingSharedMedia {
-                    conv_id: conv_id.clone(),
-                    kind,
-                    after_cursor: after_cursor.clone(),
-                    limit: safe_limit,
-                },
-            );
-            out.effects.push(Effect::FetchSharedMedia {
-                op_id,
-                conv_id,
-                is_self_cloud,
-                kind,
-                after_cursor,
-                limit: safe_limit,
-            });
-        }
-        Command::CloudCachedMessage { conv_id, msg_id } => {
-            let Some(op_id) = op_id else {
-                return;
-            };
-            let found = state
-                .cloud
-                .cached_media_store_message(&conv_id, &msg_id)
-                .or_else(|| state.cloud.cached_media_store_message_any(&msg_id))
-                .cloned();
-            out.effects.push(Effect::CompleteOp {
-                op_id,
-                result: OpResult::OptionalMessage(found.map(Box::new)),
-                after_store: false,
             });
         }
         Command::CloudThumbnail { key } => {
@@ -361,10 +216,7 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
                 });
                 return;
             }
-            if let Some(msg) = find_message_across_windows(state, &mid)
-                .or_else(|| state.cloud.cached_media_store_message_any(&mid))
-                .cloned()
-            {
+            if let Some(msg) = find_message_across_windows(state, &mid).cloned() {
                 start_fetch_with_message(state, op_id, &cid, &mid, &msg, out);
             } else {
                 out.effects.push(Effect::CompleteOp {
@@ -416,7 +268,6 @@ fn reduce_command(state: &mut CoreState, cmd: Command, op_id: Option<u64>, out: 
             }
         }
         Command::ResetCloud => {
-            state.cloud.clear_all_media_store_caches();
             if state.cloud.reset_snapshot() {
                 out.dirty.insert(DirtyKey::Cloud);
             }
@@ -499,7 +350,6 @@ struct CloudListStoreInput<'a> {
     sql_items: &'a [StoredCloudMediaItem],
     sql_has_more: bool,
     sql_error: bool,
-    server_batches: Vec<CloudMediaStoreBatch>,
 }
 
 fn handle_cloud_list_store_done(
@@ -513,39 +363,9 @@ fn handle_cloud_list_store_done(
     let sql_items = input.sql_items;
     let sql_has_more = input.sql_has_more;
     let sql_error = input.sql_error;
-    let server_batches = input.server_batches;
     let Some(req) = state.cloud.pending_lists.remove(&op_id) else {
         return;
     };
-
-
-    if req.is_self_cloud
-        && let Some(self_cid) = req.conv_id.as_deref()
-    {
-        for batch in server_batches {
-            if !batch.succeeded {
-                continue;
-            }
-            state
-                .cloud
-                .cache_media_store_messages(self_cid, &batch.items);
-            let entry = state
-                .cloud
-                .my_cloud_media_cache
-                .entry(batch.category)
-                .or_default();
-            let mut existing_ids: BTreeSet<String> =
-                entry.items.iter().map(|m| m.id.clone()).collect();
-            for msg in batch.items {
-                if existing_ids.insert(msg.id.clone()) {
-                    entry.items.push(msg);
-                }
-            }
-            entry.last_id = batch.last_id;
-            entry.has_more = batch.has_more && entry.last_id.is_some();
-            entry.fetched = true;
-        }
-    }
 
     let mut unsynced_items: Vec<CloudItem> = Vec::new();
     let convs: Vec<String> = match &req.conv_id {
@@ -585,37 +405,11 @@ fn handle_cloud_list_store_done(
         }
     }
 
-    let mut server_cloud_items: Vec<CloudItem> = Vec::new();
-    let mut cache_has_more = false;
-    if req.is_self_cloud
-        && let Some(self_cid) = req.conv_id.as_deref()
-    {
-        let (conv_name, _, _) = resolve_cloud_conversation_meta(state, self_cid, "", "", None);
-        for &cat in cloud_media_store_categories_for_kind(req.kind) {
-            if let Some(entry) = state.cloud.my_cloud_media_cache.get(&cat) {
-                if entry.fetched && entry.has_more {
-                    cache_has_more = true;
-                }
-                for msg in &entry.items {
-                    let Some(item) = cloud_item_from_message(msg, self_cid, &conv_name) else {
-                        continue;
-                    };
-                    if req.kind.is_some_and(|k| k != item.kind) {
-                        continue;
-                    }
-                    server_cloud_items.push(item);
-                }
-            }
-        }
-    }
-
     let safe_offset = usize::try_from(req.safe_offset).unwrap_or(0);
     let safe_limit = usize::try_from(req.safe_limit).unwrap_or(1);
-    let has_extra_items = !unsynced_items.is_empty() || !server_cloud_items.is_empty();
-    let used_full_window = has_extra_items || req.force_full_window;
 
     let page = if store_present {
-        if !used_full_window {
+        if unsynced_items.is_empty() {
             if sql_error {
                 CloudPage {
                     items: Vec::new(),
@@ -633,19 +427,13 @@ fn handle_cloud_list_store_done(
                     error: None,
                 }
             }
-        } else if sql_error && !has_extra_items {
-            CloudPage {
-                items: Vec::new(),
-                has_more: false,
-                error: Some(CLOUD_LOCAL_READ_ERROR.to_owned()),
-            }
         } else {
             let mut merged: Vec<CloudItem> = sql_items
                 .iter()
                 .filter_map(|row| cloud_item_from_stored(state, row))
                 .collect();
             let mut seen_ids: BTreeSet<String> = merged.iter().map(|i| i.id.clone()).collect();
-            for item in unsynced_items.into_iter().chain(server_cloud_items) {
+            for item in unsynced_items {
                 if seen_ids.insert(item.id.clone()) {
                     merged.push(item);
                 }
@@ -657,8 +445,7 @@ fn handle_cloud_list_store_done(
                 .skip(safe_offset)
                 .take(safe_limit)
                 .collect();
-            let has_more =
-                sql_has_more || cache_has_more || safe_offset.saturating_add(sliced.len()) < total;
+            let has_more = sql_has_more || safe_offset.saturating_add(sliced.len()) < total;
             CloudPage {
                 items: sliced,
                 has_more,
@@ -666,21 +453,14 @@ fn handle_cloud_list_store_done(
             }
         }
     } else {
-        let mut merged: Vec<CloudItem> = Vec::new();
-        let mut seen_ids: BTreeSet<String> = BTreeSet::new();
-        for item in unsynced_items.into_iter().chain(server_cloud_items) {
-            if seen_ids.insert(item.id.clone()) {
-                merged.push(item);
-            }
-        }
-        sort_cloud_items(&mut merged, req.sort_by_size, req.ascending);
-        let total = merged.len();
-        let sliced: Vec<CloudItem> = merged
+        sort_cloud_items(&mut unsynced_items, req.sort_by_size, req.ascending);
+        let total = unsynced_items.len();
+        let sliced: Vec<CloudItem> = unsynced_items
             .into_iter()
             .skip(safe_offset)
             .take(safe_limit)
             .collect();
-        let has_more = cache_has_more || safe_offset.saturating_add(sliced.len()) < total;
+        let has_more = safe_offset.saturating_add(sliced.len()) < total;
         CloudPage {
             items: sliced,
             has_more,
@@ -691,57 +471,6 @@ fn handle_cloud_list_store_done(
     out.effects.push(Effect::CompleteOp {
         op_id,
         result: OpResult::CloudPage(page),
-        after_store: false,
-    });
-}
-
-fn handle_shared_media_loaded(
-    state: &mut CoreState,
-    op_id: u64,
-    store_present: bool,
-    from_server: bool,
-    server_items: Vec<ChatMessage>,
-    mut page: SharedMediaPage,
-    out: &mut ReduceOutput,
-) {
-    let Some(req) = state.cloud.pending_shared_media.remove(&op_id) else {
-        return;
-    };
-    if !server_items.is_empty() {
-        state
-            .cloud
-            .cache_media_store_messages(&req.conv_id, &server_items);
-    }
-
-    let resolved = if from_server {
-        if req.after_cursor.is_none()
-            && page.ok
-            && let Some(window) = state.messages.windows.get(&req.conv_id)
-        {
-            let in_mem: Vec<ChatMessage> = window
-                .iter()
-                .filter(|m| req.kind.matches_message(m))
-                .cloned()
-                .collect();
-            if !in_mem.is_empty() {
-                page.items = merge_shared_media_items(page.items, in_mem, page.more);
-            }
-        }
-        page
-    } else if store_present {
-        page
-    } else {
-        let window = state
-            .messages
-            .windows
-            .get(&req.conv_id)
-            .map_or(&[][..], Vec::as_slice);
-        shared_media_page_from_memory(window, req.kind, req.after_cursor.as_deref(), req.limit)
-    };
-
-    out.effects.push(Effect::CompleteOp {
-        op_id,
-        result: OpResult::SharedMediaPage(resolved),
         after_store: false,
     });
 }
@@ -846,15 +575,7 @@ fn handle_cloud_lookup_message_done(
     if let Some(PendingCloudFetchStage::LookingUp { conv_id, msg_id }) =
         state.cloud.pending_fetches.remove(&op_id)
     {
-        let resolved = message
-            .or_else(|| {
-                state
-                    .cloud
-                    .cached_media_store_message(&conv_id, &msg_id)
-                    .cloned()
-            })
-            .or_else(|| find_message_across_windows(state, &msg_id).cloned())
-            .or_else(|| state.cloud.cached_media_store_message_any(&msg_id).cloned());
+        let resolved = message.or_else(|| find_message_across_windows(state, &msg_id).cloned());
         if let Some(msg) = resolved {
             start_fetch_with_message(state, op_id, &conv_id, &msg_id, &msg, out);
         } else {
@@ -868,20 +589,8 @@ fn handle_cloud_lookup_message_done(
     }
 
     if let Some(del) = state.cloud.pending_deletes.get(&op_id).cloned() {
-        let resolved = message
-            .or_else(|| {
-                state
-                    .cloud
-                    .cached_media_store_message(&del.current_conv_id, &del.current_msg_id)
-                    .cloned()
-            })
-            .or_else(|| find_message_across_windows(state, &del.current_msg_id).cloned())
-            .or_else(|| {
-                state
-                    .cloud
-                    .cached_media_store_message_any(&del.current_msg_id)
-                    .cloned()
-            });
+        let resolved =
+            message.or_else(|| find_message_across_windows(state, &del.current_msg_id).cloned());
         if let Some(msg) = resolved {
             let cli_msg_id = if msg.client_id.is_empty() {
                 del.current_msg_id.clone()
@@ -1045,10 +754,7 @@ fn advance_cloud_delete(state: &mut CoreState, op_id: u64, out: &mut ReduceOutpu
             });
             return;
         }
-        if let Some(msg) = find_message_across_windows(state, &mid)
-            .or_else(|| state.cloud.cached_media_store_message_any(&mid))
-            .cloned()
-        {
+        if let Some(msg) = find_message_across_windows(state, &mid).cloned() {
             let cli_msg_id = if msg.client_id.is_empty() {
                 mid.clone()
             } else {
@@ -1105,18 +811,12 @@ fn handle_cloud_delete_api_done(
 
 /// Resumes an in-flight `CloudDelete` batch after U6 remote-delete finishes for the current key.
 pub fn on_cloud_remote_delete_done(state: &mut CoreState, op_id: u64, out: &mut ReduceOutput) {
-    let deleted_ids = {
-        let Some(del) = state.cloud.pending_deletes.get_mut(&op_id) else {
-            return;
-        };
-        if let Some(key) = del.original_keys.get(del.index).cloned() {
-            del.deleted.push(key);
-        }
-        del.index += 1;
-        (del.current_conv_id.clone(), del.current_msg_id.clone())
+    let Some(del) = state.cloud.pending_deletes.get_mut(&op_id) else {
+        return;
     };
-    state
-        .cloud
-        .remove_cached_media_store_message(&deleted_ids.0, &deleted_ids.1);
+    if let Some(key) = del.original_keys.get(del.index).cloned() {
+        del.deleted.push(key);
+    }
+    del.index += 1;
     advance_cloud_delete(state, op_id, out);
 }

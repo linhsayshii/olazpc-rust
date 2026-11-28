@@ -22,11 +22,7 @@ use tokio::task::AbortHandle;
 
 use crate::actions::swift_error_type_name;
 use crate::actor::{ActorSink, InFlightGuard};
-use crate::cloud::{
-    CLOUD_MEDIA_STORE_PAGE_LIMIT, CloudMediaStoreBatch, CloudServerSnapshot,
-    MAX_CLOUD_MEDIA_STORE_PAGES, MEDIA_STORE_CURSOR_PREFIX, SharedMediaPage,
-    merge_shared_media_items, message_cloud_kind,
-};
+use crate::cloud::CloudServerSnapshot;
 use crate::conversations::{
     BatchApplyDelta, IdentityTable, MessagePreviewInput, hidden_pin_md5, hidden_pin_sha256,
     load_local_account_from_store, to_wire_stored,
@@ -1014,8 +1010,6 @@ enum StoreJob {
         offset: i64,
         limit: i64,
         memory_media: Vec<(String, Vec<String>, Vec<String>)>,
-        force_full_window: bool,
-        server_batches: Vec<CloudMediaStoreBatch>,
         sink: ActorSink,
         _guard: InFlightGuard,
     },
@@ -3653,238 +3647,20 @@ impl<T: Transport + 'static> EffectRunner for SessionEffectRunner<T> {
                     offset,
                     limit,
                     memory_media,
-                    force_full_window,
-                    server_media_store,
                 } => {
                     let guard = sink.track();
-                    if let Some(spec) = server_media_store {
-                        let api = Arc::clone(&self.api);
-                        let client = Arc::clone(&self.client);
-                        let store_tx = self.store_tx.clone();
-                        let sink = sink.clone();
-                        self.runtime.spawn(async move {
-                            let mut server_batches = Vec::new();
-                            if client.account().is_some() {
-                                for cat_fetch in spec.categories {
-                                    let mut collected: Vec<ChatMessage> = Vec::new();
-                                    let mut seen_ids: BTreeSet<String> = BTreeSet::new();
-                                    let mut matching_count: usize = 0;
-                                    let mut cursor = cat_fetch.start_last_id;
-                                    let mut has_more = false;
-                                    let mut any_succeeded = false;
-                                    for _ in 0..MAX_CLOUD_MEDIA_STORE_PAGES {
-                                        match api
-                                            .fetch_media_store_list(
-                                                &spec.self_conv_id,
-                                                true,
-                                                cat_fetch.category,
-                                                cursor.as_deref(),
-                                                CLOUD_MEDIA_STORE_PAGE_LIMIT,
-                                            )
-                                            .await
-                                        {
-                                            Ok(page) => {
-                                                any_succeeded = true;
-                                                for msg in page.items {
-                                                    if seen_ids.insert(msg.id.clone()) {
-                                                        if cat_fetch.kind_filter.is_none_or(|k| {
-                                                            message_cloud_kind(&msg) == Some(k)
-                                                        }) {
-                                                            matching_count += 1;
-                                                        }
-                                                        collected.push(msg);
-                                                    }
-                                                }
-                                                let next_cursor = page.last_id;
-                                                let cursor_advanced =
-                                                    next_cursor.is_some() && next_cursor != cursor;
-                                                has_more = page.has_more && cursor_advanced;
-                                                cursor = next_cursor;
-                                                if !has_more {
-                                                    break;
-                                                }
-                                                if let Some(target) = cat_fetch.target_additional
-                                                    && matching_count >= target
-                                                {
-                                                    break;
-                                                }
-                                            }
-                                            Err(_) => {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    server_batches.push(CloudMediaStoreBatch {
-                                        category: cat_fetch.category,
-                                        items: collected,
-                                        last_id: cursor,
-                                        has_more,
-                                        succeeded: any_succeeded,
-                                    });
-                                }
-                            }
-                            let _ = store_tx.send(StoreJob::CloudListQuery {
-                                op_id,
-                                conv_id,
-                                excluding_self,
-                                kind_tags,
-                                sort_by_size,
-                                ascending,
-                                offset,
-                                limit,
-                                memory_media,
-                                force_full_window,
-                                server_batches,
-                                sink,
-                                _guard: guard,
-                            });
-                        });
-                    } else {
-                        self.send_store(StoreJob::CloudListQuery {
-                            op_id,
-                            conv_id,
-                            excluding_self,
-                            kind_tags,
-                            sort_by_size,
-                            ascending,
-                            offset,
-                            limit,
-                            memory_media,
-                            force_full_window,
-                            server_batches: Vec::new(),
-                            sink: sink.clone(),
-                            _guard: guard,
-                        });
-                    }
-                }
-                Effect::FetchSharedMedia {
-                    op_id,
-                    conv_id,
-                    is_self_cloud,
-                    kind,
-                    after_cursor,
-                    limit,
-                } => {
-                    let api = Arc::clone(&self.api);
-                    let client = Arc::clone(&self.client);
-                    let shared_store = Arc::clone(&self.shared_store);
-                    let sink = sink.clone();
-                    let guard = sink.track();
-                    self.runtime.spawn(async move {
-                        let use_server = is_self_cloud
-                            && client.account().is_some()
-                            && after_cursor
-                                .as_deref()
-                                .is_none_or(|c| c.starts_with(MEDIA_STORE_CURSOR_PREFIX));
-                        if use_server {
-                            let server_cursor = after_cursor
-                                .as_deref()
-                                .and_then(|c| c.strip_prefix(MEDIA_STORE_CURSOR_PREFIX));
-                            match api
-                                .fetch_media_store_list(
-                                    &conv_id,
-                                    true,
-                                    kind.media_store_category(),
-                                    server_cursor,
-                                    limit,
-                                )
-                                .await
-                            {
-                                Ok(server_page) => {
-                                    let server_items = server_page.items;
-                                    let next_cursor = if server_page.has_more {
-                                        server_page
-                                            .last_id
-                                            .map(|id| format!("{MEDIA_STORE_CURSOR_PREFIX}{id}"))
-                                    } else {
-                                        None
-                                    };
-                                    let more = next_cursor.is_some();
-                                    let mut items = server_items.clone();
-                                    let mut store_present = false;
-                                    if server_cursor.is_none()
-                                        && let Some(local_page) = read_local_shared_media(
-                                            &shared_store,
-                                            conv_id.clone(),
-                                            kind.kind_tags(),
-                                            None,
-                                            limit,
-                                        )
-                                        .await
-                                    {
-                                        store_present = true;
-                                        if local_page.ok && !local_page.items.is_empty() {
-                                            items = merge_shared_media_items(
-                                                items,
-                                                local_page.items,
-                                                more,
-                                            );
-                                        }
-                                    }
-                                    sink.send(Input::SharedMediaLoaded {
-                                        op_id,
-                                        store_present,
-                                        from_server: true,
-                                        server_items,
-                                        page: SharedMediaPage {
-                                            items,
-                                            cursor: next_cursor,
-                                            more,
-                                            ok: true,
-                                        },
-                                    });
-                                    drop(guard);
-                                    return;
-                                }
-                                Err(_) => {
-                                    if server_cursor.is_some() {
-                                        sink.send(Input::SharedMediaLoaded {
-                                            op_id,
-                                            store_present: true,
-                                            from_server: true,
-                                            server_items: Vec::new(),
-                                            page: SharedMediaPage {
-                                                items: Vec::new(),
-                                                cursor: None,
-                                                more: false,
-                                                ok: false,
-                                            },
-                                        });
-                                        drop(guard);
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                        match read_local_shared_media(
-                            &shared_store,
-                            conv_id,
-                            kind.kind_tags(),
-                            after_cursor,
-                            limit,
-                        )
-                        .await
-                        {
-                            Some(page) => {
-                                sink.send(Input::SharedMediaLoaded {
-                                    op_id,
-                                    store_present: true,
-                                    from_server: false,
-                                    server_items: Vec::new(),
-                                    page,
-                                });
-                            }
-                            None => {
-                                sink.send(Input::SharedMediaLoaded {
-                                    op_id,
-                                    store_present: false,
-                                    from_server: false,
-                                    server_items: Vec::new(),
-                                    page: SharedMediaPage::default(),
-                                });
-                            }
-                        }
-                        drop(guard);
+                    self.send_store(StoreJob::CloudListQuery {
+                        op_id,
+                        conv_id,
+                        excluding_self,
+                        kind_tags,
+                        sort_by_size,
+                        ascending,
+                        offset,
+                        limit,
+                        memory_media,
+                        sink: sink.clone(),
+                        _guard: guard,
                     });
                 }
                 Effect::PinBoardMessageApi {
@@ -5335,8 +5111,6 @@ async fn run_store_worker(
                 offset,
                 limit,
                 memory_media,
-                force_full_window,
-                server_batches,
                 sink,
                 _guard,
             } => {
@@ -5361,7 +5135,7 @@ async fn run_store_worker(
                                 }
                                 existing.insert(cid, found);
                             }
-                            if !has_unsynced && !force_full_window {
+                            if !has_unsynced {
                                 let q = CloudMediaQuery {
                                     conv_id,
                                     excluding_conv_id: excluding_self,
@@ -5399,7 +5173,6 @@ async fn run_store_worker(
                         sql_items,
                         sql_has_more,
                         sql_error,
-                        server_batches,
                     });
                 } else {
                     sink.send(Input::CloudListStoreDone {
@@ -5409,7 +5182,6 @@ async fn run_store_worker(
                         sql_items: Vec::new(),
                         sql_has_more: false,
                         sql_error: false,
-                        server_batches,
                     });
                 }
             }
@@ -7616,56 +7388,4 @@ mod tests {
 
         core.stop();
     }
-}
-
-async fn read_local_shared_media(
-    shared_store: &Arc<Mutex<Option<Arc<Mutex<Store>>>>>,
-    conv_id: String,
-    kind_tags: Vec<String>,
-    after_cursor: Option<String>,
-    limit: i64,
-) -> Option<SharedMediaPage> {
-    let store_arc = shared_store
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone()?;
-    let page = tokio::task::spawn_blocking(move || {
-        let store = store_arc.lock().unwrap_or_else(PoisonError::into_inner);
-        match store.shared_media_raw(&conv_id, &kind_tags, after_cursor.as_deref(), limit) {
-            Ok(raw) => {
-                let items: Vec<ChatMessage> = raw
-                    .rows
-                    .iter()
-                    .filter_map(|blob| {
-                        serde_json::from_slice::<Value>(blob)
-                            .ok()
-                            .and_then(|v| match v {
-                                Value::Object(map) => ChatMessage::from_json(&map, &conv_id),
-                                _ => None,
-                            })
-                    })
-                    .collect();
-                SharedMediaPage {
-                    items,
-                    cursor: raw.cursor,
-                    more: raw.more,
-                    ok: true,
-                }
-            }
-            Err(_) => SharedMediaPage {
-                items: Vec::new(),
-                cursor: None,
-                more: false,
-                ok: false,
-            },
-        }
-    })
-    .await
-    .unwrap_or(SharedMediaPage {
-        items: Vec::new(),
-        cursor: None,
-        more: false,
-        ok: false,
-    });
-    Some(page)
 }

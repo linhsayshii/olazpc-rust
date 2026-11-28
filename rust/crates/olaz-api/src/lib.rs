@@ -29,7 +29,6 @@ mod error;
 mod group_polls;
 mod groups;
 mod history;
-mod media_store;
 mod messaging;
 mod notify;
 mod pins;
@@ -62,10 +61,6 @@ pub use e2ee::{
     build_e2ee_message_request_payload, extract_e2ee_send_response,
 };
 pub use error::ApiError;
-pub use media_store::{
-    MediaStoreCategory, MediaStorePage, build_media_store_list_request,
-    media_store_item_to_chat_message, parse_media_store_list_response,
-};
 pub use messaging::{
     CallSpec, ReactionParams, ReactionRequestSpec, RecallParams, SendContactCardParams,
     SendTextArgs, SendTextParams, build_reaction_request, build_recall_message_request,

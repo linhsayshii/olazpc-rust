@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-pub use olaz_api::{CloudPlanKind, CloudServerSnapshot, MediaStoreCategory};
+pub use olaz_api::{CloudPlanKind, CloudServerSnapshot};
 use olaz_store::{StoredCloudConversationSummary, StoredCloudMediaItem};
 use olaz_wire::{ChatMessage, Kind, is_group_id};
 
@@ -26,13 +26,6 @@ pub const ESTIMATED_PHOTO_BYTES: i64 = 150_000;
 pub const ESTIMATED_VIDEO_BYTES: i64 = 1_500_000;
 /// Estimated byte size for an unsynced in-memory voice message.
 pub const ESTIMATED_VOICE_BYTES: i64 = 40_000;
-
-/// Prefix distinguishing server Media Store `last_id` cursors from local SQLite `"<ts>|<id>"` cursors.
-pub const MEDIA_STORE_CURSOR_PREFIX: &str = "ms:";
-/// Page size requested from `media_store_send2me` when populating zCloud `CloudList`.
-pub const CLOUD_MEDIA_STORE_PAGE_LIMIT: i64 = 100;
-/// Maximum pages fetched in a single `CloudList` call to bound worst-case latency.
-pub const MAX_CLOUD_MEDIA_STORE_PAGES: usize = 10;
 
 /// User-facing error when a cloud item cannot be located.
 pub const CLOUD_NOT_FOUND_ERROR: &str = "Không tìm thấy tệp.";
@@ -78,138 +71,6 @@ impl CloudItemKind {
             "other" => Some(Self::Other),
             _ => None,
         }
-    }
-}
-
-/// Shared Media tab category (Swift `SharedMediaKind`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SharedMediaKind {
-    Images,
-    Files,
-    Links,
-}
-
-impl SharedMediaKind {
-    #[must_use]
-    pub const fn media_store_category(self) -> MediaStoreCategory {
-        match self {
-            Self::Images => MediaStoreCategory::Media,
-            Self::Files => MediaStoreCategory::File,
-            Self::Links => MediaStoreCategory::Link,
-        }
-    }
-
-    #[must_use]
-    pub fn kind_tags(self) -> Vec<String> {
-        match self {
-            Self::Images => vec!["photo".to_owned(), "video".to_owned()],
-            Self::Files => vec!["file".to_owned()],
-            Self::Links => vec!["link".to_owned()],
-        }
-    }
-
-    #[must_use]
-    pub fn matches_message(self, msg: &ChatMessage) -> bool {
-        matches!(
-            (self, &msg.kind),
-            (Self::Images, Kind::Photo { .. } | Kind::Video { .. })
-                | (Self::Files, Kind::File { .. })
-                | (Self::Links, Kind::Link { .. })
-        )
-    }
-}
-
-/// Paged Shared Media result (Swift `SharedMediaPage`).
-#[derive(Clone, Default, PartialEq)]
-pub struct SharedMediaPage {
-    pub items: Vec<ChatMessage>,
-    pub cursor: Option<String>,
-    pub more: bool,
-    pub ok: bool,
-}
-
-impl fmt::Debug for SharedMediaPage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SharedMediaPage")
-            .field("items", &self.items.len())
-            .field("has_cursor", &self.cursor.is_some())
-            .field("more", &self.more)
-            .field("ok", &self.ok)
-            .finish()
-    }
-}
-
-/// Per-category fetch directive for `media_store_send2me` inside `Effect::CloudListStore`.
-#[derive(Clone, PartialEq, Eq)]
-pub struct CloudMediaStoreCategoryFetch {
-    pub category: MediaStoreCategory,
-    pub start_last_id: Option<String>,
-    /// Additional items matching `kind_filter` needed to satisfy the current page, or `None`
-    /// to drain all available pages (up to `MAX_CLOUD_MEDIA_STORE_PAGES`) when sorting by size
-    /// or ascending date.
-    pub target_additional: Option<usize>,
-    pub kind_filter: Option<CloudItemKind>,
-}
-
-impl fmt::Debug for CloudMediaStoreCategoryFetch {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CloudMediaStoreCategoryFetch")
-            .field("category", &self.category)
-            .field("has_start_last_id", &self.start_last_id.is_some())
-            .field("target_additional", &self.target_additional)
-            .field("kind_filter", &self.kind_filter)
-            .finish()
-    }
-}
-
-/// Server Media Store fetch plan attached to `Effect::CloudListStore` for "Cloud của tôi".
-#[derive(Clone, PartialEq, Eq)]
-pub struct CloudMediaStoreFetchSpec {
-    pub self_conv_id: String,
-    pub categories: Vec<CloudMediaStoreCategoryFetch>,
-}
-
-impl fmt::Debug for CloudMediaStoreFetchSpec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CloudMediaStoreFetchSpec")
-            .field("categories", &self.categories)
-            .finish()
-    }
-}
-
-/// Fetched server Media Store items returned inside `Input::CloudListStoreDone`.
-#[derive(Clone, PartialEq)]
-pub struct CloudMediaStoreBatch {
-    pub category: MediaStoreCategory,
-    pub items: Vec<ChatMessage>,
-    pub last_id: Option<String>,
-    pub has_more: bool,
-    pub succeeded: bool,
-}
-
-impl fmt::Debug for CloudMediaStoreBatch {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CloudMediaStoreBatch")
-            .field("category", &self.category)
-            .field("items", &self.items.len())
-            .field("has_last_id", &self.last_id.is_some())
-            .field("has_more", &self.has_more)
-            .field("succeeded", &self.succeeded)
-            .finish()
-    }
-}
-
-/// Returns the server Media Store categories backing a `CloudList` `kind` filter for
-/// "Cloud của tôi" (`media_store_send2me`).
-#[must_use]
-pub const fn cloud_media_store_categories_for_kind(
-    kind: Option<CloudItemKind>,
-) -> &'static [MediaStoreCategory] {
-    match kind {
-        Some(CloudItemKind::File) => &[MediaStoreCategory::File],
-        Some(CloudItemKind::Photo | CloudItemKind::Video) => &[MediaStoreCategory::Media],
-        None => &[MediaStoreCategory::File, MediaStoreCategory::Media],
-        Some(CloudItemKind::Voice | CloudItemKind::Other) => &[],
     }
 }
 
@@ -449,28 +310,6 @@ pub(crate) struct PendingCloudList {
     pub ascending: bool,
     pub safe_offset: i64,
     pub safe_limit: i64,
-    pub is_self_cloud: bool,
-    pub force_full_window: bool,
-}
-
-/// In-flight `shared_media` request parameters held until store / API fetch finishes.
-#[derive(Clone, Debug)]
-pub(crate) struct PendingSharedMedia {
-    pub conv_id: String,
-    pub kind: SharedMediaKind,
-    pub after_cursor: Option<String>,
-    pub limit: i64,
-}
-
-/// In-memory cache of server `media_store_send2me` items per category for "Cloud của tôi".
-/// Kept strictly in memory (never inserted into SQLite `messages`, which stores contiguous
-/// chat scrollback windows).
-#[derive(Clone, Default)]
-pub(crate) struct MediaStoreCacheEntry {
-    pub items: Vec<ChatMessage>,
-    pub last_id: Option<String>,
-    pub has_more: bool,
-    pub fetched: bool,
 }
 
 /// Stage of an in-flight `cloud_fetch` operation.
@@ -508,9 +347,6 @@ pub struct CloudState {
     pub(crate) pending_fetches: BTreeMap<u64, PendingCloudFetchStage>,
     pub(crate) pending_thumbnails: BTreeSet<u64>,
     pub(crate) pending_deletes: BTreeMap<u64, PendingCloudDelete>,
-    pub(crate) pending_shared_media: BTreeMap<u64, PendingSharedMedia>,
-    pub(crate) my_cloud_media_cache: BTreeMap<MediaStoreCategory, MediaStoreCacheEntry>,
-    pub(crate) media_store_messages: BTreeMap<(String, String), ChatMessage>,
 }
 
 impl fmt::Debug for CloudState {
@@ -521,9 +357,6 @@ impl fmt::Debug for CloudState {
             .field("pending_fetches", &self.pending_fetches.len())
             .field("pending_thumbnails", &self.pending_thumbnails.len())
             .field("pending_deletes", &self.pending_deletes.len())
-            .field("pending_shared_media", &self.pending_shared_media.len())
-            .field("my_cloud_media_cache", &self.my_cloud_media_cache.len())
-            .field("media_store_messages", &self.media_store_messages.len())
             .finish()
     }
 }
@@ -535,9 +368,6 @@ impl CloudState {
         self.pending_fetches.clear();
         self.pending_thumbnails.clear();
         self.pending_deletes.clear();
-        self.pending_shared_media.clear();
-        self.my_cloud_media_cache.clear();
-        self.media_store_messages.clear();
         self.reset_snapshot()
     }
 
@@ -550,123 +380,6 @@ impl CloudState {
             self.snapshot = default;
             true
         }
-    }
-
-    /// Clears the per-category `media_store_send2me` page cache (used on `RefreshCloud` so
-    /// reopening zCloud picks up items uploaded from other devices).
-    pub fn clear_media_store_cache(&mut self) {
-        self.my_cloud_media_cache.clear();
-    }
-
-    /// Clears both the per-category page cache and the message-lookup map (used on `ResetCloud`).
-    pub fn clear_all_media_store_caches(&mut self) {
-        self.my_cloud_media_cache.clear();
-        self.media_store_messages.clear();
-    }
-
-    /// Caches server Media Store messages by `(conv_id, msg_id)` so `CloudFetch`, `CloudDelete`,
-    /// and media URL/thumbnail resolvers can locate server-only items not present in SQLite.
-    pub fn cache_media_store_messages(&mut self, conv_id: &str, items: &[ChatMessage]) {
-        for msg in items {
-            self.media_store_messages
-                .insert((conv_id.to_owned(), msg.id.clone()), msg.clone());
-        }
-    }
-
-    /// Looks up a cached server Media Store message by `(conv_id, msg_id)`.
-    #[must_use]
-    pub fn cached_media_store_message(&self, conv_id: &str, msg_id: &str) -> Option<&ChatMessage> {
-        self.media_store_messages
-            .get(&(conv_id.to_owned(), msg_id.to_owned()))
-    }
-
-    /// Looks up a cached server Media Store message across all conversations by `msg_id`.
-    #[must_use]
-    pub fn cached_media_store_message_any(&self, msg_id: &str) -> Option<&ChatMessage> {
-        self.media_store_messages
-            .iter()
-            .find_map(|((_, mid), msg)| (mid == msg_id).then_some(msg))
-    }
-
-    /// Removes a deleted item from both server Media Store caches.
-    pub fn remove_cached_media_store_message(&mut self, conv_id: &str, msg_id: &str) {
-        self.media_store_messages
-            .remove(&(conv_id.to_owned(), msg_id.to_owned()));
-        for entry in self.my_cloud_media_cache.values_mut() {
-            entry
-                .items
-                .retain(|m| !(m.conversation_id == conv_id && m.id == msg_id));
-        }
-    }
-}
-
-/// Merges `extra` (e.g. local SQLite or in-memory messages) into `primary` (server page 1),
-/// deduplicating by `msg.id` and sorting newest-first (`date_ms DESC, id DESC`).
-/// When `has_more_primary` is true, drops `extra` items strictly older than the oldest item in
-/// `primary` so they don't jump ahead of later server pages.
-#[must_use]
-pub fn merge_shared_media_items(
-    mut primary: Vec<ChatMessage>,
-    extra: impl IntoIterator<Item = ChatMessage>,
-    has_more_primary: bool,
-) -> Vec<ChatMessage> {
-    let cutoff_ms = if has_more_primary {
-        primary.iter().map(|m| m.date_ms).min()
-    } else {
-        None
-    };
-    let mut seen: BTreeSet<String> = primary.iter().map(|m| m.id.clone()).collect();
-    for msg in extra {
-        if seen.contains(&msg.id) {
-            continue;
-        }
-        if cutoff_ms.is_some_and(|min_ms| msg.date_ms < min_ms) {
-            continue;
-        }
-        seen.insert(msg.id.clone());
-        primary.push(msg);
-    }
-    primary.sort_by(|a, b| b.date_ms.cmp(&a.date_ms).then_with(|| b.id.cmp(&a.id)));
-    primary
-}
-
-/// Pure in-memory fallback for `SharedMedia` when no SQLite store is attached.
-#[must_use]
-pub fn shared_media_page_from_memory(
-    messages: &[ChatMessage],
-    kind: SharedMediaKind,
-    after_cursor: Option<&str>,
-    limit: i64,
-) -> SharedMediaPage {
-    let safe_limit = usize::try_from(limit.clamp(1, 200)).unwrap_or(1);
-    let mut filtered: Vec<ChatMessage> = messages
-        .iter()
-        .filter(|m| kind.matches_message(m))
-        .cloned()
-        .collect();
-    filtered.sort_by(|a, b| b.date_ms.cmp(&a.date_ms).then_with(|| b.id.cmp(&a.id)));
-
-    if let Some(raw_cursor) = after_cursor
-        && !raw_cursor.starts_with(MEDIA_STORE_CURSOR_PREFIX)
-        && let Some((ts_str, id_str)) = raw_cursor.split_once('|')
-        && let Ok(cursor_ts) = ts_str.parse::<i64>()
-        && !id_str.is_empty()
-    {
-        filtered.retain(|m| m.date_ms < cursor_ts || (m.date_ms == cursor_ts && m.id.as_str() < id_str));
-    }
-
-    let more = filtered.len() > safe_limit;
-    let items: Vec<ChatMessage> = filtered.into_iter().take(safe_limit).collect();
-    let cursor = if more {
-        items.last().map(|m| format!("{}|{}", m.date_ms, m.id))
-    } else {
-        None
-    };
-    SharedMediaPage {
-        items,
-        cursor,
-        more,
-        ok: true,
     }
 }
 

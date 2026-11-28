@@ -12,7 +12,6 @@ use olaz_core::changes::{DirtyKey, snapshot_message_meta};
 use olaz_core::cloud::{
     CloudActionResult, CloudBreakdown, CloudConversation, CloudFetch, CloudFile, CloudItem,
     CloudItemKind, CloudPage, CloudPlan, CloudPlanKind, CloudSettings, CloudSnapshotState,
-    SharedMediaKind, SharedMediaPage,
 };
 use olaz_core::composer::{ComposerConfirm, ComposerOutcome, MyCardInfo, ReminderComposeInfo};
 use olaz_core::conversations::{BatchApplyDelta, ConversationSummary, sort_conversations};
@@ -1274,44 +1273,6 @@ impl From<CloudPage> for CloudPageRecord {
             items: p.items.into_iter().map(Into::into).collect(),
             has_more: p.has_more,
             error: p.error,
-        }
-    }
-}
-
-/// Shared Media tab category (Swift `SharedMediaKind`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum SharedMediaKindRecord {
-    Images,
-    Files,
-    Links,
-}
-
-impl From<SharedMediaKindRecord> for SharedMediaKind {
-    fn from(k: SharedMediaKindRecord) -> Self {
-        match k {
-            SharedMediaKindRecord::Images => Self::Images,
-            SharedMediaKindRecord::Files => Self::Files,
-            SharedMediaKindRecord::Links => Self::Links,
-        }
-    }
-}
-
-/// Paged Shared Media result (Swift `SharedMediaPage`).
-#[derive(Debug, Clone, Default, PartialEq, uniffi::Record)]
-pub struct SharedMediaPageRecord {
-    pub items: Vec<ChatMessageRecord>,
-    pub cursor: Option<String>,
-    pub more: bool,
-    pub ok: bool,
-}
-
-impl From<SharedMediaPage> for SharedMediaPageRecord {
-    fn from(p: SharedMediaPage) -> Self {
-        Self {
-            items: p.items.into_iter().map(ChatMessageRecord::from).collect(),
-            cursor: p.cursor,
-            more: p.more,
-            ok: p.ok,
         }
     }
 }
@@ -5465,47 +5426,6 @@ impl CoreEngine {
         })
         .await?;
         Ok(page.into())
-    }
-
-    /// Queries a page of Shared Media ("Kho lưu trữ") for `conv_id`.
-    /// For "Cloud của tôi" (`send2me_id`), queries Zalo's `media_store_send2me` API first
-    /// and merges recent local SQLite/in-memory messages on page 1, with offline fallback.
-    pub async fn shared_media(
-        &self,
-        conv_id: String,
-        kind: SharedMediaKindRecord,
-        after_cursor: Option<String>,
-        limit: i64,
-    ) -> Result<SharedMediaPageRecord, CoreError> {
-        let handle = Arc::clone(&self.handle);
-        let page = run(async move {
-            handle
-                .request_shared_media_page(Command::SharedMedia {
-                    conv_id,
-                    kind: kind.into(),
-                    after_cursor,
-                    limit,
-                })
-                .await
-        })
-        .await?;
-        Ok(page.into())
-    }
-
-    /// Looks up a server-fetched Media Store message cached in `olaz-core` by `(conv_id, msg_id)`.
-    pub async fn cloud_cached_message(
-        &self,
-        conv_id: String,
-        msg_id: String,
-    ) -> Result<Option<ChatMessageRecord>, CoreError> {
-        let handle = Arc::clone(&self.handle);
-        let msg = run(async move {
-            handle
-                .request_optional_message(Command::CloudCachedMessage { conv_id, msg_id })
-                .await
-        })
-        .await?;
-        Ok(msg.map(ChatMessageRecord::from))
     }
 
     /// Resolves a cloud item's thumbnail via `Host::resolve_media`.

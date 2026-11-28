@@ -49,17 +49,13 @@ pub use changes::{
 // U11
 pub use cloud::{
     CLOUD_FETCH_FAILED_ERROR, CLOUD_LOCAL_READ_ERROR, CLOUD_NOT_FOUND_ERROR,
-    CLOUD_MEDIA_STORE_PAGE_LIMIT, CLOUD_OFFLOAD_UNSUPPORTED_ERROR, CloudActionResult,
-    CloudBreakdown, CloudConversation, CloudFetch, CloudFile, CloudItem, CloudItemKind,
-    CloudMediaStoreBatch, CloudMediaStoreCategoryFetch, CloudMediaStoreFetchSpec, CloudPage,
-    CloudPlan, CloudPlanKind, CloudServerSnapshot, CloudSettings, CloudSnapshotState, CloudState,
-    DEFAULT_FREE_CLOUD_QUOTA, DEFAULT_FREE_FILE_LIMIT, ESTIMATED_PHOTO_BYTES,
-    ESTIMATED_VIDEO_BYTES, ESTIMATED_VOICE_BYTES, MAX_CLOUD_MEDIA_STORE_PAGES,
-    MEDIA_STORE_CURSOR_PREFIX, MediaStoreCategory, SharedMediaKind, SharedMediaPage,
+    CLOUD_OFFLOAD_UNSUPPORTED_ERROR, CloudActionResult, CloudBreakdown, CloudConversation,
+    CloudFetch, CloudFile, CloudItem, CloudItemKind, CloudPage, CloudPlan, CloudPlanKind,
+    CloudServerSnapshot, CloudSettings, CloudSnapshotState, CloudState, DEFAULT_FREE_CLOUD_QUOTA,
+    DEFAULT_FREE_FILE_LIMIT, ESTIMATED_PHOTO_BYTES, ESTIMATED_VIDEO_BYTES, ESTIMATED_VOICE_BYTES,
     apply_cloud_snapshot, cloud_item_from_message, cloud_item_from_stored,
-    cloud_media_store_categories_for_kind, conversation_display_name, merge_shared_media_items,
-    message_cloud_kind, path_extension, resolve_cloud_conversation_meta,
-    shared_media_page_from_memory, sort_cloud_items, split_cloud_key,
+    conversation_display_name, message_cloud_kind, path_extension, resolve_cloud_conversation_meta,
+    sort_cloud_items, split_cloud_key,
 };
 pub use composer::{
     COMPOSER_GENERIC_FAILURE, CONFIRM_PROMOTE_DELAY_MS, ComposerConfirm, ComposerOutcome,

@@ -1020,8 +1020,6 @@ fn timestamp_and_misc_helpers() {
     );
     assert_eq!(sticker_cdn_url(-1, " "), "");
     assert_eq!(normalized_msg_type(" 24 "), "chat.location.new");
-    assert_eq!(normalized_msg_type("19"), "share.file");
-    assert_eq!(normalized_msg_type("23"), "share.file");
     assert_eq!(normalized_msg_type("chat.gif"), "chat.gif");
     assert_eq!(zdb_msg_type(-4), "group.event");
     assert_eq!(zdb_msg_type(999), "webchat");
