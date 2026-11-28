@@ -29,7 +29,7 @@ enum ActorMsg {
         input: Box<Input>,
         ack: Option<oneshot::Sender<u64>>,
     },
-    CoalescedIdentities,
+    CoalescedIdentities(Arc<Mutex<Option<IdentityTable>>>),
     OpRequest {
         cmd: Box<Command>,
         reply: oneshot::Sender<(OpResult, u64)>,
@@ -139,7 +139,7 @@ pub struct CoreHandle {
     tracker: Arc<ActivityTracker>,
     state_notify: Arc<Notify>,
     identity_snapshot: Arc<Mutex<Arc<IdentitySnapshot>>>,
-    latest_identities: Arc<Mutex<Option<IdentityTable>>>,
+    pending_identities: Mutex<Option<Arc<Mutex<Option<IdentityTable>>>>>,
 }
 
 impl CoreHandle {
@@ -161,7 +161,6 @@ impl CoreHandle {
         let tracker = Arc::new(ActivityTracker::new());
         let state_notify = Arc::new(Notify::new());
         let identity_snapshot = Arc::new(Mutex::new(Arc::new(initial.identity_snapshot())));
-        let latest_identities = Arc::new(Mutex::new(None));
         let sink = ActorSink {
             tx: tx.clone(),
             tracker: Arc::clone(&tracker),
@@ -175,7 +174,6 @@ impl CoreHandle {
             Arc::clone(&tracker),
             Arc::clone(&state_notify),
             Arc::clone(&identity_snapshot),
-            Arc::clone(&latest_identities),
         ));
         Self {
             tx,
@@ -183,7 +181,7 @@ impl CoreHandle {
             tracker,
             state_notify,
             identity_snapshot,
-            latest_identities,
+            pending_identities: Mutex::new(None),
         }
     }
 
@@ -269,28 +267,51 @@ impl CoreHandle {
         }
     }
 
+    /// Seals any active coalescing burst of `Command::UpdateIdentities` and enqueues `msg`
+    /// strictly after it so subsequent identity pushes can never overtake intervening commands.
+    fn enqueue_non_identity(&self, msg: ActorMsg) -> Result<(), mpsc::error::SendError<ActorMsg>> {
+        let mut pending = self
+            .pending_identities
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *pending = None;
+        self.tx.send(msg)
+    }
+
     /// Enqueues a command without blocking.
     ///
-    /// Burst `Command::UpdateIdentities` calls coalesce in place via `latest_identities` so the
-    /// actor mailbox holds at most one pending identity update per burst.
+    /// Consecutive `Command::UpdateIdentities` calls coalesce in place into a per-burst slot so
+    /// the actor mailbox holds at most one pending identity update per consecutive burst, while
+    /// any intervening command seals the burst to preserve strict FIFO ordering.
     pub fn send(&self, command: Command) {
+        let mut pending = self
+            .pending_identities
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         self.sync_identity_snapshot_before_send(&command);
         if let Command::UpdateIdentities(table) = command {
-            let mut slot = self
-                .latest_identities
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let was_none = slot.is_none();
-            *slot = Some(table);
-            if was_none {
-                self.tracker.increment();
-                if self.tx.send(ActorMsg::CoalescedIdentities).is_err() {
-                    *slot = None;
-                    self.tracker.decrement();
+            if let Some(slot) = pending.as_ref() {
+                let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
+                if guard.is_some() {
+                    *guard = Some(table);
+                    return;
                 }
+            }
+            let slot = Arc::new(Mutex::new(Some(table)));
+            self.tracker.increment();
+            if self
+                .tx
+                .send(ActorMsg::CoalescedIdentities(Arc::clone(&slot)))
+                .is_err()
+            {
+                *pending = None;
+                self.tracker.decrement();
+            } else {
+                *pending = Some(slot);
             }
             return;
         }
+        *pending = None;
         self.tracker.increment();
         if self
             .tx
@@ -310,8 +331,7 @@ impl CoreHandle {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.tracker.increment();
         if self
-            .tx
-            .send(ActorMsg::Input {
+            .enqueue_non_identity(ActorMsg::Input {
                 input: Box::new(Input::Command(command)),
                 ack: Some(ack_tx),
             })
@@ -328,8 +348,7 @@ impl CoreHandle {
         let (reply, rx) = oneshot::channel();
         self.tracker.increment();
         if self
-            .tx
-            .send(ActorMsg::OpRequest {
+            .enqueue_non_identity(ActorMsg::OpRequest {
                 cmd: Box::new(command),
                 reply,
             })
@@ -654,8 +673,7 @@ impl CoreHandle {
         let (reply, rx) = oneshot::channel();
         self.tracker.increment();
         if self
-            .tx
-            .send(ActorMsg::DrainChatPolling {
+            .enqueue_non_identity(ActorMsg::DrainChatPolling {
                 max_batches,
                 notify_incoming,
                 reply,
@@ -683,7 +701,7 @@ impl CoreHandle {
     /// enqueued before this call has been reduced and published. Returns `None` once stopped.
     pub async fn settle(&self) -> Option<u64> {
         let (tx, rx) = oneshot::channel();
-        if self.tx.send(ActorMsg::Settle(tx)).is_err() {
+        if self.enqueue_non_identity(ActorMsg::Settle(tx)).is_err() {
             return None;
         }
         rx.await.ok()
@@ -692,7 +710,7 @@ impl CoreHandle {
     /// Reads the current [`SessionSnapshot`] directly from the actor (tests / diagnostics).
     pub async fn snapshot(&self) -> Option<SessionSnapshot> {
         let (tx, rx) = oneshot::channel();
-        if self.tx.send(ActorMsg::Snapshot(tx)).is_err() {
+        if self.enqueue_non_identity(ActorMsg::Snapshot(tx)).is_err() {
             return None;
         }
         rx.await.ok()
@@ -701,7 +719,10 @@ impl CoreHandle {
     /// Reads the full [`CoreSnapshot`] across session, conversations, messages, and contacts domains.
     pub async fn full_snapshot(&self) -> Option<CoreSnapshot> {
         let (tx, rx) = oneshot::channel();
-        if self.tx.send(ActorMsg::FullSnapshot(tx)).is_err() {
+        if self
+            .enqueue_non_identity(ActorMsg::FullSnapshot(tx))
+            .is_err()
+        {
             return None;
         }
         rx.await.ok()
@@ -786,7 +807,7 @@ impl CoreHandle {
 
     /// Stops the actor, aborts in-flight effects, and closes `next_changes()`.
     pub fn stop(&self) {
-        let _ = self.tx.send(ActorMsg::Stop);
+        let _ = self.enqueue_non_identity(ActorMsg::Stop);
     }
 
     #[cfg(test)]
@@ -904,18 +925,12 @@ async fn run_actor(
     tracker: Arc<ActivityTracker>,
     state_notify: Arc<Notify>,
     identity_snapshot: Arc<Mutex<Arc<IdentitySnapshot>>>,
-    latest_identities: Arc<Mutex<Option<IdentityTable>>>,
 ) {
     let mut waiters = ActorWaiters::new();
     while let Some(msg) = rx.recv().await {
         match msg {
-            ActorMsg::CoalescedIdentities => {
-                let maybe_table = {
-                    let mut slot = latest_identities
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    slot.take()
-                };
+            ActorMsg::CoalescedIdentities(slot) => {
+                let maybe_table = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
                 if let Some(table) = maybe_table {
                     let out = reduce(&mut state, Input::Command(Command::UpdateIdentities(table)));
                     let _ = dispatch_reduce_output(
@@ -1174,6 +1189,139 @@ mod tests {
             .expect("cached group retained in GroupsState");
         assert_eq!(cached.name, "Group v24");
         assert_eq!(cached.members, 25);
+        core.stop();
+    }
+
+    #[tokio::test]
+    async fn update_identities_does_not_overtake_intervening_seed_contacts() {
+        let mut initial = CoreState::default();
+        initial
+            .conversations
+            .pinned_ids
+            .insert("3000902".to_owned());
+        let core = CoreHandle::start_with_state(initial, Arc::new(NoopRunner), Handle::current());
+
+        let old_friend = crate::messages::FriendEntry {
+            id: "3000902".to_owned(),
+            name: "Friend 902".to_owned(),
+            zalo_name: "Friend 902".to_owned(),
+            avatar: Some("https://cdn.example.invalid/902_v2.jpg".to_owned()),
+            last_active_ms: None,
+            online: false,
+            section: "F".to_owned(),
+            sort_key: "friend 902".to_owned(),
+        };
+
+        let mut old_contacts = crate::messages::ContactsState::default();
+        old_contacts.friends.push(old_friend);
+        old_contacts
+            .aliases
+            .insert("3000902".to_owned(), "Alias 902".to_owned());
+
+        let old_table = old_contacts.to_identity_table(&crate::groups::GroupsState::default());
+        let mut new_table = old_table.clone();
+        new_table
+            .aliases
+            .insert("3000902".to_owned(), "Updated Alias 902".to_owned());
+
+        // Enqueue the exact burst produced by Swift's `contacts.didSet` followed by
+        // `cachedAliases.didSet` and `ensureKnownContactsInConversations()` without yielding.
+        core.send(Command::UpdateIdentities(old_table));
+        core.send(Command::SeedContacts(Box::new(old_contacts)));
+        core.send(Command::UpdateIdentities(new_table));
+        core.send(Command::EnsureKnownContacts);
+
+        let rev = core.settle().await;
+        assert!(rev.is_some());
+        core.wait_idle().await;
+
+        let full = core.full_snapshot().await.expect("full snapshot");
+        assert_eq!(
+            full.contacts.aliases.get("3000902").map(String::as_str),
+            Some("Updated Alias 902")
+        );
+        let conv = full
+            .conversations
+            .conversations
+            .iter()
+            .find(|c| c.id == "3000902")
+            .expect("known contact conversation created");
+        assert_eq!(conv.name, "Updated Alias 902");
+        assert_eq!(
+            conv.avatar.as_deref(),
+            Some("https://cdn.example.invalid/902_v2.jpg")
+        );
+        core.stop();
+    }
+
+    #[tokio::test]
+    async fn seed_contacts_and_blocked_users_do_not_echo_stale_contacts_mirror() {
+        let mut initial = CoreState::default();
+        initial
+            .conversations
+            .pinned_ids
+            .insert("3000902".to_owned());
+        let core = CoreHandle::start_with_state(initial, Arc::new(NoopRunner), Handle::current());
+
+        let mut old_contacts = crate::messages::ContactsState::default();
+        old_contacts.friends.push(crate::messages::FriendEntry {
+            id: "3000902".to_owned(),
+            name: "Friend 902".to_owned(),
+            zalo_name: "Friend 902".to_owned(),
+            avatar: Some("https://cdn.example.invalid/902_v2.jpg".to_owned()),
+            last_active_ms: None,
+            online: false,
+            section: "F".to_owned(),
+            sort_key: "friend 902".to_owned(),
+        });
+        old_contacts
+            .aliases
+            .insert("3000902".to_owned(), "Alias 902".to_owned());
+
+        let mut new_table = old_contacts.to_identity_table(&crate::groups::GroupsState::default());
+        new_table
+            .aliases
+            .insert("3000902".to_owned(), "Updated Alias 902".to_owned());
+
+        core.send(Command::SeedContacts(Box::new(old_contacts)));
+        core.send(Command::SeedBlockedUsers(Some(vec![
+            crate::messages::BlockedUserState {
+                id: "3000999".to_owned(),
+                name: "Blocked".to_owned(),
+                avatar: None,
+            },
+        ])));
+        core.send(Command::UpdateIdentities(new_table));
+        core.send(Command::EnsureKnownContacts);
+
+        let rev = core.settle().await;
+        assert!(rev.is_some());
+        core.wait_idle().await;
+
+        let changes = core.next_changes().await.expect("conversation changes");
+        assert!(
+            changes.contacts.is_none(),
+            "SeedContacts / SeedBlockedUsers must not echo stale ContactsState back to Swift mirror"
+        );
+        let convs = changes.conversations.expect("conversations dirty");
+        assert_eq!(convs[0].id, "3000902");
+        assert_eq!(convs[0].name, "Updated Alias 902");
+
+        let full = core.full_snapshot().await.expect("full snapshot");
+        assert_eq!(
+            full.contacts
+                .blocked_users
+                .as_ref()
+                .map(|b| b[0].id.as_str()),
+            Some("3000999")
+        );
+        assert_eq!(
+            core.identity_snapshot()
+                .lookup_person("3000902")
+                .as_ref()
+                .map(|h| h.name.as_str()),
+            Some("Updated Alias 902")
+        );
         core.stop();
     }
 }

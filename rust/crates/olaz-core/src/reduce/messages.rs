@@ -753,7 +753,7 @@ fn reduce_message_command(
 
         Command::SeedContacts(contacts) => {
             state.contacts.apply_seeded_contacts(*contacts);
-            out.dirty.insert(DirtyKey::Contacts);
+            out.refresh_identity_snapshot = true;
             complete_op(op_id, out);
         }
 
