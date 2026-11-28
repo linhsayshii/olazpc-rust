@@ -11,7 +11,9 @@ use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::changes::{ChangeHub, CoreChanges};
-use crate::cloud::{CloudActionResult, CloudFetch, CloudPage, MediaResolutionOutcome};
+use crate::cloud::{
+    CloudActionResult, CloudFetch, CloudPage, MediaResolutionOutcome, SharedMediaPage,
+};
 use crate::composer::{ComposerOutcome, MyCardInfo, ReminderComposeInfo};
 use crate::conversations::{ConversationActionResult, IdentityTable, PinBoard};
 use crate::effect::{Effect, OpResult};
@@ -562,6 +564,20 @@ impl CoreHandle {
         match self.request(command).await {
             Some(OpResult::MediaResolution(res)) => res,
             _ => MediaResolutionOutcome::Unavailable,
+        }
+    }
+
+    pub async fn request_shared_media_page(&self, command: Command) -> SharedMediaPage {
+        match self.request(command).await {
+            Some(OpResult::SharedMediaPage(page)) => page,
+            _ => SharedMediaPage::default(),
+        }
+    }
+
+    pub async fn request_optional_message(&self, command: Command) -> Option<olaz_wire::ChatMessage> {
+        match self.request(command).await {
+            Some(OpResult::OptionalMessage(msg)) => msg.map(|m| *m),
+            _ => None,
         }
     }
 

@@ -15,7 +15,10 @@ use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
 use crate::actions::DeleteUndoItem;
-use crate::cloud::{CloudActionResult, CloudFetch, CloudPage, MediaResolutionOutcome};
+use crate::cloud::{
+    CloudActionResult, CloudFetch, CloudMediaStoreFetchSpec, CloudPage, MediaResolutionOutcome,
+    SharedMediaKind, SharedMediaPage,
+};
 use crate::composer::{ComposerOutcome, MyCardInfo, ReminderComposeInfo};
 use crate::conversations::{
     ConversationActionResult, ConversationPreview, IdentityTable, PinBoard,
@@ -495,6 +498,8 @@ pub enum OpResult {
     CloudFetch(CloudFetch),
     CloudAction(CloudActionResult),
     MediaResolution(MediaResolutionOutcome),
+    SharedMediaPage(SharedMediaPage),
+    OptionalMessage(Option<Box<ChatMessage>>),
     // U13
     StickerTabs(Option<Vec<StickerTab>>),
     StickerEntries(Option<Vec<StickerEntry>>),
@@ -560,6 +565,11 @@ impl fmt::Debug for OpResult {
             Self::CloudFetch(r) => f.debug_tuple("CloudFetch").field(r).finish(),
             Self::CloudAction(a) => f.debug_tuple("CloudAction").field(a).finish(),
             Self::MediaResolution(m) => f.debug_tuple("MediaResolution").field(m).finish(),
+            Self::SharedMediaPage(p) => f.debug_tuple("SharedMediaPage").field(p).finish(),
+            Self::OptionalMessage(m) => f
+                .debug_struct("OptionalMessage")
+                .field("found", &m.is_some())
+                .finish(),
             // U13
             Self::StickerTabs(v) => f
                 .debug_struct("StickerTabs")
@@ -1513,6 +1523,17 @@ pub enum Effect {
         offset: i64,
         limit: i64,
         memory_media: Vec<(String, Vec<String>, Vec<String>)>,
+        force_full_window: bool,
+        server_media_store: Option<CloudMediaStoreFetchSpec>,
+    },
+    /// Fetches a Shared Media page (server `media_store_send2me` for "Cloud của tôi", SQLite otherwise).
+    FetchSharedMedia {
+        op_id: u64,
+        conv_id: String,
+        is_self_cloud: bool,
+        kind: SharedMediaKind,
+        after_cursor: Option<String>,
+        limit: i64,
     },
     /// Looks up a decoded message in SQLite for `cloud_fetch` / `cloud_delete`.
     CloudLookupMessage {
@@ -2212,6 +2233,8 @@ impl fmt::Debug for Effect {
                 ascending,
                 offset,
                 limit,
+                force_full_window,
+                server_media_store,
                 ..
             } => f
                 .debug_struct("CloudListStore")
@@ -2219,6 +2242,23 @@ impl fmt::Debug for Effect {
                 .field("sort_by_size", sort_by_size)
                 .field("ascending", ascending)
                 .field("offset", offset)
+                .field("limit", limit)
+                .field("force_full_window", force_full_window)
+                .field("has_server_media_store", &server_media_store.is_some())
+                .finish(),
+            Self::FetchSharedMedia {
+                op_id,
+                is_self_cloud,
+                kind,
+                after_cursor,
+                limit,
+                ..
+            } => f
+                .debug_struct("FetchSharedMedia")
+                .field("op_id", op_id)
+                .field("is_self_cloud", is_self_cloud)
+                .field("kind", kind)
+                .field("has_cursor", &after_cursor.is_some())
                 .field("limit", limit)
                 .finish(),
             Self::CloudLookupMessage { op_id, .. } => f

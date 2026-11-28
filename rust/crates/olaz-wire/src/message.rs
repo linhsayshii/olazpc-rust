@@ -144,7 +144,7 @@ pub fn normalized_msg_type(raw_type: &str) -> String {
         "3" => "chat.voice",
         "4" => "chat.video.msg",
         "5" => "chat.sticker",
-        "19" => "share.file",
+        "19" | "23" => "share.file",
         "24" => "chat.location.new",
         "31" => "chat.undo",
         _ => return raw_type.to_string(),

@@ -19,7 +19,9 @@ use olaz_ws::CursorMap;
 use serde_json::{Map, Value};
 
 use crate::actions::{MessageConfirmState, ReactFailure, RecallFailure};
-use crate::cloud::{CloudItemKind, CloudServerSnapshot};
+use crate::cloud::{
+    CloudItemKind, CloudMediaStoreBatch, CloudServerSnapshot, SharedMediaKind, SharedMediaPage,
+};
 use crate::composer::{ComposerConfirm, ComposerOutcome};
 use crate::conversations::{
     BatchApplyDelta, ConversationActionResult, ConversationPreview, ConversationSummary,
@@ -704,6 +706,16 @@ pub enum Command {
         enabled: bool,
     },
     ResetCloud,
+    SharedMedia {
+        conv_id: String,
+        kind: SharedMediaKind,
+        after_cursor: Option<String>,
+        limit: i64,
+    },
+    CloudCachedMessage {
+        conv_id: String,
+        msg_id: String,
+    },
 
     // --- Stickers & composer side actions (U13) ---
     /// Fetch picker tabs (prepends recent tab `-2` when `recentStickers` is non-empty).
@@ -1327,6 +1339,13 @@ impl fmt::Debug for Command {
                 .field("enabled", enabled)
                 .finish(),
             Self::ResetCloud => f.write_str("ResetCloud"),
+            Self::SharedMedia { kind, limit, after_cursor, .. } => f
+                .debug_struct("SharedMedia")
+                .field("kind", kind)
+                .field("has_cursor", &after_cursor.is_some())
+                .field("limit", limit)
+                .finish(),
+            Self::CloudCachedMessage { .. } => f.write_str("CloudCachedMessage"),
             // U13
             Self::StickerTabs => f.write_str("StickerTabs"),
             Self::StickersInTab { id } => f.debug_struct("StickersInTab").field("id", id).finish(),
@@ -2150,6 +2169,14 @@ pub enum Input {
         sql_items: Vec<StoredCloudMediaItem>,
         sql_has_more: bool,
         sql_error: bool,
+        server_batches: Vec<CloudMediaStoreBatch>,
+    },
+    SharedMediaLoaded {
+        op_id: u64,
+        store_present: bool,
+        from_server: bool,
+        server_items: Vec<ChatMessage>,
+        page: SharedMediaPage,
     },
     CloudLookupMessageDone {
         op_id: u64,
@@ -3078,6 +3105,7 @@ impl fmt::Debug for Input {
                 sql_items,
                 sql_has_more,
                 sql_error,
+                server_batches,
                 ..
             } => f
                 .debug_struct("CloudListStoreDone")
@@ -3086,6 +3114,21 @@ impl fmt::Debug for Input {
                 .field("sql_items", &sql_items.len())
                 .field("sql_has_more", sql_has_more)
                 .field("sql_error", sql_error)
+                .field("server_batches", &server_batches.len())
+                .finish(),
+            Self::SharedMediaLoaded {
+                op_id,
+                store_present,
+                from_server,
+                server_items,
+                page,
+            } => f
+                .debug_struct("SharedMediaLoaded")
+                .field("op_id", op_id)
+                .field("store_present", store_present)
+                .field("from_server", from_server)
+                .field("server_items", &server_items.len())
+                .field("page", page)
                 .finish(),
             Self::CloudLookupMessageDone { op_id, message } => f
                 .debug_struct("CloudLookupMessageDone")

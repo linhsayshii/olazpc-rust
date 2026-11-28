@@ -98,6 +98,8 @@ fn is_cloud_command(cmd: &Command) -> bool {
             | Command::CloudDelete { .. }
             | Command::CloudSetOffload { .. }
             | Command::ResetCloud
+            | Command::SharedMedia { .. }
+            | Command::CloudCachedMessage { .. }
     )
 }
 
@@ -336,6 +338,7 @@ pub fn reduce(state: &mut CoreState, input: Input) -> ReduceOutput {
         }
         Input::CloudRefreshLoaded { .. }
         | Input::CloudListStoreDone { .. }
+        | Input::SharedMediaLoaded { .. }
         | Input::CloudLookupMessageDone { .. }
         | Input::CloudResolveMediaDone { .. }
         | Input::CloudResolveFileDone { .. }
