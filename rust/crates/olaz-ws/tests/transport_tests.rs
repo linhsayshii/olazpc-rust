@@ -172,8 +172,12 @@ async fn connect_sends_handshake_and_surfaces_auth_event() {
             .map(|(_, v)| v.clone())
             .unwrap_or_default()
     };
-    assert_eq!(hdr("cookie"), "zpw_sek=SEKVALUE; _zlang=vi");
-    assert_eq!(hdr("zpw_sek"), "SEKVALUE");
+    assert_eq!(hdr("cookie"), ""); // localhost is not a Zalo cookie destination
+    assert_eq!(hdr("zpw_sek"), "");
+    assert_eq!(hdr("accept-language"), "en-US");
+    assert_eq!(hdr("accept-encoding"), "gzip, deflate, br");
+    assert_eq!(hdr("pragma"), "no-cache");
+    assert_eq!(hdr("cache-control"), "no-cache");
     assert_eq!(hdr("origin"), "file://");
     assert_eq!(hdr("user-agent"), "ZaloPC-darwin-23v694");
 

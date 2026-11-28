@@ -12,6 +12,7 @@ workspace = true
 crate-type = ["staticlib", "lib"]
 
 [dependencies]
+olaz-client = { path = "../olaz-client" }
 async-trait = "0.1"
 olaz-api = { path = "../olaz-api" }
 olaz-core = { path = "../olaz-core" }
@@ -30,5 +31,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 uniffi = "0.32.2"
 
 [dev-dependencies]
+tokio-tungstenite = "0.30"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net", "io-util", "time"] }

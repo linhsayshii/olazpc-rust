@@ -108,12 +108,21 @@ struct LiveWsSession {
 #[derive(Default)]
 pub struct LiveWsDriver {
     active: Mutex<Option<LiveWsSession>>,
+    preferred_languages: Vec<String>,
 }
 
 impl LiveWsDriver {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn with_preferred_languages(preferred_languages: Vec<String>) -> Self {
+        Self {
+            preferred_languages,
+            ..Self::default()
+        }
     }
 
     fn current_handle(&self) -> Option<WsHandle> {
@@ -142,6 +151,7 @@ impl WsDriver for LiveWsDriver {
 
         let mut config = WsConfig::new(params.endpoints, params.zpw_sek);
         config.seed_cursors = params.seed_cursors;
+        config.preferred_languages = self.preferred_languages.clone();
 
         // `WsClient::start` spawns its transport task on the current tokio runtime.
         let _entered = runtime.enter();
@@ -1054,14 +1064,10 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
     /// Starts the runner's serial host worker on `runtime` with [`LiveWsDriver`].
     #[must_use]
     pub fn new(client: Arc<SessionClient<T>>, host: Arc<dyn Host>, runtime: Handle) -> Self {
-        Self::with_options(
-            client,
-            host,
-            Arc::new(LiveWsDriver::new()),
-            runtime,
-            None,
-            false,
-        )
+        let ws_driver = Arc::new(LiveWsDriver::with_preferred_languages(
+            client.transport().preferred_languages().to_vec(),
+        ));
+        Self::with_options(client, host, ws_driver, runtime, None, false)
     }
 
     /// Starts the runner with an optional domains override restored after `ClearCoreSession`
@@ -1073,14 +1079,10 @@ impl<T: Transport + 'static> SessionEffectRunner<T> {
         runtime: Handle,
         default_domains: Option<ZaloDomains>,
     ) -> Self {
-        Self::with_options(
-            client,
-            host,
-            Arc::new(LiveWsDriver::new()),
-            runtime,
-            default_domains,
-            false,
-        )
+        let ws_driver = Arc::new(LiveWsDriver::with_preferred_languages(
+            client.transport().preferred_languages().to_vec(),
+        ));
+        Self::with_options(client, host, ws_driver, runtime, default_domains, false)
     }
 
     /// Full constructor allowing tests to inject a custom [`WsDriver`] and suppress periodic

@@ -105,6 +105,7 @@ pub fn sanitize_headers(
         if name.is_empty()
             || !name.chars().all(is_token_char)
             || FORBIDDEN_HEADER_NAMES.contains(&lower.as_str())
+            || lower == "zpw_sek"
             || !value_ok(value)
         {
             continue;
@@ -270,6 +271,7 @@ mod tests {
             pair("Host", "evil"),
             pair("Content-Length", "1"),
             pair("Accept-Encoding", "gzip"),
+            pair("zpw_sek", "removed"),
             pair("X-Inject", "a\r\nb: c"),
             pair("X-Tab", "a\tb"),
             pair("X-Del", "a\u{7f}"),

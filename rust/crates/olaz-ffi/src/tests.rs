@@ -125,6 +125,7 @@ async fn ws_session_stop_notifies_listener() {
     let (tx, rx) = mpsc::channel();
     let session = ws_start(
         WsConfigRecord {
+            preferred_languages: vec!["vi".to_owned()],
             endpoints: vec!["ws://127.0.0.1:1".into()],
             zpw_sek: "sek".into(),
             seed_cursors: vec![CursorEntry {

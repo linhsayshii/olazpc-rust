@@ -122,6 +122,17 @@ impl CoreSession {
         computer_name: String,
         domains_json: Option<String>,
     ) -> Result<Arc<Self>, CoreError> {
+        Self::with_client_config(imei, computer_name, domains_json, Vec::new())
+    }
+
+    /// Host language preferences apply to all HTTP calls through this session, including login.
+    #[uniffi::constructor]
+    pub fn with_client_config(
+        imei: String,
+        computer_name: String,
+        domains_json: Option<String>,
+        preferred_languages: Vec<String>,
+    ) -> Result<Arc<Self>, CoreError> {
         let domains = match domains_json {
             Some(json) => {
                 let parsed: ZaloDomains =
@@ -132,7 +143,7 @@ impl CoreSession {
             }
             None => None,
         };
-        let transport = ReqwestTransport::new()?;
+        let transport = ReqwestTransport::with_preferred_languages(preferred_languages)?;
         let client = SessionClient::new(transport, imei, computer_name);
         if let Some(d) = &domains {
             client.with_session(|s| s.domains = d.clone());

@@ -87,6 +87,10 @@ run_quiet() {
     fi
 }
 
+# Local-only runtime drift check: runtime assets are deliberately absent from CI.
+run_quiet runtime_version "installed runtime client version" python3 "$ROOT/scripts/check-client-version.py"
+cat "$TMPDIR_GATE/check_runtime_version.log"
+
 # 1. Rust workspace fmt, clippy, tests
 run_quiet 1 "rust fmt / clippy / test" zsh -c '
     set -euo pipefail

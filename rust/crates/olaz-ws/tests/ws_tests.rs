@@ -472,11 +472,12 @@ fn reconnect_policy_backoff_and_rotation() {
 
 #[test]
 fn handshake_headers() {
-    let h = connect_headers("SEK");
-    assert_eq!(h[0], ("Cookie", "zpw_sek=SEK; _zlang=vi".to_string()));
-    assert_eq!(h[1], ("zpw_sek", "SEK".to_string()));
-    assert_eq!(h[2], ("Origin", "file://".to_string()));
-    assert_eq!(h[3], ("User-Agent", "ZaloPC-darwin-23v694".to_string()));
+    let h = connect_headers("ws1-msg.chat.zalo.me", "SEK", &["vi".into()]);
+    assert_eq!(h.len(), 7);
+    assert!(h.contains(&("Cookie", "zpw_sek=SEK; zpw_sek=SEK".to_string())));
+    assert!(h.contains(&("Origin", "file://".to_string())));
+    assert!(h.contains(&("Accept-Language", "vi".to_string())));
+    assert!(!h.iter().any(|(k, _)| k.eq_ignore_ascii_case("zpw_sek")));
 }
 
 // ---- Waiters --------------------------------------------------------------------------------------

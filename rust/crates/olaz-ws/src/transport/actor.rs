@@ -81,6 +81,7 @@ pub(crate) struct ActorParts {
     pub policy: ReconnectPolicy,
     pub endpoints: Vec<String>,
     pub zpw_sek: String,
+    pub preferred_languages: Vec<String>,
     pub timings: WsTimings,
     pub cmds: mpsc::Receiver<Cmd>,
     pub events: mpsc::Sender<WsEvent>,
@@ -284,7 +285,11 @@ impl Actor {
             .as_str()
             .into_client_request()
             .map_err(|e| e.to_string())?;
-        for (name, value) in connect_headers(&self.p.zpw_sek) {
+        for (name, value) in connect_headers(
+            req.uri().host().unwrap_or(""),
+            &self.p.zpw_sek,
+            &self.p.preferred_languages,
+        ) {
             let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| e.to_string())?;
             let value = HeaderValue::from_str(&value).map_err(|_| "invalid header value")?;
             req.headers_mut().insert(name, value);

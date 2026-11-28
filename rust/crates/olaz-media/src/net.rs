@@ -23,7 +23,8 @@ use crate::doh::{DEFAULT_ENDPOINTS, DohResolver};
 use crate::error::{MediaError, NetKind, ResolveError};
 use crate::naming::{DOH_HOST_SUFFIXES, is_suffix_match};
 
-pub const USER_AGENT: &str = "ZaloPC-darwin-23v694";
+use olaz_client::headers::{RequestKind, request_headers};
+pub use olaz_client::identity::USER_AGENT;
 
 const DOH_STICKINESS: Duration = Duration::from_secs(600);
 const SYSTEM_OK_TTL: Duration = Duration::from_secs(300);
@@ -46,6 +47,7 @@ pub struct MediaConfig {
     /// Hosts whose system lookup fails (tests simulate a broken system resolver).
     pub dns_failing: HashSet<String>,
     pub user_agent: String,
+    pub preferred_languages: Vec<String>,
 }
 
 impl Default for MediaConfig {
@@ -58,6 +60,7 @@ impl Default for MediaConfig {
             dns_overrides: HashMap::new(),
             dns_failing: HashSet::new(),
             user_agent: USER_AGENT.to_owned(),
+            preferred_languages: Vec::new(),
         }
     }
 }
@@ -186,7 +189,6 @@ fn builder(cfg: &MediaConfig) -> Result<reqwest::ClientBuilder, MediaError> {
     let mut b = reqwest::Client::builder()
         .user_agent(cfg.user_agent.clone())
         .redirect(reqwest::redirect::Policy::none())
-        .no_gzip()
         .connect_timeout(Duration::from_secs(10));
     for pem in &cfg.extra_root_pem {
         let cert =
@@ -442,6 +444,7 @@ impl Net {
         route: Route,
         url: &Url,
         headers: &[(String, String)],
+        kind: RequestKind,
         idle: Duration,
     ) -> Result<Head, MediaError> {
         let inner = self.inner()?;
@@ -457,7 +460,14 @@ impl Net {
             }
         };
         let mut request = client.get(url.clone());
-        for (name, value) in headers {
+        let mut extra = headers.to_vec();
+        if !extra
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        {
+            extra.push(("user-agent".to_owned(), self.cfg.user_agent.clone()));
+        }
+        for (name, value) in request_headers(kind, &self.cfg.preferred_languages, &extra) {
             request = request.header(name.as_str(), value.as_str());
         }
         let sent = tokio::time::timeout(idle, request.send()).await;
@@ -556,6 +566,8 @@ pub(crate) async fn stream_to_file(
     stall_error: MediaError,
     mut progress: impl FnMut(u64, Option<u64>),
 ) -> Result<u64, MediaError> {
+    // reqwest removes the encoded Content-Length when decoding. Never compare compressed
+    // wire length with decoded bytes; enforce the limit again on every decoded chunk below.
     let total = response.content_length();
     if total.is_some_and(|n| n > limit) {
         return Err(MediaError::TooLarge);

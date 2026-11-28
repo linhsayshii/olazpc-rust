@@ -87,6 +87,7 @@ actor MediaLoader {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         urlCache = URLCache(memoryCapacity: 32 << 20, diskCapacity: 400 << 20, directory: directory)
         rustMedia = CoreMedia(options: MediaCoreOptions(
+            preferredLanguages: Locale.preferredLanguages,
             filesDir: filesDirectory.path, filesCacheLimit: UInt64(filesCacheLimit),
             maxConcurrent: UInt32(maxConcurrentDownloads), allowPlainHttp: allowPlainHTTP,
             dohEndpoints: nil, fileIdleSecs: Self.fileIdleTimeout, imageIdleSecs: 10),

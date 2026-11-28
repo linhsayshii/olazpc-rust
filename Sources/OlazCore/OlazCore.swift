@@ -10350,7 +10350,7 @@ public func FfiConverterTypeCoreOfflineConversations_lower(_ value: CoreOfflineC
 public protocol CoreRawHttpProtocol: AnyObject, Sendable {
     
     /**
-     * Swift `rawDownloadData`: GET with only the `User-Agent` header; non-2xx is `CoreError.http`.
+     * Swift `rawDownloadData`: GET with Chromium media-other headers; non-2xx is `CoreError.http`.
      */
     func download(url: String, timeoutSecs: Double) async throws  -> Data
     
@@ -10430,10 +10430,19 @@ public convenience init()throws  {
     }
 
     
+public static func withPreferredLanguages(preferredLanguages: [String])throws  -> CoreRawHttp  {
+    return try  FfiConverterTypeCoreRawHttp_lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_constructor_corerawhttp_with_preferred_languages(
+        FfiConverterSequenceString.lower(preferredLanguages),uniffiCallStatus
+    )
+})
+}
+    
 
     
     /**
-     * Swift `rawDownloadData`: GET with only the `User-Agent` header; non-2xx is `CoreError.http`.
+     * Swift `rawDownloadData`: GET with Chromium media-other headers; non-2xx is `CoreError.http`.
      */
 open func download(url: String, timeoutSecs: Double)async throws  -> Data  {
     return
@@ -10679,6 +10688,21 @@ public convenience init(computerName: String)throws  {
         try! rustCall { uniffi_olaz_ffi_fn_free_coresession(handle, $0) }
     }
 
+    
+    /**
+     * Host language preferences apply to all HTTP calls through this session, including login.
+     */
+public static func withClientConfig(imei: String, computerName: String, domainsJson: String?, preferredLanguages: [String])throws  -> CoreSession  {
+    return try  FfiConverterTypeCoreSession_lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_constructor_coresession_with_client_config(
+        FfiConverterString.lower(imei),
+        FfiConverterString.lower(computerName),
+        FfiConverterOptionString.lower(domainsJson),
+        FfiConverterSequenceString.lower(preferredLanguages),uniffiCallStatus
+    )
+})
+}
     
     /**
      * A fresh session configured with an explicit IMEI and optional `ZaloDomains` JSON override.
@@ -14889,6 +14913,72 @@ public func FfiConverterTypeChatMessageRecord_lower(_ value: ChatMessageRecord) 
 }
 
 
+public struct ClientIdentityRecord: Equatable, Hashable {
+    public var clientVersion: String
+    public var clientType: String
+    public var webClientType: String
+    public var userAgent: String
+    public var wsOrigin: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(clientVersion: String, clientType: String, webClientType: String, userAgent: String, wsOrigin: String) {
+        self.clientVersion = clientVersion
+        self.clientType = clientType
+        self.webClientType = webClientType
+        self.userAgent = userAgent
+        self.wsOrigin = wsOrigin
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ClientIdentityRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeClientIdentityRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ClientIdentityRecord {
+        return
+            try ClientIdentityRecord(
+                clientVersion: FfiConverterString.read(from: &buf), 
+                clientType: FfiConverterString.read(from: &buf), 
+                webClientType: FfiConverterString.read(from: &buf), 
+                userAgent: FfiConverterString.read(from: &buf), 
+                wsOrigin: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ClientIdentityRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.clientVersion, into: &buf)
+        FfiConverterString.write(value.clientType, into: &buf)
+        FfiConverterString.write(value.webClientType, into: &buf)
+        FfiConverterString.write(value.userAgent, into: &buf)
+        FfiConverterString.write(value.wsOrigin, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeClientIdentityRecord_lift(_ buf: RustBuffer) throws -> ClientIdentityRecord {
+    return try FfiConverterTypeClientIdentityRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeClientIdentityRecord_lower(_ value: ClientIdentityRecord) -> RustBuffer {
+    return FfiConverterTypeClientIdentityRecord.lower(value)
+}
+
+
 /**
  * Outcome of [`CoreEngine::cloud_delete`] or [`CoreEngine::cloud_set_offload`] (U11).
  */
@@ -19086,6 +19176,7 @@ public func FfiConverterTypeLoginStateRecord_lower(_ value: LoginStateRecord) ->
  * DoH override); tests point it at local servers.
  */
 public struct MediaCoreOptions: Equatable, Hashable {
+    public var preferredLanguages: [String]
     public var filesDir: String
     public var filesCacheLimit: UInt64
     public var maxConcurrent: UInt32
@@ -19102,13 +19193,14 @@ public struct MediaCoreOptions: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(filesDir: String, filesCacheLimit: UInt64, maxConcurrent: UInt32, allowPlainHttp: Bool, dohEndpoints: [String]?, 
+    public init(preferredLanguages: [String] = [], filesDir: String, filesCacheLimit: UInt64, maxConcurrent: UInt32, allowPlainHttp: Bool, dohEndpoints: [String]?, 
         /**
          * Allowed gap between file bytes (production: 30 s).
          */fileIdleSecs: Double, 
         /**
          * Allowed gap between image bytes (production: 10 s).
          */imageIdleSecs: Double) {
+        self.preferredLanguages = preferredLanguages
         self.filesDir = filesDir
         self.filesCacheLimit = filesCacheLimit
         self.maxConcurrent = maxConcurrent
@@ -19134,6 +19226,7 @@ public struct FfiConverterTypeMediaCoreOptions: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MediaCoreOptions {
         return
             try MediaCoreOptions(
+                preferredLanguages: FfiConverterSequenceString.read(from: &buf), 
                 filesDir: FfiConverterString.read(from: &buf), 
                 filesCacheLimit: FfiConverterUInt64.read(from: &buf), 
                 maxConcurrent: FfiConverterUInt32.read(from: &buf), 
@@ -19145,6 +19238,7 @@ public struct FfiConverterTypeMediaCoreOptions: FfiConverterRustBuffer {
     }
 
     public static func write(_ value: MediaCoreOptions, into buf: inout [UInt8]) {
+        FfiConverterSequenceString.write(value.preferredLanguages, into: &buf)
         FfiConverterString.write(value.filesDir, into: &buf)
         FfiConverterUInt64.write(value.filesCacheLimit, into: &buf)
         FfiConverterUInt32.write(value.maxConcurrent, into: &buf)
@@ -23813,7 +23907,7 @@ public struct RawRequestRecord: Equatable, Hashable {
     public var timeoutSecs: Double?
     public var headers: [String: String]
     /**
-     * Sent as `Cookie: zpw_sek=..; _zlang=vi` + `zpw_sek:` header on Zalo hosts only.
+     * Sent only as host-shaped session cookies on HTTPS Zalo hosts.
      */
     public var zpwSek: String?
 
@@ -23827,7 +23921,7 @@ public struct RawRequestRecord: Equatable, Hashable {
          * Inactivity timeout in seconds; `None` = the 35 s default.
          */timeoutSecs: Double?, headers: [String: String], 
         /**
-         * Sent as `Cookie: zpw_sek=..; _zlang=vi` + `zpw_sek:` header on Zalo hosts only.
+         * Sent only as host-shaped session cookies on HTTPS Zalo hosts.
          */zpwSek: String?) {
         self.method = method
         self.url = url
@@ -26372,12 +26466,13 @@ public func FfiConverterTypeWireStored_lower(_ value: WireStored) -> RustBuffer 
  * Input of [`ws_start`].
  */
 public struct WsConfigRecord: Equatable, Hashable {
+    public var preferredLanguages: [String]
     /**
      * `wss://host` bases, rotated on reconnect. Empty means the built-in defaults.
      */
     public var endpoints: [String]
     /**
-     * Session key (`zpw_sek`). Sent as cookie/header only, never logged.
+     * Session key (`zpw_sek`). Sent as cookies only, never logged.
      */
     public var zpwSek: String
     /**
@@ -26397,12 +26492,12 @@ public struct WsConfigRecord: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(
+    public init(preferredLanguages: [String] = [], 
         /**
          * `wss://host` bases, rotated on reconnect. Empty means the built-in defaults.
          */endpoints: [String] = [], 
         /**
-         * Session key (`zpw_sek`). Sent as cookie/header only, never logged.
+         * Session key (`zpw_sek`). Sent as cookies only, never logged.
          */zpwSek: String, 
         /**
          * Cursors to resume from.
@@ -26414,6 +26509,7 @@ public struct WsConfigRecord: Equatable, Hashable {
          * Signed-in uid and "My Cloud" conversation id, used to parse chat envelopes in the socket task. Swift verifies
          * them on every delivery (`WirePayload::resolve`), so a wrong or late value only costs a re-parse.
          */myUid: String? = nil, selfConvId: String? = nil) {
+        self.preferredLanguages = preferredLanguages
         self.endpoints = endpoints
         self.zpwSek = zpwSek
         self.seedCursors = seedCursors
@@ -26438,6 +26534,7 @@ public struct FfiConverterTypeWsConfigRecord: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WsConfigRecord {
         return
             try WsConfigRecord(
+                preferredLanguages: FfiConverterSequenceString.read(from: &buf), 
                 endpoints: FfiConverterSequenceString.read(from: &buf), 
                 zpwSek: FfiConverterString.read(from: &buf), 
                 seedCursors: FfiConverterSequenceTypeCursorEntry.read(from: &buf), 
@@ -26448,6 +26545,7 @@ public struct FfiConverterTypeWsConfigRecord: FfiConverterRustBuffer {
     }
 
     public static func write(_ value: WsConfigRecord, into buf: inout [UInt8]) {
+        FfiConverterSequenceString.write(value.preferredLanguages, into: &buf)
         FfiConverterSequenceString.write(value.endpoints, into: &buf)
         FfiConverterString.write(value.zpwSek, into: &buf)
         FfiConverterSequenceTypeCursorEntry.write(value.seedCursors, into: &buf)
@@ -34784,6 +34882,13 @@ public func inflate(data: Data)throws  -> Data  {
     )
 })
 }
+public func clientIdentity() -> ClientIdentityRecord  {
+    return try!  FfiConverterTypeClientIdentityRecord_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_olaz_ffi_fn_func_client_identity(uniffiCallStatus
+    )
+})
+}
 /**
  * `<hash(seed)>.<ext>` cache file name (`MediaLoader.cachedFileLocation`).
  */
@@ -35393,6 +35498,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_func_inflate() != 10643) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_func_client_identity() != 2944) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_func_media_cached_file_name() != 50847) {
@@ -36574,7 +36682,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_method_mediapublishhook_before_publish() != 3838) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_olaz_ffi_checksum_method_corerawhttp_download() != 44253) {
+    if (uniffi_olaz_ffi_checksum_method_corerawhttp_download() != 28805) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_method_corerawhttp_download_sync_batch() != 17218) {
@@ -36826,7 +36934,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_olaz_ffi_checksum_constructor_corerawhttp_new() != 28295) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_olaz_ffi_checksum_constructor_corerawhttp_with_preferred_languages() != 52705) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_olaz_ffi_checksum_constructor_coresession_new() != 51392) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_olaz_ffi_checksum_constructor_coresession_with_client_config() != 63740) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_olaz_ffi_checksum_constructor_coresession_with_config() != 16329) {

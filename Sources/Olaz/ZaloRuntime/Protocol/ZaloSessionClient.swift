@@ -244,7 +244,7 @@ actor ZaloSessionClient {
     private func coreRaw() throws -> CoreRawHttp {
         if let coreRawHandle { return coreRawHandle }
         do {
-            let created = try CoreRawHttp()
+            let created = try CoreRawHttp.withPreferredLanguages(preferredLanguages: Locale.preferredLanguages)
             coreRawHandle = created
             return created
         } catch {
@@ -272,10 +272,11 @@ actor ZaloSessionClient {
             }
             return String(data: current, encoding: .utf8)
         }()
-        guard let created = try? CoreSession.withConfig(
+        guard let created = try? CoreSession.withClientConfig(
             imei: imei,
             computerName: computerName,
-            domainsJson: customDomainsJSON
+            domainsJson: customDomainsJSON,
+            preferredLanguages: Locale.preferredLanguages
         ) else {
             return nil
         }
@@ -323,7 +324,10 @@ actor ZaloSessionClient {
         )
         guard let data = try? JSONEncoder().encode(snapshot), let json = String(data: data, encoding: .utf8) else { return false }
         if coreSession == nil {
-            guard let created = try? CoreSession(computerName: computerName) else { return false }
+            guard let created = try? CoreSession.withClientConfig(
+                imei: imei, computerName: computerName, domainsJson: nil,
+                preferredLanguages: Locale.preferredLanguages
+            ) else { return false }
             if let seeded = seededNextClientId {
                 created.seedNextClientId(next: seeded)
             }
