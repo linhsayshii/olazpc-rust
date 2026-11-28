@@ -367,7 +367,11 @@ fn video_duration_seconds(raw_ms: i64) -> i64 {
 }
 
 fn voice_duration_seconds(raw_ms: i64) -> i64 {
-    if raw_ms <= 0 { 0 } else { raw_ms.saturating_add(500) / 1000 }
+    if raw_ms <= 0 {
+        0
+    } else {
+        raw_ms.saturating_add(500) / 1000
+    }
 }
 
 // MARK: - parseWireMessage
@@ -737,7 +741,8 @@ pub fn parse_wire_message(
             let url = candidates.first().cloned().unwrap_or_default();
             let fallbacks: Vec<String> = candidates.iter().skip(1).cloned().collect();
             let thumb = first_non_empty(&[&dd.ds("thumb"), &dd.ds("thumbUrl"), &dd.ps("thumb")]);
-            let dur = video_duration_seconds(int64(dd.p("duration").or(dd.d("duration"))).unwrap_or(0));
+            let dur =
+                video_duration_seconds(int64(dd.p("duration").or(dd.d("duration"))).unwrap_or(0));
             text_body = dd.ds("title");
             let mut v =
                 obj(json!({"type": "video", "thumbnail": thumb, "duration": dur, "url": url}));
@@ -755,7 +760,8 @@ pub fn parse_wire_message(
                 &dd.ds("fileUrl"),
                 &dd.ps("m4a"),
             ]);
-            let dur = voice_duration_seconds(int64(dd.p("duration").or(dd.d("duration"))).unwrap_or(0));
+            let dur =
+                voice_duration_seconds(int64(dd.p("duration").or(dd.d("duration"))).unwrap_or(0));
             kind_dict = obj(json!({"type": "voice", "url": url, "duration": dur}));
             kind_tag = "voice".into();
             text_body = "[Tin nhắn thoại]".into();

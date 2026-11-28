@@ -1349,7 +1349,10 @@ fn video_and_voice_wire_durations_always_milliseconds() {
         );
         // Stored SQLite rows already hold seconds and must NOT be divided again on read.
         let roundtrip = decode_stored_message(&stored).unwrap();
-        assert_eq!(roundtrip.kind, msg.kind, "video stored roundtrip raw_ms={raw_ms}");
+        assert_eq!(
+            roundtrip.kind, msg.kind,
+            "video stored roundtrip raw_ms={raw_ms}"
+        );
     }
 
     // Voice uses Math.round(ms / 1000) per official zV/HV/XV.
@@ -1378,6 +1381,9 @@ fn video_and_voice_wire_durations_always_milliseconds() {
             "voice raw_ms={raw_ms}"
         );
         let roundtrip = decode_stored_message(&stored).unwrap();
-        assert_eq!(roundtrip.kind, msg.kind, "voice stored roundtrip raw_ms={raw_ms}");
+        assert_eq!(
+            roundtrip.kind, msg.kind,
+            "voice stored roundtrip raw_ms={raw_ms}"
+        );
     }
 }
